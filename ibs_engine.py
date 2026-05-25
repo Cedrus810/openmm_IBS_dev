@@ -21,7 +21,10 @@ import json
 import time
 import math
 import warnings
-from typing import Dict, List, Tuple, Optional
+import multiprocessing as mp
+import logging
+import builtins
+from typing import Dict, List, Tuple, Optional, Any
 from abfe_core import (
     ACESoftcorePotential,
     AlchemicalPotentialFactory,
@@ -38,7 +41,277 @@ try:
 except ImportError:
     HAS_PYMBAR = False
 
+logger = logging.getLogger(__name__)
 
+
+def _infer_log_level_from_message(message: str) -> int:
+    if any(token in message for token in ("⚠️", "警告", "warning")):
+        return logging.WARNING
+    if any(token in message for token in ("🚨", "❌", "失败", "错误", "异常", "error")):
+        return logging.ERROR
+    return logging.INFO
+
+
+def _log_print(*args, sep=" ", end="\n", file=None, flush=False):
+    message = sep.join(str(arg) for arg in args)
+    if end and end != "\n":
+        message += end.rstrip("\n")
+    logger.log(_infer_log_level_from_message(message), message)
+    if flush and not logger.handlers:
+        builtins.print(message, end=end, file=file, flush=flush)
+
+
+print = _log_print
+
+
+def _atomic_save_npy(filepath: str, array: np.ndarray) -> None:
+    """同步原子写 NPY：先写临时文件，再原子替换。"""
+    dirpath = os.path.dirname(filepath)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
+    tmp_file = filepath + ".tmp"
+    with open(tmp_file, "wb") as handle:
+        np.save(handle, array)
+    os.replace(tmp_file, filepath)
+
+
+def _atomic_write_json(filepath: str, payload: Dict[str, Any]) -> None:
+    """同步原子写 JSON：先写临时文件，再原子替换。"""
+    dirpath = os.path.dirname(filepath)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
+    tmp_file = filepath + ".tmp"
+    with open(tmp_file, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    os.replace(tmp_file, filepath)
+
+
+def _positions_to_nm_array(positions) -> np.ndarray:
+    if positions is None:
+        raise ValueError("positions 不能为空")
+    if hasattr(positions, "value_in_unit"):
+        return np.asarray(positions.value_in_unit(unit.nanometer), dtype=np.float64)
+    if isinstance(positions, np.ndarray):
+        return positions.astype(np.float64, copy=False)
+    if isinstance(positions, (list, tuple)):
+        if len(positions) == 0:
+            raise ValueError("positions 不能为空序列")
+        if hasattr(positions[0], "x"):
+            return np.asarray([[p.x, p.y, p.z] for p in positions], dtype=np.float64)
+        return np.asarray(positions, dtype=np.float64)
+    raise TypeError(f"不支持的 positions 类型: {type(positions)}")
+
+
+def _box_vectors_to_nm_array(box_vectors) -> Optional[np.ndarray]:
+    if box_vectors is None:
+        return None
+    if hasattr(box_vectors, "value_in_unit"):
+        return np.asarray(box_vectors.value_in_unit(unit.nanometer), dtype=np.float64)
+    if isinstance(box_vectors, np.ndarray):
+        return box_vectors.astype(np.float64, copy=False)
+    if isinstance(box_vectors, (list, tuple)):
+        if len(box_vectors) != 3:
+            return None
+        first = box_vectors[0]
+        if hasattr(first, "x"):
+            return np.asarray([[v.x, v.y, v.z] for v in box_vectors], dtype=np.float64)
+        return np.asarray(box_vectors, dtype=np.float64)
+    return None
+
+
+def _create_bulk_water_ion_restraint(
+    ion_index: int,
+    reference_position_nm: np.ndarray,
+    force_constant_kj_per_mol_nm2: float = 25.0,
+) -> openmm.CustomExternalForce:
+    """将共炼金反离子锚定在初始 bulk 水位点，使用 periodicdistance 保持 PBC 一致性。"""
+    expr = "0.5*k_ion*periodicdistance(x,y,z,x0,y0,z0)^2"
+    force = openmm.CustomExternalForce(expr)
+    force.addGlobalParameter("k_ion", float(force_constant_kj_per_mol_nm2))
+    for name in ("x0", "y0", "z0"):
+        force.addPerParticleParameter(name)
+    force.addParticle(int(ion_index), [float(reference_position_nm[0]), float(reference_position_nm[1]), float(reference_position_nm[2])])
+    return force
+
+
+def _value_in_inverse_nanometer(value: Any) -> float:
+    """
+    将 OpenMM 返回的 PME alpha 统一归一化为 1/nm 的纯浮点数。
+    兼容 float、Quantity(/nanometer) 以及不同 API 返回形式。
+    """
+    if hasattr(value, "value_in_unit"):
+        try:
+            return float((value * unit.nanometer).value_in_unit(unit.dimensionless))
+        except Exception:
+            pass
+        try:
+            return float(value / (1 / unit.nanometer))
+        except Exception:
+            pass
+    return float(value)
+
+
+def _select_bulk_water_counterion(
+    nb_force: openmm.NonbondedForce,
+    ligand_indices: List[int],
+    topology,
+    positions,
+) -> Tuple[Optional[int], Optional[np.ndarray], Dict[str, float]]:
+    """选择位于 bulk 水区域的匹配反离子。"""
+    pos_nm = _positions_to_nm_array(positions)
+    ligand_set = set(int(i) for i in ligand_indices)
+    lig_net_charge = 0.0
+    for idx in ligand_set:
+        q, _, _ = nb_force.getParticleParameters(idx)
+        lig_net_charge += q.value_in_unit(unit.elementary_charge)
+    lig_net_charge = round(lig_net_charge)
+    if abs(lig_net_charge) < 0.01:
+        return None, None, {}
+
+    target_ion_charge = -1.0 if lig_net_charge > 0 else 1.0
+    water_names = {"HOH", "WAT", "SOL", "TIP3", "TIP3P"}
+    ion_names = {"CL", "CLA", "NA", "SOD", "K", "POT", "MG", "CA"}
+    heavy_solute_indices = [
+        a.index for a in topology.atoms()
+        if a.index not in ligand_set
+        and a.residue.name.upper() not in water_names | ion_names
+        and getattr(a.element, "symbol", "") != "H"
+    ]
+    if not heavy_solute_indices:
+        heavy_solute_indices = [
+            a.index for a in topology.atoms()
+            if a.index not in ligand_set and a.residue.name.upper() not in water_names | ion_names
+        ]
+    solute_anchor = np.mean(pos_nm[list(ligand_set) + heavy_solute_indices], axis=0) if heavy_solute_indices else np.mean(pos_nm[list(ligand_set)], axis=0)
+
+    water_oxygen_indices = [
+        a.index for a in topology.atoms()
+        if a.residue.name.upper() in water_names and getattr(a.element, "symbol", "").upper() == "O"
+    ]
+
+    best_ion_idx = None
+    best_score = -1e18
+    best_meta: Dict[str, float] = {}
+    for atom in topology.atoms():
+        if atom.residue.name.upper() not in ion_names:
+            continue
+        idx = atom.index
+        q, _, _ = nb_force.getParticleParameters(idx)
+        q_val = q.value_in_unit(unit.elementary_charge)
+        if abs(q_val - target_ion_charge) >= 0.1:
+            continue
+
+        ion_pos = pos_nm[idx]
+        solute_dist = float(np.linalg.norm(ion_pos - solute_anchor))
+        water_coord = 0
+        if water_oxygen_indices:
+            water_dists = np.linalg.norm(pos_nm[water_oxygen_indices] - ion_pos, axis=1)
+            water_coord = int(np.sum(water_dists <= 0.45))
+        score = solute_dist + 0.15 * water_coord
+        if score > best_score:
+            best_score = score
+            best_ion_idx = idx
+            best_meta = {
+                "solute_distance_nm": solute_dist,
+                "water_coordination": float(water_coord),
+                "target_charge_e": float(target_ion_charge),
+            }
+
+    if best_ion_idx is None:
+        return None, None, {}
+    return best_ion_idx, pos_nm[best_ion_idx].copy(), best_meta
+
+
+def _prepare_pme_coulomb_leg_system(
+    system_template: openmm.System,
+    ligand_indices: List[int],
+    lambda_name: str = "lambda_coul",
+    allow_charged_ligand: bool = False,
+    topology=None,
+    positions=None,
+    box_vectors=None,
+) -> openmm.System:
+    prepared = openmm.XmlSerializer.deserialize(openmm.XmlSerializer.serialize(system_template))
+    prepared.thisown = 1
+    configure_pme_ligand_charge_offsets(
+        prepared,
+        ligand_indices,
+        lambda_name=lambda_name,
+        allow_charged_ligand=allow_charged_ligand,
+        topology=topology,
+        positions=positions,
+        box_vectors=box_vectors,
+    )
+    return prepared
+
+
+def _build_traditional_mbar_eval_context(
+    system_xml: str,
+    platform_name: str,
+):
+    """为离线 MBAR worker 构建独立的 OpenMM Context。"""
+    eval_sys = openmm.XmlSerializer.deserialize(system_xml)
+    resolved_platform, props = _build_platform_properties(platform_name)
+    platform = openmm.Platform.getPlatformByName(resolved_platform)
+    integ = openmm.VerletIntegrator(0.001)
+    ctx = openmm.Context(eval_sys, integ, platform, props)
+    return eval_sys, integ, ctx
+
+
+def _compute_u_kn_chunk(task: Dict) -> Tuple[int, np.ndarray]:
+    """多进程 worker：重算一个帧块在所有 λ 态下的约化势。"""
+    frame_offset = int(task["frame_offset"])
+    xyz_chunk = np.asarray(task["xyz"], dtype=np.float64)
+    box_chunk = task.get("box_vectors")
+    if box_chunk is not None:
+        box_chunk = np.asarray(box_chunk, dtype=np.float64)
+
+    eval_sys, integ, ctx = _build_traditional_mbar_eval_context(
+        system_xml=task["system_xml"],
+        platform_name=str(task["platform_name"]),
+    )
+
+    lambdas_coul = np.asarray(task["lambdas_coul"], dtype=float)
+    lambdas_vdw = np.asarray(task["lambdas_vdw"], dtype=float)
+    n_states = len(lambdas_coul)
+    u_chunk = np.zeros((n_states, xyz_chunk.shape[0]), dtype=np.float64)
+    kt = float(task["kt"])
+    is_pme_coulomb_leg = bool(task["is_pme_coulomb_leg"])
+    pme_self_prefactor_kj = None
+    if is_pme_coulomb_leg:
+        lig_qsq = float(task.get("ligand_charge_square_sum", 0.0))
+        if lig_qsq > 0.0:
+            nb_force = next((f for f in eval_sys.getForces() if isinstance(f, openmm.NonbondedForce)), None)
+            if nb_force is not None:
+                try:
+                    alpha_ewald, _, _, _ = nb_force.getPMEParametersInContext(ctx)
+                    alpha_ewald = _value_in_inverse_nanometer(alpha_ewald)
+                except Exception:
+                    alpha_q, _, _, _ = nb_force.getPMEParameters()
+                    alpha_ewald = _value_in_inverse_nanometer(alpha_q)
+                if alpha_ewald > 0.0:
+                    pme_self_prefactor_kj = 138.935456 * alpha_ewald * lig_qsq / math.sqrt(math.pi)
+
+    for local_f in range(xyz_chunk.shape[0]):
+        ctx.setPositions(xyz_chunk[local_f] * unit.nanometer)
+        if box_chunk is not None and len(box_chunk) > 0:
+            ctx.setPeriodicBoxVectors(*box_chunk[local_f] * unit.nanometer)
+
+        for k in range(n_states):
+            REMDManager._try_set_context_parameter(ctx, "lambda_coul", lambdas_coul[k])
+            REMDManager._try_set_context_parameter(ctx, "lambda_vdw", lambdas_vdw[k])
+            if is_pme_coulomb_leg:
+                e = ctx.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+                if pme_self_prefactor_kj is not None:
+                    # PME 总能量包含与坐标无关的自能项 -C*lambda^2。
+                    # 它不会影响构型采样，但会严重污染 ΔG；这里在离线 u_kn 中解析去除。
+                    e += pme_self_prefactor_kj * (lambdas_coul[k] ** 2)
+            else:
+                e = ctx.getState(getEnergy=True, groups={1}).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+            u_chunk[k, local_f] = e / kt
+
+    del ctx, integ, eval_sys
+    return frame_offset, u_chunk
 def _split_platform_spec(platform_name: str) -> Tuple[str, Optional[str]]:
     spec = str(platform_name or "CPU").strip()
     if ":" not in spec:
@@ -74,11 +347,13 @@ import numpy as np
 
 # ================= ibs_engine.py 顶部新增 =================
 def configure_coalchemical_neutral_decharging(
-    system: openmm.System, 
-    ligand_indices: List[int], 
-    topology, 
+    system: openmm.System,
+    ligand_indices: List[int],
+    topology,
     positions,
-    lambda_name: str = "lam_coul"
+    box_vectors=None,
+    lambda_name: str = "lam_coul",
+    ion_restraint_k: float = 25.0,
 ) -> Tuple[Dict, Optional[int]]:
     """
     🔥 终极防御：共炼金反离子策略
@@ -88,9 +363,9 @@ def configure_coalchemical_neutral_decharging(
     if nb_force is None:
         raise RuntimeError("系统中未找到 NonbondedForce")
 
-    # 1. 计算配体净电荷
+    ligand_set = set(int(i) for i in ligand_indices)
     lig_net_charge = 0.0
-    for idx in ligand_indices:
+    for idx in ligand_set:
         q, _, _ = nb_force.getParticleParameters(idx)
         lig_net_charge += q.value_in_unit(unit.elementary_charge)
     lig_net_charge = round(lig_net_charge)
@@ -98,33 +373,23 @@ def configure_coalchemical_neutral_decharging(
     if abs(lig_net_charge) < 0.01:
         print("  ℹ️ 配体为电中性，无需共消电反离子。使用标准 PME Offset。")
         target_ion_charge = 0.0
+        best_ion_idx = None
+        ion_ref_pos_nm = None
+        ion_meta = {}
     else:
         print(f"  ⚡ 检测到带电配体 (Net Charge: {lig_net_charge:+d})，启动共炼金反离子搜索...")
         target_ion_charge = -1.0 if lig_net_charge > 0 else 1.0
-
-    # 2. 寻找距离“蛋白+配体”质心最远的匹配离子
-    best_ion_idx = None
-    if target_ion_charge != 0.0 and positions is not None:
-        pos_nm = np.array([p.value_in_unit(unit.nanometer) if hasattr(p, 'value_in_unit') else p for p in positions])
-        heavy_solute_indices = [
-            a.index for a in topology.atoms() 
-            if a.residue.name not in ['HOH', 'WAT', 'SOL', 'CL', 'CLA', 'NA', 'SOD', 'K', 'POT', 'MG'] 
-            and a.element.symbol != 'H'
-        ]
-        if heavy_solute_indices:
-            solute_com = np.mean(pos_nm[heavy_solute_indices], axis=0)
-            max_dist = -1.0
-            for atom in topology.atoms():
-                if atom.residue.name.upper() in ['CL', 'CLA', 'NA', 'SOD', 'K', 'POT', 'MG']:
-                    idx = atom.index
-                    q, _, _ = nb_force.getParticleParameters(idx)
-                    if abs(q.value_in_unit(unit.elementary_charge) - target_ion_charge) < 0.1:
-                        dist = np.linalg.norm(pos_nm[idx] - solute_com)
-                        if dist > max_dist:
-                            max_dist = dist
-                            best_ion_idx = idx
-            if best_ion_idx is not None:
-                print(f"  🎯 锁定共消电反离子: Index {best_ion_idx}, 距离溶质核心 {max_dist:.2f} nm")
+        best_ion_idx, ion_ref_pos_nm, ion_meta = _select_bulk_water_counterion(
+            nb_force, ligand_indices, topology, positions
+        )
+        if best_ion_idx is not None:
+            print(
+                f"  🎯 锁定共消电反离子: Index {best_ion_idx}, "
+                f"距溶质 {ion_meta.get('solute_distance_nm', float('nan')):.2f} nm, "
+                f"水配位={int(ion_meta.get('water_coordination', 0))}"
+            )
+        else:
+            raise RuntimeError("未找到可用于共炼金的匹配反离子，无法保持 PME 去电荷腿的电中性。")
 
     # 3. 注入全局 Lambda 与 ParameterOffset
     existing_params = [nb_force.getGlobalParameterName(i) for i in range(nb_force.getNumGlobalParameters())]
@@ -134,7 +399,7 @@ def configure_coalchemical_neutral_decharging(
     original_charges = {}
     
     # 3.1 配体 Offset
-    for idx in ligand_indices:
+    for idx in ligand_set:
         q, sig, eps = nb_force.getParticleParameters(idx)
         original_charges[idx] = q
         nb_force.setParticleParameters(idx, 0.0*unit.elementary_charge, sig, eps)
@@ -148,7 +413,7 @@ def configure_coalchemical_neutral_decharging(
         nb_force.addParticleParameterOffset(lambda_name, best_ion_idx, ion_q, 0.0*unit.nanometer, 0.0*unit.kilojoule_per_mole)
 
     # 3.3 屏蔽主系统中的 L-L 静电 (防止与 Group 2 双重计数)
-    ll_pairs = set((i, j) for i in ligand_indices for j in ligand_indices if i < j)
+    ll_pairs = set((i, j) for i in ligand_set for j in ligand_set if i < j)
     for i in range(nb_force.getNumExceptions()):
         p1, p2, cp, sig, eps = nb_force.getExceptionParameters(i)
         p1, p2 = int(p1), int(p2)
@@ -161,15 +426,146 @@ def configure_coalchemical_neutral_decharging(
     # 3.4 处理 1-4 静电 Offset
     for i in range(nb_force.getNumExceptions()):
         p1, p2, cp, sig, eps = nb_force.getExceptionParameters(i)
-        if p1 in ligand_indices or p2 in ligand_indices:
+        if p1 in ligand_set or p2 in ligand_set:
             q1 = original_charges.get(p1, nb_force.getParticleParameters(p1)[0])
             q2 = original_charges.get(p2, nb_force.getParticleParameters(p2)[0])
             nominal_cp = q1 * q2
             nb_force.setExceptionParameters(i, p1, p2, 0.0*unit.elementary_charge**2, sig, eps)
             nb_force.addExceptionParameterOffset(lambda_name, i, nominal_cp, 0.0*unit.nanometer, 0.0*unit.kilojoule_per_mole)
 
+    if best_ion_idx is not None and ion_ref_pos_nm is not None:
+        restraint = _create_bulk_water_ion_restraint(
+            ion_index=best_ion_idx,
+            reference_position_nm=ion_ref_pos_nm,
+            force_constant_kj_per_mol_nm2=ion_restraint_k,
+        )
+        restraint.setForceGroup(6)
+        system.addForce(restraint)
+        print(
+            f"  🪢 共炼金反离子 bulk 水锚定已注入: "
+            f"k={ion_restraint_k:.1f} kJ/mol/nm^2, ref=({ion_ref_pos_nm[0]:.3f}, {ion_ref_pos_nm[1]:.3f}, {ion_ref_pos_nm[2]:.3f}) nm"
+        )
+
     print("  ✅ 共炼金反离子防御阵列部署完毕。PME 倒空间计算全程严格电中性！")
     return original_charges, best_ion_idx
+
+
+def configure_pme_ligand_charge_offsets(
+    system: openmm.System,
+    ligand_indices: List[int],
+    lambda_name: str = "lambda_coul",
+    allow_charged_ligand: bool = False,
+    topology=None,
+    positions=None,
+    box_vectors=None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Configure a PME-preserving Coulomb leg on the native NonbondedForce.
+
+    This avoids putting ligand-environment electrostatics into
+    CustomNonbondedForce, which would truncate Coulomb at the cutoff.  Charged
+    ligands are rejected by default because co-alchemical ion schemes change the
+    thermodynamic cycle unless they are implemented and validated explicitly.
+    """
+    nb_force = next((f for f in system.getForces() if isinstance(f, openmm.NonbondedForce)), None)
+    if nb_force is None:
+        raise RuntimeError("系统中未找到 NonbondedForce，无法配置 PME 去电荷阶段。")
+
+    ligand_set = set(int(i) for i in ligand_indices)
+    net_charge = 0.0
+    for idx in ligand_set:
+        q, _, _ = nb_force.getParticleParameters(idx)
+        net_charge += q.value_in_unit(unit.elementary_charge)
+    rounded_charge = round(net_charge)
+    if abs(rounded_charge) > 0.01 and not allow_charged_ligand:
+        raise RuntimeError(
+            f"检测到带净电配体 ({rounded_charge:+d} e)。当前 PME 去电荷路径不再自动共炼金反离子，"
+            "请先使用净电中性配体、显式实现可验证的离子方案，或改用支持 PME 多态炼金的底层实现。"
+        )
+
+    if abs(rounded_charge) > 0.01:
+        if topology is None or positions is None:
+            raise RuntimeError("带电配体的 PME 去电荷路径需要 topology 和初始 positions 以构建共炼金反离子 bulk 水锚定。")
+        original_charges, ion_idx = configure_coalchemical_neutral_decharging(
+            system,
+            ligand_indices,
+            topology,
+            positions,
+            box_vectors=box_vectors,
+            lambda_name=lambda_name,
+        )
+        return {
+            "mode": "coalchemical_counterion",
+            "ion_index": ion_idx,
+            "n_offsets": len(original_charges),
+        }
+
+    existing_params = [nb_force.getGlobalParameterName(i) for i in range(nb_force.getNumGlobalParameters())]
+    if lambda_name not in existing_params:
+        nb_force.addGlobalParameter(lambda_name, 1.0)
+
+    ligand_params = {}
+    for idx in ligand_set:
+        q, sig, eps = nb_force.getParticleParameters(idx)
+        ligand_params[idx] = (q, sig, eps)
+        nb_force.setParticleParameters(idx, 0.0 * unit.elementary_charge, sig, eps)
+        nb_force.addParticleParameterOffset(
+            lambda_name,
+            idx,
+            q,
+            0.0 * unit.nanometer,
+            0.0 * unit.kilojoule_per_mole,
+        )
+
+    # 冻结所有 L-L 非键对，使去电荷腿只作用于配体-环境静电，而不污染配体内部 self-energy。
+    frozen_ll_pairs = set()
+    for exc_idx in range(nb_force.getNumExceptions()):
+        p1, p2, charge_prod, sig, eps = nb_force.getExceptionParameters(exc_idx)
+        p1, p2 = int(p1), int(p2)
+        if p1 in ligand_set and p2 in ligand_set:
+            frozen_ll_pairs.add((min(p1, p2), max(p1, p2)))
+            continue
+        if (p1 in ligand_set) ^ (p2 in ligand_set):
+            nb_force.setExceptionParameters(
+                exc_idx,
+                p1,
+                p2,
+                0.0 * unit.elementary_charge**2,
+                sig,
+                eps,
+            )
+            nb_force.addExceptionParameterOffset(
+                lambda_name,
+                exc_idx,
+                charge_prod,
+                0.0 * unit.nanometer,
+                0.0 * unit.kilojoule_per_mole,
+            )
+
+    # 为原本走标准 NB 的 L-L 对补全显式 exception，避免粒子电荷缩放把内部库仑也带着变掉。
+    lig_list = sorted(ligand_set)
+    for offset_i, p1 in enumerate(lig_list):
+        q1, sig1, eps1 = ligand_params[p1]
+        q1_val = q1.value_in_unit(unit.elementary_charge)
+        sig1_val = sig1.value_in_unit(unit.nanometer)
+        eps1_val = eps1.value_in_unit(unit.kilojoule_per_mole)
+        for p2 in lig_list[offset_i + 1:]:
+            key = (p1, p2)
+            if key in frozen_ll_pairs:
+                continue
+            q2, sig2, eps2 = ligand_params[p2]
+            q2_val = q2.value_in_unit(unit.elementary_charge)
+            sig2_val = sig2.value_in_unit(unit.nanometer)
+            eps2_val = eps2.value_in_unit(unit.kilojoule_per_mole)
+            nb_force.addException(
+                p1,
+                p2,
+                (q1_val * q2_val) * unit.elementary_charge**2,
+                0.5 * (sig1_val + sig2_val) * unit.nanometer,
+                math.sqrt(max(eps1_val * eps2_val, 0.0)) * unit.kilojoule_per_mole,
+                True,
+            )
+    return {"mode": "ligand_only_offset", "ion_index": None, "n_offsets": len(ligand_set)}
 
 def _create_pure_vdw_softcore_force(
     nb_force: openmm.NonbondedForce,
@@ -193,8 +589,8 @@ def _create_pure_vdw_softcore_force(
     m_lj = softcore_params.m_lj
     expr = (
         f"{lam_v_str} * 4 * sqrt(epsilon1*epsilon2) * ("
-        f"(sigma12^12 / (r^6 + {alpha_lj}*(1.0-{lam_v_str}+1e-9)^{m_lj} + 1e-6)^2) - "
-        f"(sigma12^6 / (r^6 + {alpha_lj}*(1.0-{lam_v_str}+1e-9)^{m_lj} + 1e-6))"
+        f"(sigma12^12 / (r^6 + {alpha_lj}*(1.0-{lam_v_str}+1e-9)^{m_lj} + 1e-4)^2) - "
+        f"(sigma12^6 / (r^6 + {alpha_lj}*(1.0-{lam_v_str}+1e-9)^{m_lj} + 1e-4))"
         f");"
         f"sigma12=0.5*(sigma1+sigma2)"
     )
@@ -300,17 +696,8 @@ def _create_softcore_force(
     lam_c_str = f"{lam_coul:.8f}"
     lam_v_str = f"{lam_vdw:.8f}"
     
-    # 软核分母安全保护 (1-λ) 项，防止 λ→1 时 α*(1-λ)^m 归零导致 r→0 奇点
-    safe_1mlam_v = max(1.0 - lam_vdw, 0.01)
-    safe_1mlam_v_str = f"{safe_1mlam_v:.8f}"
-    
     # 调用工厂生成完整软核表达式 (含 Coulomb + VdW)
     expr, _ = AlchemicalPotentialFactory.build("softcore", softcore_params, lam_c_str, lam_v_str)
-    
-    # 🔧 替换表达式中的 (1-λ) 软核项为安全常数 (OpenMM 编译期会自动折叠常数运算)
-    import re
-    expr = re.sub(r'\(1\.0\s*-\s*' + re.escape(lam_v_str) + r'(?:\s*\+\s*1e-9)?\)', safe_1mlam_v_str, expr)
-    expr = re.sub(r'\(1\s*-\s*' + re.escape(lam_v_str) + r'(?:\s*\+\s*1e-9)?\)', safe_1mlam_v_str, expr)
     
     sc_force = openmm.CustomNonbondedForce(expr)
     for p in ["q", "sigma", "epsilon"]:
@@ -503,6 +890,7 @@ def diagnose_softcore_cv_values(
     lambdas_coul: List[float],
     lambdas_vdw: List[float],
     prefix: str = "",
+    sampler: "IBSSampler" = None,
 ):
     """打印当前窗口所有软核 CV / Boresch CV 的原始数值，帮助定位异常背景。"""
     print(f"\n🔍 [{prefix}] 软核 CV 数值诊断:")
@@ -521,22 +909,43 @@ def diagnose_softcore_cv_values(
 
     print(f"  e_base(Group2+3)={e_base:.3f} kJ/mol | e_bias(Group1)={e_bias:.3f} kJ/mol")
 
-    try:
-        cv_vals = ibs_wrapper.get_force().getCollectiveVariableValues(context)
-    except Exception as e:
-        print(f"  CV 读取失败: {e}")
-        return
+    sampled_interactions = None
+    if sampler is not None:
+        try:
+            sampled_interactions = sampler.get_raw_interaction_energies()
+        except Exception as e:
+            print(f"  CV 探针读取失败: {e}")
+            return
 
+    interaction_values = []
     for k, (lc, lv) in enumerate(zip(lambdas_coul, lambdas_vdw)):
-        idx_int = 2 * k
-        idx_rest = 2 * k + 1
-        e_int = cv_vals[idx_int] if idx_int < len(cv_vals) else float("nan")
-        e_rest = cv_vals[idx_rest] if idx_rest < len(cv_vals) else float("nan")
+        if sampler is not None:
+            e_int = sampled_interactions[k] if k < len(sampled_interactions) else float("nan")
+        else:
+            try:
+                cv_vals = ibs_wrapper.get_force().getCollectiveVariableValues(context)
+            except Exception as e:
+                print(f"  CV 读取失败: {e}")
+                return
+            idx_int = 2 * k
+            e_int = cv_vals[idx_int] if idx_int < len(cv_vals) else float("nan")
+        e_rest = 0.0
+        interaction_values.append(float(e_int))
         e_tot = e_base + e_int + e_rest if np.isfinite(e_base) else float("nan")
         print(
             f"  state {k:>2d} | lam_c={lc:7.4f} lam_v={lv:7.4f} | "
             f"e_int={e_int:14.3f} | e_rest={e_rest:10.3f} | e_total={e_tot:14.3f}"
         )
+
+    interaction_values = np.asarray(interaction_values, dtype=float)
+    finite = interaction_values[np.isfinite(interaction_values)]
+    if finite.size >= 2:
+        adjacent = np.abs(np.diff(finite))
+        max_adjacent = float(np.max(adjacent))
+        total_span = float(np.max(finite) - np.min(finite))
+        print(f"  ΔU诊断: 窗口跨度={total_span:.1f} kJ/mol | 最大相邻ΔU={max_adjacent:.1f} kJ/mol")
+        if max_adjacent > 50.0:
+            print("  ⚠️ 相邻 λ 能量差远超 50 kJ/mol，IBS 权重很可能塌缩；建议显著增加该阶段 λ 状态数。")
 
 def build_ibs_dual_system(
     system: openmm.System,
@@ -566,6 +975,16 @@ def build_ibs_dual_system(
     perturbed_set = set(perturbed_indices)
     env_indices = [i for i in range(num_atoms) if i not in perturbed_set]
     softcore_params = _normalize_softcore_params(softcore_params, len(perturbed_indices))
+
+    lambda_coul_arr = np.asarray(lambdas_coul, dtype=float)
+    if np.any(np.abs(lambda_coul_arr) > 1e-8):
+        raise RuntimeError(
+            "IBS/OpenMM CustomNonbondedForce 路径不能用于非零 λ_coul。"
+            "CustomNonbondedForce 不支持 PME，若把配体-环境 Coulomb 放进 IBS CV，"
+            "静电会被截断成 cutoff 相互作用，导致物理 Hamiltonian 和 MBAR 均不可信。"
+            "请将 Coulomb 去电荷阶段改为保留 PME 的 NonbondedForce/ParameterOffset 或独立传统窗口；"
+            "当前 IBS 路径仅允许 λ_coul=0 的 VDW 短程阶段。"
+        )
 
     # ---------- 1. 提取 NonbondedForce ----------
     nb_forces = [f for f in new_sys.getForces() if isinstance(f, openmm.NonbondedForce)]
@@ -602,33 +1021,10 @@ def build_ibs_dual_system(
     lig_net_charge = round(lig_net_charge)
 
     if abs(lig_net_charge) > 0.01:
-        print(f"  ⚡ 检测到带电配体 (Net Charge: {lig_net_charge:+d})，启动静态反离子中和...")
-        target_ion_charge = -1.0 if lig_net_charge > 0 else 1.0
-        pos_nm = np.array([p.value_in_unit(unit.nanometer) if hasattr(p, 'value_in_unit') else p for p in reference_positions]) if reference_positions is not None else None
-        
-        best_ion_idx = None
-        if pos_nm is not None:
-            heavy_solute_indices = [a.index for a in topology.atoms() if a.residue.name not in ['HOH', 'WAT', 'SOL', 'CL', 'NA'] and a.element.symbol != 'H']
-            solute_com = np.mean(pos_nm[heavy_solute_indices], axis=0) if heavy_solute_indices else np.mean(pos_nm, axis=0)
-            max_dist = -1.0
-            for atom in topology.atoms():
-                if atom.residue.name.upper() in ['CL', 'CLA', 'NA', 'SOD', 'K', 'POT', 'MG']:
-                    idx = atom.index
-                    q_ion, _, _ = all_params[idx]
-                    if abs(q_ion.value_in_unit(unit.elementary_charge) - target_ion_charge) < 0.1:
-                        dist = np.linalg.norm(pos_nm[idx] - solute_com)
-                        if dist > max_dist:
-                            max_dist = dist
-                            best_ion_idx = idx
-        
-        if best_ion_idx is not None:
-            ion_q, ion_sig, ion_eps = all_params[best_ion_idx]
-            new_ion_q = (ion_q.value_in_unit(unit.elementary_charge) - lig_net_charge) * unit.elementary_charge
-            # 直接修改主 NB 中的反离子电荷 (静态，不依赖 λ)
-            nb.setParticleParameters(best_ion_idx, new_ion_q, ion_sig, ion_eps)
-            print(f"  🎯 静态中和: 反离子 {best_ion_idx} 电荷调整为 {new_ion_q.value_in_unit(unit.elementary_charge):.2f} e (PME 严格中性)")
-        else:
-            print(f"  ⚠️ 未找到合适反离子，OpenMM PME 将使用均匀背景电荷中和系统。")
+        raise RuntimeError(
+            f"检测到带净电配体 ({lig_net_charge:+d} e)。IBS 的 VDW 阶段不再静态改写反离子电荷；"
+            "请先用保留 PME 的去电荷阶段处理净电荷，或显式实现经过验证的离子炼金方案。"
+        )
 
     # ---------- 3. 🔑 永久关闭主 NB 力中的配体相互作用 (确保 base 严格 λ 无关) ----------
     for idx in perturbed_set:
@@ -652,11 +1048,11 @@ def build_ibs_dual_system(
     if ll_14_f: new_sys.addForce(ll_14_f)
 
     # ---------- 5. 物理 Boresch 限制力 (Group 3) ----------
-    if restraint_params and "receptor_indices" in restraint_params:
+    if _has_valid_boresch_restraint(restraint_params):
         rest_f_phys = LambdaDependentBoreschForce(
             rec_idx=restraint_params["receptor_indices"], lig_idx=restraint_params["ligand_indices"],
             eq=restraint_params["equilibrium_values"], fc=restraint_params["force_constants"],
-            lam_name="lambda_boresch_scale", fixed_lam=None, sign=1.0
+            lam_name="lambda_boresch_scale", fixed_lam=None, sign=1.0, use_pbc=True
         )
         rest_f_phys.setForceGroup(3)
         new_sys.addForce(rest_f_phys)
@@ -678,7 +1074,7 @@ def build_ibs_dual_system(
     wca_force.setForceGroup(4)
     new_sys.addForce(wca_force)
 
-    if reference_positions is not None and perturbed_indices:
+    if reference_positions is not None and perturbed_indices and not _has_valid_boresch_restraint(restraint_params):
         ref_com = _compute_reference_com(reference_positions, new_sys, perturbed_indices)
         # CustomCentroidBondForce 在部分 OpenMM 版本中不支持 periodicdistance()；
         # 这里退回兼容性更好的显式欧氏距离表达式，优先保证 Context 可创建。
@@ -699,23 +1095,61 @@ def build_ibs_dual_system(
             com_force.setForceGroup(5)
             new_sys.addForce(com_force)
         except Exception:
-            pass # 降级处理省略
+            logger.warning("COM 限制力构建失败，配体可能逃逸", exc_info=True)
+    elif _has_valid_boresch_restraint(restraint_params):
+        print("  ℹ️ 检测到有效 Boresch 锚定，跳过 Group 5 COM 限制力以避免双重定位约束冲突。")
 
-    # ---------- 7. IBS 偏置力与完整软核 CV (Group 1) 🔑 核心修复 ----------
+    # ---------- 7. IBS 偏置力与纯 VDW 软核 CV (Group 1) ----------
     ibs_wrapper = IBSBiasForce(len(lambdas_coul), temperature, prefix=prefix)
     original_params_fresh = [original_nb.getParticleParameters(i) for i in range(num_atoms)]
+
+    cv_template = _create_softcore_force(
+        nb,
+        perturbed_indices,
+        env_indices,
+        lam_coul=0.0,
+        lam_vdw=0.0,
+        softcore_params=softcore_params,
+        reference_exclusions=softcore_excl,
+        particle_params_override=original_params_fresh,
+        num_particles=num_atoms,
+    )
+    legacy_softcore_signature = "+ 1e-4)^2"
+    if legacy_softcore_signature in cv_template.getEnergyFunction():
+        print("  ⚠️ [IBS CV] 检测到旧版 VDW softcore 表达式签名；请检查 CV 构造路径。")
+    template_cutoff = cv_template.getCutoffDistance()
+    template_switch = cv_template.getSwitchingDistance()
+    template_method = cv_template.getNonbondedMethod()
+    template_excl = {
+        tuple(sorted(map(int, cv_template.getExclusionParticles(i))))
+        for i in range(cv_template.getNumExclusions())
+    }
     
-    for k, (lc, lv) in enumerate(zip(lambdas_coul, lambdas_vdw)):
-        # 🔑 修复：直接传入浮点数值，硬编码至 CV 表达式，彻底解除全局参数绑定
-        # CV 现在包含了完整的配体-环境 静电 + VdW 软核相互作用
+    for k, (_lc, lv) in enumerate(zip(lambdas_coul, lambdas_vdw)):
+        # IBS/OpenMM 只允许处理短程 VDW CV；Coulomb 已禁止进入 CustomNonbondedForce，
+        # 避免把 PME 静电截断为 cutoff 相互作用。
         int_f_cv = _create_softcore_force(
-            nb, perturbed_indices, env_indices,
-            lam_coul=float(lc), lam_vdw=float(lv),
+            nb,
+            perturbed_indices,
+            env_indices,
+            lam_coul=0.0,
+            lam_vdw=float(lv),
             softcore_params=softcore_params,
             reference_exclusions=softcore_excl,
             particle_params_override=original_params_fresh,
-            num_particles=num_atoms
+            num_particles=num_atoms,
         )
+        int_f_cv.setCutoffDistance(template_cutoff)
+        int_f_cv.setSwitchingDistance(template_switch)
+        int_f_cv.setNonbondedMethod(template_method)
+        int_f_cv.setUseLongRangeCorrection(False)
+        int_f_cv.setUseSwitchingFunction(True)
+        current_excl = {
+            tuple(sorted(map(int, int_f_cv.getExclusionParticles(i))))
+            for i in range(int_f_cv.getNumExclusions())
+        }
+        if current_excl != template_excl:
+            raise RuntimeError(f"CV {k} 排除表不一致，将破坏 VDW-IBS 邻居表复用条件。")
         ibs_wrapper.addCollectiveVariable(f"cv_{k}_int", int_f_cv)
         
         # Boresch CV 保持零力（物理限制已在 Group 3）
@@ -741,6 +1175,7 @@ class IBSBiasForce:
         self.n_states = n_states
         self.prefix = prefix
         self._cv_keeper = []
+        self._int_cv_force_xmls = []
         if isinstance(temperature, float):
             temperature = temperature * openmm.unit.kelvin
         kt = (unit.MOLAR_GAS_CONSTANT_R * temperature).value_in_unit(openmm.unit.kilojoule_per_mole)
@@ -770,9 +1205,9 @@ class IBSBiasForce:
         for k in range(1, n_states):
             # 差分项: (cv_k_int + cv_k_rest - f_k) - (cv_0_int + cv_0_rest - f_0)
             diff_expr = f"(cv_{k}_int + cv_{k}_rest - {prefix}_f_{k}) - (cv_0_int + cv_0_rest - {prefix}_f_0)"
-            # 限制指数参数范围 [-50, 50] 防止 exp 溢出/下溢 (比之前的 500 更严格，更安全)
-            safe_diff = f"max(-50.0, min(50.0, -beta * ({diff_expr})))"
-            terms.append(f"exp({safe_diff})")
+            # 使用平滑饱和替代 max/min 硬截断，避免偏置力在边界处发生不可导突变。
+            smooth_diff = f"(80.0*tanh(((-beta * ({diff_expr})))/80.0))"
+            terms.append(f"exp({smooth_diff})")
         
         # 总和: 1 + sum(exp(...))
         sum_term = "1.0 + " + " + ".join(terms) if terms else "1.0"
@@ -791,6 +1226,8 @@ class IBSBiasForce:
         self.force.setForceGroup(1)
     def addCollectiveVariable(self, name: str, cv_force: openmm.Force) -> int:
         self._cv_keeper.append(cv_force)
+        if name.endswith("_int"):
+            self._int_cv_force_xmls.append(openmm.XmlSerializer.serialize(cv_force))
         return self.force.addCollectiveVariable(name, cv_force)
 
     def get_force(self) -> openmm.CustomCVForce:
@@ -841,6 +1278,52 @@ class IBSSampler:
         
         # 🔑 新增：能量偏移缓存
         self.e_offset = 0.0
+        self._probe_context = None
+        self._probe_integrator = None
+        self._probe_groups = []
+        if self.ibs_wrapper is not None and getattr(self.ibs_wrapper, "_int_cv_force_xmls", None):
+            self._build_probe_context()
+
+    def _build_probe_context(self):
+        main_system = self.context.getSystem()
+        probe_sys = openmm.System()
+        for i in range(main_system.getNumParticles()):
+            probe_sys.addParticle(main_system.getParticleMass(i))
+        try:
+            probe_sys.setDefaultPeriodicBoxVectors(*main_system.getDefaultPeriodicBoxVectors())
+        except Exception:
+            pass
+
+        self._probe_groups = []
+        for idx, force_xml in enumerate(self.ibs_wrapper._int_cv_force_xmls):
+            force = openmm.XmlSerializer.deserialize(force_xml)
+            gid = 16 + idx
+            force.setForceGroup(gid)
+            probe_sys.addForce(force)
+            self._probe_groups.append(gid)
+
+        self._probe_integrator = openmm.VerletIntegrator(0.001 * unit.picoseconds)
+        self._probe_context = openmm.Context(probe_sys, self._probe_integrator, self.context.getPlatform())
+
+    def _collect_interaction_energies(self) -> np.ndarray:
+        if self._probe_context is None or not self._probe_groups:
+            return np.zeros(self.n_states, dtype=float)
+
+        state_main = self.context.getState(getPositions=True)
+        self._probe_context.setPositions(state_main.getPositions())
+        try:
+            self._probe_context.setPeriodicBoxVectors(*self.context.getState().getPeriodicBoxVectors())
+        except Exception:
+            pass
+
+        interaction_energies = np.zeros(self.n_states, dtype=float)
+        for k, gid in enumerate(self._probe_groups[:self.n_states]):
+            state = self._probe_context.getState(getEnergy=True, groups={gid})
+            interaction_energies[k] = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+        return interaction_energies
+
+    def get_raw_interaction_energies(self) -> np.ndarray:
+        return self._collect_interaction_energies().copy()
 
     def collect_energies(self) -> np.ndarray:
         energies = np.zeros(self.n_states)
@@ -850,18 +1333,18 @@ class IBSSampler:
             e_base = state_base.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
         except Exception:
             e_base = 0.0
-        self.base_energy_history.append(float(e_base))
         
         if self.ibs_wrapper is None:
             return np.full(self.n_states, np.nan)
             
         try:
-            cv_vals = self.ibs_wrapper.get_force().getCollectiveVariableValues(self.context)
-            interaction_energies = np.zeros(self.n_states)
-            for k in range(self.n_states):
-                idx_int = 2 * k
-                e_int = cv_vals[idx_int] if idx_int < len(cv_vals) else 0.0
-                interaction_energies[k] = e_int
+            try:
+                state_bias = self.context.getState(getEnergy=True, groups={1})
+                e_bias = state_bias.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+            except Exception:
+                e_bias = np.nan
+
+            interaction_energies = self._collect_interaction_energies()
                 
             # 相对偏移防溢出 (以 State 0 为参考)
             if self.n_states > 0 and np.isfinite(interaction_energies[0]):
@@ -871,6 +1354,8 @@ class IBSSampler:
             if not np.any(np.isnan(energies)):
                 self.energy_buffer.append(energies)
                 self.energy_history.append(interaction_energies.copy())
+                self.base_energy_history.append(float(e_base))
+                self.bias_history.append(float(e_bias))
         except Exception as e:
             print(f"  ⚠️ CV 探针能量提取失败: {e}")
             energies[:] = np.nan
@@ -925,11 +1410,28 @@ class IBSSampler:
         target_p = 1.0 / K
         log_grad = np.log(self.ema_mean_p + 1e-30) - np.log(target_p)
         log_grad = np.clip(log_grad, -2.0, 2.0)
+
+        if K > 2 and np.std(mean_p_batch[1:]) < 1e-4 and mean_p_batch[0] > 3.0 * target_p:
+            mean_u = np.mean(u_mk, axis=0)
+            adjacent_span = np.abs(np.diff(mean_u))
+            max_adjacent_span = float(np.max(adjacent_span)) if adjacent_span.size else 0.0
+            total_span = float(np.max(mean_u) - np.min(mean_u))
+            print(
+                "  ⚠️ IBS 权重覆盖疑似坍缩：state 0 占据显著偏高，其余状态概率几乎一致。"
+                " 这通常意味着偏置过陡、窗口能量饱和，或体系仍未充分松弛。"
+            )
+            print(
+                f"     → 当前窗口平均 ΔU 跨度={total_span:.1f} kJ/mol，"
+                f"最大相邻 ΔU={max_adjacent_span:.1f} kJ/mol；"
+                "若远大于 50 kJ/mol，请增加该阶段 λ 状态数或缩小窗口。"
+            )
         
         t = len(self.f_history) + 1
         eta_sgd = 1.0 / (1.0 + t / 100.0)
         
         f_new = f_old - eta_sgd * self.kt * log_grad
+        # 去除任意零点漂移，避免 f_k 仅因规范选择而表现为整体阶跃平移。
+        f_new = f_new - np.mean(f_new)
         
         # 约束防止发散
         f_new = np.clip(f_new, -10000, 10000)
@@ -943,16 +1445,17 @@ class IBSSampler:
         return f_new
 # ================= ibs_engine.py -> IBSSampler 类 =================
     def save_ibs_state(self, filepath: str):
-        """序列化 IBS 核心状态 (f_k 权重与 SGD 步数)"""
-        import json
+        """同步保存 IBS 状态，使用原子替换避免损坏。"""
         f_current = [self.context.getParameter(f"{self.prefix}_f_{k}") for k in range(self.n_states)]
         state = {
+            "n_states": int(self.n_states),
+            "prefix": self.prefix,
             "f_k": f_current,
             "t": len(self.f_history),
-            "e_offset": self.e_offset
+            "e_offset": self.e_offset,
+            "status": "running",
         }
-        with open(filepath, "w") as f:
-            json.dump(state, f, indent=2)
+        _atomic_write_json(filepath, state)
 
     def load_ibs_state(self, filepath: str) -> bool:
         """反序列化并注入 IBS 状态，恢复历史记忆"""
@@ -964,6 +1467,21 @@ class IBSSampler:
                 state = json.load(f)
             f_k = state["f_k"]
             t = state["t"]
+            if state.get("n_states") != self.n_states:
+                print(
+                    f"  ⚠️ IBS 状态与当前窗口不兼容 "
+                    f"(cache n_states={state.get('n_states')}, current={self.n_states})，忽略旧状态"
+                )
+                return False
+            if state.get("prefix") not in (None, self.prefix):
+                print(
+                    f"  ⚠️ IBS 状态 prefix 不兼容 "
+                    f"(cache={state.get('prefix')}, current={self.prefix})，忽略旧状态"
+                )
+                return False
+            if len(f_k) != self.n_states or not np.all(np.isfinite(np.asarray(f_k, dtype=float))):
+                print("  ⚠️ IBS 状态 f_k 无效，忽略旧状态")
+                return False
             self.e_offset = state.get("e_offset", 0.0)
             
             # 注入 Context
@@ -1016,6 +1534,28 @@ class IBSWindowManagerDualLambda:
 
         _temp_q = temperature if hasattr(temperature, 'value_in_unit') else temperature * unit.kelvin
         self.kt = (unit.MOLAR_GAS_CONSTANT_R * _temp_q).value_in_unit(unit.kilojoule_per_mole)
+
+    def _enqueue_window_snapshot(self, window_idx: int, stage_type: str, sampler) -> None:
+        """同步原子刷盘能量快照。"""
+        e_arr = np.array(sampler.energy_history, dtype=np.float64, copy=True) if sampler.energy_history else np.zeros((0, 0), dtype=np.float64)
+        e_save = e_arr.T if e_arr.size > 0 else np.zeros((0, 0), dtype=np.float64)
+        bias = np.array(sampler.bias_history, dtype=np.float64, copy=True) if sampler.bias_history else np.zeros((0,), dtype=np.float64)
+        base = np.array(sampler.base_energy_history, dtype=np.float64, copy=True) if sampler.base_energy_history else np.zeros((0,), dtype=np.float64)
+
+        _atomic_save_npy(
+            os.path.join(self.output_dir, f"dual_window_{window_idx}_{stage_type}_energies.npy"),
+            e_save,
+        )
+        if bias.size > 0:
+            _atomic_save_npy(
+                os.path.join(self.output_dir, f"dual_window_{window_idx}_{stage_type}_bias.npy"),
+                bias,
+            )
+        if base.size > 0:
+            _atomic_save_npy(
+                os.path.join(self.output_dir, f"dual_window_{window_idx}_{stage_type}_base.npy"),
+                base,
+            )
 
     def run_all_windows(
         self,
@@ -1090,7 +1630,7 @@ class IBSWindowManagerDualLambda:
             print(f"  ✓ 最小化完成")
 
             # 几何检查
-            if self.boresch and "receptor_indices" in self.boresch:
+            if _has_valid_boresch_restraint(self.boresch):
                 ok, r0_chk, thA_chk, thB_chk = _check_boresch_geometry_safe(sim.context, self.boresch)
                 if not ok:
                     raise RuntimeError(
@@ -1099,13 +1639,14 @@ class IBSWindowManagerDualLambda:
                     )
                 print(f"  ✅ Boresch 几何检查通过：r0={r0_chk*10:.2f}Å，θA={thA_chk:.1f}°，θB={thB_chk:.1f}°")
 
+            pre_test_breakdown = None
             if debug_mode:
                 diagnose_force_groups_detailed(sim.context, win_sys, prefix=f"窗口{window_idx}_最小化后")
-                diagnose_force_breakdown(sim.context, win_sys, prefix=f"窗口{window_idx}_最小化后")
+                pre_test_breakdown = diagnose_force_breakdown(sim.context, win_sys, prefix=f"窗口{window_idx}_最小化后")
 
             # ---------- 测试步进 ----------
             print(f"\n[阶段2] 测试性步进 (Boresch 缩放至 1%)...")
-            if self.boresch and "receptor_indices" in self.boresch:
+            if _has_valid_boresch_restraint(self.boresch):
                 # PBC 跨盒修复 (保留原逻辑)
                 state_chk = sim.context.getState(getPositions=True)
                 pos_chk = state_chk.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
@@ -1153,25 +1694,41 @@ class IBSWindowManagerDualLambda:
 
             sim.integrator.setStepSize(original_dt)
             print(f"  ✅ 测试步进通过，恢复步长 {original_dt.value_in_unit(unit.picoseconds):.3f} ps")
+            post_test_breakdown = None
             if debug_mode:
-                diagnose_force_breakdown(sim.context, win_sys, prefix=f"窗口{window_idx}_测试步进后")
+                post_test_breakdown = diagnose_force_breakdown(sim.context, win_sys, prefix=f"窗口{window_idx}_测试步进后")
+
+            deadlock_msg = _detect_constraint_deadlock(
+                pre_test_breakdown,
+                post_test_breakdown,
+                win_sys.getNumConstraints(),
+            )
+            if deadlock_msg is not None:
+                print(f"  🚨 [约束死锁预警] {deadlock_msg}")
+                print("  🧯 自动切换到 1.0 fs 保守步长，并执行额外最小化/松弛以避免生产阶段首步崩溃...")
+                original_dt = 0.001 * unit.picoseconds
+                sim.integrator.setStepSize(original_dt)
+                sim.minimizeEnergy(maxIterations=5000, tolerance=10.0)
+                for _ in range(10):
+                    sim.step(200)
+                if debug_mode:
+                    diagnose_force_breakdown(sim.context, win_sys, prefix=f"窗口{window_idx}_死锁缓解后")
 
             # ---------- Boresch 安全爬坡 ----------
             # ================================================================
             # Boresch 安全爬坡：自定义阶梯，逐个恢复力强度
             # ================================================================
-            if self.boresch and "receptor_indices" in self.boresch:
+            if _has_valid_boresch_restraint(self.boresch):
                 print(f"\n[阶段3] Boresch 安全爬坡（自定义阶梯）...")
                 
-                # 自定义阶梯序列：从 1% 逐步恢复到 100%
-                custom_scales = [0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-                n_steps_per_level = 500          # 每个台阶松弛的步数
+                # 自定义阶梯序列：低强度区采用更细分辨率，避免在高内应力底座上一步踩空。
+                custom_scales = [0.01, 0.02, 0.03, 0.05, 0.08, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.0]
                 dt_ramp = 0.001                  # 爬坡期间极小步长 (ps)
                 
                 # 保存原始步长，并设置为爬坡步长
                 original_dt = sim.integrator.getStepSize()
                 sim.integrator.setStepSize(dt_ramp * unit.picoseconds)
-                print(f"  → 爬坡使用步长 {dt_ramp} ps，每台阶 {n_steps_per_level} 步")
+                print(f"  → 爬坡使用步长 {dt_ramp} ps，低强度区采用更细台阶")
                 
                 # 确保从当前 scale 开始（例如之前测试步进时设置的 0.01）
                 try:
@@ -1179,6 +1736,7 @@ class IBSWindowManagerDualLambda:
                 except Exception:
                     current_scale = 0.01
                 print(f"  → 起始 Boresch scale = {current_scale:.3f}")
+                prev_energy = sim.context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
                 
                 ramp_success = True
                 for target_scale in custom_scales:
@@ -1187,26 +1745,31 @@ class IBSWindowManagerDualLambda:
                         continue
                     
                     sim.context.setParameter("lambda_boresch_scale", float(target_scale))
+                    n_steps_per_level = 1500 if target_scale <= 0.10 else (1000 if target_scale <= 0.30 else 500)
                     print(f"  🔹 设置 Boresch scale = {target_scale:.2f}，松弛 {n_steps_per_level} 步...", end="", flush=True)
-                    sim.step(n_steps_per_level)
+                    sim.minimizeEnergy(maxIterations=200, tolerance=20.0)
+                    for _ in range(max(1, n_steps_per_level // 100)):
+                        sim.step(100)
                     
                     # 检查能量与受力
                     state = sim.context.getState(getEnergy=True, getForces=True)
                     e = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
                     forces = state.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole/unit.nanometer)
                     max_f = np.max(np.linalg.norm(forces, axis=1))
+                    delta_e = e - prev_energy
                     
-                    if abs(e) > 1e6 or not np.isfinite(e) or max_f > 50000:
+                    if (not np.isfinite(e)) or max_f > 50000 or (abs(delta_e) > 5e5 and max_f > 15000):
                         print(f"\n  🚨 Boresch 爬坡在 scale={target_scale:.2f} 处失败！")
-                        print(f"    当前势能 = {e:.1f} kJ/mol，最大力 = {max_f:.1f} kJ/(mol·nm)")
+                        print(f"    当前势能 = {e:.1f} kJ/mol，ΔE = {delta_e:.1f} kJ/mol，最大力 = {max_f:.1f} kJ/(mol·nm)")
                         if debug_mode:
                             diagnose_force_breakdown(sim.context, win_sys, prefix=f"窗口{window_idx}_Boresch爬坡失败_scale{target_scale:.2f}")
                         ramp_success = False
                         break
                     else:
-                        print(f" 势能 = {e:.2f} kJ/mol，最大力 = {max_f:.2f} kJ/(mol·nm)")
+                        print(f" 势能 = {e:.2f} kJ/mol，ΔE = {delta_e:.2f} kJ/mol，最大力 = {max_f:.2f} kJ/(mol·nm)")
                         # 记录新的当前 scale
                         current_scale = target_scale
+                        prev_energy = e
                 
                 # 恢复原始步长
                 sim.integrator.setStepSize(original_dt)
@@ -1229,7 +1792,10 @@ class IBSWindowManagerDualLambda:
 
             # ---------- 初始化采样器 ----------
             sampler = IBSSampler(sim.context, len(lc_win), self.temperature, self.prefix, ibs_wrapper=ibs_wrap)
-            ibs_state_file = os.path.join(self.checkpoint_dir, f"ibs_state_window_{window_idx}.json")
+            ibs_state_file = os.path.join(
+                self.checkpoint_dir,
+                f"ibs_state_{stage_type}_window_{window_idx}.json",
+            )
             
             # 🔑 核心修复：断点续传状态检测
             is_resumed_ibs = False
@@ -1254,7 +1820,15 @@ class IBSWindowManagerDualLambda:
                 print(f"\n[诊断] 预热后状态检查：")
                 diagnose_force_groups_detailed(sim.context, win_sys, prefix=f"窗口{window_idx}_预热后")
                 diagnose_force_breakdown(sim.context, win_sys, prefix=f"窗口{window_idx}_预热后")
-                diagnose_softcore_cv_values(sim.context, ibs_wrap, lc_win, lv_win, prefix=f"窗口{window_idx}_预热后")
+                diagnose_softcore_cv_values(sim.context, ibs_wrap, lc_win, lv_win, prefix=f"窗口{window_idx}_预热后", sampler=sampler)
+            raw_probe = sampler.get_raw_interaction_energies()
+            if len(raw_probe) >= 2:
+                raw_span = float(np.max(raw_probe) - np.min(raw_probe))
+                if raw_span < 1e-6 and np.max(np.abs(raw_probe)) < 1e-6:
+                    raise RuntimeError(
+                        f"窗口 {window_idx} 的 IBS 软核 CV 全部为 0。"
+                        "这不是窗口重叠问题，而是 CV 构造/读取链路异常；已中止以避免产出全零溶剂腿或失真复合物腿。"
+                    )
 
             # 清空 sampler 的能量缓存
             sampler.energy_buffer = []
@@ -1308,7 +1882,15 @@ class IBSWindowManagerDualLambda:
             if max(f_vals) - min(f_vals) < 1.0:
                 print(f"  ⚠️ 警告: f_k 仍未明显分化，可能需延长预热或检查窗口重叠度。")
             if debug_mode:
-                diagnose_softcore_cv_values(sim.context, ibs_wrap, lc_win, lv_win, prefix=f"窗口{window_idx}_偏置预热后")
+                diagnose_softcore_cv_values(sim.context, ibs_wrap, lc_win, lv_win, prefix=f"窗口{window_idx}_偏置预热后", sampler=sampler)
+            raw_probe = sampler.get_raw_interaction_energies()
+            if len(raw_probe) >= 2:
+                raw_span = float(np.max(raw_probe) - np.min(raw_probe))
+                if raw_span < 1e-6 and np.max(np.abs(raw_probe)) < 1e-6:
+                    raise RuntimeError(
+                        f"窗口 {window_idx} 的 IBS 软核 CV 在偏置预热后仍全部为 0。"
+                        "已阻止进入生产采样，请继续检查 VDW CV 构造或状态注入。"
+                    )
 
             print("\n  🧯 [生产前卸压] 开始...")
             sim.context.setParameter(f"{self.prefix}_bias_scale", 0.0)
@@ -1323,10 +1905,45 @@ class IBSWindowManagerDualLambda:
             forces_relax = state_relax.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole / unit.nanometer)
             fmax_relax = np.max(np.linalg.norm(forces_relax, axis=1))
             print(f"  卸压后 max|F| = {fmax_relax:.1f} kJ/(mol·nm)")
-            if fmax_relax > 3000.0:
-                print("  ⚠️ 力仍偏高，建议延长驰豫或进一步缩短积分步长。")
+            preprod_force_threshold = 7000.0
+            if fmax_relax > preprod_force_threshold:
+                print("  🚨 [安全警报] 卸压后合力依然超标！触发应急深度最小化与局部松弛...")
+                emergency_dt = 0.0005 * unit.picoseconds
+                sim.integrator.setStepSize(emergency_dt)
+                sim.context.setParameter(f"{self.prefix}_bias_scale", 0.0)
+                sim.minimizeEnergy(maxIterations=5000, tolerance=10.0)
+                for _ in range(20):
+                    sim.step(500)
+                for scale in np.linspace(0.05, 1.0, 20):
+                    sim.context.setParameter(f"{self.prefix}_bias_scale", float(scale))
+                    sim.step(500)
+                fmax_relax = current_max_force_from_context(sim.context)
+                state_relax = sim.context.getState(getForces=True, getPositions=True)
+                print(f"  🩺 应急松弛后 max|F| = {fmax_relax:.1f} kJ/(mol·nm)")
+                if fmax_relax > preprod_force_threshold:
+                    if debug_mode:
+                        diagnose_force_groups_detailed(sim.context, win_sys, prefix=f"窗口{window_idx}_生产前拦截")
+                        diagnose_force_breakdown(sim.context, win_sys, prefix=f"窗口{window_idx}_生产前拦截")
+                        diagnose_top_force_atoms(
+                            sim.context,
+                            win_sys,
+                            topology=self.topology,
+                            ligand_indices=self.ligand_indices,
+                            prefix=f"窗口{window_idx}_生产前拦截",
+                        )
+                    raise RuntimeError(
+                        f"窗口 {window_idx} 卸压后最大合力仍为 {fmax_relax:.1f} kJ/(mol·nm)，已阻止进入生产采样。"
+                    )
+                elif fmax_relax > 2500.0:
+                    print(
+                        f"  ⚠️ 卸压后最大合力 {fmax_relax:.1f} kJ/(mol·nm) 偏高但低于生产灾难阈值 "
+                        f"{preprod_force_threshold:.0f}，允许进入生产采样并交由运行时回退监控。"
+                    )
+            else:
+                print("  ✅ 卸压后合力通过阈值检查，允许进入生产采样。")
 
             sim.context.setParameter(f"{self.prefix}_bias_scale", 1.0)
+            sim.integrator.setStepSize(original_dt)
             sampler.energy_buffer = []
             sampler.energy_history = []
             sampler.bias_history = []
@@ -1376,24 +1993,34 @@ class IBSWindowManagerDualLambda:
             # 4. 打印配体和环境原子各自的前 5 个参数
             lig_indices = self.ligand_indices
             num_atoms = win_sys.getNumParticles()
+            cv_param_names = [
+                cv_force.getPerParticleParameterName(i)
+                for i in range(cv_force.getNumPerParticleParameters())
+            ]
 
-            print("\n  配体原子前 5 个参数（电荷, sigma, epsilon）：")
+            def _format_cv_particle(idx: int) -> str:
+                params = cv_force.getParticleParameters(idx)
+                values = []
+                for name, val in zip(cv_param_names, params):
+                    if hasattr(val, "value_in_unit"):
+                        if "charge" in name.lower() or name.lower().startswith("q"):
+                            val = val.value_in_unit(unit.elementary_charge)
+                        elif "sigma" in name.lower() or "r0" in name.lower():
+                            val = val.value_in_unit(unit.nanometer)
+                        else:
+                            val = val.value_in_unit(unit.kilojoule_per_mole)
+                    values.append(f"{name}={float(val):.4f}")
+                return ", ".join(values)
+
+            print(f"\n  配体原子前 5 个参数（{', '.join(cv_param_names)}）：")
             for idx in lig_indices[:5]:
-                q, sig, eps = cv_force.getParticleParameters(idx)
-                q_val = q.value_in_unit(unit.elementary_charge) if hasattr(q, "value_in_unit") else float(q)
-                sig_val = sig.value_in_unit(unit.nanometer) if hasattr(sig, "value_in_unit") else float(sig)
-                eps_val = eps.value_in_unit(unit.kilojoule_per_mole) if hasattr(eps, "value_in_unit") else float(eps)
-                print(f"    atom {idx}: q={q_val:.3f} e, sigma={sig_val:.4f} nm, epsilon={eps_val:.4f} kJ/mol")
+                print(f"    atom {idx}: {_format_cv_particle(idx)}")
 
             # 环境原子前 5 个参数
             env_list = [i for i in range(num_atoms) if i not in set(lig_indices)]
             print("\n  环境原子前 5 个参数：")
             for idx in env_list[:5]:
-                q, sig, eps = cv_force.getParticleParameters(idx)
-                q_val = q.value_in_unit(unit.elementary_charge) if hasattr(q, "value_in_unit") else float(q)
-                sig_val = sig.value_in_unit(unit.nanometer) if hasattr(sig, "value_in_unit") else float(sig)
-                eps_val = eps.value_in_unit(unit.kilojoule_per_mole) if hasattr(eps, "value_in_unit") else float(eps)
-                print(f"    atom {idx}: q={q_val:.3f} e, sigma={sig_val:.4f} nm, epsilon={eps_val:.4f} kJ/mol")
+                print(f"    atom {idx}: {_format_cv_particle(idx)}")
 
             # 开始生产采样循环
             for up in range(n_updates):
@@ -1436,6 +2063,8 @@ class IBSWindowManagerDualLambda:
                     sampler.update_weights()
                     # 🔑 实时落盘 IBS 状态，防止意外中断导致历史遗失
                     sampler.save_ibs_state(ibs_state_file)
+                if (up + 1) % 100 == 0:
+                    self._enqueue_window_snapshot(window_idx, stage_type, sampler)
 
                 if debug_mode and up % 10 == 0:
                     e_total = e_total_n
@@ -1499,6 +2128,7 @@ class IBSWindowManagerDualLambda:
                     if len(sampler.energy_buffer) >= 10:
                         sampler.update_weights()
                         sampler.save_ibs_state(ibs_state_file)
+                    self._enqueue_window_snapshot(window_idx, stage_type, sampler)
                     print(f"    [采样] 补齐余数 {remaining_steps} 步，总步数严格达标 {n_steps_per_window}")
                     if debug_mode:
                         has_nan_energy = not np.isfinite(e_total_n)
@@ -1511,14 +2141,18 @@ class IBSWindowManagerDualLambda:
             # ---------- 保存能量 ----------
             e_arr = np.array(sampler.energy_history) if sampler.energy_history else np.zeros((0, len(lc_win)))
             e_save = e_arr.T if e_arr.size > 0 else np.zeros((len(lc_win), 0))
-            np.save(os.path.join(self.output_dir, f"dual_window_{window_idx}_{stage_type}_energies.npy"), e_save)
+            _atomic_save_npy(os.path.join(self.output_dir, f"dual_window_{window_idx}_{stage_type}_energies.npy"), e_save)
 
             if sampler.bias_history:
-                np.save(os.path.join(self.output_dir, f"dual_window_{window_idx}_{stage_type}_bias.npy"),
-                        np.array(sampler.bias_history))
+                _atomic_save_npy(
+                    os.path.join(self.output_dir, f"dual_window_{window_idx}_{stage_type}_bias.npy"),
+                    np.array(sampler.bias_history),
+                )
             if sampler.base_energy_history:
-                np.save(os.path.join(self.output_dir, f"dual_window_{window_idx}_{stage_type}_base.npy"),
-                        np.array(sampler.base_energy_history))
+                _atomic_save_npy(
+                    os.path.join(self.output_dir, f"dual_window_{window_idx}_{stage_type}_base.npy"),
+                    np.array(sampler.base_energy_history),
+                )
             print(f"  💾 窗口 {window_idx} 完成，能量已保存 ({e_save.shape})")
 
             # 清理
@@ -1590,6 +2224,10 @@ class IBSWindowManagerDualLambda:
         try:
             current_scale = sim.context.getParameter("lambda_boresch_scale")
         except Exception:
+            logger.warning(
+                "读取 lambda_boresch_scale 失败，回退到默认初始值 0.01",
+                exc_info=True,
+            )
             current_scale = 0.01
         n_ramp = 10
         scales = np.linspace(current_scale, final_scale, n_ramp + 1)[1:]
@@ -1634,7 +2272,9 @@ class IBSWindowManagerDualLambda:
                 'u_kn': u_kn[:, :n_frames],  # U_k_int, kJ/mol
                 'bias_energies': bias[:n_frames],
                 'base_energies': base[:n_frames],
-                'lambda_indices': list(range(start, end))
+                'lambda_indices': list(range(start, end)),
+                # 显式记录：局部 MBAR 的第 0 行是“采样分布”而非某个物理 lambda 态。
+                'sampled_distribution_row': 0,
             })
         return results
 
@@ -1710,9 +2350,13 @@ class GlobalMBARAnalyzer:
             # 构建 (K+1, N) 矩阵
             u_mbar = np.vstack([u_sampled_eff, u_kj_shifted])
             
-            # 样本计数：只有第 0 行（采样分布）有 N 个样本
+            # 样本计数：只有第 0 行（采样分布，而非物理 lambda 态）有 N 个样本。
+            sampled_row = int(w.get("sampled_distribution_row", 0))
             n_k_local = np.zeros(len(win_lams) + 1, dtype=np.int32)
-            n_k_local[0] = n_frames
+            if not (0 <= sampled_row < len(n_k_local)):
+                print(f"  ⚠️ 窗口 {w_idx} sampled_distribution_row={sampled_row} 非法，回退为 0")
+                sampled_row = 0
+            n_k_local[sampled_row] = n_frames
             
             # ------------------------------------------------------------------
             # 🔑 修复 3: 列平移稳定性 (Column-wise Shift)
@@ -1724,9 +2368,9 @@ class GlobalMBARAnalyzer:
             # 剔除含 NaN 或 Inf 的列
             valid_mask = np.isfinite(u_mbar_stable).all(axis=0)
             u_mbar_final = u_mbar_stable[:, valid_mask]
-            n_k_local[0] = np.sum(valid_mask) # 更新有效样本数
+            n_k_local[sampled_row] = np.sum(valid_mask) # 更新有效样本数
             
-            if n_k_local[0] < 10:
+            if n_k_local[sampled_row] < 10:
                 continue
 
             if not HAS_PYMBAR:
@@ -1734,8 +2378,13 @@ class GlobalMBARAnalyzer:
             
             try:
                 # 使用混合求解器，提高收敛性
-                mbar = pymbar.MBAR(u_mbar_final, n_k_local, relative_tolerance=1e-7,
-                                   initialize='BAR', solver_protocol='hybr')
+                mbar = pymbar.MBAR(
+                    u_mbar_final,
+                    n_k_local,
+                    relative_tolerance=1e-7,
+                    initialize="BAR",
+                    solver_protocol="default",
+                )
                 
                 res = mbar.compute_free_energy_differences()
                 
@@ -1892,15 +2541,132 @@ def _check_boresch_geometry_safe(context, boresch_params, min_sin_theta=0.1):
 
     return True, r0, np.degrees(thA), np.degrees(thB)
 
+
+def _has_valid_boresch_restraint(params) -> bool:
+    """仅当 Boresch 参数包含完整 3+3 锚点时才认为可注入/可启用。"""
+    if not isinstance(params, dict):
+        return False
+    rec_idx = params.get("receptor_indices") or []
+    lig_idx = params.get("ligand_indices") or []
+    return len(rec_idx) == 3 and len(lig_idx) == 3
+
+
+def current_max_force_from_context(context) -> float:
+    """返回当前上下文的全体系最大合力范数，用于生产前安全拦截。"""
+    state = context.getState(getForces=True)
+    forces = state.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole / unit.nanometer)
+    if forces.size == 0:
+        return 0.0
+    return float(np.max(np.linalg.norm(forces, axis=1)))
+
+
+def diagnose_top_force_atoms(
+    context,
+    system,
+    topology=None,
+    ligand_indices=None,
+    prefix: str = "窗口诊断",
+    top_n: int = 20,
+):
+    """打印最大受力原子及各 force group 贡献，用于定位高力来源。"""
+    from openmm import unit
+    ligand_set = set(int(i) for i in (ligand_indices or []))
+    atoms = list(topology.atoms()) if topology is not None else []
+    water_names = {"HOH", "WAT", "SOL", "TIP3", "TIP3P"}
+    ion_names = {"NA", "SOD", "CL", "CLA", "K", "POT", "MG", "CA"}
+
+    state = context.getState(getForces=True)
+    total_forces = state.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole / unit.nanometer)
+    if total_forces.size == 0:
+        return
+
+    group_forces = {}
+    for gid in sorted({force.getForceGroup() for force in system.getForces()}):
+        try:
+            g_state = context.getState(getForces=True, groups={gid})
+            group_forces[gid] = g_state.getForces(asNumpy=True).value_in_unit(
+                unit.kilojoule_per_mole / unit.nanometer
+            )
+        except Exception:
+            continue
+
+    norms = np.linalg.norm(total_forces, axis=1)
+    order = np.argsort(norms)[::-1][:top_n]
+
+    print(f"\n🔎 [{prefix}] 最大受力原子定位:")
+    print(
+        f"{'rank':<4} | {'atom':<7} | {'residue':<12} | {'role':<7} | "
+        f"{'total':>10} | {'G0':>10} | {'G1':>10} | {'G2':>10} | {'G3':>10} | {'G4':>10}"
+    )
+    print("-" * 105)
+    for rank, idx in enumerate(order, 1):
+        atom_label = str(idx)
+        residue_label = "N/A"
+        role = "env"
+        if idx < len(atoms):
+            atom = atoms[int(idx)]
+            residue = atom.residue
+            atom_label = f"{idx}:{atom.name}"
+            residue_label = f"{residue.name}{residue.index}"
+            res_name = residue.name.upper()
+            if idx in ligand_set:
+                role = "ligand"
+            elif res_name in water_names:
+                role = "water"
+            elif res_name in ion_names:
+                role = "ion"
+        elif idx in ligand_set:
+            role = "ligand"
+
+        def gnorm(gid):
+            arr = group_forces.get(gid)
+            if arr is None or idx >= len(arr):
+                return 0.0
+            return float(np.linalg.norm(arr[int(idx)]))
+
+        print(
+            f"{rank:<4} | {atom_label:<7} | {residue_label:<12} | {role:<7} | "
+            f"{float(norms[int(idx)]):10.1f} | {gnorm(0):10.1f} | {gnorm(1):10.1f} | "
+            f"{gnorm(2):10.1f} | {gnorm(3):10.1f} | {gnorm(4):10.1f}"
+        )
+    print("-" * 105)
+
+
+def _detect_constraint_deadlock(pre_breakdown, post_breakdown, n_constraints: int) -> Optional[str]:
+    """根据测试步进前后 Bond/Angle 核心力异常放大，识别约束-非键死锁。"""
+    if n_constraints < 1000 or not pre_breakdown or not post_breakdown:
+        return None
+    pre_bond = float(pre_breakdown.get("Bond", {}).get("max", 0.0))
+    pre_angle = float(pre_breakdown.get("Angle", {}).get("max", 0.0))
+    post_bond = float(post_breakdown.get("Bond", {}).get("max", 0.0))
+    post_angle = float(post_breakdown.get("Angle", {}).get("max", 0.0))
+
+    bond_exploded = post_bond > max(3000.0, 1.4 * max(pre_bond, 1.0))
+    angle_exploded = post_angle > max(2500.0, 1.4 * max(pre_angle, 1.0))
+    if bond_exploded and angle_exploded:
+        return (
+            f"疑似约束死锁：Bond Max {pre_bond:.1f} -> {post_bond:.1f}, "
+            f"Angle Max {pre_angle:.1f} -> {post_angle:.1f}, constraints={n_constraints}"
+        )
+    return None
+
 def diagnose_force_groups_detailed(context, system, prefix="窗口诊断"):
-    """生产级逐力组受力拆解：精准定位哪个 ForceGroup 导致 NaN/爆炸"""
+    """按唯一 ForceGroup 聚合的受力拆解，避免同组总力被重复打印到每个力对象上。"""
     from openmm import unit
     print(f"\n🔍 [{prefix}] 逐力组受力拆解报告:")
-    print(f"{'ID':<4} | {'Group':<8} | {'Force Type':<28} | {'Max|F| (kJ/mol/nm)':<20} | {'RMS|F|':<12} | {'状态'}")
-    print("-" * 95)
-    for i, force in enumerate(system.getForces()):
+    print(f"{'Group':<8} | {'成员力类型':<52} | {'Max|F| (kJ/mol/nm)':<20} | {'RMS|F|':<12} | {'状态'}")
+    print("-" * 125)
+
+    group_members = {}
+    for force in system.getForces():
         gid = force.getForceGroup()
-        ftype = type(force).__name__
+        group_members.setdefault(gid, []).append(type(force).__name__)
+
+    for gid in sorted(group_members):
+        member_types = group_members[gid]
+        member_summary = ", ".join(member_types[:3])
+        if len(member_types) > 3:
+            member_summary += f", ... x{len(member_types)}"
         try:
             state = context.getState(getForces=True, groups={gid})
             forces = state.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole/openmm.unit.nanometer)
@@ -1910,10 +2676,10 @@ def diagnose_force_groups_detailed(context, system, prefix="窗口诊断"):
             max_f = np.max(norms)
             rms_f = np.sqrt(np.mean(norms**2))
             status = "🚨 爆炸源" if max_f > 10000 else ("⚠️ 偏高" if max_f > 2000 else "✓ 正常")
-            print(f"{i:<4} | Group {gid:<4} | {ftype:<28} | {max_f:<20.2f} | {rms_f:<12.2f} | {status}")
+            print(f"Group {gid:<2} | {member_summary:<52} | {max_f:<20.2f} | {rms_f:<12.2f} | {status}")
         except Exception as e:
-            print(f"{i:<4} | Group {gid:<4} | {ftype:<28} | {'(CV/元力跳过)':<20} | {'N/A':<12} | ℹ️ {str(e)[:25]}")
-    print("-" * 95)
+            print(f"Group {gid:<2} | {member_summary:<52} | {'(CV/元力跳过)':<20} | {'N/A':<12} | ℹ️ {str(e)[:25]}")
+    print("-" * 125)
     n_cons = system.getNumConstraints()
     if n_cons > 0:
         print(f"  🔗 系统含 {n_cons} 个刚性约束 (SHAKE/LINCS)。若上述力组均正常但合力爆炸，根因必为约束死锁或初始键长畸变。")
@@ -2026,20 +2792,24 @@ def diagnose_force_breakdown(main_context, main_system, prefix=""):
     # 读取各组力
     group_map = {10: "Bond", 11: "Angle", 12: "Nonbonded", 13: "Torsion"}
     print(f"\n🔍 [{prefix}] 非侵入式力分解报告：")
+    stats = {}
     for gid, name in group_map.items():
         try:
             fstate = diag_context.getState(getForces=True, groups={gid})
             forces = fstate.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole/unit.nanometer)
             norms = np.linalg.norm(forces, axis=1)
             max_f, avg_f, rms_f = np.max(norms), np.mean(norms), np.sqrt(np.mean(norms**2))
+            stats[name] = {"max": float(max_f), "avg": float(avg_f), "rms": float(rms_f)}
             print(f"  {name:<12} | Max:{max_f:12.2f} | Avg:{avg_f:12.2f} | RMS:{rms_f:12.2f} kJ/(mol·nm)")
         except Exception as e:
+            stats[name] = {"error": str(e)}
             print(f"  {name:<12} | 无法获取: {e}")
 
     # 清理
     del diag_context
     del diag_sys
     gc.collect()
+    return stats
 
 
 # ============================================================================
@@ -2047,6 +2817,19 @@ def diagnose_force_breakdown(main_context, main_system, prefix=""):
 # ============================================================================
 class REMDManager:
     """传统 λ-REMD 引擎：相邻窗口 Metropolis 交换 + 轨迹落盘"""
+    class _ReporterIntegratorView:
+        def __init__(self, step_size):
+            self._step_size = step_size
+
+        def getStepSize(self):
+            return self._step_size
+
+    class _ReporterSimulationView:
+        def __init__(self, topology, current_step: int, step_size):
+            self.topology = topology
+            self.currentStep = int(current_step)
+            self.integrator = REMDManager._ReporterIntegratorView(step_size)
+
     def __init__(
         self,
         system_template: openmm.System,
@@ -2067,6 +2850,10 @@ class REMDManager:
         self.lambdas_coul = np.array(lambdas_coul)
         self.lambdas_vdw = np.array(lambdas_vdw)
         self.n_replicas = len(lambdas_coul)
+        self.is_pme_coulomb_leg = (
+            np.allclose(self.lambdas_vdw, 1.0)
+            and not np.allclose(self.lambdas_coul, self.lambdas_coul[0])
+        )
         self.temperature = temperature * unit.kelvin
         self.kt = (unit.MOLAR_GAS_CONSTANT_R * self.temperature).value_in_unit(unit.kilojoule_per_mole)
         self.beta = 1.0 / self.kt
@@ -2076,36 +2863,70 @@ class REMDManager:
 
         self.contexts = []
         self.integrators = []
+        self._state_to_context = list(range(self.n_replicas))
+        self._context_to_state = list(range(self.n_replicas))
+        self._steps_completed = 0
+        self._is_warmed_up = False
         self._build_replicas(system_template)
+
+    @staticmethod
+    def _try_set_context_parameter(context, name: str, value: float) -> None:
+        try:
+            context.setParameter(name, float(value))
+        except Exception as exc:
+            msg = str(exc)
+            if "invalid parameter name" not in msg:
+                raise
 
     def _build_replicas(self, system_template):
         resolved_platform, props = _build_platform_properties(self.platform_name)
         platform = openmm.Platform.getPlatformByName(resolved_platform)
 
         for i in range(self.n_replicas):
-            sys_xml = openmm.XmlSerializer.serialize(system_template)
-            replica_sys = openmm.XmlSerializer.deserialize(sys_xml)
-            replica_sys.thisown = 1
+            if self.is_pme_coulomb_leg:
+                replica_sys = _prepare_pme_coulomb_leg_system(
+                    system_template,
+                    self.ligand_indices,
+                    lambda_name="lambda_coul",
+                    allow_charged_ligand=True,
+                    topology=self.topology,
+                    positions=self.positions,
+                    box_vectors=self.box_vectors,
+                )
+            else:
+                sys_xml = openmm.XmlSerializer.serialize(system_template)
+                replica_sys = openmm.XmlSerializer.deserialize(sys_xml)
+                replica_sys.thisown = 1
+                nb = [f for f in replica_sys.getForces() if isinstance(f, openmm.NonbondedForce)][0]
+                env_idx = [j for j in range(replica_sys.getNumParticles()) if j not in self.ligand_indices]
+                sc_force = BeutlerSoftcoreBuilder.build(nb, self.ligand_indices, env_idx)
+                sc_force.setForceGroup(1)
+                replica_sys.addForce(sc_force)
 
-            nb = [f for f in replica_sys.getForces() if isinstance(f, openmm.NonbondedForce)][0]
-            env_idx = [j for j in range(replica_sys.getNumParticles()) if j not in self.ligand_indices]
-            sc_force = BeutlerSoftcoreBuilder.build(nb, self.ligand_indices, env_idx)
-            sc_force.setForceGroup(1)
-            replica_sys.addForce(sc_force)
-
-            for idx in self.ligand_indices:
-                nb.setParticleParameters(idx, 0.0, 0.1*unit.nanometer, 0.0)
+                for idx in self.ligand_indices:
+                    nb.setParticleParameters(idx, 0.0, 0.1*unit.nanometer, 0.0)
 
             integ = openmm.LangevinMiddleIntegrator(self.temperature, 1.0/unit.picosecond, 0.002*unit.picosecond)
             ctx = openmm.Context(replica_sys, integ, platform, props)
             ctx.setPositions(self.positions)
-            if self.box_vectors:
+            if self.box_vectors is not None:
                 ctx.setPeriodicBoxVectors(*self.box_vectors)
-            ctx.setParameter("lambda_coul", float(self.lambdas_coul[i]))
-            ctx.setParameter("lambda_vdw", float(self.lambdas_vdw[i]))
+            self._try_set_context_parameter(ctx, "lambda_coul", self.lambdas_coul[i])
+            self._try_set_context_parameter(ctx, "lambda_vdw", self.lambdas_vdw[i])
 
             self.contexts.append(ctx)
             self.integrators.append(integ)
+
+    def _set_context_state(self, context_idx: int, state_idx: int) -> None:
+        ctx = self.contexts[context_idx]
+        self._try_set_context_parameter(ctx, "lambda_coul", self.lambdas_coul[state_idx])
+        self._try_set_context_parameter(ctx, "lambda_vdw", self.lambdas_vdw[state_idx])
+
+    @staticmethod
+    def _crossed_save_boundary(prev_step: int, next_step: int, save_interval: int) -> bool:
+        if save_interval <= 0:
+            return False
+        return (prev_step // save_interval) != (next_step // save_interval)
 
     def run(
         self,
@@ -2115,61 +2936,106 @@ class REMDManager:
         stage_name: str = "complex",
     ):
         n_exchanges = n_steps // exchange_interval
+        remaining_steps = n_steps - n_exchanges * exchange_interval
         traj_files = [os.path.join(self.output_dir, f"{stage_name}_rep{i}.dcd") for i in range(self.n_replicas)]
-        reporters = [app.DCDReporter(f, save_interval, enforcePeriodicBox=False) for f in traj_files]
-
-        print(f"\n🔄 启动传统 REMD | {self.n_replicas} 副本 | {n_steps} 步 | 交换间隔={exchange_interval}")
-
-        for ctx in self.contexts:
-            ctx.getIntegrator().step(5000)
-
+        append_mode = self._steps_completed > 0
+        reporters = [
+            app.DCDReporter(f, save_interval, append=append_mode, enforcePeriodicBox=False)
+            for f in traj_files
+        ]
+        print(f"\n🔄 启动传统 REMD (单卡懒加载极速版) | {self.n_replicas} 副本 | 交换间隔={exchange_interval}")
+        
+        # 预热
+        if not self._is_warmed_up:
+            for ctx in self.contexts:
+                ctx.getIntegrator().step(5000)
+            self._is_warmed_up = True
+            
         exchange_log = []
+        
         for step in range(n_exchanges):
+            # 1. 批量提交步进任务 (GPU 会在底层自动流水线并发，无需 Python 干预)
+            prev_steps = self._steps_completed
             for ctx in self.contexts:
                 ctx.getIntegrator().step(exchange_interval)
-
-            for i, ctx in enumerate(self.contexts):
-                state = ctx.getState(getPositions=True, enforcePeriodicBox=True)
-                reporters[i].report(app.Simulation(self.topology, ctx.getSystem(), ctx.getIntegrator()), state)
-
+            self._steps_completed += exchange_interval
+                
+            # 2. 轨迹落盘
+            if self._crossed_save_boundary(prev_steps, self._steps_completed, save_interval):
+                for state_idx, ctx_idx in enumerate(self._state_to_context):
+                    ctx = self.contexts[ctx_idx]
+                    state = ctx.getState(getPositions=True, enforcePeriodicBox=True)
+                    reporters[state_idx].report(
+                        self._ReporterSimulationView(
+                            self.topology, self._steps_completed, ctx.getIntegrator().getStepSize()
+                        ), state,
+                    )
+                
             accepted = 0
-            for i in range(self.n_replicas - 1):
-                ctx_i, ctx_j = self.contexts[i], self.contexts[i+1]
-                state_i = ctx_i.getState(getEnergy=True, getPositions=True, getVelocities=True)
-                state_j = ctx_j.getState(getEnergy=True, getPositions=True, getVelocities=True)
-
-                U_i_i = state_i.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-                U_j_j = state_j.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-
-                ctx_i.setParameter("lambda_coul", float(self.lambdas_coul[i+1]))
-                ctx_i.setParameter("lambda_vdw", float(self.lambdas_vdw[i+1]))
-                ctx_i.setPositions(state_j.getPositions())
+            
+            # 3. 交换状态映射而非整份坐标/速度，避免接受交换时的大对象搬运
+            for state_i in range(self.n_replicas - 1):
+                state_j = state_i + 1
+                ctx_idx_i = self._state_to_context[state_i]
+                ctx_idx_j = self._state_to_context[state_j]
+                ctx_i = self.contexts[ctx_idx_i]
+                ctx_j = self.contexts[ctx_idx_j]
+                
+                # --- 阶段 A: 仅获取能量 (极快，PCIe 传输量仅几字节，不阻塞 GPU) ---
+                U_i_i = ctx_i.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+                U_j_j = ctx_j.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+                
+                # --- 阶段 B: 计算交叉能量 (通过修改参数，GPU 原地重算) ---
+                self._set_context_state(ctx_idx_i, state_j)
                 U_i_j = ctx_i.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-
-                ctx_j.setParameter("lambda_coul", float(self.lambdas_coul[i]))
-                ctx_j.setParameter("lambda_vdw", float(self.lambdas_vdw[i]))
-                ctx_j.setPositions(state_i.getPositions())
+                
+                self._set_context_state(ctx_idx_j, state_i)
                 U_j_i = ctx_j.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-
-                ctx_i.setParameter("lambda_coul", float(self.lambdas_coul[i]))
-                ctx_i.setParameter("lambda_vdw", float(self.lambdas_vdw[i]))
-                ctx_j.setParameter("lambda_coul", float(self.lambdas_coul[i+1]))
-                ctx_j.setParameter("lambda_vdw", float(self.lambdas_vdw[i+1]))
-
+                
+                # 恢复原始参数
+                self._set_context_state(ctx_idx_i, state_i)
+                self._set_context_state(ctx_idx_j, state_j)
+                
+                # --- 阶段 C: Metropolis 判定 ---
                 delta = self.beta * (U_i_j + U_j_i - U_i_i - U_j_j)
-                if delta < 0 or np.random.rand() < np.exp(-delta):
-                    ctx_i.setPositions(state_j.getPositions())
-                    ctx_i.setVelocities(state_j.getVelocities())
-                    ctx_j.setPositions(state_i.getPositions())
-                    ctx_j.setVelocities(state_i.getVelocities())
+                accept = delta < 0 or np.random.rand() < np.exp(-delta)
+                
+                # --- 阶段 D: 仅交换状态分配，Context 本身保持连续推进 ---
+                if accept:
+                    self._state_to_context[state_i], self._state_to_context[state_j] = (
+                        ctx_idx_j,
+                        ctx_idx_i,
+                    )
+                    self._context_to_state[ctx_idx_i], self._context_to_state[ctx_idx_j] = (
+                        state_j,
+                        state_i,
+                    )
+                    self._set_context_state(ctx_idx_i, state_j)
+                    self._set_context_state(ctx_idx_j, state_i)
                     accepted += 1
-
+                    
             exchange_log.append(accepted / (self.n_replicas - 1))
             if step % 50 == 0:
                 print(f"  [REMD] 交换轮次 {step}/{n_exchanges} | 接受率: {exchange_log[-1]:.2f}")
 
-        for rep in reporters:
-            rep.close()
+        if remaining_steps > 0:
+            prev_steps = self._steps_completed
+            for ctx in self.contexts:
+                ctx.getIntegrator().step(remaining_steps)
+            self._steps_completed += remaining_steps
+            if self._crossed_save_boundary(prev_steps, self._steps_completed, save_interval):
+                for state_idx, ctx_idx in enumerate(self._state_to_context):
+                    ctx = self.contexts[ctx_idx]
+                    state = ctx.getState(getPositions=True, enforcePeriodicBox=True)
+                    reporters[state_idx].report(
+                        self._ReporterSimulationView(
+                            self.topology, self._steps_completed, ctx.getIntegrator().getStepSize()
+                        ),
+                        state,
+                    )
+                
+        # OpenMM 的 DCDReporter 没有公共 close()；对象释放时会完成底层文件收尾。
+        reporters.clear()
         print(f"✅ REMD 完成 | 平均交换接受率: {np.mean(exchange_log):.3f}")
         return traj_files
 
@@ -2191,11 +3057,19 @@ class TraditionalMBARAnalyzer:
         lambdas_coul: List[float],
         lambdas_vdw: List[float],
         platform_name: str = "CPU",
+        topology: app.Topology = None,
+        reference_positions=None,
+        reference_box_vectors=None,
     ) -> np.ndarray:
         import mdtraj as md
-        md_top = md.Topology.from_openmm(system_template)
+        if topology is None:
+            raise ValueError("compute_u_kn 需要 OpenMM topology，不能用 System 构建 mdtraj Topology")
+        md_top = md.Topology.from_openmm(topology)
 
-        traj = md.load(traj_files, top=md_top)
+        traj_list = [md.load(path, top=md_top) for path in traj_files]
+        n_k = np.array([t.n_frames for t in traj_list], dtype=int)
+        traj = md.join(traj_list, check_topology=False)
+        self._last_n_k = n_k
         # ✅ 在其下方紧跟着插入 PBC 解包逻辑：
         # 🔑 核心修复：强制 PBC 分子完整性解包，消除跨盒“假撕裂”导致的能量 Spike
         try:
@@ -2208,46 +3082,147 @@ class TraditionalMBARAnalyzer:
         n_frames = traj.n_frames
         n_states = len(lambdas_coul)
         u_kn = np.zeros((n_states, n_frames))
+        lambdas_coul_arr = np.asarray(lambdas_coul, dtype=float)
+        lambdas_vdw_arr = np.asarray(lambdas_vdw, dtype=float)
+        is_pme_coulomb_leg = (
+            np.allclose(lambdas_vdw_arr, 1.0)
+            and not np.allclose(lambdas_coul_arr, lambdas_coul_arr[0])
+        )
+        ligand_charge_square_sum = 0.0
+        if is_pme_coulomb_leg:
+            nb_force_ref = next((f for f in system_template.getForces() if isinstance(f, openmm.NonbondedForce)), None)
+            if nb_force_ref is None:
+                raise RuntimeError("PME 去电荷路径未找到参考 NonbondedForce，无法估算自能修正。")
+            for idx in ligand_indices:
+                q, _, _ = nb_force_ref.getParticleParameters(int(idx))
+                q_val = q.value_in_unit(unit.elementary_charge)
+                ligand_charge_square_sum += q_val * q_val
+        xyz_all = np.asarray(traj.xyz, dtype=np.float64)
+        box_all = None
+        if traj.unitcell_vectors is not None and len(traj.unitcell_vectors) > 0:
+            box_all = np.asarray(traj.unitcell_vectors, dtype=np.float64)
 
-        platform = openmm.Platform.getPlatformByName(platform_name)
-        eval_sys = openmm.XmlSerializer.deserialize(openmm.XmlSerializer.serialize(system_template))
-        nb = [f for f in eval_sys.getForces() if isinstance(f, openmm.NonbondedForce)][0]
-        env_idx = [i for i in range(eval_sys.getNumParticles()) if i not in ligand_indices]
-        sc = BeutlerSoftcoreBuilder.build(nb, ligand_indices, env_idx)
-        sc.setForceGroup(1)
-        eval_sys.addForce(sc)
-        for idx in ligand_indices:
-            nb.setParticleParameters(idx, 0.0, 0.1*unit.nanometer, 0.0)
+        cpu_count = max(1, os.cpu_count() or 1)
+        chunk_size = max(25, min(250, int(math.ceil(n_frames / max(1, cpu_count * 2)))))
+        n_chunks = max(1, int(math.ceil(n_frames / chunk_size)))
+        n_workers = min(cpu_count, n_chunks)
+        if is_pme_coulomb_leg:
+            prepared_system = _prepare_pme_coulomb_leg_system(
+                system_template,
+                ligand_indices,
+                lambda_name="lambda_coul",
+                allow_charged_ligand=True,
+                topology=topology,
+                positions=reference_positions,
+                box_vectors=reference_box_vectors,
+            )
+            system_xml = openmm.XmlSerializer.serialize(prepared_system)
+            del prepared_system
+        else:
+            eval_sys = openmm.XmlSerializer.deserialize(openmm.XmlSerializer.serialize(system_template))
+            eval_sys.thisown = 1
+            nb = [f for f in eval_sys.getForces() if isinstance(f, openmm.NonbondedForce)][0]
+            env_idx = [i for i in range(eval_sys.getNumParticles()) if i not in ligand_indices]
+            sc = BeutlerSoftcoreBuilder.build(nb, ligand_indices, env_idx)
+            sc.setForceGroup(1)
+            eval_sys.addForce(sc)
+            for idx in ligand_indices:
+                nb.setParticleParameters(idx, 0.0, 0.1 * unit.nanometer, 0.0)
+            system_xml = openmm.XmlSerializer.serialize(eval_sys)
+            del eval_sys
 
-        integ = openmm.VerletIntegrator(0.001)
-        ctx = openmm.Context(eval_sys, integ, platform)
+        print(f"\n📊 开始离线能量重算 | {n_frames} 帧 × {n_states} 态 | workers={n_workers} | chunk_size={chunk_size}")
+        tasks = []
+        for frame_offset in range(0, n_frames, chunk_size):
+            frame_end = min(frame_offset + chunk_size, n_frames)
+            tasks.append(
+                {
+                    "frame_offset": frame_offset,
+                    "xyz": xyz_all[frame_offset:frame_end].copy(),
+                    "box_vectors": None if box_all is None else box_all[frame_offset:frame_end].copy(),
+                    "system_xml": system_xml,
+                    "ligand_indices": list(ligand_indices),
+                    "lambdas_coul": lambdas_coul_arr,
+                    "lambdas_vdw": lambdas_vdw_arr,
+                    "platform_name": platform_name,
+                    "kt": self.kt,
+                    "is_pme_coulomb_leg": is_pme_coulomb_leg,
+                    "ligand_charge_square_sum": ligand_charge_square_sum,
+                }
+            )
 
-        print(f"\n📊 开始离线能量重算 | {n_frames} 帧 × {n_states} 态")
-        for f in range(n_frames):
-            ctx.setPositions(traj.xyz[f] * unit.nanometer)
-            if traj.unitcell_vectors is not None and len(traj.unitcell_vectors) > 0:
-                ctx.setPeriodicBoxVectors(*traj.unitcell_vectors[f] * unit.nanometer)
+        if n_workers == 1:
+            for task in tasks:
+                frame_offset, u_chunk = _compute_u_kn_chunk(task)
+                frame_end = frame_offset + u_chunk.shape[1]
+                u_kn[:, frame_offset:frame_end] = u_chunk
+                print(f"  → 帧 {frame_end}/{n_frames} 完成")
+        else:
+            try:
+                ctx = mp.get_context("spawn")
+                with ctx.Pool(processes=n_workers) as pool:
+                    for frame_offset, u_chunk in pool.imap_unordered(_compute_u_kn_chunk, tasks):
+                        frame_end = frame_offset + u_chunk.shape[1]
+                        u_kn[:, frame_offset:frame_end] = u_chunk
+                        print(f"  → 帧 {frame_end}/{n_frames} 完成")
+            except Exception as exc:
+                print(f"  ⚠️ 多进程重算失败，回退单进程: {exc}")
+                for task in tasks:
+                    frame_offset, u_chunk = _compute_u_kn_chunk(task)
+                    frame_end = frame_offset + u_chunk.shape[1]
+                    u_kn[:, frame_offset:frame_end] = u_chunk
+                    print(f"  → 帧 {frame_end}/{n_frames} 完成")
 
-            for k in range(n_states):
-                ctx.setParameter("lambda_coul", float(lambdas_coul[k]))
-                ctx.setParameter("lambda_vdw", float(lambdas_vdw[k]))
-                e = ctx.getState(getEnergy=True, groups={1}).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-                u_kn[k, f] = e / self.kt
-
-            if f % 100 == 0:
-                print(f"  → 帧 {f}/{n_frames} 完成")
-
-        del ctx, integ, eval_sys
         return u_kn
 
     def solve(self, u_kn: np.ndarray) -> Dict:
+        u_kn = np.asarray(u_kn, dtype=np.float64)
         K, N = u_kn.shape
-        n_k = np.full(K, N, dtype=int)
+        n_k = getattr(self, "_last_n_k", np.full(K, N // K, dtype=int))
+        if len(n_k) != K or int(np.sum(n_k)) != N:
+            raise ValueError(f"MBAR 样本数不匹配: len(n_k)={len(n_k)}, sum(n_k)={np.sum(n_k)}, N={N}")
+        if not np.all(np.isfinite(u_kn)):
+            raise ValueError("u_kn 含 NaN/Inf，无法执行 MBAR")
         if not HAS_PYMBAR:
             raise ImportError("需要 pymbar 包，请安装: pip install pymbar")
-        mbar = pymbar.MBAR(u_kn, n_k, solver_protocol="hybr", verbose=False)
-        res = mbar.compute_free_energy_differences()
 
-        dg = (res["Delta_f"][0, -1] - res["Delta_f"][0, 0]) * self.kt
-        err = res["dDelta_f"][0, -1] * self.kt
-        return {"delta_G": dg, "error": err, "method": "MBAR", "n_frames": N, "n_states": K}
+        # 逐列平移不会改变自由能差，但能显著改善大体系绝对能量下的数值条件。
+        u_kn_stable = u_kn - np.min(u_kn, axis=0, keepdims=True)
+
+        last_exc = None
+        last_mbar = None
+        protocol_plan = (
+            ("default", "MBAR-default"),
+            ("robust", "MBAR-robust"),
+        )
+        for protocol, method_name in protocol_plan:
+            try:
+                last_mbar = pymbar.MBAR(
+                    u_kn_stable,
+                    n_k,
+                    solver_protocol=protocol,
+                    initialize="BAR",
+                    relative_tolerance=1e-6,
+                    verbose=False,
+                )
+                try:
+                    res = last_mbar.compute_free_energy_differences(compute_uncertainty=True)
+                    err = float(res["dDelta_f"][0, -1] * self.kt)
+                except Exception as cov_exc:
+                    print(f"  ⚠️ MBAR 协方差求解失败 ({protocol}): {cov_exc}，回退为仅计算 ΔG 不估计误差")
+                    res = last_mbar.compute_free_energy_differences(compute_uncertainty=False)
+                    err = float("nan")
+
+                dg = float((res["Delta_f"][0, -1] - res["Delta_f"][0, 0]) * self.kt)
+                return {
+                    "delta_G": dg,
+                    "error": err,
+                    "method": method_name,
+                    "n_frames": N,
+                    "n_states": K,
+                }
+            except Exception as exc:
+                last_exc = exc
+                print(f"  ⚠️ MBAR {protocol} 求解失败: {exc}")
+
+        raise RuntimeError(f"MBAR 求解失败，最后错误: {last_exc}")

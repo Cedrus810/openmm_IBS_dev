@@ -14,7 +14,7 @@
   "stage2_n_states": 16,
 
   "boresch": true,
-  "boresch_source": "auto",
+  "boresch_source": "simple",
   "boresch_batch": 0,
   "boresch_select": 1,
 

@@ -32,6 +32,32 @@ def _normalize_variance_weights(std_dev_clipped, max_ratio=0.15):
     # ✅ 修复：Clip 后必须重新归一化，保证 ∑w = 1（等熵长度分布前提）
     return clipped / (np.sum(clipped) + 1e-10)
 
+
+def _sample_group1_energies(context, total_steps, sample_interval=50):
+    """批量推进积分器，保留固定采样间隔，减少 Python/C++ 边界往返。"""
+    if total_steps <= 0:
+        return []
+
+    integrator = context.getIntegrator()
+    energies = []
+    full_batches, remainder = divmod(int(total_steps), int(sample_interval))
+
+    for _ in range(full_batches):
+        integrator.step(sample_interval)
+        state = context.getState(getEnergy=True, groups={1})
+        energies.append(
+            state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+        )
+
+    if remainder:
+        integrator.step(remainder)
+        state = context.getState(getEnergy=True, groups={1})
+        energies.append(
+            state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+        )
+
+    return energies
+
 class ABFEPreOptimizer:
     """ABFE 预采样优化器 - ACES 路径优化版
     【修复 3】绑定 context 生命周期，不再单独保存 system
@@ -174,6 +200,9 @@ class ABFEPreOptimizer:
             print(f"  ℹ️ 设置初始 {active_p}={initial_lam:.2f} 进行预平衡...")
             self.context.getIntegrator().step(25000)
 
+        variance_data = []
+        mean_energy = []
+
         # 主采样循环
         for i, lam in enumerate(self.lambdas):
             try:
@@ -188,20 +217,11 @@ class ABFEPreOptimizer:
             energies = []
             nan_count = 0
 
-            for step in range(n_steps_per_state):
-                self.context.getIntegrator().step(1)
-                if step % 50 == 0:  # ✅ 更频繁采样
-                    # === 【修复 3】只读取 Group 1 (ACES 力) 的能量 ===
-                    state = self.context.getState(getEnergy=True, groups={1})
-                    e = state.getPotentialEnergy().value_in_unit(
-                        unit.kilojoule_per_mole
-                    )
-
-                    if np.isnan(e) or np.isinf(e):
-                        nan_count += 1
-                        e = energies[-1] if energies else 0.0
-
-                    energies.append(e)
+            for e in _sample_group1_energies(self.context, n_steps_per_state, sample_interval=50):
+                if np.isnan(e) or np.isinf(e):
+                    nan_count += 1
+                    e = energies[-1] if energies else 0.0
+                energies.append(e)
 
             if nan_count > len(energies) * 0.5:
                 print(
@@ -457,28 +477,29 @@ class ABFEPreOptimizer:
         # === 【步骤 7】累积分布与插值 ===
         cumulative_density = np.cumsum(density_weight)
         total_density = max(1e-10, cumulative_density[-1])
-        xp = cumulative_density / total_density  # [0, ..., 1] 递增
+        # 构造与 lambda 节点一一对应的单调 CDF：首节点固定为 0，末节点固定为 1。
+        xp = np.concatenate(([0.0], cumulative_density[:-1] / total_density))
+        xp[-1] = min(xp[-1], 1.0)
 
-        # 原始 lambdas 是降序 [1.0, ..., 0.0]
-        original_lambdas = self.lambdas.copy()
+        # 原始 lambdas 是降序 [1.0, ..., 0.0]，长度必须与 xp 严格一致。
+        original_lambdas = np.asarray(self.lambdas.copy(), dtype=float)
+        lambda_xp = original_lambdas
 
         if HAS_SCIPY and len(xp) >= 3:
             # ✅ 使用 PCHIP 保持单调性，无需手动翻转
             # 注意：xp 递增，original_lambdas 递减 → 插值函数自动处理反向映射
-            interp_func = PchipInterpolator(xp, original_lambdas, extrapolate=False)
+            interp_func = PchipInterpolator(xp, lambda_xp, extrapolate=False)
             target_cumulative = np.linspace(0, 1.0, target_n_states)
             optimized_lambdas = interp_func(target_cumulative)
         else:
             # 回退到原逻辑 (带翻转)
-            fp = original_lambdas[::-1]  # 转为升序
             target_cumulative = np.linspace(0, 1.0, target_n_states)
             unique_xp, idx_map = np.unique(xp, return_index=True)
-            fp_filtered = fp[idx_map]
+            fp_filtered = lambda_xp[idx_map]
             xp = unique_xp
             if len(unique_xp) < 2:
                 return np.linspace(1.0, 0.0, target_n_states).tolist()
-            new_lambdas_asc = np.interp(target_cumulative, xp, fp_filtered)
-            optimized_lambdas = new_lambdas_asc[::-1]  # 转回降序
+            optimized_lambdas = np.interp(target_cumulative, xp, fp_filtered)
 
         optimized_lambdas = np.asarray(optimized_lambdas, dtype=float).ravel()
 
@@ -647,21 +668,19 @@ class DualLambdaPreOptimizer:
             if self.param_vdw is not None:  # ✅ 修复：增加 None 守卫，确保 Stage1 安全
                 self.context.setParameter(self.param_vdw, 1.0)
             self.context.getIntegrator().step(500)
-            energies = []
-            for step in range(n_steps_per_state):
-                self.context.getIntegrator().step(1)
-                if step % 50 == 0:
-                    state = self.context.getState(getEnergy=True, groups={1})
-                    e = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-                    if not (np.isnan(e) or np.isinf(e)): energies.append(e)
+            energies = [
+                e for e in _sample_group1_energies(self.context, n_steps_per_state, sample_interval=50)
+                if not (np.isnan(e) or np.isinf(e))
+            ]
             variance_data.append(np.var(energies) if len(energies) >1 else 1.0)
 
         # 路径重分布 (保持原逻辑)
         std_dev = np.sqrt(np.array(variance_data) + 1e-10)
         density_weight = np.asarray(_normalize_variance_weights(std_dev, max_ratio=0.15), dtype=float).ravel()
         cumulative_density = np.cumsum(density_weight)
-        xp = np.asarray(cumulative_density / (float(cumulative_density[-1]) + 1e-10), dtype=float).ravel()
-        fp = lambdas[::-1]
+        total_density = float(cumulative_density[-1]) + 1e-10
+        xp = np.concatenate(([0.0], cumulative_density[:-1] / total_density)).astype(float).ravel()
+        fp = np.asarray(lambdas, dtype=float).ravel()
         target_cumulative = np.linspace(0, 1.0, n_states)
         optimized_lambdas = np.asarray(np.interp(target_cumulative, xp, fp)[::-1], dtype=float).ravel()
         optimized_lambdas = np.clip(np.sort(optimized_lambdas)[::-1], 0.0, 1.0)
@@ -687,20 +706,19 @@ class DualLambdaPreOptimizer:
             self.context.setParameter(self.param_vdw, float(lam))
             self.context.setParameter(self.param_coul, 0.0)
             self.context.getIntegrator().step(500)
-            energies = []
-            for step in range(n_steps_per_state):
-                self.context.getIntegrator().step(1)
-                if step % 50 == 0:
-                    e = self.context.getState(getEnergy=True, groups={1}).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-                    if not (np.isnan(e) or np.isinf(e)): energies.append(e)
+            energies = [
+                e for e in _sample_group1_energies(self.context, n_steps_per_state, sample_interval=50)
+                if not (np.isnan(e) or np.isinf(e))
+            ]
             variance_data.append(np.var(energies) if len(energies)>1 else 1.0)
 
         std_dev = np.sqrt(np.array(variance_data) + 1e-10)
         density_weight = np.asarray(_normalize_variance_weights(std_dev, max_ratio=0.15), dtype=float).ravel()
         cumulative_density = np.cumsum(density_weight)
-        xp = np.asarray(cumulative_density / (float(cumulative_density[-1]) + 1e-10), dtype=float).ravel()
+        total_density = float(cumulative_density[-1]) + 1e-10
+        xp = np.concatenate(([0.0], cumulative_density[:-1] / total_density)).astype(float).ravel()
         optimized_lambdas = np.asarray(
-            np.interp(np.linspace(0, 1.0, n_states), xp, lambdas[::-1])[::-1],
+            np.interp(np.linspace(0, 1.0, n_states), xp, np.asarray(lambdas, dtype=float).ravel())[::-1],
             dtype=float,
         ).ravel()
         optimized_lambdas = np.clip(np.sort(optimized_lambdas)[::-1], 0.0, 1.0)
@@ -901,23 +919,27 @@ def compute_2d_metric_grid(context, lam_c_grid, lam_v_grid, n_steps=3000, delta=
             context.getIntegrator().step(500)
 
             dc_vals, dv_vals = [], []
-            for step_idx in range(n_steps):
-                context.getIntegrator().step(1)
-                if step_idx % 50 == 0:
-                    context.setParameter("lam_coul", lc + delta)
-                    e_cp = context.getState(getEnergy=True, groups={1}).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-                    context.setParameter("lam_coul", lc - delta)
-                    e_cm = context.getState(getEnergy=True, groups={1}).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-                    context.setParameter("lam_coul", lc)
+            full_batches, remainder = divmod(int(n_steps), 50)
+            sample_count = full_batches + (1 if remainder else 0)
+            for sample_idx in range(sample_count):
+                batch_steps = 50 if sample_idx < full_batches else remainder
+                if batch_steps <= 0:
+                    continue
+                context.getIntegrator().step(batch_steps)
+                context.setParameter("lam_coul", lc + delta)
+                e_cp = context.getState(getEnergy=True, groups={1}).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+                context.setParameter("lam_coul", lc - delta)
+                e_cm = context.getState(getEnergy=True, groups={1}).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+                context.setParameter("lam_coul", lc)
 
-                    context.setParameter("lam_vdw", lv + delta)
-                    e_vp = context.getState(getEnergy=True, groups={1}).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-                    context.setParameter("lam_vdw", lv - delta)
-                    e_vm = context.getState(getEnergy=True, groups={1}).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-                    context.setParameter("lam_vdw", lv)
+                context.setParameter("lam_vdw", lv + delta)
+                e_vp = context.getState(getEnergy=True, groups={1}).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+                context.setParameter("lam_vdw", lv - delta)
+                e_vm = context.getState(getEnergy=True, groups={1}).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+                context.setParameter("lam_vdw", lv)
 
-                    dc_vals.append((e_cp - e_cm) / (2 * delta))
-                    dv_vals.append((e_vp - e_vm) / (2 * delta))
+                dc_vals.append((e_cp - e_cm) / (2 * delta))
+                dv_vals.append((e_vp - e_vm) / (2 * delta))
 
             dc, dv = np.array(dc_vals), np.array(dv_vals)
             cov = np.cov([dc, dv]) * beta ** 2
@@ -970,10 +992,14 @@ def optimize_2d_geodesic_path(
     )
 
     print(f"  ✅ 度量张量场完成 | 形状: {G.shape}")
-    path = dijkstra_monotonic_geodesic(G, lam_c_grid, lam_v_grid)
-    print(f"  🏆 测地线路径: {len(path)} 个状态")
-    print(f"     λ_coul: {path[0][0]:.3f} → {path[-1][0]:.3f}")
-    print(f"     λ_vdw:  {path[0][1]:.3f} → {path[-1][1]:.3f}")
+    try:
+        path = dijkstra_monotonic_geodesic(G, lam_c_grid, lam_v_grid)
+        print(f"  🏆 测地线路径: {len(path)} 个状态")
+        print(f"     λ_coul: {path[0][0]:.3f} → {path[-1][0]:.3f}")
+        print(f"     λ_vdw:  {path[0][1]:.3f} → {path[-1][1]:.3f}")
+    except Exception as e:
+        print(f"  ⚠️ 测地线寻径失败 ({e})，回退到对角线线性路径。")
+        path = list(zip(np.linspace(1.0, 0.0, n_grid), np.linspace(1.0, 0.0, n_grid)))
 
     path_arr = np.array(path)
     # 确保 lam_coul 和 lam_vdw 严格单调递减 (从 1.0 -> 0.0)
@@ -1029,9 +1055,19 @@ def dijkstra_monotonic_geodesic(G, lam_c_grid, lam_v_grid):
                     heapq.heappush(pq, (dist[ni, nj], ni, nj))
 
     ci, cj = nc - 1, nv - 1
+    if not np.isfinite(dist[ci, cj]) or prev[ci, cj] is None:
+        raise RuntimeError(
+            "测地线寻径失败：lambda 图不连通或终点不可达。"
+            "请检查度量张量是否含 NaN/Inf，或回退到线性/对角路径。"
+        )
     path = []
     while (ci, cj) != (0, 0):
         path.append((lam_c_grid[ci], lam_v_grid[cj]))
-        ci, cj = prev[ci, cj]
+        parent = prev[ci, cj]
+        if parent is None:
+            raise RuntimeError(
+                f"测地线寻径中断：节点 ({ci}, {cj}) 缺少前驱，图可能不连通。"
+            )
+        ci, cj = parent
     path.append((lam_c_grid[0], lam_v_grid[0]))
     return path[::-1]

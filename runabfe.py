@@ -204,6 +204,39 @@ def resolve_ligand_ffxml(output_dir: str, ligand_resname: str, explicit_path: Op
     return None
 
 
+def _build_stable_ligand_atom_names(gmx_top: app.GromacsTopFile, ligand_resname: str) -> Dict[int, str]:
+    """基于 .top 的原始原子顺序生成稳定且唯一的配体原子名映射。"""
+    lig_atoms = [a for a in gmx_top.topology.atoms() if a.residue.name == ligand_resname]
+    if not lig_atoms:
+        raise ValueError(f"未在拓扑中找到配体残基: {ligand_resname}")
+
+    raw_names = [atom.name.strip() or atom.element.symbol for atom in lig_atoms]
+    if len(set(raw_names)) == len(raw_names):
+        return {atom.index: raw for atom, raw in zip(lig_atoms, raw_names)}
+
+    elem_counter: Dict[str, int] = {}
+    stable_names: Dict[int, str] = {}
+    for atom in lig_atoms:
+        elem = atom.element.symbol if atom.element is not None else "X"
+        elem_counter[elem] = elem_counter.get(elem, 0) + 1
+        stable_names[atom.index] = f"{elem}{elem_counter[elem]}"
+    return stable_names
+
+
+def _resolve_mdtraj_topology_input(output_dir: str, gro_file: Optional[str], top_file: Optional[str]) -> str:
+    """为 mdtraj.load 解析最稳妥的拓扑输入，优先缓存的 mmCIF。"""
+    cif_path = os.path.join(output_dir, "topology.cif")
+    if os.path.isfile(cif_path):
+        return cif_path
+    if gro_file and os.path.isfile(gro_file):
+        return gro_file
+    if top_file and os.path.isfile(top_file):
+        return top_file
+    raise FileNotFoundError(
+        "无法为轨迹加载解析拓扑：未找到 topology.cif 缓存，也未提供有效的 --gro/--top。"
+    )
+
+
 def generate_ligand_xml_from_top(
     top_file: str,
     ligand_resname: str,
@@ -218,17 +251,59 @@ def generate_ligand_xml_from_top(
         raise ValueError(f"未在拓扑中找到配体残基: {ligand_resname}")
 
     lig_idx = [a.index for a in lig_res.atoms()]
+    stable_names = _build_stable_ligand_atom_names(top, ligand_resname)
     global_to_local = {g: l for l, g in enumerate(lig_idx)}
     atoms = list(top.topology.atoms())
-    charges = list(getattr(top, "_charges", []))
-    nb = list(getattr(top, "_nonbondedParams", []))
+    lig_set = set(lig_idx)
+    bond_neighbors: Dict[int, set] = {idx: set() for idx in lig_idx}
+    for bond in top.topology.bonds():
+        i, j = bond.atom1.index, bond.atom2.index
+        if i in lig_set and j in lig_set:
+            bond_neighbors[i].add(j)
+            bond_neighbors[j].add(i)
 
-    unique_names: Dict[int, str] = {}
-    elem_counter: Dict[str, int] = {}
-    for i in lig_idx:
-        elem = atoms[i].element.symbol
-        elem_counter[elem] = elem_counter.get(elem, 0) + 1
-        unique_names[i] = f"{elem}{elem_counter[elem]}"
+    # 不再依赖 GromacsTopFile 的私有字段；直接用 createSystem() 后的真实 OpenMM 力参数。
+    extracted_system = top.createSystem(
+        nonbondedMethod=app.NoCutoff,
+        constraints=None,
+        rigidWater=False,
+    )
+    nb_force = next(
+        (f for f in extracted_system.getForces() if isinstance(f, openmm.NonbondedForce)),
+        None,
+    )
+    bond_force = next(
+        (f for f in extracted_system.getForces() if isinstance(f, openmm.HarmonicBondForce)),
+        None,
+    )
+    angle_force = next(
+        (f for f in extracted_system.getForces() if isinstance(f, openmm.HarmonicAngleForce)),
+        None,
+    )
+    torsion_force = next(
+        (f for f in extracted_system.getForces() if isinstance(f, openmm.PeriodicTorsionForce)),
+        None,
+    )
+    if nb_force is None:
+        raise RuntimeError("GROMACS 拓扑构建出的 System 中未找到 NonbondedForce，无法抽取配体参数")
+
+    def classify_torsion(p1: int, p2: int, p3: int, p4: int) -> Tuple[str, Tuple[int, int, int, int]]:
+        atoms4 = (p1, p2, p3, p4)
+        if (
+            p2 in bond_neighbors.get(p1, ())
+            and p3 in bond_neighbors.get(p2, ())
+            and p4 in bond_neighbors.get(p3, ())
+        ):
+            return "Proper", atoms4
+
+        for center in atoms4:
+            outer = [x for x in atoms4 if x != center]
+            if all(x in bond_neighbors.get(center, ()) for x in outer):
+                return "Improper", (center, outer[0], outer[1], outer[2])
+
+        return "Proper", atoms4
+
+    unique_names: Dict[int, str] = {int(i): stable_names[int(i)] for i in lig_idx}
 
     xml_lines = ["<ForceField>", "  <AtomTypes>"]
     for i in lig_idx:
@@ -237,7 +312,7 @@ def generate_ligand_xml_from_top(
         xml_lines.append(f'    <Type name="T{i}" class="T{i}" element="{elem.symbol}" mass="{mass:.6f}"/>')
     xml_lines += ["  </AtomTypes>", "  <Residues>", f'    <Residue name="{ligand_resname}">']
     for i in lig_idx:
-        charge = charges[i] if i < len(charges) else 0.0
+        charge = nb_force.getParticleParameters(i)[0].value_in_unit(unit.elementary_charge)
         xml_lines.append(f'      <Atom name="{unique_names[i]}" type="T{i}" charge="{charge:.8f}"/>')
 
     for bond in top.topology.bonds():
@@ -249,39 +324,56 @@ def generate_ligand_xml_from_top(
     xml_lines += ["    </Residue>", "  </Residues>"]
 
     xml_lines.append("  <HarmonicBondForce>")
-    for bond in getattr(top, "_bonds", []):
-        if bond[0] in unique_names and bond[1] in unique_names:
-            xml_lines.append(
-                f'    <Bond class1="T{bond[0]}" class2="T{bond[1]}" length="{bond[2]:.8f}" k="{bond[3]:.8f}"/>'
-            )
+    if bond_force is not None:
+        for bidx in range(bond_force.getNumBonds()):
+            p1, p2, length, k = bond_force.getBondParameters(bidx)
+            p1 = int(p1)
+            p2 = int(p2)
+            if p1 in unique_names and p2 in unique_names:
+                xml_lines.append(
+                    f'    <Bond class1="T{p1}" class2="T{p2}" '
+                    f'length="{length.value_in_unit(unit.nanometer):.8f}" '
+                    f'k="{k.value_in_unit(unit.kilojoule_per_mole / unit.nanometer**2):.8f}"/>'
+                )
     xml_lines.append("  </HarmonicBondForce>")
 
     xml_lines.append("  <HarmonicAngleForce>")
-    for angle in getattr(top, "_angles", []):
-        if all(x in unique_names for x in angle[:3]):
-            xml_lines.append(
-                f'    <Angle class1="T{angle[0]}" class2="T{angle[1]}" class3="T{angle[2]}" angle="{angle[3]:.8f}" k="{angle[4]:.8f}"/>'
-            )
+    if angle_force is not None:
+        for aidx in range(angle_force.getNumAngles()):
+            p1, p2, p3, angle, k = angle_force.getAngleParameters(aidx)
+            p1, p2, p3 = int(p1), int(p2), int(p3)
+            if all(x in unique_names for x in (p1, p2, p3)):
+                xml_lines.append(
+                    f'    <Angle class1="T{p1}" class2="T{p2}" class3="T{p3}" '
+                    f'angle="{angle.value_in_unit(unit.radian):.8f}" '
+                    f'k="{k.value_in_unit(unit.kilojoule_per_mole / unit.radian**2):.8f}"/>'
+                )
     xml_lines.append("  </HarmonicAngleForce>")
 
     xml_lines.append("  <PeriodicTorsionForce>")
-    for proper in getattr(top, "_propers", []):
-        if all(x in unique_names for x in proper[:4]):
-            idx = 4
-            while idx + 2 < len(proper):
+    if torsion_force is not None:
+        for tidx in range(torsion_force.getNumTorsions()):
+            p1, p2, p3, p4, periodicity, phase, k = torsion_force.getTorsionParameters(tidx)
+            p1, p2, p3, p4 = int(p1), int(p2), int(p3), int(p4)
+            if all(x in unique_names for x in (p1, p2, p3, p4)):
+                torsion_tag, ordered = classify_torsion(p1, p2, p3, p4)
+                t1, t2, t3, t4 = ordered
                 xml_lines.append(
-                    f'    <Proper class1="T{proper[0]}" class2="T{proper[1]}" class3="T{proper[2]}" class4="T{proper[3]}" '
-                    f'periodicity="{int(proper[idx])}" phase="{proper[idx+1]:.8f}" k="{proper[idx+2]:.8f}"/>'
+                    f'    <{torsion_tag} class1="T{t1}" class2="T{t2}" class3="T{t3}" class4="T{t4}" '
+                    f'periodicity="{int(periodicity)}" '
+                    f'phase="{phase.value_in_unit(unit.radian):.8f}" '
+                    f'k="{k.value_in_unit(unit.kilojoule_per_mole):.8f}"/>'
                 )
-                idx += 3
     xml_lines.append("  </PeriodicTorsionForce>")
 
     xml_lines.append('  <NonbondedForce coulomb14scale="0.833333" lj14scale="0.5">')
     for i in lig_idx:
-        charge = charges[i] if i < len(charges) else 0.0
-        sigma, epsilon = nb[i] if i < len(nb) else (0.3, 0.0)
+        charge, sigma, epsilon = nb_force.getParticleParameters(i)
         xml_lines.append(
-            f'    <Atom type="T{i}" charge="{charge:.8f}" sigma="{sigma:.8f}" epsilon="{epsilon:.8f}"/>'
+            f'    <Atom type="T{i}" '
+            f'charge="{charge.value_in_unit(unit.elementary_charge):.8f}" '
+            f'sigma="{sigma.value_in_unit(unit.nanometer):.8f}" '
+            f'epsilon="{epsilon.value_in_unit(unit.kilojoule_per_mole):.8f}"/>'
         )
     xml_lines.append("  </NonbondedForce>")
     xml_lines.append("</ForceField>")
@@ -399,6 +491,7 @@ def build_and_cache_solvent_leg(
         
     log.info("  🧬 彻底抛弃 mmCIF，从原始 .top 重建 100% 纯净配体拓扑...")
     gmx_top = app.GromacsTopFile(top_file, includeDir=gmx_include_dir)
+    stable_names = _build_stable_ligand_atom_names(gmx_top, ligand_resname)
     
     # 获取 .top 中的配体原子索引
     top_lig_indices = [a.index for a in gmx_top.topology.atoms() if a.residue.name == ligand_resname]
@@ -414,14 +507,14 @@ def build_and_cache_solvent_leg(
     modeller.delete(atoms_to_delete)
     log.info("  ✅ 纯净配体拓扑构建完成 (键连接 100% 忠于 .top，无假键)")
 
-    # 3. 动态重命名配体原子 (C1, C2...)，严格对齐即将生成的 XML 模板
+    # 3. 用 .top 的稳定名字映射重命名，确保拓扑与 XML 完全同序对齐
     lig_atoms_in_mod = [a for a in modeller.topology.atoms() if a.residue.name == ligand_resname]
-    elem_counter_mod = {}
-    for atom in lig_atoms_in_mod:
-        elem = atom.element.symbol
-        elem_counter_mod[elem] = elem_counter_mod.get(elem, 0) + 1
-        atom.name = f"{elem}{elem_counter_mod[elem]}"
-    log.info("  ✅ 配体原子名已重命名并对齐 XML (C1, C2, H1...)")
+    if len(lig_atoms_in_mod) != len(top_lig_indices):
+        log.error("❌ 配体原子数不匹配：Modeller=%d, Topology=%d", len(lig_atoms_in_mod), len(top_lig_indices))
+        return False
+    for atom, top_idx in zip(lig_atoms_in_mod, top_lig_indices):
+        atom.name = stable_names[int(top_idx)]
+    log.info("  ✅ 配体原子名已按 .top 稳定映射重命名并对齐 XML")
 
     # 4. 复用/生成配体 XML + TIP3P 水
     ffxml_path = resolve_ligand_ffxml(output_dir, ligand_resname, explicit_path=ligand_ffxml)
@@ -672,7 +765,7 @@ def center_system_rigidly(
     
     # 计算配体质心与盒子中心
     lig_com = np.mean(pos[ligand_indices], axis=0)
-    box_center = 0.5 * np.diag(box) # 考虑非正交盒子的几何中心
+    box_center = 0.5 * np.sum(box, axis=0)
     
     # 整体刚性平移
     shift = box_center - lig_com
@@ -720,6 +813,8 @@ class RunConfig:
 
         # 3. 命令行参数覆盖
         cli_overrides = {
+            "resume": args.resume,
+            "reset": args.reset,
             "n_steps_per_window": args.n_steps_per_window,
             "steps_per_update": args.steps_per_update,
             "stage1_n_states": args.n_states_per_stage,  # 统一命名
@@ -731,6 +826,8 @@ class RunConfig:
             "potential": args.potential,
             "boresch": args.boresch,
             "boresch_source": args.boresch_source,
+            "boresch_anchors": args.boresch_anchors,
+            "boresch_orb": args.boresch_orb,
             "boresch_batch": args.boresch_batch,
             "boresch_select": args.boresch_select,
             "enable_early_stop": args.enable_early_stop,
@@ -750,6 +847,13 @@ class RunConfig:
             preset["n_steps_per_window"] = args.n_steps_per_window
         if args.steps_per_update is not None:
             preset["steps_per_update"] = args.steps_per_update
+
+        # 复合物腿默认启用 Boresch；若用户未显式指定来源，则默认走自动估算。
+        if preset.get("boresch") is None:
+            preset["boresch"] = True
+        if preset.get("boresch_source") in (None, "", "traditional") and preset.get("boresch", False):
+            if getattr(args, "boresch_source", None) is None and not getattr(args, "boresch_anchors", None):
+                preset["boresch_source"] = "auto"
 
         self.data = preset
         self.args = args  # 保留原始 args 供其它函数使用
@@ -803,6 +907,30 @@ def _sanitize_boresch_params(params: Dict) -> Dict:
     }
 
 
+def _has_valid_boresch_anchors(params: Optional[Dict]) -> bool:
+    """判定 Boresch 参数是否包含完整 3+3 锚点，避免键存在但值为空时静默失效。"""
+    if not isinstance(params, dict):
+        return False
+    rec_idx = params.get("receptor_indices") or []
+    lig_idx = params.get("ligand_indices") or []
+    return len(rec_idx) == 3 and len(lig_idx) == 3
+
+
+def _sanitize_boresch_params_strict(params: Dict) -> Dict:
+    """严格清洗并校验 Boresch 参数，发现锚点缺失时立即报错。"""
+    cleaned = _sanitize_boresch_params(params)
+    if cleaned is None:
+        return None
+    if not _has_valid_boresch_anchors(cleaned):
+        anchors = params.get("boresch_anchors", params) if isinstance(params, dict) else {}
+        raise ValueError(
+            "Boresch 参数缺失有效锚点：需要 3 个 receptor_indices 和 3 个 ligand_indices。"
+            f" 当前解析结果 receptor_indices={anchors.get('receptor_indices', params.get('receptor_indices', [])) if isinstance(params, dict) else []},"
+            f" ligand_indices={anchors.get('ligand_indices', params.get('ligand_indices', [])) if isinstance(params, dict) else []}"
+        )
+    return cleaned
+
+
 def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Optional[Dict]:
     """统一获取 Boresch 参数，支持传统文件、auto、simple、fluctuation 多种来源"""
     if not config.boresch:
@@ -819,7 +947,7 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
         with open(path) as f:
             params = json.load(f)
         log.info("✅ 加载外部 Boresch 参数: %s", path)
-        return _sanitize_boresch_params(params)
+        return _sanitize_boresch_params_strict(params)
 
     # 自动估算来源 (auto / simple / fluctuation)
     boresch_file = os.path.join(output_dir, f"boresch_{source}.json")
@@ -827,7 +955,7 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
         log.info("♻️ 从缓存加载 Boresch 参数: %s", boresch_file)
         with open(boresch_file) as f:
             params = json.load(f)
-        return _sanitize_boresch_params(params)
+        return _sanitize_boresch_params_strict(params)
 
     # 需要预平衡生成轨迹
     if not config.reset and equilibrium_is_done(output_dir):
@@ -843,13 +971,14 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
     traj_file = os.path.join(output_dir, "pre_equilibration.dcd")
     if not os.path.exists(traj_file):
         raise RuntimeError("预平衡轨迹不存在，无法估算 Boresch 参数")
+    traj_top = _resolve_mdtraj_topology_input(output_dir, config.gro, config.top)
 
     # 根据来源调用不同估算器
     if source == "auto":
         from abfe_core import OrbBoreschEstimator
         estimator = OrbBoreschEstimator(temperature=config.temperature)
         import mdtraj as md
-        traj = md.load(traj_file, top=config.gro)
+        traj = md.load(traj_file, top=traj_top)
         # 自动估算（默认使用最后 5ns）
         candidates = estimator.estimate_multiple_anchors_from_trajectory(
             traj, config.ligand, n_candidates=1, output_path=boresch_file, use_last_ns=5.0
@@ -861,14 +990,14 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
     elif source == "simple":
         from abfe_core import OrbBoreschEstimator
         import mdtraj as md
-        traj = md.load(traj_file, top=config.gro)
+        traj = md.load(traj_file, top=traj_top)
         estimator = OrbBoreschEstimator(temperature=config.temperature)
         boresch = estimator.estimate_from_trajectory(traj, config.ligand, output_path=boresch_file)
 
     elif source == "fluctuation":
         estimator = GeometricRestraintEstimator(temperature=config.temperature)
         import mdtraj as md
-        traj = md.load(traj_file, top=config.gro)
+        traj = md.load(traj_file, top=traj_top)
         boresch = estimator.estimate_from_trajectory(traj, config.ligand, output_path=boresch_file)
     else:
         raise ValueError(f"未识别的 Boresch 来源: {source}")
@@ -876,7 +1005,7 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
     # 用最后一帧更新平衡几何量
     try:
         import mdtraj as md
-        traj = md.load(traj_file, top=config.gro)
+        traj = md.load(traj_file, top=traj_top)
         protein_sel = traj.topology.select("protein and backbone")
         if len(protein_sel) > 0:
             traj.superpose(traj, 0, atom_indices=protein_sel)
@@ -901,7 +1030,7 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
     with open(boresch_file, "w") as f:
         json.dump(boresch, f, indent=2, cls=NumpyEncoder)
     log.info("💾 Boresch 参数已保存: %s", boresch_file)
-    return _sanitize_boresch_params(boresch)
+    return _sanitize_boresch_params_strict(boresch)
 
 
 # ---------------------------------------------------------------------------
@@ -958,8 +1087,9 @@ def parse_arguments():
     parser.add_argument("--dexp-params", default=None, help="DEXP 参数文件 (JSON)")
 
     # Boresch 相关
-    parser.add_argument("--boresch", action="store_true", help="启用 Boresch 限制力")
-    parser.add_argument("--boresch-source", default="traditional",
+    parser.add_argument("--boresch", action=argparse.BooleanOptionalAction, default=None,
+                        help="是否启用 Boresch 限制力；复合物腿默认启用，可用 --no-boresch 显式关闭")
+    parser.add_argument("--boresch-source", default=None,
                         choices=["traditional", "orb_ml", "simple", "auto", "fluctuation"])
     parser.add_argument("--boresch-anchors", default=None, help="传统 Boresch 锚点文件")
     parser.add_argument("--boresch-orb", default=None, help="Orb ML 预测 Boresch 文件")
@@ -1021,6 +1151,22 @@ def run_post_analysis(args):
         stage_dir = os.path.join(output_dir, stage_name)
         if not os.path.exists(stage_dir):
             continue
+        window_data = []
+
+        stage_checkpoint = os.path.join(
+            output_dir,
+            "checkpoints",
+            "stage1_decharging.json" if stage == "coul" else "stage2_vanishing.json",
+        )
+        if stage == "coul" and os.path.exists(stage_checkpoint):
+            with open(stage_checkpoint) as f:
+                cached_stage = json.load(f)
+            dg = float(cached_stage.get("total_delta_G", 0.0))
+            err = float(cached_stage.get("total_error", 0.0))
+            total_dg += dg
+            total_err_sq += err**2
+            log.info("Stage %s: 使用 PME 去电荷 checkpoint ΔG = %.2f ± %.2f kJ/mol", stage, dg, err)
+            continue
             
         # 🔑 修复：读取真实的窗口划分与 Lambda 索引
         preopt_file = os.path.join(output_dir, "checkpoints", f"preopt_dual_{stage_name}.json")
@@ -1035,7 +1181,18 @@ def run_post_analysis(args):
                 
         e_files = sorted(glob.glob(os.path.join(stage_dir, f"dual_window_*_{stage}_energies.npy")))
         for w_idx, e_file in enumerate(e_files):
-            # ... [读取 u_kn, bias, base 的代码保持不变] ...
+            u_kn = np.load(e_file)
+            bias_path = e_file.replace("_energies.npy", "_bias.npy")
+            base_path = e_file.replace("_energies.npy", "_base.npy")
+            if not os.path.exists(bias_path):
+                raise RuntimeError(
+                    f"缺少 IBS bias 能量文件: {bias_path}。"
+                    "偏置采样必须在 MBAR 中补偿，不能用 0 代替。"
+                )
+            if not os.path.exists(base_path):
+                raise RuntimeError(f"缺少 base 能量文件: {base_path}")
+            bias = np.load(bias_path)
+            base = np.load(base_path)
             
             # 🔑 修复：赋予真实的全局 lambda_indices
             if w_idx < len(window_ranges):
@@ -1320,6 +1477,10 @@ def main():
         dexp_params = None
 
     # ----- 4. Boresch 参数获取（可能触发预平衡估算） -----
+    if config.boresch:
+        log.info("🧷 复合物腿 Boresch 已启用 | source=%s", config.boresch_source)
+    else:
+        log.info("🧷 复合物腿 Boresch 已显式关闭")
     boresch_restraint = resolve_boresch_restraint(config, pipeline)
 
     # ----- 5. 带限制力再平衡（如果启用） -----

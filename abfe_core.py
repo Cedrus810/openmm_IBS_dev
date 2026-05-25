@@ -14,6 +14,8 @@ import math
 import warnings
 import json
 import os
+import logging
+import builtins
 from itertools import combinations
 from collections import deque
 from typing import Dict, List, Tuple, Optional, Any, Callable
@@ -41,6 +43,28 @@ try:
     HAS_PYMBAR = True
 except ImportError:
     HAS_PYMBAR = False
+
+logger = logging.getLogger(__name__)
+
+
+def _infer_log_level_from_message(message: str) -> int:
+    if any(token in message for token in ("⚠️", "警告", "warning")):
+        return logging.WARNING
+    if any(token in message for token in ("🚨", "❌", "失败", "错误", "异常", "error")):
+        return logging.ERROR
+    return logging.INFO
+
+
+def _log_print(*args, sep=" ", end="\n", file=None, flush=False):
+    message = sep.join(str(arg) for arg in args)
+    if end and end != "\n":
+        message += end.rstrip("\n")
+    logger.log(_infer_log_level_from_message(message), message)
+    if flush and not logger.handlers:
+        builtins.print(message, end=end, file=file, flush=flush)
+
+
+print = _log_print
 
 
 def get_optimal_device_settings():
@@ -107,16 +131,10 @@ class ACESoftcorePotential:
     def build_expression(self, lam_coul, lam_vdw):
         COUL = 138.935456
         lc, lv = f"({lam_coul}^{self.n_coul})", f"({lam_vdw}^{self.n_lj})"
-        
-        # === 增强 1：r 项独立偏置 δ ===
-        delta_r6 = 1e-6   # nm⁶ ≈ 1e-2 Å⁶，防止 r→0 时分母归零
-        delta_r2 = 1e-4   # nm² ≈ 1e-2 Å²，静电分母保护
-        
-        # LJ 软核：α·(1-λ)^m + r^6 + δ
-        dlj = f"({self.alpha_lj}*(1.0-{lam_vdw}+1e-9)^{self.m_lj} + r^6 + {delta_r6})"
-        
-        # Coulomb 软核：sqrt(r² + α·(1-λ)^m + δ)
-        dc = f"sqrt(r^2 + {self.alpha_coul}*(1.0-{lam_coul}+1e-9)^{self.m_coul} + {delta_r2})"
+
+        # 仅在 r->0 且 lambda->1 的奇异角落启用兜底，不污染正常物理区间。
+        dlj = f"max({self.alpha_lj}*(1.0-{lam_vdw})^{self.m_lj} + r^6, 1e-6)"
+        dc = f"sqrt(max(r^2 + {self.alpha_coul}*(1.0-{lam_coul})^{self.m_coul}, 1e-6))"
         
         # 必须整体加括号，否则会被解析成 0.5*(sigma1+sigma2)^n，
         # 而不是 ((sigma1+sigma2)/2)^n，短程排斥会被严重放大。
@@ -125,6 +143,17 @@ class ACESoftcorePotential:
         coul = f"{lc} * {COUL} * q1 * q2 / {dc}"
         
         return f"{lj} + {coul}"
+
+    @staticmethod
+    def _normalize_alpha_units(alpha_lj, alpha_coul):
+        alpha_lj = float(alpha_lj)
+        alpha_coul = float(alpha_coul)
+        # 兼容历史遗留的 Å 标度 JSON：LJ 常见为 1e-6 量级，Coul 常见为 1e-3~1e-2 量级。
+        if alpha_lj < 1.0e-3:
+            alpha_lj *= 1.0e6
+        if alpha_coul < 5.0e-2:
+            alpha_coul *= 1.0e2
+        return alpha_lj, alpha_coul
 
     @staticmethod
     def optimize_alpha(n, alpha_coul_nm2=None):
@@ -157,9 +186,13 @@ class ACESoftcorePotential:
 
     @classmethod
     def from_dict(cls, p):
+        alpha_lj, alpha_coul = cls._normalize_alpha_units(
+            p.get("alpha_lj", 0.5),
+            p.get("alpha_coul", 0.2),
+        )
         return cls(
-            p.get("alpha_lj", 1.5e-6),
-            p.get("alpha_coul", 0.2e-2),
+            alpha_lj,
+            alpha_coul,
             tuple(p.get("power_lj", [2, 2])),
             tuple(p.get("power_coul", [1, 1])),
         )
@@ -181,11 +214,11 @@ class BeutlerSoftcoreBuilder:
     ) -> openmm.CustomNonbondedForce:
         expr = (
             f"lambda_vdw * 4*sqrt(epsilon1*epsilon2)*("
-            f"(sigma12^12 / (r^6 + {alpha_lj}*(1-lambda_vdw)^{power_lj})^2) - "
-            f"(sigma12^6 / (r^6 + {alpha_lj}*(1-lambda_vdw)^{power_lj}))"
+            f"(sigma12^12 / (r^6 + {alpha_lj}*(1-lambda_vdw)^{power_lj} + 1e-4)^2) - "
+            f"(sigma12^6 / (r^6 + {alpha_lj}*(1-lambda_vdw)^{power_lj} + 1e-4))"
             f") + "
-            f"lambda_coul * 138.935456 * q1*q2 / sqrt(r^2 + {alpha_coul}*(1-lambda_coul)^{power_coul}); "
-            f"sigma12=0.5*(sigma1+sigma2)"
+            f"lambda_coul * 138.935456 * q1*q2 / sqrt(r^2 + {alpha_coul}*(1-lambda_coul)^{power_coul} + 1e-3); "
+            f"sigma12=(0.5*(sigma1+sigma2))"
         )
         sc_force = openmm.CustomNonbondedForce(expr)
         for p in ["q", "sigma", "epsilon"]:
@@ -244,8 +277,19 @@ class DEXPSurrogatePotential:
         vdw = f"{lam_vdw} * 4 * sqrt(epsilon1*epsilon2) * ({self.A_fit}*exp(-{self.alpha_vdw}*({r_sc}/{self.r0_vdw}-1.0)) - {self.B_fit}*exp(-{self.beta_vdw}*({r_sc}/{self.r0_vdw}-1.0)))"
         ssq = self.sigma_elec**2
         coul = f"{lam_coul} * 138.935456 * q1 * q2 * (erfc({rs}/sqrt(2*{ssq}))/{rs} + 1/sqrt({PI}*{ssq})*exp(-{rs}^2/(2*{ssq})))"
-        sw = f"(step({self.cutoff_distance}-{self.switch_width}-{r_sc}) + (1-step({self.cutoff_distance}-{self.switch_width}-{r_sc}))*step({self.cutoff_distance}-{r_sc})*(0.5 + 0.5*cos({PI}*({r_sc}-({self.cutoff_distance}-{self.switch_width}))/{self.switch_width})))"
-        return f"({vdw} * {sw}) + ({coul} * {sw.replace(r_sc, rs)}) + {lam_vdw} * ({self.offset_c0} + {self.offset_c1} * r)"
+        r_sw = self.cutoff_distance - self.switch_width
+
+        def _smooth_switch(radius_expr: str) -> str:
+            x = f"max(0.0, min(1.0, ({radius_expr} - {r_sw}) / {self.switch_width}))"
+            smooth_step = f"(1.0 - 10.0*({x})^3 + 15.0*({x})^4 - 6.0*({x})^5)"
+            return (
+                f"(step({r_sw} - {radius_expr}) + "
+                f"step({radius_expr} - {r_sw}) * step({self.cutoff_distance} - {radius_expr}) * {smooth_step})"
+            )
+
+        sw_vdw = _smooth_switch(r_sc)
+        sw_coul = _smooth_switch(rs)
+        return f"({vdw} * {sw_vdw}) + ({coul} * {sw_coul}) + {lam_vdw} * ({self.offset_c0} + {self.offset_c1} * r)"
 
     def get_parameters_dict(self):
         return {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
@@ -401,6 +445,7 @@ class LambdaDependentBoreschForce(openmm.CustomCompoundBondForce):
         lam_name="lambda_rest",
         fixed_lam=None,
         sign=1.0,
+        use_pbc=False,
         # ✅ 移除 unit_sys 参数，强制标准单位
     ):
         if len(rec_idx) != 3 or len(lig_idx) != 3:
@@ -457,6 +502,9 @@ class LambdaDependentBoreschForce(openmm.CustomCompoundBondForce):
             ("kpC", kpC),
         ]:
             self.addGlobalParameter(n, v)
+
+        if hasattr(self, "setUsesPeriodicBoundaryConditions"):
+            self.setUsesPeriodicBoundaryConditions(bool(use_pbc))
 
         self.addBond(list(rec_idx) + list(lig_idx))
 
@@ -544,7 +592,7 @@ class OrbBoreschEstimator:
 
     def __init__(self, temperature=300.0, device=None, cutoff_nm=0.9, n_frames=500):
         self.T = temperature
-        self.kB = 8.314e-3
+        self.gas_constant_kj_per_mol_k = 8.314e-3
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.config = {
             **self.DEFAULT_CONFIG,
@@ -749,16 +797,23 @@ class OrbBoreschEstimator:
             raise ValueError("未找到配体")
         lig_center = traj.xyz[0, lig_sel].mean(axis=0)
         prot_sel = top.select("protein")
-        nearby = [
+        nearby_atoms = [
             a
             for a in prot_sel
             if np.linalg.norm(traj.xyz[0, a] - lig_center) <= self.config["cutoff_nm"]
         ]
-        pocket_sel = np.union1d(lig_sel, np.array(nearby, dtype=int))
+        # 保留完整残基，避免在主链/侧链中间截断产生自由基；比事后手工补 capping H 更稳。
+        nearby_residues = {top.atom(a).residue.index for a in nearby_atoms}
+        pocket_atoms = set(int(i) for i in lig_sel.tolist())
+        for res in top.residues:
+            if res.index in nearby_residues:
+                for atom in res.atoms:
+                    pocket_atoms.add(atom.index)
+        pocket_sel = np.array(sorted(pocket_atoms), dtype=int)
         if len(pocket_sel) < 10:
             raise ValueError("口袋原子不足，请增大 cutoff_nm")
 
-        cap_h = self._add_capping_hydrogens(top, pocket_sel, traj.xyz[0])
+        cap_h = []
         pocket_traj = traj.atom_slice(pocket_sel)
         omm_top = pocket_traj.topology.to_openmm()
         context = OrbVacuumContext(omm_top, device=self.device)
@@ -980,23 +1035,29 @@ class OrbBoreschEstimator:
                 q[g_idx] = mdtraj.compute_dihedrals(
                     mdtraj.Trajectory(r_anchors[None], dummy_top), [tup]
                 )[0, 0]
+                perturbations = []
+                grad_slots = []
                 for a in tup:
                     for d in range(3):
-                        rp, rm = r_anchors.copy(), r_anchors.copy()
+                        rp = r_anchors.copy()
+                        rm = r_anchors.copy()
                         rp[a, d] += eps
                         rm[a, d] -= eps
-                        grads[g_idx, a, d] = (
-                            mdtraj.compute_dihedrals(
-                                mdtraj.Trajectory(rp[None], dummy_top), [tup]
-                            )[0, 0]
-                            - mdtraj.compute_dihedrals(
-                                mdtraj.Trajectory(rm[None], dummy_top), [tup]
-                            )[0, 0]
-                        ) / (2 * eps)
+                        perturbations.extend((rp, rm))
+                        grad_slots.append((a, d))
+
+                batch_xyz = np.asarray(perturbations, dtype=float)
+                batch_angles = mdtraj.compute_dihedrals(
+                    mdtraj.Trajectory(batch_xyz, dummy_top), [tup]
+                )[:, 0]
+                for idx, (a, d) in enumerate(grad_slots):
+                    grads[g_idx, a, d] = (
+                        batch_angles[2 * idx] - batch_angles[2 * idx + 1]
+                    ) / (2 * eps)
         return q, grads
 
     def _apply_hybrid_filter(self, q, Fq):
-        kB_T = self.kB * self.T
+        kB_T = self.gas_constant_kj_per_mol_k * self.T
         names = ["kr", "kthetaA", "kthetaB", "kphiA", "kphiB", "kphiC"]
         ks = {}
         for i in range(6):
@@ -1400,11 +1461,15 @@ class OrbBoreschEstimator:
         candidates.sort(key=lambda x: x["score"], reverse=True)
         print(f"  → 通过几何过滤的候选: {len(candidates)} 个")
         
-        pocket_sel = np.union1d(lig_sel, np.array(rigid_ca, dtype=int))
-        # 确保 pocket_sel 唯一且排序，以便 np.where 正确工作
-        pocket_sel = np.unique(pocket_sel)
-        
-        cap_h = self._add_capping_hydrogens(top, pocket_sel, traj.xyz[0])
+        rigid_residues = {top.atom(int(a)).residue.index for a in rigid_ca}
+        pocket_atoms = set(int(i) for i in lig_sel.tolist())
+        for res in top.residues:
+            if res.index in rigid_residues:
+                for atom in res.atoms:
+                    pocket_atoms.add(atom.index)
+        pocket_sel = np.array(sorted(pocket_atoms), dtype=int)
+
+        cap_h = []
         pocket_traj = traj.atom_slice(pocket_sel)
         context = OrbVacuumContext(pocket_traj.topology.to_openmm(), device=self.device)
         
@@ -2637,12 +2702,19 @@ class UnitFormatter:
     @classmethod
     def format_results_human(cls, results: dict) -> str:
         """格式化最终结果报告"""
-        # ✅ 修复：优先匹配 Pipeline 实际生成的键名，向下兼容旧键名
-        dg_kj = results.get("total_delta_G_complex_kJ_mol", results.get("total_delta_G_complex", 0.0))
         err_kj = results.get("total_error_kJ_mol", results.get("total_error", 0.0))
+        if "delta_G_bind_kJ_mol" in results:
+            dg_kj = results.get("delta_G_bind_kJ_mol", 0.0)
+            title = "✅ 结合自由能 ΔG_bind"
+        elif "decoupling_delta_G_kJ_mol" in results:
+            dg_kj = results.get("decoupling_delta_G_kJ_mol", 0.0)
+            title = "✅ 解耦腿自由能 ΔG_leg"
+        else:
+            dg_kj = results.get("total_delta_G_complex_kJ_mol", results.get("total_delta_G_complex", 0.0))
+            title = "✅ 自由能结果 ΔG"
         return (
             f"\n{'='*50}\n"
-            f"✅ 结合自由能 ΔG_bind = {cls.kJ_to_kcal(dg_kj):.2f} ± {cls.kJ_to_kcal(err_kj):.2f} kcal/mol\n"
+            f"{title} = {cls.kJ_to_kcal(dg_kj):.2f} ± {cls.kJ_to_kcal(err_kj):.2f} kcal/mol\n"
             f"   ( = {dg_kj:.2f} ± {err_kj:.2f} kJ/mol )\n"
             f"{'='*50}"
         )
@@ -2703,8 +2775,13 @@ def sync_all_exclusions(system: openmm.System) -> int:
     for c_force in custom_forces:
         if c_force.getNumParticles() != nb_force.getNumParticles():
             continue
+        current_exclusions = c_force.getNumExclusions()
+        # 绝大多数生产构建路径已通过 reference_exclusions 完整注入排除表；
+        # 此处先做 O(1) 数量校验，避免对数十万排除对执行 Python 层全量差集。
+        if current_exclusions == len(main_excl):
+            continue
         existing = set()
-        for i in range(c_force.getNumExclusions()):
+        for i in range(current_exclusions):
             p1, p2 = c_force.getExclusionParticles(i)
             existing.add((min(p1, p2), max(p1, p2)))
 
@@ -2857,7 +2934,7 @@ class GeometricRestraintEstimator:
                  bond_dist=0.22,          # nm
                  anchor_atom_names=None):
         self.temperature = temperature
-        self.kB = 8.314e-3               # kJ/(mol·K)
+        self.gas_constant_kj_per_mol_k = 8.314e-3
         self.search_dist = search_dist
         self.bond_dist = bond_dist
         if anchor_atom_names is None:
@@ -3027,7 +3104,7 @@ class GeometricRestraintEstimator:
             "phiC0":    float(np.mean(diheds_c[:, best_idx])),
         }
 
-        kBT = self.kB * self.temperature
+        kBT = self.gas_constant_kj_per_mol_k * self.temperature
         fc = {
             "kr":       kBT / (var_dist[best_idx] + 1e-10),
             "kthetaA":  kBT / (var_angA[best_idx] + 1e-10),

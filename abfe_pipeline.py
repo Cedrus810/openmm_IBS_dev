@@ -20,6 +20,9 @@ import os
 import json
 import shutil
 import multiprocessing as mp
+import time
+import logging
+import builtins
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 
@@ -44,6 +47,130 @@ from abfe_core import (
     TwoDimensionalLambdaPathPlanner,
 )
 import warnings
+
+PME_DECHARGE_MODEL_VERSION = "pme_decharge_v2_llfreeze_pmeself_20260523"
+
+logger = logging.getLogger(__name__)
+
+
+def _infer_log_level_from_message(message: str) -> int:
+    if any(token in message for token in ("⚠️", "警告", "warning")):
+        return logging.WARNING
+    if any(token in message for token in ("🚨", "❌", "失败", "错误", "异常", "error")):
+        return logging.ERROR
+    return logging.INFO
+
+
+def _log_print(*args, sep=" ", end="\n", file=None, flush=False):
+    message = sep.join(str(arg) for arg in args)
+    if end and end != "\n":
+        message += end.rstrip("\n")
+    logger.log(_infer_log_level_from_message(message), message)
+    if flush and not logger.handlers:
+        builtins.print(message, end=end, file=file, flush=flush)
+
+
+print = _log_print
+
+
+def _pme_u_kn_meta_path(stage_output_dir: str, stage_name: str) -> str:
+    return os.path.join(stage_output_dir, f"{stage_name}_pme_u_kn.meta.json")
+
+
+def _is_pme_u_kn_cache_compatible(stage_output_dir: str, stage_name: str, n_states: int) -> bool:
+    meta_path = _pme_u_kn_meta_path(stage_output_dir, stage_name)
+    if not os.path.exists(meta_path):
+        return False
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        return (
+            meta.get("model_version") == PME_DECHARGE_MODEL_VERSION
+            and int(meta.get("n_states", -1)) == int(n_states)
+        )
+    except Exception:
+        return False
+
+
+def _write_pme_u_kn_meta(stage_output_dir: str, stage_name: str, n_states: int) -> None:
+    meta_path = _pme_u_kn_meta_path(stage_output_dir, stage_name)
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "model_version": PME_DECHARGE_MODEL_VERSION,
+                "n_states": int(n_states),
+            },
+            f,
+            indent=2,
+        )
+
+
+def _has_valid_boresch_restraint(params: Optional[Dict]) -> bool:
+    """仅当 Boresch 参数包含完整 3+3 锚点时才认为可启用。"""
+    if not isinstance(params, dict):
+        return False
+    rec_idx = params.get("receptor_indices") or []
+    lig_idx = params.get("ligand_indices") or []
+    return len(rec_idx) == 3 and len(lig_idx) == 3
+
+
+class _PipelineStateLock:
+    def __init__(self, path: str, timeout_s: float = 10.0, poll_s: float = 0.05):
+        self.path = path
+        self.timeout_s = timeout_s
+        self.poll_s = poll_s
+        self.fd = None
+
+    @staticmethod
+    def _pid_is_alive(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def _break_stale_lock_if_needed(self) -> None:
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                payload = f.read().strip()
+            pid = int(payload) if payload else -1
+        except Exception:
+            pid = -1
+        if pid > 0 and self._pid_is_alive(pid):
+            return
+        try:
+            if os.path.exists(self.path):
+                os.remove(self.path)
+        except Exception:
+            pass
+
+    def __enter__(self):
+        deadline = time.time() + self.timeout_s
+        while True:
+            try:
+                self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                os.write(self.fd, str(os.getpid()).encode("utf-8"))
+                return self
+            except FileExistsError:
+                self._break_stale_lock_if_needed()
+                if time.time() >= deadline:
+                    raise TimeoutError(f"获取状态文件锁超时: {self.path}")
+                time.sleep(self.poll_s)
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+        try:
+            if os.path.exists(self.path):
+                os.remove(self.path)
+        except Exception:
+            pass
+
 #============================================================================
 # 辅助函数：统一 Simulation Reporter 挂载工具 (Step 1)
 #============================================================================
@@ -118,6 +245,15 @@ def _is_traj_valid(dcd_path: str, min_frames: int = 1) -> bool:
         return True
     except Exception:
         return False
+
+
+def _expected_remd_traj_files(stage_output_dir: str, stage_name: str, n_replicas: int) -> List[str]:
+    return [os.path.join(stage_output_dir, f"{stage_name}_rep{i}.dcd") for i in range(int(n_replicas))]
+
+
+def _all_remd_trajs_valid(stage_output_dir: str, stage_name: str, n_replicas: int, min_frames: int = 1) -> bool:
+    traj_files = _expected_remd_traj_files(stage_output_dir, stage_name, n_replicas)
+    return all(_is_traj_valid(path, min_frames=min_frames) for path in traj_files)
 
 def cleanup_temp_files(checkpoint_dir: str):
     """清理损坏的临时文件 (.tmp)"""
@@ -412,6 +548,9 @@ class ABFEPipeline:
         """获取全局状态文件路径"""
         return os.path.join(self.checkpoint_dir, "pipeline_state.json")
 
+    def _get_state_lock_file(self) -> str:
+        return self._get_state_file() + ".lock"
+
     def _load_pipeline_state(self) -> Dict:
         """加载 Pipeline 状态"""
         state_file = self._get_state_file()
@@ -435,16 +574,21 @@ class ABFEPipeline:
 
     def _update_stage_status(self, stage: str, status: str, extra: Dict = None):
         """更新阶段状态"""
-        state = self._load_pipeline_state()
-        if "stages" not in state:
-            state["stages"] = {}
+        try:
+            with _PipelineStateLock(self._get_state_lock_file()):
+                state = self._load_pipeline_state()
+                if "stages" not in state:
+                    state["stages"] = {}
 
-        state["stages"][stage] = {
-            "status": status,
-            "timestamp": datetime.now().isoformat(),
-            **(extra or {}),
-        }
-        self._save_pipeline_state(state)
+                state["stages"][stage] = {
+                    "status": status,
+                    "timestamp": datetime.now().isoformat(),
+                    **(extra or {}),
+                }
+                self._save_pipeline_state(state)
+        except Exception as e:
+            self._log(f"  ⚠️ 状态更新失败 ({stage}={status}): {e}")
+            return
         self._log(f"  📝 状态更新: {stage} = {status}")
 
     # =========================================================================
@@ -590,9 +734,27 @@ class ABFEPipeline:
         
         cleanup_temp_files(self.checkpoint_dir)
         self._log(f"🔄 启动带 Boresch 限制力的再平衡 ({n_steps} 步)...")
+        chk_path = os.path.join(self.output_dir, "rebalance.chk")
+        traj_path = os.path.join(self.output_dir, "rebalance_traj.dcd")
+        state_path = os.path.join(self.output_dir, "rebalance_state.json")
+
+        if resume and os.path.exists(state_path) and _is_checkpoint_valid(chk_path) and _is_traj_valid(traj_path, min_frames=1):
+            try:
+                with open(state_path, "r", encoding="utf-8") as f:
+                    rebalance_state = json.load(f)
+                if rebalance_state.get("status") == "completed" and rebalance_state.get("n_steps") == int(n_steps):
+                    self._log("  ♻️ 再平衡状态已完成，且 Checkpoint/轨迹有效，跳过重复再平衡。")
+                    return {
+                        "positions": self.positions,
+                        "box_vectors": self.box_vectors,
+                        "resumed": True,
+                        "skipped": True,
+                    }
+            except Exception as e:
+                self._log(f"  ⚠️ 再平衡完成态读取失败 ({e})，继续按 Checkpoint 续跑逻辑处理")
 
         # ✅ 新增：初始距离检查，防止拉力过载
-        if boresch_params and "receptor_indices" in boresch_params:
+        if _has_valid_boresch_restraint(boresch_params):
             import numpy as np
             from openmm import unit
             
@@ -630,8 +792,10 @@ class ABFEPipeline:
             # 3. 安全索引 (将 ligand_indices 转为 numpy 整数数组)
             lig_idx_arr = np.array(self.ligand_indices, dtype=int)
             lig_com = pos_nm[lig_idx_arr].mean(axis=0)
-            box_center = 0.5 * np.diag(self.box_vectors.value_in_unit(unit.nanometer))
-            if np.linalg.norm(lig_com - box_center) > 0.4 * np.min(np.diag(self.box_vectors.value_in_unit(unit.nanometer))):
+            box_nm = np.asarray([v.value_in_unit(unit.nanometer) for v in self.box_vectors], dtype=np.float64)
+            box_center = 0.5 * np.sum(box_nm, axis=0)
+            box_lengths = np.linalg.norm(box_nm, axis=1)
+            if np.linalg.norm(lig_com - box_center) > 0.4 * np.min(box_lengths):
                 self.positions, self.box_vectors = self._wrap_ligand_to_box(self.positions, self.box_vectors)
                 self._log("  📦 检测到配体偏离主周期，已自动执行 PBC 居中")            
             # 计算实际距离 (H0-L0: 最近受体锚点 - 配体首锚点)
@@ -650,7 +814,7 @@ class ABFEPipeline:
         _ = rebal_sys.getNumParticles()  # 触发底层指针验证，固化状态
         
         # 添加 Boresch 限制力 (fixed_lam=1.0 全程开启)
-        if boresch_params and "receptor_indices" in boresch_params:
+        if _has_valid_boresch_restraint(boresch_params):
             rest_force = LambdaDependentBoreschForce(
                 rec_idx=boresch_params["receptor_indices"],
                 lig_idx=boresch_params["ligand_indices"],
@@ -658,6 +822,7 @@ class ABFEPipeline:
                 fc=boresch_params["force_constants"],
                 fixed_lam=1.0,
                 sign=1.0,
+                use_pbc=True,
             )
             rest_force.setForceGroup(3)  # 与采样阶段一致
             rebal_sys.addForce(rest_force)
@@ -684,7 +849,6 @@ class ABFEPipeline:
         simulation = app.Simulation(self.topology, rebal_sys, integrator, platform, props)
         
         # ✅ 挂载统一 Reporter
-        chk_path = os.path.join(self.output_dir, "rebalance.chk")
         dcd_path, log_path, _ = attach_simulation_reporters(
             simulation, "rebalance", self.output_dir,
             traj_interval=2000, energy_interval=500, chk_interval=5000
@@ -731,7 +895,24 @@ class ABFEPipeline:
                 import gc; gc.collect()
             except Exception as e:
                 self._log(f"  ⚠️ 上下文清理警告: {e}")
-        
+
+        try:
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "status": "completed",
+                        "n_steps": int(n_steps),
+                        "timestamp": datetime.now().isoformat(),
+                        "checkpoint": chk_path,
+                        "trajectory": dcd_path,
+                        "log": log_path,
+                    },
+                    f,
+                    indent=2,
+                )
+        except Exception as e:
+            self._log(f"  ⚠️ 再平衡完成态保存失败: {e}")
+
         self._log(f"  ✓ 再平衡完成 | 坐标已更新")
         return {"positions": new_positions, "box_vectors": new_box}
 
@@ -1026,11 +1207,26 @@ class ABFEPipeline:
         
         self._log(f"\n[PIPELINE] 开始优化 {stage_name} 阶段...")
         softcore_obj = ACESoftcorePotential.from_dict(ACESoftcorePotential.optimize_alpha(len(self.ligand_indices)))
-        
+
         if stage_name == "decharging":
-            probe_sys = build_aces_probe_system_dual_lambda(self.system, self.ligand_indices, softcore_obj, fixed_lam_coul=1.0, fixed_lam_vdw=1.0)
-        else:
-            probe_sys = build_aces_probe_system_dual_lambda(self.system, self.ligand_indices, softcore_obj, fixed_lam_coul=0.0, fixed_lam_vdw=1.0)
+            self._log(
+                "[PIPELINE] Stage 1 去电荷预优化已强制禁用自适应 Pathfinding："
+                "Cutoff 型 CustomNonbonded 探针无法保真 PME 长程静电，直接回退线性 λ 路径。"
+            )
+            opt_n_states = int(n_states)
+            return {
+                "lambdas_var": np.linspace(1.0, 0.0, opt_n_states).tolist(),
+                "n_states": opt_n_states,
+                "window_ranges": generate_overlapping_windows(
+                    n_states=opt_n_states,
+                    n_windows=None,
+                    pts_per_window=6,
+                    overlap=2,
+                ),
+                "softcore_params": softcore_obj,
+            }
+        
+        probe_sys = build_aces_probe_system_dual_lambda(self.system, self.ligand_indices, softcore_obj, fixed_lam_coul=0.0, fixed_lam_vdw=1.0)
 
         integrator = openmm.LangevinMiddleIntegrator(self.temperature, 1.0 / unit.picosecond, 0.002 * unit.picosecond)
         try:
@@ -1153,6 +1349,77 @@ class ABFEPipeline:
             fixed_lam_vdw if stage_name == "decharging" else fixed_lam_coul
         ] * n_states
 
+        if stage_name == "decharging":
+            self._log(
+                "  ⚠️ Coulomb 去电荷阶段已禁用 IBS-CustomNonbondedForce；"
+                "改用 NonbondedForce ParameterOffset 路径以保留 PME 长程静电。"
+            )
+            stage_output_dir = os.path.join(self.output_dir, stage_name)
+            os.makedirs(stage_output_dir, exist_ok=True)
+            lambdas_coul = lambdas_var
+            lambdas_vdw = lambdas_fix
+            temp_k = self.temperature.value_in_unit(unit.kelvin)
+            traj_files = _expected_remd_traj_files(stage_output_dir, stage_name, len(lambdas_coul))
+            u_kn_path = os.path.join(stage_output_dir, f"{stage_name}_pme_u_kn.npy")
+            if resume and os.path.exists(u_kn_path) and _is_pme_u_kn_cache_compatible(stage_output_dir, stage_name, n_states):
+                self._log("  ♻️ 检测到已有 PME u_kn，跳过 REMD 采样与重算，直接求解 MBAR")
+                u_kn = np.load(u_kn_path)
+                analyzer = TraditionalMBARAnalyzer(temperature=temp_k)
+                res = analyzer.solve(u_kn)
+                return {
+                    "stage": stage_name,
+                    "total_delta_G": float(res.get("delta_G", 0.0)),
+                    "total_error": float(res.get("error", 0.0)),
+                    "method": "PME-REMD-MBAR",
+                    "n_states": int(n_states),
+                }
+            elif resume and os.path.exists(u_kn_path):
+                self._log("  ♻️ 检测到旧版 PME u_kn 缓存，但模型版本不兼容；保留轨迹并重新执行离线 MBAR 重算。")
+
+            if resume and _all_remd_trajs_valid(stage_output_dir, stage_name, len(lambdas_coul), min_frames=1):
+                self._log("  ♻️ 检测到完整 REMD DCD，视为采样已完成，跳过 REMD 继续离线 MBAR")
+            else:
+                remd = REMDManager(
+                    system_template=self.system,
+                    topology=self.topology,
+                    positions=self.positions,
+                    box_vectors=self.box_vectors,
+                    ligand_indices=self.ligand_indices,
+                    lambdas_coul=lambdas_coul,
+                    lambdas_vdw=lambdas_vdw,
+                    temperature=temp_k,
+                    platform_name=self.platform_name,
+                    output_dir=stage_output_dir,
+                )
+                traj_files = remd.run(
+                    n_steps=n_steps_per_window,
+                    exchange_interval=max(1, int(steps_per_update)),
+                    stage_name=stage_name,
+                )
+
+            analyzer = TraditionalMBARAnalyzer(temperature=temp_k)
+            u_kn = analyzer.compute_u_kn(
+                traj_files=traj_files,
+                system_template=self.system,
+                ligand_indices=self.ligand_indices,
+                lambdas_coul=lambdas_coul,
+                lambdas_vdw=lambdas_vdw,
+                platform_name="CPU",
+                topology=self.topology,
+                reference_positions=self.positions,
+                reference_box_vectors=self.box_vectors,
+            )
+            np.save(os.path.join(stage_output_dir, f"{stage_name}_pme_u_kn.npy"), u_kn)
+            _write_pme_u_kn_meta(stage_output_dir, stage_name, n_states)
+            res = analyzer.solve(u_kn)
+            return {
+                "stage": stage_name,
+                "total_delta_G": float(res.get("delta_G", 0.0)),
+                "total_error": float(res.get("error", 0.0)),
+                "method": "PME-REMD-MBAR",
+                "n_states": int(n_states),
+            }
+
         # 2. 划分窗口
         from abfe_preoptimizer import generate_overlapping_windows
         pts_per_window, overlap = 6, 2
@@ -1211,11 +1478,22 @@ class ABFEPipeline:
         # ✅ 导入修复后的函数
         from ibs_engine import solve_stage_integrated
         
+        window_outputs = manager.get_stage_data_for_analysis(stage_type=stage_type)
+        if not window_outputs:
+            raise RuntimeError(
+                f"{stage_name} 阶段未找到任何窗口能量文件，无法执行全局 TMBAR。"
+                "这通常意味着窗口落盘失败或输出目录异常。"
+            )
+
         stage_result = solve_stage_integrated(
-            window_outputs=manager.get_stage_data_for_analysis(stage_type=stage_type),  # ✅ 改为 window_outputs
+            window_outputs=window_outputs,
             kt=kt_val,
             stage_name=stage_name
         )
+        if stage_result.get("error"):
+            raise RuntimeError(
+                f"{stage_name} 阶段全局 TMBAR 失败: {stage_result['error']}"
+            )
         return stage_result
 
     # =========================================================================
@@ -1361,6 +1639,17 @@ class ABFEPipeline:
         if kr_val <= 0:
             self._log(f"  ⚠️ 检测到异常 kr={kr_val}，自动替换为保守默认值 418.4 kJ/mol/nm²")
             fc_norm["kr"] = 418.4
+
+        thA_val = float(eq_norm.get("thetaA0", 1.5708))
+        thB_val = float(eq_norm.get("thetaB0", 1.5708))
+        sin_guard = min(abs(np.sin(thA_val)), abs(np.sin(thB_val)))
+        if sin_guard < 0.1:
+            self._log(
+                f"  ⚠️ Boresch 平衡角接近奇点: "
+                f"θA={np.degrees(thA_val):.2f}°, θB={np.degrees(thB_val):.2f}° "
+                f"(min|sinθ|={sin_guard:.4f})，跳过解析修正。"
+            )
+            return {"delta_g_rest": 0.0, "error": 0.0}
             
         # 4. 计算修正项 (移除 try...except 静默吞没，改为明确日志)
         delta_g = 0.0
@@ -1382,7 +1671,7 @@ class ABFEPipeline:
 
     def update_boresch_from_last_frame(self, boresch_params: Optional[Dict] = None) -> Optional[Dict]:
         """🔑 生产级修复：严格拦截奇点角度与异常漂移，防止自动更新引入 NaN 隐患"""
-        if not boresch_params or "receptor_indices" not in boresch_params:
+        if not _has_valid_boresch_restraint(boresch_params):
             return boresch_params
         try:
             from abfe_core import calc_boresch_from_last_frame
@@ -1481,7 +1770,14 @@ class ABFEPipeline:
         self._log(f"{'='*60}")
         complex_res = self.run_full_pipeline(decoupling_scheme=decoupling_scheme, run_equilibration=True, **kwargs)
         
-        delta_g_bind = complex_res["total_delta_G"]
+        delta_g_bind = complex_res.get(
+            "total_delta_G_complex_kJ_mol",
+            complex_res.get("total_delta_G", 0.0),
+        )
+        total_err_bind = complex_res.get(
+            "total_error_kJ_mol",
+            complex_res.get("total_error", 0.0),
+        )
         
         if run_solvent and solvent_gro and solvent_top:
             print("\n💧 启动溶剂相 (Ligand-in-Water) 计算...")
@@ -1490,13 +1786,24 @@ class ABFEPipeline:
             ligand_resname = self.topology.atom(self.ligand_indices[0]).residue.name
             solvent_runner = SolventLegRunner(ligand_resname, platform_name=self.platform_name)
             sys_solv, top_solv, pos_solv, box_solv = solvent_runner.build_solvent_system(solvent_gro, solvent_top)
+            solvent_ligand_indices = [
+                atom.index for atom in top_solv.atoms()
+                if atom.residue.name == ligand_resname
+            ]
             
             # 复用配置
-            solvent_res = solvent_runner.run_solvent_decoupling(pos_solv, top_solv, self.ligand_indices, **kwargs)
-            delta_g_bind -= solvent_res["total_delta_G"]
+            solvent_res = solvent_runner.run_solvent_decoupling(pos_solv, top_solv, solvent_ligand_indices, **kwargs)
+            delta_g_bind -= solvent_res.get(
+                "decoupling_delta_G_kJ_mol",
+                solvent_res.get("total_delta_G_complex_kJ_mol", solvent_res.get("total_delta_G", 0.0)),
+            )
+            total_err_bind = float(np.sqrt(
+                total_err_bind**2
+                + solvent_res.get("total_error_kJ_mol", solvent_res.get("total_error", 0.0))**2
+            ))
             
-        print(f"\n🎯 最终结合自由能 ΔG_bind = {delta_g_bind:.2f} ± {complex_res['total_error']:.2f} kJ/mol")
-        return {"delta_g_bind": delta_g_bind, "complex": complex_res}
+        print(f"\n🎯 最终结合自由能 ΔG_bind = {delta_g_bind:.2f} ± {total_err_bind:.2f} kJ/mol")
+        return {"delta_g_bind": delta_g_bind, "total_error": total_err_bind, "complex": complex_res}
 
     # =========================================================================
     # 6. 主流程控制器
@@ -1616,15 +1923,7 @@ class ABFEPipeline:
                     del sim.context; del sim; del temp_sys
                 except Exception as e:
                     self._log(f"  ⚠️ 快速最小化失败: {e}，使用当前坐标继续")
-                    
-            else:
-                # === 正常执行预平衡 ===
-                self._log("  ⏳ 预平衡状态未完成或首次运行，开始执行...")
-                equil_data = self.pre_equilibrate(resume=resume)  # ✅ 透传 resume
-                self.positions = equil_data["positions"]
-                self.box_vectors = equil_data["box_vectors"]
-                self._log("  ✓ 预平衡轨迹已保存，坐标已更新至稳态。")
-                
+
         else:
             self._log("⚠️ 跳过预平衡 (使用传入初始坐标)。")
 
@@ -1674,7 +1973,7 @@ class ABFEPipeline:
         # 3. 用最后一帧更新 Boresch 平衡几何量
         # =========================================================================
         # ✅ 无论是否跳过预平衡，只要挂载了限制力就更新平衡值
-        if boresch_params and "receptor_indices" in boresch_params:
+        if _has_valid_boresch_restraint(boresch_params):
             self._log("  🔧 正在用当前坐标更新 Boresch 平衡几何量...")
             boresch_params = self.update_boresch_from_last_frame(boresch_params)
             r0 = boresch_params["equilibrium_values"].get("r0", 0) * 10  # nm → Å
@@ -1697,7 +1996,7 @@ class ABFEPipeline:
                 return final
             else:
                 self._log("  ⚠️ 状态标记为完成但未找到结果文件，重新运行采样")
-        elif decoupling_scheme == "dual_lambda":
+        if decoupling_scheme == "dual_lambda":
             stage1_key = "sampling_dual_decharging"
             stage2_key = "sampling_dual_vanishing"
             stage1_status = stages.get(stage1_key, {}).get("status")
@@ -1719,10 +2018,17 @@ class ABFEPipeline:
                 try:
                     with open(preopt1_file, "r") as f:
                         cached = json.load(f)
-                    optimized_lambdas_1 = cached["lambdas_var"]
-                    self._log(
-                        f"  ♻️ 已加载 Stage 1 优化路径缓存 ({len(optimized_lambdas_1)} 个状态)"
-                    )
+                    cached_lambdas = cached["lambdas_var"]
+                    if len(cached_lambdas) == int(n_states_per_stage):
+                        optimized_lambdas_1 = cached_lambdas
+                        self._log(
+                            f"  ♻️ 已加载 Stage 1 优化路径缓存 ({len(optimized_lambdas_1)} 个状态)"
+                        )
+                    else:
+                        self._log(
+                            f"  ⚠️ Stage 1 优化路径缓存状态数不匹配 "
+                            f"({len(cached_lambdas)} != {n_states_per_stage})，重新优化"
+                        )
                 except Exception as e:
                     self._log(f"  ⚠️ 加载 Stage 1 优化缓存失败: {e}，将重新优化")
 
@@ -1740,6 +2046,7 @@ class ABFEPipeline:
                         json.dump({
                             "lambdas_var": optimized_lambdas_1,
                             "window_ranges": window_ranges_1,
+                            "n_states": len(optimized_lambdas_1),
                         }, f, indent=2)
                     self._log(f"  ✓ Stage 1 优化路径已缓存")
                 except Exception as e:
@@ -1751,8 +2058,11 @@ class ABFEPipeline:
                 try:
                     with open(stage1_file, "r") as f:
                         stage1 = json.load(f)
-                    self._log("  ♻️ 双λ Stage 1 (去电荷) 已完成，跳过")
-                    should_run_stage1 = False
+                    if stage1.get("n_states") == int(n_states_per_stage):
+                        self._log("  ♻️ 双λ Stage 1 (去电荷) 已完成，跳过")
+                        should_run_stage1 = False
+                    else:
+                        self._log("  ⚠️ Stage 1 结果缓存状态数不匹配，重新运行")
                 except Exception as e:
                     self._log(f"  ⚠️ Stage 1 缓存读取失败: {e}，重新运行")
 
@@ -1762,10 +2072,17 @@ class ABFEPipeline:
                 try:
                     with open(preopt2_file, "r") as f:
                         cached = json.load(f)
-                    optimized_lambdas_2 = cached["lambdas_var"]
-                    self._log(
-                        f"  ♻️ 已加载 Stage 2 优化路径缓存 ({len(optimized_lambdas_2)} 个状态)"
-                    )
+                    cached_lambdas = cached["lambdas_var"]
+                    if len(cached_lambdas) == int(n_states_per_stage):
+                        optimized_lambdas_2 = cached_lambdas
+                        self._log(
+                            f"  ♻️ 已加载 Stage 2 优化路径缓存 ({len(optimized_lambdas_2)} 个状态)"
+                        )
+                    else:
+                        self._log(
+                            f"  ⚠️ Stage 2 优化路径缓存状态数不匹配 "
+                            f"({len(cached_lambdas)} != {n_states_per_stage})，重新优化"
+                        )
                 except Exception as e:
                     self._log(f"  ⚠️ 加载 Stage 2 优化缓存失败: {e}，将重新优化")
 
@@ -1783,6 +2100,7 @@ class ABFEPipeline:
                         json.dump({
                             "lambdas_var": optimized_lambdas_2,
                             "window_ranges": window_ranges_2,
+                            "n_states": len(optimized_lambdas_2),
                         }, f, indent=2)
                     self._log(f"  ✓ Stage 2 优化路径已缓存")
                 except Exception as e:
@@ -1794,8 +2112,11 @@ class ABFEPipeline:
                 try:
                     with open(stage2_file, "r") as f:
                         stage2 = json.load(f)
-                    self._log("  ♻️ 双λ Stage 2 (去VDW) 已完成，跳过")
-                    should_run_stage2 = False
+                    if stage2.get("n_states") == int(n_states_per_stage):
+                        self._log("  ♻️ 双λ Stage 2 (去VDW) 已完成，跳过")
+                        should_run_stage2 = False
+                    else:
+                        self._log("  ⚠️ Stage 2 结果缓存状态数不匹配，重新运行")
                 except Exception as e:
                     self._log(f"  ⚠️ Stage 2 缓存读取失败: {e}，重新运行")
 
@@ -1902,14 +2223,14 @@ class ABFEPipeline:
 
                 # Save checkpoint files
                 _s1 = {"stage": "decharging", "total_delta_G": stage1["total_delta_G"],
-                        "total_error": stage1["total_error"]}
+                        "total_error": stage1["total_error"], "n_states": int(n_states_per_stage)}
                 with open(stage1_file, "w") as f:
                     json.dump(_s1, f, indent=2)
                 self._update_stage_status(stage1_key, "completed",
                                           {"total_delta_G": stage1["total_delta_G"]})
 
                 _s2 = {"stage": "vanishing", "total_delta_G": stage2["total_delta_G"],
-                        "total_error": stage2["total_error"]}
+                        "total_error": stage2["total_error"], "n_states": int(n_states_per_stage)}
                 with open(stage2_file, "w") as f:
                     json.dump(_s2, f, indent=2)
                 self._update_stage_status(stage2_key, "completed",
@@ -1940,6 +2261,7 @@ class ABFEPipeline:
                         "stage": "decharging",
                         "total_delta_G": stage1["total_delta_G"],
                         "total_error": stage1["total_error"],
+                        "n_states": int(n_states_per_stage),
                     }
                     os.makedirs(self.checkpoint_dir, exist_ok=True)
                     with open(stage1_file, "w") as f:
@@ -1975,6 +2297,7 @@ class ABFEPipeline:
                         "stage": "vanishing",
                         "total_delta_G": stage2["total_delta_G"],
                         "total_error": stage2["total_error"],
+                        "n_states": int(n_states_per_stage),
                     }
                     os.makedirs(self.checkpoint_dir, exist_ok=True)
                     with open(stage2_file, "w") as f:
@@ -2238,25 +2561,39 @@ class TraditionalABFEPipeline:
         lambdas_vdw: List[float],
         n_steps: int = 500000,
         exchange_interval: int = 1000,
+        resume: bool = False,
     ) -> Dict:
         print(f"\n{'='*60}\n🧪 开始 {stage_name} 腿解耦\n{'='*60}")
-        remd = REMDManager(
-            system_template=self.system,
-            topology=self.topology,
-            positions=self.positions,
-            box_vectors=self.box_vectors,
-            ligand_indices=self.ligand_indices,
-            lambdas_coul=lambdas_coul,
-            lambdas_vdw=lambdas_vdw,
-            temperature=self.temperature,
-            platform_name=self.platform_name,
-            output_dir=os.path.join(self.output_dir, stage_name),
-        )
-        traj_files = remd.run(
-            n_steps=n_steps,
-            exchange_interval=exchange_interval,
-            stage_name=stage_name,
-        )
+        stage_output_dir = os.path.join(self.output_dir, stage_name)
+        os.makedirs(stage_output_dir, exist_ok=True)
+        traj_files = _expected_remd_traj_files(stage_output_dir, stage_name, len(lambdas_coul))
+        u_kn_path = os.path.join(self.output_dir, f"{stage_name}_u_kn.npy")
+
+        if resume and os.path.exists(u_kn_path):
+            print("  ♻️ 检测到已有 u_kn，跳过 REMD 采样与重算，直接求解 MBAR")
+            u_kn = np.load(u_kn_path)
+            return TraditionalMBARAnalyzer(temperature=self.temperature).solve(u_kn)
+
+        if resume and _all_remd_trajs_valid(stage_output_dir, stage_name, len(lambdas_coul), min_frames=1):
+            print("  ♻️ 检测到完整 REMD DCD，视为采样已完成，跳过 REMD 继续离线 MBAR")
+        else:
+            remd = REMDManager(
+                system_template=self.system,
+                topology=self.topology,
+                positions=self.positions,
+                box_vectors=self.box_vectors,
+                ligand_indices=self.ligand_indices,
+                lambdas_coul=lambdas_coul,
+                lambdas_vdw=lambdas_vdw,
+                temperature=self.temperature,
+                platform_name=self.platform_name,
+                output_dir=stage_output_dir,
+            )
+            traj_files = remd.run(
+                n_steps=n_steps,
+                exchange_interval=exchange_interval,
+                stage_name=stage_name,
+            )
 
         analyzer = TraditionalMBARAnalyzer(temperature=self.temperature)
         u_kn = analyzer.compute_u_kn(
@@ -2266,6 +2603,9 @@ class TraditionalABFEPipeline:
             lambdas_coul=lambdas_coul,
             lambdas_vdw=lambdas_vdw,
             platform_name="CPU",
+            topology=self.topology,
+            reference_positions=self.positions,
+            reference_box_vectors=self.box_vectors,
         )
         np.save(os.path.join(self.output_dir, f"{stage_name}_u_kn.npy"), u_kn)
         return analyzer.solve(u_kn)
@@ -2278,11 +2618,11 @@ class TraditionalABFEPipeline:
     ) -> Dict:
         lambdas_coul = np.linspace(1.0, 0.0, n_lambda).tolist()
         lambdas_vdw = [1.0] * n_lambda
-        res_coul = self.run_leg("decharging", lambdas_coul, lambdas_vdw, n_steps_per_leg)
+        res_coul = self.run_leg("decharging", lambdas_coul, lambdas_vdw, n_steps_per_leg, resume=False)
 
         lambdas_coul = [0.0] * n_lambda
         lambdas_vdw = np.linspace(1.0, 0.0, n_lambda).tolist()
-        res_vdw = self.run_leg("vanishing", lambdas_coul, lambdas_vdw, n_steps_per_leg)
+        res_vdw = self.run_leg("vanishing", lambdas_coul, lambdas_vdw, n_steps_per_leg, resume=False)
 
         dg_phys = res_coul["delta_G"] + res_vdw["delta_G"]
         err_phys = np.sqrt(res_coul["error"]**2 + res_vdw["error"]**2)
