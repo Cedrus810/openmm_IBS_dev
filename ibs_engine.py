@@ -33,6 +33,9 @@ from abfe_core import (
     ensure_owned_system,
     sync_all_exclusions,
     BeutlerSoftcoreBuilder,
+    _build_mbar_compatible,
+    _compute_free_energy_result_compatible,
+    _extract_free_energy_arrays,
 )
 
 try:
@@ -245,6 +248,20 @@ def _prepare_pme_coulomb_leg_system(
     return prepared
 
 
+def _compute_ligand_net_charge(
+    system: openmm.System,
+    ligand_indices: List[int],
+) -> float:
+    nb_force = next((f for f in system.getForces() if isinstance(f, openmm.NonbondedForce)), None)
+    if nb_force is None:
+        raise RuntimeError("系统中未找到 NonbondedForce，无法统计配体净电荷。")
+    total = 0.0
+    for idx in ligand_indices:
+        q, _, _ = nb_force.getParticleParameters(int(idx))
+        total += q.value_in_unit(unit.elementary_charge)
+    return float(total)
+
+
 def _build_traditional_mbar_eval_context(
     system_xml: str,
     platform_name: str,
@@ -277,8 +294,9 @@ def _compute_u_kn_chunk(task: Dict) -> Tuple[int, np.ndarray]:
     u_chunk = np.zeros((n_states, xyz_chunk.shape[0]), dtype=np.float64)
     kt = float(task["kt"])
     is_pme_coulomb_leg = bool(task["is_pme_coulomb_leg"])
+    apply_pme_self_correction = bool(task.get("apply_pme_self_correction", False))
     pme_self_prefactor_kj = None
-    if is_pme_coulomb_leg:
+    if is_pme_coulomb_leg and apply_pme_self_correction:
         lig_qsq = float(task.get("ligand_charge_square_sum", 0.0))
         if lig_qsq > 0.0:
             nb_force = next((f for f in eval_sys.getForces() if isinstance(f, openmm.NonbondedForce)), None)
@@ -302,7 +320,7 @@ def _compute_u_kn_chunk(task: Dict) -> Tuple[int, np.ndarray]:
             REMDManager._try_set_context_parameter(ctx, "lambda_vdw", lambdas_vdw[k])
             if is_pme_coulomb_leg:
                 e = ctx.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-                if pme_self_prefactor_kj is not None:
+                if apply_pme_self_correction and pme_self_prefactor_kj is not None:
                     # PME 总能量包含与坐标无关的自能项 -C*lambda^2。
                     # 它不会影响构型采样，但会严重污染 ΔG；这里在离线 u_kn 中解析去除。
                     e += pme_self_prefactor_kj * (lambdas_coul[k] ** 2)
@@ -2378,7 +2396,7 @@ class GlobalMBARAnalyzer:
             
             try:
                 # 使用混合求解器，提高收敛性
-                mbar = pymbar.MBAR(
+                mbar = _build_mbar_compatible(
                     u_mbar_final,
                     n_k_local,
                     relative_tolerance=1e-7,
@@ -2386,13 +2404,14 @@ class GlobalMBARAnalyzer:
                     solver_protocol="default",
                 )
                 
-                res = mbar.compute_free_energy_differences()
+                res = _compute_free_energy_result_compatible(mbar, compute_uncertainty=True)
+                df_matrix, ddf_matrix = _extract_free_energy_arrays(res, require_uncertainty=True)
                 
                 # Delta_f[0, k] 是第 k 个物理态相对于采样态 (Row 0) 的自由能差 (单位: kT)
                 # 注意：res['Delta_f'] 的形状是 (K+1, K+1)
                 # 我们想要的是物理态 (indices 1..K) 的结果
-                f_phys_kt = res['Delta_f'][0, 1:] 
-                df_phys_kt = res['dDelta_f'][0, 1:]
+                f_phys_kt = df_matrix[0, 1:] 
+                df_phys_kt = ddf_matrix[0, 1:]
                 
                 # 转换为 kJ/mol
                 f_phys_kj = f_phys_kt * self.kt
@@ -3089,14 +3108,23 @@ class TraditionalMBARAnalyzer:
             and not np.allclose(lambdas_coul_arr, lambdas_coul_arr[0])
         )
         ligand_charge_square_sum = 0.0
+        apply_pme_self_correction = False
         if is_pme_coulomb_leg:
             nb_force_ref = next((f for f in system_template.getForces() if isinstance(f, openmm.NonbondedForce)), None)
             if nb_force_ref is None:
                 raise RuntimeError("PME 去电荷路径未找到参考 NonbondedForce，无法估算自能修正。")
+            ligand_net_charge = _compute_ligand_net_charge(system_template, ligand_indices)
             for idx in ligand_indices:
                 q, _, _ = nb_force_ref.getParticleParameters(int(idx))
                 q_val = q.value_in_unit(unit.elementary_charge)
                 ligand_charge_square_sum += q_val * q_val
+            if abs(ligand_net_charge) < 0.01:
+                apply_pme_self_correction = True
+            else:
+                print(
+                    "  ⚠️ 检测到带电配体的共炼金 PME 去电荷路径；"
+                    "已禁用 ligand-only 解析自能补偿，避免引入数百 kJ/mol 的错误偏移。"
+                )
         xyz_all = np.asarray(traj.xyz, dtype=np.float64)
         box_all = None
         if traj.unitcell_vectors is not None and len(traj.unitcell_vectors) > 0:
@@ -3147,6 +3175,7 @@ class TraditionalMBARAnalyzer:
                     "platform_name": platform_name,
                     "kt": self.kt,
                     "is_pme_coulomb_leg": is_pme_coulomb_leg,
+                    "apply_pme_self_correction": apply_pme_self_correction,
                     "ligand_charge_square_sum": ligand_charge_square_sum,
                 }
             )
@@ -3197,7 +3226,7 @@ class TraditionalMBARAnalyzer:
         )
         for protocol, method_name in protocol_plan:
             try:
-                last_mbar = pymbar.MBAR(
+                last_mbar = _build_mbar_compatible(
                     u_kn_stable,
                     n_k,
                     solver_protocol=protocol,
@@ -3206,14 +3235,28 @@ class TraditionalMBARAnalyzer:
                     verbose=False,
                 )
                 try:
-                    res = last_mbar.compute_free_energy_differences(compute_uncertainty=True)
-                    err = float(res["dDelta_f"][0, -1] * self.kt)
+                    res = _compute_free_energy_result_compatible(
+                        last_mbar,
+                        compute_uncertainty=True,
+                    )
+                    df_matrix, ddf_matrix = _extract_free_energy_arrays(
+                        res,
+                        require_uncertainty=True,
+                    )
+                    err = float(ddf_matrix[0, -1] * self.kt)
                 except Exception as cov_exc:
                     print(f"  ⚠️ MBAR 协方差求解失败 ({protocol}): {cov_exc}，回退为仅计算 ΔG 不估计误差")
-                    res = last_mbar.compute_free_energy_differences(compute_uncertainty=False)
+                    res = _compute_free_energy_result_compatible(
+                        last_mbar,
+                        compute_uncertainty=False,
+                    )
+                    df_matrix, _ = _extract_free_energy_arrays(
+                        res,
+                        require_uncertainty=False,
+                    )
                     err = float("nan")
 
-                dg = float((res["Delta_f"][0, -1] - res["Delta_f"][0, 0]) * self.kt)
+                dg = float((df_matrix[0, -1] - df_matrix[0, 0]) * self.kt)
                 return {
                     "delta_G": dg,
                     "error": err,

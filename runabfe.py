@@ -1591,11 +1591,7 @@ def main():
 
     # ----- 7. 输出最终结果 -----
     log.info("✅ ABFE 计算完成")
-    if results:
-        if "total_delta_G_complex_kJ_mol" in results:
-            log.info(UnitFormatter.format_results_human(results))
-        else:
-            log.info("结果已生成，见 %s/final_results.json", output_dir)
+    log.info("结果已生成，见 %s", bind_out_path)
 
 
 if __name__ == "__main__":

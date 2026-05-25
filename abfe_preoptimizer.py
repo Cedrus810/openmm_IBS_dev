@@ -907,6 +907,55 @@ def build_aces_probe_system(system, perturbed_indices, softcore_params, prefix="
 # ============================================================================
 # 双λ 2D 度量张量场采集与单调有向图寻径 (DualLambdaPreOptimizer 扩展)
 # ============================================================================
+def _is_safe_dual_lambda_state(lam_coul: float, lam_vdw: float, tol: float = 1e-8) -> bool:
+    """硬性物理边界：禁止在 VDW 斥力消失过快时保留过多电荷。"""
+    return float(lam_vdw) + tol >= float(lam_coul)
+
+
+def _safe_lambda_delta(base: float, trial: float) -> float:
+    return max(0.0, min(1.0, float(trial))) - float(base)
+
+
+def _sample_group1_energy(context, lam_coul: float, lam_vdw: float) -> float:
+    context.setParameter("lam_coul", float(lam_coul))
+    context.setParameter("lam_vdw", float(lam_vdw))
+    return context.getState(getEnergy=True, groups={1}).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+
+
+def _finite_difference_on_safe_region(context, lc: float, lv: float, axis: str, delta: float) -> float:
+    """
+    仅在安全区域内估计 dU/dlambda，优先中心差分，否则退回单边差分。
+    """
+    if axis == "coul":
+        plus = (lc + delta, lv)
+        minus = (lc - delta, lv)
+    else:
+        plus = (lc, lv + delta)
+        minus = (lc, lv - delta)
+
+    plus_ok = 0.0 <= plus[0] <= 1.0 and 0.0 <= plus[1] <= 1.0 and _is_safe_dual_lambda_state(*plus)
+    minus_ok = 0.0 <= minus[0] <= 1.0 and 0.0 <= minus[1] <= 1.0 and _is_safe_dual_lambda_state(*minus)
+
+    e0 = None
+    if plus_ok and minus_ok:
+        e_plus = _sample_group1_energy(context, *plus)
+        e_minus = _sample_group1_energy(context, *minus)
+        return (e_plus - e_minus) / (2.0 * delta)
+    if plus_ok:
+        e_plus = _sample_group1_energy(context, *plus)
+        e0 = _sample_group1_energy(context, lc, lv)
+        step = _safe_lambda_delta(lc if axis == "coul" else lv, plus[0] if axis == "coul" else plus[1])
+        return (e_plus - e0) / max(step, 1e-8)
+    if minus_ok:
+        e_minus = _sample_group1_energy(context, *minus)
+        e0 = _sample_group1_energy(context, lc, lv)
+        step = _safe_lambda_delta(lc if axis == "coul" else lv, minus[0] if axis == "coul" else minus[1])
+        return (e0 - e_minus) / max(abs(step), 1e-8)
+    raise RuntimeError(
+        f"状态 (lambda_coul={lc:.3f}, lambda_vdw={lv:.3f}) 在 axis={axis} 上缺少安全差分邻点"
+    )
+
+
 def compute_2d_metric_grid(context, lam_c_grid, lam_v_grid, n_steps=3000, delta=0.02, temperature=300.0):
     """采集 2D 度量张量场 g_cc, g_vv, g_cv 用于黎曼几何路径规划"""
     beta = 1.0 / (0.00831446 * temperature)
@@ -914,9 +963,19 @@ def compute_2d_metric_grid(context, lam_c_grid, lam_v_grid, n_steps=3000, delta=
 
     for i, lc in enumerate(lam_c_grid):
         for j, lv in enumerate(lam_v_grid):
-            context.setParameter("lam_coul", lc)
-            context.setParameter("lam_vdw", lv)
-            context.getIntegrator().step(500)
+            if not _is_safe_dual_lambda_state(lc, lv):
+                # 用巨大各向同性度量把不安全区域标成“不可通行”。
+                G[i, j] = np.eye(2, dtype=float) * 1e8
+                continue
+
+            context.setParameter("lam_coul", float(lc))
+            context.setParameter("lam_vdw", float(lv))
+            try:
+                context.getIntegrator().step(500)
+            except Exception as exc:
+                print(f"  ⚠️ 2D 度量预采样失败 (λc={lc:.3f}, λv={lv:.3f}): {exc}")
+                G[i, j] = np.eye(2, dtype=float) * 1e8
+                continue
 
             dc_vals, dv_vals = [], []
             full_batches, remainder = divmod(int(n_steps), 50)
@@ -925,24 +984,27 @@ def compute_2d_metric_grid(context, lam_c_grid, lam_v_grid, n_steps=3000, delta=
                 batch_steps = 50 if sample_idx < full_batches else remainder
                 if batch_steps <= 0:
                     continue
-                context.getIntegrator().step(batch_steps)
-                context.setParameter("lam_coul", lc + delta)
-                e_cp = context.getState(getEnergy=True, groups={1}).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-                context.setParameter("lam_coul", lc - delta)
-                e_cm = context.getState(getEnergy=True, groups={1}).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-                context.setParameter("lam_coul", lc)
+                try:
+                    context.getIntegrator().step(batch_steps)
+                    dc_vals.append(_finite_difference_on_safe_region(context, lc, lv, "coul", delta))
+                    dv_vals.append(_finite_difference_on_safe_region(context, lc, lv, "vdw", delta))
+                    context.setParameter("lam_coul", float(lc))
+                    context.setParameter("lam_vdw", float(lv))
+                except Exception as exc:
+                    print(f"  ⚠️ 2D 度量采样失败 (λc={lc:.3f}, λv={lv:.3f}): {exc}")
+                    dc_vals = []
+                    dv_vals = []
+                    break
 
-                context.setParameter("lam_vdw", lv + delta)
-                e_vp = context.getState(getEnergy=True, groups={1}).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-                context.setParameter("lam_vdw", lv - delta)
-                e_vm = context.getState(getEnergy=True, groups={1}).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-                context.setParameter("lam_vdw", lv)
-
-                dc_vals.append((e_cp - e_cm) / (2 * delta))
-                dv_vals.append((e_vp - e_vm) / (2 * delta))
+            if len(dc_vals) < 2 or len(dv_vals) < 2:
+                G[i, j] = np.eye(2, dtype=float) * 1e8
+                continue
 
             dc, dv = np.array(dc_vals), np.array(dv_vals)
             cov = np.cov([dc, dv]) * beta ** 2
+            if not np.all(np.isfinite(cov)):
+                G[i, j] = np.eye(2, dtype=float) * 1e8
+                continue
             eigvals, eigvecs = np.linalg.eigh(cov)
             eigvals = np.maximum(eigvals, 1e-4)
             G[i, j] = eigvecs @ np.diag(eigvals) @ eigvecs.T
@@ -1005,6 +1067,7 @@ def optimize_2d_geodesic_path(
     # 确保 lam_coul 和 lam_vdw 严格单调递减 (从 1.0 -> 0.0)
     path_arr[:, 0] = np.minimum.accumulate(path_arr[:, 0])
     path_arr[:, 1] = np.minimum.accumulate(path_arr[:, 1])
+    path_arr[:, 1] = np.maximum(path_arr[:, 1], path_arr[:, 0])
     
     # 强制锚定边界
     path_arr[0, :] = [1.0, 1.0]
@@ -1044,10 +1107,14 @@ def dijkstra_monotonic_geodesic(G, lam_c_grid, lam_v_grid):
         for di, dj in moves:
             ni, nj = i + di, j + dj
             if 0 <= ni < nc and 0 <= nj < nv:
+                if not _is_safe_dual_lambda_state(lam_c_grid[ni], lam_v_grid[nj]):
+                    continue
                 dlc = lam_c_grid[ni] - lam_c_grid[i]
                 dlv = lam_v_grid[nj] - lam_v_grid[j]
                 dlam = np.array([dlc, dlv])
                 g_mid = 0.5 * (G[i, j] + G[ni, nj])
+                if not np.all(np.isfinite(g_mid)) or np.max(np.abs(g_mid)) > 1e7:
+                    continue
                 w = np.sqrt(max(0.0, dlam @ g_mid @ dlam)) + 1e-4
                 if dist[i, j] + w < dist[ni, nj]:
                     dist[ni, nj] = dist[i, j] + w

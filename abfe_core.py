@@ -67,6 +67,109 @@ def _log_print(*args, sep=" ", end="\n", file=None, flush=False):
 print = _log_print
 
 
+def _pymbar_version_tuple() -> Tuple[int, ...]:
+    if not HAS_PYMBAR:
+        return (0,)
+    version_str = str(getattr(pymbar, "__version__", getattr(pymbar, "version", "0")))
+    parts = []
+    for token in version_str.replace("-", ".").split("."):
+        digits = "".join(ch for ch in token if ch.isdigit())
+        if digits:
+            parts.append(int(digits))
+        else:
+            break
+    return tuple(parts) if parts else (0,)
+
+
+def _build_mbar_compatible(u_kn, n_k, **kwargs):
+    """
+    兼容 PyMBAR 3.x/4.x 的 MBAR 构造器。
+    若某些关键字参数在当前版本不可用，则按保守顺序回退。
+    """
+    if not HAS_PYMBAR:
+        raise ImportError("需要 pymbar 包，请安装: pip install pymbar")
+
+    base_kwargs = dict(kwargs)
+    drop_order = [
+        "solver_protocol",
+        "initialize",
+        "relative_tolerance",
+        "solver_tolerance",
+        "initial_f_k",
+        "verbose",
+    ]
+    variants = [base_kwargs]
+    seen = {tuple(sorted((k, repr(v)) for k, v in base_kwargs.items()))}
+    current = dict(base_kwargs)
+    for key in drop_order:
+        if key in current:
+            current = dict(current)
+            current.pop(key, None)
+            signature = tuple(sorted((k, repr(v)) for k, v in current.items()))
+            if signature not in seen:
+                variants.append(current)
+                seen.add(signature)
+
+    last_type_error = None
+    for candidate in variants:
+        try:
+            return pymbar.MBAR(u_kn, n_k, **candidate)
+        except TypeError as exc:
+            last_type_error = exc
+            continue
+    if last_type_error is not None:
+        raise last_type_error
+    return pymbar.MBAR(u_kn, n_k)
+
+
+def _extract_mbar_matrix(result, primary_name: str, fallback_names: Tuple[str, ...]) -> Optional[np.ndarray]:
+    candidate_names = (primary_name,) + tuple(fallback_names)
+    for name in candidate_names:
+        if isinstance(result, dict) and name in result:
+            return np.asarray(result[name], dtype=float)
+        if hasattr(result, name):
+            return np.asarray(getattr(result, name), dtype=float)
+    return None
+
+
+def _compute_free_energy_result_compatible(mbar, compute_uncertainty: bool = True):
+    methods = []
+    if hasattr(mbar, "compute_free_energy_differences"):
+        methods.append(("compute_free_energy_differences", {"compute_uncertainty": compute_uncertainty}))
+    if hasattr(mbar, "compute_free_energy"):
+        methods.append(("compute_free_energy", {}))
+    if not methods:
+        raise AttributeError("当前 pymbar.MBAR 对象不包含可用的自由能计算方法")
+
+    last_exc = None
+    for method_name, kwargs in methods:
+        try:
+            return getattr(mbar, method_name)(**kwargs)
+        except TypeError:
+            try:
+                return getattr(mbar, method_name)()
+            except Exception as exc:
+                last_exc = exc
+        except Exception as exc:
+            last_exc = exc
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("MBAR 自由能计算失败")
+
+
+def _extract_free_energy_arrays(result, require_uncertainty: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+    delta_f = _extract_mbar_matrix(result, "Delta_f", ("delta_f", "free_energy"))
+    if delta_f is None:
+        raise KeyError("无法从 pymbar 结果中提取自由能矩阵")
+
+    delta_df = _extract_mbar_matrix(result, "dDelta_f", ("d_delta_f", "error", "uncertainty"))
+    if delta_df is None:
+        if require_uncertainty:
+            raise KeyError("无法从 pymbar 结果中提取不确定度矩阵")
+        delta_df = np.full_like(delta_f, np.nan, dtype=float)
+    return delta_f, delta_df
+
+
 def get_optimal_device_settings():
     if not HAS_ORB or not torch.cuda.is_available():
         return "cpu", False
@@ -2153,7 +2256,7 @@ class OnlineConvergenceMonitor:
         try:
             K, N = u_kn_chunk.shape
             n_k_array = np.full(K, N, dtype=int)
-            mbar = pymbar.MBAR(
+            mbar = _build_mbar_compatible(
                 u_kn_chunk,
                 n_k_array,
                 initial_f_k=self.f_k_prev,
@@ -2162,9 +2265,8 @@ class OnlineConvergenceMonitor:
                 verbose=False,
             )
 
-            res = mbar.compute_free_energy_differences()
-            df = res["Delta_f"] if isinstance(res, dict) else res.Delta_f
-            ddf = res["dDelta_f"] if isinstance(res, dict) else res.dDelta_f
+            res = _compute_free_energy_result_compatible(mbar, compute_uncertainty=True)
+            df, ddf = _extract_free_energy_arrays(res, require_uncertainty=True)
 
             self.f_k_prev = df[0, :].copy()
 
@@ -2535,18 +2637,27 @@ class ChunkedMBARAnalyzer:
 
         # 2. 单次全局 MBAR 求解 (统计严格)
         try:
-            mbar = pymbar.MBAR(u_kn_sub, n_k_sub, verbose=False, solver_protocol="hybr")
-            res = mbar.compute_free_energy_differences()
+            mbar = _build_mbar_compatible(
+                u_kn_sub,
+                n_k_sub,
+                verbose=False,
+                solver_protocol="hybr",
+            )
+            res = _compute_free_energy_result_compatible(mbar, compute_uncertainty=True)
             return self._extract_delta_g(res, n_k_sub, stage_type)
         except Exception as e:
             print(f"  🚨 MBAR 求解失败: {e}，尝试降级至 robust 求解器...")
-            mbar = pymbar.MBAR(u_kn_sub, n_k_sub, verbose=False, solver_protocol="robust")
-            res = mbar.compute_free_energy_differences()
+            mbar = _build_mbar_compatible(
+                u_kn_sub,
+                n_k_sub,
+                verbose=False,
+                solver_protocol="robust",
+            )
+            res = _compute_free_energy_result_compatible(mbar, compute_uncertainty=True)
             return self._extract_delta_g(res, n_k_sub, stage_type)
 
     def _extract_delta_g(self, res, n_k_array, stage_type):
-        df = res["Delta_f"] if isinstance(res, dict) else res.Delta_f
-        ddf = res["dDelta_f"] if isinstance(res, dict) else res.dDelta_f
+        df, ddf = _extract_free_energy_arrays(res, require_uncertainty=True)
         return df[0, :], ddf[0, :]
 
 
