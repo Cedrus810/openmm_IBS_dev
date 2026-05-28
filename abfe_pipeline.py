@@ -43,6 +43,7 @@ from abfe_core import (
     calculate_boresch_analytical_correction,
     ACESoftcorePotential,
     BeutlerSoftcoreBuilder,
+    DEXPSurrogatePotential,
     UnitFormatter,
     TwoDimensionalLambdaPathPlanner,
 )
@@ -71,6 +72,18 @@ def _log_print(*args, sep=" ", end="\n", file=None, flush=False):
 
 
 print = _log_print
+
+
+def _resolve_alchemical_params(
+    potential_type: str,
+    dexp_params: Optional[Dict],
+    ligand_indices: List[int],
+):
+    if potential_type == "dexp":
+        return DEXPSurrogatePotential.from_dict(dexp_params or {})
+    return ACESoftcorePotential.from_dict(
+        ACESoftcorePotential.optimize_alpha(len(ligand_indices))
+    )
 
 
 def _pme_u_kn_meta_path(stage_output_dir: str, stage_name: str) -> str:
@@ -1437,6 +1450,9 @@ class ABFEPipeline:
         
         stage_type = "coul" if stage_name == "decharging" else "vdw"
         
+        alchemical_params = _resolve_alchemical_params(
+            potential_type, dexp_params, self.ligand_indices
+        )
         manager = IBSWindowManagerDualLambda(
             system_template=self.system,
             topology=self.topology,
@@ -1445,9 +1461,8 @@ class ABFEPipeline:
             lambdas_vdw=lambdas_fix if stage_name == "decharging" else lambdas_var,
             temperature=self.temperature,
             window_ranges=window_ranges,
-            softcore_params=ACESoftcorePotential.from_dict(
-                ACESoftcorePotential.optimize_alpha(len(self.ligand_indices))
-            ),
+            alchemical_params=alchemical_params,
+            potential_type=potential_type,
             restraint_params=boresch_params,
             prefix="abfe_dual",
             platform_name=self.platform_name,
@@ -1542,6 +1557,9 @@ class ABFEPipeline:
         os.makedirs(stage_output_dir, exist_ok=True)
         stage_type = "2d"
 
+        alchemical_params = _resolve_alchemical_params(
+            potential_type, dexp_params, self.ligand_indices
+        )
         manager = IBSWindowManagerDualLambda(
             system_template=self.system,
             topology=self.topology,
@@ -1550,9 +1568,8 @@ class ABFEPipeline:
             lambdas_vdw=lambdas_vdw,
             temperature=self.temperature,
             window_ranges=window_ranges,
-            softcore_params=ACESoftcorePotential.from_dict(
-                ACESoftcorePotential.optimize_alpha(len(self.ligand_indices))
-            ),
+            alchemical_params=alchemical_params,
+            potential_type=potential_type,
             restraint_params=boresch_params,
             prefix="abfe_2d",
             platform_name=self.platform_name,

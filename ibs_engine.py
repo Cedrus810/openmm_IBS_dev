@@ -28,6 +28,7 @@ from typing import Dict, List, Tuple, Optional, Any
 from abfe_core import (
     ACESoftcorePotential,
     AlchemicalPotentialFactory,
+    DEXPSurrogatePotential,
     LambdaDependentBoreschForce,
     create_ligand_internal_force,
     ensure_owned_system,
@@ -697,7 +698,8 @@ def _create_softcore_force(
     environment_indices: List[int],
     lam_coul: float,
     lam_vdw: float,
-    softcore_params: ACESoftcorePotential,
+    alchemical_params,
+    potential_type: str = "softcore",
     reference_exclusions=None,
     particle_params_override=None,
     num_particles=None,
@@ -715,7 +717,9 @@ def _create_softcore_force(
     lam_v_str = f"{lam_vdw:.8f}"
     
     # 调用工厂生成完整软核表达式 (含 Coulomb + VdW)
-    expr, _ = AlchemicalPotentialFactory.build("softcore", softcore_params, lam_c_str, lam_v_str)
+    expr, _ = AlchemicalPotentialFactory.build(
+        potential_type, alchemical_params, lam_c_str, lam_v_str
+    )
     
     sc_force = openmm.CustomNonbondedForce(expr)
     for p in ["q", "sigma", "epsilon"]:
@@ -765,6 +769,19 @@ def _normalize_softcore_params(softcore_params: ACESoftcorePotential, n_perturbe
         f"(输入值: LJ={requested_lj:.3f}, Coul={requested_coul:.3f})"
     )
     return normalized
+
+
+def _normalize_alchemical_params(alchemical_params, potential_type: str, n_perturbed: int):
+    if potential_type == "dexp":
+        if isinstance(alchemical_params, DEXPSurrogatePotential):
+            return alchemical_params
+        return DEXPSurrogatePotential.from_dict(alchemical_params or {})
+    if isinstance(alchemical_params, ACESoftcorePotential):
+        return _normalize_softcore_params(alchemical_params, n_perturbed)
+    return _normalize_softcore_params(
+        ACESoftcorePotential.from_dict(alchemical_params or {}),
+        n_perturbed,
+    )
 
 
 def _compute_reference_com(
@@ -971,7 +988,8 @@ def build_ibs_dual_system(
     perturbed_indices: List[int],
     lambdas_coul: List[float],
     lambdas_vdw: List[float],
-    softcore_params: ACESoftcorePotential,
+    alchemical_params,
+    potential_type: str = "softcore",
     restraint_params: Optional[Dict] = None,
     temperature: openmm.unit.Quantity = 300 * openmm.unit.kelvin,
     prefix: str = "abfe_dual",
@@ -992,7 +1010,9 @@ def build_ibs_dual_system(
     num_atoms = new_sys.getNumParticles()
     perturbed_set = set(perturbed_indices)
     env_indices = [i for i in range(num_atoms) if i not in perturbed_set]
-    softcore_params = _normalize_softcore_params(softcore_params, len(perturbed_indices))
+    alchemical_params = _normalize_alchemical_params(
+        alchemical_params, potential_type, len(perturbed_indices)
+    )
 
     lambda_coul_arr = np.asarray(lambdas_coul, dtype=float)
     if np.any(np.abs(lambda_coul_arr) > 1e-8):
@@ -1127,7 +1147,8 @@ def build_ibs_dual_system(
         env_indices,
         lam_coul=0.0,
         lam_vdw=0.0,
-        softcore_params=softcore_params,
+        alchemical_params=alchemical_params,
+        potential_type=potential_type,
         reference_exclusions=softcore_excl,
         particle_params_override=original_params_fresh,
         num_particles=num_atoms,
@@ -1152,7 +1173,8 @@ def build_ibs_dual_system(
             env_indices,
             lam_coul=0.0,
             lam_vdw=float(lv),
-            softcore_params=softcore_params,
+            alchemical_params=alchemical_params,
+            potential_type=potential_type,
             reference_exclusions=softcore_excl,
             particle_params_override=original_params_fresh,
             num_particles=num_atoms,
@@ -1527,7 +1549,8 @@ class IBSWindowManagerDualLambda:
         lambdas_vdw: List[float],
         temperature,
         window_ranges: List[Tuple[int, int]],
-        softcore_params: ACESoftcorePotential,
+        alchemical_params,
+        potential_type: str = "softcore",
         restraint_params: Optional[Dict] = None,
         prefix: str = "abfe_dual",
         platform_name: str = "CUDA",
@@ -1541,7 +1564,8 @@ class IBSWindowManagerDualLambda:
         self.lambdas_vdw = lambdas_vdw
         self.temperature = temperature
         self.ranges = window_ranges
-        self.softcore = softcore_params
+        self.alchemical_params = alchemical_params
+        self.potential_type = potential_type
         self.boresch = restraint_params
         self.prefix = prefix
         self.platform_name = platform_name
@@ -1619,7 +1643,8 @@ class IBSWindowManagerDualLambda:
                 self.ligand_indices,
                 lc_win,
                 lv_win,
-                self.softcore,
+                self.alchemical_params,
+                self.potential_type,
                 self.boresch,
                 self.temperature,
                 self.prefix,

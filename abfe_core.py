@@ -373,26 +373,18 @@ class DEXPSurrogatePotential:
         )
         self.offset_c0, self.offset_c1 = offset_c0, offset_c1
 
-    def build_expression(self, lam_coul="lam_coul", lam_vdw="lam_vdw"):
-        PI, rs = "3.141592653589793", "max(r, 0.12)"
-        sc_a = 0.5
-        r_sc = f"max(0.05, (({sc_a}*(1-{lam_vdw})^6 + {rs}^6 + 1e-9)^(1/6)))"
-        vdw = f"{lam_vdw} * 4 * sqrt(epsilon1*epsilon2) * ({self.A_fit}*exp(-{self.alpha_vdw}*({r_sc}/{self.r0_vdw}-1.0)) - {self.B_fit}*exp(-{self.beta_vdw}*({r_sc}/{self.r0_vdw}-1.0)))"
-        ssq = self.sigma_elec**2
-        coul = f"{lam_coul} * 138.935456 * q1 * q2 * (erfc({rs}/sqrt(2*{ssq}))/{rs} + 1/sqrt({PI}*{ssq})*exp(-{rs}^2/(2*{ssq})))"
-        r_sw = self.cutoff_distance - self.switch_width
-
-        def _smooth_switch(radius_expr: str) -> str:
-            x = f"max(0.0, min(1.0, ({radius_expr} - {r_sw}) / {self.switch_width}))"
-            smooth_step = f"(1.0 - 10.0*({x})^3 + 15.0*({x})^4 - 6.0*({x})^5)"
-            return (
-                f"(step({r_sw} - {radius_expr}) + "
-                f"step({radius_expr} - {r_sw}) * step({self.cutoff_distance} - {radius_expr}) * {smooth_step})"
-            )
-
-        sw_vdw = _smooth_switch(r_sc)
-        sw_coul = _smooth_switch(rs)
-        return f"({vdw} * {sw_vdw}) + ({coul} * {sw_coul}) + {lam_vdw} * ({self.offset_c0} + {self.offset_c1} * r)"
+    def build_expression(self, lam_vdw="lam_vdw"):
+        """
+        仅返回纯粹的 DEXP 核心表达式。
+        Switch、Gaussian-Coulomb 与传统 PME 解耦由外层 Builder 统一接管。
+        """
+        rs = "max(r, 1e-6)"
+        vdw_core = (
+            f"4 * sqrt(epsilon1*epsilon2) * "
+            f"({self.A_fit}*exp(-{self.alpha_vdw}*({rs}/{self.r0_vdw}-1.0)) - "
+            f"{self.B_fit}*exp(-{self.beta_vdw}*({rs}/{self.r0_vdw}-1.0)))"
+        )
+        return f"{lam_vdw} * ({vdw_core})"
 
     def get_parameters_dict(self):
         return {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
@@ -419,70 +411,154 @@ class Orbv3SurrogateFitter:
         self.r_min, self.r_max = fitting_region
 
     def fit_parameters(self, distances_per_frame, e_delta_list, eff_eps=1.0):
-        e_arr = np.array(e_delta_list)
-        mask = np.abs(e_arr) < 500.0
+        e_arr = np.asarray(e_delta_list, dtype=float)
+        mask = np.abs(e_arr) < 5000.0
         if mask.sum() < 30:
-            return {}
-        clean_d, clean_e = (
-            [d for i, d in enumerate(distances_per_frame) if mask[i]],
-            e_arr[mask],
-        )
-        e_min = clean_e.min()
+            return {"fitting_success": False, "error": "insufficient_frames"}
 
-        def objective(params):
-            a, d, r0, A, B, offset = params
-            b = a - d
+        frame_energies = e_arr[mask]
+        frame_dists = [
+            np.asarray(d, dtype=float)
+            for i, d in enumerate(distances_per_frame)
+            if mask[i]
+        ]
+        diagnostic_global_mu = float(np.mean(frame_energies))
+
+        # 使用均匀帧权重，避免把 ΔE 误当作统计力学玻尔兹曼因子。
+        frame_weights = np.full(frame_energies.shape, 1.0 / float(len(frame_energies)))
+
+        def _full_objective(params):
+            a, dgap, r0, A, B = params
+
+            if r0 < 0.25 or r0 > 0.45 or a < 8.0 or dgap < 2.0 or A < 0 or B < 0:
+                return 1e9
+
+            b = a - dgap
             inv = 1.0 / r0
-            pen = 1000.0 * max(0, 3.5 - d) ** 2 + 500.0 * max(0, r0 - 0.38) ** 2
-            terr, tw = 0.0, 0.0
-            for Et, dists in zip(clean_e, clean_d):
-                v = (dists >= self.r_min) & (dists <= self.r_max)
-                dd = dists[v]
-                if len(dd) == 0:
-                    continue
-                x = dd * inv - 1.0
-                w_base = np.exp(-np.clip(Et - e_min, 0, 100) / 15.0) * (
-                    1.0 + 4.0 * np.exp(-15.0 * (dd - 0.28))
-                )
-                decay = np.ones_like(dd)
-                mask_sw = (dd > 0.6) & (dd < 0.8)
-                decay[mask_sw] = 0.5 * (1.0 + np.cos(np.pi * (dd[mask_sw] - 0.6) / 0.2))
-                decay[dd >= 0.8] = 0.0
-                w = w_base * decay
-                Ep = np.dot(
-                    4.0 * eff_eps * (A * np.exp(-a * x) - B * np.exp(-b * x)), w
-                ) / max(1.0, np.sum(w))
-                terr += np.sum(w) * (Et - (Ep + offset)) ** 2
-                tw += np.sum(w)
-            return terr / max(1.0, tw) + pen
+            pen = 100.0 * max(0.0, 3.5 - dgap) ** 2
 
-        best, bc = None, float("inf")
-        bounds = [(14, 20), (4, 10), (0.32, 0.38), (0.5, 2.0), (0.1, 1.0), (-15, 15)]
-        for x0 in [[15, 6, 0.34, 1, 0.5, 0], [16, 7, 0.35, 1.2, 0.6, 2]]:
-            res = minimize(
-                objective,
-                x0,
-                method="L-BFGS-B",
-                bounds=bounds,
-                options={"ftol": 1e-8, "maxiter": 800},
+            # 强迫纯 DEXP 在 0.8 nm 外快速归零，避免承担任何长程基线职责。
+            r_anchors = np.array([0.80, 0.90, 1.00, 1.10, 1.20], dtype=float)
+            x_anchors = np.clip(r_anchors * inv - 1.0, -50.0, 50.0)
+            u_dexp_anchors = 4.0 * eff_eps * (
+                A * np.exp(-a * x_anchors) - B * np.exp(-b * x_anchors)
             )
-            if res.fun < bc:
-                best, bc = res, res.fun
-        if not best:
-            return {}
-        a, d, r0, A, B, off = best.x
+            reg_penalty = 2500.0 * np.mean(u_dexp_anchors ** 2)
+
+            predicted_frame_energies = []
+            valid_indices = []
+            for idx, dd in enumerate(frame_dists):
+                if dd.size == 0:
+                    continue
+                x = np.clip(dd * inv - 1.0, -50.0, 50.0)
+                pair_energy = 4.0 * eff_eps * (
+                    A * np.exp(-a * x) - B * np.exp(-b * x)
+                )
+                normalization = max(1.0, float(dd.size))
+                predicted_frame_energies.append(float(np.sum(pair_energy) / normalization))
+                valid_indices.append(idx)
+
+            if not predicted_frame_energies:
+                return 1e9
+
+            pred_raw = np.asarray(predicted_frame_energies, dtype=float)
+            valid_weights = frame_weights[valid_indices]
+            target_raw = frame_energies[valid_indices]
+            weight_norm = float(np.sum(valid_weights))
+            if weight_norm <= 1.0e-12:
+                return 1e9
+            c0_opt = float(np.sum(valid_weights * (target_raw - pred_raw)) / weight_norm)
+            terr = float(
+                np.sum(
+                    valid_weights
+                    * (target_raw - (pred_raw + c0_opt)) ** 2
+                )
+            )
+
+            return terr + pen + reg_penalty
+
+        bounds = [
+            (10.0, 25.0),
+            (3.0, 12.0),
+            (0.28, 0.40),
+            (1.0e-5, 5.0),
+            (1.0e-5, 5.0),
+        ]
+
+        x0 = [14.0, 6.0, 0.34, 0.05, 0.02]
+
+        res = minimize(
+            _full_objective,
+            x0,
+            method="L-BFGS-B",
+            bounds=bounds,
+            options={"ftol": 1e-8, "maxiter": 1500},
+        )
+
+        if (not res.success) and res.fun > 1e8:
+            return {"fitting_success": False, "error": "optimizer_failed"}
+
+        a, dgap, r0, A, B = res.x
+        b = a - dgap
+        inv = 1.0 / r0
+        predicted_frame_energies = []
+        valid_indices = []
+        for idx, dd in enumerate(frame_dists):
+            if dd.size == 0:
+                continue
+            x = np.clip(dd * inv - 1.0, -50.0, 50.0)
+            pair_energy = 4.0 * eff_eps * (
+                A * np.exp(-a * x) - B * np.exp(-b * x)
+            )
+            normalization = max(1.0, float(dd.size))
+            predicted_frame_energies.append(float(np.sum(pair_energy) / normalization))
+            valid_indices.append(idx)
+
+        diagnostic_fit_c0 = diagnostic_global_mu
+        if predicted_frame_energies:
+            pred_raw = np.asarray(predicted_frame_energies, dtype=float)
+            valid_weights = frame_weights[valid_indices]
+            target_raw = frame_energies[valid_indices]
+            weight_norm = float(np.sum(valid_weights))
+            if weight_norm > 1.0e-12:
+                diagnostic_fit_c0 = float(
+                    np.sum(valid_weights * (target_raw - pred_raw)) / weight_norm
+                )
+
+        # 诊断用接触度量：越短程越大，但绝不进入 OpenMM force。
+        contact_metrics = []
+        diagnostic_energies = []
+        for Et_raw, dd in zip(frame_energies, frame_dists):
+            if dd.size == 0:
+                continue
+            contact_score = np.clip(0.65 - dd, 0.0, None)
+            contact_metrics.append(float(np.sum(contact_score)))
+            diagnostic_energies.append(float(Et_raw))
+
+        diagnostic_contact_mu = diagnostic_global_mu
+        diagnostic_contact_slope = 0.0
+        if len(contact_metrics) >= 2 and np.std(contact_metrics) > 1.0e-12:
+            diagnostic_contact_slope, diagnostic_contact_mu = np.polyfit(
+                contact_metrics, diagnostic_energies, 1
+            )
+
         return {
-            "alpha_vdw": a,
-            "beta_vdw": a - d,
-            "r0_vdw": r0,
-            "A_fit": A,
-            "B_fit": B,
-            "offset_c0": off,
+            "alpha_vdw": float(a),
+            "beta_vdw": float(a - dgap),
+            "r0_vdw": float(r0),
+            "A_fit": float(A),
+            "B_fit": float(B),
+            "offset_c0": 0.0,
             "offset_c1": 0.0,
+            "diagnostic_global_mu": float(diagnostic_global_mu),
+            "diagnostic_fit_c0": float(diagnostic_fit_c0),
+            "diagnostic_contact_mu": float(diagnostic_contact_mu),
+            "diagnostic_contact_slope": float(diagnostic_contact_slope),
             "sigma_elec": 0.1,
             "switch_width": 0.2,
             "cutoff_distance": 1.2,
             "fitting_success": True,
+            "final_cost": float(res.fun),
         }
 
 
@@ -1744,12 +1820,71 @@ class GhostIonHandler:
         self.ghost_ion_distance = ghost_ion_distance
         self.ghost_ion_scale_factor = ghost_ion_scale_factor
 
-    def create_ghost_ion_force(self, ligand_charges, lambda_param="lam_coul"):
+    def _resolve_ghost_anchor(self, box_vectors=None, reference_positions=None, ligand_indices=None):
+        if box_vectors is None:
+            return (
+                float(self.ghost_ion_distance),
+                0.0,
+                0.0,
+            )
+
+        box_lengths = np.array(
+            [
+                np.linalg.norm(np.asarray(vec.value_in_unit(unit.nanometer) if hasattr(vec, "value_in_unit") else vec, dtype=float))
+                for vec in box_vectors
+            ],
+            dtype=float,
+        )
+        box_lengths = np.where(box_lengths > 1.0e-6, box_lengths, 3.0)
+        safe_margin = np.minimum(0.2, 0.1 * box_lengths)
+
+        if reference_positions is not None and ligand_indices:
+            lig_xyz = []
+            for idx in ligand_indices:
+                pos = reference_positions[idx]
+                if hasattr(pos, "value_in_unit"):
+                    lig_xyz.append(np.asarray(pos.value_in_unit(unit.nanometer), dtype=float))
+                else:
+                    lig_xyz.append(np.asarray(pos, dtype=float))
+            if lig_xyz:
+                lig_com = np.mean(np.asarray(lig_xyz, dtype=float), axis=0)
+                anchor = np.mod(lig_com + 0.5 * box_lengths - safe_margin, box_lengths)
+                return tuple(float(x) for x in anchor)
+
+        anchor = 0.5 * box_lengths - safe_margin
+        return tuple(float(x) for x in anchor)
+
+    def create_ghost_ion_force(
+        self,
+        ligand_indices,
+        ligand_charges,
+        lambda_param="lam_coul",
+        box_vectors=None,
+        reference_positions=None,
+    ):
         total = sum(ligand_charges)
         ghost = -total * self.ghost_ion_scale_factor
-        return openmm.CustomExternalForce(
-            f"{lambda_param} * {ghost} * 138.935456 / sqrt((x-{self.ghost_ion_distance})^2 + y^2 + z^2)"
+        if abs(ghost) < 1.0e-12 or not ligand_indices:
+            return None
+
+        xg, yg, zg = self._resolve_ghost_anchor(
+            box_vectors=box_vectors,
+            reference_positions=reference_positions,
+            ligand_indices=ligand_indices,
         )
+        force = openmm.CustomExternalForce(
+            f"{lambda_param} * 138.935456 * ghost_charge * ligand_charge / "
+            f"max(periodicdistance(x, y, z, ghost_x, ghost_y, ghost_z), 0.05)"
+        )
+        force.addGlobalParameter(lambda_param, 1.0)
+        force.addGlobalParameter("ghost_charge", float(ghost))
+        force.addGlobalParameter("ghost_x", float(xg))
+        force.addGlobalParameter("ghost_y", float(yg))
+        force.addGlobalParameter("ghost_z", float(zg))
+        force.addPerParticleParameter("ligand_charge")
+        for idx, charge in zip(ligand_indices, ligand_charges):
+            force.addParticle(int(idx), [float(charge)])
+        return force
 
 
 class TwoDimensionalLambdaPathPlanner:
@@ -1776,8 +1911,7 @@ class TwoDimensionalLambdaPathPlanner:
 
 
 class SurrogateSystemBuilder:
-    def __init__(self, surrogate_params, ghost_handler=None):
-        self.offset_val = surrogate_params.get("offset", 0.0)
+    def __init__(self, surrogate_params, ghost_handler=None, sigma_gauss_nm: float = 0.10):
         self.surrogate_potential = DEXPSurrogatePotential.from_dict(
             {
                 k: v
@@ -1786,6 +1920,7 @@ class SurrogateSystemBuilder:
             }
         )
         self.ghost_handler = ghost_handler
+        self.sigma_gauss_nm = float(sigma_gauss_nm)
 
     def build_surrogate_system(
         self,
@@ -1794,92 +1929,124 @@ class SurrogateSystemBuilder:
         environment_indices,
         lambda_names=("lam_coul", "lam_vdw"),
         force_group=1,
+        reference_positions=None,
+        box_vectors=None,
     ):
-        new_system = openmm.XmlSerializer.deserialize(
-            openmm.XmlSerializer.serialize(original_system)
-        )
+        new_system = ensure_owned_system(original_system)
         nb_force = next(
             (f for f in new_system.getForces() if isinstance(f, openmm.NonbondedForce)),
             None,
         )
         if not nb_force:
             raise ValueError("未找到 NonbondedForce")
-        ligand_params = {
-            idx: nb_force.getParticleParameters(idx) for idx in ligand_indices
-        }
+
         lig_set, env_set = set(ligand_indices), set(environment_indices)
-        for idx in ligand_indices:
-            nb_force.setParticleParameters(idx, 0.0, 0.1 * unit.nanometer, 0.0)
+        original_params = [
+            nb_force.getParticleParameters(i) for i in range(new_system.getNumParticles())
+        ]
+        reference_exclusions = []
         for i in range(nb_force.getNumExceptions()):
             p1, p2, _, _, _ = nb_force.getExceptionParameters(i)
+            reference_exclusions.append((int(p1), int(p2)))
+
+        # L-L 内部力：复用成熟组件，保留完整 1-2/1-3/1-4 拓扑。
+        ll_force, ll_14_force = create_ligand_internal_force(
+            nb_force=nb_force,
+            perturbed_indices=ligand_indices,
+            particle_params=None,
+            reference_exclusions=None,
+            num_particles=new_system.getNumParticles(),
+            system=new_system,
+        )
+        ll_force.setForceGroup(2)
+        if ll_14_force is not None:
+            ll_14_force.setForceGroup(2)
+
+        # 原生 PME 只保留 E-E，彻底静默所有涉及配体的 L-L / L-E 非键项。
+        for idx in ligand_indices:
+            q, sig, _eps = original_params[idx]
+            nb_force.setParticleParameters(
+                idx,
+                0.0 * unit.elementary_charge,
+                sig,
+                0.0 * unit.kilojoule_per_mole,
+            )
+        for i in range(nb_force.getNumExceptions()):
+            p1, p2, _q_prod, sig, _eps = nb_force.getExceptionParameters(i)
             p1, p2 = int(p1), int(p2)
             if p1 in lig_set or p2 in lig_set:
                 nb_force.setExceptionParameters(
-                    i, p1, p2, 0.0, 0.1 * unit.nanometer, 0.0
-                )
-        ll_force = openmm.CustomNonbondedForce(
-            "4*sqrt(epsilon1*epsilon2)*((sigma12/r)^12-(sigma12/r)^6)+138.935456*q1*q2/r; sigma12=0.5*(sigma1+sigma2)"
-        )
-        for p in ["q", "sigma", "epsilon"]:
-            ll_force.addPerParticleParameter(p)
-        for i in range(new_system.getNumParticles()):
-            p = ligand_params.get(
-                i,
-                (
-                    0.0 * unit.elementary_charge,
-                    0.1 * unit.nanometer,
+                    i,
+                    p1,
+                    p2,
+                    0.0 * unit.elementary_charge**2,
+                    sig,
                     0.0 * unit.kilojoule_per_mole,
-                ),
-            )
-            ll_force.addParticle(
-                [
-                    p[0].value_in_unit(unit.elementary_charge),
-                    p[1].value_in_unit(unit.nanometer),
-                    p[2].value_in_unit(unit.kilojoule_per_mole),
-                ]
-            )
-        ll_force.addInteractionGroup(lig_set, lig_set)
-        ll_force.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
-        ll_force.setCutoffDistance(
-            self.surrogate_potential.cutoff_distance * unit.nanometer
+                )
+
+        gamma_eff = 1.0 / max(math.sqrt(2.0) * self.sigma_gauss_nm, 1.0e-6)
+        coul_expr = (
+            f"{lambda_names[0]} * 138.935456 * q1 * q2 * erf({gamma_eff} * r_safe) / r_safe; "
+            "r_safe = max(r, 1e-6)"
         )
-        ll_force.setForceGroup(2)
-        surr_expr = self.surrogate_potential.build_expression(*lambda_names)
-        surr_force = openmm.CustomNonbondedForce(surr_expr)
-        for p in ["q", "sigma", "epsilon"]:
-            surr_force.addPerParticleParameter(p)
-        surr_force.addGlobalParameter(lambda_names[0], 1.0)
-        surr_force.addGlobalParameter(lambda_names[1], 1.0)
+        coul_force = openmm.CustomNonbondedForce(coul_expr)
+        coul_force.addPerParticleParameter("q")
+        coul_force.addGlobalParameter(lambda_names[0], 1.0)
         for i in range(new_system.getNumParticles()):
-            p = ligand_params.get(i, nb_force.getParticleParameters(i))
-            surr_force.addParticle(
-                [
-                    p[0].value_in_unit(unit.elementary_charge),
-                    p[1].value_in_unit(unit.nanometer),
-                    p[2].value_in_unit(unit.kilojoule_per_mole),
-                ]
-            )
-        surr_force.addInteractionGroup(lig_set, env_set)
-        surr_force.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
-        surr_force.setCutoffDistance(
-            self.surrogate_potential.cutoff_distance * unit.nanometer
+            q, _, _ = original_params[i]
+            coul_force.addParticle([q.value_in_unit(unit.elementary_charge)])
+        coul_force.addInteractionGroup(lig_set, env_set)
+        coul_force.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
+        coul_force.setCutoffDistance(self.surrogate_potential.cutoff_distance * unit.nanometer)
+        coul_force.setUseSwitchingFunction(True)
+        coul_force.setSwitchingDistance(
+            (self.surrogate_potential.cutoff_distance - self.surrogate_potential.switch_width)
+            * unit.nanometer
         )
-        surr_force.setUseSwitchingFunction(False)
-        surr_force.setForceGroup(force_group)
-        for i in range(nb_force.getNumExceptions()):
-            p1, p2, _, _, _ = nb_force.getExceptionParameters(i)
-            ll_force.addExclusion(int(p1), int(p2))
-            surr_force.addExclusion(int(p1), int(p2))
+        coul_force.setForceGroup(force_group)
+
+        dexp_expr = self.surrogate_potential.build_expression(lam_vdw=lambda_names[1])
+        dexp_force = openmm.CustomNonbondedForce(dexp_expr)
+        dexp_force.addPerParticleParameter("epsilon")
+        dexp_force.addGlobalParameter(lambda_names[1], 1.0)
+        for i in range(new_system.getNumParticles()):
+            _, _, eps = original_params[i]
+            dexp_force.addParticle([eps.value_in_unit(unit.kilojoule_per_mole)])
+        dexp_force.addInteractionGroup(lig_set, env_set)
+        dexp_force.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
+        dexp_force.setCutoffDistance(self.surrogate_potential.cutoff_distance * unit.nanometer)
+        dexp_force.setUseSwitchingFunction(True)
+        dexp_force.setSwitchingDistance(
+            (self.surrogate_potential.cutoff_distance - self.surrogate_potential.switch_width)
+            * unit.nanometer
+        )
+        dexp_force.setForceGroup(force_group)
+
+        for p1, p2 in reference_exclusions:
+            coul_force.addExclusion(int(p1), int(p2))
+            dexp_force.addExclusion(int(p1), int(p2))
+
         new_system.addForce(ll_force)
-        new_system.addForce(surr_force)
-        if self.ghost_handler and ligand_params:
+        if ll_14_force is not None:
+            new_system.addForce(ll_14_force)
+        new_system.addForce(coul_force)
+        new_system.addForce(dexp_force)
+        sync_all_exclusions(new_system)
+
+        if self.ghost_handler and ligand_indices:
             charges = [
-                p[0].value_in_unit(unit.elementary_charge)
-                for p in ligand_params.values()
+                original_params[i][0].value_in_unit(unit.elementary_charge)
+                for i in sorted(ligand_indices)
             ]
-            new_system.addForce(
-                self.ghost_handler.create_ghost_ion_force(charges, lambda_names[0])
+            ghost_force = self.ghost_handler.create_ghost_ion_force(
+                ligand_indices=sorted(ligand_indices),
+                ligand_charges=charges,
+                lambda_param=lambda_names[0],
+                box_vectors=box_vectors if box_vectors is not None else new_system.getDefaultPeriodicBoxVectors(),
+                reference_positions=reference_positions,
             )
+            if ghost_force is not None:
+                new_system.addForce(ghost_force)
         return new_system
 
 
@@ -2150,11 +2317,23 @@ class Orbv3SurrogatePipeline:
         return TwoDimensionalLambdaPathPlanner(n_points, path_type).generate_path()
 
     def build_production_system(
-        self, original_system, ligand_indices, environment_indices, surrogate_params
+        self,
+        original_system,
+        ligand_indices,
+        environment_indices,
+        surrogate_params,
+        reference_positions=None,
+        box_vectors=None,
     ):
         return SurrogateSystemBuilder(
             surrogate_params, self.ghost_handler
-        ).build_surrogate_system(original_system, ligand_indices, environment_indices)
+        ).build_surrogate_system(
+            original_system,
+            ligand_indices,
+            environment_indices,
+            reference_positions=reference_positions,
+            box_vectors=box_vectors,
+        )
 
 
 
@@ -2173,10 +2352,26 @@ class AlchemicalPotentialFactory:
             obj = ACESoftcorePotential.from_dict(params or {})
         else:
             obj = ACESoftcorePotential.from_dict(params or {})
+        if isinstance(obj, DEXPSurrogatePotential):
+            return obj.build_expression(lam_vdw=lam_vdw), obj.get_parameters_dict()
         return obj.build_expression(lam_coul, lam_vdw), obj.get_parameters_dict()
 
-def create_ghost_ion_force(lig_charges, lam_param="lam_coul", dist=10.0, scale=0.1):
-    return GhostIonHandler(dist, scale).create_ghost_ion_force(lig_charges, lam_param)
+def create_ghost_ion_force(
+    lig_indices,
+    lig_charges,
+    lam_param="lam_coul",
+    dist=10.0,
+    scale=0.1,
+    box_vectors=None,
+    reference_positions=None,
+):
+    return GhostIonHandler(dist, scale).create_ghost_ion_force(
+        ligand_indices=lig_indices,
+        ligand_charges=lig_charges,
+        lambda_param=lam_param,
+        box_vectors=box_vectors,
+        reference_positions=reference_positions,
+    )
 
 
 # ============================================================================
@@ -2866,37 +3061,42 @@ def ensure_owned_system(system: openmm.System) -> openmm.System:
 
 def sync_all_exclusions(system: openmm.System) -> int:
     """
-    生产级排除表同步：强制所有 CustomNonbondedForce 与主 NonbondedForce 排除表一致。
-    修复：只补齐缺失的排除对，不删除原有（避免 Identical Exclusions 错误）。
+    生产级排除表同步：强制所有同粒子数的 CustomNonbondedForce exclusion 完全一致。
+    规则：取主 NonbondedForce exceptions 与所有 CustomNonbondedForce exclusions 的并集，
+    再将缺失项补齐到每一条 CustomNonbondedForce，避免 OpenMM 的 identical exclusions 错误。
     """
     nb_forces = [f for f in system.getForces() if isinstance(f, openmm.NonbondedForce)]
-    if not nb_forces:
+    custom_forces = [f for f in system.getForces() if isinstance(f, openmm.CustomNonbondedForce)]
+    if not nb_forces or not custom_forces:
         return 0
     nb_force = nb_forces[0]
 
-    main_excl = set()
+    union_excl = set()
     for i in range(nb_force.getNumExceptions()):
         p1, p2, _, _, _ = nb_force.getExceptionParameters(i)
         p1, p2 = int(p1), int(p2)
         if p1 != p2:
-            main_excl.add((min(p1, p2), max(p1, p2)))
+            union_excl.add((min(p1, p2), max(p1, p2)))
 
-    custom_forces = [f for f in system.getForces() if isinstance(f, openmm.CustomNonbondedForce)]
-    total_synced = 0
+    existing_per_force = []
     for c_force in custom_forces:
         if c_force.getNumParticles() != nb_force.getNumParticles():
-            continue
-        current_exclusions = c_force.getNumExclusions()
-        # 绝大多数生产构建路径已通过 reference_exclusions 完整注入排除表；
-        # 此处先做 O(1) 数量校验，避免对数十万排除对执行 Python 层全量差集。
-        if current_exclusions == len(main_excl):
+            existing_per_force.append(None)
             continue
         existing = set()
-        for i in range(current_exclusions):
+        for i in range(c_force.getNumExclusions()):
             p1, p2 = c_force.getExclusionParticles(i)
             existing.add((min(p1, p2), max(p1, p2)))
+        union_excl |= existing
+        existing_per_force.append(existing)
 
-        missing = main_excl - existing
+    total_synced = 0
+    for c_force, existing in zip(custom_forces, existing_per_force):
+        if existing is None:
+            continue
+        if len(existing) == len(union_excl):
+            continue
+        missing = union_excl - existing
         for p1, p2 in missing:
             c_force.addExclusion(p1, p2)
         total_synced += len(missing)
@@ -3327,7 +3527,7 @@ class Orbv3DEXPFittingPipeline:
         e_env = _eval(env_idx)
         return e_cplx - e_lig - e_env
 
-    def _build_mm_le_context(self, topology, gro_box, lig_idx, env_idx, gmx_include_dir=None, top_file=None):
+    def _build_mm_le_contexts(self, topology, gro_box, lig_idx, env_idx, gmx_include_dir=None, top_file=None):
         if isinstance(topology, openmm.app.Topology):
             omm_top = topology
         else:
@@ -3358,33 +3558,52 @@ class Orbv3DEXPFittingPipeline:
         if nb_orig is None:
             raise RuntimeError("原始系统中未找到 NonbondedForce")
 
-        le_sys = openmm.System()
-        for _ in range(n_total):
-            le_sys.addParticle(1.0)
-
-        le_force = openmm.CustomNonbondedForce(
-            "138.935456*q1*q2/r + 4*eps*((sigma/r)^12-(sigma/r)^6); "
-            "eps=sqrt(epsilon1*epsilon2); sigma=0.5*(sigma1+sigma2)"
-        )
-        for p in ["q", "sigma", "epsilon"]:
-            le_force.addPerParticleParameter(p)
-
-        for i in range(n_total):
-            q, sig, eps = nb_orig.getParticleParameters(i)
-            le_force.addParticle([
-                q.value_in_unit(unit.elementary_charge),
-                sig.value_in_unit(unit.nanometer),
-                eps.value_in_unit(unit.kilojoule_per_mole),
-            ])
-
-        le_force.addInteractionGroup(lig_idx.tolist(), env_idx.tolist())
-        le_force.setNonbondedMethod(openmm.CustomNonbondedForce.NoCutoff)
-        le_sys.addForce(le_force)
-
-        ctx = openmm.Context(le_sys, openmm.VerletIntegrator(0.001))
-        if gro_box is not None:
-            ctx.setPeriodicBoxVectors(*gro_box)
-        return ctx
+        force_defs = {
+            "coul": (
+                "138.935456*q1*q2/max(r, 0.05)",
+                ("q",),
+            ),
+            "vdw": (
+                "4*eps*((sigma/r)^12-(sigma/r)^6); "
+                "eps=sqrt(epsilon1*epsilon2); sigma=0.5*(sigma1+sigma2)",
+                ("sigma", "epsilon"),
+            ),
+        }
+        cutoff_nm = 0.85
+        switching_nm = cutoff_nm - 0.15
+        contexts = {}
+        for label, (expr, per_params) in force_defs.items():
+            le_sys = openmm.System()
+            for _ in range(n_total):
+                le_sys.addParticle(1.0)
+            le_force = openmm.CustomNonbondedForce(expr)
+            for param_name in per_params:
+                le_force.addPerParticleParameter(param_name)
+            for i in range(n_total):
+                q, sig, eps = nb_orig.getParticleParameters(i)
+                payload = []
+                for param_name in per_params:
+                    if param_name == "q":
+                        payload.append(q.value_in_unit(unit.elementary_charge))
+                    elif param_name == "sigma":
+                        payload.append(sig.value_in_unit(unit.nanometer))
+                    elif param_name == "epsilon":
+                        payload.append(eps.value_in_unit(unit.kilojoule_per_mole))
+                le_force.addParticle(payload)
+            le_force.addInteractionGroup(lig_idx.tolist(), env_idx.tolist())
+            le_force.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
+            le_force.setCutoffDistance(cutoff_nm * unit.nanometer)
+            le_force.setUseSwitchingFunction(True)
+            le_force.setSwitchingDistance(switching_nm * unit.nanometer)
+            for i in range(nb_orig.getNumExceptions()):
+                p1, p2, _, _, _ = nb_orig.getExceptionParameters(i)
+                le_force.addExclusion(int(p1), int(p2))
+            le_sys.addForce(le_force)
+            ctx = openmm.Context(le_sys, openmm.VerletIntegrator(0.001))
+            if gro_box is not None:
+                ctx.setPeriodicBoxVectors(*gro_box)
+            contexts[label] = ctx
+        return contexts
 
     def run_from_trajectory(
         self,
@@ -3411,7 +3630,7 @@ class Orbv3DEXPFittingPipeline:
         all_nums = np.array([a.element.atomic_number for a in traj.top.atoms], dtype=int)
 
         gro_box = traj.unitcell_vectors[0] * unit.nanometer if traj.unitcell_vectors is not None else None
-        mm_ctx = self._build_mm_le_context(
+        mm_contexts = self._build_mm_le_contexts(
             traj.topology, gro_box, lig_idx, env_idx,
             gmx_include_dir=gmx_include_dir, top_file=top_file,
         )
@@ -3420,7 +3639,7 @@ class Orbv3DEXPFittingPipeline:
         e_int_list, dists_per_frame = [], []
         stats = {"total": 0, "success": 0, "skip_outlier": 0, "skip_no_dists": 0}
 
-        print(f"⏳ 开始标注 {len(frame_indices)} 帧 ΔE = E_orb_int - E_mm_int ...")
+        print(f"⏳ 开始标注 {len(frame_indices)} 帧 ΔE_res = E_orb_int - E_mm_coul ...")
         for i, fid in enumerate(frame_indices):
             stats["total"] += 1
             try:
@@ -3429,10 +3648,17 @@ class Orbv3DEXPFittingPipeline:
 
                 e_orb_int = self._compute_orb_decomposition(pos_nm, lig_idx, env_idx, all_nums)
 
-                mm_ctx.setPositions(pos_nm * unit.nanometer)
-                e_mm_int = mm_ctx.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+                e_mm_coul = 0.0
+                e_mm_vdw = 0.0
+                for label, ctx in mm_contexts.items():
+                    ctx.setPositions(pos_nm * unit.nanometer)
+                    energy = ctx.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+                    if label == "coul":
+                        e_mm_coul = energy
+                    elif label == "vdw":
+                        e_mm_vdw = energy
 
-                delta_e = e_orb_int - e_mm_int
+                delta_e = e_orb_int - e_mm_coul
                 if np.isnan(delta_e) or np.isinf(delta_e) or abs(delta_e) > 5000.0:
                     stats["skip_outlier"] += 1
                     continue
@@ -3453,7 +3679,10 @@ class Orbv3DEXPFittingPipeline:
                 dists_per_frame.append(valid_dists)
 
                 if stats["success"] <= 3 or stats["success"] % 50 == 0:
-                    print(f"   ✅ Frame {fid} | ΔE={delta_e:7.2f} kJ/mol | Pairs={len(valid_dists)}")
+                    print(
+                        f"   ✅ Frame {fid} | ΔE_res={delta_e:7.2f} kJ/mol | "
+                        f"E_coul={e_mm_coul:7.2f} | E_vdw={e_mm_vdw:7.2f} | Pairs={len(valid_dists)}"
+                    )
             except Exception as e:
                 stats["skip_outlier"] += 1
                 continue
