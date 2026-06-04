@@ -1316,7 +1316,7 @@ def run_prepare_command(args):
             temperature=args.temperature,
             device="cuda" if args.platform.upper() == "CUDA" else "cpu",
             n_frames=200,
-            env_radius_nm=0.65,
+            env_radius_nm=0.85,
             gmx_include_dir=find_gmx_include_dir(args.gmx_path),
         )
         # 复制到指定文件名

@@ -15,11 +15,12 @@ import warnings
 import json
 import os
 import logging
+import gc
 import builtins
 from itertools import combinations
 from collections import deque
 from typing import Dict, List, Tuple, Optional, Any, Callable
-from scipy.optimize import minimize
+from scipy.optimize import differential_evolution, least_squares, minimize
 from scipy import constants
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -45,6 +46,59 @@ except ImportError:
     HAS_PYMBAR = False
 
 logger = logging.getLogger(__name__)
+
+
+def _build_openmmml_kwargs(
+    device: Optional[str] = None,
+    precision: Optional[str] = None,
+    return_energy_type: Optional[str] = None,
+    charge: Optional[int] = None,
+    multiplicity: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    统一按 openmm-ml 官方接口组织 MLPotential.createSystem() 参数。
+    是否显式传 precision 由调用侧决定；若不传则遵循 openmm-ml 的模型默认精度。
+    """
+    kwargs: Dict[str, Any] = {}
+    if return_energy_type is not None:
+        kwargs["returnEnergyType"] = return_energy_type
+    if device is not None:
+        kwargs["device"] = device
+    if precision in ("single", "double"):
+        kwargs["precision"] = precision
+    if charge is not None:
+        kwargs["charge"] = charge
+    if multiplicity is not None:
+        kwargs["multiplicity"] = multiplicity
+    return kwargs
+
+
+def _select_env_indices_from_mdtraj_frame(frame, lig_idx: np.ndarray, env_radius_nm: float, max_env_atoms: Optional[int] = None) -> np.ndarray:
+    """
+    先做半径近邻筛选，再按“到配体最近距离”的 Top-K 排序裁剪环境原子。
+    这里裁的是原子，不是整盒水，也不是全环境残基。
+    """
+    import mdtraj as md
+
+    raw_env = md.compute_neighbors(frame, env_radius_nm, lig_idx)[0]
+    env_idx = np.setdiff1d(raw_env, lig_idx, assume_unique=True)
+    if max_env_atoms is None or len(env_idx) <= max_env_atoms:
+        return np.asarray(env_idx, dtype=int)
+
+    pos_nm = np.asarray(frame.xyz[0], dtype=np.float64)
+    if frame.unitcell_vectors is not None:
+        box_vecs = np.asarray(frame.unitcell_vectors[0], dtype=np.float64)
+        box_lens = np.linalg.norm(box_vecs, axis=1)
+    else:
+        box_lens = None
+
+    delta = pos_nm[lig_idx][:, None, :] - pos_nm[env_idx][None, :, :]
+    if box_lens is not None:
+        delta -= box_lens * np.round(delta / box_lens)
+    dists = np.linalg.norm(delta, axis=-1)
+    min_dists = np.min(dists, axis=0)
+    keep_order = np.argsort(min_dists)[:max_env_atoms]
+    return np.sort(np.asarray(env_idx[keep_order], dtype=int))
 
 
 def _infer_log_level_from_message(message: str) -> int:
@@ -359,8 +413,8 @@ class DEXPSurrogatePotential:
         A_fit=1.0,
         B_fit=0.5,
         sigma_elec=0.1,
-        switch_width=0.2,
-        cutoff_distance=1.2,
+        switch_width=0.10,
+        cutoff_distance=0.65,
         offset_c0=0.0,
         offset_c1=0.0,
     ):
@@ -407,8 +461,13 @@ class DEXPSurrogatePotential:
 
 
 class Orbv3SurrogateFitter:
-    def __init__(self, fitting_region=(0.2, 1.0)):
+    def __init__(
+        self,
+        fitting_region=(0.20, 0.60),
+        enable_lbfgsb_refine: bool = True,
+    ):
         self.r_min, self.r_max = fitting_region
+        self.enable_lbfgsb_refine = bool(enable_lbfgsb_refine)
 
     def fit_parameters(self, distances_per_frame, e_delta_list, eff_eps=1.0):
         e_arr = np.asarray(e_delta_list, dtype=float)
@@ -416,35 +475,63 @@ class Orbv3SurrogateFitter:
         if mask.sum() < 30:
             return {"fitting_success": False, "error": "insufficient_frames"}
 
-        frame_energies = e_arr[mask]
-        frame_dists = [
+        frame_energies_raw = e_arr[mask]
+        frame_dists_raw = [
             np.asarray(d, dtype=float)
             for i, d in enumerate(distances_per_frame)
             if mask[i]
         ]
+
+        contact_scores = []
+        for dd in frame_dists_raw:
+            if dd.size == 0:
+                contact_scores.append(0.0)
+            else:
+                score = np.sum(np.clip(self.r_max - dd, 0.0, None) ** 2)
+                contact_scores.append(score)
+        contact_scores = np.asarray(contact_scores, dtype=float)
+        if len(contact_scores) and float(np.max(contact_scores)) > 1.0e-6:
+            frame_weights = contact_scores / float(np.sum(contact_scores))
+        else:
+            frame_weights = np.full(len(frame_energies_raw), 1.0 / float(len(frame_energies_raw)))
+
+        robust_center = float(np.median(frame_energies_raw))
+        abs_dev = np.abs(frame_energies_raw - robust_center)
+        robust_scale = float(1.4826 * np.median(abs_dev)) if len(abs_dev) else 0.0
+        if not np.isfinite(robust_scale) or robust_scale < 1.0e-8:
+            robust_scale = max(float(np.std(frame_energies_raw)), 1.0)
+
+        trim_limit = max(60.0, 3.5 * robust_scale)
+        keep_trim = np.abs(frame_energies_raw - robust_center) <= trim_limit
+        if int(np.sum(keep_trim)) >= 30:
+            frame_energies = frame_energies_raw[keep_trim]
+            frame_dists = [d for d, keep in zip(frame_dists_raw, keep_trim) if keep]
+            frame_weights = frame_weights[keep_trim]
+            frame_weights /= float(np.sum(frame_weights))
+        else:
+            frame_energies = frame_energies_raw
+            frame_dists = frame_dists_raw
+
         diagnostic_global_mu = float(np.mean(frame_energies))
+        diagnostic_weighted_mu = float(np.sum(frame_weights * frame_energies))
+        diagnostic_centered_std = float(
+            np.sqrt(np.sum(frame_weights * (frame_energies - diagnostic_weighted_mu) ** 2))
+        )
 
-        # 使用均匀帧权重，避免把 ΔE 误当作统计力学玻尔兹曼因子。
-        frame_weights = np.full(frame_energies.shape, 1.0 / float(len(frame_energies)))
-
-        def _full_objective(params):
+        def _predict_frame_values(params):
             a, dgap, r0, A, B = params
-
-            if r0 < 0.25 or r0 > 0.45 or a < 8.0 or dgap < 2.0 or A < 0 or B < 0:
-                return 1e9
-
             b = a - dgap
+
+            if (
+                r0 < 0.30 or r0 > 0.38
+                or a < 12.0 or a > 30.0
+                or b < 5.0 or b > 15.0
+                or b >= a
+                or A < 0 or B < 0
+            ):
+                return None, None, None
+
             inv = 1.0 / r0
-            pen = 100.0 * max(0.0, 3.5 - dgap) ** 2
-
-            # 强迫纯 DEXP 在 0.8 nm 外快速归零，避免承担任何长程基线职责。
-            r_anchors = np.array([0.80, 0.90, 1.00, 1.10, 1.20], dtype=float)
-            x_anchors = np.clip(r_anchors * inv - 1.0, -50.0, 50.0)
-            u_dexp_anchors = 4.0 * eff_eps * (
-                A * np.exp(-a * x_anchors) - B * np.exp(-b * x_anchors)
-            )
-            reg_penalty = 2500.0 * np.mean(u_dexp_anchors ** 2)
-
             predicted_frame_energies = []
             valid_indices = []
             for idx, dd in enumerate(frame_dists):
@@ -454,76 +541,96 @@ class Orbv3SurrogateFitter:
                 pair_energy = 4.0 * eff_eps * (
                     A * np.exp(-a * x) - B * np.exp(-b * x)
                 )
-                normalization = max(1.0, float(dd.size))
-                predicted_frame_energies.append(float(np.sum(pair_energy) / normalization))
+                predicted_frame_energies.append(float(np.sum(pair_energy)))
                 valid_indices.append(idx)
-
             if not predicted_frame_energies:
-                return 1e9
+                return None, None, None
+            return np.asarray(predicted_frame_energies, dtype=float), np.asarray(valid_indices, dtype=int), (a, b, r0, A, B)
 
-            pred_raw = np.asarray(predicted_frame_energies, dtype=float)
+        def _residual_vector(params):
+            pred_raw, valid_indices, unpacked = _predict_frame_values(params)
+            if pred_raw is None:
+                return np.full(len(frame_energies) + 3, 1.0e6, dtype=float)
+
+            a, b, r0, A, B = unpacked
             valid_weights = frame_weights[valid_indices]
             target_raw = frame_energies[valid_indices]
             weight_norm = float(np.sum(valid_weights))
             if weight_norm <= 1.0e-12:
-                return 1e9
-            c0_opt = float(np.sum(valid_weights * (target_raw - pred_raw)) / weight_norm)
-            terr = float(
-                np.sum(
-                    valid_weights
-                    * (target_raw - (pred_raw + c0_opt)) ** 2
-                )
+                return np.full(len(frame_energies) + 3, 1.0e6, dtype=float)
+
+            target_center = float(np.sum(valid_weights * target_raw) / weight_norm)
+            pred_center = float(np.sum(valid_weights * pred_raw) / weight_norm)
+            core_residuals = np.sqrt(valid_weights) * (
+                (target_raw - target_center) - (pred_raw - pred_center)
             )
 
-            return terr + pen + reg_penalty
+            inv = 1.0 / r0
+            r_anchors = np.array([0.60, 0.70, 0.80], dtype=float)
+            x_anchors = np.clip(r_anchors * inv - 1.0, -50.0, 50.0)
+            u_dexp_anchors = 4.0 * eff_eps * (
+                A * np.exp(-a * x_anchors) - B * np.exp(-b * x_anchors)
+            )
+            anchor_residuals = np.sqrt(1000.0 / max(1, len(r_anchors))) * u_dexp_anchors
+
+            return np.concatenate([core_residuals, anchor_residuals])
+
+        def _scalar_objective(params):
+            residuals = _residual_vector(params)
+            return float(np.dot(residuals, residuals))
 
         bounds = [
-            (10.0, 25.0),
-            (3.0, 12.0),
-            (0.28, 0.40),
-            (1.0e-5, 5.0),
-            (1.0e-5, 5.0),
+            (12.0, 30.0),
+            (2.0, 15.0),
+            (0.30, 0.38),
+            (1.0e-5, 10.0),
+            (1.0e-5, 10.0),
         ]
+        x0 = np.array([18.0, 8.0, 0.34, 0.5, 0.2], dtype=float)
 
-        x0 = [14.0, 6.0, 0.34, 0.05, 0.02]
-
-        res = minimize(
-            _full_objective,
-            x0,
-            method="L-BFGS-B",
+        de_res = differential_evolution(
+            _scalar_objective,
             bounds=bounds,
-            options={"ftol": 1e-8, "maxiter": 1500},
+            polish=False,
+            maxiter=50,
+            popsize=15,
+            tol=0.01,
+            updating="deferred",
+            workers=1,
+            seed=20260526,
         )
+        x_seed = np.asarray(de_res.x if de_res.success else x0, dtype=float)
 
-        if (not res.success) and res.fun > 1e8:
+        ls_lower = np.array([b[0] for b in bounds], dtype=float)
+        ls_upper = np.array([b[1] for b in bounds], dtype=float)
+        ls_res = least_squares(
+            _residual_vector,
+            x_seed,
+            bounds=(ls_lower, ls_upper),
+            loss="soft_l1",
+            f_scale=max(robust_scale, 10.0),
+            max_nfev=2000,
+        )
+        x_best = np.asarray(ls_res.x, dtype=float)
+        best_cost = _scalar_objective(x_best)
+
+        if self.enable_lbfgsb_refine:
+            lbfgsb_res = minimize(
+                _scalar_objective,
+                x_best,
+                method="L-BFGS-B",
+                bounds=bounds,
+                options={"ftol": 1e-10, "maxiter": 500},
+            )
+            if lbfgsb_res.success and lbfgsb_res.fun <= best_cost:
+                x_best = np.asarray(lbfgsb_res.x, dtype=float)
+                best_cost = float(lbfgsb_res.fun)
+
+        if not np.all(np.isfinite(x_best)):
             return {"fitting_success": False, "error": "optimizer_failed"}
 
-        a, dgap, r0, A, B = res.x
+        a, dgap, r0, A, B = x_best
         b = a - dgap
-        inv = 1.0 / r0
-        predicted_frame_energies = []
-        valid_indices = []
-        for idx, dd in enumerate(frame_dists):
-            if dd.size == 0:
-                continue
-            x = np.clip(dd * inv - 1.0, -50.0, 50.0)
-            pair_energy = 4.0 * eff_eps * (
-                A * np.exp(-a * x) - B * np.exp(-b * x)
-            )
-            normalization = max(1.0, float(dd.size))
-            predicted_frame_energies.append(float(np.sum(pair_energy) / normalization))
-            valid_indices.append(idx)
-
-        diagnostic_fit_c0 = diagnostic_global_mu
-        if predicted_frame_energies:
-            pred_raw = np.asarray(predicted_frame_energies, dtype=float)
-            valid_weights = frame_weights[valid_indices]
-            target_raw = frame_energies[valid_indices]
-            weight_norm = float(np.sum(valid_weights))
-            if weight_norm > 1.0e-12:
-                diagnostic_fit_c0 = float(
-                    np.sum(valid_weights * (target_raw - pred_raw)) / weight_norm
-                )
 
         # 诊断用接触度量：越短程越大，但绝不进入 OpenMM force。
         contact_metrics = []
@@ -531,7 +638,7 @@ class Orbv3SurrogateFitter:
         for Et_raw, dd in zip(frame_energies, frame_dists):
             if dd.size == 0:
                 continue
-            contact_score = np.clip(0.65 - dd, 0.0, None)
+            contact_score = np.clip(self.r_max - dd, 0.0, None)
             contact_metrics.append(float(np.sum(contact_score)))
             diagnostic_energies.append(float(Et_raw))
 
@@ -551,14 +658,22 @@ class Orbv3SurrogateFitter:
             "offset_c0": 0.0,
             "offset_c1": 0.0,
             "diagnostic_global_mu": float(diagnostic_global_mu),
-            "diagnostic_fit_c0": float(diagnostic_fit_c0),
+            "diagnostic_fit_c0": float(diagnostic_weighted_mu),
+            "diagnostic_weighted_center": float(diagnostic_weighted_mu),
+            "diagnostic_centered_std": float(diagnostic_centered_std),
             "diagnostic_contact_mu": float(diagnostic_contact_mu),
             "diagnostic_contact_slope": float(diagnostic_contact_slope),
+            "diagnostic_robust_center": float(robust_center),
+            "diagnostic_robust_scale": float(robust_scale),
+            "diagnostic_trim_limit": float(trim_limit),
+            "diagnostic_frames_after_trim": int(len(frame_energies)),
             "sigma_elec": 0.1,
-            "switch_width": 0.2,
-            "cutoff_distance": 1.2,
+            "switch_width": 0.10,
+            "cutoff_distance": 0.60,
             "fitting_success": True,
-            "final_cost": float(res.fun),
+            "final_cost": float(best_cost),
+            "optimizer_global_success": bool(de_res.success),
+            "optimizer_ls_success": bool(ls_res.success),
         }
 
 
@@ -695,17 +810,17 @@ class OrbVacuumContext:
     """ORB 真空力场计算上下文 (仅用于口袋内力场计算)"""
 
     def __init__(
-        self, topology, model_name="orb-v3-conservative-inf-omat", device="cpu"
+        self, topology, model_name="mace-off24-medium", device="cpu"
     ):
         self.device = device
+        self.model_name = model_name
         self.potential = MLPotential(model_name)
-        self.system = self.potential.createSystem(
-            topology,
-            returnEnergyType="energy",
+        self.system = self.potential.createSystem(topology, **_build_openmmml_kwargs(
+            device=self.device,
+            return_energy_type="energy",
             charge=0,
             multiplicity=1,
-            device=self.device,
-        )
+        ))
         self.integrator = openmm.VerletIntegrator(1.0 * unit.femtoseconds)
         try:
             platform = openmm.Platform.getPlatformByName(device.upper())
@@ -1940,7 +2055,9 @@ class SurrogateSystemBuilder:
         if not nb_force:
             raise ValueError("未找到 NonbondedForce")
 
-        lig_set, env_set = set(ligand_indices), set(environment_indices)
+        # `environment_indices` 仅保留接口兼容；DEXP correction 仍按全局 type-switch 选择全部 L-E 对。
+        _ = environment_indices
+        lig_set = set(ligand_indices)
         original_params = [
             nb_force.getParticleParameters(i) for i in range(new_system.getNumParticles())
         ]
@@ -1949,70 +2066,18 @@ class SurrogateSystemBuilder:
             p1, p2, _, _, _ = nb_force.getExceptionParameters(i)
             reference_exclusions.append((int(p1), int(p2)))
 
-        # L-L 内部力：复用成熟组件，保留完整 1-2/1-3/1-4 拓扑。
-        ll_force, ll_14_force = create_ligand_internal_force(
-            nb_force=nb_force,
-            perturbed_indices=ligand_indices,
-            particle_params=None,
-            reference_exclusions=None,
-            num_particles=new_system.getNumParticles(),
-            system=new_system,
+        dexp_expr = (
+            f"active * ({self.surrogate_potential.build_expression(lam_vdw=lambda_names[1])}); "
+            "active = abs(type1-type2)"
         )
-        ll_force.setForceGroup(2)
-        if ll_14_force is not None:
-            ll_14_force.setForceGroup(2)
-
-        # 原生 PME 只保留 E-E，彻底静默所有涉及配体的 L-L / L-E 非键项。
-        for idx in ligand_indices:
-            q, sig, _eps = original_params[idx]
-            nb_force.setParticleParameters(
-                idx,
-                0.0 * unit.elementary_charge,
-                sig,
-                0.0 * unit.kilojoule_per_mole,
-            )
-        for i in range(nb_force.getNumExceptions()):
-            p1, p2, _q_prod, sig, _eps = nb_force.getExceptionParameters(i)
-            p1, p2 = int(p1), int(p2)
-            if p1 in lig_set or p2 in lig_set:
-                nb_force.setExceptionParameters(
-                    i,
-                    p1,
-                    p2,
-                    0.0 * unit.elementary_charge**2,
-                    sig,
-                    0.0 * unit.kilojoule_per_mole,
-                )
-
-        gamma_eff = 1.0 / max(math.sqrt(2.0) * self.sigma_gauss_nm, 1.0e-6)
-        coul_expr = (
-            f"{lambda_names[0]} * 138.935456 * q1 * q2 * erf({gamma_eff} * r_safe) / r_safe; "
-            "r_safe = max(r, 1e-6)"
-        )
-        coul_force = openmm.CustomNonbondedForce(coul_expr)
-        coul_force.addPerParticleParameter("q")
-        coul_force.addGlobalParameter(lambda_names[0], 1.0)
-        for i in range(new_system.getNumParticles()):
-            q, _, _ = original_params[i]
-            coul_force.addParticle([q.value_in_unit(unit.elementary_charge)])
-        coul_force.addInteractionGroup(lig_set, env_set)
-        coul_force.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
-        coul_force.setCutoffDistance(self.surrogate_potential.cutoff_distance * unit.nanometer)
-        coul_force.setUseSwitchingFunction(True)
-        coul_force.setSwitchingDistance(
-            (self.surrogate_potential.cutoff_distance - self.surrogate_potential.switch_width)
-            * unit.nanometer
-        )
-        coul_force.setForceGroup(force_group)
-
-        dexp_expr = self.surrogate_potential.build_expression(lam_vdw=lambda_names[1])
         dexp_force = openmm.CustomNonbondedForce(dexp_expr)
         dexp_force.addPerParticleParameter("epsilon")
+        dexp_force.addPerParticleParameter("type")
         dexp_force.addGlobalParameter(lambda_names[1], 1.0)
         for i in range(new_system.getNumParticles()):
             _, _, eps = original_params[i]
-            dexp_force.addParticle([eps.value_in_unit(unit.kilojoule_per_mole)])
-        dexp_force.addInteractionGroup(lig_set, env_set)
+            particle_type = 1.0 if i in lig_set else 0.0
+            dexp_force.addParticle([eps.value_in_unit(unit.kilojoule_per_mole), particle_type])
         dexp_force.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
         dexp_force.setCutoffDistance(self.surrogate_potential.cutoff_distance * unit.nanometer)
         dexp_force.setUseSwitchingFunction(True)
@@ -2023,13 +2088,8 @@ class SurrogateSystemBuilder:
         dexp_force.setForceGroup(force_group)
 
         for p1, p2 in reference_exclusions:
-            coul_force.addExclusion(int(p1), int(p2))
             dexp_force.addExclusion(int(p1), int(p2))
 
-        new_system.addForce(ll_force)
-        if ll_14_force is not None:
-            new_system.addForce(ll_14_force)
-        new_system.addForce(coul_force)
         new_system.addForce(dexp_force)
         sync_all_exclusions(new_system)
 
@@ -2056,7 +2116,7 @@ class SurrogateSystemBuilder:
 class OrbScanner:
     def __init__(
         self,
-        model_name="orb-v3-conservative-inf-omat",
+        model_name="mace-off24-medium",
         n_order=6,
         charge=0,
         multiplicity=1,
@@ -2066,6 +2126,7 @@ class OrbScanner:
         self.charge = charge
         self.multiplicity = multiplicity
         self.device = device
+        self.model_name = model_name
         self.context = None
         self.system = None
         if HAS_ORB:
@@ -2082,13 +2143,12 @@ class OrbScanner:
                     openmm.app.element.Element.getByAtomicNumber(atom.GetAtomicNum()),
                     res,
                 )
-            self.system = self.potential.createSystem(
-                vacuum_top,
-                returnEnergyType="interaction_energy",
+            self.system = self.potential.createSystem(vacuum_top, **_build_openmmml_kwargs(
+                device=self.device,
+                return_energy_type="interaction_energy",
                 charge=self.charge,
                 multiplicity=self.multiplicity,
-                device=self.device,
-            )
+            ))
             self.context = openmm.Context(self.system, openmm.VerletIntegrator(0.001))
 
     def run_torsion_scan(self, rdkit_mol, torsion_indices):
@@ -2124,7 +2184,7 @@ class OrbScanner:
         scan_coord: str = "r",        # "r" | "thetaA" | "thetaB" | "phiA" | "phiB" | "phiC"
         n_points: int = 21,
         device: str = "cpu",
-        model_name: str = "orb-v3-conservative-inf-omat"
+        model_name: str = "mace-off24-medium"
     ) -> Dict:
         """
         沿单个 Boresch 坐标做 1D Orb 势能面扫描。
@@ -2206,8 +2266,12 @@ class OrbScanner:
             )
         
         potential = MLPotential(model_name)
-        system = potential.createSystem(vacuum_top, returnEnergyType="energy",
-                                         charge=0, multiplicity=1, device=device)
+        system = potential.createSystem(vacuum_top, **_build_openmmml_kwargs(
+            device=device,
+            return_energy_type="energy",
+            charge=0,
+            multiplicity=1,
+        ))
         integrator = openmm.VerletIntegrator(0.001)
         platform = openmm.Platform.getPlatformByName(device.upper() if device != "cpu" else "CPU")
         context = openmm.Context(system, integrator, platform)
@@ -2302,7 +2366,7 @@ class OrbMMHybridFactory:
 
 
 class Orbv3SurrogatePipeline:
-    def __init__(self, model_name="orb-v3-conservative-inf-omat", device=GLOBAL_DEVICE):
+    def __init__(self, model_name="mace-off24-medium", device=GLOBAL_DEVICE):
         self.orb_calculator = None
         self.default_surrogate = DEXPSurrogatePotential()
         self.ghost_handler = GhostIonHandler()
@@ -3454,13 +3518,13 @@ def run_orbv3_dexp_fitting(
     temperature: float = 300.0,
     device: str = "cuda",
     n_frames: int = 200,
-    env_radius_nm: float = 0.65,
+    env_radius_nm: float = 0.85,
     gmx_include_dir: str = None
 ) -> str:
     """一键 Orbv3 → DEXP 拟合（委托给 Orbv3DEXPFittingPipeline）"""
     if not HAS_ORB:
         raise ImportError("Orb 拟合依赖 torch + openmmml，请安装后重试")
-    pipeline = Orbv3DEXPFittingPipeline(device=device)
+    pipeline = Orbv3DEXPFittingPipeline(model_name="mace-off24-medium", device=device)
     out_json = os.path.join(output_dir, "dexp_fitted_params.json")
     pipeline.run_from_trajectory(
         traj_file=traj_file,
@@ -3478,24 +3542,87 @@ class Orbv3DEXPFittingPipeline:
     """
     一键 Orbv3 残差标注 → DEXP 拟合流水线
     职责：轨迹加载 → 纯净MM L-E参考系构建 → Orb三体分解 → ΔE计算 → 拟合器对接
-    数学契约：ΔE = (E_orb_cplx - E_orb_lig - E_orb_env) - E_mm_le
+    数学契约：ΔE = E_qm(region) - E_mm_total(region)，拟合前再减去样本均值，仅学习相对 MM 总非键面的涨落修正。
     """
-    def __init__(self, model_name: str = "orb-v3-conservative-inf-omat", device: str = "cuda"):
+    def __init__(self, model_name: str = "mace-off24-medium", device: str = "cuda"):
         if not HAS_ORB:
             raise ImportError("Orb 拟合依赖 torch + openmmml，请安装后重试")
         self.device = device if (device == "cuda" and torch.cuda.is_available()) else "cpu"
         self.model_name = model_name
+        self.label_mode = "orbv3_interaction" if "orb" in model_name.lower() else "mace_decomposition"
+        self.openmmml_precision = None
+        self._precision_kwarg_supported = True
         self.potential = MLPotential(model_name)
         self._orb_ctx_cache = {}
+        self._cache_contexts = True
 
-    def _get_orb_context(self, numbers: np.ndarray, box_vectors=None):
-        key = tuple(numbers)
-        if key in self._orb_ctx_cache:
-            ctx = self._orb_ctx_cache[key]
-            if box_vectors is not None:
-                ctx.setPeriodicBoxVectors(*box_vectors)
-            return ctx
+    def _clear_orb_context_cache(self):
+        for bundle in self._orb_ctx_cache.values():
+            for ctx_bundle in bundle.get("contexts", {}).values():
+                try:
+                    ctx_bundle.pop("context", None)
+                    ctx_bundle.pop("simulation", None)
+                    ctx_bundle.pop("integrator", None)
+                    ctx_bundle.pop("system", None)
+                except Exception:
+                    pass
+        self._orb_ctx_cache = {}
+        gc.collect()
+        if HAS_ORB and torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
+    @staticmethod
+    def _is_cuda_oom(exc: Exception) -> bool:
+        text = str(exc)
+        return ("CUDA out of memory" in text) or ("cuda out of memory" in text)
+
+    @staticmethod
+    def _is_precision_or_dtype_mismatch(exc: Exception) -> bool:
+        text = str(exc)
+        return (
+            ("both inputs should have same dtype" in text)
+            or ("requested dtype" in text)
+            or ("same scalar type" in text)
+        )
+
+    @staticmethod
+    def _is_unsupported_precision_kwarg(exc: Exception) -> bool:
+        text = str(exc)
+        return ("precision" in text) and ("unexpected keyword" in text or "got an unexpected keyword argument" in text)
+
+    def _fallback_to_cpu_double(self, reason: str):
+        print(f"  ⚠️ {reason}，将按 openmm-ml 接口回退到 device='cpu', precision='double' 继续标注。")
+        self.device = "cpu"
+        self.openmmml_precision = "double" if self._precision_kwarg_supported else None
+        self._clear_orb_context_cache()
+
+    def _create_openmmml_system(self, topology, return_energy_type: Optional[str] = None):
+        kwargs = _build_openmmml_kwargs(
+            device=self.device,
+            precision=self.openmmml_precision if self._precision_kwarg_supported else None,
+            return_energy_type=return_energy_type,
+        )
+        try:
+            return self.potential.createSystem(topology, **kwargs)
+        except TypeError as exc:
+            if "precision" in kwargs and self._is_unsupported_precision_kwarg(exc):
+                self._precision_kwarg_supported = False
+                self.openmmml_precision = None
+                return self.potential.createSystem(
+                    topology,
+                    **_build_openmmml_kwargs(device=self.device, return_energy_type=return_energy_type),
+                )
+            raise
+
+    def _create_orb_context_bundle(
+        self,
+        numbers: np.ndarray,
+        box_vectors=None,
+        return_energy_type: Optional[str] = None,
+    ) -> Dict[str, Any]:
         top = openmm.app.Topology()
         chain = top.addChain()
         res = top.addResidue("MLP", chain)
@@ -3504,28 +3631,124 @@ class Orbv3DEXPFittingPipeline:
         if box_vectors is not None:
             top.setPeriodicBoxVectors(box_vectors)
 
-        sys = self.potential.createSystem(top, device=self.device)
+        sys = self._create_openmmml_system(top, return_energy_type=return_energy_type)
         integ = openmm.VerletIntegrator(0.001)
         sim = openmm.app.Simulation(top, sys, integ)
         if box_vectors is not None:
             sim.context.setPeriodicBoxVectors(*box_vectors)
-        self._orb_ctx_cache[key] = sim.context
-        return sim.context
+        return {
+            "context": sim.context,
+            "simulation": sim,
+            "integrator": integ,
+            "system": sys,
+        }
+
+    def _get_orb_decomposition_bundle(self, lig_idx: np.ndarray, env_idx: np.ndarray, all_nums: np.ndarray) -> Dict[str, Any]:
+        key = (
+            self.label_mode,
+            tuple(int(x) for x in lig_idx),
+            tuple(int(x) for x in env_idx),
+            self.device,
+            self.openmmml_precision,
+        )
+        if key in self._orb_ctx_cache:
+            return self._orb_ctx_cache[key]
+
+        comb_idx = np.concatenate([lig_idx, env_idx])
+        if self.label_mode == "orbv3_interaction":
+            bundle = {
+                "comb_idx": comb_idx,
+                "lig_idx": lig_idx,
+                "env_idx": env_idx,
+                "contexts": {
+                    "cplx": self._create_orb_context_bundle(
+                        all_nums[comb_idx],
+                        return_energy_type="interaction_energy",
+                    ),
+                },
+            }
+        else:
+            bundle = {
+                "comb_idx": comb_idx,
+                "lig_idx": lig_idx,
+                "env_idx": env_idx,
+                "contexts": {
+                    "cplx": self._create_orb_context_bundle(all_nums[comb_idx]),
+                    "lig": self._create_orb_context_bundle(all_nums[lig_idx]),
+                    "env": self._create_orb_context_bundle(all_nums[env_idx]),
+                },
+            }
+        self._orb_ctx_cache[key] = bundle
+        return bundle
+
+    @staticmethod
+    def _evaluate_orb_context_energy(ctx_bundle: Dict[str, Any], pos_nm: np.ndarray) -> float:
+        ctx = ctx_bundle["context"]
+        ctx.setPositions(pos_nm * unit.nanometer)
+        return ctx.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
 
     def _compute_orb_decomposition(self, pos_nm: np.ndarray, lig_idx: np.ndarray, env_idx: np.ndarray, all_nums: np.ndarray) -> float:
-        comb_idx = np.concatenate([lig_idx, env_idx])
+        try:
+            bundle = self._get_orb_decomposition_bundle(lig_idx, env_idx, all_nums)
+            e_cplx = self._evaluate_orb_context_energy(bundle["contexts"]["cplx"], pos_nm[bundle["comb_idx"]])
+            if self.label_mode == "orbv3_interaction":
+                return e_cplx
+            e_lig = self._evaluate_orb_context_energy(bundle["contexts"]["lig"], pos_nm[bundle["lig_idx"]])
+            e_env = self._evaluate_orb_context_energy(bundle["contexts"]["env"], pos_nm[bundle["env_idx"]])
+            return e_cplx - e_lig - e_env
+        except Exception as exc:
+            if self.device == "cuda" and self._is_cuda_oom(exc):
+                self._fallback_to_cpu_double("OpenMM-ML CUDA 显存不足")
+                bundle = self._get_orb_decomposition_bundle(lig_idx, env_idx, all_nums)
+                e_cplx = self._evaluate_orb_context_energy(bundle["contexts"]["cplx"], pos_nm[bundle["comb_idx"]])
+                if self.label_mode == "orbv3_interaction":
+                    return e_cplx
+                e_lig = self._evaluate_orb_context_energy(bundle["contexts"]["lig"], pos_nm[bundle["lig_idx"]])
+                e_env = self._evaluate_orb_context_energy(bundle["contexts"]["env"], pos_nm[bundle["env_idx"]])
+                return e_cplx - e_lig - e_env
+            if self._is_precision_or_dtype_mismatch(exc):
+                self._fallback_to_cpu_double("OpenMM-ML precision/device 与模型默认精度不兼容")
+                bundle = self._get_orb_decomposition_bundle(lig_idx, env_idx, all_nums)
+                e_cplx = self._evaluate_orb_context_energy(bundle["contexts"]["cplx"], pos_nm[bundle["comb_idx"]])
+                if self.label_mode == "orbv3_interaction":
+                    return e_cplx
+                e_lig = self._evaluate_orb_context_energy(bundle["contexts"]["lig"], pos_nm[bundle["lig_idx"]])
+                e_env = self._evaluate_orb_context_energy(bundle["contexts"]["env"], pos_nm[bundle["env_idx"]])
+                return e_cplx - e_lig - e_env
+            raise
 
-        def _eval(idx_arr):
-            nums = all_nums[idx_arr]
-            pos = pos_nm[idx_arr]
-            ctx = self._get_orb_context(nums, box_vectors=None)
-            ctx.setPositions(pos * unit.nanometer)
-            return ctx.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
-
-        e_cplx = _eval(comb_idx)
-        e_lig = _eval(lig_idx)
-        e_env = _eval(env_idx)
-        return e_cplx - e_lig - e_env
+    def _preflight_orb_backend(self, pos_nm: np.ndarray, lig_idx: np.ndarray, env_idx: np.ndarray, all_nums: np.ndarray):
+        """
+        在主循环前预建并预热 cplx/lig/env 三个常驻 Context。
+        后续每一帧只滚动更新坐标，不再在帧循环里重建 Context。
+        """
+        try:
+            bundle = self._get_orb_decomposition_bundle(lig_idx, env_idx, all_nums)
+            self._evaluate_orb_context_energy(bundle["contexts"]["cplx"], pos_nm[bundle["comb_idx"]])
+            if self.label_mode == "orbv3_interaction":
+                return
+            self._evaluate_orb_context_energy(bundle["contexts"]["lig"], pos_nm[bundle["lig_idx"]])
+            self._evaluate_orb_context_energy(bundle["contexts"]["env"], pos_nm[bundle["env_idx"]])
+        except Exception as exc:
+            if self.device == "cuda" and self._is_cuda_oom(exc):
+                self._fallback_to_cpu_double("OpenMM-ML CUDA 预检显存不足")
+                bundle = self._get_orb_decomposition_bundle(lig_idx, env_idx, all_nums)
+                self._evaluate_orb_context_energy(bundle["contexts"]["cplx"], pos_nm[bundle["comb_idx"]])
+                if self.label_mode == "orbv3_interaction":
+                    return
+                self._evaluate_orb_context_energy(bundle["contexts"]["lig"], pos_nm[bundle["lig_idx"]])
+                self._evaluate_orb_context_energy(bundle["contexts"]["env"], pos_nm[bundle["env_idx"]])
+                return
+            if self._is_precision_or_dtype_mismatch(exc):
+                self._fallback_to_cpu_double("OpenMM-ML 预检 precision/device 与模型默认精度不兼容")
+                bundle = self._get_orb_decomposition_bundle(lig_idx, env_idx, all_nums)
+                self._evaluate_orb_context_energy(bundle["contexts"]["cplx"], pos_nm[bundle["comb_idx"]])
+                if self.label_mode == "orbv3_interaction":
+                    return
+                self._evaluate_orb_context_energy(bundle["contexts"]["lig"], pos_nm[bundle["lig_idx"]])
+                self._evaluate_orb_context_energy(bundle["contexts"]["env"], pos_nm[bundle["env_idx"]])
+                return
+            raise
 
     def _build_mm_le_contexts(self, topology, gro_box, lig_idx, env_idx, gmx_include_dir=None, top_file=None):
         if isinstance(topology, openmm.app.Topology):
@@ -3558,7 +3781,15 @@ class Orbv3DEXPFittingPipeline:
         if nb_orig is None:
             raise RuntimeError("原始系统中未找到 NonbondedForce")
 
+        sigma_gauss_nm = 0.10
+        gamma_eff = 1.0 / max(math.sqrt(2.0) * sigma_gauss_nm, 1.0e-6)
         force_defs = {
+            "gauss_coul": (
+                f"active * 138.935456*q1*q2*erf({gamma_eff}*r_safe)/r_safe; "
+                "active = abs(type1-type2); "
+                "r_safe = max(r, 1e-6)",
+                ("q", "type"),
+            ),
             "coul": (
                 "138.935456*q1*q2/max(r, 0.05)",
                 ("q",),
@@ -3569,9 +3800,10 @@ class Orbv3DEXPFittingPipeline:
                 ("sigma", "epsilon"),
             ),
         }
-        cutoff_nm = 0.85
-        switching_nm = cutoff_nm - 0.15
+        cutoff_nm = 0.65
+        switching_nm = 0.55
         contexts = {}
+        lig_set = {int(x) for x in lig_idx.tolist()}
         for label, (expr, per_params) in force_defs.items():
             le_sys = openmm.System()
             for _ in range(n_total):
@@ -3585,16 +3817,18 @@ class Orbv3DEXPFittingPipeline:
                 for param_name in per_params:
                     if param_name == "q":
                         payload.append(q.value_in_unit(unit.elementary_charge))
+                    elif param_name == "type":
+                        payload.append(1.0 if i in lig_set else 0.0)
                     elif param_name == "sigma":
                         payload.append(sig.value_in_unit(unit.nanometer))
                     elif param_name == "epsilon":
                         payload.append(eps.value_in_unit(unit.kilojoule_per_mole))
                 le_force.addParticle(payload)
-            le_force.addInteractionGroup(lig_idx.tolist(), env_idx.tolist())
+            if label != "gauss_coul":
+                le_force.addInteractionGroup(lig_idx.tolist(), env_idx.tolist())
             le_force.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
             le_force.setCutoffDistance(cutoff_nm * unit.nanometer)
-            le_force.setUseSwitchingFunction(True)
-            le_force.setSwitchingDistance(switching_nm * unit.nanometer)
+            le_force.setUseSwitchingFunction(False)
             for i in range(nb_orig.getNumExceptions()):
                 p1, p2, _, _, _ = nb_orig.getExceptionParameters(i)
                 le_force.addExclusion(int(p1), int(p2))
@@ -3612,9 +3846,10 @@ class Orbv3DEXPFittingPipeline:
         ligand_resname: str,
         output_json: str,
         n_frames: int = 200,
-        env_radius_nm: float = 0.65,
+        env_radius_nm: float = 0.45,
+        env_max_atoms: Optional[int] = None,
         gmx_include_dir: str = None,
-        fitting_region: tuple = (0.20, 0.80),
+        fitting_region: tuple = (0.20, 0.45),
     ) -> dict:
         import mdtraj as md
 
@@ -3625,8 +3860,14 @@ class Orbv3DEXPFittingPipeline:
         if len(lig_idx) == 0:
             raise ValueError(f"未找到配体残基: {ligand_resname}")
 
-        raw_env = md.compute_neighbors(traj[0], env_radius_nm, lig_idx)[0]
-        env_idx = np.setdiff1d(raw_env, lig_idx, assume_unique=True)
+        env_radius_nm = float(env_radius_nm)
+        env_idx = _select_env_indices_from_mdtraj_frame(
+            traj[0], lig_idx, env_radius_nm, max_env_atoms=env_max_atoms
+        )
+        if len(env_idx) == 0:
+            raise RuntimeError("未找到配体附近环境原子，请增大 env_radius_nm")
+        if env_max_atoms is not None:
+            print(f"🔒 OpenMM-ML 环境原子上限: {env_max_atoms} | 实际选中: {len(env_idx)}")
         all_nums = np.array([a.element.atomic_number for a in traj.top.atoms], dtype=int)
 
         gro_box = traj.unitcell_vectors[0] * unit.nanometer if traj.unitcell_vectors is not None else None
@@ -3639,7 +3880,15 @@ class Orbv3DEXPFittingPipeline:
         e_int_list, dists_per_frame = [], []
         stats = {"total": 0, "success": 0, "skip_outlier": 0, "skip_no_dists": 0}
 
-        print(f"⏳ 开始标注 {len(frame_indices)} 帧 ΔE_res = E_orb_int - E_mm_coul ...")
+        first_frame = traj[frame_indices[0]]
+        first_pos_nm = (
+            first_frame.image_molecules(inplace=False).xyz[0].copy()
+            if first_frame.unitcell_vectors is not None
+            else first_frame.xyz[0].copy()
+        )
+        self._preflight_orb_backend(first_pos_nm, lig_idx, env_idx, all_nums)
+
+        print(f"⏳ 开始标注 {len(frame_indices)} 帧 ΔE_qmmm = E_qm(region) - E_mm(region) ...")
         for i, fid in enumerate(frame_indices):
             stats["total"] += 1
             try:
@@ -3651,6 +3900,9 @@ class Orbv3DEXPFittingPipeline:
                 e_mm_coul = 0.0
                 e_mm_vdw = 0.0
                 for label, ctx in mm_contexts.items():
+                    if frame.unitcell_vectors is not None:
+                        frame_box = frame.unitcell_vectors[0] * unit.nanometer
+                        ctx.setPeriodicBoxVectors(*frame_box)
                     ctx.setPositions(pos_nm * unit.nanometer)
                     energy = ctx.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
                     if label == "coul":
@@ -3658,7 +3910,7 @@ class Orbv3DEXPFittingPipeline:
                     elif label == "vdw":
                         e_mm_vdw = energy
 
-                delta_e = e_orb_int - e_mm_coul
+                delta_e = e_orb_int - e_mm_coul - e_mm_vdw
                 if np.isnan(delta_e) or np.isinf(delta_e) or abs(delta_e) > 5000.0:
                     stats["skip_outlier"] += 1
                     continue
@@ -3668,7 +3920,7 @@ class Orbv3DEXPFittingPipeline:
                 delta = pos_nm[lig_idx][:, None, :] - pos_nm[env_idx][None, :, :]
                 delta -= box_lens * np.round(delta / box_lens)
                 dists = np.linalg.norm(delta, axis=-1)
-                valid_dists = dists[(dists >= 0.25) & (dists <= 0.65)]
+                valid_dists = dists[(dists >= float(fitting_region[0])) & (dists <= float(fitting_region[1]))]
 
                 if len(valid_dists) == 0:
                     stats["skip_no_dists"] += 1
@@ -3680,8 +3932,8 @@ class Orbv3DEXPFittingPipeline:
 
                 if stats["success"] <= 3 or stats["success"] % 50 == 0:
                     print(
-                        f"   ✅ Frame {fid} | ΔE_res={delta_e:7.2f} kJ/mol | "
-                        f"E_coul={e_mm_coul:7.2f} | E_vdw={e_mm_vdw:7.2f} | Pairs={len(valid_dists)}"
+                        f"   ✅ Frame {fid} | ΔE_qmmm={delta_e:7.2f} kJ/mol | "
+                        f"E_mm_coul={e_mm_coul:7.2f} | E_mm_vdw={e_mm_vdw:7.2f} | Pairs={len(valid_dists)}"
                     )
             except Exception as e:
                 stats["skip_outlier"] += 1
@@ -3691,14 +3943,21 @@ class Orbv3DEXPFittingPipeline:
         if stats["success"] < 10:
             raise RuntimeError("有效 ΔE 数据不足 10 帧，无法拟合。请检查轨迹质量或扩大 env_radius_nm。")
 
+        qm_mm_offset = float(np.mean(e_int_list))
+        e_int_list = [float(val - qm_mm_offset) for val in e_int_list]
+        print(f"📌 QM/MM reference shift = {qm_mm_offset:.3f} kJ/mol（仅诊断，不进入 OpenMM force）")
+
         print("📉 启动 DEXP 参数优化...")
         fitter = Orbv3SurrogateFitter(fitting_region=fitting_region)
         fitted_params = fitter.fit_parameters(dists_per_frame, e_int_list)
+        fitted_params["qm_mm_offset_kjmol"] = qm_mm_offset
+        fitted_params["fit_target_definition"] = "delta_fit = (E_qm_region - E_mm_region) - <E_qm_region - E_mm_region>"
 
         if not fitted_params.get("fitting_success"):
             print("⚠️ 拟合未收敛，返回默认参数")
 
         with open(output_json, "w") as f:
             json.dump(fitted_params, f, indent=2, cls=NumpyEncoder)
+        self._clear_orb_context_cache()
         print(f"✅ 拟合完成，参数已保存: {output_json}")
         return fitted_params        
