@@ -31,7 +31,7 @@ from abfe_core import (
     ACESoftcorePotential, UnitFormatter, calculate_boresch_analytical_correction,
     calc_boresch_from_last_frame, GeometricRestraintEstimator, OrbBoreschEstimator,
     DEXPSurrogatePotential, LambdaDependentBoreschForce, ensure_owned_system,
-    run_orbv3_dexp_fitting, NumpyEncoder,  # ✅ 统一从 abfe_core 导入
+    NumpyEncoder,  # ✅ 统一从 abfe_core 导入
 )
 from abfe_pipeline import ABFEPipeline, TraditionalABFEPipeline
 from ibs_engine import solve_stage_integrated, generate_overlapping_windows # ✅ 保持从 ibs_engine 导入
@@ -569,7 +569,14 @@ def build_and_cache_solvent_leg(
     log.info("✅ 溶剂相缓存已保存 (盒子大小: %.2f nm, 原子数: %d)", box_size, system.getNumParticles())
     return True
 
-def load_native_system(output_dir, gro_file=None, top_file=None, gmx_include_dir=None, phase="complex"):
+def load_native_system(
+    output_dir,
+    gro_file=None,
+    top_file=None,
+    gmx_include_dir=None,
+    phase="complex",
+    prefer_equilibrated: bool = True,
+):
     """从 output_dir 的缓存文件加载系统（跳过 GROMACS 解析）"""
     paths = _cache_paths(output_dir, phase=phase)
     xml_path = paths["xml"]
@@ -639,7 +646,7 @@ def load_native_system(output_dir, gro_file=None, top_file=None, gmx_include_dir
     # 5. Positions (保持不变)
     positions = None
     equil_dcd = os.path.join(paths["runtime_dir"], "pre_equilibration.dcd")
-    if os.path.exists(equil_dcd) and os.path.getsize(equil_dcd) > 212:
+    if prefer_equilibrated and os.path.exists(equil_dcd) and os.path.getsize(equil_dcd) > 212:
         try:
             import mdtraj as md
             md_top = md.Topology.from_openmm(topology)
@@ -799,6 +806,17 @@ class RunConfig:
     """统一运行时配置，优先级：命令行 > 配置文件 > 预设"""
 
     def __init__(self, args: argparse.Namespace):
+        argv = sys.argv[1:]
+
+        def _flag_present(*flags: str) -> bool:
+            for flag in flags:
+                if flag in argv:
+                    return True
+                prefix = f"{flag}="
+                if any(token.startswith(prefix) for token in argv):
+                    return True
+            return False
+
         # 1. 载入预设
         preset = PRESET_CONFIGS.get(args.preset, PRESET_CONFIGS["production"]).copy()
 
@@ -811,42 +829,96 @@ class RunConfig:
                 preset[k] = v
             log.info("📄 已合并配置文件: %s", args.config)
 
-        # 3. 命令行参数覆盖
-        cli_overrides = {
-            "resume": args.resume,
-            "reset": args.reset,
-            "n_steps_per_window": args.n_steps_per_window,
-            "steps_per_update": args.steps_per_update,
-            "stage1_n_states": args.n_states_per_stage,  # 统一命名
-            "stage2_n_states": args.n_states_per_stage,
-            "temperature": args.temperature,
-            "platform": args.platform,
-            "output": args.output,
-            "decoupling": args.decoupling,
-            "potential": args.potential,
-            "boresch": args.boresch,
-            "boresch_source": args.boresch_source,
-            "boresch_anchors": args.boresch_anchors,
-            "boresch_orb": args.boresch_orb,
-            "boresch_batch": args.boresch_batch,
-            "boresch_select": args.boresch_select,
-            "enable_early_stop": args.enable_early_stop,
-            "enable_gradual_warmup": not args.disable_warmup and args.enable_gradual_warmup,
-            "warmup_steps": args.warmup_steps,
-            "rebalance_steps": args.rebalance_steps,
-            "skip_rebalance": args.skip_rebalance,
-            "n_workers": args.n_workers,
-            "parallel_stages": args.parallel_stages,
-        }
-        for key, value in cli_overrides.items():
-            if value is not None:
-                preset[key] = value
-
-        # 特殊处理：如果 --n-steps-per-window 和 --steps-per-update 在命令行显式指定，强制覆盖
-        if args.n_steps_per_window is not None:
+        # 3. 仅当命令行显式提供参数时才覆盖配置文件，避免 parser 默认值反向污染配置。
+        if _flag_present("--resume"):
+            preset["resume"] = bool(args.resume)
+        if _flag_present("--reset"):
+            preset["reset"] = bool(args.reset)
+        if _flag_present("--n-steps-per-window"):
             preset["n_steps_per_window"] = args.n_steps_per_window
-        if args.steps_per_update is not None:
+        if _flag_present("--steps-per-update"):
             preset["steps_per_update"] = args.steps_per_update
+        if _flag_present("--n-states-per-stage"):
+            preset["stage1_n_states"] = args.n_states_per_stage
+            preset["stage2_n_states"] = args.n_states_per_stage
+        if _flag_present("--temperature"):
+            preset["temperature"] = args.temperature
+        if _flag_present("--platform"):
+            preset["platform"] = args.platform
+        if _flag_present("--output"):
+            preset["output"] = args.output
+        if _flag_present("--mode"):
+            preset["mode"] = args.mode
+        if _flag_present("--decoupling"):
+            preset["decoupling"] = args.decoupling
+        if _flag_present("--potential"):
+            preset["potential"] = args.potential
+        if _flag_present("--dexp-params"):
+            preset["dexp_params"] = args.dexp_params
+        if _flag_present("--gro"):
+            preset["gro"] = args.gro
+        if _flag_present("--top"):
+            preset["top"] = args.top
+        if _flag_present("--ligand"):
+            preset["ligand"] = args.ligand
+        if _flag_present("--ligand-xml"):
+            preset["ligand_xml"] = args.ligand_xml
+        if _flag_present("--gmx-path"):
+            preset["gmx_path"] = args.gmx_path
+        if _flag_present("--torsion-params"):
+            preset["torsion_params"] = args.torsion_params
+        if _flag_present("--boresch", "--no-boresch"):
+            preset["boresch"] = args.boresch
+        if _flag_present("--boresch-source"):
+            preset["boresch_source"] = args.boresch_source
+        if _flag_present("--boresch-anchors"):
+            preset["boresch_anchors"] = args.boresch_anchors
+        if _flag_present("--boresch-orb"):
+            preset["boresch_orb"] = args.boresch_orb
+        if _flag_present("--boresch-batch"):
+            preset["boresch_batch"] = args.boresch_batch
+        if _flag_present("--boresch-select"):
+            preset["boresch_select"] = args.boresch_select
+        if _flag_present("--enable-early-stop"):
+            preset["enable_early_stop"] = bool(args.enable_early_stop)
+        if _flag_present("--disable-warmup"):
+            preset["enable_gradual_warmup"] = False
+        elif _flag_present("--enable-gradual-warmup"):
+            preset["enable_gradual_warmup"] = True
+        if _flag_present("--warmup-steps"):
+            preset["warmup_steps"] = args.warmup_steps
+        if _flag_present("--rebalance-steps"):
+            preset["rebalance_steps"] = args.rebalance_steps
+        if _flag_present("--skip-rebalance"):
+            preset["skip_rebalance"] = bool(args.skip_rebalance)
+        if _flag_present("--n-workers"):
+            preset["n_workers"] = args.n_workers
+        if _flag_present("--parallel-stages"):
+            preset["parallel_stages"] = bool(args.parallel_stages)
+        if _flag_present("--n-lambda"):
+            preset["n_lambda"] = args.n_lambda
+
+        defaults = {
+            "resume": False,
+            "reset": False,
+            "temperature": 300.0,
+            "platform": "CUDA",
+            "output": "./output",
+            "mode": "ibs",
+            "decoupling": "dual_lambda",
+            "potential": "softcore",
+            "boresch_batch": 0,
+            "boresch_select": 1,
+            "enable_early_stop": False,
+            "enable_gradual_warmup": False,
+            "warmup_steps": 500000,
+            "rebalance_steps": 50000,
+            "skip_rebalance": False,
+            "parallel_stages": False,
+            "n_lambda": 12,
+        }
+        for key, value in defaults.items():
+            preset.setdefault(key, value)
 
         # 复合物腿默认启用 Boresch；若用户未显式指定来源，则默认走自动估算。
         if preset.get("boresch") is None:
@@ -1063,13 +1135,19 @@ def parse_arguments():
     prep_parser.add_argument("--save-boresch", default=None, help="保存 Boresch 文件")
     prep_parser.add_argument("--save-dexp", default=None, help="保存 DEXP 文件")
     prep_parser.add_argument("--fit-dexp", action="store_true")
+    prep_parser.add_argument("--fit-frames", type=int, default=200, help="DEXP 拟合使用的最大帧数")
+    prep_parser.add_argument("--fit-last-ns", type=float, default=None, help="仅使用轨迹最后多少 ns 做 DEXP 拟合")
+    prep_parser.add_argument("--fit-env-radius", type=float, default=0.85, help="DEXP 环境筛选半径 (nm)")
+    prep_parser.add_argument("--fit-env-max-atoms", type=int, default=0, help="DEXP 环境原子上限；<=0 表示不裁剪")
+    prep_parser.add_argument("--fit-r-min", type=float, default=0.20, help="DEXP 拟合距离下限 (nm)")
+    prep_parser.add_argument("--fit-r-max", type=float, default=0.45, help="DEXP 拟合距离上限 (nm)")
     prep_parser.add_argument("--temperature", type=float, default=300.0)
     prep_parser.add_argument("--platform", default="CUDA")
     prep_parser.add_argument("--n-steps", type=int, default=5_000_000)
     # 基本输入
     parser.add_argument("--gro", default=None, help="GROMACS 结构文件 (首次运行时必需)")
     parser.add_argument("--top", default=None, help="GROMACS 拓扑文件 (首次运行时必需)")
-    parser.add_argument("--ligand", required=True, help="配体残基名称 (如 MOL)")
+    parser.add_argument("--ligand", default=None, help="配体残基名称 (如 MOL)")
     parser.add_argument("--ligand-xml", default=None, help="配体力场 XML/FFXML，用于溶剂腿构建")
     parser.add_argument("--gmx-path", default=None, help="GROMACS 力场 include 目录")
     parser.add_argument("--output", default="./output", help="输出目录 (同时也是缓存目录)")
@@ -1082,7 +1160,11 @@ def parse_arguments():
     # 策略选择
     parser.add_argument("--mode", default="ibs", choices=["ibs", "traditional"],
                         help="采样引擎: ibs (默认) 或 traditional-REMD")
-    parser.add_argument("--decoupling", default="dual_lambda", choices=["dual_lambda", "single_lambda", "2d_diagonal", "2d_geodesic"])
+    parser.add_argument(
+        "--decoupling",
+        default="dual_lambda",
+        choices=["dual_lambda", "single_lambda", "2d_diagonal", "2d_geodesic"],
+    )
     parser.add_argument("--potential", default="softcore", choices=["softcore", "dexp"])
     parser.add_argument("--dexp-params", default=None, help="DEXP 参数文件 (JSON)")
 
@@ -1308,53 +1390,155 @@ def run_prepare_command(args):
     # DEXP 拟合（若需要）
     if args.fit_dexp and args.save_dexp:
         log.info("🧪 启动 Orbv3 → DEXP 拟合...")
-        dexp_json = run_orbv3_dexp_fitting(
-            traj_file=traj_file,
-            top_file=args.top,
+        dexp_json = pipeline.fit_dexp_parameters(
             ligand_resname=args.ligand,
-            output_dir=output_dir,
-            temperature=args.temperature,
+            top_file=args.top,
+            output_name=args.save_dexp,
             device="cuda" if args.platform.upper() == "CUDA" else "cpu",
-            n_frames=200,
-            env_radius_nm=0.85,
+            n_frames=args.fit_frames,
+            env_radius_nm=args.fit_env_radius,
+            env_max_atoms=(args.fit_env_max_atoms if args.fit_env_max_atoms > 0 else None),
+            fit_last_ns=args.fit_last_ns,
+            fit_r_min=args.fit_r_min,
+            fit_r_max=args.fit_r_max,
             gmx_include_dir=find_gmx_include_dir(args.gmx_path),
         )
-        # 复制到指定文件名
-        import shutil
-        shutil.copy(dexp_json, os.path.join(output_dir, args.save_dexp))
-        log.info("DEXP 参数已保存至 %s", args.save_dexp)
+        log.info("DEXP 参数已保存至 %s", dexp_json)
 
     log.info("✅ prepare 完成，文件已输出至 %s", output_dir)
 
 # ---------------------------------------------------------------------------
 # 传统 ABFE-REMD 模式
 # ---------------------------------------------------------------------------
-def run_traditional_mode(args):
-    """传统双阶段λ-REMD + 离线MBAR流水线"""
+def run_traditional_mode(config: RunConfig):
+    """传统双阶段 λ-REMD：分别计算复合物腿与溶剂腿并汇总结合自由能。"""
     log.info("🔧 启动传统 ABFE-REMD 模式")
-    output_dir = args.output
+    output_dir = config.output
     os.makedirs(output_dir, exist_ok=True)
 
-    pipeline = TraditionalABFEPipeline.from_gromacs(
-        gro_file=args.gro,
-        top_file=args.top,
-        ligand_resname=args.ligand,
-        temperature=args.temperature,
-        platform_name=args.platform,
-        output_dir=output_dir,
-        gmx_include_dir=find_gmx_include_dir(args.gmx_path),
+    if not config.gro or not config.top:
+        raise ValueError("traditional 模式必须提供 gro/top 输入，或在配置文件中定义 gro/top。")
+
+    system, topology, positions, box_vectors, ligand_indices = build_system_from_gromacs(
+        config.gro,
+        config.top,
+        config.ligand,
+        find_gmx_include_dir(config.gmx_path),
+    )
+    diagnose_14_scaling(system)
+
+    if hasattr(positions, "value_in_unit"):
+        pos_nm = positions.value_in_unit(unit.nanometer)
+    else:
+        pos_nm = positions
+    pos_nm = np.asarray(pos_nm, dtype=np.float64)
+    if pos_nm.ndim == 1:
+        pos_nm = pos_nm.reshape(-1, 3)
+    positions = [Vec3(float(v[0]), float(v[1]), float(v[2])) for v in pos_nm] * unit.nanometer
+    positions, box_vectors = center_system_rigidly(positions, box_vectors, ligand_indices)
+
+    ligand_resname = _get_residue_name_by_atom_index(topology, ligand_indices[0])
+    if config.reset or not solvent_cache_exists(output_dir):
+        log.info("💧 traditional 模式准备溶剂腿缓存...")
+        if not build_and_cache_solvent_leg(
+            output_dir,
+            topology,
+            positions,
+            ligand_indices,
+            ligand_resname,
+            ligand_ffxml=getattr(config, "ligand_xml", None),
+            top_file=config.top,
+            gmx_include_dir=find_gmx_include_dir(config.gmx_path),
+        ):
+            raise RuntimeError("traditional 模式自动构建溶剂腿缓存失败。")
+
+    dg_boresch = 0.0
+    if config.boresch:
+        boresch_pipeline = ABFEPipeline(
+            system=system,
+            topology=topology,
+            positions=positions,
+            box_vectors=box_vectors,
+            ligand_indices=ligand_indices,
+            temperature=config.temperature,
+            output_dir=output_dir,
+            checkpoint_dir=os.path.join(output_dir, "checkpoints"),
+            platform_name=config.platform,
+        )
+        boresch_restraint = resolve_boresch_restraint(config, boresch_pipeline)
+        if boresch_restraint:
+            dg_boresch = boresch_pipeline.apply_boresch_correction(
+                boresch_restraint,
+                autoload_from_disk=False,
+            ).get("delta_g_rest", 0.0)
+
+    complex_pipeline = TraditionalABFEPipeline(
+        system=system,
+        topology=topology,
+        positions=positions,
+        box_vectors=box_vectors,
+        ligand_indices=ligand_indices,
+        temperature=config.temperature,
+        platform_name=config.platform,
+        output_dir=os.path.join(output_dir, "traditional_complex"),
     )
 
-    log.info("🔄 开始双阶段 REMD 采样 + MBAR 分析 (n_lambda=%d, n_steps=%d)",
-             args.n_lambda, args.n_steps_per_window or 500000)
-    results = pipeline.run_full(
-        n_lambda=args.n_lambda,
-        n_steps_per_leg=args.n_steps_per_window or 500000,
+    log.info("🔄 开始传统复合物腿 REMD + MBAR (n_lambda=%d, n_steps=%d)",
+             config.n_lambda, config.n_steps_per_window or 500000)
+    complex_results = complex_pipeline.run_full(
+        n_lambda=config.n_lambda,
+        n_steps_per_leg=config.n_steps_per_window or 500000,
         boresch_correction=0.0,
     )
-    log.info("✅ 传统 ABFE 完成: ΔG_bind = %.2f ± %.2f kJ/mol",
-             results["delta_G_bind_kJ_mol"], results["error_physical_kJ_mol"])
-    return results
+
+    sys_solv, top_solv, pos_solv, box_solv, lig_idx_solv = load_native_system(
+        output_dir,
+        phase="solvent",
+        prefer_equilibrated=not config.reset,
+    )
+    pos_solv, box_solv = center_system_rigidly(pos_solv, box_solv, lig_idx_solv)
+    solvent_pipeline = TraditionalABFEPipeline(
+        system=sys_solv,
+        topology=top_solv,
+        positions=pos_solv,
+        box_vectors=box_solv,
+        ligand_indices=lig_idx_solv,
+        temperature=config.temperature,
+        platform_name=config.platform,
+        output_dir=os.path.join(output_dir, "traditional_solvent"),
+    )
+    log.info("🔄 开始传统溶剂腿 REMD + MBAR (n_lambda=%d, n_steps=%d)",
+             config.n_lambda, config.n_steps_per_window or 500000)
+    solvent_results = solvent_pipeline.run_full(
+        n_lambda=config.n_lambda,
+        n_steps_per_leg=config.n_steps_per_window or 500000,
+        boresch_correction=0.0,
+    )
+
+    dg_complex = float(complex_results["delta_G_total_kJ_mol"])
+    dg_solvent = float(solvent_results["delta_G_total_kJ_mol"])
+    err_complex = float(complex_results["error_leg_kJ_mol"])
+    err_solvent = float(solvent_results["error_leg_kJ_mol"])
+    delta_g_bind = dg_complex - dg_solvent + float(dg_boresch)
+    total_err_bind = float(np.sqrt(err_complex**2 + err_solvent**2))
+
+    final = {
+        "complex_leg": complex_results,
+        "solvent_leg": solvent_results,
+        "complex_delta_G_kJ_mol": dg_complex,
+        "solvent_delta_G_kJ_mol": dg_solvent,
+        "boresch_correction_kJ_mol": float(dg_boresch),
+        "delta_G_bind_kJ_mol": float(delta_g_bind),
+        "delta_G_bind_kcal_mol": float(delta_g_bind / 4.184),
+        "total_error_kJ_mol": total_err_bind,
+        "timestamp": datetime.now().isoformat(),
+    }
+    out_path = os.path.join(output_dir, "final_binding_results_traditional.json")
+    with open(out_path, "w") as f:
+        json.dump(final, f, indent=2, cls=NumpyEncoder)
+    log.info("✅ 传统 ABFE 完成: ΔG_bind = %.2f ± %.2f kJ/mol", delta_g_bind, total_err_bind)
+    log.info("💾 传统模式最终结果已保存: %s", out_path)
+    return final
 
 # ---------------------------------------------------------------------------
 # 主入口
@@ -1362,18 +1546,21 @@ def run_traditional_mode(args):
 def main():
     args = parse_arguments()
 
-    # 创建配置对象
-    config = RunConfig(args)
     if args.command == "prepare":
         run_prepare_command(args)
-        return    
+        return
+    # 创建配置对象
+    config = RunConfig(args)
+    if not config.ligand:
+        log.error("未提供配体残基名称。请通过 --ligand 或配置文件中的 ligand 指定。")
+        sys.exit(2)
     # 传统模式单独处理
     if config.mode == "traditional":
-        run_traditional_mode(args)
+        run_traditional_mode(config)
         return
     # 分析模式单独处理
     if args.analyze_only:
-        run_post_analysis(args)
+        run_post_analysis(config)
         return
 
     # 准备输出目录
@@ -1408,7 +1595,8 @@ def main():
             output_dir, 
             gro_file=config.gro, 
             top_file=config.top, 
-            gmx_include_dir=find_gmx_include_dir(config.gmx_path)
+            gmx_include_dir=find_gmx_include_dir(config.gmx_path),
+            prefer_equilibrated=False,
         )
         log.info("🔄 已从缓存重新加载 System (使用落盘后对象)")
 
@@ -1508,14 +1696,17 @@ def main():
         n_steps_per_window=config.n_steps_per_window,
         steps_per_update=config.steps_per_update,
         n_states_per_stage=config.get("stage1_n_states", 16),
+        stage1_n_states=config.get("stage1_n_states", 16),
+        stage2_n_states=config.get("stage2_n_states", config.get("stage1_n_states", 16)),
         enable_early_stop=config.enable_early_stop,
         enable_gradual_warmup=config.enable_gradual_warmup,
         warmup_steps=config.warmup_steps,
         n_workers=config.n_workers,
         parallel_stages=config.parallel_stages,
+        allow_disk_boresch_autoload=True,
     )
     
-    dg_complex = complex_results.get("decoupling_delta_G_kJ_mol", complex_results.get("total_delta_G_complex_kJ_mol", 0.0))
+    dg_complex = complex_results.get("total_delta_G_complex_kJ_mol", complex_results.get("decoupling_delta_G_kJ_mol", 0.0))
     err_complex = complex_results.get("total_error_kJ_mol", 0.0)
     dg_boresch = complex_results.get("boresch_correction_kJ_mol", 0.0)
 
@@ -1552,16 +1743,19 @@ def main():
         n_steps_per_window=config.n_steps_per_window,
         steps_per_update=config.steps_per_update,
         n_states_per_stage=config.get("stage1_n_states", 16),
+        stage1_n_states=config.get("stage1_n_states", 16),
+        stage2_n_states=config.get("stage2_n_states", config.get("stage1_n_states", 16)),
         enable_early_stop=config.enable_early_stop,
         enable_gradual_warmup=config.enable_gradual_warmup,
         warmup_steps=config.warmup_steps,
+        allow_disk_boresch_autoload=False,
     )
     
-    dg_solvent = solv_results.get("decoupling_delta_G_kJ_mol", solv_results.get("total_delta_G_complex_kJ_mol", 0.0))
+    dg_solvent = solv_results.get("total_delta_G_complex_kJ_mol", solv_results.get("decoupling_delta_G_kJ_mol", 0.0))
     err_solvent = solv_results.get("total_error_kJ_mol", 0.0)
     
     # ----- 8. 计算最终结合自由能 ΔG_bind -----
-    delta_g_bind = (dg_complex - dg_solvent) + dg_boresch
+    delta_g_bind = dg_complex - dg_solvent
     total_err_bind = np.sqrt(err_complex**2 + err_solvent**2)
     
     log.info("\n" + "="*70)

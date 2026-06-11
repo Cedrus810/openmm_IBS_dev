@@ -263,6 +263,100 @@ def _compute_ligand_net_charge(
     return float(total)
 
 
+def _restore_ligand_internal_nonbonded(
+    system: openmm.System,
+    nb_force: openmm.NonbondedForce,
+    ligand_indices: List[int],
+) -> None:
+    """为传统 VDW 路径恢复配体内部普通非键与 1-4 作用。"""
+    particle_params = [nb_force.getParticleParameters(i) for i in range(nb_force.getNumParticles())]
+    reference_exclusions = [
+        (int(nb_force.getExceptionParameters(i)[0]), int(nb_force.getExceptionParameters(i)[1]))
+        for i in range(nb_force.getNumExceptions())
+    ]
+    ll_force, ll_14_force = create_ligand_internal_force(
+        nb_force,
+        ligand_indices,
+        particle_params,
+        reference_exclusions,
+        nb_force.getNumParticles(),
+        system=system,
+    )
+    if ll_force is not None:
+        system.addForce(ll_force)
+    if ll_14_force is not None:
+        system.addForce(ll_14_force)
+
+
+def _prepare_pme_mixed_alchemical_system(
+    system_template: openmm.System,
+    ligand_indices: List[int],
+    topology,
+    positions,
+    box_vectors=None,
+    lambda_coul_name: str = "lambda_coul",
+    lambda_vdw_name: str = "lambda_vdw",
+) -> openmm.System:
+    """构建同时支持 PME 去电荷与软核去 VDW 的联合炼金体系。"""
+    mixed_sys = openmm.XmlSerializer.deserialize(
+        openmm.XmlSerializer.serialize(system_template)
+    )
+    mixed_sys.thisown = 1
+    _prepare_pme_coulomb_leg_system(
+        mixed_sys,
+        ligand_indices,
+        lambda_name=lambda_coul_name,
+        allow_charged_ligand=True,
+        topology=topology,
+        positions=positions,
+        box_vectors=box_vectors,
+    )
+
+    nb_force = next(
+        (f for f in mixed_sys.getForces() if isinstance(f, openmm.NonbondedForce)),
+        None,
+    )
+    if nb_force is None:
+        raise RuntimeError("联合 PME/VDW 炼金体系未找到 NonbondedForce。")
+
+    ligand_set = set(int(i) for i in ligand_indices)
+    environment_indices = [
+        idx for idx in range(mixed_sys.getNumParticles()) if idx not in ligand_set
+    ]
+
+    for idx in ligand_set:
+        q, _, _ = nb_force.getParticleParameters(int(idx))
+        nb_force.setParticleParameters(
+            int(idx),
+            q,
+            0.1 * unit.nanometer,
+            0.0 * unit.kilojoule_per_mole,
+        )
+
+    for exc_idx in range(nb_force.getNumExceptions()):
+        p1, p2, charge_prod, sig, eps = nb_force.getExceptionParameters(exc_idx)
+        p1 = int(p1)
+        p2 = int(p2)
+        if (p1 in ligand_set) ^ (p2 in ligand_set):
+            nb_force.setExceptionParameters(
+                exc_idx,
+                p1,
+                p2,
+                charge_prod,
+                sig,
+                0.0 * unit.kilojoule_per_mole,
+            )
+
+    sc_force = BeutlerSoftcoreBuilder.build(
+        nb_force,
+        list(ligand_indices),
+        environment_indices,
+    )
+    sc_force.setForceGroup(1)
+    mixed_sys.addForce(sc_force)
+    return mixed_sys
+
+
 def _build_traditional_mbar_eval_context(
     system_xml: str,
     platform_name: str,
@@ -294,10 +388,10 @@ def _compute_u_kn_chunk(task: Dict) -> Tuple[int, np.ndarray]:
     n_states = len(lambdas_coul)
     u_chunk = np.zeros((n_states, xyz_chunk.shape[0]), dtype=np.float64)
     kt = float(task["kt"])
-    is_pme_coulomb_leg = bool(task["is_pme_coulomb_leg"])
+    use_total_energy = bool(task.get("use_total_energy", False))
     apply_pme_self_correction = bool(task.get("apply_pme_self_correction", False))
     pme_self_prefactor_kj = None
-    if is_pme_coulomb_leg and apply_pme_self_correction:
+    if use_total_energy and apply_pme_self_correction:
         lig_qsq = float(task.get("ligand_charge_square_sum", 0.0))
         if lig_qsq > 0.0:
             nb_force = next((f for f in eval_sys.getForces() if isinstance(f, openmm.NonbondedForce)), None)
@@ -319,7 +413,7 @@ def _compute_u_kn_chunk(task: Dict) -> Tuple[int, np.ndarray]:
         for k in range(n_states):
             REMDManager._try_set_context_parameter(ctx, "lambda_coul", lambdas_coul[k])
             REMDManager._try_set_context_parameter(ctx, "lambda_vdw", lambdas_vdw[k])
-            if is_pme_coulomb_leg:
+            if use_total_energy:
                 e = ctx.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
                 if apply_pme_self_correction and pme_self_prefactor_kj is not None:
                     # PME 总能量包含与坐标无关的自能项 -C*lambda^2。
@@ -416,11 +510,14 @@ def configure_coalchemical_neutral_decharging(
         nb_force.addGlobalParameter(lambda_name, 1.0)
 
     original_charges = {}
+    ligand_params = {}
+    alchemical_set = set(ligand_set)
     
     # 3.1 配体 Offset
     for idx in ligand_set:
         q, sig, eps = nb_force.getParticleParameters(idx)
         original_charges[idx] = q
+        ligand_params[idx] = (q, sig, eps)
         nb_force.setParticleParameters(idx, 0.0*unit.elementary_charge, sig, eps)
         nb_force.addParticleParameterOffset(lambda_name, idx, q, 0.0*unit.nanometer, 0.0*unit.kilojoule_per_mole)
 
@@ -428,29 +525,45 @@ def configure_coalchemical_neutral_decharging(
     if best_ion_idx is not None:
         ion_q, ion_sig, ion_eps = nb_force.getParticleParameters(best_ion_idx)
         original_charges[best_ion_idx] = ion_q
+        alchemical_set.add(int(best_ion_idx))
         nb_force.setParticleParameters(best_ion_idx, 0.0*unit.elementary_charge, ion_sig, ion_eps)
         nb_force.addParticleParameterOffset(lambda_name, best_ion_idx, ion_q, 0.0*unit.nanometer, 0.0*unit.kilojoule_per_mole)
 
-    # 3.3 屏蔽主系统中的 L-L 静电 (防止与 Group 2 双重计数)
-    ll_pairs = set((i, j) for i in ligand_set for j in ligand_set if i < j)
+    # 3.3 保持配体内部静电常量；仅对“单端炼金”的 exception 施加线性 offset。
+    frozen_ll_pairs = set()
     for i in range(nb_force.getNumExceptions()):
-        p1, p2, cp, sig, eps = nb_force.getExceptionParameters(i)
+        p1, p2, charge_prod, sig, eps = nb_force.getExceptionParameters(i)
         p1, p2 = int(p1), int(p2)
-        if (min(p1, p2), max(p1, p2)) in ll_pairs:
+        if p1 in ligand_set and p2 in ligand_set:
+            frozen_ll_pairs.add((min(p1, p2), max(p1, p2)))
+            continue
+        if (p1 in alchemical_set) ^ (p2 in alchemical_set):
             nb_force.setExceptionParameters(i, p1, p2, 0.0*unit.elementary_charge**2, sig, eps)
-            ll_pairs.remove((min(p1, p2), max(p1, p2)))
-    for p1, p2 in ll_pairs:
-        nb_force.addException(p1, p2, 0.0*unit.elementary_charge**2, 0.1*unit.nanometer, 0.0*unit.kilojoule_per_mole)
+            nb_force.addExceptionParameterOffset(lambda_name, i, charge_prod, 0.0*unit.nanometer, 0.0*unit.kilojoule_per_mole)
 
-    # 3.4 处理 1-4 静电 Offset
-    for i in range(nb_force.getNumExceptions()):
-        p1, p2, cp, sig, eps = nb_force.getExceptionParameters(i)
-        if p1 in ligand_set or p2 in ligand_set:
-            q1 = original_charges.get(p1, nb_force.getParticleParameters(p1)[0])
-            q2 = original_charges.get(p2, nb_force.getParticleParameters(p2)[0])
-            nominal_cp = q1 * q2
-            nb_force.setExceptionParameters(i, p1, p2, 0.0*unit.elementary_charge**2, sig, eps)
-            nb_force.addExceptionParameterOffset(lambda_name, i, nominal_cp, 0.0*unit.nanometer, 0.0*unit.kilojoule_per_mole)
+    # 为原本走标准 NB 的 L-L 对补全显式 exception，避免粒子电荷缩放把内部库仑也带着变掉。
+    lig_list = sorted(ligand_set)
+    for offset_i, p1 in enumerate(lig_list):
+        q1, sig1, eps1 = ligand_params[p1]
+        q1_val = q1.value_in_unit(unit.elementary_charge)
+        sig1_val = sig1.value_in_unit(unit.nanometer)
+        eps1_val = eps1.value_in_unit(unit.kilojoule_per_mole)
+        for p2 in lig_list[offset_i + 1:]:
+            key = (p1, p2)
+            if key in frozen_ll_pairs:
+                continue
+            q2, sig2, eps2 = ligand_params[p2]
+            q2_val = q2.value_in_unit(unit.elementary_charge)
+            sig2_val = sig2.value_in_unit(unit.nanometer)
+            eps2_val = eps2.value_in_unit(unit.kilojoule_per_mole)
+            nb_force.addException(
+                p1,
+                p2,
+                (q1_val * q2_val) * unit.elementary_charge**2,
+                0.5 * (sig1_val + sig2_val) * unit.nanometer,
+                math.sqrt(max(eps1_val * eps2_val, 0.0)) * unit.kilojoule_per_mole,
+                True,
+            )
 
     if best_ion_idx is not None and ion_ref_pos_nm is not None:
         restraint = _create_bulk_water_ion_restraint(
@@ -2894,10 +3007,19 @@ class REMDManager:
         self.lambdas_coul = np.array(lambdas_coul)
         self.lambdas_vdw = np.array(lambdas_vdw)
         self.n_replicas = len(lambdas_coul)
+        self.has_coulomb_scaling = not np.allclose(
+            self.lambdas_coul,
+            self.lambdas_coul[0],
+        )
+        self.has_vdw_scaling = not np.allclose(
+            self.lambdas_vdw,
+            self.lambdas_vdw[0],
+        )
         self.is_pme_coulomb_leg = (
             np.allclose(self.lambdas_vdw, 1.0)
-            and not np.allclose(self.lambdas_coul, self.lambdas_coul[0])
+            and self.has_coulomb_scaling
         )
+        self.is_mixed_pme_alchemical = self.has_coulomb_scaling and self.has_vdw_scaling
         self.temperature = temperature * unit.kelvin
         self.kt = (unit.MOLAR_GAS_CONSTANT_R * self.temperature).value_in_unit(unit.kilojoule_per_mole)
         self.beta = 1.0 / self.kt
@@ -2937,11 +3059,22 @@ class REMDManager:
                     positions=self.positions,
                     box_vectors=self.box_vectors,
                 )
+            elif self.is_mixed_pme_alchemical:
+                replica_sys = _prepare_pme_mixed_alchemical_system(
+                    system_template,
+                    self.ligand_indices,
+                    topology=self.topology,
+                    positions=self.positions,
+                    box_vectors=self.box_vectors,
+                    lambda_coul_name="lambda_coul",
+                    lambda_vdw_name="lambda_vdw",
+                )
             else:
                 sys_xml = openmm.XmlSerializer.serialize(system_template)
                 replica_sys = openmm.XmlSerializer.deserialize(sys_xml)
                 replica_sys.thisown = 1
                 nb = [f for f in replica_sys.getForces() if isinstance(f, openmm.NonbondedForce)][0]
+                _restore_ligand_internal_nonbonded(replica_sys, nb, self.ligand_indices)
                 env_idx = [j for j in range(replica_sys.getNumParticles()) if j not in self.ligand_indices]
                 sc_force = BeutlerSoftcoreBuilder.build(nb, self.ligand_indices, env_idx)
                 sc_force.setForceGroup(1)
@@ -3132,9 +3265,14 @@ class TraditionalMBARAnalyzer:
             np.allclose(lambdas_vdw_arr, 1.0)
             and not np.allclose(lambdas_coul_arr, lambdas_coul_arr[0])
         )
+        is_mixed_pme_alchemical = (
+            not np.allclose(lambdas_coul_arr, lambdas_coul_arr[0])
+            and not np.allclose(lambdas_vdw_arr, lambdas_vdw_arr[0])
+        )
+        use_total_energy = is_pme_coulomb_leg or is_mixed_pme_alchemical
         ligand_charge_square_sum = 0.0
         apply_pme_self_correction = False
-        if is_pme_coulomb_leg:
+        if use_total_energy:
             nb_force_ref = next((f for f in system_template.getForces() if isinstance(f, openmm.NonbondedForce)), None)
             if nb_force_ref is None:
                 raise RuntimeError("PME 去电荷路径未找到参考 NonbondedForce，无法估算自能修正。")
@@ -3171,10 +3309,23 @@ class TraditionalMBARAnalyzer:
             )
             system_xml = openmm.XmlSerializer.serialize(prepared_system)
             del prepared_system
+        elif is_mixed_pme_alchemical:
+            prepared_system = _prepare_pme_mixed_alchemical_system(
+                system_template,
+                ligand_indices,
+                topology=topology,
+                positions=reference_positions,
+                box_vectors=reference_box_vectors,
+                lambda_coul_name="lambda_coul",
+                lambda_vdw_name="lambda_vdw",
+            )
+            system_xml = openmm.XmlSerializer.serialize(prepared_system)
+            del prepared_system
         else:
             eval_sys = openmm.XmlSerializer.deserialize(openmm.XmlSerializer.serialize(system_template))
             eval_sys.thisown = 1
             nb = [f for f in eval_sys.getForces() if isinstance(f, openmm.NonbondedForce)][0]
+            _restore_ligand_internal_nonbonded(eval_sys, nb, ligand_indices)
             env_idx = [i for i in range(eval_sys.getNumParticles()) if i not in ligand_indices]
             sc = BeutlerSoftcoreBuilder.build(nb, ligand_indices, env_idx)
             sc.setForceGroup(1)
@@ -3199,7 +3350,7 @@ class TraditionalMBARAnalyzer:
                     "lambdas_vdw": lambdas_vdw_arr,
                     "platform_name": platform_name,
                     "kt": self.kt,
-                    "is_pme_coulomb_leg": is_pme_coulomb_leg,
+                    "use_total_energy": use_total_energy,
                     "apply_pme_self_correction": apply_pme_self_correction,
                     "ligand_charge_square_sum": ligand_charge_square_sum,
                 }

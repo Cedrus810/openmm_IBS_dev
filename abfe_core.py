@@ -17,6 +17,7 @@ import os
 import logging
 import gc
 import builtins
+import statistics
 from itertools import combinations
 from collections import deque
 from typing import Dict, List, Tuple, Optional, Any, Callable
@@ -413,7 +414,7 @@ class DEXPSurrogatePotential:
         A_fit=1.0,
         B_fit=0.5,
         sigma_elec=0.1,
-        switch_width=0.10,
+        switch_width=0.20,
         cutoff_distance=0.65,
         offset_c0=0.0,
         offset_c1=0.0,
@@ -434,7 +435,7 @@ class DEXPSurrogatePotential:
         """
         rs = "max(r, 1e-6)"
         vdw_core = (
-            f"4 * sqrt(epsilon1*epsilon2) * "
+            f"4 * "
             f"({self.A_fit}*exp(-{self.alpha_vdw}*({rs}/{self.r0_vdw}-1.0)) - "
             f"{self.B_fit}*exp(-{self.beta_vdw}*({rs}/{self.r0_vdw}-1.0)))"
         )
@@ -463,7 +464,7 @@ class DEXPSurrogatePotential:
 class Orbv3SurrogateFitter:
     def __init__(
         self,
-        fitting_region=(0.20, 0.60),
+        fitting_region=(0.20, 0.50),
         enable_lbfgsb_refine: bool = True,
     ):
         self.r_min, self.r_max = fitting_region
@@ -482,18 +483,12 @@ class Orbv3SurrogateFitter:
             if mask[i]
         ]
 
-        contact_scores = []
-        for dd in frame_dists_raw:
-            if dd.size == 0:
-                contact_scores.append(0.0)
-            else:
-                score = np.sum(np.clip(self.r_max - dd, 0.0, None) ** 2)
-                contact_scores.append(score)
-        contact_scores = np.asarray(contact_scores, dtype=float)
-        if len(contact_scores) and float(np.max(contact_scores)) > 1.0e-6:
-            frame_weights = contact_scores / float(np.sum(contact_scores))
-        else:
-            frame_weights = np.full(len(frame_energies_raw), 1.0 / float(len(frame_energies_raw)))
+        # 统一使用均匀帧权重，避免少量短程异常接触绑架 DEXP 拟合。
+        frame_weights = np.full(
+            len(frame_energies_raw),
+            1.0 / float(len(frame_energies_raw)),
+            dtype=float,
+        )
 
         robust_center = float(np.median(frame_energies_raw))
         abs_dev = np.abs(frame_energies_raw - robust_center)
@@ -566,7 +561,7 @@ class Orbv3SurrogateFitter:
             )
 
             inv = 1.0 / r0
-            r_anchors = np.array([0.60, 0.70, 0.80], dtype=float)
+            r_anchors = np.array([0.50, 0.60, 0.65], dtype=float)
             x_anchors = np.clip(r_anchors * inv - 1.0, -50.0, 50.0)
             u_dexp_anchors = 4.0 * eff_eps * (
                 A * np.exp(-a * x_anchors) - B * np.exp(-b * x_anchors)
@@ -668,8 +663,8 @@ class Orbv3SurrogateFitter:
             "diagnostic_trim_limit": float(trim_limit),
             "diagnostic_frames_after_trim": int(len(frame_energies)),
             "sigma_elec": 0.1,
-            "switch_width": 0.10,
-            "cutoff_distance": 0.60,
+            "switch_width": 0.20,
+            "cutoff_distance": 0.65,
             "fitting_success": True,
             "final_cost": float(best_cost),
             "optimizer_global_success": bool(de_res.success),
@@ -1931,7 +1926,7 @@ class OrbBoreschEstimator:
 # 4. 幽灵离子 & 2D路径规划 & 替身系统构建器
 # ============================================================================
 class GhostIonHandler:
-    def __init__(self, ghost_ion_distance=10.0, ghost_ion_scale_factor=0.1):
+    def __init__(self, ghost_ion_distance=10.0, ghost_ion_scale_factor=1.0):
         self.ghost_ion_distance = ghost_ion_distance
         self.ghost_ion_scale_factor = ghost_ion_scale_factor
 
@@ -2055,9 +2050,12 @@ class SurrogateSystemBuilder:
         if not nb_force:
             raise ValueError("未找到 NonbondedForce")
 
-        # `environment_indices` 仅保留接口兼容；DEXP correction 仍按全局 type-switch 选择全部 L-E 对。
-        _ = environment_indices
-        lig_set = set(ligand_indices)
+        lig_set = {int(idx) for idx in ligand_indices}
+        env_set = {int(idx) for idx in environment_indices if int(idx) not in lig_set}
+        if not lig_set:
+            raise ValueError("ligand_indices 为空，无法构建 surrogate decoupling system")
+        if not env_set:
+            raise ValueError("environment_indices 为空，无法构建 ligand-environment surrogate force")
         original_params = [
             nb_force.getParticleParameters(i) for i in range(new_system.getNumParticles())
         ]
@@ -2066,18 +2064,82 @@ class SurrogateSystemBuilder:
             p1, p2, _, _, _ = nb_force.getExceptionParameters(i)
             reference_exclusions.append((int(p1), int(p2)))
 
+        # 1) 先恢复 ligand-ligand 内部 nonbonded / 1-4，保留原始 MM 内部拓扑语义。
+        ll_force, ll_14_force = create_ligand_internal_force(
+            nb_force=nb_force,
+            perturbed_indices=sorted(lig_set),
+            particle_params=original_params,
+            reference_exclusions=reference_exclusions,
+            num_particles=new_system.getNumParticles(),
+            system=new_system,
+        )
+        ll_force.setForceGroup(force_group)
+        new_system.addForce(ll_force)
+        if ll_14_force is not None:
+            ll_14_force.setForceGroup(force_group)
+            new_system.addForce(ll_14_force)
+
+        # 2) 主 NonbondedForce 中将 ligand 完全去耦，避免原始 MM L-E 项始终全开。
+        for idx in sorted(lig_set):
+            q, sigma, epsilon = original_params[idx]
+            nb_force.setParticleParameters(
+                idx,
+                0.0 * unit.elementary_charge,
+                sigma,
+                0.0 * unit.kilojoule_per_mole,
+            )
+        for exc_idx in range(nb_force.getNumExceptions()):
+            p1, p2, _, sigma, _ = nb_force.getExceptionParameters(exc_idx)
+            p1, p2 = int(p1), int(p2)
+            if p1 in lig_set or p2 in lig_set:
+                nb_force.setExceptionParameters(
+                    exc_idx,
+                    p1,
+                    p2,
+                    0.0 * unit.elementary_charge * unit.elementary_charge,
+                    sigma,
+                    0.0 * unit.kilojoule_per_mole,
+                )
+
+        # 3) L-E Gaussian electrostatics：用平滑库仑核替代点电荷奇点，并与 DEXP 共用
+        #    0.45~0.65 nm 的 switching/cutoff 缝合区。
+        sigma_gauss_nm = max(
+            float(getattr(self.surrogate_potential, "sigma_elec", self.sigma_gauss_nm)),
+            1.0e-6,
+        )
+        gamma_eff = 1.0 / max(math.sqrt(2.0) * sigma_gauss_nm, 1.0e-6)
+        gauss_expr = (
+            f"{lambda_names[0]} * 138.935456*q1*q2*erf({gamma_eff}*r_safe)/r_safe; "
+            "r_safe = max(r, 1e-6)"
+        )
+        coul_force = openmm.CustomNonbondedForce(gauss_expr)
+        coul_force.addPerParticleParameter("q")
+        coul_force.addGlobalParameter(lambda_names[0], 1.0)
+        for i in range(new_system.getNumParticles()):
+            q, _, _ = original_params[i]
+            coul_force.addParticle([q.value_in_unit(unit.elementary_charge)])
+        coul_force.addInteractionGroup(sorted(lig_set), sorted(env_set))
+        coul_force.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
+        coul_force.setCutoffDistance(self.surrogate_potential.cutoff_distance * unit.nanometer)
+        coul_force.setUseSwitchingFunction(True)
+        coul_force.setSwitchingDistance(
+            (self.surrogate_potential.cutoff_distance - self.surrogate_potential.switch_width)
+            * unit.nanometer
+        )
+        coul_force.setForceGroup(force_group)
+        for p1, p2 in reference_exclusions:
+            coul_force.addExclusion(int(p1), int(p2))
+        new_system.addForce(coul_force)
+
+        # 4) L-E DEXP：短程排斥/色散替身，与 Gaussian electrostatics 拼成完整 surrogate。
         dexp_expr = (
-            f"active * ({self.surrogate_potential.build_expression(lam_vdw=lambda_names[1])}); "
-            "active = abs(type1-type2)"
+            f"{self.surrogate_potential.build_expression(lam_vdw=lambda_names[1])}"
         )
         dexp_force = openmm.CustomNonbondedForce(dexp_expr)
-        dexp_force.addPerParticleParameter("epsilon")
-        dexp_force.addPerParticleParameter("type")
         dexp_force.addGlobalParameter(lambda_names[1], 1.0)
         for i in range(new_system.getNumParticles()):
-            _, _, eps = original_params[i]
-            particle_type = 1.0 if i in lig_set else 0.0
-            dexp_force.addParticle([eps.value_in_unit(unit.kilojoule_per_mole), particle_type])
+            dexp_force.addParticle([])
+        dexp_force.addInteractionGroup(sorted(lig_set), sorted(env_set))
         dexp_force.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
         dexp_force.setCutoffDistance(self.surrogate_potential.cutoff_distance * unit.nanometer)
         dexp_force.setUseSwitchingFunction(True)
@@ -3518,7 +3580,11 @@ def run_orbv3_dexp_fitting(
     temperature: float = 300.0,
     device: str = "cuda",
     n_frames: int = 200,
-    env_radius_nm: float = 0.85,
+    env_radius_nm: float = 0.60,
+    env_max_atoms: Optional[int] = None,
+    fit_last_ns: Optional[float] = None,
+    fit_r_min: float = 0.20,
+    fit_r_max: float = 0.50,
     gmx_include_dir: str = None
 ) -> str:
     """一键 Orbv3 → DEXP 拟合（委托给 Orbv3DEXPFittingPipeline）"""
@@ -3533,9 +3599,121 @@ def run_orbv3_dexp_fitting(
         output_json=out_json,
         n_frames=n_frames,
         env_radius_nm=env_radius_nm,
+        env_max_atoms=env_max_atoms,
+        fit_last_ns=fit_last_ns,
         gmx_include_dir=gmx_include_dir,
+        fitting_region=(fit_r_min, fit_r_max),
     )
     return out_json
+
+
+def _select_tail_indices_from_time(traj, fit_frames: int, fit_last_ns: Optional[float]) -> List[int]:
+    n_frames_total = len(traj)
+    if n_frames_total == 0:
+        return []
+
+    fit_frames = max(1, int(fit_frames))
+    if fit_last_ns is None or float(fit_last_ns) <= 0.0:
+        start = max(0, n_frames_total - fit_frames)
+        return list(range(start, n_frames_total))
+
+    time_ps = getattr(traj, "time", None)
+    if time_ps is None or len(time_ps) != n_frames_total:
+        start = max(0, n_frames_total - fit_frames)
+        return list(range(start, n_frames_total))
+
+    time_ps = np.asarray(time_ps, dtype=float)
+    last_time_ps = float(time_ps[-1])
+    window_start_ps = last_time_ps - float(fit_last_ns) * 1000.0
+    in_window = np.where(time_ps >= window_start_ps)[0]
+    if len(in_window) == 0:
+        start = max(0, n_frames_total - fit_frames)
+        return list(range(start, n_frames_total))
+    if len(in_window) <= fit_frames:
+        return [int(idx) for idx in in_window.tolist()]
+
+    sampled = np.linspace(in_window[0], in_window[-1], fit_frames, dtype=int)
+    return [int(idx) for idx in sampled.tolist()]
+
+
+def _summarize_dexp_values(values) -> Dict[str, float]:
+    if not values:
+        return {
+            "count": 0,
+            "mean": math.nan,
+            "std": math.nan,
+            "min": math.nan,
+            "max": math.nan,
+            "mean_abs": math.nan,
+        }
+    if len(values) == 1:
+        val = float(values[0])
+        return {
+            "count": 1,
+            "mean": val,
+            "std": 0.0,
+            "min": val,
+            "max": val,
+            "mean_abs": abs(val),
+        }
+    mean_val = float(statistics.fmean(values))
+    return {
+        "count": int(len(values)),
+        "mean": mean_val,
+        "std": float(statistics.stdev(values)),
+        "min": float(min(values)),
+        "max": float(max(values)),
+        "mean_abs": float(statistics.fmean(abs(v) for v in values)),
+    }
+
+
+def _choose_delta_e_threshold(delta_e_values, base_threshold: float = 500.0) -> Tuple[float, Dict[str, Any]]:
+    stats = _summarize_dexp_values(delta_e_values)
+    polluted = False
+    reason = "default"
+    threshold = float(base_threshold)
+    center = float(stats["mean"]) if stats["count"] > 0 else 0.0
+    if stats["count"] == 0:
+        return threshold, {"polluted": False, "reason": "no_data", "stats": stats, "center": center}
+    centered_values = [float(v) - center for v in delta_e_values]
+    centered_stats = _summarize_dexp_values(centered_values)
+    if centered_stats["std"] > 200.0:
+        polluted = True
+        threshold = 200.0
+        reason = "centered_std_gt_200"
+    if centered_stats["std"] > 350.0:
+        polluted = True
+        threshold = 100.0
+        reason = "severe_centered_pollution"
+    if np.isfinite(centered_stats["std"]):
+        threshold = max(50.0, min(threshold, 4.0 * float(centered_stats["std"]) + 20.0))
+    return threshold, {
+        "polluted": polluted,
+        "reason": reason,
+        "stats": stats,
+        "centered_stats": centered_stats,
+        "center": center,
+    }
+
+
+def _detect_suspicious_fit(fitted_params: Dict[str, Any]) -> Dict[str, Any]:
+    bounds = {
+        "alpha_vdw": (10.0, 30.0),
+        "r0_vdw": (0.28, 0.40),
+        "A_fit": (1.0e-5, 5.0),
+        "B_fit": (1.0e-5, 5.0),
+    }
+    eps = 1.0e-6
+    hits: List[str] = []
+    for key, (lower, upper) in bounds.items():
+        value = fitted_params.get(key)
+        if value is None:
+            continue
+        if abs(float(value) - lower) < eps:
+            hits.append(f"{key}=lower_bound({lower})")
+        elif abs(float(value) - upper) < eps:
+            hits.append(f"{key}=upper_bound({upper})")
+    return {"suspicious_fit": bool(hits), "boundary_hits": hits}
 
 
 class Orbv3DEXPFittingPipeline:
@@ -3846,10 +4024,11 @@ class Orbv3DEXPFittingPipeline:
         ligand_resname: str,
         output_json: str,
         n_frames: int = 200,
-        env_radius_nm: float = 0.45,
+        env_radius_nm: float = 0.60,
         env_max_atoms: Optional[int] = None,
+        fit_last_ns: Optional[float] = None,
         gmx_include_dir: str = None,
-        fitting_region: tuple = (0.20, 0.45),
+        fitting_region: tuple = (0.20, 0.50),
     ) -> dict:
         import mdtraj as md
 
@@ -3860,27 +4039,36 @@ class Orbv3DEXPFittingPipeline:
         if len(lig_idx) == 0:
             raise ValueError(f"未找到配体残基: {ligand_resname}")
 
+        frame_indices = _select_tail_indices_from_time(traj, n_frames, fit_last_ns)
+        if not frame_indices:
+            raise RuntimeError("轨迹为空，无法执行 DEXP 拟合")
+        fit_traj = traj[frame_indices]
+        if fit_traj.unitcell_vectors is not None:
+            fit_traj = fit_traj.image_molecules(inplace=False)
+
         env_radius_nm = float(env_radius_nm)
         env_idx = _select_env_indices_from_mdtraj_frame(
-            traj[0], lig_idx, env_radius_nm, max_env_atoms=env_max_atoms
+            fit_traj[-1], lig_idx, env_radius_nm, max_env_atoms=env_max_atoms
         )
         if len(env_idx) == 0:
             raise RuntimeError("未找到配体附近环境原子，请增大 env_radius_nm")
         if env_max_atoms is not None:
             print(f"🔒 OpenMM-ML 环境原子上限: {env_max_atoms} | 实际选中: {len(env_idx)}")
-        all_nums = np.array([a.element.atomic_number for a in traj.top.atoms], dtype=int)
+        all_nums = np.array([a.element.atomic_number for a in fit_traj.top.atoms], dtype=int)
 
-        gro_box = traj.unitcell_vectors[0] * unit.nanometer if traj.unitcell_vectors is not None else None
+        gro_box = fit_traj.unitcell_vectors[0] * unit.nanometer if fit_traj.unitcell_vectors is not None else None
         mm_contexts = self._build_mm_le_contexts(
-            traj.topology, gro_box, lig_idx, env_idx,
+            fit_traj.topology, gro_box, lig_idx, env_idx,
             gmx_include_dir=gmx_include_dir, top_file=top_file,
         )
 
-        frame_indices = np.linspace(0, len(traj) - 1, min(n_frames, len(traj)), dtype=int)
         e_int_list, dists_per_frame = [], []
         stats = {"total": 0, "success": 0, "skip_outlier": 0, "skip_no_dists": 0}
+        raw_orb_values: List[float] = []
+        raw_mm_coul_values: List[float] = []
+        raw_mm_vdw_values: List[float] = []
 
-        first_frame = traj[frame_indices[0]]
+        first_frame = fit_traj[0]
         first_pos_nm = (
             first_frame.image_molecules(inplace=False).xyz[0].copy()
             if first_frame.unitcell_vectors is not None
@@ -3892,8 +4080,8 @@ class Orbv3DEXPFittingPipeline:
         for i, fid in enumerate(frame_indices):
             stats["total"] += 1
             try:
-                frame = traj[fid]
-                pos_nm = frame.image_molecules(inplace=False).xyz[0].copy() if frame.unitcell_vectors is not None else frame.xyz[0].copy()
+                frame = fit_traj[i]
+                pos_nm = frame.xyz[0].copy()
 
                 e_orb_int = self._compute_orb_decomposition(pos_nm, lig_idx, env_idx, all_nums)
 
@@ -3911,6 +4099,9 @@ class Orbv3DEXPFittingPipeline:
                         e_mm_vdw = energy
 
                 delta_e = e_orb_int - e_mm_coul - e_mm_vdw
+                raw_orb_values.append(float(e_orb_int))
+                raw_mm_coul_values.append(float(e_mm_coul))
+                raw_mm_vdw_values.append(float(e_mm_vdw))
                 if np.isnan(delta_e) or np.isinf(delta_e) or abs(delta_e) > 5000.0:
                     stats["skip_outlier"] += 1
                     continue
@@ -3943,6 +4134,24 @@ class Orbv3DEXPFittingPipeline:
         if stats["success"] < 10:
             raise RuntimeError("有效 ΔE 数据不足 10 帧，无法拟合。请检查轨迹质量或扩大 env_radius_nm。")
 
+        delta_threshold, delta_diag = _choose_delta_e_threshold(e_int_list)
+        if delta_diag["polluted"]:
+            filtered_pairs = [
+                (delta_e, dists)
+                for delta_e, dists in zip(e_int_list, dists_per_frame)
+                if np.isfinite(delta_e) and abs(float(delta_e) - float(delta_diag["center"])) < delta_threshold
+            ]
+            if len(filtered_pairs) >= 10:
+                e_int_list = [float(delta_e) for delta_e, _ in filtered_pairs]
+                dists_per_frame = [dists for _, dists in filtered_pairs]
+                stats["success"] = len(e_int_list)
+                print(
+                    f"📎 启用尾段过滤: 保留 {len(e_int_list)} 帧 | "
+                    f"threshold={delta_threshold:.1f} kJ/mol | reason={delta_diag['reason']}"
+                )
+            else:
+                print("⚠️ ΔE 过滤后有效帧不足 10，回退为使用全部成功帧拟合。")
+
         qm_mm_offset = float(np.mean(e_int_list))
         e_int_list = [float(val - qm_mm_offset) for val in e_int_list]
         print(f"📌 QM/MM reference shift = {qm_mm_offset:.3f} kJ/mol（仅诊断，不进入 OpenMM force）")
@@ -3952,9 +4161,42 @@ class Orbv3DEXPFittingPipeline:
         fitted_params = fitter.fit_parameters(dists_per_frame, e_int_list)
         fitted_params["qm_mm_offset_kjmol"] = qm_mm_offset
         fitted_params["fit_target_definition"] = "delta_fit = (E_qm_region - E_mm_region) - <E_qm_region - E_mm_region>"
+        fitted_params["fit_frames_requested"] = int(n_frames)
+        fitted_params["fit_last_ns_requested"] = float(fit_last_ns) if fit_last_ns is not None else None
+        fitted_params["fit_frames_total"] = int(len(frame_indices))
+        fitted_params["fit_frames_used"] = int(len(e_int_list))
+        fitted_params["fit_frame_start"] = int(frame_indices[0])
+        fitted_params["fit_frame_end"] = int(frame_indices[-1])
+        if getattr(traj, "time", None) is not None:
+            fitted_params["fit_time_start_ps"] = float(traj.time[frame_indices[0]])
+            fitted_params["fit_time_end_ps"] = float(traj.time[frame_indices[-1]])
+        fitted_params["env_radius_nm"] = float(env_radius_nm)
+        fitted_params["env_max_atoms"] = int(env_max_atoms) if env_max_atoms is not None else None
+        fitted_params["fit_region_nm"] = [float(fitting_region[0]), float(fitting_region[1])]
+        fitted_params["traj_total_frames"] = int(len(traj))
+        fitted_params["ml_model"] = str(self.model_name)
+        fitted_params["label_mode"] = str(self.label_mode)
+        fitted_params["delta_e_filter_threshold_kjmol"] = float(delta_threshold)
+        fitted_params["delta_e_polluted"] = bool(delta_diag["polluted"])
+        fitted_params["delta_e_pollution_reason"] = str(delta_diag["reason"])
+        fitted_params["delta_e_mean_kjmol"] = float(delta_diag["stats"]["mean"])
+        fitted_params["delta_e_std_kjmol"] = float(delta_diag["stats"]["std"])
+        fitted_params["delta_e_mean_abs_kjmol"] = float(delta_diag["stats"]["mean_abs"])
+        orb_stats = _summarize_dexp_values(raw_orb_values)
+        mm_coul_stats = _summarize_dexp_values(raw_mm_coul_values)
+        mm_vdw_stats = _summarize_dexp_values(raw_mm_vdw_values)
+        fitted_params["e_orb_int_mean_kjmol"] = float(orb_stats["mean"])
+        fitted_params["e_orb_int_std_kjmol"] = float(orb_stats["std"])
+        fitted_params["e_mm_coul_mean_kjmol"] = float(mm_coul_stats["mean"])
+        fitted_params["e_mm_coul_std_kjmol"] = float(mm_coul_stats["std"])
+        fitted_params["e_mm_vdw_mean_kjmol"] = float(mm_vdw_stats["mean"])
+        fitted_params["e_mm_vdw_std_kjmol"] = float(mm_vdw_stats["std"])
+        fitted_params.update(_detect_suspicious_fit(fitted_params))
 
         if not fitted_params.get("fitting_success"):
             print("⚠️ 拟合未收敛，返回默认参数")
+        elif fitted_params.get("suspicious_fit"):
+            print(f"⚠️ 检测到参数撞边界: {', '.join(fitted_params.get('boundary_hits', []))}")
 
         with open(output_json, "w") as f:
             json.dump(fitted_params, f, indent=2, cls=NumpyEncoder)

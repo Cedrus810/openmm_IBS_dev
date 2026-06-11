@@ -708,7 +708,7 @@ python runabfe.py prepare --gro solv_ions.gro --top topol.top --ligand MOL --out
   `ibs` 或 `traditional`
 
 - `--decoupling`
-  `dual_lambda`、`single_lambda`、`2d_diagonal`、`2d_geodesic`
+  当前公开接口支持 `dual_lambda`、`single_lambda`、`2d_diagonal`、`2d_geodesic`
 
 - `--potential`
   `softcore` 或 `dexp`
@@ -826,7 +826,7 @@ python runabfe.py prepare --gro solv_ions.gro --top topol.top --ligand MOL --out
 
 ### 14.4 双 lambda 是主路线
 
-虽然代码支持其它模式，但当前默认配置、主要类实现和大量优化逻辑都明显围绕 `dual_lambda` 展开。
+当前默认主路线仍是 `dual_lambda`，但公开接口也保留 `single_lambda`、`2d_diagonal`、`2d_geodesic`。
 
 ## 15. 建议的阅读顺序
 

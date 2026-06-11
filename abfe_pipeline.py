@@ -44,6 +44,7 @@ from abfe_core import (
     ACESoftcorePotential,
     BeutlerSoftcoreBuilder,
     DEXPSurrogatePotential,
+    run_orbv3_dexp_fitting,
     UnitFormatter,
     TwoDimensionalLambdaPathPlanner,
 )
@@ -330,9 +331,9 @@ class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, np.ndarray):
             return obj.tolist()
-        if isinstance(obj, (np.int_, np.intc, np.intp, np.int8, np.int16, np.int32, np.int64)):
+        if isinstance(obj, np.integer):
             return int(obj)
-        if isinstance(obj, (np.float_, np.float16, np.float32, np.float64)):
+        if isinstance(obj, np.floating):
             return float(obj)
         if isinstance(obj, np.bool_):
             return bool(obj)
@@ -732,6 +733,52 @@ class ABFEPipeline:
             "resumed": resume_from_chk,
             "platform": equil_platform,
         }
+
+    def fit_dexp_parameters(
+        self,
+        ligand_resname: str,
+        top_file: str,
+        output_name: str = "dexp_fitted_params.json",
+        device: Optional[str] = None,
+        n_frames: int = 200,
+        env_radius_nm: float = 0.85,
+        env_max_atoms: Optional[int] = None,
+        fit_last_ns: Optional[float] = None,
+        fit_r_min: float = 0.20,
+        fit_r_max: float = 0.45,
+        gmx_include_dir: Optional[str] = None,
+    ) -> str:
+        traj_file = os.path.join(self.output_dir, "pre_equilibration.dcd")
+        if not _is_traj_valid(traj_file, min_frames=1):
+            raise FileNotFoundError(
+                f"未找到可用预平衡轨迹: {traj_file}。请先运行 pre_equilibrate(save_traj=True)。"
+            )
+
+        output_path = os.path.join(self.output_dir, output_name)
+        platform_upper = str(self.platform_name).upper()
+        resolved_device = device or ("cuda" if platform_upper == "CUDA" else "cpu")
+        self._log(
+            f"🧪 启动 DEXP 拟合 | device={resolved_device} | "
+            f"frames={n_frames} | tail_ns={fit_last_ns} | env_radius={env_radius_nm}"
+        )
+        generated_path = run_orbv3_dexp_fitting(
+            traj_file=traj_file,
+            top_file=top_file,
+            ligand_resname=ligand_resname,
+            output_dir=self.output_dir,
+            device=resolved_device,
+            n_frames=n_frames,
+            env_radius_nm=env_radius_nm,
+            env_max_atoms=env_max_atoms,
+            fit_last_ns=fit_last_ns,
+            fit_r_min=fit_r_min,
+            fit_r_max=fit_r_max,
+            gmx_include_dir=gmx_include_dir,
+        )
+        if os.path.abspath(generated_path) != os.path.abspath(output_path):
+            shutil.copy(generated_path, output_path)
+        self._log(f"✅ DEXP 参数已生成: {output_path}")
+        return output_path
 
     # =========================================================================
     # 1.5 带 Boresch 限制力的再平衡
@@ -1543,58 +1590,74 @@ class ABFEPipeline:
         self._log(f"  λ_vdw:  {lambdas_vdw[0]:.3f} → {lambdas_vdw[-1]:.3f}")
         self._log(f"{'=' * 60}")
 
-        from abfe_preoptimizer import generate_overlapping_windows
-        pts_per_window, overlap = 6, 2
-        window_ranges = generate_overlapping_windows(
-            n_states=n_states,
-            n_windows=kwargs.get("n_windows", None),
-            pts_per_window=pts_per_window,
-            overlap=overlap,
-        )
-        self._log(f"  🪟 自动划分 {len(window_ranges)} 个 IBS 窗口")
-
         stage_output_dir = os.path.join(self.output_dir, label)
         os.makedirs(stage_output_dir, exist_ok=True)
-        stage_type = "2d"
 
-        alchemical_params = _resolve_alchemical_params(
-            potential_type, dexp_params, self.ligand_indices
-        )
-        manager = IBSWindowManagerDualLambda(
-            system_template=self.system,
-            topology=self.topology,
-            perturbed_atom_indices=self.ligand_indices,
-            lambdas_coul=lambdas_coul,
-            lambdas_vdw=lambdas_vdw,
-            temperature=self.temperature,
-            window_ranges=window_ranges,
-            alchemical_params=alchemical_params,
-            potential_type=potential_type,
-            restraint_params=boresch_params,
-            prefix="abfe_2d",
-            platform_name=self.platform_name,
-            output_dir=stage_output_dir,
-            checkpoint_dir=self.checkpoint_dir,
-        )
-        manager.output_dir = stage_output_dir
+        traj_files = _expected_remd_traj_files(stage_output_dir, label, n_states)
+        u_kn_path = os.path.join(stage_output_dir, f"{label}_pme_u_kn.npy")
+        if resume and os.path.exists(u_kn_path) and _is_pme_u_kn_cache_compatible(
+            stage_output_dir, label, n_states
+        ):
+            self._log("  ♻️ 检测到兼容的 PME u_kn 缓存，直接求解 MBAR")
+            u_kn = np.load(u_kn_path)
+            analyzer = TraditionalMBARAnalyzer(
+                temperature=self.temperature.value_in_unit(unit.kelvin)
+            )
+            res = analyzer.solve(u_kn)
+        else:
+            if resume and _all_remd_trajs_valid(
+                stage_output_dir, label, n_states, min_frames=1
+            ):
+                self._log("  ♻️ 检测到完整 REMD 轨迹，跳过采样直接重算 u_kn")
+            else:
+                self._log("  ⚡ 2D/单λ 路径改走 PME-preserving REMD+MBAR 通路")
+                remd = REMDManager(
+                    system_template=self.system,
+                    topology=self.topology,
+                    positions=self.positions,
+                    box_vectors=self.box_vectors,
+                    ligand_indices=self.ligand_indices,
+                    lambdas_coul=lambdas_coul,
+                    lambdas_vdw=lambdas_vdw,
+                    temperature=self.temperature.value_in_unit(unit.kelvin),
+                    platform_name=self.platform_name,
+                    output_dir=stage_output_dir,
+                )
+                traj_files = remd.run(
+                    n_steps=n_steps_per_window,
+                    exchange_interval=max(1, int(steps_per_update)),
+                    stage_name=label,
+                )
 
-        manager.run_all_windows(
-            positions=self.positions,
-            box_vectors=self.box_vectors,
-            n_steps_per_window=n_steps_per_window,
-            steps_per_update=steps_per_update,
-            stage_type=stage_type,
-            resume=resume,
-            enable_gradual_warmup=enable_gradual_warmup,
-            warmup_steps=warmup_steps,
-        )
+            analyzer = TraditionalMBARAnalyzer(
+                temperature=self.temperature.value_in_unit(unit.kelvin)
+            )
+            u_kn = analyzer.compute_u_kn(
+                traj_files=traj_files,
+                system_template=self.system,
+                ligand_indices=self.ligand_indices,
+                lambdas_coul=lambdas_coul,
+                lambdas_vdw=lambdas_vdw,
+                platform_name="CPU",
+                topology=self.topology,
+                reference_positions=self.positions,
+                reference_box_vectors=self.box_vectors,
+            )
+            np.save(u_kn_path, u_kn)
+            _write_pme_u_kn_meta(stage_output_dir, label, n_states)
+            res = analyzer.solve(u_kn)
 
-        kt_val = (unit.MOLAR_GAS_CONSTANT_R * self.temperature).value_in_unit(unit.kilojoule_per_mole)
-        from ibs_engine import solve_stage_integrated
-        stage_result = solve_stage_integrated(
-            window_outputs=manager.get_stage_data_for_analysis(stage_type=stage_type),
-            kt=kt_val,
-            stage_name=label,
+        stage_result = {
+            "stage": label,
+            "total_delta_G": float(res.get("delta_G", 0.0)),
+            "total_error": float(res.get("error", 0.0)),
+            "method": "PME-REMD-MBAR",
+            "n_states": int(n_states),
+            "lambda_path": [list(map(float, p)) for p in path_2d],
+        }
+        self._log(
+            f"  ✓ {label} 路径完成: ΔG={stage_result['total_delta_G']:.2f} ± "
+            f"{stage_result['total_error']:.2f} kJ/mol"
         )
         return stage_result
 
@@ -1616,11 +1679,15 @@ class ABFEPipeline:
         return None
 
 
-    def apply_boresch_correction(self, boresch_params: Optional[Dict] = None) -> Dict:
+    def apply_boresch_correction(
+        self,
+        boresch_params: Optional[Dict] = None,
+        autoload_from_disk: bool = True,
+    ) -> Dict:
         """🔑 增强版：支持磁盘自动加载 + 严格单位清洗 + 异常不静默吞没"""
         if boresch_params is None:
             boresch_path = os.path.join(self.output_dir, "boresch_params.json")
-            if os.path.exists(boresch_path):
+            if autoload_from_disk and os.path.exists(boresch_path):
                 self._log(f"  📂 参数未传入，自动从磁盘加载: {boresch_path}")
                 with open(boresch_path, "r") as f:
                     boresch_params = json.load(f)
@@ -1831,6 +1898,8 @@ class ABFEPipeline:
         potential_type: str = "softcore",
         dexp_params: Optional[Dict] = None,
         n_states_per_stage: int = 12,
+        stage1_n_states: Optional[int] = None,
+        stage2_n_states: Optional[int] = None,
         n_steps_per_window: int = 50000,
         steps_per_update: int = 500,
         system_type: str = "complex",
@@ -1851,7 +1920,7 @@ class ABFEPipeline:
         # 自动 GPU 设备策略检测
         n_windows_for_strategy = kwargs.get("n_windows_for_strategy", 2)
         gpu_strategy = self.get_device_strategy(
-            n_windows=n_windows_for_strategy, 
+            n_windows=n_windows_for_strategy,
             platform_name=self.platform_name  # ✅ 透传平台名
         )
         device_indices = gpu_strategy["devices"]
@@ -1862,6 +1931,8 @@ class ABFEPipeline:
         # 加载全局状态
         state = self._load_pipeline_state() if resume else {}
         stages = state.get("stages", {})
+        stage1_states = int(stage1_n_states or n_states_per_stage)
+        stage2_states = int(stage2_n_states or n_states_per_stage)
 
         # ✅ 在预平衡前应用二面角修正
         if torsion_params:
@@ -2036,7 +2107,7 @@ class ABFEPipeline:
                     with open(preopt1_file, "r") as f:
                         cached = json.load(f)
                     cached_lambdas = cached["lambdas_var"]
-                    if len(cached_lambdas) == int(n_states_per_stage):
+                    if len(cached_lambdas) == stage1_states:
                         optimized_lambdas_1 = cached_lambdas
                         self._log(
                             f"  ♻️ 已加载 Stage 1 优化路径缓存 ({len(optimized_lambdas_1)} 个状态)"
@@ -2044,7 +2115,7 @@ class ABFEPipeline:
                     else:
                         self._log(
                             f"  ⚠️ Stage 1 优化路径缓存状态数不匹配 "
-                            f"({len(cached_lambdas)} != {n_states_per_stage})，重新优化"
+                            f"({len(cached_lambdas)} != {stage1_states})，重新优化"
                         )
                 except Exception as e:
                     self._log(f"  ⚠️ 加载 Stage 1 优化缓存失败: {e}，将重新优化")
@@ -2053,7 +2124,7 @@ class ABFEPipeline:
                 try:
                     opt_res = self._run_dual_lambda_optimization(
                         "decharging",
-                        n_states=n_states_per_stage,
+                        n_states=stage1_states,
                         n_steps_per_state=10000,
                     )
                     optimized_lambdas_1 = opt_res["lambdas_var"]
@@ -2075,7 +2146,7 @@ class ABFEPipeline:
                 try:
                     with open(stage1_file, "r") as f:
                         stage1 = json.load(f)
-                    if stage1.get("n_states") == int(n_states_per_stage):
+                    if stage1.get("n_states") == stage1_states:
                         self._log("  ♻️ 双λ Stage 1 (去电荷) 已完成，跳过")
                         should_run_stage1 = False
                     else:
@@ -2090,7 +2161,7 @@ class ABFEPipeline:
                     with open(preopt2_file, "r") as f:
                         cached = json.load(f)
                     cached_lambdas = cached["lambdas_var"]
-                    if len(cached_lambdas) == int(n_states_per_stage):
+                    if len(cached_lambdas) == stage2_states:
                         optimized_lambdas_2 = cached_lambdas
                         self._log(
                             f"  ♻️ 已加载 Stage 2 优化路径缓存 ({len(optimized_lambdas_2)} 个状态)"
@@ -2098,7 +2169,7 @@ class ABFEPipeline:
                     else:
                         self._log(
                             f"  ⚠️ Stage 2 优化路径缓存状态数不匹配 "
-                            f"({len(cached_lambdas)} != {n_states_per_stage})，重新优化"
+                            f"({len(cached_lambdas)} != {stage2_states})，重新优化"
                         )
                 except Exception as e:
                     self._log(f"  ⚠️ 加载 Stage 2 优化缓存失败: {e}，将重新优化")
@@ -2107,7 +2178,7 @@ class ABFEPipeline:
                 try:
                     opt_res = self._run_dual_lambda_optimization(
                         "vanishing",
-                        n_states=n_states_per_stage,
+                        n_states=stage2_states,
                         n_steps_per_state=10000,
                     )
                     optimized_lambdas_2 = opt_res["lambdas_var"]
@@ -2129,7 +2200,7 @@ class ABFEPipeline:
                 try:
                     with open(stage2_file, "r") as f:
                         stage2 = json.load(f)
-                    if stage2.get("n_states") == int(n_states_per_stage):
+                    if stage2.get("n_states") == stage2_states:
                         self._log("  ♻️ 双λ Stage 2 (去VDW) 已完成，跳过")
                         should_run_stage2 = False
                     else:
@@ -2152,7 +2223,8 @@ class ABFEPipeline:
 
                 _temp_k = self.temperature.value_in_unit(unit.kelvin)
                 _common = dict(
-                    n_states=n_states_per_stage,
+                    n_states_stage1=stage1_states,
+                    n_states_stage2=stage2_states,
                     n_steps_per_window=n_steps_per_window,
                     steps_per_update=steps_per_update,
                     system_type=system_type,
@@ -2182,7 +2254,7 @@ class ABFEPipeline:
                         target=_run_stage_worker_process,
                         args=(state_dir, _temp_k, stage1_platform, self.output_dir,
                               "decharging", 1.0, 1.0,
-                              _common["n_states"], _common["n_steps_per_window"],
+                              _common["n_states_stage1"], _common["n_steps_per_window"],
                               _common["steps_per_update"], _common["system_type"],
                               _common["potential_type"], _common["dexp_params"],
                               optimized_lambdas_1, _common["enable_early_stop"],
@@ -2193,7 +2265,7 @@ class ABFEPipeline:
                         target=_run_stage_worker_process,
                         args=(state_dir, _temp_k, stage2_platform, self.output_dir,
                               "vanishing", 0.0, 1.0,
-                              _common["n_states"], _common["n_steps_per_window"],
+                              _common["n_states_stage2"], _common["n_steps_per_window"],
                               _common["steps_per_update"], _common["system_type"],
                               _common["potential_type"], _common["dexp_params"],
                               optimized_lambdas_2, _common["enable_early_stop"],
@@ -2208,7 +2280,7 @@ class ABFEPipeline:
                     _run_stage_worker_process(
                         state_dir, _temp_k, stage1_platform, self.output_dir,
                         "decharging", 1.0, 1.0,
-                        _common["n_states"], _common["n_steps_per_window"],
+                        _common["n_states_stage1"], _common["n_steps_per_window"],
                         _common["steps_per_update"], _common["system_type"],
                         _common["potential_type"], _common["dexp_params"],
                         optimized_lambdas_1, _common["enable_early_stop"],
@@ -2218,7 +2290,7 @@ class ABFEPipeline:
                     _run_stage_worker_process(
                         state_dir, _temp_k, stage2_platform, self.output_dir,
                         "vanishing", 0.0, 1.0,
-                        _common["n_states"], _common["n_steps_per_window"],
+                        _common["n_states_stage2"], _common["n_steps_per_window"],
                         _common["steps_per_update"], _common["system_type"],
                         _common["potential_type"], _common["dexp_params"],
                         optimized_lambdas_2, _common["enable_early_stop"],
@@ -2240,14 +2312,14 @@ class ABFEPipeline:
 
                 # Save checkpoint files
                 _s1 = {"stage": "decharging", "total_delta_G": stage1["total_delta_G"],
-                        "total_error": stage1["total_error"], "n_states": int(n_states_per_stage)}
+                        "total_error": stage1["total_error"], "n_states": stage1_states}
                 with open(stage1_file, "w") as f:
                     json.dump(_s1, f, indent=2)
                 self._update_stage_status(stage1_key, "completed",
                                           {"total_delta_G": stage1["total_delta_G"]})
 
                 _s2 = {"stage": "vanishing", "total_delta_G": stage2["total_delta_G"],
-                        "total_error": stage2["total_error"], "n_states": int(n_states_per_stage)}
+                        "total_error": stage2["total_error"], "n_states": stage2_states}
                 with open(stage2_file, "w") as f:
                     json.dump(_s2, f, indent=2)
                 self._update_stage_status(stage2_key, "completed",
@@ -2263,7 +2335,7 @@ class ABFEPipeline:
                         fixed_lam_vdw=1.0,
                         potential_type=potential_type,
                         dexp_params=dexp_params,
-                        n_states=n_states_per_stage,
+                        n_states=stage1_states,
                         n_steps_per_window=n_steps_per_window,
                         steps_per_update=steps_per_update,
                         system_type=system_type,
@@ -2278,7 +2350,7 @@ class ABFEPipeline:
                         "stage": "decharging",
                         "total_delta_G": stage1["total_delta_G"],
                         "total_error": stage1["total_error"],
-                        "n_states": int(n_states_per_stage),
+                        "n_states": stage1_states,
                     }
                     os.makedirs(self.checkpoint_dir, exist_ok=True)
                     with open(stage1_file, "w") as f:
@@ -2299,7 +2371,7 @@ class ABFEPipeline:
                         fixed_lam_vdw=1.0,
                         potential_type=potential_type,
                         dexp_params=dexp_params,
-                        n_states=n_states_per_stage,
+                        n_states=stage2_states,
                         n_steps_per_window=n_steps_per_window,
                         steps_per_update=steps_per_update,
                         system_type=system_type,
@@ -2314,7 +2386,7 @@ class ABFEPipeline:
                         "stage": "vanishing",
                         "total_delta_G": stage2["total_delta_G"],
                         "total_error": stage2["total_error"],
-                        "n_states": int(n_states_per_stage),
+                        "n_states": stage2_states,
                     }
                     os.makedirs(self.checkpoint_dir, exist_ok=True)
                     with open(stage2_file, "w") as f:
@@ -2336,7 +2408,10 @@ class ABFEPipeline:
             
             # ✅ 【修复 1】延迟状态更新：确保 Boresch 修正与结果落盘成功后再标记 completed
             try:
-                correction = self.apply_boresch_correction(boresch_params)
+                correction = self.apply_boresch_correction(
+                    boresch_params,
+                    autoload_from_disk=kwargs.get("allow_disk_boresch_autoload", True),
+                )
             except Exception as e:
                 self._log(f"  🚨 Boresch 修正流程抛出未捕获异常: {e}")
                 self._log(f"  → 请检查 boresch_params.json 格式或几何奇异性。本次 ΔG_rest 暂设为 0.0")
@@ -2352,6 +2427,88 @@ class ABFEPipeline:
                 {"total_delta_G": sampling.get("total_delta_G")},
             )
             return final  # ✅ 新增：阻断落入末尾通用汇总块，避免二次写入与重复计算
+        elif decoupling_scheme == "single_lambda":
+            path_cache_file = os.path.join(self.checkpoint_dir, "path_single_lambda.json")
+            path_1d = None
+            if resume and os.path.exists(path_cache_file):
+                try:
+                    with open(path_cache_file) as f:
+                        _cached = json.load(f)
+                    path_1d = [tuple(p) for p in _cached["path"]]
+                    self._log(f"  ♻️ 已加载 single_lambda 路径缓存 ({len(path_1d)} 个状态)")
+                except Exception as e:
+                    self._log(f"  ⚠️ 加载 single_lambda 路径缓存失败: {e}，将重新生成")
+
+            if path_1d is None:
+                lambdas = np.linspace(1.0, 0.0, n_states_per_stage).tolist()
+                path_1d = [(lam, lam) for lam in lambdas]
+                os.makedirs(self.checkpoint_dir, exist_ok=True)
+                with open(path_cache_file, "w") as f:
+                    json.dump({"path": path_1d, "scheme": "single_lambda"}, f, indent=2)
+
+            _samp_file = os.path.join(self.checkpoint_dir, "sampling_single_lambda.json")
+            _should_run = True
+            if resume:
+                _key = "sampling_single_lambda"
+                _status = stages.get(_key, {}).get("status")
+                if _status == "completed" and os.path.exists(_samp_file):
+                    try:
+                        with open(_samp_file) as f:
+                            sample_result = json.load(f)
+                        self._log("  ♻️ single_lambda 采样已完成，跳过")
+                        _should_run = False
+                    except Exception:
+                        pass
+
+            if _should_run:
+                sample_result = self._run_2d_lambda_stage(
+                    path_2d=path_1d,
+                    label="single_lambda",
+                    n_steps_per_window=n_steps_per_window,
+                    steps_per_update=steps_per_update,
+                    system_type=system_type,
+                    resume=resume,
+                    potential_type=potential_type,
+                    dexp_params=dexp_params,
+                    enable_early_stop=enable_early_stop,
+                    boresch_params=boresch_params,
+                    enable_gradual_warmup=kwargs.get("enable_gradual_warmup", True),
+                    warmup_steps=kwargs.get("warmup_steps", 500000),
+                )
+                _save = {
+                    "total_delta_G": sample_result["total_delta_G"],
+                    "total_error": sample_result["total_error"],
+                }
+                os.makedirs(self.checkpoint_dir, exist_ok=True)
+                with open(_samp_file, "w") as f:
+                    json.dump(_save, f, indent=2)
+                self._update_stage_status(
+                    "sampling_single_lambda",
+                    "completed",
+                    {"total_delta_G": sample_result["total_delta_G"]},
+                )
+
+            sampling = {
+                "total_delta_G": sample_result["total_delta_G"],
+                "total_error": sample_result["total_error"],
+            }
+
+            try:
+                correction = self.apply_boresch_correction(
+                    boresch_params,
+                    autoload_from_disk=kwargs.get("allow_disk_boresch_autoload", True),
+                )
+            except Exception as e:
+                self._log(f"  🚨 Boresch 修正异常: {e}")
+                correction = {"delta_g_rest": 0.0, "error": 0.0}
+
+            final = self.compute_final_results(
+                sampling,
+                correction,
+                decoupling_scheme="single_lambda",
+            )
+            self.results["final"] = final
+            return final
         elif decoupling_scheme == "2d_diagonal":
             # === 生成对角线路径 ===
             path_cache_file = os.path.join(self.checkpoint_dir, "path_2d_diagonal.json")
@@ -2417,7 +2574,10 @@ class ABFEPipeline:
                         "total_error": sample_result["total_error"]}
 
             try:
-                correction = self.apply_boresch_correction(boresch_params)
+                correction = self.apply_boresch_correction(
+                    boresch_params,
+                    autoload_from_disk=kwargs.get("allow_disk_boresch_autoload", True),
+                )
             except Exception as e:
                 self._log(f"  🚨 Boresch 修正异常: {e}")
                 correction = {"delta_g_rest": 0.0, "error": 0.0}
@@ -2498,7 +2658,10 @@ class ABFEPipeline:
                         "total_error": sample_result["total_error"]}
 
             try:
-                correction = self.apply_boresch_correction(boresch_params)
+                correction = self.apply_boresch_correction(
+                    boresch_params,
+                    autoload_from_disk=kwargs.get("allow_disk_boresch_autoload", True),
+                )
             except Exception as e:
                 self._log(f"  🚨 Boresch 修正异常: {e}")
                 correction = {"delta_g_rest": 0.0, "error": 0.0}
@@ -2641,20 +2804,20 @@ class TraditionalABFEPipeline:
         lambdas_vdw = np.linspace(1.0, 0.0, n_lambda).tolist()
         res_vdw = self.run_leg("vanishing", lambdas_coul, lambdas_vdw, n_steps_per_leg, resume=False)
 
-        dg_phys = res_coul["delta_G"] + res_vdw["delta_G"]
-        err_phys = np.sqrt(res_coul["error"]**2 + res_vdw["error"]**2)
-        dg_bind = dg_phys + boresch_correction
+        dg_leg = res_coul["delta_G"] + res_vdw["delta_G"]
+        err_leg = np.sqrt(res_coul["error"]**2 + res_vdw["error"]**2)
+        dg_total = dg_leg + boresch_correction
 
         final = {
             "stage_decharging": res_coul,
             "stage_vanishing": res_vdw,
-            "delta_G_physical_kJ_mol": dg_phys,
-            "error_physical_kJ_mol": err_phys,
+            "delta_G_leg_kJ_mol": dg_leg,
+            "error_leg_kJ_mol": err_leg,
             "boresch_correction_kJ_mol": boresch_correction,
-            "delta_G_bind_kJ_mol": dg_bind,
-            "delta_G_bind_kcal_mol": dg_bind / 4.184,
+            "delta_G_total_kJ_mol": dg_total,
+            "delta_G_total_kcal_mol": dg_total / 4.184,
         }
         with open(os.path.join(self.output_dir, "final_results.json"), "w") as f:
             json.dump(final, f, indent=2)
-        print(f"\n✅ 传统 ABFE 完成 | ΔG_bind = {dg_bind:.2f} ± {err_phys:.2f} kJ/mol")
+        print(f"\n✅ 传统腿完成 | ΔG_leg = {dg_total:.2f} ± {err_leg:.2f} kJ/mol")
         return final

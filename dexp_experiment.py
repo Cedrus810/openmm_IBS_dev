@@ -31,6 +31,8 @@ import math
 import os
 import re
 import statistics
+import struct
+import zlib
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 import numpy as np
@@ -131,6 +133,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--softstart-dt-fs", type=float, default=0.2, help="软启动初始步长 (fs)")
     parser.add_argument("--ramp-dt-fs", default="0.5,1.0,2.0", help="逐级升温步长列表 (fs, 逗号分隔)")
     parser.add_argument("--reuse-fit-labels", action="store_true", help="复用 output-dir 下已有的能量标注缓存，只重新拟合 DEXP 参数")
+    parser.add_argument("--analysis-max-frames", type=int, default=200, help="后处理分析最多读取多少帧")
+    parser.add_argument("--lambda-scan-points", type=int, default=11, help="lambda 单点扫描状态数")
+    parser.add_argument("--rdf-r-max", type=float, default=1.2, help="L-E RDF 最大半径 (nm)")
+    parser.add_argument("--rdf-bin-width", type=float, default=0.01, help="L-E RDF bin 宽度 (nm)")
+    parser.add_argument("--pmf-bin-width", type=float, default=0.01, help="1D PMF 的 min-distance bin 宽度 (nm)")
+    parser.add_argument("--analysis-r-min", type=float, default=0.20, help="后处理重点关注距离下限 (nm)，默认 0.20 = 2A")
+    parser.add_argument("--analysis-r-max", type=float, default=0.65, help="后处理重点关注距离上限 (nm)，默认 0.65 = 6.5A")
+    parser.add_argument("--lambda-window-values", default="1.0,0.75,0.5,0.25,0.0", help="后处理固定 lambda 窗口，逗号分隔")
+    parser.add_argument("--lambda-window-ns", type=float, default=0.10, help="每个固定 lambda 窗口的短程重跑时长 (ns)")
+    parser.add_argument("--postprocess-only", action="store_true", help="跳过拟合与动力学，只基于现有 output-dir 结果重跑后处理")
     return parser.parse_args()
 
 
@@ -946,13 +958,949 @@ def read_state_csv(csv_path: str) -> Dict[str, List[float]]:
         "totalEnergy": [],
         "temperature": [],
     }
+    alias_map = {
+        "step": "step",
+        "#step": "step",
+        "potentialenergy": "potentialEnergy",
+        "potential energy (kj/mole)": "potentialEnergy",
+        "kineticenergy": "kineticEnergy",
+        "kinetic energy (kj/mole)": "kineticEnergy",
+        "totalenergy": "totalEnergy",
+        "total energy (kj/mole)": "totalEnergy",
+        "temperature": "temperature",
+        "temperature (k)": "temperature",
+    }
+
+    def _normalize_header(text: str) -> str:
+        cleaned = str(text).strip().strip('"').strip("'")
+        cleaned = cleaned.lstrip("#").strip()
+        return cleaned.lower()
+
     with open(csv_path, "r", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
+        if reader.fieldnames:
+            normalized_names = [_normalize_header(name) for name in reader.fieldnames]
+            header_lookup = {
+                raw_name: alias_map.get(norm_name)
+                for raw_name, norm_name in zip(reader.fieldnames, normalized_names)
+            }
+        else:
+            header_lookup = {}
         for row in reader:
-            for key in list(columns.keys()):
-                if key in row and row[key] not in (None, ""):
-                    columns[key].append(float(row[key]))
+            for raw_name, value in row.items():
+                canonical = header_lookup.get(raw_name)
+                if canonical is None or value in (None, ""):
+                    continue
+                columns[canonical].append(float(value))
     return columns
+
+
+def select_analysis_frame_indices(n_frames: int, max_frames: int) -> List[int]:
+    if n_frames <= 0:
+        return []
+    if max_frames <= 0 or n_frames <= max_frames:
+        return list(range(n_frames))
+    return [int(idx) for idx in np.unique(np.linspace(0, n_frames - 1, max_frames, dtype=int)).tolist()]
+
+
+def load_analysis_traj(traj_path: str, top_path: str, max_frames: int):
+    md = require_module("mdtraj")
+    traj = md.load(traj_path, top=top_path)
+    if len(traj) == 0:
+        raise RuntimeError(f"轨迹为空，无法分析: {traj_path}")
+    frame_indices = select_analysis_frame_indices(len(traj), max_frames)
+    sliced = traj[frame_indices]
+    if sliced.unitcell_vectors is not None:
+        sliced = sliced.image_molecules(inplace=False)
+    return sliced, frame_indices
+
+
+def get_ligand_env_heavy_indices(traj_topology, ligand_resname: str) -> Tuple[np.ndarray, np.ndarray]:
+    lig_heavy = np.array(
+        traj_topology.select(f"resname {ligand_resname} and not element H"),
+        dtype=int,
+    )
+    if len(lig_heavy) == 0:
+        lig_heavy = np.array(traj_topology.select(f"resname {ligand_resname}"), dtype=int)
+    if len(lig_heavy) == 0:
+        raise ValueError(f"未在拓扑中找到配体 `{ligand_resname}` 的原子")
+
+    env_heavy = np.array(
+        traj_topology.select(f"not resname {ligand_resname} and not element H"),
+        dtype=int,
+    )
+    if len(env_heavy) == 0:
+        env_heavy = np.array(traj_topology.select(f"not resname {ligand_resname}"), dtype=int)
+    if len(env_heavy) == 0:
+        raise ValueError("未在拓扑中找到环境原子")
+    return lig_heavy, env_heavy
+
+
+def compute_pairwise_distances_nm(
+    pos_nm: np.ndarray,
+    lig_idx: np.ndarray,
+    env_idx: np.ndarray,
+    box_vecs_nm: np.ndarray | None,
+) -> np.ndarray:
+    delta = pos_nm[lig_idx][:, None, :] - pos_nm[env_idx][None, :, :]
+    if box_vecs_nm is not None:
+        box_lens = np.linalg.norm(np.asarray(box_vecs_nm, dtype=np.float64), axis=1)
+        delta -= box_lens * np.round(delta / box_lens)
+    return np.linalg.norm(delta, axis=-1)
+
+
+def compute_min_distance_series_nm(traj, lig_idx: np.ndarray, env_idx: np.ndarray) -> List[float]:
+    out: List[float] = []
+    box = np.asarray(traj.unitcell_vectors, dtype=np.float64) if traj.unitcell_vectors is not None else None
+    for frame_idx in range(len(traj)):
+        box_vecs = box[frame_idx] if box is not None else None
+        dists = compute_pairwise_distances_nm(
+            np.asarray(traj.xyz[frame_idx], dtype=np.float64),
+            lig_idx,
+            env_idx,
+            box_vecs,
+        )
+        out.append(float(np.min(dists)))
+    return out
+
+
+def summarize_series_with_percentiles(values: Sequence[float]) -> Dict[str, float]:
+    if not values:
+        return {
+            "count": 0,
+            "mean": math.nan,
+            "std": math.nan,
+            "min": math.nan,
+            "p05": math.nan,
+            "p50": math.nan,
+            "p95": math.nan,
+            "max": math.nan,
+        }
+    arr = np.asarray(values, dtype=float)
+    base = summarize_series([float(x) for x in arr.tolist()])
+    return {
+        "count": int(arr.size),
+        "mean": float(base["mean"]),
+        "std": float(base["std"]),
+        "min": float(np.min(arr)),
+        "p05": float(np.percentile(arr, 5.0)),
+        "p50": float(np.percentile(arr, 50.0)),
+        "p95": float(np.percentile(arr, 95.0)),
+        "max": float(np.max(arr)),
+    }
+
+
+def write_rows_csv(path: str, rows: List[Dict]) -> str:
+    if not rows:
+        raise ValueError(f"无数据可写入: {path}")
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
+def get_matplotlib_pyplot():
+    import importlib
+
+    matplotlib = importlib.import_module("matplotlib")
+    matplotlib.use("Agg", force=True)
+    return importlib.import_module("matplotlib.pyplot")
+
+
+def parse_lambda_window_values(args: argparse.Namespace) -> List[float]:
+    values: List[float] = []
+    for token in str(args.lambda_window_values).split(","):
+        token = token.strip()
+        if not token:
+            continue
+        lam = float(token)
+        values.append(min(max(lam, 0.0), 1.0))
+    if not values:
+        values = [1.0, 0.75, 0.5, 0.25, 0.0]
+    values = sorted({round(v, 6) for v in values}, reverse=True)
+    return [float(v) for v in values]
+
+
+def build_context_for_system(system, args: argparse.Namespace):
+    openmm, _, _, _ = require_openmm()
+    integrator = openmm.VerletIntegrator(0.001)
+    platform, properties = select_platform(args.platform)
+    return openmm.Context(system, integrator, platform, properties)
+
+
+def evaluate_context(
+    context,
+    positions_nm: np.ndarray,
+    box_vectors_nm: np.ndarray | None = None,
+    lam_coul: float | None = None,
+    lam_vdw: float | None = None,
+    include_forces: bool = False,
+) -> Dict[str, float]:
+    openmm, _, unit, _ = require_openmm()
+    if box_vectors_nm is not None:
+        context.setPeriodicBoxVectors(
+            *[
+                openmm.Vec3(float(vec[0]), float(vec[1]), float(vec[2]))
+                for vec in np.asarray(box_vectors_nm, dtype=np.float64)
+            ]
+        )
+    context.setPositions(np.asarray(positions_nm, dtype=np.float64) * unit.nanometer)
+    if lam_coul is not None:
+        try:
+            context.setParameter("lam_coul", float(lam_coul))
+        except Exception:
+            pass
+    if lam_vdw is not None:
+        try:
+            context.setParameter("lam_vdw", float(lam_vdw))
+        except Exception:
+            pass
+
+    state = context.getState(getEnergy=True, getForces=include_forces)
+    result = {
+        "potential_kjmol": float(
+            state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+        )
+    }
+    if include_forces:
+        forces = state.getForces(asNumpy=True).value_in_unit(
+            unit.kilojoules_per_mole / unit.nanometer
+        )
+        norms = np.linalg.norm(np.asarray(forces, dtype=np.float64), axis=1)
+        result["max_force_kjmol_per_nm"] = float(np.max(norms))
+        result["mean_force_kjmol_per_nm"] = float(np.mean(norms))
+    return result
+
+
+def run_lambda_single_point_scan(
+    args: argparse.Namespace,
+    output_dir: str,
+    dexp_system,
+) -> Dict:
+    print("[5/8] 执行 lambda=1→0 单点扫描")
+    traj, sampled_indices = load_analysis_traj(args.traj, args.traj_top, args.analysis_max_frames)
+    context = build_context_for_system(dexp_system, args)
+    lambda_values = np.linspace(1.0, 0.0, max(2, int(args.lambda_scan_points)))
+    box = np.asarray(traj.unitcell_vectors, dtype=np.float64) if traj.unitcell_vectors is not None else None
+    rows: List[Dict] = []
+    per_lambda_energy: Dict[float, List[float]] = {}
+    per_lambda_force: Dict[float, List[float]] = {}
+
+    for local_idx, frame_idx in enumerate(sampled_indices):
+        pos_nm = np.asarray(traj.xyz[local_idx], dtype=np.float64)
+        box_vecs = box[local_idx] if box is not None else None
+        prev_energy = None
+        for lam in lambda_values:
+            metrics = evaluate_context(
+                context,
+                positions_nm=pos_nm,
+                box_vectors_nm=box_vecs,
+                lam_coul=float(lam),
+                lam_vdw=float(lam),
+                include_forces=True,
+            )
+            jump = math.nan if prev_energy is None else float(metrics["potential_kjmol"] - prev_energy)
+            prev_energy = float(metrics["potential_kjmol"])
+            row = {
+                "frame_index": int(frame_idx),
+                "lambda_value": float(lam),
+                "potential_kjmol": float(metrics["potential_kjmol"]),
+                "delta_from_prev_lambda_kjmol": jump,
+                "max_force_kjmol_per_nm": float(metrics["max_force_kjmol_per_nm"]),
+                "mean_force_kjmol_per_nm": float(metrics["mean_force_kjmol_per_nm"]),
+                "is_finite": int(
+                    np.isfinite(metrics["potential_kjmol"])
+                    and np.isfinite(metrics["max_force_kjmol_per_nm"])
+                ),
+            }
+            rows.append(row)
+            lam_key = float(lam)
+            per_lambda_energy.setdefault(lam_key, []).append(float(metrics["potential_kjmol"]))
+            per_lambda_force.setdefault(lam_key, []).append(float(metrics["max_force_kjmol_per_nm"]))
+
+    csv_path = write_rows_csv(os.path.join(output_dir, "lambda_single_point_scan.csv"), rows)
+    summary = {
+        "scan_csv": csv_path,
+        "n_frames": int(len(sampled_indices)),
+        "n_lambda": int(len(lambda_values)),
+        "all_finite": bool(all(int(row["is_finite"]) for row in rows)),
+        "max_abs_energy_jump_kjmol": float(
+            max(
+                (abs(float(row["delta_from_prev_lambda_kjmol"])) for row in rows if np.isfinite(row["delta_from_prev_lambda_kjmol"])),
+                default=math.nan,
+            )
+        ),
+        "max_force_kjmol_per_nm": float(
+            max((max(vals) for vals in per_lambda_force.values()), default=math.nan)
+        ),
+        "per_lambda": [
+            {
+                "lambda_value": float(lam),
+                "potential_mean_kjmol": float(statistics.fmean(per_lambda_energy[lam])),
+                "potential_std_kjmol": float(statistics.stdev(per_lambda_energy[lam])) if len(per_lambda_energy[lam]) > 1 else 0.0,
+                "max_force_mean_kjmol_per_nm": float(statistics.fmean(per_lambda_force[lam])),
+                "max_force_max_kjmol_per_nm": float(max(per_lambda_force[lam])),
+            }
+            for lam in sorted(per_lambda_energy.keys(), reverse=True)
+        ],
+    }
+    return summary
+
+
+def compute_rdf(traj, lig_idx: np.ndarray, env_idx: np.ndarray, r_max_nm: float, bin_width_nm: float) -> Tuple[np.ndarray, np.ndarray]:
+    if bin_width_nm <= 0.0:
+        raise ValueError("rdf bin 宽度必须 > 0")
+    n_bins = max(1, int(math.ceil(r_max_nm / bin_width_nm)))
+    edges = np.linspace(0.0, r_max_nm, n_bins + 1)
+    counts = np.zeros(n_bins, dtype=np.float64)
+    shell_factor = 4.0 * math.pi / 3.0
+    rho_sum = 0.0
+    n_frames_used = 0
+    box = np.asarray(traj.unitcell_vectors, dtype=np.float64) if traj.unitcell_vectors is not None else None
+
+    for frame_idx in range(len(traj)):
+        box_vecs = box[frame_idx] if box is not None else None
+        dists = compute_pairwise_distances_nm(
+            np.asarray(traj.xyz[frame_idx], dtype=np.float64),
+            lig_idx,
+            env_idx,
+            box_vecs,
+        ).ravel()
+        dists = dists[np.isfinite(dists)]
+        dists = dists[dists <= r_max_nm]
+        hist, _ = np.histogram(dists, bins=edges)
+        counts += hist
+        if box_vecs is not None:
+            volume = abs(float(np.linalg.det(np.asarray(box_vecs, dtype=np.float64))))
+            if volume > 1.0e-8:
+                rho_sum += float(len(env_idx)) / volume
+                n_frames_used += 1
+
+    radii = 0.5 * (edges[:-1] + edges[1:])
+    shell_volumes = shell_factor * (edges[1:] ** 3 - edges[:-1] ** 3)
+    avg_density = rho_sum / max(n_frames_used, 1)
+    denom = max(len(traj), 1) * max(len(lig_idx), 1) * avg_density * shell_volumes
+    g_r = np.divide(counts, denom, out=np.zeros_like(counts), where=denom > 0.0)
+    return radii, g_r
+
+
+def build_1d_pmf(
+    distance_nm: Sequence[float],
+    temperature_k: float,
+    bin_width_nm: float,
+    edges_nm: np.ndarray | None = None,
+    shift_kjmol: float = 0.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if not distance_nm:
+        return np.asarray([], dtype=float), np.asarray([], dtype=float)
+    dist = np.asarray(distance_nm, dtype=float)
+    if edges_nm is None:
+        d_min = max(0.0, float(np.min(dist)) - bin_width_nm)
+        d_max = float(np.max(dist)) + bin_width_nm
+        n_bins = max(10, int(math.ceil((d_max - d_min) / max(bin_width_nm, 1.0e-6))))
+        edges = np.linspace(d_min, d_max, n_bins + 1)
+    else:
+        edges = np.asarray(edges_nm, dtype=float)
+    counts, _ = np.histogram(dist, bins=edges)
+    prob = counts.astype(np.float64) / max(np.sum(counts), 1.0)
+    pmf = np.full_like(prob, np.nan, dtype=np.float64)
+    valid = prob > 0.0
+    kbt = 0.00831446261815324 * float(temperature_k)
+    pmf[valid] = -kbt * np.log(prob[valid])
+    if np.any(valid):
+        pmf[valid] += float(shift_kjmol)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    return centers, pmf
+
+
+def choose_pmf_reference_region(
+    centers_nm: np.ndarray,
+    pmf_arrays: Sequence[np.ndarray],
+    preferred_start_nm: float,
+) -> Tuple[np.ndarray, float]:
+    finite_all = np.logical_and.reduce([np.isfinite(arr) for arr in pmf_arrays])
+    mask = finite_all & (centers_nm >= float(preferred_start_nm))
+    if np.any(mask):
+        return mask, float(preferred_start_nm)
+    if np.any(finite_all):
+        fallback_start = float(np.percentile(centers_nm[finite_all], 75.0))
+        mask = finite_all & (centers_nm >= fallback_start)
+        if np.any(mask):
+            return mask, fallback_start
+    return finite_all, float(preferred_start_nm)
+
+
+def build_safe_histogram_edges(
+    values: Sequence[float],
+    bin_width_nm: float,
+    lower_nm: float | None = None,
+    upper_nm: float | None = None,
+    min_bins: int = 10,
+    force_full_range: bool = False,
+) -> np.ndarray:
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        start = 0.0 if lower_nm is None else float(lower_nm)
+        stop = start + max(float(bin_width_nm), 0.01)
+        return np.linspace(start, stop, max(2, int(min_bins)) + 1)
+
+    arr_min = float(np.min(arr))
+    arr_max = float(np.max(arr))
+    start = arr_min - float(bin_width_nm)
+    stop = arr_max + float(bin_width_nm)
+
+    if lower_nm is not None:
+        start = float(lower_nm) if force_full_range else max(start, float(lower_nm))
+    if upper_nm is not None:
+        stop = float(upper_nm) if force_full_range else min(stop, float(upper_nm))
+
+    if not np.isfinite(start):
+        start = arr_min
+    if not np.isfinite(stop):
+        stop = arr_max + float(bin_width_nm)
+
+    if stop <= start:
+        center = 0.5 * (arr_min + arr_max)
+        half_span = max(float(bin_width_nm), 0.01) * max(1, int(min_bins) // 2)
+        start = center - half_span
+        stop = center + half_span
+        if lower_nm is not None:
+            start = max(start, float(lower_nm))
+        if upper_nm is not None:
+            stop = min(stop, float(upper_nm))
+        if stop <= start:
+            stop = start + max(float(bin_width_nm), 0.01)
+
+    n_bins = max(int(min_bins), int(math.ceil((stop - start) / max(float(bin_width_nm), 1.0e-6))))
+    return np.linspace(start, stop, n_bins + 1)
+
+
+def run_contact_and_pmf_analysis(
+    args: argparse.Namespace,
+    output_dir: str,
+) -> Dict:
+    print("[6/8] 分析 L-E min-distance / RDF / 1D PMF")
+    analysis_r_min = float(args.analysis_r_min)
+    analysis_r_max = float(args.analysis_r_max)
+    if analysis_r_max <= analysis_r_min:
+        raise ValueError("analysis-r-max 必须大于 analysis-r-min")
+    original_traj, original_sampled = load_analysis_traj(
+        os.path.join(output_dir, "original_baseline", "traj.dcd"),
+        args.traj_top,
+        args.analysis_max_frames,
+    )
+    dexp_traj, dexp_sampled = load_analysis_traj(
+        os.path.join(output_dir, "dexp_surrogate", "traj.dcd"),
+        args.traj_top,
+        args.analysis_max_frames,
+    )
+    lig_heavy, env_heavy = get_ligand_env_heavy_indices(original_traj.top, args.ligand)
+
+    original_min = compute_min_distance_series_nm(original_traj, lig_heavy, env_heavy)
+    dexp_min = compute_min_distance_series_nm(dexp_traj, lig_heavy, env_heavy)
+    min_rows = [
+        {
+            "ensemble": "original_baseline",
+            "frame_index": int(frame_idx),
+            "min_distance_nm": float(value),
+        }
+        for frame_idx, value in zip(original_sampled, original_min)
+    ] + [
+        {
+            "ensemble": "dexp_surrogate",
+            "frame_index": int(frame_idx),
+            "min_distance_nm": float(value),
+        }
+        for frame_idx, value in zip(dexp_sampled, dexp_min)
+    ]
+    min_csv = write_rows_csv(os.path.join(output_dir, "le_min_distance_comparison.csv"), min_rows)
+
+    rdf_r_original, rdf_g_original = compute_rdf(
+        original_traj, lig_heavy, env_heavy, max(float(args.rdf_r_max), analysis_r_max), args.rdf_bin_width
+    )
+    rdf_r_dexp, rdf_g_dexp = compute_rdf(
+        dexp_traj, lig_heavy, env_heavy, max(float(args.rdf_r_max), analysis_r_max), args.rdf_bin_width
+    )
+    rdf_rows: List[Dict] = []
+    for radius, g_mm, g_dexp in zip(rdf_r_original, rdf_g_original, rdf_g_dexp):
+        rdf_rows.append(
+            {
+                "r_nm": float(radius),
+                "g_r_original": float(g_mm),
+                "g_r_dexp": float(g_dexp),
+                "delta_g_r": float(g_dexp - g_mm),
+            }
+        )
+    rdf_csv = write_rows_csv(os.path.join(output_dir, "le_rdf_comparison.csv"), rdf_rows)
+
+    pmf_edges = build_safe_histogram_edges(
+        original_min + dexp_min,
+        args.pmf_bin_width,
+        lower_nm=analysis_r_min,
+        upper_nm=analysis_r_max,
+        min_bins=10,
+        force_full_range=True,
+    )
+    pmf_r_original, pmf_original_raw = build_1d_pmf(
+        original_min, args.temperature, args.pmf_bin_width, edges_nm=pmf_edges
+    )
+    pmf_r_dexp, pmf_dexp_raw = build_1d_pmf(
+        dexp_min, args.temperature, args.pmf_bin_width, edges_nm=pmf_edges
+    )
+    n_pmf = min(len(pmf_r_original), len(pmf_r_dexp))
+    ref_mask, ref_start_nm = choose_pmf_reference_region(
+        pmf_r_original[:n_pmf],
+        [pmf_original_raw[:n_pmf], pmf_dexp_raw[:n_pmf]],
+        preferred_start_nm=max(0.50, analysis_r_max - 0.10),
+    )
+    original_ref = float(np.nanmean(pmf_original_raw[:n_pmf][ref_mask])) if n_pmf > 0 and np.any(ref_mask) else 0.0
+    dexp_ref = float(np.nanmean(pmf_dexp_raw[:n_pmf][ref_mask])) if n_pmf > 0 and np.any(ref_mask) else 0.0
+    pmf_original = pmf_original_raw.copy()
+    pmf_dexp = pmf_dexp_raw.copy()
+    if n_pmf > 0:
+        finite_original = np.isfinite(pmf_original[:n_pmf])
+        finite_dexp = np.isfinite(pmf_dexp[:n_pmf])
+        pmf_original[:n_pmf] = np.where(
+            finite_original,
+            pmf_original[:n_pmf] - original_ref,
+            pmf_original[:n_pmf],
+        )
+        pmf_dexp[:n_pmf] = np.where(
+            finite_dexp,
+            pmf_dexp[:n_pmf] - dexp_ref,
+            pmf_dexp[:n_pmf],
+        )
+    pmf_rows: List[Dict] = []
+    for idx in range(n_pmf):
+        pmf_rows.append(
+            {
+                "distance_nm": float(pmf_r_original[idx]),
+                "pmf_original_kjmol": float(pmf_original[idx]) if np.isfinite(pmf_original[idx]) else math.nan,
+                "pmf_dexp_kjmol": float(pmf_dexp[idx]) if np.isfinite(pmf_dexp[idx]) else math.nan,
+                "delta_pmf_kjmol": float(pmf_dexp[idx] - pmf_original[idx])
+                if np.isfinite(pmf_original[idx]) and np.isfinite(pmf_dexp[idx])
+                else math.nan,
+                "analysis_r_min_nm": float(analysis_r_min),
+                "analysis_r_max_nm": float(analysis_r_max),
+                "pmf_reference_region_start_nm": float(ref_start_nm),
+            }
+        )
+    pmf_csv = write_rows_csv(os.path.join(output_dir, "le_pmf_1d_comparison.csv"), pmf_rows)
+
+    working_window_mask = (rdf_r_original >= analysis_r_min) & (rdf_r_original <= analysis_r_max)
+    pmf_window_mask = (pmf_r_original[:n_pmf] >= analysis_r_min) & (pmf_r_original[:n_pmf] <= analysis_r_max)
+    summary = {
+        "min_distance_csv": min_csv,
+        "rdf_csv": rdf_csv,
+        "pmf_csv": pmf_csv,
+        "analysis_r_min_nm": float(analysis_r_min),
+        "analysis_r_max_nm": float(analysis_r_max),
+        "ligand_heavy_atoms": int(len(lig_heavy)),
+        "environment_heavy_atoms": int(len(env_heavy)),
+        "original_min_distance_nm": summarize_series_with_percentiles(original_min),
+        "dexp_min_distance_nm": summarize_series_with_percentiles(dexp_min),
+        "rdf_working_window_peak_original": float(np.max(rdf_g_original[working_window_mask])) if np.any(working_window_mask) else math.nan,
+        "rdf_working_window_peak_dexp": float(np.max(rdf_g_dexp[working_window_mask])) if np.any(working_window_mask) else math.nan,
+        "pmf_reference_region_start_nm": float(ref_start_nm),
+        "pmf_working_window_delta_max_kjmol": float(
+            np.nanmax(np.abs((pmf_dexp[:n_pmf] - pmf_original[:n_pmf])[pmf_window_mask]))
+        ) if n_pmf > 0 and np.any(pmf_window_mask) else math.nan,
+    }
+    return summary
+
+
+def run_delta_u_analysis(
+    args: argparse.Namespace,
+    output_dir: str,
+    original_system,
+    dexp_system,
+) -> Dict:
+    print("[7/8] 统计 ΔU = U_DEXP - U_MM 分布")
+    mm_context = build_context_for_system(original_system, args)
+    dexp_context = build_context_for_system(dexp_system, args)
+    rows: List[Dict] = []
+
+    for ensemble, traj_path in (
+        ("original_baseline", os.path.join(output_dir, "original_baseline", "traj.dcd")),
+        ("dexp_surrogate", os.path.join(output_dir, "dexp_surrogate", "traj.dcd")),
+    ):
+        traj, sampled_indices = load_analysis_traj(traj_path, args.traj_top, args.analysis_max_frames)
+        box = np.asarray(traj.unitcell_vectors, dtype=np.float64) if traj.unitcell_vectors is not None else None
+        for local_idx, frame_idx in enumerate(sampled_indices):
+            pos_nm = np.asarray(traj.xyz[local_idx], dtype=np.float64)
+            box_vecs = box[local_idx] if box is not None else None
+            u_mm = evaluate_context(mm_context, pos_nm, box_vecs, include_forces=False)["potential_kjmol"]
+            u_dexp = evaluate_context(
+                dexp_context,
+                pos_nm,
+                box_vecs,
+                lam_coul=1.0,
+                lam_vdw=1.0,
+                include_forces=False,
+            )["potential_kjmol"]
+            rows.append(
+                {
+                    "ensemble": ensemble,
+                    "frame_index": int(frame_idx),
+                    "u_mm_kjmol": float(u_mm),
+                    "u_dexp_kjmol": float(u_dexp),
+                    "delta_u_kjmol": float(u_dexp - u_mm),
+                }
+            )
+
+    csv_path = write_rows_csv(os.path.join(output_dir, "delta_u_distribution.csv"), rows)
+    delta_by_ensemble: Dict[str, List[float]] = {}
+    for row in rows:
+        delta_by_ensemble.setdefault(str(row["ensemble"]), []).append(float(row["delta_u_kjmol"]))
+    all_values = [float(row["delta_u_kjmol"]) for row in rows]
+    return {
+        "delta_u_csv": csv_path,
+        "all_frames": summarize_series_with_percentiles(all_values),
+        "by_ensemble": {
+            label: summarize_series_with_percentiles(values)
+            for label, values in delta_by_ensemble.items()
+        },
+    }
+
+
+def save_postprocess_plots(output_dir: str) -> Dict[str, str]:
+    plt = get_matplotlib_pyplot()
+    pngs: Dict[str, str] = {}
+
+    schedule_csv = os.path.join(output_dir, "lambda_schedule_comparison.csv")
+    if os.path.isfile(schedule_csv):
+        rows = read_csv_rows(schedule_csv)
+        fig, ax = plt.subplots(figsize=(8, 5))
+        if rows and "schedule" in rows[0]:
+            schedules = sorted({row["schedule"] for row in rows})
+            for schedule in schedules:
+                subset = [row for row in rows if row["schedule"] == schedule]
+                subset.sort(key=lambda row: int(row["state"]))
+                x = [int(row["state"]) for row in subset]
+                y_c = [float(row["lambda_coul"]) for row in subset]
+                y_v = [float(row["lambda_vdw"]) for row in subset]
+                ax.plot(x, y_c, label=f"{schedule}: lam_coul")
+                ax.plot(x, y_v, linestyle="--", label=f"{schedule}: lam_vdw")
+            ax.set_xlabel("State")
+        else:
+            rows_sorted = sorted(rows, key=lambda row: float(row["lambda_value"]), reverse=True)
+            x = list(range(len(rows_sorted)))
+            y_c = [float(row["lam_coul"]) for row in rows_sorted]
+            y_v = [float(row["lam_vdw"]) for row in rows_sorted]
+            x_labels = [f"{float(row['lambda_value']):.2f}" for row in rows_sorted]
+            ax.plot(x, y_c, marker="o", label="lam_coul")
+            ax.plot(x, y_v, marker="o", linestyle="--", label="lam_vdw")
+            ax.set_xticks(x)
+            ax.set_xticklabels(x_labels)
+            ax.set_xlabel("Lambda Window")
+        ax.set_ylabel("Lambda")
+        ax.set_title("Lambda Schedule Comparison")
+        ax.legend(fontsize=8)
+        ax.grid(alpha=0.3)
+        path = os.path.join(output_dir, "lambda_schedule_comparison.png")
+        fig.tight_layout()
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
+        pngs["lambda_schedule_png"] = path
+
+    lambda_csv = os.path.join(output_dir, "lambda_single_point_scan.csv")
+    if os.path.isfile(lambda_csv):
+        rows = read_csv_rows(lambda_csv)
+        grouped: Dict[float, Dict[str, List[float]]] = {}
+        for row in rows:
+            lam = float(row["lambda_value"])
+            payload = grouped.setdefault(lam, {"potential": [], "force": []})
+            payload["potential"].append(float(row["potential_kjmol"]))
+            payload["force"].append(float(row["max_force_kjmol_per_nm"]))
+        lambdas = sorted(grouped.keys(), reverse=True)
+        fig, axes = plt.subplots(2, 1, figsize=(7, 8), sharex=True)
+        axes[0].plot(lambdas, [statistics.fmean(grouped[lam]["potential"]) for lam in lambdas], marker="o")
+        axes[0].set_ylabel("Mean Potential (kJ/mol)")
+        axes[0].set_title("Lambda Single-Point Scan")
+        axes[0].grid(alpha=0.3)
+        axes[1].plot(lambdas, [max(grouped[lam]["force"]) for lam in lambdas], marker="o", color="tab:red")
+        axes[1].set_xlabel("Lambda")
+        axes[1].set_ylabel("Max Force (kJ/mol/nm)")
+        axes[1].grid(alpha=0.3)
+        path = os.path.join(output_dir, "lambda_single_point_scan.png")
+        fig.tight_layout()
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
+        pngs["lambda_single_point_scan_png"] = path
+
+    min_csv = os.path.join(output_dir, "le_min_distance_comparison.csv")
+    if os.path.isfile(min_csv):
+        rows = read_csv_rows(min_csv)
+        grouped: Dict[str, List[float]] = {}
+        for row in rows:
+            grouped.setdefault(str(row["ensemble"]), []).append(float(row["min_distance_nm"]))
+        fig, ax = plt.subplots(figsize=(7, 5))
+        for label, values in grouped.items():
+            ax.hist(values, bins=30, alpha=0.5, density=True, label=label)
+        ax.set_xlabel("Min L-E Distance (nm)")
+        ax.set_ylabel("Density")
+        ax.set_title("Min-Distance Distribution")
+        ax.legend()
+        ax.grid(alpha=0.3)
+        path = os.path.join(output_dir, "le_min_distance_comparison.png")
+        fig.tight_layout()
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
+        pngs["min_distance_png"] = path
+
+    rdf_csv = os.path.join(output_dir, "le_rdf_comparison.csv")
+    if os.path.isfile(rdf_csv):
+        rows = read_csv_rows(rdf_csv)
+        x = [float(row["r_nm"]) for row in rows]
+        y_mm = [float(row["g_r_original"]) for row in rows]
+        y_dexp = [float(row["g_r_dexp"]) for row in rows]
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.plot(x, y_mm, label="original_baseline")
+        ax.plot(x, y_dexp, label="dexp_surrogate")
+        ax.set_xlabel("r (nm)")
+        ax.set_ylabel("g(r)")
+        ax.set_title("Ligand-Environment RDF")
+        ax.legend()
+        ax.grid(alpha=0.3)
+        path = os.path.join(output_dir, "le_rdf_comparison.png")
+        fig.tight_layout()
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
+        pngs["rdf_png"] = path
+
+    pmf_csv = os.path.join(output_dir, "le_pmf_1d_comparison.csv")
+    if os.path.isfile(pmf_csv):
+        rows = read_csv_rows(pmf_csv)
+        x = [float(row["distance_nm"]) for row in rows]
+        y_mm = [float(row["pmf_original_kjmol"]) if row["pmf_original_kjmol"] not in ("", "nan", "NaN") else math.nan for row in rows]
+        y_dexp = [float(row["pmf_dexp_kjmol"]) if row["pmf_dexp_kjmol"] not in ("", "nan", "NaN") else math.nan for row in rows]
+        analysis_r_min = float(rows[0].get("pmf_reference_region_start_nm", 0.20)) - 0.10 if rows else 0.20
+        analysis_r_max = max(x) if x else 0.65
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.plot(x, y_mm, label="original_baseline")
+        ax.plot(x, y_dexp, label="dexp_surrogate")
+        ax.set_xlabel("Min L-E Distance (nm)")
+        ax.set_ylabel("Relative Free Energy (kJ/mol)")
+        ax.set_title("1D Contact Free-Energy Profile")
+        ax.set_xlim(max(0.20, analysis_r_min), min(0.65, analysis_r_max))
+        ax.legend()
+        ax.grid(alpha=0.3)
+        path = os.path.join(output_dir, "le_pmf_1d_comparison.png")
+        fig.tight_layout()
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
+        pngs["pmf_png"] = path
+
+    delta_u_csv = os.path.join(output_dir, "delta_u_distribution.csv")
+    if os.path.isfile(delta_u_csv):
+        rows = read_csv_rows(delta_u_csv)
+        grouped: Dict[str, List[float]] = {}
+        for row in rows:
+            grouped.setdefault(str(row["ensemble"]), []).append(float(row["delta_u_kjmol"]))
+        fig, ax = plt.subplots(figsize=(7, 5))
+        for label, values in grouped.items():
+            ax.hist(values, bins=30, alpha=0.5, density=True, label=label)
+        ax.set_xlabel("ΔU = U_DEXP - U_MM (kJ/mol)")
+        ax.set_ylabel("Density")
+        ax.set_title("Delta-U Distribution")
+        ax.legend()
+        ax.grid(alpha=0.3)
+        path = os.path.join(output_dir, "delta_u_distribution.png")
+        fig.tight_layout()
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
+        pngs["delta_u_png"] = path
+
+    return pngs
+
+
+def run_lambda_window_contact_analysis(
+    args: argparse.Namespace,
+    output_dir: str,
+) -> Dict:
+    schedule_csv = os.path.join(output_dir, "lambda_schedule_comparison.csv")
+    rows = read_csv_rows(schedule_csv)
+    lambda_rows = [row for row in rows if int(float(row.get("used_for_postprocess", 0))) == 1]
+    if not lambda_rows:
+        return {}
+
+    pmf_rows: List[Dict] = []
+    rdf_rows: List[Dict] = []
+    min_rows: List[Dict] = []
+    summaries: List[Dict] = []
+
+    for row in lambda_rows:
+        lam = float(row["lambda_value"])
+        window_dir = str(row["window_dir"])
+        traj, sampled = load_analysis_traj(
+            os.path.join(window_dir, "traj.dcd"),
+            args.traj_top,
+            args.analysis_max_frames,
+        )
+        lig_heavy, env_heavy = get_ligand_env_heavy_indices(traj.top, args.ligand)
+        min_series = compute_min_distance_series_nm(traj, lig_heavy, env_heavy)
+        for frame_idx, value in zip(sampled, min_series):
+            min_rows.append(
+                {
+                    "lambda_value": float(lam),
+                    "frame_index": int(frame_idx),
+                    "min_distance_nm": float(value),
+                }
+            )
+
+        rdf_r, rdf_g = compute_rdf(traj, lig_heavy, env_heavy, args.rdf_r_max, args.rdf_bin_width)
+        for radius, g_val in zip(rdf_r, rdf_g):
+            rdf_rows.append(
+                {
+                    "lambda_value": float(lam),
+                    "r_nm": float(radius),
+                    "g_r": float(g_val),
+                }
+            )
+
+        pmf_min = np.asarray(min_series, dtype=float)
+        pmf_edges = build_safe_histogram_edges(
+            pmf_min,
+            args.pmf_bin_width,
+            lower_nm=float(args.analysis_r_min),
+            upper_nm=float(args.analysis_r_max),
+            min_bins=10,
+            force_full_range=True,
+        )
+        pmf_r, pmf = build_1d_pmf(min_series, args.temperature, args.pmf_bin_width, edges_nm=pmf_edges)
+        finite_mask = np.isfinite(pmf) & (pmf_r >= float(args.fit_r_max))
+        if not np.any(finite_mask):
+            finite_mask = np.isfinite(pmf)
+        pmf_ref = float(np.nanmean(pmf[finite_mask])) if np.any(finite_mask) else 0.0
+        pmf = np.where(np.isfinite(pmf), pmf - pmf_ref, pmf)
+        for distance_nm, pmf_val in zip(pmf_r, pmf):
+            pmf_rows.append(
+                {
+                    "lambda_value": float(lam),
+                    "distance_nm": float(distance_nm),
+                    "pmf_kjmol": float(pmf_val) if np.isfinite(pmf_val) else math.nan,
+                }
+            )
+
+        summary = summarize_series_with_percentiles(min_series)
+        summary["lambda_value"] = float(lam)
+        summaries.append(summary)
+
+    min_csv = write_rows_csv(os.path.join(output_dir, "lambda_window_min_distance.csv"), min_rows)
+    rdf_csv = write_rows_csv(os.path.join(output_dir, "lambda_window_rdf.csv"), rdf_rows)
+    pmf_csv = write_rows_csv(os.path.join(output_dir, "lambda_window_pmf.csv"), pmf_rows)
+
+    plt = get_matplotlib_pyplot()
+    pngs: Dict[str, str] = {}
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for lam in sorted({float(row["lambda_value"]) for row in rdf_rows}, reverse=True):
+        subset = [row for row in rdf_rows if abs(float(row["lambda_value"]) - lam) < 1.0e-8]
+        subset.sort(key=lambda item: float(item["r_nm"]))
+        ax.plot([float(item["r_nm"]) for item in subset], [float(item["g_r"]) for item in subset], label=f"λ={lam:.2f}")
+    ax.set_xlim(float(args.analysis_r_min), float(args.analysis_r_max))
+    ax.set_xlabel("r (nm)")
+    ax.set_ylabel("g(r)")
+    ax.set_title("Lambda-Resolved RDF")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+    path = os.path.join(output_dir, "lambda_window_rdf.png")
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    pngs["lambda_window_rdf_png"] = path
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for lam in sorted({float(row["lambda_value"]) for row in pmf_rows}, reverse=True):
+        subset = [row for row in pmf_rows if abs(float(row["lambda_value"]) - lam) < 1.0e-8]
+        subset.sort(key=lambda item: float(item["distance_nm"]))
+        ax.plot(
+            [float(item["distance_nm"]) for item in subset],
+            [float(item["pmf_kjmol"]) if str(item["pmf_kjmol"]).lower() != "nan" else math.nan for item in subset],
+            label=f"λ={lam:.2f}",
+        )
+    ax.set_xlim(float(args.analysis_r_min), float(args.analysis_r_max))
+    ax.set_xlabel("Min L-E Distance (nm)")
+    ax.set_ylabel("Relative Free Energy (kJ/mol)")
+    ax.set_title("Lambda-Resolved 1D PMF")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+    path = os.path.join(output_dir, "lambda_window_pmf.png")
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    pngs["lambda_window_pmf_png"] = path
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    lambdas = [float(item["lambda_value"]) for item in summaries]
+    p05 = [float(item["p05"]) for item in summaries]
+    p50 = [float(item["p50"]) for item in summaries]
+    p95 = [float(item["p95"]) for item in summaries]
+    ax.plot(lambdas, p50, marker="o", label="p50")
+    ax.fill_between(lambdas, p05, p95, alpha=0.25, label="p05-p95")
+    ax.invert_xaxis()
+    ax.set_xlabel("Lambda")
+    ax.set_ylabel("Min L-E Distance (nm)")
+    ax.set_title("Lambda-Resolved Min-Distance Summary")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    path = os.path.join(output_dir, "lambda_window_min_distance.png")
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    pngs["lambda_window_min_distance_png"] = path
+
+    return {
+        "lambda_window_min_distance_csv": min_csv,
+        "lambda_window_rdf_csv": rdf_csv,
+        "lambda_window_pmf_csv": pmf_csv,
+        "lambda_window_summaries": summaries,
+        **pngs,
+    }
+
+
+def run_postprocess_analysis(
+    args: argparse.Namespace,
+    output_dir: str,
+    original_system,
+    dexp_system,
+    topology,
+    positions,
+    box_vectors,
+) -> Dict:
+    lambda_window_info = run_lambda_window_ensemble(
+        args=args,
+        system=dexp_system,
+        topology=topology,
+        positions=positions,
+        box_vectors=box_vectors,
+        output_dir=output_dir,
+    )
+    lambda_scan_summary = run_lambda_single_point_scan(args, output_dir, dexp_system)
+    contact_summary = run_contact_and_pmf_analysis(args, output_dir)
+    delta_u_summary = run_delta_u_analysis(args, output_dir, original_system, dexp_system)
+    lambda_window_summary = run_lambda_window_contact_analysis(args, output_dir)
+    schedule_csv = lambda_window_info["schedule_csv"]
+    plot_paths = save_postprocess_plots(output_dir)
+    lambda_scan_summary.update({k: v for k, v in plot_paths.items() if k.startswith("lambda_")})
+    contact_summary.update(
+        {
+            k: v
+            for k, v in plot_paths.items()
+            if k in {"min_distance_png", "rdf_png", "pmf_png"}
+        }
+    )
+    delta_u_summary.update({k: v for k, v in plot_paths.items() if k == "delta_u_png"})
+    return {
+        "lambda_single_point_scan": lambda_scan_summary,
+        "contact_diagnostics": contact_summary,
+        "delta_u_distribution": delta_u_summary,
+        "lambda_window_analysis": lambda_window_summary,
+        "lambda_schedule_csv": schedule_csv,
+        "plot_paths": plot_paths,
+    }
 
 
 def parse_ramp_dt_schedule(args: argparse.Namespace) -> List[float]:
@@ -1019,22 +1967,6 @@ def run_stability_simulation(
                 simulation.context.setParameter("lam_vdw", float(lam_vdw))
             except Exception:
                 pass
-
-    simulation.reporters.append(
-        app.StateDataReporter(
-            csv_path,
-            args.report_interval,
-            step=True,
-            potentialEnergy=True,
-            kineticEnergy=True,
-            totalEnergy=True,
-            temperature=True,
-            separator=",",
-        )
-    )
-    simulation.reporters.append(
-        app.DCDReporter(dcd_path, args.traj_interval, enforcePeriodicBox=False)
-    )
 
     def _set_dt_fs(dt_fs: float) -> None:
         integrator.setStepSize(dt_fs * unit.femtosecond)
@@ -1145,6 +2077,23 @@ def run_stability_simulation(
     else:
         _set_dt_fs(float(args.dt_fs))
 
+    # 仅记录正式 1 ns production，避免把 surrogate warmup 混入 RDF/PMF/能量统计。
+    simulation.reporters.append(
+        app.StateDataReporter(
+            csv_path,
+            args.report_interval,
+            step=True,
+            potentialEnergy=True,
+            kineticEnergy=True,
+            totalEnergy=True,
+            temperature=True,
+            separator=",",
+        )
+    )
+    simulation.reporters.append(
+        app.DCDReporter(dcd_path, args.traj_interval, enforcePeriodicBox=False)
+    )
+
     n_steps = int(round(args.sim_ns * 1000.0 / (args.dt_fs / 1000.0)))
     print(f"[稳定性] {label}: 运行 {n_steps} 步 ({args.sim_ns:.3f} ns) | backend={platform_label}")
     simulation.step(n_steps)
@@ -1164,6 +2113,122 @@ def run_stability_simulation(
     with open(os.path.join(sim_dir, "summary.json"), "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
     return summary
+
+
+def run_fixed_lambda_window_simulation(
+    system,
+    topology,
+    positions,
+    box_vectors,
+    args: argparse.Namespace,
+    output_dir: str,
+    lambda_value: float,
+) -> Dict:
+    openmm, app, unit, _ = require_openmm()
+    label = f"lambda_{lambda_value:.2f}".replace(".", "p")
+    sim_dir = ensure_dir(os.path.join(output_dir, "lambda_windows", label))
+    csv_path = os.path.join(sim_dir, "state.csv")
+    dcd_path = os.path.join(sim_dir, "traj.dcd")
+
+    sim_system = strip_barostat(system)
+    integrator = openmm.LangevinMiddleIntegrator(
+        args.temperature * unit.kelvin,
+        args.friction_ps / unit.picosecond,
+        args.dt_fs * unit.femtosecond,
+    )
+    integrator.setRandomNumberSeed(args.seed + int(round(lambda_value * 1000.0)))
+    platform, properties = select_platform(args.platform)
+    simulation = app.Simulation(topology, sim_system, integrator, platform, properties)
+    if box_vectors is not None:
+        simulation.context.setPeriodicBoxVectors(*box_vectors)
+    simulation.context.setPositions(positions)
+    simulation.context.setVelocitiesToTemperature(
+        args.temperature * unit.kelvin,
+        args.seed + int(round(lambda_value * 1000.0)),
+    )
+
+    for parameter_name in ("lam_coul", "lam_vdw"):
+        try:
+            simulation.context.setParameter(parameter_name, float(lambda_value))
+        except Exception:
+            pass
+
+    if args.minimize:
+        openmm.LocalEnergyMinimizer.minimize(simulation.context, maxIterations=250)
+
+    simulation.reporters.append(
+        app.StateDataReporter(
+            csv_path,
+            args.report_interval,
+            step=True,
+            potentialEnergy=True,
+            kineticEnergy=True,
+            totalEnergy=True,
+            temperature=True,
+            separator=",",
+        )
+    )
+    simulation.reporters.append(
+        app.DCDReporter(dcd_path, args.traj_interval, enforcePeriodicBox=False)
+    )
+
+    n_steps = int(round(args.lambda_window_ns * 1000.0 / (args.dt_fs / 1000.0)))
+    simulation.step(max(n_steps, 1))
+    data = read_state_csv(csv_path)
+    summary = {
+        "label": label,
+        "lambda_value": float(lambda_value),
+        "steps": int(max(n_steps, 1)),
+        "sim_ns": float(args.lambda_window_ns),
+        "potential_kjmol": summarize_series(data["potentialEnergy"]),
+        "kinetic_kjmol": summarize_series(data["kineticEnergy"]),
+        "total_kjmol": summarize_series(data["totalEnergy"]),
+        "temperature_K": summarize_series(data["temperature"]),
+    }
+    summary.update(compute_ligand_rmsd_metrics(dcd_path, args.traj_top, args.ligand))
+    with open(os.path.join(sim_dir, "summary.json"), "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+    return summary
+
+
+def run_lambda_window_ensemble(
+    args: argparse.Namespace,
+    system,
+    topology,
+    positions,
+    box_vectors,
+    output_dir: str,
+) -> Dict:
+    lambda_values = parse_lambda_window_values(args)
+    rows: List[Dict] = []
+    summaries: List[Dict] = []
+    for lam in lambda_values:
+        summary = run_fixed_lambda_window_simulation(
+            system=system,
+            topology=topology,
+            positions=positions,
+            box_vectors=box_vectors,
+            args=args,
+            output_dir=output_dir,
+            lambda_value=float(lam),
+        )
+        summaries.append(summary)
+        rows.append(
+            {
+                "lambda_value": float(lam),
+                "lam_coul": float(lam),
+                "lam_vdw": float(lam),
+                "sim_ns": float(args.lambda_window_ns),
+                "window_dir": os.path.join(output_dir, "lambda_windows", summary["label"]),
+                "used_for_postprocess": 1,
+            }
+        )
+    csv_path = write_rows_csv(os.path.join(output_dir, "lambda_schedule_comparison.csv"), rows)
+    return {
+        "lambda_values": [float(x) for x in lambda_values],
+        "schedule_csv": csv_path,
+        "window_summaries": summaries,
+    }
 
 
 def build_interaction_separation_schedule(n_states: int) -> List[Tuple[int, str, float, float]]:
@@ -1186,6 +2251,32 @@ def build_interaction_separation_schedule(n_states: int) -> List[Tuple[int, str,
     return rows
 
 
+def build_surrogate_activation_reference_schedule(n_states: int) -> List[Tuple[int, str, float, float]]:
+    if n_states < 3:
+        raise ValueError("schedule 至少需要 3 个状态")
+    rows: List[Tuple[int, str, float, float]] = []
+    phase_edges = np.linspace(0, n_states - 1, 4, dtype=int)
+    phase_edges[-1] = n_states - 1
+    for state in range(n_states):
+        if state <= phase_edges[1]:
+            frac = state / max(phase_edges[1], 1)
+            lam_coul = 0.0
+            lam_vdw = 0.05 + 0.20 * frac
+            stage = "vdw_softstart"
+        elif state <= phase_edges[2]:
+            frac = (state - phase_edges[1]) / max(phase_edges[2] - phase_edges[1], 1)
+            lam_coul = 0.0
+            lam_vdw = 0.25 + 0.75 * frac
+            stage = "vdw_ramp"
+        else:
+            frac = (state - phase_edges[2]) / max((n_states - 1) - phase_edges[2], 1)
+            lam_coul = frac
+            lam_vdw = 1.0
+            stage = "coul_ramp"
+        rows.append((state, stage, min(max(lam_coul, 0.0), 1.0), min(max(lam_vdw, 0.0), 1.0)))
+    return rows
+
+
 def write_schedule_comparison(output_dir: str, n_states: int) -> str:
     out_csv = os.path.join(output_dir, "lambda_schedule_comparison.csv")
     rows: List[Dict] = []
@@ -1194,21 +2285,27 @@ def write_schedule_comparison(output_dir: str, n_states: int) -> str:
         lam = 1.0 - frac
         rows.append(
             {
-                "schedule": "original_linear",
+                "schedule": "traditional_linear_decoupling",
                 "state": state,
                 "stage": "coupled",
                 "lambda_coul": lam,
                 "lambda_vdw": lam,
+                "direction": "1_to_0",
+                "used_by_current_stability_run": 0,
+                "notes": "Reference traditional decoupling path only",
             }
         )
-    for state, stage, lam_coul, lam_vdw in build_interaction_separation_schedule(n_states):
+    for state, stage, lam_coul, lam_vdw in build_surrogate_activation_reference_schedule(n_states):
         rows.append(
             {
-                "schedule": "interaction_separation",
+                "schedule": "current_surrogate_activation_warmup",
                 "state": state,
                 "stage": stage,
                 "lambda_coul": lam_coul,
                 "lambda_vdw": lam_vdw,
+                "direction": "0_to_1",
+                "used_by_current_stability_run": 1,
+                "notes": "Reference of actual surrogate warmup path used before production",
             }
         )
 
@@ -1219,7 +2316,17 @@ def write_schedule_comparison(output_dir: str, n_states: int) -> str:
     return out_csv
 
 
-def write_comparison_report(output_dir: str, original_summary: Dict, dexp_summary: Dict, fitted_params: Dict, schedule_csv: str) -> str:
+def write_comparison_report(
+    output_dir: str,
+    original_summary: Dict,
+    dexp_summary: Dict,
+    fitted_params: Dict,
+    schedule_csv: str,
+    lambda_scan_summary: Dict,
+    contact_summary: Dict,
+    delta_u_summary: Dict,
+    lambda_window_summary: Dict | None = None,
+) -> str:
     report_path = os.path.join(output_dir, "comparison_report.md")
     lines = [
         "# DEXP Stability Comparison",
@@ -1250,12 +2357,64 @@ def write_comparison_report(output_dir: str, original_summary: Dict, dexp_summar
         f"- Original total energy std (kJ/mol): {original_summary['total_kjmol']['std']:.3f}",
         f"- DEXP total energy std (kJ/mol): {dexp_summary['total_kjmol']['std']:.3f}",
         "",
+        "## Lambda Single-Point Scan",
+        f"- Scan CSV: {lambda_scan_summary.get('scan_csv')}",
+        f"- All finite: {lambda_scan_summary.get('all_finite')}",
+        f"- Max |ΔU(lambda_i)-ΔU(lambda_i-1)| (kJ/mol): {lambda_scan_summary.get('max_abs_energy_jump_kjmol', math.nan):.3f}",
+        f"- Max force across scan (kJ/mol/nm): {lambda_scan_summary.get('max_force_kjmol_per_nm', math.nan):.3f}",
+        "",
+        "## Contact Diagnostics",
+        f"- Min-distance CSV: {contact_summary.get('min_distance_csv')}",
+        f"- RDF CSV: {contact_summary.get('rdf_csv')}",
+        f"- PMF CSV: {contact_summary.get('pmf_csv')}",
+        f"- PMF PNG: {contact_summary.get('pmf_png')}",
+        f"- RDF PNG: {contact_summary.get('rdf_png')}",
+        "- RDF / PMF 当前基于 production 轨迹的接触统计对比，属于几何/热力学 proxy，不是严格的传统 ABFE PMF。",
+        f"- Analysis window (nm): {contact_summary.get('analysis_r_min_nm', math.nan):.2f} to {contact_summary.get('analysis_r_max_nm', math.nan):.2f}",
+        f"- PMF reference-region start (nm): {contact_summary.get('pmf_reference_region_start_nm', math.nan):.3f}",
+        f"- Original min-distance p05 / p50 / p95 (nm): "
+        f"{contact_summary['original_min_distance_nm']['p05']:.3f} / "
+        f"{contact_summary['original_min_distance_nm']['p50']:.3f} / "
+        f"{contact_summary['original_min_distance_nm']['p95']:.3f}",
+        f"- DEXP min-distance p05 / p50 / p95 (nm): "
+        f"{contact_summary['dexp_min_distance_nm']['p05']:.3f} / "
+        f"{contact_summary['dexp_min_distance_nm']['p50']:.3f} / "
+        f"{contact_summary['dexp_min_distance_nm']['p95']:.3f}",
+        f"- Working-window RDF peak original/dexp: "
+        f"{contact_summary.get('rdf_working_window_peak_original', math.nan):.3f} / "
+        f"{contact_summary.get('rdf_working_window_peak_dexp', math.nan):.3f}",
+        f"- Working-window PMF max |Δ| (kJ/mol): {contact_summary.get('pmf_working_window_delta_max_kjmol', math.nan):.3f}",
+        "",
+        "## Delta-U Distribution",
+        f"- CSV: {delta_u_summary.get('delta_u_csv')}",
+        f"- PNG: {delta_u_summary.get('delta_u_png')}",
+        f"- All-frame ΔU mean ± std (kJ/mol): "
+        f"{delta_u_summary['all_frames']['mean']:.3f} ± {delta_u_summary['all_frames']['std']:.3f}",
+        f"- All-frame ΔU p05 / p50 / p95 (kJ/mol): "
+        f"{delta_u_summary['all_frames']['p05']:.3f} / "
+        f"{delta_u_summary['all_frames']['p50']:.3f} / "
+        f"{delta_u_summary['all_frames']['p95']:.3f}",
+        "",
         "## Lambda Schedules",
         f"- CSV: {schedule_csv}",
-        "- `original_linear`: Coulomb 与 VDW 同步线性缩放。",
-        "- `interaction_separation`: 先去电荷，再去 VDW。",
+        f"- PNG: {lambda_scan_summary.get('lambda_schedule_png')}",
+        "- 当前 `lambda_schedule_comparison.csv` 记录的是后处理实际重跑的固定 lambda 窗口。",
+        "- 当前脚本没有完成传统 ABFE vs surrogate-correction 的自由能数值对比；这里只有稳定性/几何/能量 proxy 对比。",
         "",
     ]
+    if lambda_window_summary:
+        lines.extend(
+            [
+                "## Lambda-Resolved Contact Analysis",
+                f"- Window RDF CSV: {lambda_window_summary.get('lambda_window_rdf_csv')}",
+                f"- Window PMF CSV: {lambda_window_summary.get('lambda_window_pmf_csv')}",
+                f"- Window Min-distance CSV: {lambda_window_summary.get('lambda_window_min_distance_csv')}",
+                f"- Window RDF PNG: {lambda_window_summary.get('lambda_window_rdf_png')}",
+                f"- Window PMF PNG: {lambda_window_summary.get('lambda_window_pmf_png')}",
+                f"- Window Min-distance PNG: {lambda_window_summary.get('lambda_window_min_distance_png')}",
+                "",
+            ]
+        )
     with open(report_path, "w", encoding="utf-8") as handle:
         handle.write("\n".join(lines))
     return report_path
@@ -1269,10 +2428,6 @@ def main() -> int:
     args.system_xml = ensure_file(args.system_xml, "原始 system XML")
     args.ligand_indices = ensure_file(args.ligand_indices, "配体索引 JSON")
     output_dir = ensure_dir(args.output_dir)
-
-    fitted_params = fit_dexp_from_tail_frames(args, output_dir)
-
-    print("[2/4] 载入原始系统与最后一帧坐标")
     system, topology = load_cached_system(args.system_xml, args.traj_top)
     _, positions, box_vectors = load_last_frame_positions(args.traj, args.traj_top)
     ligand_indices = load_ligand_indices(args.ligand_indices)
@@ -1281,7 +2436,14 @@ def main() -> int:
         if idx not in set(ligand_indices)
     ]
 
-    print("[3/4] 构建 DEXP surrogate system 并执行 1 ns 稳定性测试")
+    if args.postprocess_only:
+        params_path = ensure_file(os.path.join(output_dir, "dexp_fitted_params.json"), "已拟合 DEXP 参数")
+        with open(params_path, "r", encoding="utf-8") as handle:
+            fitted_params = json.load(handle)
+    else:
+        fitted_params = fit_dexp_from_tail_frames(args, output_dir)
+        print("[2/4] 载入原始系统与最后一帧坐标")
+
     symbols = load_abfe_symbols()
     SurrogateSystemBuilder = symbols["SurrogateSystemBuilder"]
     surrogate_builder = SurrogateSystemBuilder(fitted_params)
@@ -1294,33 +2456,63 @@ def main() -> int:
         reference_positions=positions,
         box_vectors=box_vectors,
     )
-    dexp_summary = run_stability_simulation(
-        label="dexp_surrogate",
-        system=dexp_system,
-        topology=topology,
-        positions=positions,
-        box_vectors=box_vectors,
-        args=args,
-        output_dir=output_dir,
-    )
 
-    print("[4/4] 执行原始势能 1 ns baseline，并导出 lambda schedule 对比")
-    original_summary = run_stability_simulation(
-        label="original_baseline",
-        system=system,
-        topology=topology,
-        positions=positions,
-        box_vectors=box_vectors,
-        args=args,
-        output_dir=output_dir,
+    if args.postprocess_only:
+        original_summary_path = ensure_file(os.path.join(output_dir, "original_baseline", "summary.json"), "baseline summary")
+        dexp_summary_path = ensure_file(os.path.join(output_dir, "dexp_surrogate", "summary.json"), "dexp summary")
+        with open(original_summary_path, "r", encoding="utf-8") as handle:
+            original_summary = json.load(handle)
+        with open(dexp_summary_path, "r", encoding="utf-8") as handle:
+            dexp_summary = json.load(handle)
+    else:
+        print("[3/4] 构建 DEXP surrogate system 并执行 1 ns 稳定性测试")
+        dexp_summary = run_stability_simulation(
+            label="dexp_surrogate",
+            system=dexp_system,
+            topology=topology,
+            positions=positions,
+            box_vectors=box_vectors,
+            args=args,
+            output_dir=output_dir,
+        )
+
+        print("[4/4] 执行原始势能 1 ns baseline，并导出 lambda schedule 对比")
+        original_summary = run_stability_simulation(
+            label="original_baseline",
+            system=system,
+            topology=topology,
+            positions=positions,
+            box_vectors=box_vectors,
+            args=args,
+            output_dir=output_dir,
+        )
+
+    print("[后处理] 生成 CSV / PNG 诊断产物")
+    postprocess = run_postprocess_analysis(
+        args,
+        output_dir,
+        system,
+        dexp_system,
+        topology,
+        positions,
+        box_vectors,
     )
-    schedule_csv = write_schedule_comparison(output_dir, args.schedule_states)
+    lambda_scan_summary = postprocess["lambda_single_point_scan"]
+    contact_summary = postprocess["contact_diagnostics"]
+    delta_u_summary = postprocess["delta_u_distribution"]
+    lambda_window_summary = postprocess.get("lambda_window_analysis", {})
+    schedule_csv = postprocess["lambda_schedule_csv"]
+
     report_path = write_comparison_report(
         output_dir,
         original_summary=original_summary,
         dexp_summary=dexp_summary,
         fitted_params=fitted_params,
         schedule_csv=schedule_csv,
+        lambda_scan_summary=lambda_scan_summary,
+        contact_summary=contact_summary,
+        delta_u_summary=delta_u_summary,
+        lambda_window_summary=lambda_window_summary,
     )
 
     comparison_json = os.path.join(output_dir, "comparison_summary.json")
@@ -1330,6 +2522,11 @@ def main() -> int:
                 "fitted_params": fitted_params,
                 "dexp_surrogate": dexp_summary,
                 "original_baseline": original_summary,
+                "lambda_single_point_scan": lambda_scan_summary,
+                "contact_diagnostics": contact_summary,
+                "delta_u_distribution": delta_u_summary,
+                "lambda_window_analysis": lambda_window_summary,
+                "plot_paths": postprocess.get("plot_paths", {}),
                 "lambda_schedule_csv": schedule_csv,
                 "report_md": report_path,
             },

@@ -704,7 +704,8 @@ class DualLambdaPreOptimizer:
         lambdas = np.linspace(1.0, 0.0, n_states)
         for lam in lambdas:
             self.context.setParameter(self.param_vdw, float(lam))
-            self.context.setParameter(self.param_coul, 0.0)
+            if self.param_coul is not None and self.param_coul in current_params:
+                self.context.setParameter(self.param_coul, 0.0)
             self.context.getIntegrator().step(500)
             energies = [
                 e for e in _sample_group1_energies(self.context, n_steps_per_state, sample_interval=50)
@@ -851,18 +852,16 @@ def build_aces_probe_system_dual_lambda(
 
     nb_forces = [f for f in new_sys.getForces() if isinstance(f, openmm.NonbondedForce)]
     nb = nb_forces[0]
+    all_p = [nb.getParticleParameters(i) for i in range(num_atoms)]
+    ref_excl = [
+        (int(nb.getExceptionParameters(i)[0]), int(nb.getExceptionParameters(i)[1]))
+        for i in range(nb.getNumExceptions())
+    ]
     zero_q = 0.0 * unit.elementary_charge
     zero_sig = 0.1 * unit.nanometer  # 保留极小半径防除零，但能量为0
     zero_eps = 0.0 * unit.kilojoule_per_mole
     for idx in perturbed_indices:
         nb.setParticleParameters(idx, zero_q, zero_sig, zero_eps)
-    
-    all_p = [nb.getParticleParameters(i) for i in range(num_atoms)]
-    ref_excl = [(int(nb.getExceptionParameters(i)[0]), int(nb.getExceptionParameters(i)[1]))
-                for i in range(nb.getNumExceptions())]    
-    all_p = [nb.getParticleParameters(i) for i in range(num_atoms)]
-    ref_excl = [(int(nb.getExceptionParameters(i)[0]), int(nb.getExceptionParameters(i)[1]))
-                for i in range(nb.getNumExceptions())]
 
     # Group 2: 配体内部力
     ll_f, ll_14_f = create_ligand_internal_force(
