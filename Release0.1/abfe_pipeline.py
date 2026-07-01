@@ -41,6 +41,7 @@ from ibs_engine import (
     REMDManager,
     TraditionalMBARAnalyzer,
     generate_overlapping_windows,
+    lambda_endpoint_diagnostics,
 )
 from abfe_core import (
     calculate_boresch_analytical_correction,
@@ -50,6 +51,7 @@ from abfe_core import (
     run_orbv3_dexp_fitting,
     UnitFormatter,
     TwoDimensionalLambdaPathPlanner,
+    THERMODYNAMIC_CYCLE_DOC,
 )
 import warnings
 
@@ -137,6 +139,24 @@ def _topology_hash(topology: Optional[app.Topology]) -> Optional[str]:
     return _sha256_text(json.dumps({"atoms": atoms, "bonds": bonds, "box_nm": box_nm}, sort_keys=True))
 
 
+def _positions_hash(positions) -> Optional[str]:
+    if positions is None:
+        return None
+    try:
+        if hasattr(positions, "value_in_unit"):
+            arr = np.asarray(positions.value_in_unit(unit.nanometer), dtype=np.float64)
+        else:
+            arr = np.asarray(positions, dtype=np.float64)
+    except Exception:
+        try:
+            arr = np.asarray([[p.x, p.y, p.z] for p in positions], dtype=np.float64)
+        except Exception:
+            return None
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 3)
+    return hashlib.sha256(np.ascontiguousarray(arr, dtype=np.float64).tobytes()).hexdigest()
+
+
 def _code_hash() -> str:
     base_dir = os.path.dirname(os.path.abspath(__file__))
     payload = {}
@@ -156,6 +176,41 @@ def _package_version(package_name: str) -> Optional[str]:
         return metadata.version(package_name)
     except Exception:
         return None
+
+
+def _collect_pipeline_provenance(
+    *,
+    config: Optional[Dict],
+    system: Optional[openmm.System],
+    topology: Optional[app.Topology],
+    positions,
+    command_line: Optional[List[str]] = None,
+) -> Dict:
+    env_seed_keys = ("OPENMM_RANDOM_SEED", "ABFE_RANDOM_SEED", "PYTHONHASHSEED")
+    return {
+        "config": config or {},
+        "command_line": command_line if command_line is not None else sys.argv,
+        "hashes": {
+            "system_xml_sha256": _system_xml_hash(system),
+            "topology_sha256": _topology_hash(topology),
+            "coordinates_nm_sha256": _positions_hash(positions),
+            "code_sha256": _code_hash(),
+        },
+        "random_seeds": {
+            key: os.environ.get(key)
+            for key in env_seed_keys
+            if os.environ.get(key) is not None
+        },
+        "software_versions": {
+            "python": sys.version,
+            "platform": platform.platform(),
+            "openmm": getattr(openmm, "__version__", None),
+            "numpy": getattr(np, "__version__", None),
+            "pymbar": _package_version("pymbar"),
+            "mdtraj": _package_version("mdtraj"),
+        },
+        "thermodynamic_cycle": THERMODYNAMIC_CYCLE_DOC,
+    }
 
 
 def _pme_u_kn_meta_payload(
@@ -515,6 +570,7 @@ def _run_stage_worker_process(
     boresch_params: Optional[Dict],
     enable_gradual_warmup: bool,
     warmup_steps: int,
+    resume: bool,
     result_file: str,
 ):
     """子进程工作函数：加载保存的Pipeline状态并执行一个双λ阶段"""
@@ -556,7 +612,7 @@ def _run_stage_worker_process(
         n_steps_per_window=n_steps_per_window,
         steps_per_update=steps_per_update,
         system_type=system_type,
-        resume=False,
+        resume=resume,
         potential_type=potential_type,
         dexp_params=dexp_params,
         optimized_lambdas=optimized_lambdas,
@@ -648,7 +704,8 @@ class ABFEPipeline:
     @staticmethod
     def get_device_strategy(n_windows: int = 1, min_free_mb: int = 2000, platform_name: str = "CUDA"):
         import warnings
-        if platform_name.upper() != "CUDA":
+        platform_base, _ = _split_platform_spec(platform_name)
+        if platform_base.upper() != "CUDA":
             return {"strategy": "cpu", "devices": [], "n_gpus": 0}
         
         try:
@@ -1596,6 +1653,8 @@ class ABFEPipeline:
                     "total_error": float(res.get("error", 0.0)),
                     "method": "PME-REMD-MBAR",
                     "n_states": int(n_states),
+                    "lambda_endpoint_diagnostics": lambda_endpoint_diagnostics(lambdas_coul, lambdas_vdw),
+                    "diagnostics": res.get("diagnostics", {}),
                 }
             elif resume and os.path.exists(u_kn_path):
                 self._log("  ♻️ 检测到旧版 PME u_kn 缓存，但模型版本不兼容；保留轨迹并重新执行离线 MBAR 重算。")
@@ -1661,6 +1720,8 @@ class ABFEPipeline:
                 "total_error": float(res.get("error", 0.0)),
                 "method": "PME-REMD-MBAR",
                 "n_states": int(n_states),
+                "lambda_endpoint_diagnostics": lambda_endpoint_diagnostics(lambdas_coul, lambdas_vdw),
+                "diagnostics": res.get("diagnostics", {}),
             }
 
         # 2. 划分窗口
@@ -1739,6 +1800,19 @@ class ABFEPipeline:
             raise RuntimeError(
                 f"{stage_name} 阶段全局 TMBAR 失败: {stage_result['error']}"
             )
+        stage_result.setdefault("stage", stage_name)
+        stage_result.setdefault("n_states", int(n_states))
+        stage_result["lambda_endpoint_diagnostics"] = lambda_endpoint_diagnostics(
+            manager.lambdas_coul,
+            manager.lambdas_vdw,
+        )
+        stage_result.setdefault("diagnostics", {})
+        stage_result["diagnostics"].update({
+            "method": stage_result.get("method"),
+            "min_overlap_proxy": stage_result.get("min_overlap"),
+            "offset_error_contribution": stage_result.get("offset_error_contribution"),
+            "uncertainty_note": stage_result.get("uncertainty_note"),
+        })
         return stage_result
 
     # =========================================================================
@@ -1866,6 +1940,8 @@ class ABFEPipeline:
             "method": "PME-REMD-MBAR",
             "n_states": int(n_states),
             "lambda_path": [list(map(float, p)) for p in path_2d],
+            "lambda_endpoint_diagnostics": lambda_endpoint_diagnostics(lambdas_coul, lambdas_vdw),
+            "diagnostics": res.get("diagnostics", {}),
         }
         self._log(
             f"  ✓ {label} 路径完成: ΔG={stage_result['total_delta_G']:.2f} ± "
@@ -2038,7 +2114,8 @@ class ABFEPipeline:
         # ✅ 显式加入 Boresch 修正与约束修正
         dg_boresch = correction_results.get("delta_g_rest", 0.0)
         total_dg = dg_phys + cons_correction + dg_boresch
-        total_err = np.sqrt(err_phys**2 + cons_correction**2 * 0.01**2 + correction_results.get("error", 0.0)**2)
+        # 约束 Jacobian 修正是解析确定性项；没有独立采样误差时不并入方差。
+        total_err = np.sqrt(err_phys**2 + correction_results.get("error", 0.0)**2)
 
         final = {
             "decoupling_scheme": decoupling_scheme,
@@ -2049,12 +2126,30 @@ class ABFEPipeline:
             "total_delta_G_complex_kcal_mol": float(total_dg / 4.184),
             "total_error_kJ_mol": float(total_err),
             "total_error_kcal_mol": float(total_err / 4.184),
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "diagnostics": sampling_results.get("diagnostics", {}),
+            "stage_diagnostics": {
+                "stage1": sampling_results.get("stage1", {}).get("diagnostics", {}),
+                "stage2": sampling_results.get("stage2", {}).get("diagnostics", {}),
+                "stage1_lambda_endpoints": sampling_results.get("stage1", {}).get("lambda_endpoint_diagnostics", {}),
+                "stage2_lambda_endpoints": sampling_results.get("stage2", {}).get("lambda_endpoint_diagnostics", {}),
+            },
+            "provenance": _collect_pipeline_provenance(
+                config=getattr(self, "_last_run_config", {}),
+                system=system or self.system,
+                topology=self.topology,
+                positions=self.positions,
+                command_line=getattr(self, "_command_line", None),
+            ),
         }
         
         out_path = os.path.join(self.output_dir, "final_results.json")
         with open(out_path, "w") as f: json.dump(final, f, indent=2, cls=NumpyEncoder)
+        cycle_path = os.path.join(self.output_dir, "thermodynamic_cycle.md")
+        with open(cycle_path, "w", encoding="utf-8") as f:
+            f.write(THERMODYNAMIC_CYCLE_DOC + "\n")
         self._log(f"\n✅ 最终结果已保存: {out_path}")
+        self._log(f"  ✓ 热力学循环说明已保存: {cycle_path}")
         self._log(UnitFormatter.format_results_human(final))
         return final
 
@@ -2071,7 +2166,9 @@ class ABFEPipeline:
         self._log(f"\n{'='*60}")
         self._log(f"🔬 开始复合物相 ABFE 计算...")
         self._log(f"{'='*60}")
-        complex_res = self.run_full_pipeline(decoupling_scheme=decoupling_scheme, run_equilibration=True, **kwargs)
+        complex_kwargs = dict(kwargs)
+        complex_kwargs.setdefault("system_type", "complex")
+        complex_res = self.run_full_pipeline(decoupling_scheme=decoupling_scheme, run_equilibration=True, **complex_kwargs)
         
         delta_g_bind = complex_res.get(
             "total_delta_G_complex_kJ_mol",
@@ -2094,8 +2191,11 @@ class ABFEPipeline:
                 if atom.residue.name == ligand_resname
             ]
             
-            # 复用配置
-            solvent_res = solvent_runner.run_solvent_decoupling(pos_solv, top_solv, solvent_ligand_indices, **kwargs)
+            solvent_kwargs = dict(kwargs)
+            solvent_kwargs.setdefault("decoupling_scheme", decoupling_scheme)
+            solvent_kwargs["system_type"] = "solvent"
+            solvent_kwargs["boresch_params"] = None
+            solvent_res = solvent_runner.run_solvent_decoupling(pos_solv, top_solv, solvent_ligand_indices, **solvent_kwargs)
             delta_g_bind -= solvent_res.get(
                 "decoupling_delta_G_kJ_mol",
                 solvent_res.get("total_delta_G_complex_kJ_mol", solvent_res.get("total_delta_G", 0.0)),
@@ -2130,6 +2230,26 @@ class ABFEPipeline:
         **kwargs,
     ) -> Dict:
         """完整 ABFE 计算入口 (已集成全局断点续传、势能路由、二面角修正)"""
+        self._last_run_config = {
+            "decoupling_scheme": decoupling_scheme,
+            "potential_type": potential_type,
+            "n_states_per_stage": n_states_per_stage,
+            "stage1_n_states": stage1_n_states,
+            "stage2_n_states": stage2_n_states,
+            "n_steps_per_window": n_steps_per_window,
+            "steps_per_update": steps_per_update,
+            "system_type": system_type,
+            "resume": resume,
+            "run_equilibration": run_equilibration,
+            "enable_early_stop": enable_early_stop,
+            "temperature_K": self.temperature.value_in_unit(unit.kelvin),
+            "platform_name": self.platform_name,
+            "kwargs": {
+                str(k): v for k, v in kwargs.items()
+                if isinstance(v, (str, int, float, bool, type(None), list, tuple, dict))
+            },
+        }
+        self._command_line = sys.argv
         self._log(f"\n{'#' * 60}")
         self._log(
             f"# 启动完整 ABFE 流程 | 方案: {decoupling_scheme} | 势能: {potential_type} | Resume: {resume}"
@@ -2218,7 +2338,8 @@ class ABFEPipeline:
                     integrator = openmm.LangevinMiddleIntegrator(
                         self.temperature, 2.0/unit.picosecond, 0.002*unit.picosecond
                     )
-                    sim = app.Simulation(self.topology, temp_sys, integrator)
+                    platform, props = _build_platform_props(self.platform_name)
+                    sim = app.Simulation(self.topology, temp_sys, integrator, platform, props)
                     sim.context.setPositions(self.positions)
                     if self.box_vectors is not None:
                         sim.context.setPeriodicBoxVectors(*self.box_vectors)
@@ -2264,7 +2385,8 @@ class ABFEPipeline:
             integrator = openmm.LangevinMiddleIntegrator(
                 self.temperature, 5.0/unit.picosecond, 0.001*unit.picosecond
             )
-            sim = app.Simulation(self.topology, temp_sys, integrator)
+            platform, props = _build_platform_props(self.platform_name)
+            sim = app.Simulation(self.topology, temp_sys, integrator, platform, props)
             sim.context.setPositions(self.positions)
             if self.box_vectors is not None:
                 sim.context.setPeriodicBoxVectors(*self.box_vectors)
@@ -2453,6 +2575,7 @@ class ABFEPipeline:
                     boresch_params=boresch_params,
                     enable_gradual_warmup=kwargs.get("enable_gradual_warmup", True),
                     warmup_steps=kwargs.get("warmup_steps", 500000),
+                    resume=resume,
                 )
                 stage1_platform = self.platform_name
                 stage2_platform = self.platform_name
@@ -2478,7 +2601,7 @@ class ABFEPipeline:
                               _common["potential_type"], _common["dexp_params"],
                               optimized_lambdas_1, _common["enable_early_stop"],
                               _common["boresch_params"], _common["enable_gradual_warmup"],
-                              _common["warmup_steps"], _res1),
+                              _common["warmup_steps"], _common["resume"], _res1),
                     )
                     p2 = ctx.Process(
                         target=_run_stage_worker_process,
@@ -2489,7 +2612,7 @@ class ABFEPipeline:
                               _common["potential_type"], _common["dexp_params"],
                               optimized_lambdas_2, _common["enable_early_stop"],
                               _common["boresch_params"], _common["enable_gradual_warmup"],
-                              _common["warmup_steps"], _res2),
+                              _common["warmup_steps"], _common["resume"], _res2),
                     )
                     p1.start()
                     p2.start()
@@ -2504,7 +2627,7 @@ class ABFEPipeline:
                         _common["potential_type"], _common["dexp_params"],
                         optimized_lambdas_1, _common["enable_early_stop"],
                         _common["boresch_params"], _common["enable_gradual_warmup"],
-                        _common["warmup_steps"], _res1,
+                        _common["warmup_steps"], _common["resume"], _res1,
                     )
                     _run_stage_worker_process(
                         state_dir, _temp_k, stage2_platform, self.output_dir,
@@ -2514,7 +2637,7 @@ class ABFEPipeline:
                         _common["potential_type"], _common["dexp_params"],
                         optimized_lambdas_2, _common["enable_early_stop"],
                         _common["boresch_params"], _common["enable_gradual_warmup"],
-                        _common["warmup_steps"], _res2,
+                        _common["warmup_steps"], _common["resume"], _res2,
                     )
 
                 # Check for errors
@@ -2626,10 +2749,13 @@ class ABFEPipeline:
             }
             
             # ✅ 【修复 1】延迟状态更新：确保 Boresch 修正与结果落盘成功后再标记 completed
-            correction = self.apply_boresch_correction(
-                boresch_params,
-                autoload_from_disk=kwargs.get("allow_disk_boresch_autoload", True),
-            )
+            if system_type == "solvent" and not _has_valid_boresch_restraint(boresch_params):
+                correction = {"delta_g_rest": 0.0, "error": 0.0}
+            else:
+                correction = self.apply_boresch_correction(
+                    boresch_params,
+                    autoload_from_disk=kwargs.get("allow_disk_boresch_autoload", True),
+                )
                 
             final = self.compute_final_results(sampling, correction, system=self.system)
             self.results["final"] = final
@@ -2707,10 +2833,13 @@ class ABFEPipeline:
                 "total_error": sample_result["total_error"],
             }
 
-            correction = self.apply_boresch_correction(
-                boresch_params,
-                autoload_from_disk=kwargs.get("allow_disk_boresch_autoload", True),
-            )
+            if system_type == "solvent" and not _has_valid_boresch_restraint(boresch_params):
+                correction = {"delta_g_rest": 0.0, "error": 0.0}
+            else:
+                correction = self.apply_boresch_correction(
+                    boresch_params,
+                    autoload_from_disk=kwargs.get("allow_disk_boresch_autoload", True),
+                )
 
             final = self.compute_final_results(
                 sampling,
@@ -2784,10 +2913,13 @@ class ABFEPipeline:
             sampling = {"total_delta_G": sample_result["total_delta_G"],
                         "total_error": sample_result["total_error"]}
 
-            correction = self.apply_boresch_correction(
-                boresch_params,
-                autoload_from_disk=kwargs.get("allow_disk_boresch_autoload", True),
-            )
+            if system_type == "solvent" and not _has_valid_boresch_restraint(boresch_params):
+                correction = {"delta_g_rest": 0.0, "error": 0.0}
+            else:
+                correction = self.apply_boresch_correction(
+                    boresch_params,
+                    autoload_from_disk=kwargs.get("allow_disk_boresch_autoload", True),
+                )
 
             final = self.compute_final_results(
                 sampling, correction, system=self.system, decoupling_scheme="2d_diagonal"
@@ -2866,10 +2998,13 @@ class ABFEPipeline:
             sampling = {"total_delta_G": sample_result["total_delta_G"],
                         "total_error": sample_result["total_error"]}
 
-            correction = self.apply_boresch_correction(
-                boresch_params,
-                autoload_from_disk=kwargs.get("allow_disk_boresch_autoload", True),
-            )
+            if system_type == "solvent" and not _has_valid_boresch_restraint(boresch_params):
+                correction = {"delta_g_rest": 0.0, "error": 0.0}
+            else:
+                correction = self.apply_boresch_correction(
+                    boresch_params,
+                    autoload_from_disk=kwargs.get("allow_disk_boresch_autoload", True),
+                )
 
             final = self.compute_final_results(
                 sampling, correction, system=self.system, decoupling_scheme="2d_geodesic"

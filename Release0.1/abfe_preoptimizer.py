@@ -479,7 +479,7 @@ class ABFEPreOptimizer:
         total_density = max(1e-10, cumulative_density[-1])
         # 构造与 lambda 节点一一对应的单调 CDF：首节点固定为 0，末节点固定为 1。
         xp = np.concatenate(([0.0], cumulative_density[:-1] / total_density))
-        xp[-1] = min(xp[-1], 1.0)
+        xp[-1] = 1.0
 
         # 原始 lambdas 是降序 [1.0, ..., 0.0]，长度必须与 xp 严格一致。
         original_lambdas = np.asarray(self.lambdas.copy(), dtype=float)
@@ -502,6 +502,9 @@ class ABFEPreOptimizer:
             optimized_lambdas = np.interp(target_cumulative, xp, fp_filtered)
 
         optimized_lambdas = np.asarray(optimized_lambdas, dtype=float).ravel()
+        if not np.all(np.isfinite(optimized_lambdas)):
+            print("  ⚠️  自适应插值产生非有限 λ，使用线性路径")
+            optimized_lambdas = np.linspace(1.0, 0.0, target_n_states)
 
         # === 【步骤 8】边界强制与去重 (不变) ===
         optimized_lambdas = np.clip(optimized_lambdas, 0.0, 1.0)
@@ -516,13 +519,17 @@ class ABFEPreOptimizer:
                 optimized_lambdas[i] = max(0.0, optimized_lambdas[i - 1] - min_spacing)
 
         unique_lambdas = []
+        spacing_eps = 1e-9
         for lam in optimized_lambdas:
             lam_val = float(lam)
-            if not unique_lambdas or abs(lam_val - unique_lambdas[-1]) > min_spacing:
+            if not unique_lambdas or (unique_lambdas[-1] - lam_val) >= (min_spacing - spacing_eps):
                 unique_lambdas.append(lam_val)
 
-        if len(unique_lambdas) < target_n_states * 0.5:
-            print(f"  ⚠️  去重后状态数 ({len(unique_lambdas)}) 太少，使用线性路径 ")
+        if unique_lambdas:
+            unique_lambdas[0] = 1.0
+            unique_lambdas[-1] = 0.0
+        if len(unique_lambdas) < target_n_states:
+            print(f"  ⚠️  去重后状态数 ({len(unique_lambdas)}) 少于目标 ({target_n_states})，使用线性路径 ")
             optimized_lambdas = np.linspace(1.0, 0.0, target_n_states)
         else:
             optimized_lambdas = np.array(unique_lambdas)
@@ -575,7 +582,12 @@ class ABFEPreOptimizer:
     # 替换原 partition_ibs_windows_fixed 方法体为：
     def partition_ibs_windows_fixed(self, n_states: int = None, n_ib_windows: int = 4, pts_per_window: int = 6, overlap: int = 2) -> List[Tuple[int, int]]:
         if n_states is None: n_states = self.n_states
-        windows = generate_overlapping_windows(n_states, n_ib_windows, pts_per_window, overlap)
+        windows = generate_overlapping_windows(
+            n_states,
+            pts_per_window=pts_per_window,
+            overlap=overlap,
+            n_windows=n_ib_windows,
+        )
         print(f"→ IBS 窗口划分 ({len(windows)} 个): {windows} (覆盖 {n_states} 个状态)")
         return windows
 

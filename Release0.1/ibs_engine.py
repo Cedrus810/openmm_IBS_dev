@@ -155,6 +155,74 @@ def _value_in_inverse_nanometer(value: Any) -> float:
     return float(value)
 
 
+def pme_self_correction_prefactor_kj(alpha_ewald_inv_nm: float, ligand_charge_square_sum: float) -> float:
+    """Return C for the PME self offset -C*lambda^2 in kJ/mol."""
+    alpha = float(alpha_ewald_inv_nm)
+    qsq = float(ligand_charge_square_sum)
+    if alpha <= 0.0 or qsq <= 0.0:
+        return 0.0
+    return 138.935456 * alpha * qsq / math.sqrt(math.pi)
+
+
+def pme_self_correction_energy_kj(lambda_coul: float, prefactor_kj: float) -> float:
+    """Energy added to offline u_kn to remove OpenMM's -C*lambda^2 PME self offset."""
+    lam = float(lambda_coul)
+    return float(prefactor_kj) * lam * lam
+
+
+def lambda_endpoint_diagnostics(lambdas_coul, lambdas_vdw, tol: float = 1e-8) -> Dict:
+    """Check whether a lambda path has clear physical endpoints."""
+    lc = np.asarray(lambdas_coul, dtype=float)
+    lv = np.asarray(lambdas_vdw, dtype=float)
+    if lc.size == 0 or lv.size == 0 or lc.size != lv.size:
+        return {"ok": False, "reason": "empty_or_mismatched_lambda_arrays"}
+    start = {"lambda_coul": float(lc[0]), "lambda_vdw": float(lv[0])}
+    end = {"lambda_coul": float(lc[-1]), "lambda_vdw": float(lv[-1])}
+    ok_start = abs(start["lambda_coul"] - 1.0) <= tol and abs(start["lambda_vdw"] - 1.0) <= tol
+    ok_end = abs(end["lambda_coul"]) <= tol and abs(end["lambda_vdw"]) <= tol
+    monotonic_coul = bool(np.all(np.diff(lc) <= tol))
+    monotonic_vdw = bool(np.all(np.diff(lv) <= tol))
+    return {
+        "ok": bool(ok_start and ok_end and monotonic_coul and monotonic_vdw),
+        "start": start,
+        "end": end,
+        "starts_fully_coupled": bool(ok_start),
+        "ends_fully_decoupled": bool(ok_end),
+        "monotonic_coul": monotonic_coul,
+        "monotonic_vdw": monotonic_vdw,
+    }
+
+
+def delta_u_distribution_diagnostics(u_kn: np.ndarray) -> Dict:
+    """Summarize adjacent-state Δu distributions for overlap/convergence checks."""
+    u = np.asarray(u_kn, dtype=np.float64)
+    if u.ndim != 2 or u.shape[0] < 2 or u.shape[1] == 0:
+        return {"available": False, "reason": "u_kn_requires_at_least_2_states_and_1_frame"}
+    rows = []
+    for k in range(u.shape[0] - 1):
+        du = u[k + 1] - u[k]
+        rows.append({
+            "pair": [int(k), int(k + 1)],
+            "mean": float(np.mean(du)),
+            "std": float(np.std(du)),
+            "p05": float(np.percentile(du, 5)),
+            "p50": float(np.percentile(du, 50)),
+            "p95": float(np.percentile(du, 95)),
+        })
+    return {"available": True, "adjacent_delta_u": rows}
+
+
+def synthetic_mbar_u_kn(delta_f_kT: float = 1.25, n_per_state: int = 200, seed: int = 20260630) -> Tuple[np.ndarray, np.ndarray]:
+    """Small deterministic two-state synthetic dataset for MBAR smoke tests."""
+    rng = np.random.default_rng(int(seed))
+    x0 = rng.normal(loc=0.0, scale=1.0, size=int(n_per_state))
+    x1 = rng.normal(loc=float(delta_f_kT), scale=1.0, size=int(n_per_state))
+    x = np.concatenate([x0, x1])
+    u0 = 0.5 * x * x
+    u1 = 0.5 * (x - float(delta_f_kT)) ** 2 + float(delta_f_kT)
+    return np.vstack([u0, u1]), np.array([int(n_per_state), int(n_per_state)], dtype=int)
+
+
 def _select_bulk_water_counterion(
     nb_force: openmm.NonbondedForce,
     ligand_indices: List[int],
@@ -450,7 +518,7 @@ def _compute_u_kn_chunk(task: Dict) -> Tuple[int, np.ndarray]:
                     alpha_q, _, _, _ = nb_force.getPMEParameters()
                     alpha_ewald = _value_in_inverse_nanometer(alpha_q)
                 if alpha_ewald > 0.0:
-                    pme_self_prefactor_kj = 138.935456 * alpha_ewald * lig_qsq / math.sqrt(math.pi)
+                    pme_self_prefactor_kj = pme_self_correction_prefactor_kj(alpha_ewald, lig_qsq)
 
     for local_f in range(xyz_chunk.shape[0]):
         ctx.setPositions(xyz_chunk[local_f] * unit.nanometer)
@@ -465,7 +533,7 @@ def _compute_u_kn_chunk(task: Dict) -> Tuple[int, np.ndarray]:
                 if apply_pme_self_correction and pme_self_prefactor_kj is not None:
                     # PME 总能量包含与坐标无关的自能项 -C*lambda^2。
                     # 它不会影响构型采样，但会严重污染 ΔG；这里在离线 u_kn 中解析去除。
-                    e += pme_self_prefactor_kj * (lambdas_coul[k] ** 2)
+                    e += pme_self_correction_energy_kj(lambdas_coul[k], pme_self_prefactor_kj)
             else:
                 e = ctx.getState(getEnergy=True, groups={1}).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
             u_chunk[k, local_f] = e / kt
@@ -910,7 +978,7 @@ def _create_softcore_force(
     print(
         "  ⚠️ [VDW softcore] CustomNonbondedForce LRC 已禁用；"
         "本 VDW 腿未自动补偿 LJ tail/dispersion correction，"
-        "需在 thermodynamic cycle 中显式处理。"
+        "需在 thermodynamic cycle 中显式处理；APBS 外部项仅用于静电/连续介质类长程修正。"
     )
     sc_force.setUseLongRangeCorrection(False)
     
@@ -1067,6 +1135,14 @@ def _collect_softcore_exclusions(
         elif isinstance(force, openmm.PeriodicTorsionForce):
             for i in range(force.getNumTorsions()):
                 p1, _, _, p4, _, _, _ = force.getTorsionParameters(i)
+                _maybe_add_pair(p1, p4)
+        elif isinstance(force, openmm.CustomTorsionForce):
+            for i in range(force.getNumTorsions()):
+                p1, _, _, p4, _ = force.getTorsionParameters(i)
+                _maybe_add_pair(p1, p4)
+        elif hasattr(openmm, "RBTorsionForce") and isinstance(force, openmm.RBTorsionForce):
+            for i in range(force.getNumTorsions()):
+                p1, _, _, p4, *_ = force.getTorsionParameters(i)
                 _maybe_add_pair(p1, p4)
 
     for i in range(system.getNumConstraints()):
@@ -1349,7 +1425,7 @@ def build_ibs_dual_system(
         int_f_cv.setNonbondedMethod(template_method)
         print(
             "  ⚠️ [IBS CV] VDW custom softcore CV 不含 LJ 长程修正；"
-            "请勿直接等同于已含 dispersion correction 的 PME/LJPME 循环。"
+            "请勿直接等同于已含 dispersion correction 的 PME/LJPME 循环；APBS 修正应作为最终外部项记录。"
         )
         int_f_cv.setUseLongRangeCorrection(False)
         int_f_cv.setUseSwitchingFunction(True)
@@ -1891,18 +1967,22 @@ class IBSWindowManagerDualLambda:
                 for step_batch in range(0, n_steps, 50):
                     actual_steps = min(50, n_steps - step_batch)
                     sim.step(actual_steps)
+                    state = sim.context.getState(getEnergy=True, getForces=True, getPositions=True)
+                    e = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+                    forces = state.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole/unit.nanometer)
+                    max_f = np.max(np.linalg.norm(forces, axis=1))
+                    positions = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+                    has_bad_positions = np.any(~np.isfinite(positions))
+                    has_bad_energy = not np.isfinite(e)
+                    has_bad_force = not np.isfinite(max_f)
+                    has_bad_values = has_bad_positions or has_bad_energy or has_bad_force
                     if debug_mode and (step_batch == 0 or step_batch >= n_steps - 50):
-                        state = sim.context.getState(getEnergy=True, getForces=True, getPositions=True)
-                        e = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-                        forces = state.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole/unit.nanometer)
-                        max_f = np.max(np.linalg.norm(forces, axis=1))
-                        has_nan = np.any(np.isnan(state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)))
-                        print(f"    [dt={label}] 步{step_batch+actual_steps}: E={e:.1f}, max|F|={max_f:.1f}, NaN={has_nan}")
-                        if has_nan or np.isnan(e):
-                            print(f"    🚨 NaN 检测，打印力组拆解：")
-                            diagnose_force_groups_detailed(sim.context, win_sys, prefix=f"窗口{window_idx}_NaN前_dt={label}")
-                            diagnose_force_breakdown(sim.context, win_sys, prefix=f"窗口{window_idx}_NaN前_dt={label}")
-                            raise RuntimeError(f"在 dt={label} 处发生坐标 NaN")
+                        print(f"    [dt={label}] 步{step_batch+actual_steps}: E={e:.1f}, max|F|={max_f:.1f}, finite={not (has_bad_positions or has_bad_energy or has_bad_force)}")
+                    if has_bad_values:
+                        print(f"    🚨 非有限数值检测，打印力组拆解：")
+                        diagnose_force_groups_detailed(sim.context, win_sys, prefix=f"窗口{window_idx}_NaN前_dt={label}")
+                        diagnose_force_breakdown(sim.context, win_sys, prefix=f"窗口{window_idx}_NaN前_dt={label}")
+                        raise RuntimeError(f"在 dt={label} 处发生非有限坐标/能量/力")
 
             sim.integrator.setStepSize(original_dt)
             print(f"  ✅ 测试步进通过，恢复步长 {original_dt.value_in_unit(unit.picoseconds):.3f} ps")
@@ -2365,9 +2445,32 @@ class IBSWindowManagerDualLambda:
                     os.path.join(self.output_dir, f"dual_window_{window_idx}_{stage_type}_base.npy"),
                     np.array(sampler.base_energy_history),
                 )
+            convergence = {
+                "window_idx": int(window_idx),
+                "stage_type": stage_type,
+                "n_updates": int(len(sampler.f_history)),
+                "free_energy_history_kT": [
+                    np.asarray(f_k, dtype=float).tolist()
+                    for f_k in sampler.f_history
+                ],
+                "n_energy_samples": int(e_save.shape[1]),
+            }
+            with open(
+                os.path.join(self.output_dir, f"dual_window_{window_idx}_{stage_type}_convergence.json"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(convergence, f, indent=2)
             print(f"  💾 窗口 {window_idx} 完成，能量已保存 ({e_save.shape})")
 
             # 清理
+            if getattr(sampler, "_probe_context", None) is not None:
+                del sampler._probe_context
+                sampler._probe_context = None
+            if getattr(sampler, "_probe_integrator", None) is not None:
+                del sampler._probe_integrator
+                sampler._probe_integrator = None
+            del sampler
             del sim.context
             del sim
             del win_sys
@@ -3101,10 +3204,14 @@ class REMDManager:
 
         self.contexts = []
         self.integrators = []
+        self.replica_systems = []
+        self._atoms = list(topology.atoms()) if topology is not None else []
+        self._ligand_set = set(int(i) for i in ligand_indices)
         self._state_to_context = list(range(self.n_replicas))
         self._context_to_state = list(range(self.n_replicas))
         self._steps_completed = 0
         self._is_warmed_up = False
+        self.platform_fallback_reason = None
         self._build_replicas(system_template)
 
     @staticmethod
@@ -3116,63 +3223,114 @@ class REMDManager:
             if "invalid parameter name" not in msg:
                 raise
 
-    def _build_replicas(self, system_template):
+    def _clear_replica_contexts(self) -> None:
+        """Release already-created OpenMM Contexts after a partial REMD build failure."""
+        for ctx in getattr(self, "contexts", []):
+            try:
+                del ctx
+            except Exception:
+                pass
+        for integ in getattr(self, "integrators", []):
+            try:
+                del integ
+            except Exception:
+                pass
+        self.contexts = []
+        self.integrators = []
+        self.replica_systems = []
+        self._state_to_context = list(range(self.n_replicas))
+        self._context_to_state = list(range(self.n_replicas))
+        gc.collect()
+
+    @staticmethod
+    def _is_gpu_context_failure(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        needles = (
+            "no compatible cuda device",
+            "cuda_error_out_of_memory",
+            "out of memory",
+            "failed to create cuda context",
+            "cucontextcreate",
+            "cuda device",
+        )
+        return any(token in msg for token in needles)
+
+    def _build_replicas(self, system_template, allow_platform_fallback: bool = True):
         resolved_platform, props = _build_platform_properties(self.platform_name)
         platform = openmm.Platform.getPlatformByName(resolved_platform)
 
-        for i in range(self.n_replicas):
-            if self.is_pme_coulomb_leg:
-                replica_sys = _prepare_pme_coulomb_leg_system(
-                    system_template,
-                    self.ligand_indices,
-                    lambda_name="lambda_coul",
-                    allow_charged_ligand=True,
-                    topology=self.topology,
-                    positions=self.positions,
-                    box_vectors=self.box_vectors,
-                )
-                _add_physical_boresch_restraint(replica_sys, self.boresch_params, force_group=3)
-            elif self.is_mixed_pme_alchemical:
-                replica_sys = _prepare_pme_mixed_alchemical_system(
-                    system_template,
-                    self.ligand_indices,
-                    topology=self.topology,
-                    positions=self.positions,
-                    box_vectors=self.box_vectors,
-                    lambda_coul_name="lambda_coul",
-                    lambda_vdw_name="lambda_vdw",
-                    restraint_params=self.boresch_params,
-                )
-            else:
-                sys_xml = openmm.XmlSerializer.serialize(system_template)
-                replica_sys = openmm.XmlSerializer.deserialize(sys_xml)
-                replica_sys.thisown = 1
-                nb = [f for f in replica_sys.getForces() if isinstance(f, openmm.NonbondedForce)][0]
-                _restore_ligand_internal_nonbonded(
-                    replica_sys,
-                    nb,
-                    self.ligand_indices,
-                    zero_original_exceptions=True,
-                )
-                env_idx = [j for j in range(replica_sys.getNumParticles()) if j not in self.ligand_indices]
-                sc_force = BeutlerSoftcoreBuilder.build(nb, self.ligand_indices, env_idx)
-                sc_force.setForceGroup(1)
-                replica_sys.addForce(sc_force)
-                _add_physical_boresch_restraint(replica_sys, self.boresch_params, force_group=3)
+        try:
+            for i in range(self.n_replicas):
+                if self.is_pme_coulomb_leg:
+                    replica_sys = _prepare_pme_coulomb_leg_system(
+                        system_template,
+                        self.ligand_indices,
+                        lambda_name="lambda_coul",
+                        allow_charged_ligand=True,
+                        topology=self.topology,
+                        positions=self.positions,
+                        box_vectors=self.box_vectors,
+                    )
+                    _add_physical_boresch_restraint(replica_sys, self.boresch_params, force_group=3)
+                elif self.is_mixed_pme_alchemical:
+                    replica_sys = _prepare_pme_mixed_alchemical_system(
+                        system_template,
+                        self.ligand_indices,
+                        topology=self.topology,
+                        positions=self.positions,
+                        box_vectors=self.box_vectors,
+                        lambda_coul_name="lambda_coul",
+                        lambda_vdw_name="lambda_vdw",
+                        restraint_params=self.boresch_params,
+                    )
+                else:
+                    sys_xml = openmm.XmlSerializer.serialize(system_template)
+                    replica_sys = openmm.XmlSerializer.deserialize(sys_xml)
+                    replica_sys.thisown = 1
+                    nb = [f for f in replica_sys.getForces() if isinstance(f, openmm.NonbondedForce)][0]
+                    _restore_ligand_internal_nonbonded(
+                        replica_sys,
+                        nb,
+                        self.ligand_indices,
+                        zero_original_exceptions=True,
+                    )
+                    env_idx = [j for j in range(replica_sys.getNumParticles()) if j not in self.ligand_indices]
+                    sc_force = BeutlerSoftcoreBuilder.build(nb, self.ligand_indices, env_idx)
+                    sc_force.setForceGroup(1)
+                    replica_sys.addForce(sc_force)
+                    _add_physical_boresch_restraint(replica_sys, self.boresch_params, force_group=3)
 
-                for idx in self.ligand_indices:
-                    nb.setParticleParameters(idx, 0.0, 0.1*unit.nanometer, 0.0)
+                    for idx in self.ligand_indices:
+                        nb.setParticleParameters(idx, 0.0, 0.1*unit.nanometer, 0.0)
 
-            integ = openmm.LangevinMiddleIntegrator(self.temperature, 1.0/unit.picosecond, 0.002*unit.picosecond)
-            ctx = openmm.Context(replica_sys, integ, platform, props)
-            ctx.setPositions(self.positions)
-            if self.box_vectors is not None:
-                ctx.setPeriodicBoxVectors(*self.box_vectors)
-            self._try_set_context_parameter(ctx, "lambda_coul", self.lambdas_coul[i])
-            self._try_set_context_parameter(ctx, "lambda_vdw", self.lambdas_vdw[i])
+                integ = openmm.LangevinMiddleIntegrator(self.temperature, 1.0/unit.picosecond, 0.002*unit.picosecond)
+                ctx = openmm.Context(replica_sys, integ, platform, props)
+                ctx.setPositions(self.positions)
+                if self.box_vectors is not None:
+                    ctx.setPeriodicBoxVectors(*self.box_vectors)
+                self._try_set_context_parameter(ctx, "lambda_coul", self.lambdas_coul[i])
+                self._try_set_context_parameter(ctx, "lambda_vdw", self.lambdas_vdw[i])
+                ctx.setVelocitiesToTemperature(self.temperature)
 
-            self.contexts.append(ctx)
-            self.integrators.append(integ)
+                self.contexts.append(ctx)
+                self.integrators.append(integ)
+                self.replica_systems.append(replica_sys)
+        except Exception as exc:
+            self._clear_replica_contexts()
+            if (
+                allow_platform_fallback
+                and str(resolved_platform).upper() in {"CUDA", "OPENCL"}
+                and self._is_gpu_context_failure(exc)
+            ):
+                self.platform_fallback_reason = str(exc)
+                print(
+                    "  ⚠️ REMD GPU Context 构建失败，已释放已创建的 replica contexts；"
+                    f"回退 CPU 重建。原始错误: {exc}"
+                )
+                self.platform_name = "CPU"
+                self._build_replicas(system_template, allow_platform_fallback=False)
+                return
+            raise
 
     def _set_context_state(self, context_idx: int, state_idx: int) -> None:
         ctx = self.contexts[context_idx]
@@ -3184,6 +3342,224 @@ class REMDManager:
         if save_interval <= 0:
             return False
         return (prev_step // save_interval) != (next_step // save_interval)
+
+    def _atom_label(self, idx: int) -> str:
+        idx = int(idx)
+        role = "ligand" if idx in self._ligand_set else "env"
+        if 0 <= idx < len(self._atoms):
+            atom = self._atoms[idx]
+            residue = atom.residue
+            resname = residue.name.upper()
+            if role != "ligand":
+                if resname in {"HOH", "WAT", "SOL", "TIP3", "TIP3P"}:
+                    role = "water"
+                elif resname in {"NA", "SOD", "CL", "CLA", "K", "POT", "MG", "CA"}:
+                    role = "ion"
+            return f"{idx}:{atom.name}/{residue.name}{residue.index}:{role}"
+        return f"{idx}:{role}"
+
+    def _context_lambda_label(self, context_idx: int) -> Tuple[int, float, float]:
+        state_idx = int(self._context_to_state[int(context_idx)])
+        return state_idx, float(self.lambdas_coul[state_idx]), float(self.lambdas_vdw[state_idx])
+
+    def _diagnose_context_failure(
+        self,
+        context_idx: int,
+        phase: str,
+        exc: Optional[Exception] = None,
+    ) -> Dict[str, Any]:
+        context_idx = int(context_idx)
+        ctx = self.contexts[context_idx]
+        system = self.replica_systems[context_idx] if context_idx < len(self.replica_systems) else None
+        state_idx, lam_coul, lam_vdw = self._context_lambda_label(context_idx)
+        diag: Dict[str, Any] = {
+            "phase": str(phase),
+            "context_idx": context_idx,
+            "state_idx": state_idx,
+            "lambda_coul": lam_coul,
+            "lambda_vdw": lam_vdw,
+            "exception": str(exc) if exc is not None else None,
+        }
+
+        print("\n🚨 [REMD-NaN诊断] 捕获到不稳定 context")
+        print(
+            f"  phase={phase} | context={context_idx} | state={state_idx} | "
+            f"lambda_coul={lam_coul:.6f} | lambda_vdw={lam_vdw:.6f}"
+        )
+        if exc is not None:
+            print(f"  OpenMM 异常: {exc}")
+
+        state = None
+        try:
+            state = ctx.getState(
+                getPositions=True,
+                getEnergy=True,
+                getForces=True,
+                enforcePeriodicBox=False,
+            )
+        except Exception as state_exc:
+            diag["state_read_error"] = str(state_exc)
+            print(f"  ⚠️ 无法同时读取能量/坐标/受力: {state_exc}")
+            try:
+                state = ctx.getState(getPositions=True, enforcePeriodicBox=False)
+            except Exception as pos_exc:
+                diag["position_read_error"] = str(pos_exc)
+                print(f"  ⚠️ 坐标也无法读取: {pos_exc}")
+
+        if state is not None:
+            try:
+                positions_nm = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+                bad_pos = np.where(~np.isfinite(positions_nm).all(axis=1))[0]
+                diag["n_nonfinite_position_atoms"] = int(len(bad_pos))
+                diag["nonfinite_position_atoms"] = [self._atom_label(i) for i in bad_pos[:20]]
+                if len(bad_pos) > 0:
+                    print(f"  ❌ 非有限坐标原子数: {len(bad_pos)}")
+                    print("     " + ", ".join(diag["nonfinite_position_atoms"]))
+            except Exception as pos_exc:
+                diag["position_parse_error"] = str(pos_exc)
+
+            try:
+                energy = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+                diag["potential_energy_kj_mol"] = float(energy)
+                print(f"  E_potential={energy:.3f} kJ/mol")
+            except Exception as energy_exc:
+                diag["energy_error"] = str(energy_exc)
+
+            try:
+                forces = state.getForces(asNumpy=True).value_in_unit(
+                    unit.kilojoule_per_mole / unit.nanometer
+                )
+                norms = np.linalg.norm(forces, axis=1)
+                bad_force = np.where(~np.isfinite(forces).all(axis=1))[0]
+                finite_norms = np.where(np.isfinite(norms), norms, -np.inf)
+                top = np.argsort(finite_norms)[::-1][:10]
+                diag["n_nonfinite_force_atoms"] = int(len(bad_force))
+                diag["top_force_atoms"] = [
+                    {"atom": self._atom_label(i), "force_kj_mol_nm": float(norms[int(i)])}
+                    for i in top
+                    if np.isfinite(norms[int(i)])
+                ]
+                if np.any(np.isfinite(norms)):
+                    diag["max_force_kj_mol_nm"] = float(np.nanmax(norms))
+                    print(f"  max|F|={diag['max_force_kj_mol_nm']:.1f} kJ/mol/nm")
+                if len(bad_force) > 0:
+                    diag["nonfinite_force_atoms"] = [self._atom_label(i) for i in bad_force[:20]]
+                    print(f"  ❌ 非有限受力原子数: {len(bad_force)}")
+                    print("     " + ", ".join(diag["nonfinite_force_atoms"]))
+                if diag["top_force_atoms"]:
+                    print("  Top受力原子:")
+                    for row in diag["top_force_atoms"][:5]:
+                        print(f"    {row['atom']:<28} {row['force_kj_mol_nm']:12.1f}")
+            except Exception as force_exc:
+                diag["force_error"] = str(force_exc)
+
+        if _has_valid_boresch_restraint(self.boresch_params):
+            try:
+                ok, r0_chk, thA_chk, thB_chk = _check_boresch_geometry_safe(ctx, self.boresch_params)
+                diag["boresch_geometry"] = {
+                    "safe": bool(ok),
+                    "r_nm": float(r0_chk),
+                    "thetaA_deg": float(thA_chk),
+                    "thetaB_deg": float(thB_chk),
+                }
+                print(
+                    f"  Boresch当前几何: r={r0_chk:.3f} nm, "
+                    f"thetaA={thA_chk:.1f}°, thetaB={thB_chk:.1f}°, safe={ok}"
+                )
+            except Exception as boresch_exc:
+                diag["boresch_geometry_error"] = str(boresch_exc)
+                print(f"  ⚠️ Boresch 几何诊断失败: {boresch_exc}")
+
+        group_stats = []
+        if system is not None:
+            for gid in sorted({force.getForceGroup() for force in system.getForces()}):
+                row: Dict[str, Any] = {"group": int(gid)}
+                try:
+                    g_state = ctx.getState(getEnergy=True, getForces=True, groups={gid})
+                    g_energy = g_state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+                    g_forces = g_state.getForces(asNumpy=True).value_in_unit(
+                        unit.kilojoule_per_mole / unit.nanometer
+                    )
+                    g_norms = np.linalg.norm(g_forces, axis=1)
+                    row["energy_kj_mol"] = float(g_energy)
+                    row["max_force_kj_mol_nm"] = float(np.nanmax(g_norms))
+                except Exception as group_exc:
+                    row["error"] = str(group_exc)
+                group_stats.append(row)
+            diag["force_groups"] = group_stats
+            print("  ForceGroup 分解:")
+            for row in group_stats:
+                if "error" in row:
+                    print(f"    G{row['group']}: ERROR {row['error']}")
+                else:
+                    print(
+                        f"    G{row['group']}: E={row['energy_kj_mol']:.3f} kJ/mol | "
+                        f"max|F|={row['max_force_kj_mol_nm']:.1f}"
+                    )
+
+        try:
+            out_path = os.path.join(self.output_dir, "remd_last_failure.json")
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(diag, f, indent=2, ensure_ascii=False)
+            print(f"  📝 REMD 失败诊断已写入: {out_path}")
+        except Exception as write_exc:
+            print(f"  ⚠️ REMD 诊断写入失败: {write_exc}")
+
+        return diag
+
+    def _preflight_context(self, context_idx: int) -> None:
+        ctx = self.contexts[int(context_idx)]
+        state_idx, lam_coul, lam_vdw = self._context_lambda_label(context_idx)
+        max_force_limit = float(os.environ.get("IBS_REMD_PREFLIGHT_MAX_FORCE", "100000"))
+        try:
+            state = ctx.getState(getEnergy=True, getForces=True)
+            energy = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+            forces = state.getForces(asNumpy=True).value_in_unit(
+                unit.kilojoule_per_mole / unit.nanometer
+            )
+            norms = np.linalg.norm(forces, axis=1)
+            max_force = float(np.nanmax(norms))
+            if (not np.isfinite(energy)) or (not np.isfinite(max_force)):
+                self._diagnose_context_failure(context_idx, f"preflight_nonfinite_state{state_idx}")
+                raise RuntimeError(
+                    f"REMD preflight 非有限能量/受力: state={state_idx}, "
+                    f"lambda_coul={lam_coul}, lambda_vdw={lam_vdw}"
+                )
+            if max_force > max_force_limit:
+                print(
+                    f"  ⚠️ [REMD] context {context_idx} state {state_idx} "
+                    f"预检查 max|F|={max_force:.1f} > {max_force_limit:.1f}，执行短最小化"
+                )
+                openmm.LocalEnergyMinimizer.minimize(ctx, tolerance=20.0, maxIterations=1000)
+                ctx.setVelocitiesToTemperature(self.temperature)
+        except Exception as exc:
+            self._diagnose_context_failure(context_idx, f"preflight_state{state_idx}", exc)
+            raise
+
+    def _step_context_with_diagnostics(self, context_idx: int, n_steps: int, phase: str) -> None:
+        ctx = self.contexts[int(context_idx)]
+        n_steps = int(n_steps)
+        if n_steps <= 0:
+            return
+        chunk = int(os.environ.get("IBS_REMD_STEP_CHUNK", str(n_steps)))
+        chunk = max(1, min(chunk, n_steps))
+        steps_done = 0
+        try:
+            while steps_done < n_steps:
+                this_chunk = min(chunk, n_steps - steps_done)
+                ctx.getIntegrator().step(this_chunk)
+                steps_done += this_chunk
+        except Exception as exc:
+            self._diagnose_context_failure(
+                context_idx,
+                f"{phase}; local_step={steps_done}/{n_steps}",
+                exc,
+            )
+            state_idx, lam_coul, lam_vdw = self._context_lambda_label(context_idx)
+            raise RuntimeError(
+                f"REMD context {context_idx} 在 {phase} 爆炸: "
+                f"state={state_idx}, lambda_coul={lam_coul:.6f}, lambda_vdw={lam_vdw:.6f}"
+            ) from exc
 
     def run(
         self,
@@ -3204,8 +3580,15 @@ class REMDManager:
         
         # 预热
         if not self._is_warmed_up:
-            for ctx in self.contexts:
-                ctx.getIntegrator().step(5000)
+            print("  [REMD] 预热前执行能量/受力 preflight...")
+            for ctx_idx in range(self.n_replicas):
+                self._preflight_context(ctx_idx)
+            for ctx_idx in range(self.n_replicas):
+                self._step_context_with_diagnostics(
+                    ctx_idx,
+                    5000,
+                    f"{stage_name}:preheat",
+                )
             self._is_warmed_up = True
             
         exchange_log = []
@@ -3213,8 +3596,13 @@ class REMDManager:
         for step in range(n_exchanges):
             # 1. 批量提交步进任务 (GPU 会在底层自动流水线并发，无需 Python 干预)
             prev_steps = self._steps_completed
-            for ctx in self.contexts:
-                ctx.getIntegrator().step(exchange_interval)
+            for ctx_idx in range(self.n_replicas):
+                state_idx, _, _ = self._context_lambda_label(ctx_idx)
+                self._step_context_with_diagnostics(
+                    ctx_idx,
+                    exchange_interval,
+                    f"{stage_name}:exchange_round={step}:state={state_idx}",
+                )
             self._steps_completed += exchange_interval
                 
             # 2. 轨迹落盘
@@ -3252,10 +3640,28 @@ class REMDManager:
                 # 恢复原始参数
                 self._set_context_state(ctx_idx_i, state_i)
                 self._set_context_state(ctx_idx_j, state_j)
+
+                if not np.all(np.isfinite([U_i_i, U_j_j, U_i_j, U_j_i])):
+                    print(
+                        f"  ⚠️ [REMD] 交换能量非有限: pair=({state_i},{state_j}) "
+                        f"Uii={U_i_i}, Ujj={U_j_j}, Uij={U_i_j}, Uji={U_j_i}"
+                    )
+                    self._diagnose_context_failure(
+                        ctx_idx_i,
+                        f"{stage_name}:exchange_energy_state{state_i}_{state_j}",
+                    )
+                    self._diagnose_context_failure(
+                        ctx_idx_j,
+                        f"{stage_name}:exchange_energy_state{state_i}_{state_j}",
+                    )
+                    continue
                 
                 # --- 阶段 C: Metropolis 判定 ---
                 delta = self.beta * (U_i_j + U_j_i - U_i_i - U_j_j)
-                accept = delta < 0 or np.random.rand() < np.exp(-delta)
+                if not np.isfinite(delta):
+                    accept = bool(np.isneginf(delta))
+                else:
+                    accept = delta < 0 or np.random.rand() < np.exp(-delta)
                 
                 # --- 阶段 D: 仅交换状态分配，Context 本身保持连续推进 ---
                 if accept:
@@ -3277,8 +3683,13 @@ class REMDManager:
 
         if remaining_steps > 0:
             prev_steps = self._steps_completed
-            for ctx in self.contexts:
-                ctx.getIntegrator().step(remaining_steps)
+            for ctx_idx in range(self.n_replicas):
+                state_idx, _, _ = self._context_lambda_label(ctx_idx)
+                self._step_context_with_diagnostics(
+                    ctx_idx,
+                    remaining_steps,
+                    f"{stage_name}:remaining:state={state_idx}",
+                )
             self._steps_completed += remaining_steps
             if self._crossed_save_boundary(prev_steps, self._steps_completed, save_interval):
                 for state_idx, ctx_idx in enumerate(self._state_to_context):
@@ -3293,7 +3704,20 @@ class REMDManager:
                 
         # OpenMM 的 DCDReporter 没有公共 close()；对象释放时会完成底层文件收尾。
         reporters.clear()
-        print(f"✅ REMD 完成 | 平均交换接受率: {np.mean(exchange_log):.3f}")
+        exchange_summary = {
+            "stage_name": stage_name,
+            "n_replicas": int(self.n_replicas),
+            "platform_name": str(self.platform_name),
+            "platform_fallback_reason": self.platform_fallback_reason,
+            "n_exchange_attempts": int(n_exchanges),
+            "acceptance_by_round": [float(v) for v in exchange_log],
+            "mean_acceptance": float(np.mean(exchange_log)) if exchange_log else 0.0,
+            "min_acceptance": float(np.min(exchange_log)) if exchange_log else 0.0,
+            "max_acceptance": float(np.max(exchange_log)) if exchange_log else 0.0,
+        }
+        with open(os.path.join(self.output_dir, f"{stage_name}_exchange_diagnostics.json"), "w", encoding="utf-8") as f:
+            json.dump(exchange_summary, f, indent=2)
+        print(f"✅ REMD 完成 | 平均交换接受率: {exchange_summary['mean_acceptance']:.3f}")
         return traj_files
 
 
@@ -3482,6 +3906,7 @@ class TraditionalMBARAnalyzer:
 
         # 逐列平移不会改变自由能差，但能显著改善大体系绝对能量下的数值条件。
         u_kn_stable = u_kn - np.min(u_kn, axis=0, keepdims=True)
+        delta_u_diag = delta_u_distribution_diagnostics(u_kn_stable)
 
         last_exc = None
         last_mbar = None
@@ -3522,12 +3947,40 @@ class TraditionalMBARAnalyzer:
                     err = float("nan")
 
                 dg = float((df_matrix[0, -1] - df_matrix[0, 0]) * self.kt)
+                diagnostics = {
+                    "delta_u_distribution": delta_u_diag,
+                    "overlap_matrix": None,
+                    "effective_sample_number": None,
+                    "statistical_inefficiency": None,
+                }
+                try:
+                    overlap_res = last_mbar.compute_overlap()
+                    overlap_matrix = overlap_res["matrix"] if isinstance(overlap_res, dict) else overlap_res
+                    diagnostics["overlap_matrix"] = np.asarray(overlap_matrix, dtype=float).tolist()
+                except Exception as overlap_exc:
+                    diagnostics["overlap_error"] = str(overlap_exc)
+                try:
+                    neff = last_mbar.compute_effective_sample_number()
+                    diagnostics["effective_sample_number"] = np.asarray(neff, dtype=float).tolist()
+                except Exception as neff_exc:
+                    diagnostics["effective_sample_number_error"] = str(neff_exc)
+                try:
+                    from pymbar import timeseries
+                    g_values = []
+                    for k in range(max(1, K - 1)):
+                        series = u_kn_stable[min(k + 1, K - 1)] - u_kn_stable[k]
+                        if series.size >= 3:
+                            g_values.append(float(timeseries.statistical_inefficiency(series)))
+                    diagnostics["statistical_inefficiency"] = g_values
+                except Exception as g_exc:
+                    diagnostics["statistical_inefficiency_error"] = str(g_exc)
                 return {
                     "delta_G": dg,
                     "error": err,
                     "method": method_name,
                     "n_frames": N,
                     "n_states": K,
+                    "diagnostics": diagnostics,
                 }
             except Exception as exc:
                 last_exc = exc

@@ -8,7 +8,7 @@ ABFE 核心物理模块 (v6.0 - 完整收敛版)
 """
 
 import openmm
-from openmm import unit
+from openmm import app, unit
 import numpy as np
 import math
 import warnings
@@ -280,7 +280,7 @@ class NumpyEncoder(json.JSONEncoder):
 # ============================================================================
 class ACESoftcorePotential:
     def __init__(
-        self, alpha_lj=1.5e-6, alpha_coul=0.2e-2, power_lj=(2, 2), power_coul=(1, 1)
+        self, alpha_lj=0.5, alpha_coul=0.2, power_lj=(2, 2), power_coul=(1, 1)
     ):
         self.alpha_lj, self.alpha_coul = float(alpha_lj), float(alpha_coul)
         self.m_lj, self.n_lj = power_lj
@@ -304,14 +304,7 @@ class ACESoftcorePotential:
 
     @staticmethod
     def _normalize_alpha_units(alpha_lj, alpha_coul):
-        alpha_lj = float(alpha_lj)
-        alpha_coul = float(alpha_coul)
-        # 兼容历史遗留的 Å 标度 JSON：LJ 常见为 1e-6 量级，Coul 常见为 1e-3~1e-2 量级。
-        if alpha_lj < 1.0e-3:
-            alpha_lj *= 1.0e6
-        if alpha_coul < 5.0e-2:
-            alpha_coul *= 1.0e2
-        return alpha_lj, alpha_coul
+        return float(alpha_lj), float(alpha_coul)
 
     @staticmethod
     def optimize_alpha(n, alpha_coul_nm2=None):
@@ -679,6 +672,61 @@ class Orbv3SurrogateFitter:
 # ============================================================================
 # 2. Boresch 限制力 & 解析修正
 # ============================================================================
+THERMODYNAMIC_CYCLE_DOC = """
+Thermodynamic cycle used by this ABFE workflow
+=============================================
+
+Complex leg:
+  1. A physical Boresch restraint is applied to keep the ligand in the binding
+     pose during decoupling.
+  2. The alchemical sampler computes the restrained complex-leg decoupling free
+     energy, ΔG_decouple,restrained.
+  3. The analytical Boresch term returned by calculate_boresch_analytical_correction
+     is the standard-state release correction added to that leg:
+
+       ΔG_complex = ΔG_decouple,restrained + ΔG_release_to_1M
+
+     with V° = 1.6605 nm^3 and
+
+       ΔG_release_to_1M = -RT ln[
+         8π²V° / (r0² sinθA sinθB)
+         * sqrt(Kr KθA KθB KφA KφB KφC) / (2πRT)^3
+       ].
+
+Solvent leg:
+  No Boresch restraint is applied to the ligand in bulk solvent; therefore no
+  Boresch analytical release term is added to the solvent leg.
+
+PME/self correction:
+  For neutral ligand PME decharging evaluated from total PME energies, OpenMM's
+  reciprocal/self contribution contains a coordinate-independent term with
+  negative sign, -C λ². Offline u_kn evaluation removes this offset by adding
+  +C λ² to each λ state. Charged ligand paths disable ligand-only self correction
+  unless a validated co-alchemical neutralization cycle is active.
+
+LJ long-range/dispersion correction:
+  Custom softcore VDW interaction-group forces do not automatically reproduce
+  the original NonbondedForce dispersion correction. The workflow therefore
+  records this as an explicit thermodynamic-cycle provenance item; any LJ tail
+  or LRC term must be handled by a validated additional cycle term.
+
+External APBS correction:
+  If the production protocol uses APBS to supply the long-range electrostatic
+  or continuum correction, that value is applied only as an explicit final
+  binding-free-energy term:
+
+    ΔG_bind = ΔG_complex - ΔG_solvent + ΔG_APBS
+
+  APBS does not replace a Lennard-Jones dispersion/tail correction; any LJ tail
+  term remains a separate correction if the chosen thermodynamic cycle needs it.
+
+Binding free energy:
+  Without an external APBS term, ΔG_bind = ΔG_complex - ΔG_solvent. Terms that
+  are identical in both legs can cancel only when the Hamiltonians and correction
+  conventions are documented and matched.
+""".strip()
+
+
 def calculate_boresch_analytical_correction(eq, fc, T=300.0):
     """
     计算 Boresch 解析修正。
@@ -2255,6 +2303,7 @@ class OrbScanner:
     # abfe_core.py → 加在 OrbScanner 类之后或作为独立函数
 
     def scan_boresch_1d_pes(
+        self,
         rdkit_mol,
         rec_indices: List[int],
         lig_indices: List[int],
@@ -2551,6 +2600,7 @@ class OnlineConvergenceMonitor:
             "error": 0.8,
             "neff_ratio": 0.20,
             "overlap": 0.85,
+            "min_neighbor_overlap": 0.03,
             "ma_std": 0.30,
         }
         if precision_thresholds:
@@ -2638,7 +2688,7 @@ class OnlineConvergenceMonitor:
 
             is_stable = drift < self.thr["drift"] and ma_std < self.thr["ma_std"]
             is_precise = err < self.thr["error"] and neff_ratio > self.thr["neff_ratio"]
-            is_connected = overlap < self.thr["overlap"]
+            is_connected = min_offdiag >= self.thr.get("min_neighbor_overlap", 0.03)
 
             converged = is_stable and is_precise and is_connected
 

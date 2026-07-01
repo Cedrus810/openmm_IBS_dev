@@ -17,6 +17,8 @@ import json
 import argparse
 import logging
 import subprocess
+import hashlib
+import glob
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -31,10 +33,18 @@ from abfe_core import (
     ACESoftcorePotential, UnitFormatter, calculate_boresch_analytical_correction,
     calc_boresch_from_last_frame, GeometricRestraintEstimator, OrbBoreschEstimator,
     DEXPSurrogatePotential, LambdaDependentBoreschForce, ensure_owned_system,
-    NumpyEncoder,  # ✅ 统一从 abfe_core 导入
+    NumpyEncoder, THERMODYNAMIC_CYCLE_DOC,  # ✅ 统一从 abfe_core 导入
 )
-from abfe_pipeline import ABFEPipeline, TraditionalABFEPipeline
-from ibs_engine import solve_stage_integrated, generate_overlapping_windows # ✅ 保持从 ibs_engine 导入
+from abfe_pipeline import ABFEPipeline, TraditionalABFEPipeline, _collect_pipeline_provenance, _pme_u_kn_meta_payload
+from ibs_engine import (
+    solve_stage_integrated,
+    generate_overlapping_windows,
+    pme_self_correction_prefactor_kj,
+    pme_self_correction_energy_kj,
+    lambda_endpoint_diagnostics,
+    synthetic_mbar_u_kn,
+    TraditionalMBARAnalyzer,
+) # ✅ 保持从 ibs_engine 导入
 from abfe_preoptimizer import DualLambdaPreOptimizer, build_aces_probe_system_dual_lambda
 
 # ---------------------------------------------------------------------------
@@ -897,6 +907,10 @@ class RunConfig:
             preset["parallel_stages"] = bool(args.parallel_stages)
         if _flag_present("--n-lambda"):
             preset["n_lambda"] = args.n_lambda
+        if _flag_present("--apbs-correction-kj-mol"):
+            preset["apbs_correction_kJ_mol"] = args.apbs_correction_kj_mol
+        if _flag_present("--apbs-correction-note"):
+            preset["apbs_correction_note"] = args.apbs_correction_note
 
         defaults = {
             "resume": False,
@@ -916,6 +930,8 @@ class RunConfig:
             "skip_rebalance": False,
             "parallel_stages": False,
             "n_lambda": 12,
+            "apbs_correction_kJ_mol": 0.0,
+            "apbs_correction_note": "",
         }
         for key, value in defaults.items():
             preset.setdefault(key, value)
@@ -943,6 +959,99 @@ class RunConfig:
             return self.data[key]
         return getattr(self.args, key, default)
 
+    def as_dict(self) -> Dict:
+        """Return a JSON-serializable snapshot of the resolved runtime config."""
+        return dict(self.data)
+
+
+def _write_run_provenance(
+    output_dir: str,
+    config: RunConfig,
+    system: Optional[openmm.System] = None,
+    topology: Optional[app.Topology] = None,
+    positions=None,
+) -> Dict:
+    provenance = _collect_pipeline_provenance(
+        config=config.as_dict(),
+        system=system,
+        topology=topology,
+        positions=positions,
+        command_line=sys.argv,
+    )
+    provenance["input_files"] = {
+        "gro": config.get("gro"),
+        "top": config.get("top"),
+        "ligand_xml": config.get("ligand_xml"),
+        "config": config.get("config"),
+        "torsion_params": config.get("torsion_params"),
+        "dexp_params": config.get("dexp_params"),
+    }
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, "run_provenance.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(provenance, f, indent=2, cls=NumpyEncoder)
+    return provenance
+
+
+def run_self_tests() -> int:
+    """Lightweight built-in tests for physics conventions and cache signatures."""
+    failures = []
+    skipped = []
+
+    def check(name: str, condition: bool, detail: str = ""):
+        if condition:
+            log.info("self-test PASS | %s", name)
+        else:
+            failures.append(f"{name}: {detail}")
+            log.error("self-test FAIL | %s | %s", name, detail)
+
+    eq = {"r0": 1.0, "thetaA0": 1.5708, "thetaB0": 1.5708}
+    fc = {"kr": 418.4, "kthetaA": 41.84, "kthetaB": 41.84, "kphiA": 41.84, "kphiB": 41.84, "kphiC": 41.84}
+    dg = calculate_boresch_analytical_correction(eq, fc, 300.0)
+    check("Boresch analytical reference", abs(dg - (-22.382123)) < 1e-3, f"got {dg:.6f} kJ/mol")
+
+    pref = pme_self_correction_prefactor_kj(alpha_ewald_inv_nm=3.0, ligand_charge_square_sum=2.0)
+    corr_lam1 = pme_self_correction_energy_kj(1.0, pref)
+    corr_lam0 = pme_self_correction_energy_kj(0.0, pref)
+    check("PME self correction sign", corr_lam1 > 0.0 and corr_lam0 == 0.0, f"pref={pref}, lam1={corr_lam1}")
+
+    endpoints = lambda_endpoint_diagnostics([1.0, 0.5, 0.0], [1.0, 0.5, 0.0])
+    bad_endpoints = lambda_endpoint_diagnostics([1.0, 0.5], [1.0, 0.5])
+    check("lambda endpoint diagnostics", endpoints["ok"] and not bad_endpoints["ok"], f"{endpoints} / {bad_endpoints}")
+
+    sys_a = openmm.System()
+    sys_a.addParticle(12.0)
+    sys_b = openmm.System()
+    sys_b.addParticle(13.0)
+    meta_a = _pme_u_kn_meta_payload(2, [1.0, 0.0], [1.0, 1.0], 300.0, sys_a, None, [0], None)
+    meta_b = _pme_u_kn_meta_payload(2, [1.0, 0.0], [1.0, 1.0], 300.0, sys_b, None, [0], None)
+    check(
+        "resume/cache invalidation system hash",
+        meta_a["system_xml_sha256"] != meta_b["system_xml_sha256"],
+        "same cache signature for different particle masses",
+    )
+
+    try:
+        u_kn, n_k = synthetic_mbar_u_kn(delta_f_kT=1.25, n_per_state=200)
+        analyzer = TraditionalMBARAnalyzer(temperature=300.0)
+        analyzer._last_n_k = n_k
+        res = analyzer.solve(u_kn)
+        expected = 1.25 * analyzer.kt
+        check("MBAR synthetic data", abs(res["delta_G"] - expected) < 1.0, f"got {res['delta_G']:.3f}, expected {expected:.3f}")
+    except ImportError as exc:
+        skipped.append(f"MBAR synthetic data: {exc}")
+        log.warning("self-test SKIP | MBAR synthetic data | %s", exc)
+
+    check("thermodynamic cycle doc present", "PME/self correction" in THERMODYNAMIC_CYCLE_DOC, "missing PME section")
+
+    if skipped:
+        log.warning("self-test skipped: %s", skipped)
+    if failures:
+        log.error("self-test failures: %s", failures)
+        return 1
+    log.info("self-test completed successfully")
+    return 0
+
 
 # ---------------------------------------------------------------------------
 # Boresch 参数统一管理
@@ -953,7 +1062,7 @@ def _sanitize_boresch_params(params: Dict) -> Dict:
         return None
 
     # 尝试解包嵌套结构
-    anchors = params.get("boresch_anchors", params)
+    anchors = params.get("boresch_anchors") or params
     eq = anchors.get("equilibrium_values", params.get("equilibrium_values", {}))
     fc = anchors.get("force_constants", params.get("force_constants", {}))
 
@@ -994,7 +1103,7 @@ def _sanitize_boresch_params_strict(params: Dict) -> Dict:
     if cleaned is None:
         return None
     if not _has_valid_boresch_anchors(cleaned):
-        anchors = params.get("boresch_anchors", params) if isinstance(params, dict) else {}
+        anchors = (params.get("boresch_anchors") or params) if isinstance(params, dict) else {}
         raise ValueError(
             "Boresch 参数缺失有效锚点：需要 3 个 receptor_indices 和 3 个 ligand_indices。"
             f" 当前解析结果 receptor_indices={anchors.get('receptor_indices', params.get('receptor_indices', [])) if isinstance(params, dict) else []},"
@@ -1027,6 +1136,14 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
         log.info("♻️ 从缓存加载 Boresch 参数: %s", boresch_file)
         with open(boresch_file) as f:
             params = json.load(f)
+        if source == "auto" and isinstance(params, dict) and isinstance(params.get("candidates"), list):
+            candidates = params["candidates"]
+            select_idx = int(getattr(config, "boresch_select", 1) or 1) - 1
+            if select_idx < 0 or select_idx >= len(candidates):
+                raise ValueError(
+                    f"boresch_select={select_idx + 1} 超出缓存候选范围：共 {len(candidates)} 个候选"
+                )
+            params = candidates[select_idx]
         return _sanitize_boresch_params_strict(params)
 
     # 需要预平衡生成轨迹
@@ -1052,12 +1169,18 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
         import mdtraj as md
         traj = md.load(traj_file, top=traj_top)
         # 自动估算（默认使用最后 5ns）
+        n_candidates = max(int(getattr(config, "boresch_batch", 0) or 1), 1)
         candidates = estimator.estimate_multiple_anchors_from_trajectory(
-            traj, config.ligand, n_candidates=1, output_path=boresch_file, use_last_ns=5.0
+            traj, config.ligand, n_candidates=n_candidates, output_path=boresch_file, use_last_ns=5.0
         )
         if not candidates:
             raise RuntimeError("自动 Boresch 估算失败，未找到合格候选")
-        boresch = candidates[0]
+        select_idx = int(getattr(config, "boresch_select", 1) or 1) - 1
+        if select_idx < 0 or select_idx >= len(candidates):
+            raise ValueError(
+                f"boresch_select={select_idx + 1} 超出候选范围：共生成 {len(candidates)} 个候选"
+            )
+        boresch = candidates[select_idx]
 
     elif source == "simple":
         from abfe_core import OrbBoreschEstimator
@@ -1144,6 +1267,7 @@ def parse_arguments():
     prep_parser.add_argument("--temperature", type=float, default=300.0)
     prep_parser.add_argument("--platform", default="CUDA")
     prep_parser.add_argument("--n-steps", type=int, default=5_000_000)
+    subparsers.add_parser("self-test", help="运行轻量内置单元测试/物理约定检查")
     # 基本输入
     parser.add_argument("--gro", default=None, help="GROMACS 结构文件 (首次运行时必需)")
     parser.add_argument("--top", default=None, help="GROMACS 拓扑文件 (首次运行时必需)")
@@ -1198,6 +1322,17 @@ def parse_arguments():
     parser.add_argument("--analyze-only", action="store_true", help="仅分析已有 .npy")
     parser.add_argument("--parallel-stages", action="store_true", help="并行执行去电荷和去VDW阶段")
     parser.add_argument("--n-lambda", type=int, default=12, help="传统 REMD 模式的 λ 状态数")
+    parser.add_argument(
+        "--apbs-correction-kj-mol",
+        type=float,
+        default=None,
+        help="外部 APBS 长程/连续介质修正，单位 kJ/mol；最终 ΔG_bind 会加上该项",
+    )
+    parser.add_argument(
+        "--apbs-correction-note",
+        default=None,
+        help="APBS 修正来源说明，例如网格、介电常数、输入文件或结果文件",
+    )
 
     return parser.parse_args()
 
@@ -1243,7 +1378,7 @@ def run_post_analysis(args):
                 "checkpoints",
                 "stage1_decharging.json" if stage == "coul" else "stage2_vanishing.json",
             )
-            if stage == "coul" and os.path.exists(stage_checkpoint):
+            if os.path.exists(stage_checkpoint):
                 with open(stage_checkpoint) as f:
                     cached_stage = json.load(f)
                 total_dg += float(cached_stage.get("total_delta_G", 0.0))
@@ -1482,6 +1617,7 @@ def run_traditional_mode(config: RunConfig):
             raise RuntimeError("traditional 模式自动构建溶剂腿缓存失败。")
 
     dg_boresch = 0.0
+    boresch_restraint = None
     if config.boresch:
         boresch_pipeline = ABFEPipeline(
             system=system,
@@ -1581,6 +1717,9 @@ def run_traditional_mode(config: RunConfig):
 def main():
     args = parse_arguments()
 
+    if args.command == "self-test":
+        sys.exit(run_self_tests())
+
     if args.command == "prepare":
         run_prepare_command(args)
         return
@@ -1589,13 +1728,13 @@ def main():
     if not config.ligand:
         log.error("未提供配体残基名称。请通过 --ligand 或配置文件中的 ligand 指定。")
         sys.exit(2)
-    # 传统模式单独处理
-    if config.mode == "traditional":
-        run_traditional_mode(config)
-        return
     # 分析模式单独处理
     if args.analyze_only:
         run_post_analysis(config)
+        return
+    # 传统模式单独处理
+    if config.mode == "traditional":
+        run_traditional_mode(config)
         return
 
     # 准备输出目录
@@ -1649,6 +1788,8 @@ def main():
         positions, box_vectors, ligand_indices
     )
     log.info("  ✅ 配体已居中，分子完整性修复完毕")    
+    run_provenance = _write_run_provenance(output_dir, config, system, topology, positions)
+    log.info("🧾 运行 provenance 已保存: %s", os.path.join(output_dir, "run_provenance.json"))
 
     # ----- 1.5 自动构建溶剂腿缓存 -----
     ligand_resname = _get_residue_name_by_atom_index(topology, ligand_indices[0])
@@ -1728,6 +1869,7 @@ def main():
         torsion_params=torsion_params,
         resume=config.resume and not config.reset,
         run_equilibration=not equilibrium_is_done(output_dir) or config.reset,
+        system_type="complex",
         n_steps_per_window=config.n_steps_per_window,
         steps_per_update=config.steps_per_update,
         n_states_per_stage=config.get("stage1_n_states", 16),
@@ -1779,6 +1921,7 @@ def main():
         torsion_params=torsion_params,
         resume=config.resume and not config.reset,
         run_equilibration=not equilibrium_is_done(solvent_out_dir) or config.reset,
+        system_type="solvent",
         n_steps_per_window=config.n_steps_per_window,
         steps_per_update=config.steps_per_update,
         n_states_per_stage=config.get("stage1_n_states", 16),
@@ -1794,7 +1937,9 @@ def main():
     err_solvent = solv_results.get("total_error_kJ_mol", 0.0)
     
     # ----- 8. 计算最终结合自由能 ΔG_bind -----
-    delta_g_bind = dg_complex - dg_solvent
+    apbs_correction = float(config.get("apbs_correction_kJ_mol", 0.0) or 0.0)
+    delta_g_bind_uncorrected = dg_complex - dg_solvent
+    delta_g_bind = delta_g_bind_uncorrected + apbs_correction
     total_err_bind = np.sqrt(err_complex**2 + err_solvent**2)
     
     log.info("\n" + "="*70)
@@ -1802,6 +1947,7 @@ def main():
     log.info("   复合物腿 (膜/蛋白+水) ΔG_cplx  = %.2f ± %.2f kJ/mol", dg_complex, err_complex)
     log.info("   溶剂腿   (纯水)       ΔG_solv  = %.2f ± %.2f kJ/mol", dg_solvent, err_solvent)
     log.info("   Boresch 解析修正      ΔG_rest  = %.2f kJ/mol", dg_boresch)
+    log.info("   APBS 外部长程修正     ΔG_APBS  = %.2f kJ/mol", apbs_correction)
     log.info("   --------------------------------------------------------")
     log.info("   结合自由能 ΔG_bind           = %.2f ± %.2f kJ/mol", delta_g_bind, total_err_bind)
     log.info("                              = %.2f ± %.2f kcal/mol", delta_g_bind/4.184, total_err_bind/4.184)
@@ -1812,10 +1958,31 @@ def main():
         "complex_delta_G_kJ_mol": float(dg_complex),
         "solvent_delta_G_kJ_mol": float(dg_solvent),
         "boresch_correction_kJ_mol": float(dg_boresch),
+        "delta_G_bind_uncorrected_kJ_mol": float(delta_g_bind_uncorrected),
+        "apbs_correction_kJ_mol": float(apbs_correction),
         "delta_G_bind_kJ_mol": float(delta_g_bind),
         "delta_G_bind_kcal_mol": float(delta_g_bind / 4.184),
         "total_error_kJ_mol": float(total_err_bind),
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
+        "provenance": run_provenance,
+        "thermodynamic_cycle": THERMODYNAMIC_CYCLE_DOC,
+        "external_corrections": {
+            "apbs": {
+                "delta_G_kJ_mol": float(apbs_correction),
+                "applied_to": "final_binding_free_energy",
+                "note": config.get("apbs_correction_note", ""),
+            }
+        },
+        "diagnostics": {
+            "complex": complex_results.get("diagnostics", {}),
+            "complex_stage_diagnostics": complex_results.get("stage_diagnostics", {}),
+            "solvent": solv_results.get("diagnostics", {}),
+            "solvent_stage_diagnostics": solv_results.get("stage_diagnostics", {}),
+            "independent_repeats": {
+                "performed": False,
+                "note": "Independent repeat runs are not launched automatically; run the same config with distinct random seeds and compare final_binding_results.json.",
+            },
+        },
     }
     bind_out_path = os.path.join(output_dir, "final_binding_results.json")
     with open(bind_out_path, "w") as f:
