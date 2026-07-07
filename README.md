@@ -1,864 +1,433 @@
-# Atenolol-rank1 ABFE 项目说明
+# Atenolol-rank11 ABFE/IBS workflow
 
-本项目是一个基于 OpenMM 的 ABFE（Absolute Binding Free Energy，绝对结合自由能）计算工作目录，当前以 `Atenolol-rank1` 体系为例，围绕 5 个核心 Python 文件组织完整计算流程。
+This repository is an ABFE (Absolute Binding Free Energy) working directory for the Atenolol-rank11 system. The code is built around OpenMM: it constructs native OpenMM caches from GROMACS `gro/top` inputs, runs both the complex leg and the solvent leg, and aggregates binding free energies from IBS/MBAR/TMBAR-style window sampling results.
 
-这份 README 不只是“怎么运行”，更重点解释这套代码的逻辑分层、数据流、两条计算腿的组织方式，以及每个脚本在全流程中的职责。
-
-## 1. 项目目标
-
-该项目的目标是计算配体与受体体系的结合自由能 `ΔG_bind`。从主入口 `runabfe.py` 的实现可以看出，程序采用标准 ABFE 双腿思路：
-
-- 先计算复合物腿（complex leg）
-  这里是“蛋白/受体 + 配体 + 溶剂”体系中的配体去耦合自由能
-
-- 再计算溶剂腿（solvent leg）
-  这里是“纯水中的配体”去耦合自由能
-
-- 如果启用了 Boresch 限制，还会加入解析修正项
-
-最终结果按下面的形式汇总：
+The currently recommended route is:
 
 ```text
-ΔG_bind = ΔG_complex - ΔG_solvent + ΔG_restraint
+mode = ibs
+decoupling = dual_lambda
+potential = softcore
+boresch_source = simple
 ```
 
-在 `runabfe.py` 末尾，这个结果会保存为：
+`traditional` REMD, DEXP, ORB/MACE Boresch estimation, and external APBS corrections are still present in the code, but they are not the main route for the current results in this directory.
 
-- `output/final_binding_results.json`
+## Current Status
 
-## 2. 目录中最重要的文件
-
-### 2.1 核心 Python 文件
-
-这个项目当前的主要逻辑集中在 5 个 Python 文件中：
-
-1. `runabfe.py`
-   唯一推荐入口。负责参数解析、配置合并、系统加载、缓存管理、Boresch 处理、复合物腿和溶剂腿调度、最终结果汇总。
-
-2. `abfe_pipeline.py`
-   主流程调度器。负责把“预平衡 -> 预优化 -> 分阶段采样 -> MBAR 分析 -> 汇总结果”这条主线串起来。
-
-3. `abfe_preoptimizer.py`
-   预优化模块。负责 ACES/IBS 路径预扫描、自适应 lambda 分布优化、双 lambda 阶段路径生成。
-
-4. `ibs_engine.py`
-   生产采样引擎。负责真正的 IBS 窗口构建、逐窗口模拟、能量落盘、checkpoint、全局 MBAR/TMBAR 分析。
-
-5. `abfe_core.py`
-   物理核心库。负责软核势、DEXP 势、Boresch 限制力、几何估算器、解析修正、单位格式化和系统复制等底层能力。
-
-### 2.2 典型输入文件
-
-- `solv_ions.gro`
-- `topol.top`
-- `Atenolol-rank1.pdb`
-- `Atenolol-rank1.mol2`
-- `abfe_config.json`
-
-这些文件提供初始结构、拓扑、配体信息与运行参数。
-
-### 2.3 典型输出目录
-
-- `output/`
-- `output/checkpoints/`
-- `output/solvent_leg/`
-
-其中 `output/` 是复合物腿默认输出目录，`output/solvent_leg/` 是溶剂腿输出目录。
-
-## 3. 整体架构
-
-从代码结构看，这套程序可以理解为 4 层：
-
-### 第 1 层：命令行与工程组织层
-
-由 `runabfe.py` 负责。
-
-这一层解决的问题是：
-
-- 用户怎么传参
-- 怎么从 JSON 配置和命令行合并得到最终运行参数
-- 系统是从已有缓存读取，还是从 GROMACS 文件重新构建
-- 是否需要自动创建溶剂腿
-- 是否启用 Boresch
-- 是新跑、续跑，还是只分析已有结果
-
-### 第 2 层：流程调度层
-
-由 `abfe_pipeline.py` 负责。
-
-这一层把一次 ABFE 任务拆成可管理的步骤：
-
-- 预平衡
-- 坐标修复与安全松弛
-- 路径预优化
-- 去电荷阶段采样
-- 去范德华阶段采样
-- 全局自由能分析
-- Boresch 修正与最终结果写出
-
-### 第 3 层：窗口采样与统计分析层
-
-由 `ibs_engine.py` 负责。
-
-这一层关注的是：
-
-- 如何把一条 lambda 路径切成重叠窗口
-- 每个窗口如何构建 OpenMM 系统
-- 如何进行逐窗口模拟
-- 如何保存能量矩阵和偏置历史
-- 如何做全局 MBAR / TMBAR 拼接
-
-### 第 4 层：物理模型层
-
-由 `abfe_core.py` 负责。
-
-这一层是底层“物理零件库”，提供：
-
-- ACES softcore 势
-- DEXP surrogate 势
-- Lambda 依赖的 Boresch 力
-- Boresch 解析修正
-- 几何约束估算器
-- Orb/几何方法的 Boresch 候选生成
-- 单位处理与结果格式化
-
-## 4. 主执行逻辑
-
-这里按 `runabfe.py -> abfe_pipeline.py -> ibs_engine.py` 的调用关系，把程序主线梳理一遍。
-
-### 4.1 命令行入口
-
-程序入口在：
-
-- `runabfe.py:1362` 的 `main()`
-
-主入口支持几类模式：
-
-- 默认 ABFE 运行模式
-- `prepare` 预处理子命令
-- `traditional` 传统模式
-- `--analyze-only` 只分析已有结果
-
-其中正常最常用的是默认模式。
-
-### 4.2 配置读取与参数合并
-
-`runabfe.py` 会先解析命令行参数，再构造 `RunConfig`。这意味着：
-
-- `abfe_config.json` 提供默认值
-- 命令行参数优先级更高
-
-当前目录自带的 `abfe_config.json` 里已经设置了典型生产参数，例如：
-
-- `preset = production`
-- `platform = CUDA`
-- `decoupling = dual_lambda`
-- `potential = softcore`
-- `stage1_n_states = 16`
-- `stage2_n_states = 16`
-- `n_equil_steps = 5000000`
-
-### 4.3 系统加载策略
-
-主程序优先走缓存加载，而不是每次都重新从 GROMACS 构建。
-
-执行逻辑是：
-
-1. 如果 `output/` 中已有原生缓存，并且没有指定 `--reset`
-   直接调用 `load_native_system(...)` 读取缓存
-
-2. 如果没有缓存
-   先从 `--gro` 和 `--top` 构建系统
-
-3. 构建完成后
-   立即写入原生缓存，再重新从缓存加载一次
-
-这样做的意义是：
-
-- 统一后续对象来源
-- 避免 GROMACS 解析与即时对象混用引入副作用
-- 让续跑机制更稳定
-
-### 4.4 初始坐标处理
-
-系统加载后，`runabfe.py` 会对坐标做两件事：
-
-1. 转成安全、统一的坐标格式
-2. 通过 `center_system_rigidly(...)` 做配体居中与 PBC 完整性修复
-
-这个步骤很关键，因为后面的 Boresch 估计、窗口初始化、限制力检查都依赖合理的几何构型。
-
-### 4.5 自动构建溶剂腿
-
-这套代码不是只算复合物腿，而是一键 ABFE。
-
-因此在复合物腿运行前，主程序会检查溶剂腿缓存是否存在：
-
-- 如果不存在，自动构建 ligand-in-water 体系并缓存
-- 如果已经存在，则直接复用
-
-这意味着用户只要给出复合物体系和配体信息，程序就会自动补齐溶剂腿所需缓存。
-
-### 4.6 Boresch 限制处理
-
-主入口会调用：
-
-- `resolve_boresch_restraint(...)`
-
-用来确定复合物腿是否启用 Boresch 以及参数从哪里来。代码中支持几种来源：
-
-- 简单几何法
-- Orb ML/估算器路线
-- 外部文件指定
-
-如果启用了 Boresch，并且没有 `--skip-rebalance`，程序还会调用：
-
-- `ABFEPipeline._rebalance_with_boresch(...)`
-
-先做一次带限制力再平衡，目的是让当前坐标与限制几何更一致，避免正式采样时刚开始就产生不合理拉扯。
-
-### 4.7 复合物腿计算
-
-复合物腿通过：
-
-- `ABFEPipeline.run_full_pipeline(...)`
-
-启动。
-
-这里会把以下参数传进去：
-
-- decoupling 方案
-- 势能模型
-- Boresch 参数
-- 二面角修正参数
-- 续跑标记
-- 是否执行预平衡
-- 每窗口步数
-- 每次更新步数
-- 每阶段状态数
-
-### 4.8 溶剂腿计算
-
-复合物腿结束后，程序会从缓存中加载溶剂腿系统，再创建第二个 `ABFEPipeline` 实例。
-
-这里有一个非常重要的硬编码逻辑：
-
-- 溶剂腿强制 `boresch_params = None`
-
-也就是说，溶剂腿绝对不挂 Boresch 限制。这符合 ABFE 常见做法，因为 Boresch 只作用在复合物腿中的受体-配体相对构型约束上。
-
-### 4.9 最终结果汇总
-
-最后 `runabfe.py` 会取出：
-
-- `dg_complex`
-- `dg_solvent`
-- `dg_boresch`
-
-并计算：
+Warning: the values currently stored in `output/final_binding_results.json` were computed with the old sign convention, `Delta G_bind = Delta G_complex - Delta G_solvent`. That is inconsistent with the current code in `runabfe.py`, where `delta_g_bind_uncorrected = dg_solvent - dg_complex`. The calculation must be rerun to obtain values whose sign matches the current formula. See "Interpreting Results" below and `PHYSICS_DEFECTS.md` for details. The following numbers have been recomputed using the current formula while keeping the original `Delta G_complex` and `Delta G_solvent` values unchanged; they are only a reference and do not mean that new sampling has already been performed:
 
 ```text
-ΔG_bind = (ΔG_complex - ΔG_solvent) + ΔG_boresch
+Delta G_complex = 192.8876 kJ/mol
+Delta G_solvent = 152.0514 kJ/mol
+Boresch correction = -36.5108 kJ/mol
+APBS correction = 0.0000 kJ/mol
+Delta G_bind = Delta G_solvent - Delta G_complex = -40.8362 kJ/mol = -9.7601 kcal/mol
+reported error = 1.3178 kJ/mol
 ```
 
-误差则用两腿误差平方和开根号合并。
+A negative value indicates favorable binding: decoupling the ligand in the pocket costs more free energy (`Delta G_complex`) than decoupling it in solution (`Delta G_solvent`), which means the ligand interacts more strongly in the pocket. That is why it binds. The positive-sign result remaining on disk has the wrong physical sign and should not be used for any conclusion.
 
-## 5. `abfe_pipeline.py` 的核心逻辑
+This is not a fully corrected, closed-cycle result ready to be treated as a final publication value. The most important current physical boundaries are:
 
-`abfe_pipeline.py` 是整个项目最重要的流程层文件，建议在阅读代码时重点先看它。
+- The LJ long-range dispersion tail/LRC correction for the VDW/vanishing leg has not yet been implemented. In both `output/final_results.json` and `output/solvent_leg/final_results.json`, `lj_long_range_dispersion_correction.status` is `not_implemented`.
+- The APBS correction is only added to the final `Delta G_bind` as an external term, `Delta G_APBS`. The current `apbs_correction_kJ_mol = 0.0`, so it is disabled. APBS cannot replace the LJ tail correction.
+- Older outputs may still contain historical PME self-correction text in `thermodynamic_cycle.md` and provenance. The current `output/final_binding_results.json` includes exactly such a stale text snapshot under `provenance.thermodynamic_cycle`. Treat `PHYSICS_DEFECTS.md` and current diagnostics as authoritative. The current conclusion is that the manual `+C*lambda^2` PME self-energy "correction" has been withdrawn and should not be used as a production correction term.
+- The current Boresch harmonicity check passes (`diagnostics.boresch.boresch_harmonicity_check.harmonic_assumption_ok = true`), but 3 of the 6 force constants (`kr`, `kthetaA`, `kphiA`) were clipped to conservative ranges (`force_constant_clipped`). This must be retained in the result interpretation.
+- Stage 2 uses `Local-TMBAR-Stitched`, and the uncertainty propagates window offset variance. The complex leg has `offset_error_contribution approx 0.52 kJ/mol`, and the solvent leg has `approx 0.82 kJ/mol`. However, the uncertainty still does not include full global MBAR covariance, autocorrelation time, or effective sample size corrections. The overlap proxies are low (`min_overlap_proxy approx 0.027` for the complex leg and `approx 0.043` for the solvent leg), so denser windows and/or more sampling are recommended for follow-up confirmation.
+- No independent repeat has been performed yet: `diagnostics.independent_repeats.performed = false`.
 
-### 5.1 `ABFEPipeline`
+See `PHYSICS_DEFECTS.md` for a more detailed list of methodological defects and repair status. See `RELEASE_AUDIT_REMAINING.md` for remaining engineering-audit items.
 
-主类在：
-
-- `abfe_pipeline.py:405`
-
-它持有一次单腿计算所需的核心状态：
-
-- system
-- topology
-- positions
-- box_vectors
-- ligand_indices
-- output_dir
-- checkpoint_dir
-- platform_name
-
-也就是说，`ABFEPipeline` 本质上就是“一条腿的完整运行上下文”。
-
-### 5.2 `run_full_pipeline(...)`
-
-完整入口在：
-
-- `abfe_pipeline.py:1811`
-
-这个函数大体按下面顺序执行。
-
-#### 步骤 1：设备策略检测
-
-程序会根据窗口数和平台名选择 GPU 策略，决定使用哪些设备。
-
-#### 步骤 2：恢复全局状态
-
-如果开启了 `resume`，会读取 pipeline state，检查哪些阶段已经完成，避免重复计算。
-
-#### 步骤 3：应用二面角修正
-
-如果外部传入了 `torsion_params`，会在预平衡前应用到系统里。
-
-#### 步骤 4：预平衡
-
-这是单腿计算的物理准备阶段。
-
-逻辑包括：
-
-- 如果 `resume` 且预平衡轨迹和状态都有效，则尝试跳过
-- 如果轨迹有效，直接读取最后一帧作为新的起始构型
-- 如果状态不完整或检查失败，则重新执行预平衡
-- 新预平衡完成后，再做一次快速最小化，去掉残余应力
-
-这部分逻辑明显做了较多工程加固，目的是提高断点续跑的稳定性。
-
-#### 步骤 5：安全松弛
-
-无论是否跳过预平衡，pipeline 都会执行一次短的 L-E 界面安全弛豫。
-
-从代码注释看，这一步是为了缓解：
-
-- PBC 修复
-- 抽帧续跑
-- 坐标重载
-
-可能导致的局部水分子与配体接触冲突。
-
-#### 步骤 6：更新 Boresch 平衡几何量
-
-如果 Boresch 参数有效，pipeline 会根据当前最新坐标更新：
-
-- 距离平衡值
-- 角度平衡值
-- 二面角平衡值
-
-这样可以减少限制项和当前构型的偏差。
-
-#### 步骤 7：阶段级续跑判断
-
-`dual_lambda` 模式下，程序会分别检查：
-
-- Stage 1: decharging
-- Stage 2: vanishing
-
-同时也会检查预优化缓存文件是否匹配当前状态数。
-
-如果匹配，则直接复用已有优化路径。
-
-### 5.3 双 lambda 路线
-
-从 `run_full_pipeline(...)`、`DualLambdaPreOptimizer` 和 `IBSWindowManagerDualLambda` 可以看出，当前项目的默认主路线是 `dual_lambda`。
-
-它把去耦合过程拆成两个阶段：
-
-1. Stage 1: 去电荷（decharging）
-   一般保持 vdw 端开启，逐步关闭 coulomb 相互作用
-
-2. Stage 2: 去范德华（vanishing）
-   在 coulomb 已关闭基础上，继续逐步关闭 vdw 相互作用
-
-这么做的好处是：
-
-- 物理路径更稳定
-- 采样更容易控制
-- 能把电荷与范德华去耦合分开优化
-
-### 5.4 `TraditionalABFEPipeline`
-
-除了 IBS 双 lambda 路线外，文件中还有：
-
-- `TraditionalABFEPipeline`
-
-位置在：
-
-- `abfe_pipeline.py:2501`
-
-这个类提供传统模式，适合做对照、兼容旧路线或调试。不过从主入口默认参数和整体代码重心来看，当前推荐路线仍然是 `ibs + dual_lambda`。
-
-## 6. `abfe_preoptimizer.py` 的核心逻辑
-
-预优化模块解决的是一个非常实际的问题：
-
-- lambda 状态不是越均匀越好
-- 需要根据能量波动和采样难度，把更多状态分配到更“难”的区间
-
-### 6.1 `ABFEPreOptimizer`
-
-主类在：
-
-- `abfe_preoptimizer.py:61`
-
-这个类面向较通用的单路径优化逻辑，负责：
-
-- 探测系统中的 lambda 参数名
-- 计算能量波动
-- 优化 softcore 参数
-- 优化窗口范围
-- 自适应调整 lambda 路径
-
-### 6.2 `DualLambdaPreOptimizer`
-
-双 lambda 专用类在：
-
-- `abfe_preoptimizer.py:593`
-
-它会分别为两个阶段做路径优化：
-
-- `optimize_stage1_decharging(...)`
-- `optimize_stage2_vanishing(...)`
-
-### 6.3 Stage 1 的优化思想
-
-去电荷阶段的逻辑大致是：
-
-- 固定 `lambda_vdw = 1`
-- 让 `lambda_coul` 从 1 逐步走到 0
-- 在每个候选点短采样，收集 group 1 能量
-- 用能量方差估计该区域的“困难程度”
-- 把更多 lambda 点分布到方差更大的区域
-
-换句话说，它不是简单线性切分，而是“哪里难就往哪里多放状态”。
-
-### 6.4 Stage 2 的优化思想
-
-去范德华阶段的逻辑类似：
-
-- 固定 `lambda_coul = 0`
-- 让 `lambda_vdw` 从 1 逐步走到 0
-- 对每个候选点做短采样
-- 依据能量方差重新分布 lambda 点
-
-### 6.5 预优化的意义
-
-这一步的意义不是“计算最终自由能”，而是为正式 IBS 采样准备更好的离散路径：
-
-- 降低相邻状态差异
-- 改善窗口重叠
-- 提高 MBAR 的可解性
-- 减少把采样预算浪费在过于容易的区间
-
-## 7. `ibs_engine.py` 的核心逻辑
-
-这个文件是真正做生产采样的引擎层。
-
-### 7.1 `generate_overlapping_windows(...)`
-
-函数位置：
-
-- `ibs_engine.py:632`
-
-它负责把一串 lambda 状态切分为多个重叠窗口。
-
-之所以要重叠，是因为：
-
-- 相邻窗口之间需要共享一部分状态
-- 这样才能把局部采样结果拼接成全局自由能曲线
-
-### 7.2 `IBSWindowManagerDualLambda`
-
-主窗口管理器在：
-
-- `ibs_engine.py:1501`
-
-它负责：
-
-- 为每个窗口构建 IBS 双 lambda 系统
-- 配置平台与积分器
-- 设置周期性盒子
-- 做最小化
-- 做测试步进
-- 做 Boresch 安全检查
-- 启动正式生产采样
-- 原子化保存能量、偏置和基础能量数组
-
-### 7.3 为什么窗口管理器里有很多“安全步骤”
-
-从代码看，窗口正式开始前会做很多保护性操作：
-
-- 最小化
-- Boresch 几何检查
-- 测试性步进
-- NaN 检测
-- 力分解诊断
-- 约束死锁检查
-- Boresch 强度渐进恢复
-
-这些逻辑说明项目作者非常关注实际模拟中容易出现的工程问题，例如：
-
-- 坐标炸掉
-- 约束不收敛
-- 初始限制力过强
-- 某些窗口一启动就 NaN
-
-所以这个文件不只是“跑模拟”，更像是“带大量稳定性护栏的生产执行器”。
-
-### 7.4 MBAR / TMBAR 分析
-
-该文件中负责分析的主要对象包括：
-
-- `GlobalMBARAnalyzer`
-- `TraditionalMBARAnalyzer`
-- `solve_stage_integrated(...)`
-
-它们的职责是把每个窗口输出的局部能量矩阵整合起来，求得：
-
-- 每一阶段的自由能变化
-- 不确定度
-- 最终可供 pipeline 汇总的阶段结果
-
-## 8. `abfe_core.py` 的核心逻辑
-
-这是底层物理能力文件，代码量也很大，但阅读时不一定要最先啃。
-
-### 8.1 `ACESoftcorePotential`
-
-位置：
-
-- `abfe_core.py:123`
-
-这是默认 softcore 势模型的核心类，用于构建和传递去耦合过程中需要的软核参数。
-
-### 8.2 `DEXPSurrogatePotential`
-
-位置：
-
-- `abfe_core.py:250`
-
-如果用户选择 `--potential dexp`，就会走这条分支。
-
-它的作用是提供一个替代 softcore 的 DEXP 势表示，并支持从字典或 JSON 参数恢复。
-
-### 8.3 Boresch 相关
-
-这个文件中与 Boresch 相关的核心对象有：
-
-- `calculate_boresch_analytical_correction(...)`
-- `LambdaDependentBoreschForce`
-- `GeometricRestraintEstimator`
-- `OrbBoreschEstimator`
-
-它们分别覆盖：
-
-- 解析修正计算
-- 可随 lambda 缩放的限制力实现
-- 几何候选约束生成
-- 机器学习/Orb 路线的候选估计
-
-### 8.4 `UnitFormatter`
-
-位置：
-
-- `abfe_core.py:2617`
-
-主要用来做结果格式化，方便把自由能结果打印成人类可读形式。
-
-### 8.5 `ensure_owned_system(...)`
-
-位置：
-
-- `abfe_core.py:2740`
-
-这个函数是工程上很重要的辅助函数，用于确保系统对象是当前上下文安全拥有的副本，避免窗口构建或多阶段处理中因为共享对象产生副作用。
-
-## 9. 5 个 Python 文件之间如何协作
-
-可以把它们理解成下面这条调用链：
+## Main Files
 
 ```text
-runabfe.py
-  -> abfe_pipeline.py
-     -> abfe_preoptimizer.py
-     -> ibs_engine.py
-        -> abfe_core.py
+runabfe.py              Command-line entry point; config merging, cache construction, two-leg scheduling, final aggregation
+abfe_pipeline.py        Single-leg ABFE pipeline; pre-equilibration, pre-optimization, sampling, single-leg result writing
+abfe_preoptimizer.py    Lambda-path pre-optimization; dual-lambda and 2D path helper logic
+ibs_engine.py           IBS sampling, window energies, MBAR/TMBAR post-processing, and checkpoints
+abfe_core.py            Softcore/DEXP potentials, Boresch restraints, analytical corrections, and utilities
+apbs_correction.py      Optional helper script for external APBS correction; does not handle LJ tail correction
+abfe_config.json        Example/compatibility config for the current directory
+environment.yml         Example environment
+PHYSICS_DEFECTS.md      List of physical/modeling issues that affect Delta G values
+RELEASE_AUDIT_REMAINING.md  Remaining engineering-audit checklist
 ```
 
-更具体一点：
+This directory also contains Atenolol-rank11 input and intermediate files, such as `solv_ions.gro`, `topol.top`, `Atenolol-rank1.*`, `output/`, and related files.
 
-1. `runabfe.py` 决定“跑什么、从哪里开始、哪些参数生效”
-2. `abfe_pipeline.py` 决定“一条腿按什么顺序跑”
-3. `abfe_preoptimizer.py` 决定“路径怎么分布更合理”
-4. `ibs_engine.py` 决定“窗口怎么建、怎么采样、怎么分析”
-5. `abfe_core.py` 提供“底层物理对象与通用工具”
+## Dependencies
 
-## 10. 当前目录里的 `abfe_config.json`
+A conda/mamba environment is recommended. Core dependencies include:
 
-当前项目已经带了一个配置文件：
+- Python 3.10+
+- OpenMM
+- NumPy
+- SciPy
+- MDTraj
+- PyMBAR
 
-- [abfe_config.json](/K:/ABFE_IBS/Atenolol-rank1/abfe_config.json:1)
+Optional dependencies:
 
-其中值得特别注意的字段有：
+- CUDA or OpenCL for GPU runs.
+- A GROMACS force-field include directory for the first system build from `.top`.
+- OpenMM-ML, torch, and MACE/ORB-related dependencies. These are only needed when using `--boresch-source auto`, `orb_simple`, `orb_ml`, or related ML functionality.
 
-- `preset`
-  预设强度，当前是 `production`
+The current `output/run_provenance.json` records the runtime environment as Python 3.12.13, OpenMM 8.5.1, NumPy 2.4.3, PyMBAR 4.0.3, and MDTraj 1.10.3.
 
-- `platform`
-  当前设置为 `CUDA`
+## Input Requirements
 
-- `decoupling`
-  当前设置为 `dual_lambda`
+The first cache build usually requires:
 
-- `potential`
-  当前设置为 `softcore`
+- `--gro`: GROMACS coordinate file. The current config uses `solv_ions.gro`.
+- `--top`: GROMACS topology file. The current config uses `topol.top`.
+- `--ligand`: ligand residue name. The current config uses `MOL`.
+- `--gmx-path`: GROMACS force-field include directory. It can also be detected from `GMXDATA` or the local `gmx` installation.
+- `--ligand-xml`: optional. This can explicitly specify ligand XML/FFXML when building the solvent leg. If it is not provided, the code tries to extract the ligand from the GROMACS topology and generate `output/ligand_only.xml`.
 
-- `boresch`
-  当前默认开启
+Command-line arguments take precedence over the config file.
 
-- `n_equil_steps`
-  预平衡步数
+## Quick Start
 
-- `n_steps_per_window`
-  每个窗口的生产步数
-
-- `stage1_n_states` / `stage2_n_states`
-  两阶段的状态数
-
-- `gmx_path`
-  当前配置里是 Linux 风格路径，如果你在 Windows 或另一台 Linux 机器上运行，通常需要改成你本机实际的 GROMACS 力场目录
-
-## 11. 如何运行
-
-### 11.1 最常用命令
+Resume an existing calculation using the current config:
 
 ```bash
-python runabfe.py --ligand MOL --gro solv_ions.gro --top topol.top --config abfe_config.json
+python runabfe.py --config abfe_config.json --ligand MOL --resume
 ```
 
-### 11.2 续跑
+First run, or rebuild caches:
 
 ```bash
-python runabfe.py --ligand MOL --config abfe_config.json --resume
+python runabfe.py \
+  --config abfe_config.json \
+  --gro solv_ions.gro \
+  --top topol.top \
+  --ligand MOL \
+  --gmx-path /path/to/gromacs/share/gromacs/top \
+  --output ./output \
+  --boresch \
+  --boresch-source simple
 ```
 
-适用场景：
-
-- `output/` 中已经有缓存和 checkpoint
-- 希望从中断处继续
-
-### 11.3 强制重跑
+Ignore caches and restart:
 
 ```bash
-python runabfe.py --ligand MOL --gro solv_ions.gro --top topol.top --config abfe_config.json --reset
+python runabfe.py --config abfe_config.json --ligand MOL --reset
 ```
 
-适用场景：
-
-- 你怀疑缓存已经不可靠
-- 改了关键参数，想从头计算
-
-### 11.4 只做分析
+Only post-process existing window energies and checkpoints:
 
 ```bash
-python runabfe.py --ligand MOL --config abfe_config.json --analyze-only
+python runabfe.py --config abfe_config.json --ligand MOL --analyze-only
 ```
 
-前提是对应能量数据和中间结果已经存在。
-
-### 11.5 预处理子命令
-
-代码中还支持：
+Example CPU smoke test with a small budget:
 
 ```bash
-python runabfe.py prepare --gro solv_ions.gro --top topol.top --ligand MOL --output-dir ./prep_output
+python runabfe.py \
+  --config abfe_config.json \
+  --platform CPU \
+  --n-steps-per-window 1000 \
+  --n-states-per-stage 4 \
+  --output ./smoke_output \
+  --reset
 ```
 
-这个子命令可用于生成预处理文件，比如：
+## Config Example
+
+The current `abfe_config.json` is a compatibility JSON config. Key fields are:
+
+```json
+{
+  "preset": "production",
+  "platform": "CUDA",
+  "output": "./output",
+  "temperature": 300.0,
+
+  "gro": "solv_ions.gro",
+  "top": "topol.top",
+  "ligand": "MOL",
+  "gmx_path": "/path/to/gromacs/share/gromacs/top",
+
+  "decoupling": "dual_lambda",
+  "potential": "softcore",
+
+  "n_steps_per_window": 250000,
+  "steps_per_update": 500,
+  "stage1_n_states": 12,
+  "stage2_n_states": 18,
+
+  "boresch": true,
+  "boresch_source": "simple",
+  "boresch_batch": 0,
+  "boresch_select": 1,
+
+  "skip_rebalance": false,
+  "rebalance_steps": 50000,
+
+  "enable_early_stop": false,
+  "enable_gradual_warmup": true,
+  "warmup_steps": 500000,
+
+  "resume": false,
+  "reset": false
+}
+```
+
+Note: the `gmx_path` in this repository is machine-specific and must be checked before running on another machine.
+
+## Command Entry Points
+
+Main command:
+
+```bash
+python runabfe.py [options]
+```
+
+Important options:
+
+- `--mode {ibs,traditional}`: sampling engine. Default: `ibs`.
+- `--decoupling {dual_lambda,single_lambda,2d_diagonal,2d_geodesic}`: decoupling path. Default: `dual_lambda`.
+- `--potential {softcore,dexp}`: potential model. Default: `softcore`.
+- `--decharge-method {pme,shadow_ibs}`: only affects Stage 1 (decharging) for `--decoupling dual_lambda`. Default: `pme`, preserving the original behavior. `shadow_ibs` is an experimental Shadow-Coulomb IBS path. It has not been independently physically validated, only supports neutral ligands, and currently does not support `--parallel-stages`. Production results should keep the default `pme`.
+- `--preset {test,production,high_accuracy}`: sampling preset.
+- `--stage1-n-states`: number of lambda states for the decharging stage. Takes precedence over `--n-states-per-stage`.
+- `--stage2-n-states`: number of lambda states for the vanishing stage. Takes precedence over `--n-states-per-stage`.
+- `--resume`: reuse caches, checkpoints, window energies, and pre-optimized paths.
+- `--reset`: ignore caches and restart.
+- `--parallel-stages`: try to run the decharging and vanishing stages in parallel.
+- `--n-workers`: number of workers for offline energy recomputation/post-processing.
+- `--apbs-correction-kj-mol`: add an external APBS correction to the final `Delta G_bind`.
+- `--apbs-correction-note`: record the source of the APBS correction.
+
+Built-in subcommand:
+
+```bash
+python runabfe.py self-test
+```
+
+Runs lightweight tests and physical-convention checks. Note that the current self-test still contains a historical PME self-correction sign check. If it conflicts with the latest physical conclusion, the code/tests should be fixed first instead of treating that check as production correction evidence.
+
+```bash
+python runabfe.py prepare \
+  --gro solv_ions.gro \
+  --top topol.top \
+  --ligand MOL \
+  --gmx-path /path/to/gromacs/share/gromacs/top \
+  --output-dir ./prep_output \
+  --save-boresch boresch.json
+```
+
+Generates preprocessing files, such as Boresch parameters or DEXP parameters.
+
+```bash
+python runabfe.py refine-lambda-path \
+  --stage-dir output/vanishing \
+  --preopt-file output/checkpoints/preopt_dual_vanishing.json \
+  --stage-type vdw \
+  --max-window-span-kj 35.0 \
+  --overlap 2
+```
+
+Redistributes lambda states and window boundaries from existing window energies. It overwrites `--preopt-file`, so keep a backup before using it.
+
+## Boresch Sources
+
+Allowed values for `--boresch-source`:
+
+- `simple`: pure geometric fluctuation estimate without ML dependencies. This is the current recommendation and the source used by the current results.
+- `fluctuation`: a geometric fluctuation route similar to `simple`.
+- `traditional`: reads an external Boresch anchor file and requires `--boresch-anchors`.
+- `orb_ml`: reads an ORB/ML prediction file and requires `--boresch-orb`.
+- `orb_simple`: uses a single-candidate estimate from ORB/MACE pocket-force projection. Requires ML dependencies and model licensing.
+- `auto`: uses ORB/MACE multi-candidate enumeration. Requires ML dependencies and model licensing.
+
+Internal estimation routes save parameters and diagnostics in `output/boresch_*.json`. For the current results, inspect these Boresch diagnostics carefully:
+
+- `diagnostics.boresch.analytical_release_reliable`
+- `boresch_correction_diagnostics.diagnostics.boresch_harmonicity_check`
+- `force_constant_clipped`
+- `diagnostics.warnings`
+
+## Output Structure
+
+Common outputs:
+
+```text
+output/run_provenance.json              Config, command line, hashes, software versions
+output/final_binding_results.json       Final Delta G_bind summary
+output/final_results.json               Complex-leg results
+output/solvent_leg/final_results.json   Solvent-leg results
+output/pipeline.log                     Complex-leg log
+output/solvent_leg/pipeline.log         Solvent-leg log
+output/system_native.xml                Complex OpenMM System cache
+output/system_solvent.xml               Solvent-leg OpenMM System cache
+output/topology.cif                     Complex topology cache
+output/topology_solvent.cif             Solvent-leg topology cache
+output/boresch_simple.json              Current Boresch parameter cache
+output/checkpoints/                     Complex-leg checkpoints and stage state
+output/solvent_leg/checkpoints/         Solvent-leg checkpoints and stage state
+output/decharging/                      Decharging-stage trajectories/energies
+output/vanishing/                       Vanishing-stage window energies
+```
+
+Window-level files usually include:
 
-- Boresch 文件
-- DEXP 拟合输入/输出
+```text
+dual_window_*_energies.npy
+dual_window_*_bias.npy
+dual_window_*_base.npy
+dual_window_*_convergence.json
+decharging_pme_u_kn.npy
+decharging_pme_u_kn.meta.json
+```
 
-## 12. 主要命令行参数
+These files are the core inputs for `--analyze-only` and `refine-lambda-path`. Confirm that they are no longer needed before cleaning them up.
 
-从 `runabfe.py` 的参数定义来看，常用参数包括：
+## Interpreting Results
 
-- `--gro`
-  GROMACS 结构文件，首次构建时需要
+The final binding free energy is aggregated as:
 
-- `--top`
-  GROMACS 拓扑文件，首次构建时需要
+```text
+Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS
+```
 
-- `--ligand`
-  配体残基名，例如 `MOL`
+where:
 
-- `--ligand-xml`
-  配体力场 XML/FFXML，主要用于溶剂腿构建
+- `Delta G_complex` and `Delta G_solvent` are both defined as decoupling free energies for their respective legs, from lambda 1 to 0 (coupled to decoupled). Larger values mean decoupling is harder and the interactions are stronger.
+- `Delta G_complex` already includes the analytical Boresch release correction for the complex leg.
+- The solvent leg does not use Boresch, so `boresch_correction_kJ_mol = 0`.
+- For a genuinely binding ligand, `Delta G_complex > Delta G_solvent` because decoupling in the pocket is harder. Therefore, `Delta G_bind` should be negative, indicating favorable binding.
+- `Delta G_APBS` defaults to 0. It is only applied when `--apbs-correction-kj-mol` is passed explicitly.
+- The LJ tail/LRC correction is currently not added automatically to either leg.
 
-- `--gmx-path`
-  GROMACS 力场 include 目录
+Before treating a result as ready for the next level of discussion, check at least:
 
-- `--output`
-  输出目录，默认 `./output`
+- Whether `output/final_binding_results.json` exists and has a timestamp matching the current run.
+- Whether `provenance.hashes.code_sha256` matches the code version you intend to archive.
+- Whether `lj_long_range_dispersion_correction.status` is still `not_implemented`.
+- Whether `stage_diagnostics.stage2.min_overlap_proxy` is too low.
+- Whether `stage_diagnostics.*.uncertainty_note` still reports missing full covariance/autocorrelation corrections.
+- Whether the Boresch harmonicity check has `ok = true` and `harmonic_assumption_ok = true`.
+- Whether many entries in `force_constant_clipped` are `true`.
+- Whether independent repeats have been performed. The current result records `independent_repeats.performed = false`.
 
-- `--config`
-  JSON 配置文件
+## Caches and Resume Behavior
 
-- `--resume`
-  从 checkpoint 恢复运行
+`--resume` tries to reuse:
 
-- `--reset`
-  忽略缓存，强制重新开始
+- `system_native.xml` / `system_solvent.xml`
+- `ligand_indices*.json`
+- `topology*.cif`
+- `pre_equilibration.dcd`
+- `checkpoints/pre_equil.chk`
+- `boresch_*.json`
+- `preopt_dual_*.json`
+- Stage sampling results and window energy files
 
-- `--mode`
-  `ibs` 或 `traditional`
+Use a new `--output` directory or `--reset` in the following cases:
 
-- `--decoupling`
-  当前公开接口支持 `dual_lambda`、`single_lambda`、`2d_diagonal`、`2d_geodesic`
+- `gro/top/ligand` changed.
+- Ligand parameters or `gmx_path` changed.
+- `decoupling`, `potential`, or DEXP parameters changed.
+- The number of lambda states, window density, or sampling budget changed.
+- The Boresch source, anchors, or candidate selection changed.
+- You want to fully refresh old `thermodynamic_cycle` or provenance text.
 
-- `--potential`
-  `softcore` 或 `dexp`
+## Parallelism and GPU
 
-- `--boresch` / `--no-boresch`
-  显式开启或关闭 Boresch 限制
+`--parallel-stages` tries to run decharging and vanishing in parallel. Under CUDA, if both stages share the same GPU, the code may fall back to serial execution to avoid context conflicts.
 
-- `--boresch-source`
-  指定 Boresch 来源
+Linux shell example:
 
-- `--skip-rebalance`
-  启用 Boresch 时跳过再平衡
+```bash
+IBS_STAGE1_CUDA_DEVICE=0 IBS_STAGE2_CUDA_DEVICE=1 \
+python runabfe.py --config abfe_config.json --ligand MOL --resume --parallel-stages
+```
 
-- `--rebalance-steps`
-  再平衡步数
+Windows PowerShell example:
 
-- `--n-steps-per-window`
-  每窗口采样步数
+```powershell
+$env:IBS_STAGE1_CUDA_DEVICE = "0"
+$env:IBS_STAGE2_CUDA_DEVICE = "1"
+python runabfe.py --config abfe_config.json --ligand MOL --resume --parallel-stages
+```
 
-- `--steps-per-update`
-  采样更新频率
+## FAQ
 
-- `--n-states-per-stage`
-  每阶段状态数
+### `ModuleNotFoundError: No module named 'openmm'`
 
-- `--enable-early-stop`
-  启用提前停止逻辑
+The current Python environment does not have OpenMM installed, or the correct environment has not been activated:
 
-- `--enable-gradual-warmup`
-  启用渐进预热
+```bash
+python -c "import openmm; print(openmm.__version__)"
+```
 
-- `--disable-warmup`
-  关闭预热
+### GROMACS include files cannot be found
 
-- `--warmup-steps`
-  预热步数
+Check that `--gmx-path` points to a directory containing `.ff` folders, for example:
 
-- `--n-workers`
-  并行 worker 数
+```text
+/path/to/gromacs/share/gromacs/top
+```
 
-- `--parallel-stages`
-  去电荷和去 vdW 阶段并行执行
+You can also set `GMXDATA` so the code can try `$GMXDATA/top` automatically.
 
-## 13. 输出文件说明
+### Ligand residue cannot be found
 
-运行结束后，常见输出包括：
+Confirm that `--ligand MOL` matches the residue name in the `.gro/.top` files. The current directory uses `MOL`.
 
-- `output/pipeline.log`
-  主流程日志
+### Solvent-leg construction fails
 
-- `output/pre_equilibration.dcd`
-  预平衡轨迹
+A common cause is incomplete ligand XML/FFXML or failed extraction from the GROMACS topology. Try explicitly passing `--ligand-xml`, or check whether `output/ligand_only.xml` was generated.
 
-- `output/checkpoints/pre_equil.chk`
-  预平衡 checkpoint
+### Automatic Boresch estimation fails
 
-- `output/checkpoints/pipeline_state.json`
-  全局流程状态
+The current recommendation is to start with the non-ML route:
 
-- `output/checkpoints/preopt_dual_decharging.json`
-  去电荷阶段预优化缓存
+```bash
+--boresch --boresch-source simple
+```
 
-- `output/checkpoints/preopt_dual_vanishing.json`
-  去范德华阶段预优化缓存
+If the anchors are unstable, inspect `output/boresch_simple.json`, `pre_equilibration.dcd`, and the Boresch harmonicity diagnostics.
 
-- `output/final_results.json`
-  单腿结果
+### `--analyze-only` is missing energy files
 
-- `output/final_binding_results.json`
-  最终结合自由能结果
+At minimum, keep the stage checkpoints or window-level `.npy` energy files. Do not delete these casually:
 
-- `output/solvent_leg/final_results.json`
-  溶剂腿结果
+```text
+output/checkpoints/stage1_decharging.json
+output/checkpoints/stage2_vanishing.json
+output/decharging/decharging_pme_u_kn.npy
+output/vanishing/dual_window_*_energies.npy
+```
 
-- `output/solvent_leg/checkpoints/`
-  溶剂腿断点续跑状态
+### `thermodynamic_cycle` in the results conflicts with the defect list
 
-此外，还会看到大量窗口级文件，例如：
+This is a known issue caused by stale historical provenance text. The current README and `PHYSICS_DEFECTS.md` are authoritative: APBS does not replace the LJ tail correction, the manual PME self `+C*lambda^2` term is not used as a production correction, and `Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS`, not `Delta G_complex - Delta G_solvent`.
 
-- `dual_window_*_energies.npy`
-- `dual_window_*_bias.npy`
-- `dual_window_*_base.npy`
+If your `output/final_binding_results.json` or `thermodynamic_cycle.md` was generated before these documentation fixes, its `delta_G_bind_kJ_mol` sign may be reversed, and the `thermodynamic_cycle` field text may still be the old version. Rerun the final aggregation for the complex leg and solvent leg to refresh the result to the current convention. New sampling is not required as long as `complex_results` and `solv_results` can be loaded from cache.
 
-它们是 MBAR/TMBAR 分析的原始能量输入。
+## Maintenance Suggestions
 
-## 14. 这个项目的工程特点
+After modifying code, run a syntax check first:
 
-从代码实现看，这个项目有几个很鲜明的特点。
+```bash
+python -c "import ast, pathlib; files=['runabfe.py','abfe_pipeline.py','abfe_preoptimizer.py','ibs_engine.py','abfe_core.py']; [ast.parse(pathlib.Path(f).read_text(encoding='utf-8'), filename=f) for f in files]; print('syntax ok')"
+```
 
-### 14.1 强调缓存优先
+Then run:
 
-不是每次现构系统，而是尽量从原生缓存恢复。
+```bash
+python runabfe.py self-test
+```
 
-### 14.2 强调断点续跑
+If the self-test disagrees with the latest physical conclusions in `PHYSICS_DEFECTS.md`, update the tests and thermodynamic-cycle documentation so old assumptions do not continue entering new provenance.
 
-不只是简单 checkpoint，而是：
+Recommended next priorities:
 
-- 预平衡可续跑
-- 阶段采样可续跑
-- 预优化可复用
-- 结果文件可复用
-
-### 14.3 强调稳定性护栏
-
-例如：
-
-- 坐标居中与 PBC 修复
-- 安全松弛
-- Boresch 几何检查
-- 测试步进
-- NaN 诊断
-- 约束死锁预警
-
-这说明代码非常偏“生产工程化”，而不仅仅是论文级原型脚本。
-
-### 14.4 双 lambda 是主路线
-
-当前默认主路线仍是 `dual_lambda`，但公开接口也保留 `single_lambda`、`2d_diagonal`、`2d_geodesic`。
-
-## 15. 建议的阅读顺序
-
-如果你准备继续维护这套代码，推荐按下面顺序阅读：
-
-1. [runabfe.py](/K:/ABFE_IBS/Atenolol-rank1/runabfe.py:1362)
-   先理解程序从哪里进、整体做了什么
-
-2. [abfe_pipeline.py](/K:/ABFE_IBS/Atenolol-rank1/abfe_pipeline.py:1811)
-   再理解一条腿如何完整运行
-
-3. [abfe_preoptimizer.py](/K:/ABFE_IBS/Atenolol-rank1/abfe_preoptimizer.py:593)
-   接着看双 lambda 路径是怎么优化出来的
-
-4. [ibs_engine.py](/K:/ABFE_IBS/Atenolol-rank1/ibs_engine.py:1501)
-   然后看窗口是怎么逐个采样和分析的
-
-5. [abfe_core.py](/K:/ABFE_IBS/Atenolol-rank1/abfe_core.py:123)
-   最后再深挖具体物理对象和限制力实现
-
-## 16. 当前 README 的适用边界
-
-这份文档是根据当前目录中的源码结构直接整理的，重点反映的是：
-
-- 这套代码现在是怎么组织的
-- 默认推荐路线是什么
-- 各模块之间怎样配合
-
-它不是 ABFE 理论教材，也不是每个公式的完整推导说明。如果你后面希望，我还可以继续补两类文档：
-
-1. “偏理论版 README”
-   重点讲 ABFE、Boresch、dual lambda、IBS、MBAR 的概念与公式
-
-2. “偏开发版 README”
-   重点讲类图、关键函数、输入输出结构、常见改代码入口
+1. Implement or clearly define external handling for the LJ tail/LRC correction.
+2. Update the historical PME self-correction text in `abfe_core.py::THERMODYNAMIC_CYCLE_DOC`.
+3. Fix the historical PME self-correction sign check in `self-test`.
+4. Run at least one independent repeat for the current Atenolol-rank11 config.
+5. Use stage diagnostics to decide whether the vanishing-stage windows should be densified further or sampling should be increased.
