@@ -1,0 +1,21 @@
+name: openmm_dev
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - rdkit
+  - pytorch
+  - libtorch=2.10.0[build=cuda129*]
+  - openmm-torch
+  - triton=3.6.0[build=cuda129*]
+  - cuda-version=12.9
+  - cuda-nvcc=12.9
+  - cuda-cudart-dev=12.9
+  - cuda-driver-dev=12.9
+  - libcudnn=9.1
+  - nccl[version='>=2.20']
+  - openmm-ml
+  - pymbar-core
+  - openmm
+  - pdbfixer
+prefix: /home/canna/miniforge3/envs/openmm_dev
