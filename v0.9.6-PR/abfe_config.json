@@ -1,0 +1,57 @@
+{
+  "_comment": "⚠️ 推荐使用 abfe_config.yaml（支持注释），本文件保留仅用于向后兼容。通过 python runabfe.py --config 文件名 --ligand MOL --gro ... 运行。命令行参数优先级最高。",
+  "preset": "production",
+  "platform": "CUDA",
+  "output": "./output",
+  "temperature": 300.0,
+
+  "decoupling": "dual_lambda",
+  "potential": "softcore",
+
+  "n_steps_per_window": 250000,
+  "steps_per_update": 500,
+  "stage1_n_states": 12,
+  "stage2_n_states": 18,
+
+  "boresch": true,
+  "boresch_source": "simple",
+  "boresch_batch": 0,
+  "boresch_select": 1,
+
+  "skip_rebalance": false,
+  "rebalance_steps": 50000,
+
+  "enable_early_stop": false,
+  "enable_gradual_warmup": true,
+  "warmup_steps": 500000,
+  "min_bias_updates": 12,
+  "max_bias_updates": 50,
+  "required_consecutive_bias_updates": 3,
+  "max_bias_warmup_steps": 500000,
+
+  "pilot_finite_difference_delta": 0.01,
+  "pilot_max_window_thermodynamic_length": 6.0,
+  "pilot_overlap_thermodynamic_length": 1.5,
+  "pilot_max_states_per_window": 6,
+
+  "_comment_lambda_refine": "关掉了：第一次开启时 partition_windows_by_delta_f_budget 有 bug（净位移代替累积总变差），把 18 态/4窗口重分成了畸形的 12 窗口（其中一个窗口吞了7个态）。bug 已修，但当时已经把坏结果写进 checkpoints/preopt_dual_vanishing.json 并标记成'已精修'。改用 repair_stage2_tail_gap_local.py 手动局部修复了尾部（只重分窗口 12-18 那段，不动窗口 0/1/2），再打开这个开关会立刻重新跑一次全局重分布，把局部修复覆盖掉——所以先保持 false，除非要重新走一次全局精修。",
+  "enable_lambda_refine": false,
+  "refine_n_steps_per_window": 30000,
+  "refine_steps_per_update": 500,
+  "refine_max_window_span_kJ": 35.0,
+  "refine_overlap": 2,
+
+  "n_workers": null,
+
+  "n_equil_steps": 5000000,
+
+  "torsion_params": null,
+  "dexp_params": null,
+
+  "gro": "solv_ions.gro",
+  "top": "topol.top",
+  "ligand": "MOL",
+  "gmx_path": "/home/ruigengji/gmx26.0C ",
+  "resume": false,
+  "reset": false
+}
