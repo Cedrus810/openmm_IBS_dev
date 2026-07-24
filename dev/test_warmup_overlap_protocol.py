@@ -525,10 +525,13 @@ def test_protocol_versions_reject_old_semantics():
     # 🔑 [sampling_repair_policy rollout] 13->14：该字段决定 f_k 是否可能被
     # legacy mutating repair 改写，必须进入协议身份；否则既有 v13/无字段 state
     # 会被误当成当前协议的可疑 ensemble，在正常版本失效之前就硬停止 resume。
-    # 🔑 [IBS LSE fixed point] 14->15：冻结收敛直接检查
-    # max|log(K*<p_k>)|；热力学路径 v8-v11 均已撤回，v12 的 vanishing
-    # 先按热力学长度在困难一侧加密 lambda，再组成 few-state 子区间。
-    assert IBS_BIAS_PROTOCOL_VERSION == 27
+    # 🔑 [IBS LSE fixed point] 14->15：冻结收敛曾直接检查 max|log(K*<p_k>)|；
+    # 热力学路径 v8-v11 均已撤回，v12 的 vanishing 先按热力学长度在困难一侧加密
+    # lambda，再组成 few-state 子区间。
+    # 🔑 [local-MBAR loose gate] 27->29：冻结收敛判据整体换成局部滑窗 MBAR loose
+    # gate（相邻 |Δf_k−ΔF^MBAR| < 10 kJ/mol），移除 LSE 占据门/连续通过/冻结验证
+    # 阶梯/best-effort/warmup ESS 四联门；缓存兼容 (27,28,29)。
+    assert IBS_BIAS_PROTOCOL_VERSION == 29
     assert THERMODYNAMIC_PATH_PROTOCOL_VERSION == 18
 
 

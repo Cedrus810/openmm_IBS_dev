@@ -3100,12 +3100,42 @@ def _early_stop_configs_match(cached_cfg: Optional[Dict], current_cfg: Dict) -> 
 #     轨迹，再进 production。生产后独立 overlap/ESS/去相关样本/不确定度硬门不变。
 #     同时修正 dominant-flip watchdog：接近平坦时 argmax 随噪声换人不是过冲，
 #     只有 dominant 概率至少达到目标的 1.5 倍时才累计/报警（仍纯诊断）。
-IBS_BIAS_PROTOCOL_VERSION = 27
+#   version 29：把 warmup 的 f_k 收敛判据整体换成"局部滑窗 MBAR loose-gate"，
+#     彻底移除旧的冻结验证机制（累计 <p_k> 的 LSE 自洽门 max|log(K·<p_k>)|≤tol、
+#     required_consecutive_bias_updates 连续通过、50k→150k→300k 冻结验证阶梯、
+#     "见好就收"best-effort、warmup ESS/coverage 四联门）。新判据：冻结 f_k、短
+#     burn-in 后累计最近 IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES 批固定-f_k minibatch，
+#     跑一次单参考 local MBAR（_solve_single_window_local_mbar，不吃全历史时变
+#     TMBAR），只设一个 loose gate：max_k|Δf_{k,k+1}−ΔF^MBAR_{k,k+1}|（相邻差、
+#     gauge 无关）< IBS_LOCAL_MBAR_GATE_MAX_ADJACENT_DELTA_KJ_MOL(10 kJ/mol≈4 kT)
+#     即冻结进生产；≥阈值退回 learning 再做一轮现有 update_weights；MBAR 不可解/
+#     NaN 也退回继续更新。跑满 warmup 步数预算仍未通过则接受当前 f_k 进生产
+#     (best-effort)。动机：避开时变 TMBAR 判据不稳/自身 BAR 不收敛导致的"合理
+#     f_k 永远卡在验证门外"，把真正的自由能/ESS/overlap/误差全部交给生产后独立的
+#     _assert_stage_result_sane + 最终 MBAR。这是纯 warmup 停止判据/诊断变更，不动
+#     production Hamiltonian、f_k 符号约定、采样方式；且新 loose gate 严格弱于旧
+#     LSE 门（旧门通过的近均匀占据 f_k 必然满足新门），故按 v28 同样理由保持缓存
+#     兼容——已完成/已收敛的 v27/v28 f_k 不判废、可直接续用。
+#     v29 同批还修了 warmup 更新控制器的塌缩正反馈（"低重叠 TMBAR 给出错误大步 →
+#     占据塌缩 → TMBAR 更不可靠"）：(a) update_weights 只有累计 TMBAR 解质量同时
+#     可信（min_overlap≥0.05、min_absolute_ess≥10、去相关≥10、端点不确定度≤5
+#     kJ/mol、当前 batch coverage_ESS≥0.8K，见 IBS_TMBAR_TRUST_*）时才应用
+#     _damped_tmbar_absolute_update 的绝对候选；否则退回 _bounded_log_occupancy_
+#     update 先恢复覆盖。(b) 任何一次应用到 Context 的更新，相邻步长
+#     max_k(Δf)-min_k(Δf) 硬 cap 到 IBS_MAX_APPLIED_PAIRWISE_STEP_KT=2 kT（在
+#     update_weights 里、两个控制器之后统一施加，不进 _damped_* 本体），damping
+#     0.20→0.10。(c) learning minibatch 20→40 帧（配 5 批滑窗=200 冻结帧）。
+#     (d) local-MBAR loose gate 增加可信度门（min_ess_ratio<0.05 或绝对 ESS<10 →
+#     insufficient_overlap，不把零重叠外推的巨大 ΔF 当门残差）。这些同样只改
+#     warmup 学习/停止动力学与诊断，不动 production Hamiltonian/f_k 约定/采样，
+#     故仍保持缓存兼容。
+IBS_BIAS_PROTOCOL_VERSION = 29
 
-# v28 只改过 warmup 的停止/诊断控制，没有改变 production Hamiltonian、
-# f_k 符号约定或生产采样方式。它不该让已经完成或正在续采的 v27 production
-# 失效；撤回该误升版后，也不能反过来把已经写出的 v28 缓存判废。
-IBS_BIAS_CACHE_COMPATIBLE_PROTOCOL_VERSIONS = frozenset((27, 28))
+# v28/v29 都只改过 warmup 的停止/诊断控制，没有改变 production Hamiltonian、
+# f_k 符号约定或生产采样方式。它们不该让已经完成或正在续采的 v27 production
+# 失效；撤回 v28 误升版后，也不能反过来把已经写出的 v28 缓存判废；v29 换收敛
+# 判据同理（新 loose gate 弱于旧 LSE 门，旧收敛 f_k 仍有效），保持缓存兼容。
+IBS_BIAS_CACHE_COMPATIBLE_PROTOCOL_VERSIONS = frozenset((27, 28, 29))
 
 
 def _ibs_bias_protocol_version_is_cache_compatible(value: Any) -> bool:
@@ -3129,10 +3159,83 @@ def _normalize_ibs_protocol_for_cache_compare(manifest: Dict[str, Any]) -> Dict[
 # limit; the cap only affects unusually long or repeatedly resumed learning.
 TMBAR_HISTORY_MAX_ENTRIES = 200
 
-# 🔑 [IBS_BIAS_PROTOCOL_VERSION=25] 见上面 version 25 changelog (a) 段：
-# 独立于 eta_penalty/update_index 衰减的阻尼系数，专门压制多态同步更新在
-# softmax 耦合系统里的过冲。经验值，非解析推导；调参见上方注释。
-IBS_UPDATE_RELAXATION_FACTOR = 0.35
+# Warm-up updater identity is deliberately separate from the production bias
+# protocol. v9 replaces raw-minibatch SGD control with the absolute physical
+# free-energy candidate from the full accumulated TMBAR history. Each update
+# is f <- f + 0.2*(f_TMBAR-f). Dominant-state identity is diagnostic only and
+# never changes the update. If TMBAR is temporarily unavailable, one fixed
+# 10-kT pairwise bounded SGD step provides coverage acquisition. Warm-up frames are
+# collected every 250 MD steps (production output cadence is untouched).
+# Completed production made by an older updater remains valid; only an
+# unfinished older learning checkpoint must not be resumed into this solver.
+IBS_WARMUP_UPDATE_PROTOCOL_VERSION = 9
+# 🔑 [IBS_BIAS_PROTOCOL_VERSION=29] 0.20 -> 0.10：低重叠时绝对 TMBAR 候选给出错误
+# 大步 → 占据塌缩 → TMBAR 更不可靠的正反馈循环。配合下面 IBS_MAX_APPLIED_
+# PAIRWISE_STEP_KT 的硬步长上限，一起把每次更新的相邻步长压住。
+IBS_TMBAR_UPDATE_DAMPING = 0.10
+IBS_TMBAR_FALLBACK_SGD_PAIRWISE_STEP_KT = 10.0
+IBS_WARMUP_FRAME_STRIDE_STEPS = 250
+# 🔑 [IBS_BIAS_PROTOCOL_VERSION=29] 20 -> 40：20 帧太容易被单一构象主导，绝对
+# TMBAR/占据估计噪声大。40 帧 × local-MBAR gate 的 5 批滑窗 = 200 冻结帧，恰好
+# 满足"冻结后至少累计 ~200 帧再判 loose gate"。
+IBS_TMBAR_LEARNING_MINIBATCH_FRAMES = 40
+IBS_TMBAR_FREEZE_MAX_APPLIED_PAIRWISE_STEP_KT = 1.0
+# 🔑 [IBS_BIAS_PROTOCOL_VERSION=29] 任何一次 warmup 权重更新（绝对 TMBAR 或
+# bounded occupancy fallback）应用到 Context 之前，都把相邻步长
+# max_k(Δf)-min_k(Δf) 硬 cap 到这个值（2 kT≈5 kJ/mol@300K）。防止低重叠 MBAR
+# 候选的巨大 pairwise 跳变一步打崩占据。真实 ΔF>5 kJ 的边靠多轮小步逼近。
+IBS_MAX_APPLIED_PAIRWISE_STEP_KT = 2.0
+# 🔑 [IBS_BIAS_PROTOCOL_VERSION=29] 绝对 TMBAR 候选"可信"门：只有 update_weights
+# 里累计 TMBAR 解的质量同时满足以下全部时，才用 _damped_tmbar_absolute_update
+# 应用绝对候选；否则退回 _bounded_log_occupancy_update（受限占据反馈，先恢复
+# 覆盖）。这些只门控"用哪个更新控制器"，不是窗口收敛判据（收敛仍是 run_all_
+# windows 里的 local-MBAR loose gate）。
+IBS_TMBAR_TRUST_MIN_OVERLAP = 0.05
+IBS_TMBAR_TRUST_MIN_ABSOLUTE_ESS = 10.0
+IBS_TMBAR_TRUST_MIN_DECORRELATED_SAMPLES = 10
+IBS_TMBAR_TRUST_MAX_UNCERTAINTY_KJ_MOL = 5.0
+IBS_TMBAR_TRUST_MIN_COVERAGE_ESS_FRACTION = 0.8
+# 🔑 [IBS_BIAS_PROTOCOL_VERSION=29] local-MBAR loose gate 的可信度门：解出的
+# min_ess_ratio 或绝对 ESS 过低时，视为 insufficient_overlap（不把零重叠外推
+# 出的巨大 ΔF 当作真实门残差），按"MBAR 不可解 → 继续更新"处理。
+IBS_LOCAL_MBAR_GATE_MIN_ESS_RATIO = 0.05
+IBS_LOCAL_MBAR_GATE_MIN_ABSOLUTE_ESS = 10.0
+# 🔑 [IBS_BIAS_PROTOCOL_VERSION=29] 生产入口占据兜底门。短 warmup 滑窗（~200 帧
+# 去相关后）local MBAR 的绝对 ESS 常只有 ~2–3，达不到上面的 abs_ess≥10，Δf−ΔF
+# 主门因此永远不通过、warmup 空转。但此时若冻结占据已经平坦——每个态落在
+# [OCC_MIN_FRACTION/K, OCC_MAX_FRACTION/K]、coverage_ESS≥OCC_MIN_COVERAGE_ESS_
+# FRACTION×K、且仍有基本重叠 min_ess_ratio≥IBS_LOCAL_MBAR_GATE_MIN_ESS_RATIO——
+# 就允许进生产。两侧 box（同时卡 max 和 min）防止 [0.499,0.499,0.001,0.001] 这类
+# "max<0.5 但塌了两个态"误过。物理依据：占据平坦 ⇔ f_k≈F_k ⇔ Δf≈ΔF，是同一收敛
+# 的低方差估计。最终绝对 ESS/误差/自由能仍交生产后 _assert_stage_result_sane +
+# 最终 MBAR 兜底。这只放宽生产入口门，不动 IBS_TMBAR_TRUST_* 的 TMBAR 更新可信门。
+IBS_LOCAL_MBAR_GATE_OCC_MIN_FRACTION = 0.5
+IBS_LOCAL_MBAR_GATE_OCC_MAX_FRACTION = 2.0
+IBS_LOCAL_MBAR_GATE_OCC_MIN_COVERAGE_ESS_FRACTION = 0.8
+# 🔑 [IBS_BIAS_PROTOCOL_VERSION=29] "占据真的塌陷"（硬热力学瓶颈 → 建议插 λ/拆窗）
+# 的判据，故意比"未达平坦兜底门"严得多：只有 coverage_ESS 掉到 0.5×K 以下、或某态
+# 占据低于 0.25/K（目标的四分之一）才算塌陷。防止把 [0.41,0.27,0.20,0.125] 这类
+# 仅仅"最低态贴着 0.5/K 下限"的健康窗口误报成需要插 λ 的瓶颈。塌陷/平坦之间是
+# "统计薄，延长采样"的中间态。
+IBS_LOCAL_MBAR_GATE_OCC_COLLAPSE_COVERAGE_ESS_FRACTION = 0.5
+IBS_LOCAL_MBAR_GATE_OCC_COLLAPSE_MIN_FRACTION = 0.25
+IBS_UPDATE_NEAR_FLAT_RELAXATION_FACTOR = 0.35
+IBS_UPDATE_MIDDLE_RELAXATION_FACTOR = 0.50
+IBS_UPDATE_SEVERE_RELAXATION_FACTOR = 1.00
+IBS_UPDATE_ADAPTIVE_RESIDUAL_LOW = 1.0
+IBS_UPDATE_ADAPTIVE_RESIDUAL_HIGH = 6.0
+
+# 🔑 [IBS_BIAS_PROTOCOL_VERSION=28] 局部滑窗 MBAR loose-gate。冻结 f_k 后，把最近
+# IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES 批固定-f_k minibatch 拼成一次单参考 local
+# MBAR（_solve_single_window_local_mbar，跟最终阶段拼接同一套增广矩阵数学，但只看
+# 当前冻结 f_k 下最近这几批数据，不吃全历史时变 TMBAR），只比较相邻态 ΔF^MBAR 与
+# 当前相邻 Δf_k（gauge 无关，绝对 f_k 的任意公共常数在相邻差里抵消），设唯一 loose
+# gate：max_k |Δf_{k,k+1} − ΔF^MBAR_{k,k+1}| < 阈值即冻结进生产。10 kJ/mol ≈ 4 kT，
+# 只作"别让某个局部边完全饿死"的粗门；真正的自由能/ESS/overlap/误差全部交给生产后
+# 独立的 _assert_stage_result_sane + 最终 MBAR。故意不设连续通过、不设 LSE 占据门、
+# 不等 f_k 稳定、不设 warmup ESS 四联门——见 run_all_windows 里的收敛状态机。
+IBS_LOCAL_MBAR_GATE_MAX_ADJACENT_DELTA_KJ_MOL = 10.0
+IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES = 5
 
 # 落盘格式的独立版本号：只管 fixed-H 探针轨迹库 checkpoint/manifest 的文件
 # 结构（不是采样/校准协议本身），见 probe_adjacent_path_overlap_bank 等函数。
@@ -3325,7 +3428,6 @@ class IBSSampler:
         # update_weights() calls, which is the visible symptom of the
         # multi-state overshoot fixed in this version.
         self._last_dominant_k = None
-        self._dominant_flip_streak = 0
         
         # 🔑 新增：能量偏移缓存
         self.e_offset = 0.0
@@ -3598,6 +3700,13 @@ class IBSSampler:
         if overflow > 0:
             del self.tmbar_history[:overflow]
             self.tmbar_history_dropped_entries += overflow
+        # 滑动窗口：即使 dominant 不切换，累积过多 entry 也会因早期帧权重过大
+        # 而拖慢 TMBAR 收敛。只保留最近 N 条（每条约 20 帧），双保险。
+        _TMBAR_SLIDING_WINDOW = 10
+        if len(self.tmbar_history) > _TMBAR_SLIDING_WINDOW:
+            n_drop = len(self.tmbar_history) - _TMBAR_SLIDING_WINDOW
+            self.tmbar_history = self.tmbar_history[-_TMBAR_SLIDING_WINDOW:]
+            self.tmbar_history_dropped_entries += n_drop
         return n_valid
 
     def _solve_tmbar_and_recenter(
@@ -3657,14 +3766,63 @@ class IBSSampler:
         f_new = f_new - float(np.mean(f_new))
         return f_new, res
 
+    def _damped_tmbar_absolute_update(
+        self,
+        f_old: np.ndarray,
+        f_tmbar: np.ndarray,
+        damping: float = IBS_TMBAR_UPDATE_DAMPING,
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """Move toward the full-history absolute TMBAR solution.
+
+        TMBAR already performs the self-consistent solve; repeatedly applying
+        raw occupancy feedback to one minibatch would not add information.
+        The damping controls statistical adaptation. This implements the
+        literal convex iteration requested by the warm-up protocol; the
+        pairwise trust radius is reserved for the no-TMBAR SGD fallback.
+        """
+        old = np.asarray(f_old, dtype=np.float64).ravel()
+        target = np.asarray(f_tmbar, dtype=np.float64).ravel()
+        if old.size != self.n_states or target.size != self.n_states:
+            raise ValueError("f_old/f_tmbar 长度必须与 n_states 一致")
+        if not np.all(np.isfinite(old)) or not np.all(np.isfinite(target)):
+            raise ValueError("f_old/f_tmbar 必须全部有限")
+        old = old - float(np.mean(old))
+        target = target - float(np.mean(target))
+        requested_damping = float(damping)
+        if not 0.0 < requested_damping <= 1.0:
+            raise ValueError("TMBAR damping 必须位于 (0, 1]")
+        effective_damping = requested_damping
+        delta_f = effective_damping * (target - old)
+        delta_f -= float(np.mean(delta_f))
+        pairwise_spread = (
+            float(np.max(delta_f) - np.min(delta_f)) if delta_f.size else 0.0
+        )
+        f_new = old + delta_f
+        f_new -= float(np.mean(f_new))
+        diagnostics = {
+            "method": "damped_absolute_tmbar_v9",
+            "requested_damping": requested_damping,
+            "effective_damping": float(effective_damping),
+            "tmbar_candidate_f_kJ_mol": target.astype(float).tolist(),
+            "tmbar_candidate_pairwise_span_kJ_mol": float(
+                np.max(target) - np.min(target)
+            ) if target.size else 0.0,
+            "delta_f_kJ_mol": delta_f.astype(float).tolist(),
+            "max_abs_delta_f_kJ_mol": float(np.max(np.abs(delta_f))) if delta_f.size else 0.0,
+            "pairwise_delta_f_spread_kJ_mol": float(pairwise_spread),
+            "pairwise_step_limit_kT": None,
+            "pairwise_step_limit_kJ_mol": None,
+        }
+        return f_new, diagnostics
+
     def _bounded_log_occupancy_update(
         self,
         f_old: np.ndarray,
         mean_p: np.ndarray,
-        max_abs_log_residual: float = 2.0,
-        max_step_kT: float = 5.0,
+        max_abs_log_residual: float = 50.0,
+        severe_max_pairwise_step_kT: float = 6.0,
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
-        """[IBS_BIAS_PROTOCOL_VERSION=24] Apply one bounded all-state update.
+        """Apply one sample-and-hold, pairwise-bounded all-state update.
 
         ``mean_p`` is the actually observed IBS responsibility under ``f_old``.
         The fixed point is ``K*<p_k> = 1``.  Updating by the *negative* log
@@ -3713,40 +3871,108 @@ class IBSSampler:
         # observed as delta_f staying pinned at 2-5 kJ/mol every update
         # while `dominant_k` flips between different states update to
         # update, never settling (classic control-loop overshoot, not slow
-        # convergence). IBS_UPDATE_RELAXATION_FACTOR damps the step
-        # independently of eta_penalty (the failure-count mechanism) and of
-        # the update_index long-run decay (which barely engages within one
-        # learning attempt's ~12-18 updates) specifically to compensate for
-        # this multi-state compounding. Tunable: lower it further if
-        # oscillation (dominant_k flip warnings) persists; raise it if
-        # convergence is now too slow.
+        # convergence). Warm-up updater v5 handles this with a tent-shaped
+        # gain plus a bound on the pairwise Delta-f spread.  eta_penalty and
+        # the update_index long-run decay remain independent safeguards.
         update_index = len(self.f_history) + 1
+        residual_severity = float(np.max(np.abs(raw_log_residual)))
+        if residual_severity >= IBS_UPDATE_ADAPTIVE_RESIDUAL_HIGH:
+            gain_regime = "severe"
+            adaptive_fraction = 1.0
+            adaptive_relaxation = IBS_UPDATE_SEVERE_RELAXATION_FACTOR
+            # Keep the radius continuous at residual=6: start the severe
+            # regime at the middle-regime ceiling (4 kT) and approach the
+            # caller-selected severe ceiling by residual=12. The caller uses
+            # 6 kT immediately after a dominant switch and 12->16 kT only
+            # after fixed-block persistence confirms the direction.
+            severe_radius_fraction = float(np.clip(
+                (
+                    residual_severity - IBS_UPDATE_ADAPTIVE_RESIDUAL_HIGH
+                ) / IBS_UPDATE_ADAPTIVE_RESIDUAL_HIGH,
+                0.0,
+                1.0,
+            ))
+            pairwise_step_limit_kT = float(
+                4.0
+                + severe_radius_fraction
+                * (float(severe_max_pairwise_step_kT) - 4.0)
+            )
+        elif residual_severity >= IBS_UPDATE_ADAPTIVE_RESIDUAL_LOW:
+            gain_regime = "middle"
+            adaptive_fraction = float(
+                (residual_severity - IBS_UPDATE_ADAPTIVE_RESIDUAL_LOW)
+                / (
+                    IBS_UPDATE_ADAPTIVE_RESIDUAL_HIGH
+                    - IBS_UPDATE_ADAPTIVE_RESIDUAL_LOW
+                )
+            )
+            # At the edge of the near-flat basin gain is highest, because the
+            # response is observable but not saturated.  It falls toward the
+            # severe value as collapse increases. The pairwise radius grows
+            # from 2 to 4 kT across this recoverable middle regime.
+            adaptive_relaxation = float(
+                IBS_UPDATE_MIDDLE_RELAXATION_FACTOR
+                + adaptive_fraction
+                * (
+                    IBS_UPDATE_SEVERE_RELAXATION_FACTOR
+                    - IBS_UPDATE_MIDDLE_RELAXATION_FACTOR
+                )
+            )
+            pairwise_step_limit_kT = float(2.0 + 2.0 * adaptive_fraction)
+        else:
+            gain_regime = "near_flat"
+            adaptive_fraction = float(
+                residual_severity / IBS_UPDATE_ADAPTIVE_RESIDUAL_LOW
+            )
+            # Do not chase finite-block argmax noise at the fixed point.
+            adaptive_relaxation = float(
+                IBS_UPDATE_NEAR_FLAT_RELAXATION_FACTOR
+                + adaptive_fraction
+                * (
+                    IBS_UPDATE_MIDDLE_RELAXATION_FACTOR
+                    - IBS_UPDATE_NEAR_FLAT_RELAXATION_FACTOR
+                )
+            )
+            pairwise_step_limit_kT = float(0.5 + 1.5 * adaptive_fraction)
         eta = (
-            IBS_UPDATE_RELAXATION_FACTOR
+            adaptive_relaxation
             * float(self.eta_penalty)
             / (1.0 + float(update_index) / 500.0)
         )
         delta_f = -eta * float(self.kt) * clipped_log_residual
 
-        # Mean-centering a clipped residual can make one component larger than
-        # the pre-centering bound.  Enforce a true vector-wide trust radius in
-        # kJ/mol after centering, preserving direction by uniform rescaling.
-        max_step_kj = float(max_step_kT) * float(self.kt)
-        max_abs_delta = float(np.max(np.abs(delta_f))) if delta_f.size else 0.0
-        if max_abs_delta > max_step_kj > 0.0:
-            delta_f *= max_step_kj / max_abs_delta
+        # What changes softmax odds is delta_f[i]-delta_f[j], not an absolute
+        # component relative to an arbitrary mean-zero gauge.  Bound that
+        # physically meaningful pairwise spread and preserve the direction by
+        # uniform rescaling.  In a one-dominant five-state collapse, a 3-kT
+        # The caller selects a severe ceiling only after checking dominant
+        # persistence. This is still a relative-odds bound, not an arbitrary
+        # gauge-dependent per-component radius.
+        pairwise_step_limit_kj = pairwise_step_limit_kT * float(self.kt)
+        pairwise_delta_spread = (
+            float(np.max(delta_f) - np.min(delta_f)) if delta_f.size else 0.0
+        )
+        if pairwise_delta_spread > pairwise_step_limit_kj > 0.0:
+            delta_f *= pairwise_step_limit_kj / pairwise_delta_spread
+            pairwise_delta_spread = float(np.max(delta_f) - np.min(delta_f))
 
         f_new = f_old + delta_f
         f_new -= float(np.mean(f_new))
         diagnostics = {
-            "method": "bounded_log_occupancy_v1",
+            "method": "bounded_log_occupancy_fallback_v9",
             "eta": float(eta),
             "eta_penalty": float(self.eta_penalty),
+            "residual_severity": float(residual_severity),
+            "adaptive_relaxation": float(adaptive_relaxation),
+            "adaptive_fraction": float(adaptive_fraction),
+            "gain_regime": gain_regime,
             "raw_log_residual": raw_log_residual.astype(float).tolist(),
             "clipped_centered_log_residual": clipped_log_residual.astype(float).tolist(),
             "delta_f_kJ_mol": delta_f.astype(float).tolist(),
             "max_abs_delta_f_kJ_mol": float(np.max(np.abs(delta_f))) if delta_f.size else 0.0,
-            "max_step_kJ_mol": float(max_step_kj),
+            "pairwise_delta_f_spread_kJ_mol": float(pairwise_delta_spread),
+            "pairwise_step_limit_kT": float(pairwise_step_limit_kT),
+            "pairwise_step_limit_kJ_mol": float(pairwise_step_limit_kj),
         }
         return f_new, diagnostics
 
@@ -3772,10 +3998,10 @@ class IBSSampler:
         candidate_max_uncertainty_kJ_mol: float = 5.0,
     ) -> Optional[np.ndarray]:
         """
-        在线 IBS 权重更新。TMBAR 累计历史继续驱动候选覆盖质量门；v23 起
-        ``mean_p_batch`` 同时驱动有界的全态负反馈增量，EMA 仍仅供趋势诊断。
-        candidate_* 阈值只影响 tmbar_update 诊断里的 converged 标记（供
-        run_all_windows 的 learning 候选门读取），不影响这里实际应用的 f_k 本身。
+        在线 IBS 权重更新。v9 使用全部累计 minibatch 的 TMBAR 绝对候选，
+        按固定 0.20 阻尼更新 f_k。``mean_p_batch``、EMA 和 dominant 仅供诊断；
+        只有 TMBAR 暂不可解时才执行一次固定 10-kT pairwise bounded-SGD 兜底。
+        candidate_* 阈值同时写入 tmbar_update 诊断，供 learning 候选门读取。
         """
         if len(self.energy_buffer) < min_buffer_size:
             return None
@@ -3841,10 +4067,10 @@ class IBSSampler:
         else:
             self.ema_mean_p = self.gamma * self.ema_mean_p + (1.0 - self.gamma) * mean_p_batch
 
-        # 5. 论文 eq. 15 TMBAR：把这批 minibatch 打包进持久的 tmbar_history，
-        # 用累计至今的全部 minibatch 评估覆盖质量。v23 起它只承担 learning
-        # 候选门/诊断，不再把尚未收敛的绝对 f 向量覆盖进 Context；实际权重由
-        # 下方对真实 mean_p_batch 的有界全态负反馈增量更新。
+        # 5. 论文 eq. 15 TMBAR：把这批 minibatch 打包进持久历史，用累计
+        # 至今的全部时变采样分布自洽求解绝对物理自由能。v9 起 f_k 更新只朝
+        # 这个全历史绝对候选阻尼移动；当前 raw batch 占据仅作诊断，
+        # 不再充当 SGD 更新方向。
         self._append_tmbar_batch_from_buffer()
         tmbar_result = self._solve_tmbar_and_recenter(
             min_ess_ratio=candidate_min_ess_ratio,
@@ -3853,16 +4079,25 @@ class IBSSampler:
             max_uncertainty_kJ_mol=candidate_max_uncertainty_kJ_mol,
         )
         if tmbar_result is None:
+            tmbar_absolute_candidate = None
             self.last_update_diagnostics["tmbar_update"] = {
                 "available": False,
                 "n_tmbar_entries": len(self.tmbar_history),
+                "converged": False,
             }
         else:
-            _tmbar_absolute_candidate, tmbar_res = tmbar_result
+            tmbar_absolute_candidate, tmbar_res = tmbar_result
             self.last_update_diagnostics["tmbar_update"] = {
                 "available": True,
                 "n_tmbar_entries": len(self.tmbar_history),
-                "converged": bool(tmbar_res.get("converged", False)),
+                # solve_stage_integrated's legacy flag takes the minimum over
+                # every historical minibatch. One early low-ESS entry then
+                # poisons the flag forever as history grows. Preserve it only
+                # as a quality diagnostic; online readiness is assigned below
+                # from the actual damped TMBAR fixed-point step.
+                "legacy_per_entry_quality_converged": bool(
+                    tmbar_res.get("converged", False)
+                ),
                 "min_overlap": tmbar_res.get("min_overlap"),
                 "min_absolute_ess": tmbar_res.get("min_absolute_ess"),
                 "min_decorrelated_samples": tmbar_res.get("min_decorrelated_samples"),
@@ -3870,41 +4105,139 @@ class IBSSampler:
             }
         self.last_update_diagnostics["adjacent_delta_u_is_convergence_gate"] = False
 
-        f_new, weight_update_diag = self._bounded_log_occupancy_update(
-            f_old,
-            mean_p_batch,
-        )
-        self.last_update_diagnostics["weight_update"] = weight_update_diag
         dominant_k = int(np.argmax(mean_p_batch))
+        raw_log_residual = np.log(
+            float(K) * np.maximum(mean_p_batch, np.finfo(np.float64).tiny)
+        )
+        residual_severity = float(np.max(np.abs(raw_log_residual)))
+        total_tmbar_frames = int(sum(
+            np.asarray(entry.get("u_kn", np.empty((0, 0)))).shape[1]
+            for entry in self.tmbar_history
+        ))
+        # 🔑 [IBS_BIAS_PROTOCOL_VERSION=29] 只有累计 TMBAR 解质量同时可信时才应用
+        # 绝对候选；否则退回受限占据反馈先恢复覆盖，避免"低重叠 TMBAR 给出错误
+        # 大步 → 占据塌缩 → TMBAR 更不可靠"的正反馈。coverage_ess 用当前 batch 占据
+        # 算（mean_p_batch 已归一，sum=1）。这些只门控"用哪个控制器"，不是窗口
+        # 收敛判据——收敛仍是 run_all_windows 里的 local-MBAR loose gate。
+        _sum_sq_p = float(np.sum(np.square(mean_p_batch)))
+        coverage_ess_batch = float(1.0 / _sum_sq_p) if _sum_sq_p > 0.0 else 0.0
+        tmbar_candidate_trusted = False
+        if tmbar_absolute_candidate is not None:
+            _q_overlap = tmbar_res.get("min_overlap")
+            _q_abs_ess = tmbar_res.get("min_absolute_ess")
+            _q_decorr = tmbar_res.get("min_decorrelated_samples")
+            _q_uncert = tmbar_res.get("max_endpoint_uncertainty_kJ_mol")
+            tmbar_candidate_trusted = bool(
+                _q_overlap is not None
+                and _q_overlap >= IBS_TMBAR_TRUST_MIN_OVERLAP
+                and _q_abs_ess is not None
+                and _q_abs_ess >= IBS_TMBAR_TRUST_MIN_ABSOLUTE_ESS
+                and _q_decorr is not None
+                and _q_decorr >= IBS_TMBAR_TRUST_MIN_DECORRELATED_SAMPLES
+                and _q_uncert is not None
+                and np.isfinite(_q_uncert)
+                and _q_uncert <= IBS_TMBAR_TRUST_MAX_UNCERTAINTY_KJ_MOL
+                and coverage_ess_batch
+                >= IBS_TMBAR_TRUST_MIN_COVERAGE_ESS_FRACTION * float(K)
+            )
+        if tmbar_candidate_trusted:
+            f_new, weight_update_diag = self._damped_tmbar_absolute_update(
+                f_old,
+                tmbar_absolute_candidate,
+            )
+        else:
+            # TMBAR 候选不可信（低重叠/低 ESS/去相关不足/不确定度大/覆盖差）或
+            # 根本不可解：用受限占据反馈先把覆盖拉回来（Δf_k=-η·kT·ln(K·p_k)，
+            # 自带自适应 pairwise 上限），不让一步错误大步打崩占据。
+            f_new, weight_update_diag = self._bounded_log_occupancy_update(
+                f_old,
+                mean_p_batch,
+                severe_max_pairwise_step_kT=(
+                    IBS_TMBAR_FALLBACK_SGD_PAIRWISE_STEP_KT
+                ),
+            )
+            weight_update_diag["method"] = (
+                "bounded_occupancy_tmbar_untrusted_v9"
+                if tmbar_absolute_candidate is not None
+                else "bounded_sgd_fallback_v9"
+            )
+        weight_update_diag["tmbar_candidate_trusted"] = bool(tmbar_candidate_trusted)
+        weight_update_diag["coverage_ess_batch"] = float(coverage_ess_batch)
+        # 🔑 [IBS_BIAS_PROTOCOL_VERSION=29] 硬 pairwise cap 只加在【可信绝对 TMBAR】
+        # 路径上：绝对候选即使可信、估计略偏时一大步也危险，故 cap 到
+        # IBS_MAX_APPLIED_PAIRWISE_STEP_KT(2 kT)。而 bounded occupancy 反馈是自我纠偏
+        # 的比例控制器（Δf=-η·kT·ln(K·p)），且严重塌陷时本就需要大步纠偏——它自带
+        # 的自适应 pairwise 上限（近平坦 0.5→中区 4→严重区最高 severe_max≈10 kT）已
+        # 足够安全，这里不再额外硬 cap 到 2 kT，否则 raw_residual≈150 的严重窗口会被
+        # 卡在 2 kT/步、要 ~75 步才建起所需 f_k 谱宽（塌陷的正反馈风险来自已被 trust-
+        # gate 关掉的绝对 TMBAR，不来自 bounded）。诊断一律刷新成 cap 之后的真实步长。
+        _applied_delta = (
+            np.asarray(f_new, dtype=np.float64)
+            - np.asarray(f_old, dtype=np.float64)
+        )
+        _applied_delta -= float(np.mean(_applied_delta))
+        _applied_spread = (
+            float(np.max(_applied_delta) - np.min(_applied_delta))
+            if _applied_delta.size else 0.0
+        )
+        if tmbar_candidate_trusted:
+            _hard_cap_kj = float(IBS_MAX_APPLIED_PAIRWISE_STEP_KT) * float(self.kt)
+            if _applied_spread > _hard_cap_kj > 0.0:
+                _applied_delta *= _hard_cap_kj / _applied_spread
+                _applied_spread = float(np.max(_applied_delta) - np.min(_applied_delta))
+                f_new = np.asarray(f_old, dtype=np.float64) + _applied_delta
+                f_new -= float(np.mean(f_new))
+                weight_update_diag["hard_pairwise_cap_applied"] = True
+            else:
+                weight_update_diag["hard_pairwise_cap_applied"] = False
+            weight_update_diag["hard_pairwise_cap_kJ_mol"] = float(_hard_cap_kj)
+        else:
+            # bounded 路径：不额外硬 cap，用其自带自适应上限（见 _bounded_log_
+            # occupancy_update）。诊断记录未施加外部硬 cap。
+            weight_update_diag["hard_pairwise_cap_applied"] = False
+            weight_update_diag["hard_pairwise_cap_kJ_mol"] = None
+        weight_update_diag["delta_f_kJ_mol"] = _applied_delta.astype(float).tolist()
+        weight_update_diag["max_abs_delta_f_kJ_mol"] = (
+            float(np.max(np.abs(_applied_delta))) if _applied_delta.size else 0.0
+        )
+        weight_update_diag["pairwise_delta_f_spread_kJ_mol"] = float(_applied_spread)
+        weight_update_diag["residual_severity"] = float(residual_severity)
+        weight_update_diag["total_tmbar_frames"] = int(total_tmbar_frames)
+        applied_pairwise_step = float(
+            weight_update_diag.get("pairwise_delta_f_spread_kJ_mol", float("inf"))
+        )
+        self_consistency_limit_kj = float(
+            IBS_TMBAR_FREEZE_MAX_APPLIED_PAIRWISE_STEP_KT * self.kt
+        )
+        tmbar_self_consistent = bool(
+            tmbar_absolute_candidate is not None
+            and np.isfinite(applied_pairwise_step)
+            and applied_pairwise_step <= self_consistency_limit_kj
+        )
+        self.last_update_diagnostics["tmbar_update"].update({
+            "converged": tmbar_self_consistent,
+            "online_convergence_method": "damped_absolute_step_pairwise",
+            "applied_pairwise_step_kJ_mol": applied_pairwise_step,
+            "applied_pairwise_step_threshold_kJ_mol": self_consistency_limit_kj,
+            "total_tmbar_frames": int(total_tmbar_frames),
+        })
+        self.last_update_diagnostics["weight_update"] = weight_update_diag
         print(
-            f"    [IBS v23 有界权重更新] dominant=state{dominant_k} "
+            f"    [IBS TMBAR 自洽权重更新 v9] dominant诊断=state{dominant_k} "
             f"p={float(mean_p_batch[dominant_k]):.6f}, "
             f"delta_f={float(weight_update_diag['delta_f_kJ_mol'][dominant_k]):+.3f} kJ/mol, "
             f"max|delta_f|={float(weight_update_diag['max_abs_delta_f_kJ_mol']):.3f} "
-            f"(limit={float(weight_update_diag['max_step_kJ_mol']):.3f})"
+            f"(pairwise={float(weight_update_diag['pairwise_delta_f_spread_kJ_mol']):.3f} kJ/mol, "
+            f"method={weight_update_diag['method']}, "
+            f"alpha={float(weight_update_diag.get('effective_damping', 0.0)):.3f}, "
+            f"raw_residual={residual_severity:.3f}, "
+            f"batch={M}, total_frames={total_tmbar_frames}, "
+            f"tmbar_self_consistent={tmbar_self_consistent}, "
+            f"legacy_quality={self.last_update_diagnostics['tmbar_update'].get('legacy_per_entry_quality_converged')})"
         )
-        # [warmup-control follow-up; production protocol remains v27]
-        # dominant-state 跳变 watchdog（纯诊断，
-        # 不影响 f_k/control flow）。接近平坦时多个态近似并列，argmax 随有限
-        # batch 噪声换人是正常现象，不是过冲；只有当前冠军至少达到目标占据的
-        # 1.5 倍时，换冠军才累计为有意义的振荡 streak。
-        dominance_ratio = float(mean_p_batch[dominant_k]) * float(K)
-        if (
-            dominance_ratio >= 1.5
-            and self._last_dominant_k is not None
-            and dominant_k != self._last_dominant_k
-        ):
-            self._dominant_flip_streak += 1
-        else:
-            self._dominant_flip_streak = 0
+        # Dominant identity remains a diagnostic breadcrumb only. It does not
+        # reset, brake, accelerate, or otherwise alter the TMBAR update.
         self._last_dominant_k = dominant_k
-        if self._dominant_flip_streak >= 3:
-            print(
-                f"    ⚠️ dominant state 已连续 {self._dominant_flip_streak} 次更新发生跳变"
-                f"（当前 dominant/target={dominance_ratio:.2f}；可能是 "
-                "IBS_UPDATE_RELAXATION_FACTOR 阻尼仍不足导致的过冲振荡，"
-                "而非正常收敛过程；如持续出现，考虑调低该系数）"
-            )
 
         # 6. 应用更新
         for k in range(K):
@@ -4036,6 +4369,7 @@ class IBSSampler:
             # 验证上的步数，跨越同一份校准 f_k 的多次 resume/阶梯升级累加。
             "frozen_validation_cumulative_steps": int(self.frozen_validation_cumulative_steps),
             "ibs_bias_protocol_version": IBS_BIAS_PROTOCOL_VERSION,
+            "warmup_update_protocol_version": IBS_WARMUP_UPDATE_PROTOCOL_VERSION,
             # 🔑 [non_mutating_v1] 记录产出这份 f_k 状态的采样修复策略。旧的变异
             # 策略可能就地重校准过 f_k（不同参考系）；load 时据此 fail-closed。
             "sampling_repair_policy": getattr(self, "sampling_repair_policy", None),
@@ -4082,6 +4416,21 @@ class IBSSampler:
                     f"兼容版本={sorted(IBS_BIAS_CACHE_COMPATIBLE_PROTOCOL_VERSIONS)})，"
                     "完全忽略旧状态（不作为热启动），"
                     "从 f_k=0 重新开始"
+                )
+                return False
+            cached_warmup_update_version = state.get(
+                "warmup_update_protocol_version"
+            )
+            if (
+                not bool(state.get("bias_converged", False))
+                and cached_warmup_update_version
+                != IBS_WARMUP_UPDATE_PROTOCOL_VERSION
+            ):
+                print(
+                    "  ⚠️ 未完成的 IBS 预热状态使用旧权重控制器 "
+                    f"(cache={cached_warmup_update_version!r}, "
+                    f"current={IBS_WARMUP_UPDATE_PROTOCOL_VERSION})，"
+                    "拒绝把旧控制器的中间 f_k 注入新自适应学习；从当前协议重新预热"
                 )
                 return False
             cached_lc = state.get("lambdas_coul")
@@ -7107,6 +7456,9 @@ class IBSWindowManagerDualLambda:
             # 续传时 (is_resumed_ibs=True) 上面已经把 bias_scale 直接设为 1.0 并
             # 打印"跳过 Warmup"——这里必须真的跳过，否则会打脸自己的日志，且对
             # 已收敛的 f_k 做一次无意义的清零重爬。
+            # [IBS_BIAS_PROTOCOL_VERSION=29] 是否已经用 pilot 种子播过 f_k；否则冷启动
+            # 时下面（scale=1.0 后）用自举 TI 种子兜底，避免从 f_k=0 慢爬。
+            f_k_warm_started = False
             if not is_resumed_ibs:
                 # [IBS_BIAS_PROTOCOL_VERSION=27] The pilot-TI estimator returns
                 # the physical F(lambda), mean-centered, which is the
@@ -7122,6 +7474,7 @@ class IBSWindowManagerDualLambda:
                 if warm_start_seed is not None and len(warm_start_seed) == len(lv_win):
                     for k in range(len(lv_win)):
                         sim.context.setParameter(f"{self.prefix}_f_{k}", float(warm_start_seed[k]))
+                    f_k_warm_started = True
                     print(
                         f"  🌱 [pilot TI 热启动] 窗口 {window_idx} f_k 初始值（非冷启动 0.0）: "
                         f"{[round(float(x), 3) for x in warm_start_seed]} kJ/mol"
@@ -7201,14 +7554,72 @@ class IBSWindowManagerDualLambda:
             target_p = 1.0 / K
             min_probability_threshold = 0.5 * target_p
             coverage_ess_threshold = 0.8 * K
-            check_chunk = 500
+            check_chunk = IBS_WARMUP_FRAME_STRIDE_STEPS
             f_stability_threshold_kJ_mol = 0.05
-            # A 5k-step (10 ps at 2 fs) burn-in was followed by one 20-frame
-            # batch and an immediate return to learning.  The real v17 run
-            # therefore never left any candidate Hamiltonian fixed long enough
-            # to forget the preceding adaptive trajectory.  Reserve a distinct
-            # 20k-step burn-in before collecting validation evidence.
-            frozen_burn_in_steps = 20_000
+            # 🔑 [IBS_BIAS_PROTOCOL_VERSION=29] 自举 TI 种子（pilot 缺失时的兜底）：
+            # 冷启动（无 pilot、非续算、非恢复冻结 f_k）时，在 scale=1.0 下采一小批
+            # ~IBS_TMBAR_LEARNING_MINIBATCH_FRAMES 帧，用每态平均 softcore 能量把
+            # f_k 一步播到 f_k=⟨u_k⟩（去均值）——这是从采样系综测得的零阶 EXP/TI
+            # 种子（与 pilot TI 同一约定 f_k≈F_k），把偏置一步放到大致尺寸，避免从
+            # f_k=0 靠 2 kT/步慢爬。这段样本只用于播种、不进 tmbar_history，也不计入
+            # steps_at_full_bias 预算。重叠好的窗口据此近乎立即变平；低重叠窗口种子
+            # 可能过/欠，但随后的 bounded 自适应更新会快速纠偏。
+            if (
+                not is_resumed_ibs
+                and not f_k_warm_started
+                and resumed_frozen_f_k is None
+            ):
+                _boot_target = int(IBS_TMBAR_LEARNING_MINIBATCH_FRAMES)
+                sampler.energy_buffer = []
+                _boot_guard = 0
+                while (
+                    len(sampler.energy_buffer) < _boot_target
+                    and _boot_guard < _boot_target * 4
+                ):
+                    sim.step(check_chunk)
+                    sampler.collect_energies()
+                    _boot_guard += 1
+                _boot_u = (
+                    np.asarray(sampler.energy_buffer, dtype=np.float64)
+                    if sampler.energy_buffer else np.empty((0, K))
+                )
+                _boot_valid = (
+                    ~np.isnan(_boot_u).any(axis=1)
+                    if _boot_u.size else np.zeros(0, dtype=bool)
+                )
+                if _boot_u.size and int(np.sum(_boot_valid)) >= max(5, K + 1):
+                    _boot_mean_u = np.mean(_boot_u[_boot_valid], axis=0)
+                    _boot_seed = _boot_mean_u - float(np.mean(_boot_mean_u))
+                    if np.all(np.isfinite(_boot_seed)) and _boot_seed.shape[0] == K:
+                        for k in range(K):
+                            sim.context.setParameter(
+                                f"{self.prefix}_f_{k}", float(_boot_seed[k])
+                            )
+                        f_k_warm_started = True
+                        print(
+                            f"  🌱 [自举 TI 种子] 窗口 {window_idx} 冷启动无 pilot，用首批 "
+                            f"{int(np.sum(_boot_valid))} 帧每态平均 softcore 能量播 "
+                            f"f_k=⟨u_k⟩（去均值）: "
+                            f"{[round(float(x), 2) for x in _boot_seed]} kJ/mol"
+                            "（跳过 f_k=0 慢爬）"
+                        )
+                    else:
+                        print(
+                            f"  ⚠️ [自举 TI 种子] 窗口 {window_idx} 种子非有限/维度不符，"
+                            "回退 f_k=0 冷启动"
+                        )
+                else:
+                    print(
+                        f"  ⚠️ [自举 TI 种子] 窗口 {window_idx} 有效帧不足，回退 f_k=0 冷启动"
+                    )
+                sampler.energy_buffer = []
+                sampler.ema_mean_p = None
+            # [IBS_BIAS_PROTOCOL_VERSION=29] 冻结 f_k 后、采 local-MBAR 门数据前的
+            # 重新平衡 burn-in。这不是"等 f_k 稳定"（loose-gate 不等 f_k 收敛），
+            # 而是让构型忘掉上一段漂移偏置轨迹、在这个刚冻结的固定 Hamiltonian 下
+            # 重新平衡；之前 v27 用 20k 步冻结验证阶梯，loose-gate 只需一小段短
+            # burn-in（5k 步≈10 ps）即可，随后累计固定-f_k 帧一次性喂 local MBAR。
+            frozen_burn_in_steps = 5_000
             # 🔑 [IBS_BIAS_PROTOCOL_VERSION=9] steps_at_full_bias 是 SGD 三阶段
             # （learning/freeze_burn_in/validating）和后面 fixed-H overlap 全通过
             # 后的 MBAR 校准验证共用的同一个计数器。如果 SGD 把 max_bias_warmup_steps
@@ -7338,6 +7749,17 @@ class IBSWindowManagerDualLambda:
             validation_steps_this_freeze = 0
             early_probe_triggered = False
             early_probe_trigger_reason = None
+            # 🔑 [IBS_BIAS_PROTOCOL_VERSION=29] 局部滑窗 MBAR loose-gate 状态：
+            # frozen_mbar_batches 累计当前冻结 f_k 下最近若干批固定-f_k minibatch
+            # （每条是 tmbar_history 里的 {u_kn,bias_energies,base_energies}）；攒满
+            # IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES 批就拼一次 local MBAR 判一次门。
+            # updates_since_freeze/have_frozen_once 控制"首次冻结前累计 min_bias_
+            # updates 次更新、此后每次门失败只需再更新一轮就重新冻结复检"。
+            frozen_mbar_batches = []
+            updates_since_freeze = 0
+            have_frozen_once = False
+            local_mbar_gate_history = []
+            last_local_mbar_gate = None
             if resumed_frozen_f_k is not None:
                 # 🔑 [MAIN_WINDOW_CHECKPOINT_PROTOCOL_VERSION] 从主窗口 checkpoint
                 # 续算时不需要 freeze_burn_in：checkpoint 保存的那一刻本身就已经
@@ -7349,78 +7771,32 @@ class IBSWindowManagerDualLambda:
                 frozen_f_k_snapshot = resumed_frozen_f_k
                 sampler.energy_buffer = []
                 sampler.ema_mean_p = None
+                # 恢复的就是一份已经冻结过的 f_k：若这次 loose gate 未过退回 learning，
+                # 只需再更新一轮即重新冻结复检（不必再攒满 min_bias_updates 次）。
+                have_frozen_once = True
             else:
                 mode = "learning"
                 frozen_f_k_snapshot = None
 
             while steps_at_full_bias < full_bias_step_budget:
+                # learning 阶段的更新次数上限只约束 learning；freeze_burn_in/
+                # validating 只受总步数安全帽 full_bias_step_budget 约束。反复未
+                # 通过 loose-gate 把更新次数烧到上限时退出循环，由下方"预算耗尽即
+                # 接受当前 f_k"分支放行进生产（见 IBS_BIAS_PROTOCOL_VERSION=29）。
                 if mode == "learning" and bias_update_count >= int(max_bias_updates):
-                    if not budget_fallback_used:
-                        # 🔑 [IBS_BIAS_PROTOCOL_VERSION=25] budget-exhaustion
-                        # fallback（PROPOSAL_frozen_validation_fallback.md）：
-                        # 候选连续通过streak从未凑满，但 burn-in/validation 的
-                        # 步数预算本来就已经预留（frozen_validation_reserved_
-                        # steps），不用白不用——给当前 f_k 一次真正的冻结验证
-                        # 机会，而不是直接判 f_not_converged、零尝试放弃。只
-                        # 触发一次：如果这次冻结验证也失败、退回 learning 后
-                        # 再次撞到这个耗尽条件，说明确实没戏，老实 break。
-                        budget_fallback_used = True
-                        frozen_f_k_snapshot = [
-                            float(sim.context.getParameter(f"{self.prefix}_f_{k}"))
-                            for k in range(K)
-                        ]
-                        mode = "freeze_burn_in"
-                        freeze_burn_in_done = 0
-                        validation_probability_sum = np.zeros(K, dtype=np.float64)
-                        validation_sample_count = 0
-                        validation_batch_count = 0
-                        validation_steps_this_freeze = 0
-                        sampler.energy_buffer = []
-                        sampler.ema_mean_p = None
-                        print(
-                            "    🎯 learning 候选连续通过 streak 未在 "
-                            f"max_bias_updates={max_bias_updates} 内凑满；"
-                            "budget-exhaustion fallback 给当前 f_k 一次真正的"
-                            "冻结验证机会（仅一次）"
-                        )
-                        continue
-                    break
-                # 🔑 [IBS_EARLY_PROBE_TRIGGER_ENABLED] learning_to_validation_cycles
-                # 是单调递增计数器（只在冻结验证失败时 +1），一旦到 2 就永远 >=2；
-                # 必须只在 mode=="learning" 时检查，否则会在 freeze_burn_in/
-                # validating 即将真正通过的最后几百步把它打断，反而触发更贵的
-                # fixed-H overlap 探针+bias 校准兜底。跟下面的轨迹库重构是两件
-                # 独立的事，用同名开关分别验证（见常量定义处）。
-                if (
-                    IBS_EARLY_PROBE_TRIGGER_ENABLED
-                    and mode == "learning"
-                    and learning_to_validation_cycles >= 2
-                    and steps_at_full_bias >= 100_000
-                    and K <= 4
-                    and stage_type == "vdw"
-                ):
-                    # 🔑 记下触发原因，不能让下游只看到一个笼统的
-                    # "hit_update_or_safety_cap_unconverged"——那个状态字符串本来
-                    # 描述的是"真正烧完了步数预算"，跟"主动提前放弃 SGD、抢跑
-                    # fixed-H 探针"是两种不同的情况，必须能从落盘诊断里区分开。
-                    early_probe_triggered = True
-                    early_probe_trigger_reason = (
-                        f"learning_to_validation_cycles={learning_to_validation_cycles}>=2 "
-                        f"and steps_at_full_bias={steps_at_full_bias}>=100000 "
-                        f"and K={K}<=4 and stage_type=='vdw'"
-                    )
                     break
                 sim.step(check_chunk)
                 steps_at_full_bias += check_chunk
                 sampler.collect_energies()
 
                 if mode == "learning":
-                    # check_chunk（每 500 步检查一次）比 update_weights() 真正
-                    # 触发的频率（energy_buffer 攒够 10 帧才执行）密得多；没有
-                    # 新更新的检查直接跳过，避免同一批结果被反复计成"连续通过"。
+                    # 现有 f_k 更新（全历史 TMBAR 自洽绝对候选，不可解时固定 10-kT
+                    # SGD 兜底）——loose-gate 不改这个更新机制，只改"何时冻结进生产"。
+                    # raw block/EMA/dominant 仍仅作诊断。
                     f_updated = None
-                    if len(sampler.energy_buffer) >= 20:
+                    if len(sampler.energy_buffer) >= IBS_TMBAR_LEARNING_MINIBATCH_FRAMES:
                         f_updated = sampler.update_weights(
+                            min_buffer_size=IBS_TMBAR_LEARNING_MINIBATCH_FRAMES,
                             candidate_min_ess_ratio=candidate_min_ess_ratio,
                             candidate_min_absolute_ess=candidate_min_absolute_ess,
                             candidate_min_decorrelated_samples=candidate_min_decorrelated_samples,
@@ -7429,304 +7805,318 @@ class IBSWindowManagerDualLambda:
                     if f_updated is None:
                         continue
                     bias_update_count += 1
-                    if len(sampler.f_history) < 2:
-                        continue
-                    # Resume restores f_history to the number of updates already
-                    # completed under this same v23 protocol. Count those real
-                    # persisted updates toward min_bias_updates; still require
-                    # fresh consecutive candidate passes below before freezing.
-                    if len(sampler.f_history) < int(min_bias_updates):
-                        continue
-
-                    # [IBS_BIAS_PROTOCOL_VERSION=19] Learning 候选门读取
-                    # solve_stage_integrated 对累计至今全部 minibatch 的
-                    # converged 四项联合判据（ESS ratio+绝对 ESS+去相关样本数+
-                    # 端点不确定度，candidate_* 阈值），取代旧的单一 LSE 残差。
-                    # 后面独立、未变的冻结验证仍然是对新采样本的严格 raw-batch
-                    # 检查，这个候选门本身不能单独宣称已经生产就绪。
-                    tmbar_update_diag = dict(
-                        sampler.last_update_diagnostics.get("tmbar_update", {})
-                    )
-                    lse_residual_history.append({
-                        **tmbar_update_diag,
-                        "phase": "learning_tmbar",
-                    })
-                    lse_ok = bool(tmbar_update_diag.get("converged", False))
-                    # 保留 last_lse_balance（raw batch 下的 LSE 平衡诊断，跟旧版
-                    # 语义一致，只是不再驱动这里的收敛判定）供最终失败报告展示，
-                    # 不能让它在从未进入过 validating 的窗口里一直是 None。
-                    last_lse_balance = dict(
-                        sampler.last_update_diagnostics.get("lse_balance", {})
-                    )
-                    last_f_delta = float(
-                        np.max(np.abs(np.asarray(sampler.f_history[-1]) - np.asarray(sampler.f_history[-2])))
-                    )
-                    if lse_ok:
-                        consecutive_pass_count += 1
-                    else:
-                        consecutive_pass_count = 0
-                    if consecutive_pass_count >= int(required_consecutive_bias_updates):
-                        # 候选收敛：冻结 f_k，切到 burn-in，绝不再更新权重。
+                    updates_since_freeze += 1
+                    if len(sampler.f_history) >= 2:
+                        last_f_delta = float(
+                            np.max(
+                                np.abs(
+                                    np.asarray(sampler.f_history[-1])
+                                    - np.asarray(sampler.f_history[-2])
+                                )
+                            )
+                        )
+                    # 冻结时机（不需要连续通过、不需要等 f_k 稳定）：首次冻结前至少
+                    # 累计 min_bias_updates 次真实更新（给学习一个下限，resume 恢复的
+                    # 历史更新也计入 f_history），此后每次 loose-gate 失败只需再做一
+                    # 轮更新即重新冻结复检。
+                    updates_needed = int(min_bias_updates) if not have_frozen_once else 1
+                    if (
+                        len(sampler.f_history) >= int(min_bias_updates)
+                        and updates_since_freeze >= updates_needed
+                    ):
                         frozen_f_k_snapshot = [
                             float(sim.context.getParameter(f"{self.prefix}_f_{k}"))
                             for k in range(K)
                         ]
                         mode = "freeze_burn_in"
+                        have_frozen_once = True
+                        updates_since_freeze = 0
                         freeze_burn_in_done = 0
-                        validation_probability_sum = np.zeros(K, dtype=np.float64)
-                        validation_sample_count = 0
-                        validation_batch_count = 0
-                        validation_steps_this_freeze = 0
+                        frozen_mbar_batches = []
+                        sampler._last_dominant_k = None
                         sampler.energy_buffer = []
                         sampler.ema_mean_p = None
                     continue
 
                 if mode == "freeze_burn_in":
-                    # 冻结后的样本需要重新平衡到这个固定 Hamiltonian 下的分布，
-                    # 之前在漂移偏置下攒的帧不能算数——整批丢弃，不进入验证统计。
+                    # 冻结 f_k 后构型要在这个固定 Hamiltonian 下重新平衡；之前在漂移
+                    # 偏置下攒的帧一律丢弃，不进 local MBAR 门统计。
                     freeze_burn_in_done += check_chunk
                     sampler.energy_buffer = []
                     if freeze_burn_in_done >= frozen_burn_in_steps:
                         mode = "validating"
-                        validation_pass_count = 0
-                        validation_probability_sum = np.zeros(K, dtype=np.float64)
-                        validation_sample_count = 0
+                        frozen_mbar_batches = []
                         validation_batch_count = 0
+                        validation_sample_count = 0
                         validation_steps_this_freeze = 0
                     continue
 
-                # mode == "validating"：保持同一 f_k，只读累计该固定 Hamiltonian
-                # 下的新样本。v17 每个 20-frame batch 一失败就立刻退回 learning，既
-                # 没有估计期望值，也没有给构型分布时间松弛。现在至少累计明确的
-                # validation attempt 预算；只有整次 attempt 失败后才恢复 learning。
+                # mode == "validating"：保持同一冻结 f_k，累计最近
+                # IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES 批固定-f_k minibatch，拼成一次
+                # 单参考 local MBAR，只设一个 loose gate：相邻态 ΔF^MBAR 与当前相邻
+                # Δf_k 的最大偏差 < 阈值即冻结进生产（相邻差 gauge 无关，不比较带任意
+                # 公共常数的绝对 f_k）。
                 validation_steps_this_freeze += check_chunk
-                if len(sampler.energy_buffer) < 20:
+                if len(sampler.energy_buffer) < IBS_TMBAR_LEARNING_MINIBATCH_FRAMES:
                     continue
-                # [IBS_BIAS_PROTOCOL_VERSION=19] 无论这次 validating attempt 最终
-                # 通过与否，先把这批真实采样帧（固定 f_k 下采出的真实物理帧）打包
-                # 进持久的 tmbar_history——tmbar_history 只在 "learning" 模式下被
-                # solve_tmbar_and_recenter() 读取，"validating"/"freeze_burn_in"
-                # 阶段本身从不消费它，所以提前追加不会提前把这批样本"泄漏"进任何
-                # 决策；只有当下面这次 attempt 真的失败、退回 learning 时，它们才
-                # 会第一次真正被解出使用，语义上仍然是"验证失败后才并入下一次候选"。
-                sampler._append_tmbar_batch_from_buffer()
-                batch_p = sampler.evaluate_frozen_batch_probability()
-                if batch_p is None:
+                # 把这批固定-f_k 帧并入持久 tmbar_history（loose-gate 失败退回
+                # learning 时，下一轮 update_weights 会复用它们继续学习），并取回
+                # 同一份 (u_kn,bias_energies,base_energies) 数组喂 local MBAR——这三
+                # 者跟 _solve_single_window_local_mbar 的入参一一对应（同 collect_
+                # energies 记录的纯 softcore/base/bias，与 f_k 训练所用口径一致）。
+                n_appended = sampler._append_tmbar_batch_from_buffer()
+                sampler.energy_buffer = []
+                if n_appended <= 0:
                     continue
-                raw_batch_p = np.asarray(batch_p, dtype=np.float64)
-                frozen_batch_size = max(
-                    1, int(getattr(sampler, "last_frozen_batch_size", 0))
-                )
-                validation_probability_sum += float(frozen_batch_size) * raw_batch_p
-                validation_sample_count += int(frozen_batch_size)
+                frozen_mbar_batches.append(sampler.tmbar_history[-1])
+                if len(frozen_mbar_batches) > IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES:
+                    frozen_mbar_batches = frozen_mbar_batches[
+                        -IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES:
+                    ]
                 validation_batch_count += 1
-                p = validation_probability_sum / float(validation_sample_count)
-                last_validation_batch_p = p.tolist()
-                validation_batch_history.append(raw_batch_p.astype(float).tolist())
-                validation_cumulative_history.append({
-                    "n_batches": int(validation_batch_count),
-                    "n_frames": int(validation_sample_count),
-                    "mean_p": last_validation_batch_p,
-                })
-                last_lse_balance = ibs_lse_balance_diagnostics(p)
-                lse_residual_history.append({
-                    **last_lse_balance,
-                    "phase": "frozen_cumulative_validation",
-                    "n_batches": int(validation_batch_count),
-                    "n_frames": int(validation_sample_count),
-                })
+                validation_sample_count += int(n_appended)
                 if resumed_calibration_pending:
-                    # 🔑 [MAIN_WINDOW_CHECKPOINT_PROTOCOL_VERSION] 每评估完一批
-                    # （无论 pass/fail）就存一次主窗口 checkpoint，覆盖式落盘
-                    # （不按代际累积，续验永远只需要"最后一次看到的状态"）。
-                    # 这是应对 HPC 作业被抢占/撞墙时限杀掉的直接对策：不这样做
-                    # 的话，一次 300,000 步续验预算里的全部进展会在作业被杀时
-                    # 完全丢失，下次只能从头再续验一遍。
+                    # 🔑 [MAIN_WINDOW_CHECKPOINT_PROTOCOL_VERSION] 每批覆盖式落盘主
+                    # 窗口 checkpoint + 累计步数，抢占/撞墙被杀也能精确续算，不重跑
+                    # 也不漏算（沿用 v27 的每批落盘频率，只是判据换成 loose-gate）。
                     _atomic_save_openmm_checkpoint(sim, main_ckpt_path)
                     _atomic_write_json(main_manifest_path, expected_main_manifest)
-                    # 🔑 [checkpoint/累计步数同步修复] 上面的 .chk 每批都覆盖式落盘，
-                    # 但 frozen_validation_cumulative_steps 在这个修复之前只在整次
-                    # attempt 正常结束时才写回 JSON（下面 bias_converged 分支或
-                    # 失败分支）——一旦作业在这两点之间被杀，.chk 里的坐标已经
-                    # 反映了新跑的步数，JSON 里的累计步数却还是这次 attempt开始前
-                    # 的旧值，下次续算会用这个偏低的旧值重新计算剩余预算，导致
-                    # 已经真正跑过的步数被重复计入下一轮预算。这里让两者同频率
-                    # 落盘，跟 .chk 一样每批覆盖式更新一次，任何一批之后被杀都能
-                    # 精确续算，不会重跑或漏算已完成的步数。
                     sampler.frozen_validation_cumulative_steps = (
                         prior_cumulative_steps + steps_at_full_bias
                     )
                     sampler.save_ibs_state(ibs_state_file, lc_win, lv_win)
-                enough_validation_batches = (
-                    validation_batch_count >= int(required_consecutive_bias_updates)
+                # 只看最近 IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES 批：攒齐再解一次。
+                if len(frozen_mbar_batches) < IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES:
+                    continue
+                u_kn_gate = np.concatenate(
+                    [
+                        np.asarray(b["u_kn"], dtype=np.float64)
+                        for b in frozen_mbar_batches
+                    ],
+                    axis=1,
                 )
-                lse_ok = bool(
-                    enough_validation_batches
-                    and
-                    last_lse_balance.get("available", False)
-                    and last_lse_balance["max_abs_log_residual"]
-                    <= float(lse_log_residual_tolerance)
+                bias_gate = np.concatenate(
+                    [
+                        np.asarray(b["bias_energies"], dtype=np.float64)
+                        for b in frozen_mbar_batches
+                    ]
                 )
-                if lse_ok:
-                    validation_pass_count = int(validation_batch_count)
-                    bias_converged = True
-                    break
-                validation_pass_count = 0
-                if not enough_validation_batches:
-                    continue
-                if resumed_calibration_pending:
-                    frozen_validation_retry_count += 1
-                    print(
-                        f"    🧊 冻结累计验证 {validation_batch_count} batches/"
-                        f"{validation_sample_count} frames 尚未通过，保持同一组 f_k 继续采样"
-                    )
-                    continue
-                if validation_steps_this_freeze < int(validation_attempt_budget_steps):
-                    print(
-                        f"    🧊 冻结累计验证 {validation_sample_count} frames 尚未通过；"
-                        f"保持 f_k 不变继续采到 {validation_attempt_budget_steps} 步 attempt 上限"
-                    )
-                    continue
-
-                # This complete held-out attempt rejected the candidate. Its
-                # samples already joined tmbar_history batch-by-batch above.
-                # 🔑 [IBS_BIAS_PROTOCOL_VERSION=25] "见好就收"：在对这份 f_k 做
-                # 任何负反馈修改之前，先把它（连同这次 attempt 的残差）记入
-                # best-effort 候选——负反馈之后的 f_k 从未被冻结验证过，不能
-                # 拿来当"已验证过的最优结果"。
-                f_this_attempt = np.asarray(
+                base_gate = np.concatenate(
+                    [
+                        np.asarray(b["base_energies"], dtype=np.float64)
+                        for b in frozen_mbar_batches
+                    ]
+                )
+                gate_mbar = _solve_single_window_local_mbar(
+                    u_kn_gate,
+                    bias_gate,
+                    base_gate,
+                    list(range(K)),
+                    sampler.kt,
+                    sampled_distribution_row=0,
+                    w_idx=window_idx,
+                )
+                f_frozen_now = np.asarray(
                     [
                         sim.context.getParameter(f"{self.prefix}_f_{k}")
                         for k in range(K)
                     ],
                     dtype=np.float64,
                 )
-                this_attempt_residual = (
-                    float(last_lse_balance["max_abs_log_residual"])
-                    if last_lse_balance.get("available", False)
-                    else float("inf")
+                # 🔑 [IBS_BIAS_PROTOCOL_VERSION=29] 生产入口双门：主门 A 用可信 local
+                # MBAR 的 Δf−ΔF；短 warmup 下绝对 ESS 达不到时，用兜底门 B（冻结占据
+                # 已平坦）。两条都拿现场诊断的 occupancy/ESS。任一通过即冻结进生产。
+                gate_solver_error = gate_mbar.get("error")
+                _gate_min_ess_ratio = gate_mbar.get("min_ess_ratio")
+                _gate_n_used = int(gate_mbar.get("n_frames_used", 0) or 0)
+                _gate_abs_ess = (
+                    float(_gate_min_ess_ratio) * _gate_n_used
+                    if (_gate_min_ess_ratio is not None
+                        and np.isfinite(_gate_min_ess_ratio))
+                    else 0.0
                 )
-                if this_attempt_residual < best_effort_residual:
-                    best_effort_residual = this_attempt_residual
-                    best_effort_f_k = f_this_attempt.copy()
-                    best_effort_validation_stats = {
-                        "max_abs_log_residual": this_attempt_residual,
-                        "mean_p_batch": p.astype(float).tolist(),
-                        "validation_batch_count": int(validation_batch_count),
-                        "validation_sample_count": int(validation_sample_count),
-                    }
-
-                validation_feedback_update_count += 1
-                learning_to_validation_cycles += 1
-
-                best_effort_within_sane_bound = (
-                    best_effort_f_k is not None
-                    and _best_effort_validation_is_acceptable(
-                        best_effort_residual,
-                        best_effort_validation_stats,
-                        lse_log_residual_tolerance,
-                        best_effort_max_residual_multiple,
-                        minimum_complete_validation_frames,
+                # 基本重叠底线：两条门都要求 min_ess_ratio≥阈值（否则某条边零重叠，
+                # 占据即使短窗内看似平坦也可能是饿死态的假象）。
+                _ess_ratio_ok = bool(
+                    _gate_min_ess_ratio is not None
+                    and np.isfinite(_gate_min_ess_ratio)
+                    and _gate_min_ess_ratio >= IBS_LOCAL_MBAR_GATE_MIN_ESS_RATIO
+                )
+                # 现场诊断（占据/ESS/原始 Δu），两条门与日志都用它的 occupancy。
+                try:
+                    gate_situation = _diagnose_local_mbar_situation(
+                        u_kn_gate, f_frozen_now, sampler.kt, gate_mbar, int(start)
                     )
+                except Exception as _situ_err:
+                    gate_situation = {"error": repr(_situ_err)}
+
+                # ---- 门 A（主）：local MBAR 绝对可信（ess_ratio≥0.05 且 abs_ess≥10）
+                #      时，比较相邻态 |Δf_k−ΔF^MBAR|（gauge 无关）< 阈值。----
+                reliable_local_mbar = bool(
+                    gate_solver_error is None
+                    and _ess_ratio_ok
+                    and _gate_abs_ess >= IBS_LOCAL_MBAR_GATE_MIN_ABSOLUTE_ESS
+                )
+                max_adjacent_gap_kJ_mol = float("inf")
+                adjacent_gaps = None
+                _f_mbar_finite = False
+                if gate_solver_error is None:
+                    f_mbar = np.asarray(gate_mbar.get("f"), dtype=np.float64)
+                    if f_mbar.size == K and np.all(np.isfinite(f_mbar)):
+                        _f_mbar_finite = True
+                        if K > 1:
+                            # 相邻差：采样参考系的公共常数在 diff 里抵消。
+                            df_current = np.diff(f_frozen_now)
+                            dF_mbar = np.diff(f_mbar)
+                            adjacent_gaps = np.abs(df_current - dF_mbar)
+                            max_adjacent_gap_kJ_mol = float(np.max(adjacent_gaps))
+                        else:
+                            max_adjacent_gap_kJ_mol = 0.0
+                reliable_gate_ok = bool(
+                    reliable_local_mbar
+                    and _f_mbar_finite
+                    and max_adjacent_gap_kJ_mol
+                    < float(IBS_LOCAL_MBAR_GATE_MAX_ADJACENT_DELTA_KJ_MOL)
+                )
+
+                # ---- 门 B（兜底）：冻结占据平坦（每态∈[0.5/K,2/K]、coverage_ESS≥0.8K）
+                #      且仍有基本重叠（ess_ratio≥0.05）。物理上占据平坦⇔f_k≈F_k⇔
+                #      Δf≈ΔF，是同一收敛的低方差估计，短窗绝对 ESS 不足时用它放行。----
+                occupancy_gate_ok = False
+                _occ_cov_ess = float("nan")
+                _occ_list = (
+                    gate_situation.get("occupancy_per_state")
+                    if isinstance(gate_situation, dict) else None
                 )
                 if (
-                    learning_to_validation_cycles
-                    >= int(max_frozen_validation_cycles_before_accept_best)
-                    and best_effort_f_k is not None
-                    and (not warmup_only or best_effort_within_sane_bound)
+                    gate_solver_error is None
+                    and _ess_ratio_ok
+                    and _occ_list
+                    and len(_occ_list) == K
+                    and K > 0
                 ):
-                    # 预热到此结束。固定验证残差只描述这组 f_k 的采样效率，
-                    # 不是生产准入正确性门；继续用更多预热 attempt 逼平占据，
-                    # 反而会让预热预算超过真正的生产。只有在最优 attempt 不是
-                    # 当前 attempt 时才恢复其 f_k；随后 burn-in，再由生产入口
-                    # 硬锁保证整个 production 内绝不变化。
-                    if not np.allclose(
-                        f_this_attempt,
-                        best_effort_f_k,
-                        rtol=0.0,
-                        atol=1.0e-12,
-                    ):
-                        for k in range(K):
-                            sim.context.setParameter(
-                                f"{self.prefix}_f_{k}", float(best_effort_f_k[k])
-                            )
-                    sampler.f_history.append(best_effort_f_k.copy())
-                    validation_pass_count = int(
-                        best_effort_validation_stats["validation_batch_count"]
+                    _occ_arr = np.asarray(_occ_list, dtype=np.float64)
+                    _sum_sq_occ = float(np.sum(np.square(_occ_arr)))
+                    _occ_cov_ess = (
+                        float(1.0 / _sum_sq_occ) if _sum_sq_occ > 0.0 else 0.0
                     )
-                    bias_converged = True
-                    best_effort_acceptance = True
-                    best_effort_acceptance_reason = "bounded_warmup_budget"
-                    best_effort_reburnin_required = not np.allclose(
-                        f_this_attempt,
-                        best_effort_f_k,
-                        rtol=0.0,
-                        atol=1.0e-12,
+                    _target_p = 1.0 / float(K)
+                    occupancy_gate_ok = bool(
+                        float(np.max(_occ_arr))
+                        <= IBS_LOCAL_MBAR_GATE_OCC_MAX_FRACTION * _target_p
+                        and float(np.min(_occ_arr))
+                        >= IBS_LOCAL_MBAR_GATE_OCC_MIN_FRACTION * _target_p
+                        and _occ_cov_ess
+                        >= IBS_LOCAL_MBAR_GATE_OCC_MIN_COVERAGE_ESS_FRACTION * float(K)
                     )
-                    last_validation_batch_p = best_effort_validation_stats["mean_p_batch"]
-                    print(
-                        f"    🔒 已完成 {max_frozen_validation_cycles_before_accept_best} "
-                        "次足额 fixed-f 预热验证；占据残差仅记为效率诊断 "
-                        f"（max|log(K*p)|={best_effort_residual:.4f}, "
-                        f"ideal tolerance={float(lse_log_residual_tolerance):.4f}, "
-                        f"within_sane_bound={best_effort_within_sane_bound}）。"
-                        "现锁定该 f_k，清空预热样本并进入独立生产；生产后 "
-                        "overlap/ESS/去相关样本/不确定度硬门仍会判定最终可用性"
-                    )
-                    break
 
-                # Re-solve TMBAR for coverage diagnostics only; v23 never
-                # installs this absolute vector. Instead, the held-out
-                # cumulative occupation p drives the same bounded all-state
-                # negative-feedback increment used during learning.
-                tmbar_result = sampler._solve_tmbar_and_recenter()
-                if tmbar_result is not None:
-                    _tmbar_absolute_candidate, tmbar_res = tmbar_result
-                    tmbar_update_diag = {
-                        "available": True,
-                        "n_tmbar_entries": len(sampler.tmbar_history),
-                        "converged": bool(tmbar_res.get("converged", False)),
-                        "min_overlap": tmbar_res.get("min_overlap"),
-                        "min_absolute_ess": tmbar_res.get("min_absolute_ess"),
-                        "min_decorrelated_samples": tmbar_res.get("min_decorrelated_samples"),
-                        "max_endpoint_uncertainty_kJ_mol": tmbar_res.get("max_endpoint_uncertainty_kJ_mol"),
-                    }
-                else:
-                    # 去相关后仍不足以解出：保持 f_k 不变退回 learning，下一次
-                    # update_weights() 会带着已经并入的这些样本继续尝试。
-                    tmbar_update_diag = {
-                        "available": False,
-                        "n_tmbar_entries": len(sampler.tmbar_history),
-                    }
-                sampler.apply_learning_rate_penalty()
-                # 🔑 [IBS_BIAS_PROTOCOL_VERSION=25] 复用上面已经取过的、这次
-                # attempt 真正被冻结验证过的 f_k（negative feedback 之前），
-                # 不用再重新读一次 Context 参数。
-                f_before_feedback = f_this_attempt
-                f_after_validation, weight_update_diag = (
-                    sampler._bounded_log_occupancy_update(f_before_feedback, p)
+                gate_ok = bool(reliable_gate_ok or occupancy_gate_ok)
+                gate_pass_route = (
+                    "reliable_delta_f" if reliable_gate_ok
+                    else ("flat_occupancy_fallback" if occupancy_gate_ok else None)
                 )
-                for k in range(K):
-                    sim.context.setParameter(
-                        f"{self.prefix}_f_{k}", float(f_after_validation[k])
+                # gate_error 仅用于"未过时"的日志归因，不再单独驱动放行。
+                if gate_solver_error is not None:
+                    gate_error = gate_solver_error
+                elif not _f_mbar_finite:
+                    gate_error = "nan_or_shape_mismatch_in_local_mbar_f"
+                elif not reliable_local_mbar:
+                    gate_error = "insufficient_overlap_or_ess"
+                else:
+                    gate_error = None
+                gate_diag = {
+                    "phase": "frozen_local_mbar_loose_gate",
+                    "n_batches": int(len(frozen_mbar_batches)),
+                    # ESS/frames 无论是否被拒都如实记录，便于看清放行/未过原因。
+                    "n_frames_used": int(_gate_n_used),
+                    "min_ess_ratio": _gate_min_ess_ratio,
+                    "min_absolute_ess": float(_gate_abs_ess),
+                    "min_ess_ratio_threshold": float(IBS_LOCAL_MBAR_GATE_MIN_ESS_RATIO),
+                    "min_absolute_ess_threshold": float(
+                        IBS_LOCAL_MBAR_GATE_MIN_ABSOLUTE_ESS
+                    ),
+                    "statistical_inefficiency": gate_mbar.get("statistical_inefficiency"),
+                    "max_adjacent_delta_kJ_mol": (
+                        max_adjacent_gap_kJ_mol
+                        if np.isfinite(max_adjacent_gap_kJ_mol) else None
+                    ),
+                    "adjacent_delta_kJ_mol": (
+                        [float(x) for x in adjacent_gaps]
+                        if adjacent_gaps is not None else None
+                    ),
+                    "gate_threshold_kJ_mol": float(
+                        IBS_LOCAL_MBAR_GATE_MAX_ADJACENT_DELTA_KJ_MOL
+                    ),
+                    "reliable_gate_ok": bool(reliable_gate_ok),
+                    "occupancy_gate_ok": bool(occupancy_gate_ok),
+                    "occupancy_coverage_ess": (
+                        float(_occ_cov_ess) if np.isfinite(_occ_cov_ess) else None
+                    ),
+                    "gate_pass_route": gate_pass_route,
+                    "error": gate_error,
+                    "steps_at_full_bias": int(steps_at_full_bias),
+                    "validation_sample_count": int(validation_sample_count),
+                    "situation": gate_situation,
+                }
+                local_mbar_gate_history.append(gate_diag)
+                last_local_mbar_gate = gate_diag
+                lse_residual_history.append(gate_diag)
+                # loose-gate 不用占据概率判据做 EMA；last_validation_batch_p 仅用于
+                # 失败/收敛报告兜底展示，保持 None（下游报告会退回 EMA/nan）。
+                last_validation_batch_p = None
+                if gate_ok:
+                    validation_pass_count = int(validation_batch_count)
+                    bias_converged = True
+                    if gate_pass_route == "reliable_delta_f":
+                        print(
+                            "    ✅ local-MBAR loose gate 通过（Δf−ΔF 主门）："
+                            f"max|Δf_k−ΔF^MBAR|={max_adjacent_gap_kJ_mol:.3f} kJ/mol < "
+                            f"{float(IBS_LOCAL_MBAR_GATE_MAX_ADJACENT_DELTA_KJ_MOL):.1f} "
+                            f"kJ/mol（abs_ess={_gate_abs_ess:.1f}, "
+                            f"{validation_sample_count} frames）；冻结 f_k 进生产"
+                        )
+                    else:
+                        print(
+                            "    ✅ 进入生产（占据兜底门）：冻结占据已平坦、coverage_ESS="
+                            f"{_occ_cov_ess:.2f}≥{IBS_LOCAL_MBAR_GATE_OCC_MIN_COVERAGE_ESS_FRACTION * float(K):.2f}"
+                            f"、min_ess_ratio={_gate_min_ess_ratio:.3f}≥"
+                            f"{float(IBS_LOCAL_MBAR_GATE_MIN_ESS_RATIO):.2f}（短 warmup 绝对"
+                            f" ESS={_gate_abs_ess:.1f} 不足以走 Δf−ΔF 门）；现场："
+                            f"{_format_local_mbar_situation(gate_situation)}；最终绝对 ESS/"
+                            "误差/自由能交生产后 MBAR"
+                        )
+                    break
+                # 两条门都没过：退回 learning 再做一轮现有 f_k 更新（失败帧已并入
+                # tmbar_history 供下一轮 update_weights 复用）。归因日志：
+                learning_to_validation_cycles += 1
+                if reliable_local_mbar and _f_mbar_finite:
+                    print(
+                        "    ⟳ local-MBAR loose gate 未过（Δf−ΔF 主门可信但超阈值）："
+                        f"max|Δf_k−ΔF^MBAR|={max_adjacent_gap_kJ_mol:.3f} kJ/mol ≥ "
+                        f"{float(IBS_LOCAL_MBAR_GATE_MAX_ADJACENT_DELTA_KJ_MOL):.1f}；"
+                        "某条局部边仍明显偏离，退回 learning 再更新一轮"
                     )
-                sampler.f_history.append(f_after_validation.copy())
+                elif gate_error == "insufficient_overlap_or_ess":
+                    print(
+                        f"    ⟳ 两门均未过：local MBAR abs_ess={_gate_abs_ess:.2f}<"
+                        f"{float(IBS_LOCAL_MBAR_GATE_MIN_ABSOLUTE_ESS):.0f}（Δf 门不可信），"
+                        "且冻结占据尚未平坦到占据兜底门（或 min_ess_ratio<0.05）；退回 "
+                        f"learning 继续更新。现场：{_format_local_mbar_situation(gate_situation)}"
+                    )
+                else:
+                    print(
+                        f"    ⟳ local MBAR 暂不可解（{gate_error}）；"
+                        "退回 learning 继续更新（不让 BAR/MBAR 不收敛卡住流程）"
+                    )
                 sampler.last_update_diagnostics = {
-                    "source": "failed_frozen_cumulative_validation",
-                    "batch_size": int(validation_sample_count),
-                    "mean_p_batch": p.astype(float).tolist(),
-                    "lse_balance": last_lse_balance,
-                    "tmbar_update": tmbar_update_diag,
-                    "weight_update": weight_update_diag,
+                    "source": "failed_local_mbar_loose_gate",
+                    "local_mbar_gate": gate_diag,
                     "adjacent_delta_u_is_convergence_gate": False,
                 }
-                print(
-                    f"    ⚠️ 第 {learning_to_validation_cycles} 次完整冻结验证 attempt "
-                    f"（{validation_sample_count} frames）失败；其样本已并入 TMBAR 历史，"
-                    "并已执行受限占据负反馈，恢复 learning"
-                )
                 mode = "learning"
-                consecutive_pass_count = 0
+                updates_since_freeze = 0
+                frozen_mbar_batches = []
+                sampler._last_dominant_k = None
                 sampler.ema_mean_p = None
                 sampler.energy_buffer = []
                 validation_probability_sum = np.zeros(K, dtype=np.float64)
@@ -7735,95 +8125,103 @@ class IBSWindowManagerDualLambda:
                 validation_steps_this_freeze = 0
                 continue
 
-            # [warmup-control follow-up; production protocol remains v27]
-            # The loop can hit its global cap
-            # during a partial validation. Reuse the exact same sane-bound here, but only
-            # for a previously completed fixed-f attempt.  The partial attempt
-            # that happened to be in progress at the cap is diagnostic-only.
-            if (
-                not bias_converged
-                and not resumed_calibration_pending
-                and steps_at_full_bias >= int(full_bias_step_budget)
-                and best_effort_f_k is not None
-                and _best_effort_validation_is_acceptable(
-                    best_effort_residual,
-                    best_effort_validation_stats,
-                    lse_log_residual_tolerance,
-                    best_effort_max_residual_multiple,
-                    minimum_complete_validation_frames,
+            # [IBS_BIAS_PROTOCOL_VERSION=29] 跑满整个 warmup 步数预算仍没有任何一次
+            # local-MBAR loose gate < 阈值时，直接接受当前 f_k 进生产（best-effort）。
+            # loose gate 只是"别让某个局部边完全饿死"的粗门（10 kJ/mol≈4 kT）；真正的
+            # 自由能/ESS/overlap/误差全部交给生产后独立的 _assert_stage_result_sane +
+            # 最终 MBAR。resumed_calibration_pending 续验同样走这条（不再有阶梯升级/
+            # 无限续验：判据已换成 loose gate，预算耗尽即接受）。接受的就是循环退出
+            # 时 Context 里的这份 f_k，不需要恢复更早的 attempt，也不需要额外 re-burn-in。
+            # 条件用 `not bias_converged` 覆盖两种退出：撞总步数帽，或反复未过 gate
+            # 把 learning 更新次数烧到 max_bias_updates 而 break——两者都算预算耗尽。
+            # 但 warmup_only 是设计期验证模式，本就不进生产、其职责是如实报告窗口是
+            # 否收敛，故不 best-effort 接受——让它照常落到下面 else 分支报未收敛。
+            if not bias_converged and not warmup_only:
+                accepted_f_k = np.asarray(
+                    [
+                        sim.context.getParameter(f"{self.prefix}_f_{k}")
+                        for k in range(K)
+                    ],
+                    dtype=np.float64,
                 )
-            ):
-                safety_tmbar_result = sampler._solve_tmbar_and_recenter(
-                    min_ess_ratio=candidate_min_ess_ratio,
-                    min_absolute_ess=candidate_min_absolute_ess,
-                    min_decorrelated_samples=candidate_min_decorrelated_samples,
-                    max_uncertainty_kJ_mol=candidate_max_uncertainty_kJ_mol,
+                frozen_f_k_snapshot = accepted_f_k.astype(float).tolist()
+                validation_pass_count = int(validation_batch_count)
+                bias_converged = True
+                best_effort_acceptance = True
+                best_effort_acceptance_reason = "warmup_budget_exhausted_loose_gate"
+                best_effort_residual = (
+                    float(last_local_mbar_gate["max_adjacent_delta_kJ_mol"])
+                    if (
+                        last_local_mbar_gate is not None
+                        and last_local_mbar_gate.get("max_adjacent_delta_kJ_mol")
+                        is not None
+                    )
+                    else float("inf")
                 )
-                safety_cap_best_effort_tmbar_converged = bool(
-                    safety_tmbar_result is not None
-                    and safety_tmbar_result[1].get("converged", False)
+                mode = "best_effort_budget_exhausted_accepted"
+                _last_gap_repr = (
+                    f"{best_effort_residual:.3f} kJ/mol"
+                    if np.isfinite(best_effort_residual)
+                    else "n/a（local MBAR 从未在预算内解出）"
                 )
-                if safety_cap_best_effort_tmbar_converged:
-                    current_f_at_cap = np.asarray(
-                        [
-                            sim.context.getParameter(f"{self.prefix}_f_{k}")
-                            for k in range(K)
-                        ],
-                        dtype=np.float64,
-                    )
-                    best_effort_reburnin_required = not np.allclose(
-                        current_f_at_cap,
-                        best_effort_f_k,
-                        rtol=0.0,
-                        atol=1.0e-12,
-                    )
-                    for k in range(K):
-                        sim.context.setParameter(
-                            f"{self.prefix}_f_{k}", float(best_effort_f_k[k])
-                        )
-                    sampler.f_history.append(best_effort_f_k.copy())
-                    validation_pass_count = int(
-                        best_effort_validation_stats["validation_batch_count"]
-                    )
-                    bias_converged = True
-                    best_effort_acceptance = True
-                    best_effort_acceptance_reason = "global_safety_cap"
-                    truncated_validation_frames_ignored = (
-                        int(validation_sample_count) if mode == "validating" else 0
-                    )
-                    validation_batch_count = int(
-                        best_effort_validation_stats["validation_batch_count"]
-                    )
-                    validation_sample_count = int(
-                        best_effort_validation_stats["validation_sample_count"]
-                    )
-                    last_validation_batch_p = best_effort_validation_stats[
-                        "mean_p_batch"
-                    ]
-                    frozen_f_k_snapshot = best_effort_f_k.astype(float).tolist()
-                    mode = "best_effort_safety_cap_accepted"
-                    print(
-                        "    🤝 总步数安全帽先于冻结重试次数上限到达；忽略当前未完成"
-                        f"验证的 {truncated_validation_frames_ignored} 帧，采用此前完整 "
-                        f"{best_effort_validation_stats['validation_sample_count']} 帧 attempt "
-                        f"中最优的 fixed-f 结果（max|log(K*p)|="
-                        f"{best_effort_residual:.4f}），累计 TMBAR 仍已收敛；放行进生产，"
-                        "生产后独立正确性门继续兜底"
-                    )
-
-            if best_effort_acceptance and best_effort_reburnin_required:
-                # The accepted best attempt may predate the configuration at
-                # loop exit.  Restore its f_k, re-equilibrate without recording
-                # these frames, then continue production.  Previously accepted
-                # fixed-f frames remain valid as a separate same-H segment.
-                sim.step(int(frozen_burn_in_steps))
-                best_effort_reburnin_steps = int(frozen_burn_in_steps)
-                sampler.energy_buffer = []
-                sampler.ema_mean_p = None
                 print(
-                    f"    🧊 已在恢复的 best-effort f_k 下额外 burn-in "
-                    f"{best_effort_reburnin_steps} 步（全部丢弃），再进入生产"
+                    "    🤝 warmup 步数预算耗尽仍未通过 local-MBAR loose gate；接受当前 "
+                    f"f_k 进生产（最近一次 max|Δf_k−ΔF^MBAR|={_last_gap_repr}，阈值 "
+                    f"{float(IBS_LOCAL_MBAR_GATE_MAX_ADJACENT_DELTA_KJ_MOL):.1f} kJ/mol）；"
+                    "生产后独立质量门 + 最终 MBAR 继续兜底"
                 )
+                # 🔑 [IBS_BIAS_PROTOCOL_VERSION=29] 现场判决必须区分两种"预算耗尽"：
+                # (a) 占据真的塌了（某态低于 0.5/K）→ 硬热力学瓶颈，权重救不了，建议
+                #     插 λ/拆窗；(b) 占据其实平坦、只是短 warmup 的 local MBAR 绝对
+                #     ESS/端点 reweight ESS 偏低 → 不是瓶颈，已接受进生产，最终 ESS/
+                #     误差交生产后 MBAR。之前只凭"MBAR 没解出可信 ΔF"就一律报瓶颈，会
+                #     把 (b)（如占据 [0.41,0.27,0.20,0.125] 这种健康窗口）误报成需要插 λ。
+                _acc_situation = (
+                    last_local_mbar_gate.get("situation")
+                    if last_local_mbar_gate is not None else None
+                )
+                _never_trustworthy = (
+                    last_local_mbar_gate is None
+                    or last_local_mbar_gate.get("max_adjacent_delta_kJ_mol") is None
+                )
+                if _acc_situation:
+                    print(
+                        f"    🔎 现场：{_format_local_mbar_situation(_acc_situation)}"
+                    )
+                _situ_ok = bool(_acc_situation and not _acc_situation.get("error"))
+                if _situ_ok and _acc_situation.get("occupancy_is_flat"):
+                    # (b) 占据平坦：良性，不是插 λ 的场景。
+                    print(
+                        "    ✔️ 判决：冻结占据已平坦（coverage_ESS="
+                        f"{_acc_situation.get('coverage_ess', float('nan')):.2f}≥"
+                        f"{IBS_LOCAL_MBAR_GATE_OCC_MIN_COVERAGE_ESS_FRACTION * float(K):.2f}），"
+                        "只是短 warmup 的 local MBAR 绝对 ESS/端点 reweight ESS 偏低、未能走 "
+                        "Δf−ΔF 主门；已接受进生产，最终绝对 ESS/误差/自由能交生产后 "
+                        "_assert_stage_result_sane + 最终 MBAR。这不是需要插 λ 的瓶颈；"
+                        "若最终 MBAR 显示某端点采样不足，再考虑延长生产采样。"
+                    )
+                elif _never_trustworthy and _situ_ok and _acc_situation.get(
+                    "occupancy_collapsed"
+                ):
+                    # (a) 占据真的塌陷：硬瓶颈。
+                    _sg = _acc_situation.get("starved_global_state")
+                    _edges = _acc_situation.get("starved_edges_global") or []
+                    print(
+                        "    ⚠️ 判决：占据塌陷 + local MBAR 全程重叠/ESS 不足 → 这是"
+                        f"{'端点' if _acc_situation.get('is_endpoint') else '内部'}"
+                        f"热力学瓶颈（global s{_sg} 占据="
+                        f"{_acc_situation.get('starved_occupancy'):.2e} 低于健康下限 "
+                        f"{_acc_situation.get('occupancy_floor'):.3f}，与相邻态零重叠），"
+                        f"权重无法弥补物理缺口。建议在相邻 global 态之间插入 λ 或拆窗："
+                        f"边 {_edges}。（生产后 _assert_stage_result_sane 亦会独立判不可用。）"
+                    )
+                elif _never_trustworthy and _situ_ok:
+                    # 中间态：占据没塌到下限、但也没达到平坦兜底门（如 coverage 略低）。
+                    print(
+                        "    ℹ️ 判决：占据尚可但未达平坦兜底门、local MBAR 绝对 ESS 也不足；"
+                        "已接受进生产（best-effort）。优先延长生产采样；若最终 MBAR 仍显示"
+                        "某相邻边重叠不足，再考虑插 λ。现场见上。"
+                    )
 
             state = sim.context.getState(getEnergy=True)
             if not np.isfinite(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)):
@@ -7927,10 +8325,24 @@ class IBSWindowManagerDualLambda:
                 "lse_log_residual_tolerance": float(lse_log_residual_tolerance),
                 "lse_balance": report_lse_balance,
                 "lse_residual_history": lse_residual_history,
+                # 🔑 [IBS_BIAS_PROTOCOL_VERSION=29] 局部滑窗 MBAR loose-gate 诊断：
+                # 每次冻结复检解出的相邻态 |Δf_k−ΔF^MBAR| 及阈值/滑窗深度，供事后
+                # 追溯这个窗口是靠 loose-gate 通过还是预算耗尽 best-effort 放行。
+                "local_mbar_loose_gate": {
+                    "gate_threshold_kJ_mol": float(
+                        IBS_LOCAL_MBAR_GATE_MAX_ADJACENT_DELTA_KJ_MOL
+                    ),
+                    "sliding_window_batches": int(
+                        IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES
+                    ),
+                    "last": last_local_mbar_gate,
+                    "history": local_mbar_gate_history,
+                },
                 "convergence_criterion": {
-                    "learning_candidate": "max_abs_log_balance_n_old_times_Qhat_TA",
+                    "learning_candidate": "existing_update_weights_tmbar_or_bounded_sgd",
                     "frozen_validation": (
-                        "max_abs_log_K_mean_p_on_cumulative_new_fixed_f_samples"
+                        "max_adjacent_abs_delta_f_minus_local_mbar_delta_F_below_"
+                        "IBS_LOCAL_MBAR_GATE_MAX_ADJACENT_DELTA_KJ_MOL"
                     ),
                 },
                 "resumed_from_cache": bool(resumed_frozen_f_k is not None),
@@ -8240,26 +8652,35 @@ class IBSWindowManagerDualLambda:
                         )
 
             if bias_converged:
+                # [IBS_BIAS_PROTOCOL_VERSION=29] 收敛报告改用 local-MBAR loose gate
+                # 的相邻态残差（max|Δf_k−ΔF^MBAR|），不再打印已移除的占据 LSE 残差。
+                _gate_gap = (
+                    last_local_mbar_gate.get("max_adjacent_delta_kJ_mol")
+                    if last_local_mbar_gate is not None else None
+                )
+                _gate_gap_repr = (
+                    f"{float(_gate_gap):.3f} kJ/mol"
+                    if _gate_gap is not None else "n/a"
+                )
                 if best_effort_acceptance:
                     print(
                         f" 完成（{bias_update_count} 次权重更新、"
-                        f"{learning_to_validation_cycles} 次冻结验证失败重学习后，采用 "
-                        f"{best_effort_acceptance_reason} best-effort；完整 fixed-f attempt="
-                        f"{validation_batch_count} batches/{validation_sample_count} frames，"
-                        f"max|log(K·<p_k>)|="
-                        f"{report_lse_balance.get('max_abs_log_residual', float('inf')):.4f}"
-                        f"<={float(best_effort_max_residual_multiple):.1f}×"
-                        f"{float(lse_log_residual_tolerance):.4f} sane-bound；未声称严格达到 "
-                        f"tolerance，coverage_ESS={coverage_ess:.3f}；生产后独立质量门仍生效）"
+                        f"{learning_to_validation_cycles} 次 loose-gate 未过后，采用 "
+                        f"{best_effort_acceptance_reason} best-effort：warmup 预算耗尽即接受"
+                        f"当前 f_k；最近一次 max|Δf_k−ΔF^MBAR|={_gate_gap_repr}，阈值 "
+                        f"{float(IBS_LOCAL_MBAR_GATE_MAX_ADJACENT_DELTA_KJ_MOL):.1f} kJ/mol；"
+                        "未声称严格达标，生产后独立质量门 + 最终 MBAR 仍生效）"
                     )
                 else:
                     print(
-                        f" 完成（{bias_update_count} 次权重更新、{learning_to_validation_cycles} 次冻结验证失败"
-                        f"重学习后，最终在冻结 f_k 下累计 {validation_batch_count} batches/"
-                        f"{validation_sample_count} frames（非 EMA）通过 LSE 自洽门："
-                        f"max|log(K·<p_k>)|={report_lse_balance.get('max_abs_log_residual', float('inf')):.4f}"
-                        f"<={float(lse_log_residual_tolerance):.4f}；"
-                        f"coverage_ESS={coverage_ess:.3f} 仅作诊断）"
+                        f" 完成（{bias_update_count} 次权重更新、"
+                        f"{learning_to_validation_cycles} 次 loose-gate 未过后，最终在冻结 "
+                        f"f_k 下通过 local-MBAR loose gate："
+                        f"max|Δf_k−ΔF^MBAR|={_gate_gap_repr} < "
+                        f"{float(IBS_LOCAL_MBAR_GATE_MAX_ADJACENT_DELTA_KJ_MOL):.1f} kJ/mol"
+                        f"（{validation_sample_count} frames / "
+                        f"{last_local_mbar_gate.get('n_batches') if last_local_mbar_gate else 0} "
+                        "batches）；真正的自由能/ESS/overlap/误差交生产后 MBAR）"
                     )
                 sampler.bias_converged = True
                 sampler.bias_status = "converged"
@@ -8415,7 +8836,9 @@ class IBSWindowManagerDualLambda:
                         "    bounded weight update: "
                         f"eta={_weight_diag.get('eta')}, "
                         f"max|delta_f|={_weight_diag.get('max_abs_delta_f_kJ_mol')} kJ/mol, "
-                        f"limit={_weight_diag.get('max_step_kJ_mol')} kJ/mol"
+                        f"pairwise_spread={_weight_diag.get('pairwise_delta_f_spread_kJ_mol')} kJ/mol, "
+                        f"pairwise_limit={_weight_diag.get('pairwise_step_limit_kJ_mol')} kJ/mol, "
+                        f"regime={_weight_diag.get('gain_regime')}"
                     )
                 if "bidirectional_overlap_probe" in bias_warmup_diag:
                     print(
@@ -9436,6 +9859,137 @@ class IBSWindowManagerShadowCoul(IBSWindowManagerDualLambda):
             prefix=self.prefix,
             box_vectors=resolved_box,
         )
+
+
+def _diagnose_local_mbar_situation(
+    u_kn_softcore: np.ndarray,
+    f_frozen: np.ndarray,
+    kt: float,
+    gate_mbar: Dict[str, Any],
+    global_start: int,
+) -> Dict[str, Any]:
+    """[IBS_BIAS_PROTOCOL_VERSION=29] 把一次冻结 local-MBAR loose gate 的"现场"
+    量化成可读诊断，回答"哪个态/哪条边饿死、物理缺口多大、该在哪里插 λ"。
+
+    - occupancy_per_state：当前冻结 f_k 下每个局部态的平均占据（softmax 与
+      update_weights/gate 同式：p_k ∝ exp(-beta*(u_k - f_k))）。一个态≈1、其余
+      ≈0 就是塌缩。
+    - ess_ratio_per_state：local MBAR 对每个物理态的重加权有效样本比例（来自
+      gate_mbar）。~0 = 该态与采样分布零重叠，ΔF 不可信。
+    - adjacent_mean_delta_u_kJ_mol：相邻态原始 softcore 平均能量差（物理缺口，
+      与 f_k 无关）。某条边极大 = 该边本身没有构象重叠，加权改不动。
+    - starved_state / starved_edge：占据最低（或 ESS 最低）的态及其两侧边，给出
+      global 态索引，方便直接决定在哪对 global 态之间插 λ 或拆窗。
+    纯诊断，不参与任何控制流。
+    """
+    u = np.asarray(u_kn_softcore, dtype=np.float64)
+    f = np.asarray(f_frozen, dtype=np.float64).ravel()
+    K = u.shape[0]
+    beta = 1.0 / float(kt)
+    # 占据：p_k ∝ exp(-beta*(u_k - f_k))，逐帧 softmax 再对帧取平均。
+    logits = beta * (f[:, None] - u)
+    logits -= np.max(logits, axis=0, keepdims=True)
+    w = np.exp(logits)
+    p = w / np.sum(w, axis=0, keepdims=True)
+    occ = np.mean(p, axis=1)
+    mean_u = np.mean(u, axis=1)
+    adjacent_delta_u = np.diff(mean_u) if K > 1 else np.array([])
+    ess_map = gate_mbar.get("ess_ratio_per_lambda") or {}
+    ess_per_state = [float(ess_map.get(int(k), float("nan"))) for k in range(K)]
+    # 最低占据态：occ 最小者（占据是最直接、总有定义的信号）。注意"最低占据"≠
+    # "饿死"——只有当它真的低于健康下限 0.5/K 时才算塌陷/饿死。
+    starved_k = int(np.argmin(occ)) if K > 0 else 0
+    starved_edges = []
+    if starved_k - 1 >= 0:
+        starved_edges.append((starved_k - 1, starved_k))
+    if starved_k + 1 <= K - 1:
+        starved_edges.append((starved_k, starved_k + 1))
+    is_endpoint = bool(starved_k == 0 or starved_k == K - 1)
+    # 🔑 占据平坦度：区分"真塌陷（需插 λ/拆窗）"与"只是短 warmup 统计薄、
+    # 占据其实平坦（交生产后 MBAR）"。用与生产入口占据兜底门相同的判据。
+    target_p = 1.0 / float(K) if K > 0 else 0.0
+    sum_sq_occ = float(np.sum(np.square(occ))) if K > 0 else 0.0
+    coverage_ess = float(1.0 / sum_sq_occ) if sum_sq_occ > 0.0 else 0.0
+    min_occ = float(np.min(occ)) if K > 0 else 0.0
+    max_occ = float(np.max(occ)) if K > 0 else 0.0
+    least_occupied_below_floor = bool(
+        K > 0 and min_occ < IBS_LOCAL_MBAR_GATE_OCC_MIN_FRACTION * target_p
+    )
+    occupancy_is_flat = bool(
+        K > 0
+        and max_occ <= IBS_LOCAL_MBAR_GATE_OCC_MAX_FRACTION * target_p
+        and min_occ >= IBS_LOCAL_MBAR_GATE_OCC_MIN_FRACTION * target_p
+        and coverage_ess
+        >= IBS_LOCAL_MBAR_GATE_OCC_MIN_COVERAGE_ESS_FRACTION * float(K)
+    )
+    # 塌陷（硬瓶颈）判据比"未平坦"严得多：coverage_ESS<0.5K 或某态<0.25/K。
+    occupancy_collapsed = bool(
+        K > 0
+        and (
+            coverage_ess
+            < IBS_LOCAL_MBAR_GATE_OCC_COLLAPSE_COVERAGE_ESS_FRACTION * float(K)
+            or min_occ < IBS_LOCAL_MBAR_GATE_OCC_COLLAPSE_MIN_FRACTION * target_p
+        )
+    )
+    return {
+        "n_states": int(K),
+        "global_state_start": int(global_start),
+        "occupancy_per_state": [float(x) for x in occ],
+        "ess_ratio_per_state": ess_per_state,
+        "mean_softcore_u_kJ_mol_per_state": [float(x) for x in mean_u],
+        "adjacent_mean_delta_u_kJ_mol": [float(x) for x in adjacent_delta_u],
+        "coverage_ess": coverage_ess,
+        "occupancy_is_flat": occupancy_is_flat,
+        "occupancy_collapsed": occupancy_collapsed,
+        "least_occupied_below_floor": least_occupied_below_floor,
+        "occupancy_floor": float(IBS_LOCAL_MBAR_GATE_OCC_MIN_FRACTION * target_p),
+        # 名字保留 starved_* 以兼容既有 gate_diag 消费方；语义是"最低占据态"。
+        "starved_local_state": int(starved_k),
+        "starved_global_state": int(global_start + starved_k),
+        "starved_occupancy": float(occ[starved_k]) if K > 0 else float("nan"),
+        "starved_ess_ratio": (
+            float(ess_per_state[starved_k]) if K > 0 else float("nan")
+        ),
+        "starved_edges_global": [
+            [int(global_start + a), int(global_start + b)] for a, b in starved_edges
+        ],
+        "starved_edge_mean_delta_u_kJ_mol": [
+            float(adjacent_delta_u[min(a, b)]) for a, b in starved_edges
+        ],
+        "is_endpoint": is_endpoint,
+    }
+
+
+def _format_local_mbar_situation(situation: Dict[str, Any]) -> str:
+    """把 _diagnose_local_mbar_situation 的 dict 压成一行可读中文摘要。"""
+    if not situation:
+        return "无可用现场诊断"
+    if situation.get("error") or situation.get("starved_global_state") is None:
+        return f"现场诊断不可用（{situation.get('error', 'incomplete')}）"
+    occ = situation.get("occupancy_per_state") or []
+    gstart = int(situation.get("global_state_start", 0))
+    occ_str = ", ".join(
+        f"s{gstart + k}={o:.2e}" for k, o in enumerate(occ)
+    )
+    edges = situation.get("starved_edges_global") or []
+    edge_du = situation.get("starved_edge_mean_delta_u_kJ_mol") or []
+    edge_str = "; ".join(
+        f"边{e}原始Δu≈{du:+.1f} kJ/mol"
+        for e, du in zip(edges, edge_du)
+    ) or "n/a"
+    # "最低占据态"用中性词；只有真的塌陷（occupancy_collapsed）才标"饿死"，避免把
+    # 0.125=0.5/K 这种健康端点误报成塌陷。
+    _collapsed = situation.get("occupancy_collapsed")
+    _flat = situation.get("occupancy_is_flat")
+    _label = "饿死态" if _collapsed else "最低占据态"
+    _flat_tag = "，占据平坦" if _flat else ("，占据塌陷" if _collapsed else "，占据未平坦")
+    return (
+        f"占据[{occ_str}]（coverage_ESS={situation.get('coverage_ess', float('nan')):.2f}"
+        f"{_flat_tag}）；{_label}=global s{situation.get('starved_global_state')}"
+        f"（占据={situation.get('starved_occupancy'):.2e}, "
+        f"ESS_ratio={situation.get('starved_ess_ratio'):.3f}"
+        f"{'，端点' if situation.get('is_endpoint') else ''}）；{edge_str}"
+    )
 
 
 def _solve_single_window_local_mbar(

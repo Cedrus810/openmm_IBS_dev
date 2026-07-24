@@ -1,8 +1,10 @@
 """Regression tests for audit items #11, #14, #20 and #23."""
 
+import ast
 import math
 import unittest
 from pathlib import Path
+from typing import Any, Dict, Tuple
 
 import numpy as np
 
@@ -69,9 +71,9 @@ class SourceContractTests(unittest.TestCase):
         self.assertIn("np.isfinite(e_bias)", block)
 
     def test_bias_protocol_and_update_count_gate_are_locked(self):
-        self.assertIn("IBS_BIAS_PROTOCOL_VERSION = 27", self.engine)
+        self.assertIn("IBS_BIAS_PROTOCOL_VERSION = 29", self.engine)
         self.assertIn(
-            "IBS_BIAS_CACHE_COMPATIBLE_PROTOCOL_VERSIONS = frozenset((27, 28))",
+            "IBS_BIAS_CACHE_COMPATIBLE_PROTOCOL_VERSIONS = frozenset((27, 28, 29))",
             self.engine,
         )
         self.assertIn(
@@ -81,44 +83,198 @@ class SourceContractTests(unittest.TestCase):
         self.assertIn("bias_update_count += 1", self.engine)
         self.assertIn("if f_updated is None:", self.engine)
         self.assertIn("_meets_minimum_with_roundoff(min_overlap", self.engine)
-        self.assertIn("if len(sampler.f_history) < int(min_bias_updates):", self.engine)
-
-    def test_safety_cap_accepts_only_completed_sane_best_effort(self):
-        self.assertIn("def _best_effort_validation_is_acceptable(", self.engine)
+        # [IBS_BIAS_PROTOCOL_VERSION=29] learning→freeze 触发条件：先累计
+        # min_bias_updates 次真实更新（下限），再进 local-MBAR loose gate。
         self.assertIn(
-            'best_effort_acceptance_reason = "global_safety_cap"', self.engine
-        )
-        self.assertIn(
-            "n_frames >= int(minimum_complete_frames)", self.engine
-        )
-        self.assertIn(
-            "safety_cap_best_effort_tmbar_converged", self.engine
-        )
-        self.assertIn(
-            "truncated_validation_frames_ignored", self.engine
-        )
-        self.assertIn(
-            "sim.step(int(frozen_burn_in_steps))", self.engine
+            "len(sampler.f_history) >= int(min_bias_updates)", self.engine
         )
 
-    def test_production_warmup_is_bounded_and_residual_is_diagnostic(self):
+    def test_budget_exhaustion_accepts_current_f_k_for_production(self):
+        # [IBS_BIAS_PROTOCOL_VERSION=29] 跑满 warmup 预算仍未通过 loose gate 时，
+        # 生产运行（非 warmup_only）接受当前 f_k 进生产（best-effort），而不是抛
+        # 未收敛；warmup_only 设计期模式仍照常报未收敛。
+        self.assertIn("if not bias_converged and not warmup_only:", self.engine)
         self.assertIn(
-            "max_frozen_validation_cycles_before_accept_best: int = 1",
+            'best_effort_acceptance_reason = "warmup_budget_exhausted_loose_gate"',
             self.engine,
         )
         self.assertIn(
-            'best_effort_acceptance_reason = "bounded_warmup_budget"',
-            self.engine,
+            'mode = "best_effort_budget_exhausted_accepted"', self.engine
+        )
+
+    def test_convergence_speedups_bootstrap_seed_and_bounded_cap_exemption(self):
+        # [IBS_BIAS_PROTOCOL_VERSION=29] 加速收敛：(a) 冷启动无 pilot 时用本窗口首批
+        # 每态平均 softcore 能量自举播 f_k=⟨u_k⟩，避免从 0 慢爬；(b) 硬 2 kT pairwise
+        # cap 只加在可信绝对 TMBAR 路径，bounded occupancy 反馈改用其自适应上限
+        # （严重塌陷区最高 ~10 kT），让大谱宽窗口快速建起 f_k。
+        self.assertIn("🌱 [自举 TI 种子]", self.engine)
+        self.assertIn("f_k_warm_started", self.engine)
+        update_start = self.engine.index("    def update_weights(")
+        update_end = self.engine.index("    def apply_learning_rate_penalty(", update_start)
+        update_body = self.engine[update_start:update_end]
+        # 硬 cap 只在 trusted 分支；bounded 分支显式不加外部硬 cap（None）。
+        self.assertIn("if tmbar_candidate_trusted:", update_body)
+        self.assertIn('weight_update_diag["hard_pairwise_cap_kJ_mol"] = None', update_body)
+
+    def test_frozen_convergence_uses_local_mbar_loose_gate(self):
+        # [IBS_BIAS_PROTOCOL_VERSION=29] 冻结收敛判据换成局部滑窗 MBAR loose gate：
+        # 相邻态 |Δf_k − ΔF^MBAR| < 阈值（gauge 无关），无连续通过 / 无 LSE 占据门 /
+        # 无 50k→150k→300k 冻结验证阶梯 / 无 warmup ESS 四联门。
+        self.assertIn(
+            "IBS_LOCAL_MBAR_GATE_MAX_ADJACENT_DELTA_KJ_MOL = 10.0", self.engine
+        )
+        self.assertIn("IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES = 5", self.engine)
+        self.assertIn("gate_mbar = _solve_single_window_local_mbar(", self.engine)
+        self.assertIn(
+            "adjacent_gaps = np.abs(df_current - dF_mbar)", self.engine
+        )
+        self.assertIn('"phase": "frozen_local_mbar_loose_gate"', self.engine)
+        # 现场诊断：饿死态/边 + global 索引 + 原始 softcore Δu，供预算耗尽接受时
+        # 判"是可恢复的慢弛豫还是需要插 λ/拆窗的硬瓶颈"。
+        self.assertIn("def _diagnose_local_mbar_situation(", self.engine)
+        self.assertIn("gate_situation = _diagnose_local_mbar_situation(", self.engine)
+        self.assertIn("starved_global_state", self.engine)
+
+    def test_production_entry_has_flat_occupancy_fallback_gate(self):
+        # [IBS_BIAS_PROTOCOL_VERSION=29] 短 warmup 下 local MBAR 绝对 ESS 只有 ~2–3、
+        # Δf−ΔF 主门永不通过时，冻结占据已平坦（两侧 box + coverage_ESS + ess_ratio
+        # 底线）则经占据兜底门进生产。放宽的是生产入口门，不是 TMBAR 更新可信门。
+        self.assertIn("IBS_LOCAL_MBAR_GATE_OCC_MIN_FRACTION = 0.5", self.engine)
+        self.assertIn("IBS_LOCAL_MBAR_GATE_OCC_MAX_FRACTION = 2.0", self.engine)
+        self.assertIn(
+            "IBS_LOCAL_MBAR_GATE_OCC_MIN_COVERAGE_ESS_FRACTION = 0.8", self.engine
         )
         self.assertIn(
-            "and (not warmup_only or best_effort_within_sane_bound)",
+            "gate_ok = bool(reliable_gate_ok or occupancy_gate_ok)", self.engine
+        )
+        self.assertIn('"gate_pass_route"', self.engine)
+        self.assertIn("flat_occupancy_fallback", self.engine)
+        # 两侧 box：同时卡 max 和 min，防止 [0.499,0.499,0.001,0.001] 误过。
+        self.assertIn("IBS_LOCAL_MBAR_GATE_OCC_MAX_FRACTION * _target_p", self.engine)
+        self.assertIn("IBS_LOCAL_MBAR_GATE_OCC_MIN_FRACTION * _target_p", self.engine)
+        # TMBAR 更新可信门保持 abs_ess>=10 不变（只放宽生产入口门）。
+        self.assertIn("IBS_TMBAR_TRUST_MIN_ABSOLUTE_ESS = 10.0", self.engine)
+        # 旧的占据 LSE 自洽收敛门/best-effort 残差门已彻底移除，不再驱动放行。
+        self.assertNotIn('best_effort_acceptance_reason = "global_safety_cap"', self.engine)
+        self.assertNotIn('best_effort_acceptance_reason = "bounded_warmup_budget"', self.engine)
+
+    def test_untrusted_tmbar_falls_back_to_bounded_with_hard_pairwise_cap(self):
+        # [IBS_BIAS_PROTOCOL_VERSION=29] 破"低重叠 TMBAR 错误大步→占据塌缩→TMBAR
+        # 更不可靠"循环：TMBAR 候选质量不可信时退回 bounded feedback；任何更新硬
+        # cap 2 kT；local-MBAR gate 低 ESS 视为 insufficient_overlap（不当门残差）。
+        self.assertIn("IBS_MAX_APPLIED_PAIRWISE_STEP_KT = 2.0", self.engine)
+        self.assertIn("IBS_TMBAR_TRUST_MIN_OVERLAP = 0.05", self.engine)
+        self.assertIn("IBS_TMBAR_TRUST_MIN_ABSOLUTE_ESS = 10.0", self.engine)
+        self.assertIn("IBS_TMBAR_TRUST_MIN_DECORRELATED_SAMPLES = 10", self.engine)
+        self.assertIn("IBS_TMBAR_TRUST_MAX_UNCERTAINTY_KJ_MOL = 5.0", self.engine)
+        self.assertIn("IBS_TMBAR_TRUST_MIN_COVERAGE_ESS_FRACTION = 0.8", self.engine)
+        # 控制器选择由 trust 门控，硬 cap 在 update_weights 两个控制器之后统一施加。
+        update_start = self.engine.index("    def update_weights(")
+        update_end = self.engine.index("    def apply_learning_rate_penalty(", update_start)
+        update_body = self.engine[update_start:update_end]
+        self.assertIn("if tmbar_candidate_trusted:", update_body)
+        self.assertIn("IBS_MAX_APPLIED_PAIRWISE_STEP_KT", update_body)
+        self.assertIn("hard_pairwise_cap_applied", update_body)
+        # cap 不在 _damped_tmbar_absolute_update 本体（保持该单元的独立可测性）。
+        damped_start = self.engine.index("    def _damped_tmbar_absolute_update(")
+        damped_end = self.engine.index("    def _bounded_log_occupancy_update(", damped_start)
+        self.assertNotIn(
+            "IBS_MAX_APPLIED_PAIRWISE_STEP_KT",
+            self.engine[damped_start:damped_end],
+        )
+        # local-MBAR gate 可信度门。
+        self.assertIn("IBS_LOCAL_MBAR_GATE_MIN_ESS_RATIO = 0.05", self.engine)
+        self.assertIn("IBS_LOCAL_MBAR_GATE_MIN_ABSOLUTE_ESS = 10.0", self.engine)
+        self.assertIn('gate_error = "insufficient_overlap_or_ess"', self.engine)
+
+    def test_dominant_identity_is_diagnostic_only(self):
+        update_start = self.engine.index("    def update_weights(")
+        update_end = self.engine.index("    def apply_learning_rate_penalty(", update_start)
+        update_body = self.engine[update_start:update_end]
+        self.assertIn("dominant诊断=state", update_body)
+        self.assertNotIn("dominant_switched", update_body)
+        self.assertNotIn("_dominant_hold_streak", update_body)
+
+    def test_warmup_update_uses_sample_hold_pairwise_controller(self):
+        self.assertIn("IBS_WARMUP_UPDATE_PROTOCOL_VERSION = 9", self.engine)
+        # [IBS_BIAS_PROTOCOL_VERSION=29] damping 0.20->0.10, minibatch 20->40.
+        self.assertIn("IBS_TMBAR_UPDATE_DAMPING = 0.10", self.engine)
+        self.assertIn("IBS_TMBAR_FALLBACK_SGD_PAIRWISE_STEP_KT = 10.0", self.engine)
+        self.assertIn("IBS_WARMUP_FRAME_STRIDE_STEPS = 250", self.engine)
+        self.assertIn("IBS_TMBAR_LEARNING_MINIBATCH_FRAMES = 40", self.engine)
+        self.assertIn("IBS_TMBAR_FREEZE_MAX_APPLIED_PAIRWISE_STEP_KT = 1.0", self.engine)
+        update_start = self.engine.index("    def update_weights(")
+        update_end = self.engine.index("    def apply_learning_rate_penalty(", update_start)
+        update_body = self.engine[update_start:update_end]
+        self.assertIn("self._damped_tmbar_absolute_update(", update_body)
+        self.assertIn("IBS_TMBAR_FALLBACK_SGD_PAIRWISE_STEP_KT", update_body)
+        self.assertNotIn("dominant_switched", update_body)
+        self.assertNotIn("_dominant_hold_streak", update_body)
+        self.assertIn(
+            '"warmup_update_protocol_version": IBS_WARMUP_UPDATE_PROTOCOL_VERSION',
             self.engine,
         )
-        self.assertIn("占据残差仅记为效率诊断", self.engine)
+        self.assertIn("cached_warmup_update_version", self.engine)
+        self.assertIn(
+            "self._bounded_log_occupancy_update(\n"
+            "                f_old,\n"
+            "                mean_p_batch,",
+            self.engine,
+        )
+        # update_weights 仍用阻尼 TMBAR 自洽步长做诊断（不再驱动 warmup 收敛门，
+        # 收敛门已换成 run_all_windows 里的 local-MBAR loose gate）。
+        self.assertIn("tmbar_self_consistent", update_body)
 
-    def test_dominant_flip_watchdog_ignores_near_flat_argmax_noise(self):
-        self.assertIn("dominance_ratio = float(mean_p_batch[dominant_k]) * float(K)", self.engine)
-        self.assertIn("dominance_ratio >= 1.5", self.engine)
+    def test_v9_tmbar_damping_reaches_expected_fraction_in_ten_updates(self):
+        tree = ast.parse(self.engine)
+        sampler_class = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "IBSSampler"
+        )
+        update_method = next(
+            node
+            for node in sampler_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_damped_tmbar_absolute_update"
+        )
+        module = ast.fix_missing_locations(
+            ast.Module(body=[update_method], type_ignores=[])
+        )
+        namespace = {
+            "np": np,
+            "Any": Any,
+            "Dict": Dict,
+            "Tuple": Tuple,
+            "IBS_TMBAR_UPDATE_DAMPING": 0.20,
+        }
+        exec(compile(module, "extracted_v9_tmbar_update", "exec"), namespace)
+        dummy = type(
+            "DummySampler",
+            (),
+            {
+                "n_states": 5,
+                "f_history": [],
+            },
+        )()
+        target = np.array([-20.0, -10.0, 0.0, 10.0, 20.0])
+        current = np.zeros(5, dtype=float)
+        diagnostics = None
+        for _ in range(10):
+            current, diagnostics = namespace["_damped_tmbar_absolute_update"](
+                dummy,
+                current,
+                target,
+            )
+        expected_fraction = 1.0 - 0.8 ** 10
+        np.testing.assert_allclose(
+            current,
+            expected_fraction * target,
+            rtol=0.0,
+            atol=1.0e-12,
+        )
+        self.assertEqual(diagnostics["method"], "damped_absolute_tmbar_v9")
+        self.assertAlmostEqual(diagnostics["effective_damping"], 0.20)
 
     def test_physical_free_energy_seeds_are_not_sign_inverted(self):
         pilot_start = self.preoptimizer.index("def estimate_f_k_from_pilot_ti(")
@@ -206,16 +362,19 @@ class SourceContractTests(unittest.TestCase):
         self.assertIn('manifest.get("cl_count", 0)', self.runabfe)
 
     def test_vanishing_uses_thermodynamic_few_state_subdomains_without_overlap_two(self):
-        self.assertIn("THERMODYNAMIC_PATH_PROTOCOL_VERSION = 18", self.preoptimizer)
+        self.assertIn("THERMODYNAMIC_PATH_PROTOCOL_VERSION = 20", self.preoptimizer)
         self.assertIn(
             "redistribute_vanishing_lambda_subdomains(",
             self.preoptimizer,
         )
         self.assertIn("VANISHING_PROBE_BASE_STATE_COUNT = 17", self.preoptimizer)
-        self.assertIn("VANISHING_FINAL_STATE_COUNT = 21", self.preoptimizer)
-        self.assertIn("(17, 21)", self.preoptimizer)
-        self.assertIn("pilot_fisher_17_plus_human_endpoint_4", self.preoptimizer)
+        self.assertIn("VANISHING_PREBRIDGE_STATE_COUNT = 21", self.preoptimizer)
+        self.assertIn("VANISHING_FINAL_STATE_COUNT = 23", self.preoptimizer)
+        self.assertIn("VANISHING_FISHER_BRIDGE_INSERTION_COUNT = 2", self.preoptimizer)
+        self.assertIn("quadratic_17_plus_lambda1_4_plus_fisher_bridge_2", self.preoptimizer)
         self.assertIn("probe_controls_base_lambda_placement", self.preoptimizer)
+        self.assertIn("quadratic_vanishing_base_lambdas()", self.preoptimizer)
+        self.assertIn("def insert_fisher_bridge_lambdas(", self.preoptimizer)
         self.assertIn("validate_human_vanishing_anchors_preserved", self.pipeline)
         self.assertIn("validate_single_shared_boundary_ranges", self.pipeline)
         redistribute_start = self.preoptimizer.index(
@@ -226,7 +385,9 @@ class SourceContractTests(unittest.TestCase):
         )
         redistribute_body = self.preoptimizer[redistribute_start:redistribute_end]
         self.assertIn("redistribute_lambda_by_thermodynamic_length(", redistribute_body)
+        self.assertIn("base_lambdas = quadratic_vanishing_base_lambdas()", redistribute_body)
         self.assertIn("insert_human_vanishing_endpoint_lambdas(base_lambdas)", redistribute_body)
+        self.assertIn("insert_fisher_bridge_lambdas(", redistribute_body)
         self.assertIn('"total_window_state_slots": int(', redistribute_body)
         self.assertNotIn("_pilot_ti_cumulative_f", redistribute_body)
         self.assertNotIn("mean_dU_dlambda", redistribute_body)
@@ -256,9 +417,16 @@ class SourceContractTests(unittest.TestCase):
         self.assertIn("def _solve_tmbar_and_recenter(", self.engine)
         self.assertIn("self.tmbar_history: List[Dict[str, Any]] = []", self.engine)
         self.assertNotIn("def ibs_lse_time_averaged_update(", self.engine)
-        self.assertIn("validation_probability_sum +=", self.engine)
-        self.assertIn("validation_steps_this_freeze <", self.engine)
-        self.assertIn("failed_frozen_cumulative_validation", self.engine)
+        # [IBS_BIAS_PROTOCOL_VERSION=29] validating 阶段：累计最近若干批固定-f_k
+        # minibatch，攒满滑窗深度就跑一次 local MBAR loose gate；未过则退回 learning。
+        self.assertIn(
+            "frozen_mbar_batches.append(sampler.tmbar_history[-1])", self.engine
+        )
+        self.assertIn(
+            "len(frozen_mbar_batches) < IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES",
+            self.engine,
+        )
+        self.assertIn("failed_local_mbar_loose_gate", self.engine)
         self.assertIn(
             "effective_mbar_calibration_reserved_steps = (",
             self.engine,
