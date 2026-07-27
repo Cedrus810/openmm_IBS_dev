@@ -1,6 +1,6 @@
 # 运行验证监控表
 
-更新日期：2026-07-26（新增 VAL-TEST-006）；2026-07-22（新增 VAL-GPU-008）；2026-07-21（新增 VAL-TEST-003）；2026-07-19（旧自动修复验证结项，新增 VAL-GPU-007/VAL-NM-001）
+更新日期：2026-07-22（新增 VAL-GPU-008）；2026-07-21（新增 VAL-TEST-003）；2026-07-19（旧自动修复验证结项，新增 VAL-GPU-007/VAL-NM-001）
 
 本文件只跟踪“代码已经修复，但尚未获得完整运行证据”的项目。尚未实现的代码工作放在
 [`../TODO.md`](../TODO.md)；问题背景、修复理由和最终审计结论放在
@@ -28,68 +28,18 @@
 | `VAL-GPU-005` | [`#26`](https://github.com/Cedrus810/openmm_IBS_dev/issues/26) | `reseed_resample` 生产 checkpoint 续算 | 历史修复 | `non_mutating_v1` 已禁止该生产修复路径 | — | `已取代` / Issue closed / Project `Done` | 2026-07-19 |
 | `VAL-TEST-002` | [`#27`](https://github.com/Cedrus810/openmm_IBS_dev/issues/27) | 预优化缓存范围收窄与旧 schema 迁移兼容 | 已修复 | 已有部分真实运行证据，仍缺失效正例与 debug hash 开关验证 | `openmm_dev` + 真实 pipeline resume | `部分通过` / Project `In review` | 2026-07-19 |
 | `VAL-GPU-006` | [`#4`](https://github.com/Cedrus810/openmm_IBS_dev/issues/4) | 冻结验证累计步数与跨进程 rung 恢复 | 已修复 | 针对性单测已补，合并进当前完整回归套件 | OpenMM + CUDA | `待运行` / Project `In review` | 2026-07-19 |
-| `VAL-GPU-007` | [`#28`](https://github.com/Cedrus810/openmm_IBS_dev/issues/28) | ~~在线 IBS 学习以 TMBAR 取代朴素 TA（`IBS_BIAS_PROTOCOL_VERSION=19`）~~ **条目已过期，见下方说明** | 历史修复 | 代码已推进到 v29；本条描述的 v21/v22 反号已在 v27 被证实为错并撤销 | — | `已取代`（待按 v29 重写或关闭） | 2026-07-27 |
+| `VAL-GPU-007` | [`#28`](https://github.com/Cedrus810/openmm_IBS_dev/issues/28) | 在线 IBS 学习以 TMBAR 取代朴素 TA（`IBS_BIAS_PROTOCOL_VERSION=19`） | 已修复 | `py_compile` 通过；TMBAR 解析回归已补；尚未在目标 pytest/GPU 环境实跑 | OpenMM + CUDA + PyMBAR | `待运行` / Project `In review` | 2026-07-19 |
 | `VAL-NM-001` | [`#30`](https://github.com/Cedrus810/openmm_IBS_dev/issues/30) | `non_mutating_v1` 旧缓存/旧状态 fail-closed 与只读保护 | 已修复 | NM-01/NM-02 和策略门控回归已写 | `openmm_dev` + OpenMM + PyMBAR + pytest | `待运行` / Project `In review` | 2026-07-19 |
 | `VAL-TEST-003` | [#32](https://github.com/Cedrus810/openmm_IBS_dev/issues/32) | todo2 A-01/A-02/A-03/A-04/A-09/A-11/A-18：传统 REMD v2 LRC、PME alpha fallback、TMBAR history 上限、System/base/checkpoint 加固 | 已修复 | `py_compile` 与 source-contract 测试已补；本机 K: 卷 Python `Path.resolve`/`__pycache__` 受限 | OpenMM + PyMBAR + pytest；另需一个固定盒传统 REMD 小例 | `待运行` / Project `In review` | 2026-07-21 |
-| `VAL-TEST-004` | [#33](https://github.com/Cedrus810/openmm_IBS_dev/issues/33) | **Stage 2 v21**：`blended_metric_vanishing_lambdas`（`(1-β)·s_hat + β·(1-λ)` 等分，β=0.3）；六个单边界共享窗口。~~v20 的 17 点 `λ=x²` 锚点 + 2 个 Fisher bridge 已退役~~ | 已修复 | 缓存证据 `output_lrc_fix/checkpoints/preopt_dual_vanishing.json`：`path_protocol_version=21`、23 唯一 λ、末边 `0.100049→0`、`realized_max_lambda_gap=0.100049 ≤ bound 0.151515`、28 槽位；v18/v19/**v20** 缓存 fail-closed | OpenMM + CUDA + PyMBAR + pytest | `待运行` | 2026-07-27 |
+| `VAL-TEST-004` | [#33](https://github.com/Cedrus810/openmm_IBS_dev/issues/33) | Stage 2 v20：17 点 `λ=x²` 锚点 + λ≈1 四点增密 + 两个 Fisher bridge；六个单边界共享窗口 | 已修复 | 真实 pilot 数学回归得到 bridge=`0.9803043327,0.9628845428`、23 唯一 λ、28 槽位；v18/v19 缓存 fail-closed | OpenMM + CUDA + PyMBAR + pytest | `待运行` / Project `In review` | 2026-07-22 |
 | `VAL-TEST-005` | [#34](https://github.com/Cedrus810/openmm_IBS_dev/issues/34) | 溶剂腿显式 0.15 M NaCl、中和及 v2 缓存 manifest | 已修复 | 已确认旧缓存为 `0 Na / 0 Cl`、复合物为 `68 Na / 75 Cl`；源码契约覆盖显式离子参数和旧缓存失效门 | OpenMM + Amber14 + 实际溶剂盒重建 | `待运行` / Project `In review` | 2026-07-21 |
-| `VAL-TEST-006` | [#59](https://github.com/Cedrus810/openmm_IBS_dev/issues/59) | 核心物理/数值单测（Boresch 解析修正、`solve_stage_integrated` 合成已知 ΔG、`IBSBiasForce` log-sum-exp、pilot-TI 种子符号）+ `run_all_windows` resume 8 门抽成纯函数 `_resume_cached_window_gate_status` | 已修复 | 新增 `test_core_physics_numerics.py` / `test_resume_reuse_contracts.py`；`ast.parse` 与模块属性引用 AST 交叉核对已过；抽函数逐门语义未改、调用侧诊断打印保持原样 | `openmm_dev` + OpenMM + PyMBAR + pytest（**CPU 即可，无需 GPU**） | `待运行` | 2026-07-26 |
 | `VAL-GPU-008` | — | 2026-07-22 IBS production 协议：TI/TMBAR 符号、全历史自洽预热更新、一次 fixed-f 验证、production `f_k` 硬锁、数据隔离、失败定位、定向续采及 immutable rescue ensembles | 已修复 | v9 用全部累计 minibatch 的 TMBAR 绝对 `f_target` 做 `f←f+0.2(f_target-f)`；TMBAR 暂不可解时才用固定10 kT bounded-SGD；dominant/EMA/raw 占据仅诊断；warmup stride 500→250 steps/frame；learning minibatch 统一 20 帧；冻结候选门改看应用阻尼步 `0.2(f_target-f_old) ≤ 1 kT`（旧逐-entry ESS 判据降级为 `legacy_per_entry_quality_converged` 诊断），raw residual 不再阻止早冻，fixed-f 验证仍是终检 | Linux + OpenMM + CUDA + PyMBAR；复用真实 Stage 2 失败输出 | `待运行` | 2026-07-22 |
 
-> **2026-07-27 一致性复核（读本表前必看）**
->
-> 1. **`VAL-GPU-007` 落后 10 个协议版本，且它要验的东西已被撤销。** 本表跟踪
->    `IBS_BIAS_PROTOCOL_VERSION=19`，代码是 `ibs_engine.py:3373 = 29`。changelog
->    `ibs_engine.py:3216-3228` 明确记载 **v21/v22 的反号在 v27 已被证实为错并撤销**。
->    要么按 v29 重写验收条件，要么关闭该条。
-> 2. **`VAL-TEST-004` 已从 v20 改写为 v21。** 原验收条件（两个 Fisher bridge、
->    末边 `0.00390625→0`）在当前代码上**物理上不可能满足**——布点算法整体换了。
->    权威描述见 [`../design/LAMBDA_SCHEDULE_CONTRACT.md`](../design/LAMBDA_SCHEDULE_CONTRACT.md)（已同步 v21）。
-> 3. **本表与 `TODO.md` 对同一天的 pytest 结论互相矛盾。** `TODO.md:144,160` 打勾
->    "119 passed"/"231 passed"，而 `VAL-TEST-006`（验收命令正是这批）日期同为
->    2026-07-26、状态仍是 `待运行`。本表**没有任何一项是 `通过`**——需要一次真实
->    运行来决定是把这些条目关掉，还是把 TODO 里的勾去掉。
-> 4. `VAL-TEST-003` 记的阻塞理由是 Windows `K:` 卷的 `Path.resolve`/`__pycache__`
->    限制，对当前 Linux 检出不适用，该阻塞已过期。
->
 > `VAL-GPU-001`～`005` 的详细验收段落保留为历史审计记录，不再作为当前执行清单；
 > 当前执行入口以 #4、#27、#28、#30、`VAL-TEST-003` 和
 > [`NON_MUTATING_V1_STATUS.md`](NON_MUTATING_V1_STATUS.md) 为准。
 
 ## 验收条件与证据
-
-### VAL-TEST-006 — 核心物理/数值单测与 resume 门抽函数
-
-目标命令（CPU 即可，不需要提交 GPU 节点）：
-
-```bash
-source /home/ruigengji/mambaforge/etc/profile.d/mamba.sh
-mamba activate openmm_dev
-cd /home/ruigengji/ABFE_IBS/Atenolol-rank11
-python -m pytest -q test_core_physics_numerics.py test_resume_reuse_contracts.py
-./run_offline_tests.sh
-```
-
-验收条件：
-
-- 两个新文件全绿。
-- **`test_audit_protocol_regressions.py` 与 `test_warmup_overlap_protocol.py` 仍全绿。**
-  这两个文件含读 `run_all_windows` 源码文本的契约断言，resume 门抽函数可能让某些
-  文本锚点失配；若失配，说明断言锚在实现细节上，**跟着更新锚点，不允许放宽断言**。
-- 抽函数是纯重构的证据：`run_all_windows` 里那串逐门诊断打印（含 `legacy_mutating`
-  分支与 `ExistingEnsembleRequiresRescueAudit` 的 raise）与改动前逐字节一致，
-  `_resume_cached_window_gate_status` 的与链顺序为
-  shape → lambdas → wca → ibs_bias → lse → lrc → repair_policy → early_stop。
-- `test_solve_stage_integrated_recovers_known_delta_g_with_nontrivial_weights` 若
-  失败，先看它打印的 `min_absolute_ess` / `min_decorrelated_samples`：这条要求
-  `converged is True`，而 `converged` 的四项硬门槛依赖合成帧数（当前 1500 帧 iid）。
-  是门槛没过而非 ΔG 偏了的话，属于测试参数问题，**调帧数，不要放宽 converged 断言**。
-
-建议证据：pytest 完整输出（含 `-ra` 的跳过原因汇总）、`python -c "import openmm,pymbar"`
-的版本、代码 SHA256。
-
-不在本项范围内（ATT-19 仍 open）：软核势 λ 端点、DEXP LJ-matching、并行 stage
-worker、热力学循环 toy-cycle（ATT-09）。
 
 ### VAL-GPU-001 — v12 冻结校准续验
 

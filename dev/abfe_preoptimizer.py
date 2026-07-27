@@ -17,7 +17,7 @@ import os
 import glob
 import json
 import shutil
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 from abfe_core import ACESoftcorePotential
 from ibs_engine import generate_overlapping_windows
 try:
@@ -276,17 +276,72 @@ except ImportError:
 #               half-open ranges below. They contain 6+5+5+5+4=25 state slots,
 #               with exactly four single-node boundary reuses and no duplicated
 #               lambda edge.
-THERMODYNAMIC_PATH_PROTOCOL_VERSION = 18
+#   version 19: the 17-node production base path is now the deterministic
+#               quadratic schedule lambda=x^2, x=linspace(1,0,17).  v18 let
+#               the Fisher metric place the production nodes; in the observed
+#               run this collapsed the decoupled tail to 0.9225, 0.8382, 0.0,
+#               leaving an unbridgeable final edge despite four extra nodes
+#               having been inserted at the opposite (lambda~1) endpoint.
+#               Fisher probing remains diagnostic, but it no longer gets to
+#               remove geometric coverage near lambda=0.  The existing four
+#               lambda~1 insertions are retained, so both endpoints are dense.
+#   version 20: v19 real warm-up exposed two Fisher-length gaps at the coupled
+#               endpoint despite its geometric lambda~1 insertions. Insert one
+#               measured thermodynamic midpoint into each of the two longest
+#               production edges, then split the former first ensemble into
+#               two. The observed pilot gives ~0.980304 and ~0.962885; these
+#               values are computed from the cached sqrt(g) arc length, never
+#               hard-coded. Final path: 23 states / 6 immutable ensembles.
+#   version 21: the measured Fisher metric now CONTROLS production lambda
+#               placement instead of only annotating it.  v19/v20 placed the
+#               nodes with a fixed quadratic schedule plus four hand-picked
+#               lambda~1 insertions plus two bridge bisections, and discarded
+#               the equal-thermodynamic-length solution it had just computed
+#               (probe_controls_base_lambda_placement=false).  The observed
+#               consequence on the real cached path: window 0 held 41.32 of the
+#               path's 47.22 total thermodynamic length in four edges (8.82,
+#               8.82, 11.83, 11.83) while the remaining 18 edges shared 5.90,
+#               with tail edges as short as 0.0002 -- zero overlap in window 0,
+#               IBS occupancy degenerating to a hard argmax (mean_p=1.000000),
+#               TMBAR never self-consistent.
+#
+#               v18 already tried pure Fisher equipartition and produced the
+#               opposite failure (the decoupled tail collapsed to 0.9225,
+#               0.8382, 0.0 -- an unbridgeable final edge), which is why v19
+#               reverted to a geometric schedule.  v21 does not repeat either
+#               mistake: nodes equipartition a BLEND of normalized arc length
+#               and geometric progress,
+#                   u(lam) = (1-beta)*s_hat(lam) + beta*(1-lam),
+#               so placement is metric-driven while every edge still satisfies
+#               the provable geometric bound |d lam| <= 1/(beta*(n_states-1)).
+#               beta=VANISHING_GEOMETRIC_FLOOR_WEIGHT.  With no metric available
+#               (fallback paths) the quadratic schedule remains, now generated
+#               directly at the final state count.
+#
+#               Ordering note: this only pays off on a pilot measured under
+#               SOFTCORE_ALPHA_CONVENTION=dimensionless_sigma_scaled_v2.  The
+#               old metric's concentration near lambda=1 was itself an artifact
+#               of treating alpha_lj as an absolute nm^6 offset (~685x too
+#               large), which compressed the entire hard->soft core transition
+#               into lambda_vdw in [0.96, 1].  Re-pilot before trusting any
+#               placement computed from a cached metric.
+THERMODYNAMIC_PATH_PROTOCOL_VERSION = 21
 
 VANISHING_PROBE_BASE_STATE_COUNT = 17
-VANISHING_MANUAL_INSERTION_COUNT = 4
-VANISHING_FINAL_STATE_COUNT = 21
+VANISHING_FINAL_STATE_COUNT = 23
+# Geometric floor weight in the blended placement measure.  Larger = closer to a
+# uniform-lambda path (safer coverage, less metric control); smaller = closer to
+# pure equal-thermodynamic-length (better overlap where the metric is real, but
+# v18 showed pure equipartition can strand the decoupled endpoint).  0.3 bounds
+# any single lambda gap at 1/(0.3*22) = 0.152 for the 23-state vanishing path.
+VANISHING_GEOMETRIC_FLOOR_WEIGHT = 0.3
 VANISHING_FIXED_WINDOW_RANGES = (
-    (0, 6),
-    (5, 10),
-    (9, 14),
-    (13, 18),
-    (17, 21),
+    (0, 5),
+    (4, 8),
+    (7, 12),
+    (11, 16),
+    (15, 20),
+    (19, 23),
 )
 
 # Single source of truth for the position-dependent override above -- every
@@ -295,7 +350,7 @@ VANISHING_FIXED_WINDOW_RANGES = (
 # actually produce" (both the real generator in optimize_stage2_vanishing and
 # every cache-validation call site in abfe_pipeline.py) must use this constant,
 # not a hardcoded literal, or validation and generation will silently diverge.
-VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS: Optional[int] = 5
+VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS: Optional[int] = 4
 
 VANISHING_TARGET_INTERVALS_PER_ENSEMBLE = 3
 VANISHING_MIN_INTERVALS_PER_ENSEMBLE = 2
@@ -362,57 +417,167 @@ def validate_single_shared_boundary_ranges(
 
 
 def human_vanishing_initial_lambdas(requested_base_n_states: int) -> np.ndarray:
-    """Return the 17-point conventional pilot input grid."""
+    """Return the 17-point conventional *probe* input grid.
+
+    This is the grid the Fisher pilot measures on (before
+    _refine_pilot_grid_in_steep_segments adds probes); the production path is
+    placed separately by blended_metric_vanishing_lambdas at
+    VANISHING_FINAL_STATE_COUNT nodes.
+    """
     if int(requested_base_n_states) != VANISHING_PROBE_BASE_STATE_COUNT:
         raise ValueError(
-            "当前 vanishing 人工调度固定为 17 个探针常规态 + 4 个端点插入态 "
-            "= 21 个唯一 lambda；"
-            f"收到 base_n_states={requested_base_n_states}"
+            f"vanishing pilot 探针网格固定为 {VANISHING_PROBE_BASE_STATE_COUNT} 个"
+            f"常规态；收到 base_n_states={requested_base_n_states}"
         )
     return np.linspace(1.0, 0.0, VANISHING_PROBE_BASE_STATE_COUNT)
 
 
-def insert_human_vanishing_endpoint_lambdas(base_lambdas) -> np.ndarray:
-    """Insert 3 quarter-points in edge 0 and 1 midpoint in edge 1.
+def quadratic_vanishing_base_lambdas(
+    n_states: int = VANISHING_FINAL_STATE_COUNT,
+) -> np.ndarray:
+    """Metric-free fallback path ``lambda=x^2`` (dense near lambda=0).
 
-    Every one of the 17 Fisher-probe nodes is copied bit-for-bit into the
-    21-node result. Only four new values are added; downstream indices shift.
+    Only used when no pilot metric is available (see the fallback branch in
+    abfe_pipeline).  When a metric exists, blended_metric_vanishing_lambdas
+    places the nodes instead -- see THERMODYNAMIC_PATH_PROTOCOL_VERSION 21.
     """
-    base = np.asarray(base_lambdas, dtype=float).ravel()
-    if base.size != VANISHING_PROBE_BASE_STATE_COUNT:
+    if int(n_states) < 2:
+        raise ValueError("vanishing 路径至少需要 2 个态")
+    x = np.linspace(1.0, 0.0, int(n_states))
+    base = np.square(x)
+    base[0], base[-1] = 1.0, 0.0
+    if not np.all(np.diff(base) < 0.0):
+        raise RuntimeError("平方 vanishing 基础路径没有严格从 1 递减到 0")
+    return base
+
+
+def vanishing_max_lambda_gap_bound(
+    n_states: int = VANISHING_FINAL_STATE_COUNT,
+    geometric_floor_weight: float = VANISHING_GEOMETRIC_FLOOR_WEIGHT,
+) -> float:
+    """Provable per-edge |Delta lambda| ceiling of the blended placement.
+
+    Consecutive nodes are spaced by exactly ``du = 1/(n_states-1)`` in the
+    blended coordinate ``u = (1-beta)*s_hat + beta*(1-lambda)``.  Because
+    ``s_hat`` is non-decreasing along the path, ``du >= beta*|d lambda|``,
+    hence ``|d lambda| <= du/beta``.  This is what keeps a metric that is
+    heavily concentrated at one end from stranding the other end the way pure
+    equipartition did in v18.
+    """
+    beta = float(geometric_floor_weight)
+    if not (0.0 < beta < 1.0):
+        raise ValueError(f"geometric_floor_weight 必须在 (0,1)：{beta}")
+    if int(n_states) < 2:
+        raise ValueError("vanishing 路径至少需要 2 个态")
+    return 1.0 / (beta * float(int(n_states) - 1))
+
+
+def blended_metric_vanishing_lambdas(
+    pilot_lambdas,
+    metric_g,
+    n_states: int = VANISHING_FINAL_STATE_COUNT,
+    geometric_floor_weight: float = VANISHING_GEOMETRIC_FLOOR_WEIGHT,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Place production lambdas by equipartitioning a metric/geometry blend.
+
+    Returns ``(lambdas, pilot_cumulative, edge_thermodynamic_lengths)``.
+
+    ``s_hat(lambda)`` is the pilot arc length ``integral sqrt(g) d lambda``
+    normalized to [0,1]; ``1-lambda`` is geometric progress from the coupled to
+    the decoupled endpoint.  Equipartitioning ``(1-beta)*s_hat + beta*(1-lambda)``
+    concentrates nodes where the measured metric is large while guaranteeing
+    ``vanishing_max_lambda_gap_bound`` -- neither v19/v20's "ignore the metric"
+    nor v18's "let the metric strand the tail".
+    """
+    lam = np.asarray(pilot_lambdas, dtype=float).ravel()
+    g = np.asarray(metric_g, dtype=float).ravel()
+    if lam.size != g.size or lam.size < 2:
+        raise ValueError("pilot_lambdas/metric_g 必须等长且至少包含两个点")
+    if not np.all(np.isfinite(lam)) or not np.all(np.isfinite(g)) or np.any(g < 0.0):
+        raise ValueError("pilot/metric 必须有限且 metric_g 非负")
+    order = np.argsort(-lam)
+    lam = lam[order]
+    g = g[order]
+    if not np.all(np.diff(lam) < 0.0):
+        raise ValueError("pilot lambda 必须唯一且严格单调")
+    if not (np.isclose(lam[0], 1.0) and np.isclose(lam[-1], 0.0)):
+        raise ValueError("pilot lambda 必须覆盖完整的 1 -> 0 区间")
+    beta = float(geometric_floor_weight)
+    if not (0.0 < beta < 1.0):
+        raise ValueError(f"geometric_floor_weight 必须在 (0,1)：{beta}")
+
+    root_g = np.sqrt(np.maximum(g, 1.0e-12))
+    cumulative = np.concatenate((
+        [0.0],
+        np.cumsum(0.5 * (root_g[:-1] + root_g[1:]) * np.abs(np.diff(lam))),
+    ))
+    total_length = float(cumulative[-1])
+    if not np.isfinite(total_length) or total_length <= 0.0:
         raise ValueError(
-            f"vanishing 常规路径必须恰好 {VANISHING_PROBE_BASE_STATE_COUNT} 态"
+            f"pilot 热力学总长非正/非有限（{total_length}），无法用度规布点"
         )
-    if not np.all(np.diff(base) < 0.0) or not np.isclose(base[0], 1.0) or not np.isclose(base[-1], 0.0):
-        raise ValueError("vanishing 常规路径必须从 1 到 0 严格递减")
-    first_edge = [base[0] + fraction * (base[1] - base[0]) for fraction in (0.25, 0.50, 0.75)]
-    second_midpoint = 0.5 * (base[1] + base[2])
-    final = np.asarray(
-        [base[0], *first_edge, base[1], second_midpoint, *base[2:]],
-        dtype=float,
-    )
-    if final.size != VANISHING_FINAL_STATE_COUNT or not np.all(np.diff(final) < 0.0):
-        raise RuntimeError("人工端点增密没有产生严格递减的 21 态路径")
-    return final
+    s_hat = cumulative / total_length
+    blended = (1.0 - beta) * s_hat + beta * (1.0 - lam)
+    if not np.all(np.diff(blended) > 0.0):
+        raise RuntimeError("混合布点坐标不是严格递增的，无法反解 lambda")
+
+    targets = np.linspace(0.0, 1.0, int(n_states))
+    placed = np.interp(targets, blended, lam)
+    placed[0], placed[-1] = 1.0, 0.0
+    if not np.all(np.diff(placed) < 0.0):
+        raise RuntimeError("混合布点没有产生严格递减的 lambda 路径")
+
+    gap_bound = vanishing_max_lambda_gap_bound(int(n_states), beta)
+    realized_gap = float(np.max(np.abs(np.diff(placed))))
+    # 允许极小的插值/端点钳制浮点余量，但不允许真正越界。
+    if realized_gap > gap_bound * (1.0 + 1.0e-6):
+        raise RuntimeError(
+            f"混合布点越过几何覆盖上限：max|Δλ|={realized_gap:.6f} > {gap_bound:.6f}"
+        )
+    placed_cumulative = np.interp(placed[::-1], lam[::-1], cumulative[::-1])[::-1]
+    return placed, cumulative, np.abs(np.diff(placed_cumulative))
 
 
-def validate_human_vanishing_anchors_preserved(
+def validate_vanishing_lambda_path_invariants(
     lambdas_vdw,
-    requested_base_n_states: int = VANISHING_PROBE_BASE_STATE_COUNT,
+    *,
+    n_states: int = VANISHING_FINAL_STATE_COUNT,
+    geometric_floor_weight: float = VANISHING_GEOMETRIC_FLOOR_WEIGHT,
 ) -> None:
-    """Validate the final 21-node/25-slot human schedule shape."""
+    """Structural invariants every production vanishing path must satisfy.
+
+    ``n_states`` is keyword-only on purpose.  The v20 predecessor
+    (validate_human_vanishing_anchors_preserved) took ``requested_base_n_states``
+    -- the *requested* probe count, 17 -- as its second positional argument,
+    while this one takes the *expected produced path length*, 23.  Call sites
+    that kept passing the old positional value would otherwise silently
+    validate against the wrong number instead of failing loudly.
+
+    v20 and earlier validated *identity* against a hard-coded quadratic+manual
+    anchor set, which is meaningless once the metric places the nodes.  What
+    actually has to hold is: the right number of states, a strictly decreasing
+    1 -> 0 path with exact endpoints, and no lambda gap wider than the blended
+    placement's geometric floor (the invariant that prevents v18's stranded
+    decoupled tail).  The quadratic fallback satisfies this too.
+    """
     lambdas = np.asarray(lambdas_vdw, dtype=float).ravel()
-    if int(requested_base_n_states) != VANISHING_PROBE_BASE_STATE_COUNT:
-        raise ValueError("vanishing base_n_states 必须为 17")
-    if (
-        lambdas.size != VANISHING_FINAL_STATE_COUNT
-        or not np.all(np.diff(lambdas) < 0.0)
-        or not np.isclose(lambdas[0], 1.0)
-        or not np.isclose(lambdas[-1], 0.0)
-    ):
+    if lambdas.size != int(n_states):
         raise ValueError(
-            "vanishing 最终路径必须是 lambda_0..lambda_20 共 21 态，"
-            "严格从 1 递减到 0"
+            f"vanishing 路径必须恰好 {int(n_states)} 态，实际 {lambdas.size}"
+        )
+    if not np.all(np.isfinite(lambdas)):
+        raise ValueError("vanishing 路径含非有限 lambda")
+    if not np.all(np.diff(lambdas) < 0.0):
+        raise ValueError("vanishing 路径必须严格递减")
+    if not (np.isclose(lambdas[0], 1.0) and np.isclose(lambdas[-1], 0.0)):
+        raise ValueError("vanishing 路径端点必须恰好是 lambda=1 和 lambda=0")
+    gap_bound = vanishing_max_lambda_gap_bound(int(n_states), geometric_floor_weight)
+    realized_gap = float(np.max(np.abs(np.diff(lambdas))))
+    if realized_gap > gap_bound * (1.0 + 1.0e-6):
+        raise ValueError(
+            f"vanishing 路径存在超过几何覆盖上限的 lambda 断层："
+            f"max|Δλ|={realized_gap:.6f} > {gap_bound:.6f}（"
+            "v18 曾因纯等热力学长度布点把解耦端拉断，这条门就是防它复发）"
         )
 
 
@@ -451,14 +616,14 @@ def vanishing_subdomain_ranges_from_lambdas(
         raise ValueError("vanishing lambda 路径必须至少 2 态且严格递减")
     if lambdas.size != VANISHING_FINAL_STATE_COUNT:
         raise ValueError(
-            "当前 vanishing 窗口画线固定覆盖 lambda_0..lambda_20；"
+            "当前 vanishing 窗口画线固定覆盖 lambda_0..lambda_22；"
             f"收到 {lambdas.size} 个状态"
         )
     if first_ensemble_target_intervals not in (
         None,
         VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS,
     ):
-        raise ValueError("第一窗口固定为闭区间 [0,5]，即 5 条 lambda 边")
+        raise ValueError("第一窗口固定为闭区间 [0,4]，即 4 条 lambda 边")
     ranges = [tuple(r) for r in VANISHING_FIXED_WINDOW_RANGES]
     validate_single_shared_boundary_ranges(ranges, int(lambdas.size))
     return ranges
@@ -515,7 +680,14 @@ def redistribute_vanishing_lambda_subdomains(
     max_states_per_ensemble: int = VANISHING_MAX_STATES_PER_IBS_ENSEMBLE,
     first_ensemble_target_intervals: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Tuple[int, int]], Dict]:
-    """Build 17 Fisher nodes, then insert the four human endpoint nodes."""
+    """Place the production vanishing lambdas from the measured Fisher metric.
+
+    🔑 [THERMODYNAMIC_PATH_PROTOCOL_VERSION=21] The metric now CONTROLS
+    placement (blended with a geometric floor); v19/v20 computed the
+    equal-thermodynamic-length solution here and then threw it away in favour
+    of a fixed quadratic schedule + 4 hand-picked + 2 bridge nodes.  See the
+    version history at the top of this module for why both extremes failed.
+    """
     if int(target_intervals_per_ensemble) != VANISHING_TARGET_INTERVALS_PER_ENSEMBLE:
         raise ValueError("人工 vanishing 窗口契约禁止覆盖 target_intervals_per_ensemble")
     if int(min_intervals_per_ensemble) != VANISHING_MIN_INTERVALS_PER_ENSEMBLE:
@@ -530,21 +702,15 @@ def redistribute_vanishing_lambda_subdomains(
 
     if int(n_states) != VANISHING_PROBE_BASE_STATE_COUNT:
         raise ValueError("vanishing 探针常规态数固定为 17")
-    base_lambdas, cumulative, _base_edge_lengths = (
-        redistribute_lambda_by_thermodynamic_length(
+    optimized_lambdas, cumulative, optimized_edge_lengths = (
+        blended_metric_vanishing_lambdas(
             np.asarray(pilot_lambdas, dtype=float),
             np.asarray(metric_g, dtype=float),
-            VANISHING_PROBE_BASE_STATE_COUNT,
+            VANISHING_FINAL_STATE_COUNT,
+            VANISHING_GEOMETRIC_FLOOR_WEIGHT,
         )
     )
-    optimized_lambdas = insert_human_vanishing_endpoint_lambdas(base_lambdas)
-    validate_human_vanishing_anchors_preserved(optimized_lambdas, int(n_states))
-    optimized_cumulative = np.interp(
-        optimized_lambdas,
-        np.asarray(pilot_lambdas, dtype=float)[::-1],
-        np.asarray(cumulative, dtype=float)[::-1],
-    )
-    optimized_edge_lengths = np.diff(optimized_cumulative)
+    validate_vanishing_lambda_path_invariants(optimized_lambdas)
     window_ranges = vanishing_subdomain_ranges_from_lambdas(
         optimized_lambdas,
         target_intervals_per_ensemble=target_intervals_per_ensemble,
@@ -555,10 +721,20 @@ def redistribute_vanishing_lambda_subdomains(
     validate_single_shared_boundary_ranges(window_ranges, len(optimized_lambdas))
     interval_counts = [end - start - 1 for start, end in window_ranges]
     allocation = {
-        "probe_base_state_count": int(len(base_lambdas)),
-        "probe_base_lambdas": [float(x) for x in base_lambdas],
-        "manual_inserted_state_count": VANISHING_MANUAL_INSERTION_COUNT,
-        "manual_insertion_rule": "three_quarter_points_edge_0_plus_midpoint_edge_1",
+        "base_lambda_placement": "fisher_metric_blended_with_geometric_floor_v21",
+        "geometric_floor_weight": float(VANISHING_GEOMETRIC_FLOOR_WEIGHT),
+        "max_lambda_gap_bound": float(
+            vanishing_max_lambda_gap_bound(VANISHING_FINAL_STATE_COUNT)
+        ),
+        "realized_max_lambda_gap": float(
+            np.max(np.abs(np.diff(optimized_lambdas)))
+        ),
+        "realized_max_edge_thermodynamic_length": float(
+            np.max(optimized_edge_lengths)
+        ) if len(optimized_edge_lengths) else 0.0,
+        "realized_min_edge_thermodynamic_length": float(
+            np.min(optimized_edge_lengths)
+        ) if len(optimized_edge_lengths) else 0.0,
         "actual_state_count": int(len(optimized_lambdas)),
         "total_window_state_slots": int(
             sum(end - start for start, end in window_ranges)
@@ -2358,7 +2534,8 @@ class DualLambdaPreOptimizer:
     ):
         print(
             f"\n→ Stage 2: 去 VDW 路径优化 "
-            f"({n_states} 个 Fisher 常规态 + 4 个端点插入态)..."
+            f"({n_states} 点 Fisher 探针网格 → {VANISHING_FINAL_STATE_COUNT} 态"
+            f"度规布点，几何覆盖下限 beta={VANISHING_GEOMETRIC_FLOOR_WEIGHT})..."
         )
         current_params = dict(self.context.getParameters())
         if self.param_vdw is None or self.param_vdw not in current_params:
@@ -2369,9 +2546,10 @@ class DualLambdaPreOptimizer:
         self.context.setParameter(self.param_vdw, 1.0)
         self.context.getIntegrator().step(5000)
 
-        # Probe the conventional grid first. Fisher thermodynamic length creates
-        # the 17-node base path; the four human endpoint nodes are inserted only
-        # after that base path is complete.
+        # Probe a conventional grid for diagnostics.  Production lambda
+        # placement keeps the v19 quadratic base so the lambda~0 tail cannot
+        # collapse again; v20 additionally lets this metric insert two bridge
+        # states into the longest remaining production edges.
         pilot_lambdas = human_vanishing_initial_lambdas(int(n_states))
         metric_g = []
         pilot_points = []
@@ -2419,12 +2597,20 @@ class DualLambdaPreOptimizer:
         
         diagnostics = {
             "estimator": "beta^2_var_dU_dlambda_finite_difference",
-            "lambda_placement_method": "pilot_fisher_17_plus_human_endpoint_4",
+            "lambda_placement_method": (
+                "fisher_metric_blended_with_geometric_floor_v21"
+            ),
             "path_protocol_version": THERMODYNAMIC_PATH_PROTOCOL_VERSION,
-            "probe_base_lambdas": subdomain_allocation["probe_base_lambdas"],
-            "probe_base_nodes_preserved": True,
             "probe_controls_base_lambda_placement": True,
-            "human_manual_insertion_count": VANISHING_MANUAL_INSERTION_COUNT,
+            "geometric_floor_weight": subdomain_allocation["geometric_floor_weight"],
+            "max_lambda_gap_bound": subdomain_allocation["max_lambda_gap_bound"],
+            "realized_max_lambda_gap": subdomain_allocation["realized_max_lambda_gap"],
+            "realized_max_edge_thermodynamic_length": subdomain_allocation[
+                "realized_max_edge_thermodynamic_length"
+            ],
+            "realized_min_edge_thermodynamic_length": subdomain_allocation[
+                "realized_min_edge_thermodynamic_length"
+            ],
             "requested_probe_base_state_count": int(n_states),
             "actual_state_count": int(len(optimized_lambdas)),
             "pilot_lambdas": [float(x) for x in pilot_lambdas],

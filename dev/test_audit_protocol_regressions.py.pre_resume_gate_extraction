@@ -52,47 +52,6 @@ class SourceContractTests(unittest.TestCase):
         cls.runabfe = (ROOT / "runabfe.py").read_text(encoding="utf-8")
         cls.core = (ROOT / "abfe_core.py").read_text(encoding="utf-8")
 
-    def _extracted_resume_gate_source(self):
-        """Source text of `_resume_cached_window_gate_status`'s body only.
-
-        The resume-reuse gates were extracted out of `run_all_windows` into this
-        module-level pure function so they can be unit-tested directly against a
-        mock convergence.json (test_resume_reuse_contracts.py).  Source-contract
-        assertions about those gates should be scoped to this function rather than
-        to the whole 12k-line file: an unscoped `assertIn` would keep passing if a
-        gate were deleted here but the same string happened to survive somewhere
-        else (a comment, a docstring, a diagnostic message).
-
-        Fails the test if the function is gone -- reverting the extraction without
-        updating these contracts must be loud, not silently vacuous.
-        """
-        marker = "def _resume_cached_window_gate_status("
-        self.assertIn(
-            marker,
-            self.engine,
-            "resume-reuse gates must live in the module-level pure helper "
-            "_resume_cached_window_gate_status (see test_resume_reuse_contracts.py)",
-        )
-        start = self.engine.index(marker)
-        # Bound the slice at the function's own end: the first column-0 statement
-        # that is not a comment.  Stopping at the next `def`/`class` instead would
-        # drag in the ~135 lines of module constants that follow and make these
-        # contracts looser than they look.
-        # A column-0 line only ends the function if it actually *starts* a new
-        # statement (identifier / `_` / decorator).  The multi-line signature's own
-        # closing `) -> Dict[str, Any]:` also sits at column 0, so a naive
-        # "not indented" test would cut the slice off after the signature and make
-        # every assertion below vacuously fail.
-        lines = self.engine[start:].splitlines(keepends=True)
-        body = [lines[0]]
-        for line in lines[1:]:
-            stripped = line.strip()
-            starts_statement = bool(stripped) and (line[0].isalnum() or line[0] in "_@")
-            if starts_statement and not stripped.startswith("#"):
-                break
-            body.append(line)
-        return "".join(body)
-
     def test_softcore_alpha_is_dimensionless_and_sigma_scaled(self):
         # 🔑 alpha_lj/alpha_coul 是无量纲 Beutler 系数，两套 softcore 构造器都必须在
         # 表达式里乘 sigma_ij^6 / sigma_ij^2。曾经把它们当绝对 nm^6/nm^2 直接相加，
@@ -649,24 +608,12 @@ class SourceContractTests(unittest.TestCase):
         self.assertLess(block.index("system.getNumParticles()"), block.index("return system"))
 
     def test_resume_rejects_mismatched_lrc_protocol_version(self):
-        # The eight resume-reuse gates used to be inlined in run_all_windows (~110
-        # lines depending on 8 locals, impossible to call in isolation).  They now
-        # live in the module-level pure helper _resume_cached_window_gate_status,
-        # extracted so each gate can be exercised against a mock convergence.json
-        # -- see test_resume_reuse_contracts.py.  Gate semantics and thresholds are
-        # unchanged; only the location is.
-        #
-        # Anchor INSIDE that function's body rather than anywhere in the file, so
-        # the contract cannot be satisfied by the same text appearing in an
-        # unrelated place, and normalize whitespace so a pure reformat (wrapping
-        # the comparison across lines) does not read as a missing gate.
-        gate_fn = self._extracted_resume_gate_source()
         self.assertIn(
-            'lrc_version_match = ( cached_conv.get("lj_tail_lrc_protocol_version") '
-            "== TRADITIONAL_LJ_LRC_PROTOCOL_VERSION )",
-            " ".join(gate_fn.split()),
+            'lrc_version_match = cached_conv.get("lj_tail_lrc_protocol_version") == '
+            "TRADITIONAL_LJ_LRC_PROTOCOL_VERSION",
+            self.engine,
         )
-        self.assertIn("and lrc_version_match", gate_fn)
+        self.assertIn("and lrc_version_match", self.engine)
         # Same gate must also apply to the λ-content window-reuse path (splitting/
         # inserting lambdas), not just the plain resume-skip path.
         self.assertIn(
@@ -744,59 +691,24 @@ class SourceContractTests(unittest.TestCase):
             self.pipeline,
         )
 
-    def test_final_convergence_gate_uses_orthogonal_evidence_not_duplicated_ess(self):
-        # todolist.md P1 原意：converged 曾经只要求 min ESS ratio >= 0.05，样本总数
-        # 很少时个位数的绝对 ESS 也能通过 >5% 的比例门。当时补的 absolute ESS 门
-        # 修的是真问题，但用错了量——见下。
-        #
-        # [ESS_GATE_PROTOCOL_VERSION=2] absolute_ess 在构造上恒等于
-        # min_ess_ratio × n_frames_decorrelated（denom 是同一个标量，
-        # min(neff)/denom == min(neff/denom)），所以它不是第二份独立证据；给同一个量
-        # 配两个阈值的实际效果是让 ratio 阈值失去意义（final_min_absolute_ess=50 在
-        # N_decorrelated=114 时等价于要求 ratio>=0.44，而日志里报的门是 0.05），而且
-        # 样本越少门越严——与"延长采样"的修复方向相反。
-        # 现在换成三份真正正交的证据，本测试钉住这个结构，防止 absolute-ESS 门被
-        # "顺手加回来"，也防止 min_ess_ratio 被换回 raw 单参考 ESS。
+    def test_final_convergence_gate_checks_absolute_ess_and_uncertainty(self):
+        # todolist.md P1: GlobalMBARAnalyzer.solve_stage_integrated's converged
+        # used to only require min ESS ratio >= 0.05 -- with very few total
+        # samples, a single-digit absolute ESS could still pass a >5% ratio.
         conv_idx = self.engine.index("converged = bool(\n            len(local_results) == len(valid_windows)")
         conv_block = self.engine[conv_idx:conv_idx + 700]
-        # (1) 权重质量：扣掉共模因子后的混合覆盖度比例
-        self.assertIn(
-            "_meets_minimum_with_roundoff(min_overlap, min_overlap_threshold)",
-            conv_block,
-        )
-        # (2) 权重质量的一阶矩伴随项：ESS 是逐态尺度不变的，抓不到"均匀被饿死"的
-        # 态（实测 f_k 未补偿、高出 80 kT 的态 ESS/N 仍报 0.34）。必须配 K*<p_k>。
         self.assertIn(
             "_meets_minimum_with_roundoff(\n"
-            "                min_occupancy_normalized, min_occupancy_normalized_threshold",
+            "                min_absolute_ess, float(final_min_absolute_ess)",
             conv_block,
         )
-        # (3) 样本量：与比例正交的那份证据
         self.assertIn(
             "min_decorrelated_samples >= int(final_min_decorrelated_samples)",
             conv_block,
         )
-        # (3) 输出精度：MBAR 自带全协方差的端点不确定度
         self.assertIn(
             "_meets_maximum_with_roundoff(", conv_block
         )
-        # 退役的 absolute-ESS 门不得出现在 converged 里
-        self.assertNotIn("final_min_absolute_ess", conv_block)
-        self.assertNotIn("min_absolute_ess", conv_block)
-        # 受门量必须是 mixture 版本，raw 版本只能是诊断
-        self.assertIn(
-            '"min_overlap_method": (\n'
-            '                "per_window_mixture_coverage_ess_ratio_common_mode_removed"',
-            self.engine,
-        )
-        self.assertIn('"min_absolute_ess_threshold": None,', self.engine)
-        self.assertIn('"raw_min_overlap": raw_min_overlap,', self.engine)
-        # warmup 的 TMBAR trust 门是另一个消费者，必须继续读 raw 量（tmbar_history
-        # 天生没有 f_k，读 mixture 量会让它永久 False、把 warmup 钉死在受限反馈上）
-        self.assertIn('_q_overlap = tmbar_res.get("raw_min_overlap")', self.engine)
-        self.assertIn('_q_abs_ess = tmbar_res.get("raw_min_absolute_ess")', self.engine)
-        # 两份增广矩阵实现都必须对 sampled_distribution_row != 0 fail closed
-        self.assertEqual(2, self.engine.count("if sampled_row != 0:"))
         # The four threshold values that actually govern acceptance must be
         # folded into the stage protocol fingerprint, or changing them (via
         # kwarg or code-default) would silently fail to invalidate a

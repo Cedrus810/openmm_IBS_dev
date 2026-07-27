@@ -19,7 +19,7 @@ from abfe_preoptimizer import (
     human_vanishing_initial_lambdas,
     insert_lambda_from_overlap_failure,
     split_window_from_warmup_failure,
-    validate_human_vanishing_anchors_preserved,
+    validate_vanishing_lambda_path_invariants,
     validate_single_shared_boundary_ranges,
     vanishing_subdomain_ranges_from_lambdas,
 )
@@ -531,8 +531,16 @@ def test_protocol_versions_reject_old_semantics():
     # 🔑 [local-MBAR loose gate] 27->29：冻结收敛判据整体换成局部滑窗 MBAR loose
     # gate（相邻 |Δf_k−ΔF^MBAR| < 10 kJ/mol），移除 LSE 占据门/连续通过/冻结验证
     # 阶梯/best-effort/warmup ESS 四联门；缓存兼容 (27,28,29)。
+    # 🔑 [Fisher 度规控制布点] 20->21：v19/v20 算出等热力学长度解后丢弃，改用写死的
+    # 二次网格 + 4 个人工端点 + 2 个 bridge 点（probe_controls_base_lambda_placement
+    # = false）。实测后果：window 0 用 4 条边扛了全程 47.22 中的 41.32（单边
+    # 8.82~11.83），其余 18 条边合计 5.90、最短 0.0002——零重叠，IBS 占据退化成硬
+    # argmax。v18 的纯等长布点则是相反的失败（解耦端被拉断成 0.9225, 0.8382, 0）。
+    # v21 等分 u=(1-beta)*s_hat+beta*(1-lambda)：度规驱动布点，同时每条边满足可证明的
+    # 几何覆盖上限 |Δλ| <= 1/(beta*(n_states-1))。旧路径缓存必须整体失效重新 pilot，
+    # 何况它们本来就属于旧的绝对-nm^6 alpha 哈密顿量。
     assert IBS_BIAS_PROTOCOL_VERSION == 29
-    assert THERMODYNAMIC_PATH_PROTOCOL_VERSION == 18
+    assert THERMODYNAMIC_PATH_PROTOCOL_VERSION == 21
 
 
 def test_inclusive_tmbar_thresholds_accept_roundoff_but_not_real_shortfall():
@@ -603,7 +611,7 @@ def test_tmbar_recovers_equal_free_energy_of_equal_width_wells():
     assert result is not None
     f_new, res = result
     assert f_new == pytest.approx(0.0, abs=0.5)
-    assert f_new == pytest.approx(np.mean(f_new), abs=1.0e-9)  # mean-centered
+    assert np.mean(f_new) == pytest.approx(0.0, abs=1.0e-9)  # mean-centered
     assert "converged" in res
 
 
@@ -630,7 +638,7 @@ def test_bounded_log_occupancy_update_lowers_strong_state_and_raises_weak_states
     assert f_new[2] > 0.0
     assert np.mean(f_new) == pytest.approx(0.0, abs=1.0e-12)
     assert np.max(np.abs(f_new)) <= 2.0 * sampler.kt + 1.0e-12
-    assert diag["method"] == "bounded_log_occupancy_v1"
+    assert diag["method"] == "bounded_log_occupancy_fallback_v9"
 
 
 def test_bounded_log_occupancy_update_leaves_uniform_weights_unchanged():
@@ -639,6 +647,7 @@ def test_bounded_log_occupancy_update_leaves_uniform_weights_unchanged():
     sampler.kt = 2.5
     sampler.eta_penalty = 1.0
     sampler.f_history = []
+    sampler.tmbar_history = []
     f_old = np.asarray([-3.0, -1.0, 1.0, 3.0], dtype=float)
 
     f_new, _ = sampler._bounded_log_occupancy_update(
@@ -693,31 +702,29 @@ def test_vanishing_pilot_returns_few_state_subdomains_without_overlap_two():
         n_steps_per_state=0,
     )
     lambdas = np.asarray(result["lambdas_vdw"], dtype=float)
-    base = np.asarray(
-        result["path_diagnostics"]["subdomain_allocation"]["probe_base_lambdas"]
-    )
-    assert len(base) == 17
-    assert len(lambdas) == 21
-    validate_human_vanishing_anchors_preserved(lambdas, 17)
+    assert len(lambdas) == 23
+    validate_vanishing_lambda_path_invariants(lambdas)
     validate_single_shared_boundary_ranges(result["window_ranges"], len(lambdas))
     assert result["path_diagnostics"]["ibs_ensemble_layout"] == (
         "few_state_thermodynamic_subdomains"
     )
+    # 🔑 [THERMODYNAMIC_PATH_PROTOCOL_VERSION=21] 度规控制布点，不再是固定二次网格
+    # + 人工点 + bridge 点。
     assert result["path_diagnostics"]["lambda_placement_method"] == (
-        "pilot_fisher_17_plus_human_endpoint_4"
+        "fisher_metric_blended_with_geometric_floor_v21"
     )
-    assert result["path_diagnostics"]["probe_base_nodes_preserved"] is True
     assert result["path_diagnostics"]["probe_controls_base_lambda_placement"] is True
+    # 几何覆盖下限必须真实成立（v18 纯等长布点把解耦端拉断，就是缺这条）。
+    assert (
+        result["path_diagnostics"]["realized_max_lambda_gap"]
+        <= result["path_diagnostics"]["max_lambda_gap_bound"] * (1.0 + 1.0e-6)
+    )
     assert result["path_diagnostics"]["sliding_overlap_states"] == 0
     assert result["path_diagnostics"]["common_boundary_state_count"] == 1
-    assert all(
-        np.count_nonzero(np.isclose(lambdas, x, rtol=0.0, atol=1.0e-12)) == 1
-        for x in base
-    )
     assert result["window_ranges"] == [
-        (0, 6), (5, 10), (9, 14), (13, 18), (17, 21)
+        (0, 5), (4, 8), (7, 12), (11, 16), (15, 20), (19, 23)
     ]
-    assert sum(end - start for start, end in result["window_ranges"]) == 25
+    assert sum(end - start for start, end in result["window_ranges"]) == 28
     assert result["window_ranges"] == vanishing_subdomain_ranges_from_lambdas(
         result["lambdas_vdw"],
         first_ensemble_target_intervals=VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS,
@@ -760,15 +767,24 @@ def test_vanishing_pilot_adds_nodes_to_harder_tail_without_moving_anchors():
     optimizer._sample_scalar_metric = _metric
     hard_tail = optimizer.optimize_stage2_vanishing(n_states=17, n_steps_per_state=0)
 
-    uniform_base = np.asarray(
-        uniform["path_diagnostics"]["subdomain_allocation"]["probe_base_lambdas"]
+    uniform_lambdas = np.asarray(uniform["lambdas_vdw"], dtype=float)
+    hard_lambdas = np.asarray(hard_tail["lambdas_vdw"], dtype=float)
+
+    # 🔑 [THERMODYNAMIC_PATH_PROTOCOL_VERSION=21] 度规现在【控制】整条路径，不再
+    # 只影响两个 bridge 点。metric_g 在 λ<=0.5 上是 9（sqrt=3 倍难度），布点必须
+    # 真的往那一侧搬——这正是 v19/v20 做不到的事（那时整条基础路径是写死的二次
+    # 网格，占据比例几乎不随 pilot 变化）。
+    assert not np.allclose(hard_lambdas, uniform_lambdas)
+    assert np.count_nonzero(hard_lambdas < 0.5) > np.count_nonzero(
+        uniform_lambdas < 0.5
     )
-    hard_base = np.asarray(
-        hard_tail["path_diagnostics"]["subdomain_allocation"]["probe_base_lambdas"]
-    )
-    assert np.count_nonzero(hard_base < 0.5) > np.count_nonzero(uniform_base < 0.5)
-    validate_human_vanishing_anchors_preserved(uniform["lambdas_vdw"], 17)
-    validate_human_vanishing_anchors_preserved(hard_tail["lambdas_vdw"], 17)
+    # 但无论度规多么偏斜，几何覆盖下限都必须守住（防 v18 的解耦端断层复发）。
+    for res in (uniform, hard_tail):
+        validate_vanishing_lambda_path_invariants(res["lambdas_vdw"])
+        assert (
+            res["path_diagnostics"]["realized_max_lambda_gap"]
+            <= res["path_diagnostics"]["max_lambda_gap_bound"] * (1.0 + 1.0e-6)
+        )
 
 
 def test_fixed_h_probe_cache_protocol_version_is_explicit():
@@ -1384,6 +1400,8 @@ class _FakeIbsSampler:
         self.context = _FakeIbsContext(n_states, prefix)
         self.f_history = [np.zeros(n_states)] * 5
         self.tmbar_history = []
+        self.tmbar_history_dropped_entries = 0
+        self.eta_penalty = 1.0
         self.e_offset = 0.0
         self.bias_converged = False
         self.bias_status = "unconverged"
@@ -1459,14 +1477,17 @@ def test_ibs_sampler_load_terminal_status_clears_pending_fields(tmp_path):
         "prefix": "test",
         "f_k": [1.0, 2.0, 3.0],
         "t": 5,
+        "eta_penalty": 1.0,
         "e_offset": 0.0,
         "tmbar_history": [],
+        "tmbar_history_dropped_entries": 0,
         "status": "running",
         "bias_converged": False,
         "bias_status": "calibrated_validation_failed",
         "frozen_f_k_pending": [1.0, 2.0, 3.0],  # stale leftover; load must ignore/clear it
         "frozen_validation_cumulative_steps": 300_000,
         "ibs_bias_protocol_version": IBS_BIAS_PROTOCOL_VERSION,
+        "warmup_update_protocol_version": ibs_engine.IBS_WARMUP_UPDATE_PROTOCOL_VERSION,
         "sampling_repair_policy": "non_mutating_v1",
         "lambdas_coul": lambdas_coul,
         "lambdas_vdw": lambdas_vdw,

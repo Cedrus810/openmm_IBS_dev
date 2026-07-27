@@ -1,7 +1,7 @@
 # ABFE 审计状态总表（历史记录；当前覆盖更新至 2026-07-21）
 
 > **当前覆盖说明**：源码采用 `IBS_BIAS_PROTOCOL_VERSION=26`、
-> `THERMODYNAMIC_PATH_PROTOCOL_VERSION=18`、`TRADITIONAL_LJ_LRC_PROTOCOL_VERSION=2`
+> `THERMODYNAMIC_PATH_PROTOCOL_VERSION=19`、`TRADITIONAL_LJ_LRC_PROTOCOL_VERSION=2`
 > 和 `WCA_ACCOUNTING_VERSION=2`。本文件正文保留 2026-07-14～20 的审计演进，较早章节中
 > 的“当前”“未修复”和旧协议版本均只代表当时快照。现行行动清单以
 > [`../TODO.md`](../TODO.md) 为准，代码完成但待运行的项目以

@@ -172,93 +172,6 @@ def _load_validated_window_data_triplet(
     )
 
 
-def ibs_lj_tail_lrc_is_applicable(potential_type: Optional[str]) -> bool:
-    """🔑 [P2-14] `build_ibs_dual_system` 是否会给该势函数附加解析 LJ 长程尾项修正。
-
-    这是**唯一真相**，生产者和报告者共用同一个谓词：
-
-      * 生产者 `build_ibs_dual_system` 用它决定要不要算
-        `ibs_wrapper.lj_tail_lrc_coeff_kj_mol`；
-      * 报告者 `ABFEPipeline.compute_final_results` 用它填
-        `final_results.json` 的 `lj_long_range_dispersion_correction.applied`。
-
-    之前那个字段是**裸字面量 `True`**，对 DEXP 运行无条件说谎：IBS 明确不给
-    DEXP 附加修正，`None` 一路 short-circuit 到零（`IBSSampler._lj_tail_
-    correction_kj_mol` 直接 `return np.zeros(...)`），可 JSON 里仍写着已应用、
-    且下面那段 note 还用散文再断言一遍。
-
-    共用谓词而不是在报告侧另写一个 `potential_type != "dexp"`：DEXP 的解析尾项
-    公式一旦被验证/替换，只需要改这一处，行为和报告会一起动，不会再分叉。
-    同一份纪律仓库里已经用在系数数组本身上（三个消费者共读
-    `ibs_wrapper.lj_tail_lrc_coeff_kj_mol`）。
-    """
-    return str(potential_type or "").strip().lower() != "dexp"
-
-
-def ibs_lj_tail_lrc_inapplicable_reason(potential_type: Optional[str]) -> str:
-    """不附加修正时的机器可读理由；适用时返回空串。"""
-    if ibs_lj_tail_lrc_is_applicable(potential_type):
-        return ""
-    return (
-        "potential_type='dexp' 尚未验证解析尾项公式是否适用于该势函数"
-    )
-
-
-class IBSIncompleteStageCoverageError(RuntimeError):
-    """一个 stage 的预期窗口没有全部加载成功，拒绝在缺口上求解自由能。"""
-
-
-def _assert_expected_windows_all_loaded(
-    *,
-    expected_windows: List[int],
-    loaded_windows: List[int],
-    missing_windows: List[Dict[str, Any]],
-    source: str,
-) -> None:
-    """🔑 [P0-8] expected → loaded 的收缩必须 fail closed。
-
-    `GlobalMBARAnalyzer.solve_stage_integrated()` 的完整性判据是
-    `len(local_results) == len(valid_windows)`，而 `valid_windows` 本身就是从
-    传进来的 `window_data` 算的——loader 静默丢掉的窗口在那里根本不可见。
-    协方差链能挡住**中间**缺窗（找不到共享 λ 会走 `_fallback`），但挡不住：
-
-      * 缺首窗：window 1 自然变成 `local_idx == 0`，`join_lam = local_lams[0]`；
-      * 缺末窗：链提前正常结束。
-
-    两者都返回一条截断的 ΔG 并报 `converged=True`。`_assert_stage_result_sane()`
-    只看求解器返回的字段，不数窗口、不查 λ 覆盖，结构上也抓不到。所以这道门必须
-    加在 loader 出口——求解器拿到数据时，信息已经丢了。
-    """
-    expected = [int(x) for x in expected_windows]
-    loaded = {int(x) for x in loaded_windows}
-    missing = [int(x) for x in expected if int(x) not in loaded]
-    if not missing:
-        return
-    detail_by_index = {
-        int(entry.get("window_index", -1)): entry for entry in missing_windows
-    }
-    lines = []
-    for idx in missing:
-        entry = detail_by_index.get(idx)
-        if entry:
-            lines.append(
-                f"    窗口 {idx} λ范围={entry.get('lambda_range')} "
-                f"缺文件={entry.get('missing_files')}"
-            )
-        else:
-            lines.append(f"    窗口 {idx}（未产出任何数据）")
-    raise IBSIncompleteStageCoverageError(
-        f"IBS stage 数据不完整，拒绝求解截断的自由能曲线（来源：{source}）。\n"
-        f"  预期窗口 {expected}\n"
-        f"  实际加载 {sorted(loaded)}\n"
-        f"  缺失窗口 {missing}\n" + "\n".join(lines) + "\n"
-        "  缺中间窗口会被协方差链挡下，但缺首/末窗口只会让链在更窄的 λ 区间上闭合，"
-        "产出截断的 ΔG 且仍报 converged=True。若确实要在部分窗口上分析（例如 "
-        "vanishing rescue 用 rescue ensemble 取代原始窗口），必须显式传入 "
-        "excluded_local_windows，而不是让文件缺失来隐式决定覆盖范围。"
-    )
-
-
 def _atomic_write_json(filepath: str, payload: Dict[str, Any]) -> None:
     """Durably write JSON through a temporary file and atomic replace."""
     dirpath = os.path.dirname(filepath)
@@ -2309,11 +2222,8 @@ def build_ibs_dual_system(
     # softcore-aware 径向积分（_lj_tail_lrc_coefficients_kj_mol），同时补上
     # 排斥项 r^-12 的尾贡献（之前只有吸引项 r^-6）。每帧修正 = coeff[k] / V(t)。
     ibs_wrapper.lj_tail_lrc_coeff_kj_mol = None
-    if not ibs_lj_tail_lrc_is_applicable(potential_type):
-        print(
-            f"  ⚠️ [LJ LRC] {ibs_lj_tail_lrc_inapplicable_reason(potential_type)}"
-            "，本次不附加修正。"
-        )
+    if potential_type == "dexp":
+        print("  ⚠️ [LJ LRC] potential_type='dexp' 尚未验证解析尾项公式是否适用于该势函数，本次不附加修正。")
     else:
         rc_nm = template_cutoff.value_in_unit(unit.nanometer)
         rs_nm = template_switch.value_in_unit(unit.nanometer)
@@ -3484,214 +3394,6 @@ def _normalize_ibs_protocol_for_cache_compare(manifest: Dict[str, Any]) -> Dict[
         normalized["ibs_bias_protocol_version"] = IBS_BIAS_PROTOCOL_VERSION
     return normalized
 
-
-def _resume_cached_window_gate_status(
-    cached_conv: Optional[Dict[str, Any]],
-    cached_e_shape: Optional[Tuple[int, ...]],
-    lc_win: Any,
-    lv_win: Any,
-    repair_policy: str,
-    lse_log_residual_tolerance: float,
-    enable_early_stop: bool,
-    current_early_stop_config: Dict[str, Any],
-    effective_target_steps: int,
-) -> Dict[str, Any]:
-    """一份磁盘窗口缓存在 resume 时能不能直接复用：8 个门的纯函数求值。
-
-    原先这 ~110 行判断内联在 ``run_all_windows`` 里，依赖 8 个局部变量，没有任何
-    办法单独调用，因此"缺字段是否真的 fail-closed""步数预算门是否真的不管
-    early_stop_triggered 都生效"这类问题只能靠读代码确认，不能靠测试保证。抽成
-    纯函数后每个门都能用 mock 的 ``cached_conv`` 单独验证（见
-    ``test_resume_reuse_contracts.py``），且不碰任何文件 I/O。
-
-    刻意留在 ``run_all_windows`` 里没有搬进来的两件事：
-      - ``ExistingEnsembleRequiresRescueAudit``：那是带 diagnostics 的 raise，
-        不是布尔门，且在 triplet 加载之前就要先拦（保护旧 ensemble 不被覆盖）。
-      - ``_load_validated_window_data_triplet`` 的文件读取与 manifest 校验。
-    本函数只吃已经解析好的 ``cached_conv`` dict 和能量矩阵的 shape。
-
-    返回 dict 而不是 ``(bool, reason)``：调用方那串逐门诊断打印（每个门有各自的
-    文案和一个 legacy_mutating 分支）需要读到**单个门**的布尔值，返回聚合结果会
-    迫使那些打印重写。这里把逐门布尔一并返回，调用侧的 elif 阶梯得以一字不动。
-
-    ``usable`` 的与链顺序与原内联判断完全一致：
-        shape -> lambdas -> wca -> ibs_bias -> lse -> lrc -> repair_policy -> early_stop
-    任何字段缺失（旧格式缓存读不到该 key）一律保守判"不可复用"，绝不"大概率
-    没变"就放过。
-    """
-    if not isinstance(cached_conv, dict):
-        cached_conv = {}
-
-    # 🔑 形状：ndim==2、物理态数与本次窗口的 λ 数一致、至少有一帧。
-    shape_ok = bool(
-        cached_e_shape is not None
-        and len(tuple(cached_e_shape)) == 2
-        and int(tuple(cached_e_shape)[0]) == len(lc_win)
-        and int(tuple(cached_e_shape)[1]) > 0
-    )
-
-    # 🔑 只按 window_idx + shape 判断"这份缓存还能不能用"是不安全的：λ 路径被
-    # 自动加密/重新划分窗口后，同一个 window_idx 完全可能对应一段全新的 λ 区间，
-    # 只要凑巧态数相同就会被静默当成有效缓存复用——采样对了，但对的是错的 λ。
-    # 旧格式缓存没有这两个字段的，保守地当作不匹配，强制重采。
-    cached_lc = cached_conv.get("lambdas_coul")
-    cached_lv = cached_conv.get("lambdas_vdw")
-    lambdas_match = bool(
-        cached_lc is not None
-        and cached_lv is not None
-        and len(cached_lc) == len(lc_win)
-        and len(cached_lv) == len(lv_win)
-        and np.allclose(cached_lc, lc_win, atol=1e-9)
-        and np.allclose(cached_lv, lv_win, atol=1e-9)
-    )
-
-    # 🔑 [wca_accounting_version] λ 值对得上不代表数值对得上：base/bias 的力组
-    # 切分口径变过（Group4 λ-WCA 从"算作 base"改成"算作 bias"）时，旧文件里的
-    # base/bias 数值是在旧口径下算出来的，即使 λ 完全相同也绝不能复用。
-    version_match = cached_conv.get("wca_accounting_version") == WCA_ACCOUNTING_VERSION
-
-    # 🔑 [ibs_bias_protocol_version] 旧协议下这份能量文件可能是在 f_k 全程漂移
-    # （生产阶段仍在 update_weights()）的情况下采出来的，不满足 MBAR 的单一固定
-    # 采样分布假设——即使 λ/WCA 口径都对得上，也不能当成有效缓存复用。
-    bias_protocol_match = _ibs_bias_protocol_version_is_cache_compatible(
-        cached_conv.get("ibs_bias_protocol_version")
-    )
-
-    cached_lse_tolerance = cached_conv.get("lse_log_residual_tolerance")
-    lse_tolerance_match = bool(
-        cached_lse_tolerance is not None
-        and np.isclose(
-            float(cached_lse_tolerance),
-            float(lse_log_residual_tolerance),
-            rtol=0.0,
-            atol=1.0e-15,
-        )
-    )
-
-    # 🔑 [lj_tail_lrc_protocol_version] LRC 公式版本必须匹配——v1 只补 cutoff 外的
-    # r^-6、忽略 switching 区间，v2 是真正 switching+softcore-aware 的积分；旧协议
-    # 下算出的 target_energies 里叠加的 LRC 数值跟当前公式完全不是同一回事。缺失
-    # 该字段（比 v1 更旧）同样保守地判不匹配。
-    lrc_version_match = (
-        cached_conv.get("lj_tail_lrc_protocol_version")
-        == TRADITIONAL_LJ_LRC_PROTOCOL_VERSION
-    )
-
-    # 🔑 [non_mutating_v1] 采样修复策略必须匹配：旧的变异策略缓存（其 f_k 可能被
-    # fixed-H 累计 ΔF 就地覆盖过，属于不同参考系）绝不能被非变异策略的 run 复用。
-    # 旧缓存没有这个字段（None），与 "non_mutating_v1" 不相等，因此自动判无效。
-    repair_policy_match = cached_conv.get("sampling_repair_policy") == repair_policy
-
-    # 🔑 [early_stop / 步数预算] 两条独立检查，不管这份缓存是否触发过 early stop
-    # 都要过第一条：
-    #  (1) 缓存产出时的目标步数不能低于当前调用的目标步数——否则即使从来没有触发
-    #      过 early stop、是"完整跑满"的缓存，也可能只是"250k 时代"跑完的窗口，
-    #      被静默当成满足"预算已提到 500k"的当前要求复用，实际样本量根本不够。
-    #  (2) 如果这份缓存确实是 early_stop_triggered=True 提前停止产出的短样本，还
-    #      要求当前调用同样启用 early stop、协议版本一致、且这次实际使用的八个
-    #      阈值跟缓存记录的完全一致——只比协议版本不够：版本号只在判据逻辑本身
-    #      变了才会变，把某个阈值从松调紧（例如 max_uncertainty_kJ_mol 从 5.0 收紧
-    #      到 1.0）根本不影响协议版本，但旧窗口是在更松的阈值下通过的。
-    early_stop_ok = True
-    early_stop_reject_reason: Optional[str] = None
-    cached_target = cached_conv.get("n_steps_per_window_effective")
-    if cached_target is None or int(cached_target) < int(effective_target_steps):
-        early_stop_ok = False
-        early_stop_reject_reason = (
-            f"当前目标步数（{int(effective_target_steps)}）高于缓存产出时的目标"
-            f"（{cached_target}）"
-        )
-    elif bool(cached_conv.get("early_stop_triggered", False)):
-        if not enable_early_stop:
-            early_stop_ok = False
-            early_stop_reject_reason = "当前调用未启用 early stop"
-        elif (
-            cached_conv.get("early_stop_protocol_version")
-            != EARLY_STOP_PROTOCOL_VERSION
-        ):
-            early_stop_ok = False
-            early_stop_reject_reason = (
-                f"缓存的 early_stop_protocol_version="
-                f"{cached_conv.get('early_stop_protocol_version')!r}（期望 "
-                f"{EARLY_STOP_PROTOCOL_VERSION}）"
-            )
-        elif not _early_stop_configs_match(
-            cached_conv.get("early_stop_config"), current_early_stop_config
-        ):
-            early_stop_ok = False
-            early_stop_reject_reason = (
-                f"缓存的 early_stop_config（{cached_conv.get('early_stop_config')}）"
-                f"与当前调用（{current_early_stop_config}）不一致"
-            )
-
-    usable = bool(
-        shape_ok
-        and lambdas_match
-        and version_match
-        and bias_protocol_match
-        and lse_tolerance_match
-        and lrc_version_match
-        and repair_policy_match
-        and early_stop_ok
-    )
-
-    # reason 的判定顺序与调用侧那串诊断打印的 elif 阶梯一致，保证"日志说的原因"
-    # 和"函数报告的原因"永远是同一个门。
-    if usable:
-        reason: Optional[str] = None
-    elif not shape_ok:
-        reason = (
-            f"缓存能量形状 {tuple(cached_e_shape) if cached_e_shape is not None else None} "
-            f"与期望 ({len(lc_win)}, N) 不符"
-        )
-    elif not version_match:
-        reason = (
-            f"wca_accounting_version={cached_conv.get('wca_accounting_version')!r}"
-            f"（期望 {WCA_ACCOUNTING_VERSION}）"
-        )
-    elif not bias_protocol_match:
-        reason = (
-            f"ibs_bias_protocol_version="
-            f"{cached_conv.get('ibs_bias_protocol_version')!r}（兼容版本 "
-            f"{sorted(IBS_BIAS_CACHE_COMPATIBLE_PROTOCOL_VERSIONS)}）"
-        )
-    elif not lse_tolerance_match:
-        reason = (
-            f"LSE log 残差容差={cached_lse_tolerance!r}"
-            f"（当前 {lse_log_residual_tolerance}）"
-        )
-    elif not lrc_version_match:
-        reason = (
-            f"lj_tail_lrc_protocol_version="
-            f"{cached_conv.get('lj_tail_lrc_protocol_version')!r}"
-            f"（期望 {TRADITIONAL_LJ_LRC_PROTOCOL_VERSION}）"
-        )
-    elif not repair_policy_match:
-        reason = (
-            f"sampling_repair_policy="
-            f"{cached_conv.get('sampling_repair_policy')!r}（期望 {repair_policy!r}）"
-        )
-    elif not early_stop_ok:
-        reason = early_stop_reject_reason
-    else:
-        reason = "λ 值不匹配（缺少 λ 元数据或 λ 路径已变更）"
-
-    return {
-        "usable": usable,
-        "reason": reason,
-        "shape_ok": shape_ok,
-        "lambdas_match": lambdas_match,
-        "version_match": version_match,
-        "bias_protocol_match": bias_protocol_match,
-        "lse_tolerance_match": lse_tolerance_match,
-        "cached_lse_tolerance": cached_lse_tolerance,
-        "lrc_version_match": lrc_version_match,
-        "repair_policy_match": repair_policy_match,
-        "early_stop_ok": early_stop_ok,
-        "early_stop_reject_reason": early_stop_reject_reason,
-    }
-
-
 # A minibatch stores a full KxN energy matrix plus bias/base vectors.  Keeping
 # every learning batch forever makes long/debug warmups grow without bound and
 # bloats JSON checkpoints.  The normal production budget is far below this
@@ -4726,12 +4428,8 @@ class IBSSampler:
                 "legacy_per_entry_quality_converged": bool(
                     tmbar_res.get("converged", False)
                 ),
-                # [ESS_GATE_PROTOCOL_VERSION=2] raw_* 是这条路径真正用来判 trust 的量
-                # （见下面 tmbar_candidate_trusted 处的说明）；mixture 量对 tmbar_history
-                # 恒为 None，一并落盘只为让诊断自解释。
-                "min_overlap": tmbar_res.get("raw_min_overlap"),
-                "min_absolute_ess": tmbar_res.get("raw_min_absolute_ess"),
-                "mixture_min_overlap": tmbar_res.get("min_overlap"),
+                "min_overlap": tmbar_res.get("min_overlap"),
+                "min_absolute_ess": tmbar_res.get("min_absolute_ess"),
                 "min_decorrelated_samples": tmbar_res.get("min_decorrelated_samples"),
                 "max_endpoint_uncertainty_kJ_mol": tmbar_res.get("max_endpoint_uncertainty_kJ_mol"),
             }
@@ -4755,18 +4453,8 @@ class IBSSampler:
         coverage_ess_batch = float(1.0 / _sum_sq_p) if _sum_sq_p > 0.0 else 0.0
         tmbar_candidate_trusted = False
         if tmbar_absolute_candidate is not None:
-            # 🔑 [ESS_GATE_PROTOCOL_VERSION=2] 这里刻意读 raw_* 而不是 min_overlap/
-            # min_absolute_ess。两个消费者要的不是同一件事：
-            #   - 阶段收敛门问"混合分布对物理态覆盖够不够"→ 用扣掉共模因子的
-            #     mixture 量（共模项在它真正报出去的物理态↔物理态 ΔF 里会抵消）。
-            #   - 这里问"从这批原始重要性权重解出来的绝对 f_k 向量敢不敢直接用"→
-            #     权重退化本身就是不敢用的理由，raw 单参考 ESS 才是正确的悲观度量。
-            # 另外 tmbar_history 的 entry 天生没有 f_k 字段（每条 entry 是在不同
-            # f_k 下采的，单一 f_k 无法代表整段历史，这正是 TMBAR 存在的理由），
-            # mixture 量对这个调用方恒为 None——读它会让 trust 门永久为 False，
-            # 把 warmup 永久钉死在受限占据反馈上。
-            _q_overlap = tmbar_res.get("raw_min_overlap")
-            _q_abs_ess = tmbar_res.get("raw_min_absolute_ess")
+            _q_overlap = tmbar_res.get("min_overlap")
+            _q_abs_ess = tmbar_res.get("min_absolute_ess")
             _q_decorr = tmbar_res.get("min_decorrelated_samples")
             _q_uncert = tmbar_res.get("max_endpoint_uncertainty_kJ_mol")
             tmbar_candidate_trusted = bool(
@@ -7468,45 +7156,125 @@ class IBSWindowManagerDualLambda:
                         # 里存的实际 λ 值（见下方保存逻辑）跟本次真正要跑的 lc_win/lv_win 是否
                         # 完全一致；旧格式缓存没有这个字段的，保守地当作不匹配，强制重采，而不是
                         # 假设它"大概率没变"。
-                        _gate = _resume_cached_window_gate_status(
-                            cached_conv,
-                            tuple(cached_e.shape),
-                            lc_win,
-                            lv_win,
-                            repair_policy,
-                            lse_log_residual_tolerance,
-                            enable_early_stop,
-                            {
-                                "min_steps": int(early_stop_min_steps),
-                                "check_interval_steps": int(early_stop_check_interval_steps),
-                                "required_consecutive_passes": int(early_stop_required_consecutive_passes),
-                                "min_ess_ratio": float(early_stop_min_ess_ratio),
-                                "min_absolute_ess": float(early_stop_min_absolute_ess),
-                                "min_decorrelated_samples": int(early_stop_min_decorrelated_samples),
-                                "max_delta_g_drift_kJ_mol": float(early_stop_max_delta_g_drift_kJ_mol),
-                                "max_uncertainty_kJ_mol": float(early_stop_max_uncertainty_kJ_mol),
-                            },
-                            (
-                                int(production_step_overrides[window_idx])
-                                if production_step_overrides and window_idx in production_step_overrides
-                                else int(n_steps_per_window)
-                            ),
+                        cached_lc = cached_conv.get("lambdas_coul")
+                        cached_lv = cached_conv.get("lambdas_vdw")
+                        lambdas_match = (
+                            cached_lc is not None
+                            and cached_lv is not None
+                            and len(cached_lc) == len(lc_win)
+                            and len(cached_lv) == len(lv_win)
+                            and np.allclose(cached_lc, lc_win, atol=1e-9)
+                            and np.allclose(cached_lv, lv_win, atol=1e-9)
                         )
-                        # 🔑 这 8 个门原先内联在这里（~110 行），现已抽成模块级纯函数
-                        # _resume_cached_window_gate_status，逐门语义与阈值一字未改，
-                        # 只是变得可以用 mock 的 convergence.json 单独测试（见
-                        # test_resume_reuse_contracts.py）。下面那串逐门诊断打印仍然
-                        # 读同名局部变量，因此完全保持原样。
-                        lambdas_match = _gate["lambdas_match"]
-                        version_match = _gate["version_match"]
-                        bias_protocol_match = _gate["bias_protocol_match"]
-                        cached_lse_tolerance = _gate["cached_lse_tolerance"]
-                        lse_tolerance_match = _gate["lse_tolerance_match"]
-                        lrc_version_match = _gate["lrc_version_match"]
-                        repair_policy_match = _gate["repair_policy_match"]
-                        early_stop_ok = _gate["early_stop_ok"]
-                        early_stop_reject_reason = _gate["early_stop_reject_reason"]
-                        if _gate["usable"]:
+                        # 🔑 [wca_accounting_version] λ 值对得上不代表数值对得上：base/bias
+                        # 的力组切分口径变过（Group4 λ-WCA 从"算作 base"改成"算作 bias"，
+                        # 见 WCA_ACCOUNTING_VERSION），旧版本文件里的 base/bias 数值是在
+                        # 旧口径下算出来的，即使 λ 完全相同也绝不能当成同一份数据复用。
+                        version_match = cached_conv.get("wca_accounting_version") == WCA_ACCOUNTING_VERSION
+                        # 🔑 [ibs_bias_protocol_version] 旧协议下这份能量文件可能是在
+                        # f_k 全程漂移（生产阶段仍在 update_weights()）的情况下采出来的，
+                        # 不满足 MBAR 的单一固定采样分布假设——即使 λ/WCA 口径都对得上，
+                        # 也不能当成有效缓存复用。
+                        bias_protocol_match = _ibs_bias_protocol_version_is_cache_compatible(
+                            cached_conv.get("ibs_bias_protocol_version")
+                        )
+                        cached_lse_tolerance = cached_conv.get(
+                            "lse_log_residual_tolerance"
+                        )
+                        lse_tolerance_match = bool(
+                            cached_lse_tolerance is not None
+                            and np.isclose(
+                                float(cached_lse_tolerance),
+                                float(lse_log_residual_tolerance),
+                                rtol=0.0,
+                                atol=1.0e-15,
+                            )
+                        )
+                        # 🔑 [early_stop / 步数预算] 两条独立检查，不管这份缓存是否
+                        # 触发过 early stop 都要过第一条：
+                        #  (1) 缓存产出时的目标步数（n_steps_per_window_effective）
+                        #      不能低于当前调用的目标步数——否则即使从来没有触发
+                        #      过 early stop、是"完整跑满"的缓存，也可能只是"250k
+                        #      时代"跑完的窗口，被静默当成满足"预算已提到 500k"的
+                        #      当前要求复用，实际样本量根本不够。
+                        #  (2) 如果这份缓存确实是 early_stop_triggered=True 提前
+                        #      停止产出的短样本，还要求当前调用同样启用 early
+                        #      stop、协议版本一致、且这次实际使用的八个阈值
+                        #      （early_stop_config）跟缓存记录的完全一致——只比协议
+                        #      版本不够：版本号只在判据逻辑本身变了才会变，把某个
+                        #      阈值从松调紧（例如 max_uncertainty_kJ_mol 从 5.0
+                        #      收紧到 1.0）根本不影响协议版本，但旧窗口是在更松的
+                        #      阈值下通过的，不能假设它在新阈值下也一定通过。
+                        # 任何一项不满足都视为缓存不可信，强制重新采样该窗口。
+                        early_stop_ok = True
+                        early_stop_reject_reason = None
+                        _effective_target_for_resume_check = (
+                            int(production_step_overrides[window_idx])
+                            if production_step_overrides and window_idx in production_step_overrides
+                            else int(n_steps_per_window)
+                        )
+                        _cached_target = cached_conv.get("n_steps_per_window_effective")
+                        if _cached_target is None or int(_cached_target) < _effective_target_for_resume_check:
+                            early_stop_ok = False
+                            early_stop_reject_reason = (
+                                f"当前目标步数（{_effective_target_for_resume_check}）高于缓存产出时的目标"
+                                f"（{_cached_target}）"
+                            )
+                        elif bool(cached_conv.get("early_stop_triggered", False)):
+                            if not enable_early_stop:
+                                early_stop_ok = False
+                                early_stop_reject_reason = "当前调用未启用 early stop"
+                            elif cached_conv.get("early_stop_protocol_version") != EARLY_STOP_PROTOCOL_VERSION:
+                                early_stop_ok = False
+                                early_stop_reject_reason = (
+                                    f"缓存的 early_stop_protocol_version="
+                                    f"{cached_conv.get('early_stop_protocol_version')!r}（期望 "
+                                    f"{EARLY_STOP_PROTOCOL_VERSION}）"
+                                )
+                            else:
+                                _current_early_stop_config = {
+                                    "min_steps": int(early_stop_min_steps),
+                                    "check_interval_steps": int(early_stop_check_interval_steps),
+                                    "required_consecutive_passes": int(early_stop_required_consecutive_passes),
+                                    "min_ess_ratio": float(early_stop_min_ess_ratio),
+                                    "min_absolute_ess": float(early_stop_min_absolute_ess),
+                                    "min_decorrelated_samples": int(early_stop_min_decorrelated_samples),
+                                    "max_delta_g_drift_kJ_mol": float(early_stop_max_delta_g_drift_kJ_mol),
+                                    "max_uncertainty_kJ_mol": float(early_stop_max_uncertainty_kJ_mol),
+                                }
+                                if not _early_stop_configs_match(
+                                    cached_conv.get("early_stop_config"), _current_early_stop_config
+                                ):
+                                    early_stop_ok = False
+                                    early_stop_reject_reason = (
+                                        f"缓存的 early_stop_config（{cached_conv.get('early_stop_config')}）"
+                                        f"与当前调用（{_current_early_stop_config}）不一致"
+                                    )
+                        # 🔑 [lj_tail_lrc_protocol_version] LRC 公式版本必须匹配——
+                        # v1 只补 cutoff 外的 r^-6、忽略 switching 区间，v2 是真正
+                        # switching+softcore-aware 的积分；旧协议下算出的
+                        # target_energies 里叠加的 LRC 数值跟当前公式完全不是同一
+                        # 回事，即使 λ/WCA/IBS 偏置协议都对得上，也不能当成同一份
+                        # 数据复用。缺失该字段（比 v1 更旧、这个字段还不存在的
+                        # 缓存）同样保守地判不匹配。
+                        lrc_version_match = cached_conv.get("lj_tail_lrc_protocol_version") == TRADITIONAL_LJ_LRC_PROTOCOL_VERSION
+                        # 🔑 [non_mutating_v1] 采样修复策略必须匹配：旧的变异策略缓存
+                        # （其 f_k 可能被 fixed-H 累计 ΔF 就地覆盖过，属于不同参考系）
+                        # 绝不能被非变异策略的 run 复用。旧缓存没有这个字段（None），
+                        # 与 "non_mutating_v1" 不相等，因此自动判为无效并重新采样。
+                        repair_policy_match = cached_conv.get("sampling_repair_policy") == repair_policy
+                        if (
+                            cached_e.ndim == 2
+                            and cached_e.shape[0] == len(lc_win)
+                            and cached_e.shape[1] > 0
+                            and lambdas_match
+                            and version_match
+                            and bias_protocol_match
+                            and lse_tolerance_match
+                            and lrc_version_match
+                            and repair_policy_match
+                            and early_stop_ok
+                        ):
                             print(
                                 f"  ⏭️  窗口 {window_idx} 已有有效缓存能量 {cached_e.shape} 且 λ 值匹配，"
                                 f"resume 模式下跳过重新采样。"
@@ -8530,27 +8298,21 @@ class IBSWindowManagerDualLambda:
                         for b in frozen_mbar_batches
                     ]
                 )
-                f_frozen_now = np.asarray(
-                    [
-                        sim.context.getParameter(f"{self.prefix}_f_{k}")
-                        for k in range(K)
-                    ],
-                    dtype=np.float64,
-                )
-                # 🔑 [ESS_GATE_PROTOCOL_VERSION=2] f_frozen_now 上移到这里：混合
-                # 覆盖度 ESS 需要"这批 minibatch 采样时真正生效的 f_k"才能把共模
-                # 因子除干净（gauge-free 的逐帧 softmax 捷径在谱宽大的窗口会给出
-                # 差数十倍的结果，见 _ibs_reweighting_quality_diagnostics）。这批
-                # batch 是在冻结 f_k 下采的，所以此刻读到的就是采样时的值。
                 gate_mbar = _solve_single_window_local_mbar(
                     u_kn_gate,
                     bias_gate,
                     base_gate,
                     list(range(K)),
                     sampler.kt,
-                    f_k=f_frozen_now,
                     sampled_distribution_row=0,
                     w_idx=window_idx,
+                )
+                f_frozen_now = np.asarray(
+                    [
+                        sim.context.getParameter(f"{self.prefix}_f_{k}")
+                        for k in range(K)
+                    ],
+                    dtype=np.float64,
                 )
                 # 🔑 [IBS_BIAS_PROTOCOL_VERSION=29] 生产入口门 = 纯 Δf−ΔF loose gate：
                 # 只要 local MBAR 解出有限 f_mbar，就算相邻态 |Δf_k−ΔF^MBAR|（gauge
@@ -9949,19 +9711,8 @@ class IBSWindowManagerDualLambda:
                         np.asarray(sampler.base_energy_history, dtype=np.float64)
                         if sampler.base_energy_history else np.zeros((0,))
                     )
-                    # 🔑 [ESS_GATE_PROTOCOL_VERSION=2] 生产期 f_k 已冻结（进生产后
-                    # 不再调用 update_weights），所以此刻从 context 读到的就是这段
-                    # 历史采样时生效的 f_k，可以直接用来除掉共模因子。
-                    f_k_frozen = np.asarray(
-                        [
-                            sim.context.getParameter(f"{self.prefix}_f_{k}")
-                            for k in range(len(lc_win))
-                        ],
-                        dtype=np.float64,
-                    )
                     local_result = _solve_single_window_local_mbar(
                         u_kj_raw, bias_kj, base_kj, list(range(start, end)), early_stop_kt,
-                        f_k=f_k_frozen,
                         sampled_distribution_row=0, w_idx=window_idx,
                     )
                     step_at_check = (up + 1) * steps_per_update
@@ -10341,36 +10092,10 @@ class IBSWindowManagerDualLambda:
         print("  ✅ Boresch 限制力已完全启用")
         return True
 
-    def get_stage_data_for_analysis(
-        self,
-        stage_type: str = "coul",
-        *,
-        excluded_local_windows: Optional[set] = None,
-    ) -> List[Dict]:
-        """从磁盘加载能量与偏置，构造分析器期望的 window_data 列表
-
-        🔑 [P0-8] `self.ranges` 里每个未被显式排除的窗口都必须有完整的
-        energies/bias/base 三文件；缺任何一个一律 fail closed，不再静默
-        `continue`。旧行为下缺**首**窗口会让 window 1 自然成为协方差链的
-        `local_idx == 0`（`join_lam = local_lams[0]`），缺**末**窗口会让链
-        提前结束，两者都产出截断的 ΔG 却仍报 `converged=True`——因为
-        `solve_stage_integrated` 的完整性判据只比 `local_results` 与已经被
-        加载的 `valid_windows`，看不到 expected→loaded 的收缩。中间缺窗反而
-        是安全的（协方差链找不到共享 λ 会走 `_fallback`）。
-
-        `excluded_local_windows` 是**显式**的合法排除集合，给 vanishing
-        rescue 那条"原始窗口被 rescue ensemble 取代"的路径用；默认不排除
-        任何窗口。
-        """
+    def get_stage_data_for_analysis(self, stage_type: str = "coul") -> List[Dict]:
+        """从磁盘加载能量与偏置，构造分析器期望的 window_data 列表"""
         results = []
-        excluded = {int(x) for x in (excluded_local_windows or set())}
-        expected_windows = [
-            int(i) for i in range(len(self.ranges)) if int(i) not in excluded
-        ]
-        missing_windows: List[Dict] = []
         for i, (start, end) in enumerate(self.ranges):
-            if int(i) in excluded:
-                continue
             e_path = os.path.join(self.output_dir, f"dual_window_{i}_{stage_type}_energies.npy")
             b_path = os.path.join(self.output_dir, f"dual_window_{i}_{stage_type}_bias.npy")
             base_path = os.path.join(self.output_dir, f"dual_window_{i}_{stage_type}_base.npy")
@@ -10378,22 +10103,7 @@ class IBSWindowManagerDualLambda:
                 self.output_dir,
                 f"dual_window_{i}_{stage_type}_convergence.json",
             )
-            # 🔑 [P0-8] 三文件缺任何一个都记账，循环结束后统一 fail closed。
-            absent = [
-                label
-                for label, path in (
-                    ("energies", e_path),
-                    ("bias", b_path),
-                    ("base", base_path),
-                )
-                if not os.path.isfile(path)
-            ]
-            if absent:
-                missing_windows.append({
-                    "window_index": int(i),
-                    "lambda_range": [int(start), int(end)],
-                    "missing_files": absent,
-                })
+            if not os.path.exists(e_path):
                 continue
             if not os.path.isfile(conv_path):
                 raise FileNotFoundError(
@@ -10410,29 +10120,6 @@ class IBSWindowManagerDualLambda:
             if u_kn.shape[1] == 0:
                 raise ValueError(f"窗口 {i} 的 IBS 数据集没有任何有效帧")
             n_frames = u_kn.shape[1]
-            # 🔑 [ESS_GATE_PROTOCOL_VERSION=2] 混合覆盖度 ESS 需要该窗口真正冻结进
-            # 生产的 f_k（gauge-free 的逐帧 softmax 捷径在谱宽大的窗口会差数十倍，
-            # 见 _ibs_reweighting_quality_diagnostics）。f_k 不新存一份文件：
-            # save_ibs_state 早就把它写进 checkpoints/ibs_state_*.json 了，这里直接
-            # 读那份，因此所有已有缓存数据都能用、无需协议号升级或重算。
-            # 缺文件/态数不符一律 fail closed——与本函数上面"有 energies 但缺
-            # convergence manifest"同一策略：静默降级会让收敛门失去判据却看起来通过。
-            state_path = os.path.join(
-                self.checkpoint_dir, f"ibs_state_{stage_type}_window_{i}.json"
-            )
-            if not os.path.isfile(state_path):
-                raise FileNotFoundError(
-                    f"窗口 {i} 有 energies 但缺少 ibs_state checkpoint ({state_path})；"
-                    "ESS 门需要冻结的 f_k，拒绝在缺判据的情况下继续分析"
-                )
-            with open(state_path, encoding="utf-8") as handle:
-                ibs_state = json.load(handle)
-            f_k_window = np.asarray(ibs_state.get("f_k", []), dtype=np.float64).ravel()
-            if f_k_window.size != u_kn.shape[0] or not np.all(np.isfinite(f_k_window)):
-                raise ValueError(
-                    f"窗口 {i} ibs_state 的 f_k（长度 {f_k_window.size}）与能量矩阵"
-                    f"态数（{u_kn.shape[0]}）不符或含非有限值，拒绝用于 ESS 门"
-                )
             results.append({
                 'window_index': int(i),
                 'window_label': f'window_{i}',
@@ -10443,17 +10130,9 @@ class IBSWindowManagerDualLambda:
                 'lambda_indices': list(range(start, end)),
                 'lambdas_coul': [float(x) for x in self.lambdas_coul[start:end]],
                 'lambdas_vdw': [float(x) for x in self.lambdas_vdw[start:end]],
-                # 冻结进生产的偏置权重，kJ/mol；ESS 门用它把共模因子除掉。
-                'f_k': f_k_window,
                 # 显式记录：局部 MBAR 的第 0 行是“采样分布”而非某个物理 lambda 态。
                 'sampled_distribution_row': 0,
             })
-        _assert_expected_windows_all_loaded(
-            expected_windows=expected_windows,
-            loaded_windows=[int(r["window_index"]) for r in results],
-            missing_windows=missing_windows,
-            source=f"{self.output_dir} (stage_type={stage_type})",
-        )
         return results
 
 
@@ -10659,222 +10338,12 @@ def _format_local_mbar_situation(situation: Dict[str, Any]) -> str:
     )
 
 
-def _logsumexp_rows(a: np.ndarray, axis: int = 0) -> np.ndarray:
-    """Numerically stable log-sum-exp along ``axis`` (no scipy.special dep)."""
-    a = np.asarray(a, dtype=np.float64)
-    a_max = np.max(a, axis=axis, keepdims=True)
-    a_max = np.where(np.isfinite(a_max), a_max, 0.0)
-    return np.squeeze(a_max, axis=axis) + np.log(
-        np.sum(np.exp(a - a_max), axis=axis)
-    )
-
-
-def _ess_from_log_weights(log_w: np.ndarray) -> float:
-    """(sum w)^2 / sum w^2 computed in log space; invariant to any constant
-    shift of ``log_w`` (so it does not depend on the f_k gauge for a fixed
-    state, nor on the arbitrary global energy offset)."""
-    log_w = np.asarray(log_w, dtype=np.float64).ravel()
-    if log_w.size == 0 or not np.all(np.isfinite(log_w)):
-        return float("nan")
-    return float(np.exp(2.0 * _logsumexp_rows(log_w) - _logsumexp_rows(2.0 * log_w)))
-
-
-# ============================================================================
-# 🔑 [ESS_GATE_PROTOCOL_VERSION=2] IBS 重加权质量诊断：区分"混合分布覆盖度"
-# 与"共模采样偏置代价"
-# ----------------------------------------------------------------------------
-# 单参考增广 MBAR（n_k=[N,0,...,0]）的 compute_effective_sample_number() 算的是
-#
-#     W_nk ∝ exp[ (V_bias(x_n) - U'_k(x_n)) / kT ]
-#
-# 而生产实际施加的 V_bias 读的是 OpenMM force groups {1, 4}（见
-# IBSSampler.collect_energies）——Group 1 是 IBS 混合偏置，Group 4 是 λ-WCA 防护壳；
-# 目标态能量 U'_k 是 softcore + 解析 LRC。防护壳在窗口内对所有 k 用同一个
-# lambda_shield（见 _serialize_ibs_common_plus_wca_system 的 docstring），LRC 是
-# coeff[k]/V(t)，所以两者合起来在 log 权重里是一个**逐帧共模因子** r_n：
-#
-#     log W_nk = r_n / kT + log p_k(x_n) + const_k,
-#     p_k(x) = exp[-(U'_k - f_k)/kT] / Σ_j exp[-(U'_j - f_j)/kT]
-#
-# r_n 在 occupancy ⟨p_k⟩、相邻 ΔF、warmup loose gate、以及物理态↔物理态自由能差
-# 里都（大部分）抵消——而后者正是本阶段真正报出去的量。但它在 W_nk 里不抵消，
-# 于是把 ESS 按 exp(σ_r²) 整体压掉：真实测到 σ_r 从 λ_vdw≈1 端的 0.95 kT 涨到
-# λ_vdw→0 端的 2.40 kT，对应 ESS/N 上限 0.40 → 0.003，而同一批数据的 ⟨p_k⟩ 是
-# 平坦的 0.249-0.251。也就是说旧的 min_ess_ratio 门衡量的是**防护壳的重加权代价**，
-# 不是采样质量，更不是输出精度：实测 window 5 的 raw ESS 最差(0.0029)但端点
-# 不确定度最好(0.199 kJ/mol)，window 3 的 σ_r 几乎一样(2.35 kT)而端点不确定度
-# 是 2.17 kJ/mol。用它当收敛门会让 rescue 循环去追一个数学上不可满足、且与
-# 被估计量无关的目标。
-#
-# 现在拆成三项互相独立的证据：
-#   (1) min_ess_ratio（**受门**）：去掉共模因子后的混合分布覆盖度 ESS(p_k)/N_decorr。
-#       这才是"采样到的混合分布对物理态 k 覆盖够不够"。
-#   (2) min_decorrelated_samples（**受门**，已有字段）：独立样本数本身。
-#   (3) max_endpoint_uncertainty_kJ_mol（**受门**，已有字段）：MBAR 自己带全协方差
-#       算出的端点 ΔF 精度，即输出精度的直接度量。
-# raw_min_ess_ratio / raw_absolute_ess / common_mode_log_sigma_kT 继续算、继续落盘，
-# 但**只报告不设门**——它们是"防护壳收了多少重加权税"的诚实诊断。
-#
-# 注意 ESS(p_k) 必须用该窗口真正冻结进生产的 f_k。试过用逐帧
-# softmax 归一化（r_n=mean_k 或 logsumexp_k，无需 f_k、且 gauge-free）来省掉
-# f_k 的传参：对相邻 ΔU≲2.5 kT 的窄窗口（3/4/5）与真 f_k 版本一致，但对
-# window 0（相邻 ΔU≈10 kT）给出 0.014 vs 真值 0.500，差 36 倍——因为 f_k 加权的
-# logsumexp 与无权算术平均在谱宽大时是完全不同的逐帧函数。所以这条捷径不成立，
-# f_k 必须真的传进来（从 checkpoint 的 ibs_state_*.json 读，见
-# get_stage_data_for_analysis）。
-# ============================================================================
-ESS_GATE_PROTOCOL_VERSION = 2
-
-
-def _ibs_reweighting_quality_diagnostics(
-    u_kj_raw: np.ndarray,
-    bias_kj: np.ndarray,
-    f_k: Optional[np.ndarray],
-    kt: float,
-) -> Dict[str, Any]:
-    """Split IBS single-reference reweighting quality into the mixture-coverage
-    part (gated) and the common-mode sampling-bias part (reported only).
-
-    ``u_kj_raw`` is (K, N) per-state interaction energy in kJ/mol, ``bias_kj``
-    the (N,) recorded sampling bias (force groups {1,4}) in kJ/mol, ``f_k`` the
-    (K,) frozen production bias weights in kJ/mol.
-
-    Returns ``mixture_ess`` (absolute, per state), ``mixture_ess_ratio``
-    (per state, relative to N), ``raw_ess`` / ``raw_ess_ratio`` (the old
-    single-reference quantity, for reference), ``top1pct_raw_weight`` (fraction
-    of total raw weight carried by the heaviest 1% of frames -- the most direct
-    statement of weight degeneracy) and ``common_mode_log_sigma_kT``.
-
-    ``f_k`` of ``None`` (or a length/finiteness mismatch) yields ``None`` for
-    every mixture-derived field and an explicit ``error`` -- callers must treat
-    that as "cannot evaluate the gate", never as a pass.
-    """
-    u_kj_raw = np.asarray(u_kj_raw, dtype=np.float64)
-    bias_kj = np.asarray(bias_kj, dtype=np.float64).ravel()
-    n_states, n_frames = u_kj_raw.shape
-    out: Dict[str, Any] = {
-        "n_frames": int(n_frames),
-        "raw_ess": None,
-        "raw_ess_ratio": None,
-        "top1pct_raw_weight": None,
-        "mixture_ess": None,
-        "mixture_ess_ratio": None,
-        "mixture_occupancy": None,
-        "mixture_occupancy_normalized": None,
-        "common_mode_log_sigma_kT": None,
-        "common_mode_log_mean_kJ_mol": None,
-        "error": None,
-    }
-    if n_frames == 0 or bias_kj.size != n_frames:
-        out["error"] = "frame_count_mismatch"
-        return out
-
-    # ---- raw single-reference weights (reported only) ----
-    log_w_raw = (bias_kj[None, :] - u_kj_raw) / float(kt)
-    raw_ess = [_ess_from_log_weights(log_w_raw[k]) for k in range(n_states)]
-    out["raw_ess"] = [float(x) for x in raw_ess]
-    out["raw_ess_ratio"] = [float(x) / float(n_frames) for x in raw_ess]
-    n_top = max(1, n_frames // 100)
-    top1 = []
-    for k in range(n_states):
-        lw = log_w_raw[k] - np.max(log_w_raw[k])
-        wt = np.exp(lw)
-        total = float(np.sum(wt))
-        top1.append(
-            float(np.sum(np.sort(wt)[-n_top:]) / total) if total > 0.0 else float("nan")
-        )
-    out["top1pct_raw_weight"] = top1
-
-    # ---- mixture coverage, common-mode factor divided out (gated) ----
-    if f_k is None:
-        out["error"] = "missing_f_k"
-        return out
-    f_arr = np.asarray(f_k, dtype=np.float64).ravel()
-    if f_arr.size != n_states or not np.all(np.isfinite(f_arr)):
-        out["error"] = "f_k_shape_or_finiteness_mismatch"
-        return out
-
-    logits = -(u_kj_raw - f_arr[:, None]) / float(kt)
-    log_norm = _logsumexp_rows(logits, axis=0)
-    log_p = logits - log_norm[None, :]
-    mix_ess = [_ess_from_log_weights(log_p[k]) for k in range(n_states)]
-    out["mixture_ess"] = [float(x) for x in mix_ess]
-    out["mixture_ess_ratio"] = [float(x) / float(n_frames) for x in mix_ess]
-
-    # 🔑 ESS 单独用**不够**，必须配上占据 <p_k>：ESS 对每个态是尺度不变的
-    # ((sum w)^2/sum w^2 在 w -> c*w 下不变)，所以一个"均匀地"被饿死的态——比如
-    # f_k 没补偿、U'_k 比别人高 80 kT——它的 p_k 逐帧都是 ~e^-80，但**相对**逐帧
-    # 起伏很小，ESS(p_k)/N 照样能报 0.34 这种健康值。实测确认过这个盲点。
-    # ESS 查的是二阶矩（权重是否集中在少数帧），<p_k> 查的是一阶矩（这个态到底
-    # 有没有拿到权重），两个失效模式必须各由一项覆盖。归一化成 K*<p_k>（理想=1），
-    # 沿用 warmup 那边同一套占据判据的口径（IBS_LOCAL_MBAR_GATE_OCC_MIN_FRACTION）。
-    occ = np.exp(log_p).mean(axis=1)
-    occ_sum = float(np.sum(occ))
-    if occ_sum > 0.0 and np.all(np.isfinite(occ)):
-        occ = occ / occ_sum
-        out["mixture_occupancy"] = [float(x) for x in occ]
-        out["mixture_occupancy_normalized"] = [
-            float(x) * float(n_states) for x in occ
-        ]
-
-    # r_n: the part of the applied sampling bias that no (U'_k, f_k) pair can
-    # reproduce -- i.e. the WCA guard shell (Group 4) plus the softcore-vs-LRC
-    # Hamiltonian mismatch. -kt*log_norm is the IBS bias the recorded f_k/U'_k
-    # imply; the difference is the common-mode nuisance factor.
-    residual_kj = bias_kj + float(kt) * log_norm
-    if np.all(np.isfinite(residual_kj)):
-        out["common_mode_log_sigma_kT"] = float(np.std(residual_kj) / float(kt))
-        out["common_mode_log_mean_kJ_mol"] = float(np.mean(residual_kj))
-    return out
-
-
-def _decorrelate_by_worst_target_state(
-    u_kj_raw: np.ndarray,
-    bias_kj: np.ndarray,
-    kt: float,
-) -> Tuple[np.ndarray, float, int]:
-    """Subsample using the slowest-decorrelating *reweighting* series.
-
-    🔑 [ESS_GATE_PROTOCOL_VERSION=2] The previous series was the total sampled
-    potential ``base_kj + bias_kj``. That is dominated by bulk solvent
-    fluctuation, which has nothing to do with how fast the importance weights
-    decorrelate, and it measurably *underestimates* g here: on the live
-    Atenolol vdw stage it gave g=1.76/2.58/2.44 for windows 0/2/5 where the
-    per-target-state reduced-potential difference gives g=19.6/26.5/7.7. An
-    understated g inflates n_k fed to MBAR and shrinks the reported error bars
-    -- the exact failure ``subsample_series_by_autocorrelation`` exists to
-    prevent.
-
-    The right series is the one whose exponential *is* the weight,
-    ``Delta_u_k = (U'_k - V_bias)/kT`` (``base`` cancels). One g per target
-    state, then the most conservative (largest g) state drives the shared
-    subsampling, so no state is left correlated. Mirrors the existing
-    per-state pattern at the offline ``u_kn[k, start:end]`` call site.
-
-    Returns ``(indices, g, worst_state_index)``.
-    """
-    u_kj_raw = np.asarray(u_kj_raw, dtype=np.float64)
-    bias_kj = np.asarray(bias_kj, dtype=np.float64).ravel()
-    best_idx = np.arange(u_kj_raw.shape[1])
-    best_g = 1.0
-    worst_k = -1
-    for k in range(u_kj_raw.shape[0]):
-        series = (u_kj_raw[k] - bias_kj) / float(kt)
-        idx_k, g_k = subsample_series_by_autocorrelation(series)
-        if float(g_k) > best_g:
-            best_g = float(g_k)
-            best_idx = np.asarray(idx_k, dtype=int)
-            worst_k = int(k)
-    return best_idx, best_g, worst_k
-
-
 def _solve_single_window_local_mbar(
     u_kj_raw: np.ndarray,
     bias_kj: np.ndarray,
     base_kj: np.ndarray,
     win_lams: List[int],
     kt: float,
-    f_k: Optional[np.ndarray] = None,
     sampled_distribution_row: int = 0,
     w_idx: int = 0,
     min_frames: int = 10,
@@ -10934,11 +10403,8 @@ def _solve_single_window_local_mbar(
     if n_frames < min_frames:
         return {"error": "insufficient_frames", "n_frames": int(n_frames)}
 
-    # 🔑 [ESS_GATE_PROTOCOL_VERSION=2] 去相关序列改为"权重本身的指数"，见
-    # _decorrelate_by_worst_target_state 的 docstring（旧的 base+bias 会低估 g）。
-    sub_idx, g_val, g_worst_state = _decorrelate_by_worst_target_state(
-        u_kj_raw, bias_kj, kt
-    )
+    raw_sampled_series = base_kj + bias_kj
+    sub_idx, g_val = subsample_series_by_autocorrelation(raw_sampled_series)
     if sub_idx.size < n_frames:
         u_kj_raw = u_kj_raw[:, sub_idx]
         bias_kj = bias_kj[sub_idx]
@@ -10959,24 +10425,10 @@ def _solve_single_window_local_mbar(
     u_mbar = np.vstack([u_sampled_eff, u_kj_shifted])
     u_mbar = u_mbar * (1.0 / float(kt))
 
-    # 🔑 [ESS_GATE_PROTOCOL_VERSION=2] Row 0 是"实际 IBS 采样分布"、row 1..K 是
-    # 物理目标态，这个布局是 u_mbar 上面那几行硬编码出来的。旧代码允许把样本数放
-    # 到任意 sampled_distribution_row，然后又用 `i != sampled_row` 挑目标行、再和
-    # win_lams 直接 zip——sampled_row != 0 时 (a) MBAR 会被告知样本来自某个*物理*
-    # 态（物理错误，不只是索引错位），(b) ESS→λ 映射整体错位，win_lams[0] 会被配到
-    # 采样分布那一行的 ESS。这个不变量原先只写在下面的注释里、没有 enforce，而对
-    # "非法值"的容错回退（越界→0）恰好掩盖了真正危险的"合法但非零"值。改为 fail
-    # closed。
     sampled_row = int(sampled_distribution_row)
-    if sampled_row != 0:
-        return {
-            "error": (
-                f"窗口 {w_idx} sampled_distribution_row={sampled_row} != 0；"
-                "本函数的增广矩阵 row 0 固定是 IBS 采样分布、row 1..K 是物理态，"
-                "非零采样行会同时破坏 MBAR 的采样态声明与 ESS→λ 映射，拒绝继续。"
-            )
-        }
     n_k_local = np.zeros(len(win_lams) + 1, dtype=np.int32)
+    if not (0 <= sampled_row < len(n_k_local)):
+        sampled_row = 0
     n_k_local[sampled_row] = n_frames
 
     u_min_col = np.min(u_mbar, axis=0, keepdims=True)
@@ -11000,37 +10452,18 @@ def _solve_single_window_local_mbar(
     except Exception as e:
         return {"error": f"mbar_solve_failed: {e}"}
 
-    # 🔑 [ESS_GATE_PROTOCOL_VERSION=2] min_ess_ratio 从"单参考 raw ESS"换成
-    # "扣掉共模因子后的混合覆盖度 ESS(p_k)"，raw 量降级为只报告不设门。
-    # 详见 _ibs_reweighting_quality_diagnostics 顶部的长注释。
-    # 必须用 valid_mask 之后的那批帧：denom 是 n_k_local[sampled_row]=sum(valid_mask)，
-    # 若 quality 用未过滤的全部帧，比例的分子分母就来自不同样本集。
-    quality = _ibs_reweighting_quality_diagnostics(
-        u_kj_raw[:, valid_mask], bias_kj[valid_mask], f_k, kt
-    )
-    denom = max(int(n_k_local[sampled_row]), 1)
     min_ess_ratio = None
     ess_ratio_per_lambda = None
-    raw_min_ess_ratio = None
-    raw_ess_ratio_per_lambda = None
-    if quality.get("raw_ess") is not None:
-        raw_ratio = np.asarray(quality["raw_ess"], dtype=float) / denom
-        raw_min_ess_ratio = float(np.min(raw_ratio))
-        raw_ess_ratio_per_lambda = {
-            int(lam): float(r) for lam, r in zip(win_lams, raw_ratio)
-        }
-    min_occupancy_normalized = None
-    if quality.get("mixture_ess") is not None:
-        mix_ratio = np.asarray(quality["mixture_ess"], dtype=float) / denom
-        min_ess_ratio = float(np.min(mix_ratio))
-        ess_ratio_per_lambda = {
-            int(lam): float(r) for lam, r in zip(win_lams, mix_ratio)
-        }
-        # 一阶矩伴随量，见 _ibs_reweighting_quality_diagnostics 里的说明：ESS 尺度
-        # 不变，抓不到"均匀被饿死"的态，两项必须一起看。
-        occ_norm = quality.get("mixture_occupancy_normalized")
-        if occ_norm:
-            min_occupancy_normalized = float(np.min(occ_norm))
+    try:
+        neff = np.asarray(mbar.compute_effective_sample_number(), dtype=float)
+        denom = max(int(n_k_local[sampled_row]), 1)
+        target_idx = [i for i in range(len(neff)) if i != sampled_row]
+        if target_idx:
+            ess_ratio = neff[target_idx] / denom
+            min_ess_ratio = float(np.min(ess_ratio))
+            ess_ratio_per_lambda = {int(lam): float(r) for lam, r in zip(win_lams, ess_ratio)}
+    except Exception:
+        pass
 
     f_phys_kt = df_matrix[0, 1:]
     df_phys_kt = ddf_matrix[0, 1:]
@@ -11060,21 +10493,6 @@ def _solve_single_window_local_mbar(
         "min_ess_ratio": min_ess_ratio,
         "ess_ratio_per_lambda": ess_ratio_per_lambda,
         "statistical_inefficiency": float(g_val),
-        # ---- [ESS_GATE_PROTOCOL_VERSION=2] 只报告、不设门的诚实诊断 ----
-        "ess_gate_protocol_version": int(ESS_GATE_PROTOCOL_VERSION),
-        "ess_gate_metric": "mixture_coverage_ess_common_mode_removed",
-        "min_occupancy_normalized": min_occupancy_normalized,
-        "min_occupancy_normalized_threshold": float(
-            IBS_LOCAL_MBAR_GATE_OCC_MIN_FRACTION
-        ),
-        "mixture_occupancy_normalized": quality.get("mixture_occupancy_normalized"),
-        "raw_min_ess_ratio": raw_min_ess_ratio,
-        "raw_ess_ratio_per_lambda": raw_ess_ratio_per_lambda,
-        "top1pct_raw_weight": quality.get("top1pct_raw_weight"),
-        "common_mode_log_sigma_kT": quality.get("common_mode_log_sigma_kT"),
-        "common_mode_log_mean_kJ_mol": quality.get("common_mode_log_mean_kJ_mol"),
-        "reweighting_quality_error": quality.get("error"),
-        "statistical_inefficiency_worst_state": int(g_worst_state),
     }
 
 
@@ -11169,15 +10587,12 @@ class GlobalMBARAnalyzer:
             # ------------------------------------------------------------------
             # 🔑 修复（审查报告 #1）: 自相关子采样
             # ------------------------------------------------------------------
-            # 该窗口只有一个真实被采样的分布；用能量时间序列估计统计非效率 g，再对
-            # 本窗口所有相关数组做同步去相关子采样，避免把强相关的逐帧 MD 输出当独
-            # 立样本喂给 MBAR（会让误差棒系统性偏小）。
-            # 🔑 [ESS_GATE_PROTOCOL_VERSION=2] 序列从 base_kj+bias_kj 换成每个目标态
-            # 自己的 Δu_k=(U'_k−V_bias)/kT、取 g 最大的那个态——总势能被溶剂涨落主导，
-            # 实测低估 g 达 3-10 倍（见 _decorrelate_by_worst_target_state）。
-            sub_idx, g_val, g_worst_state = _decorrelate_by_worst_target_state(
-                u_kj_raw, bias_kj, self.kt
-            )
+            # 该窗口只有一个真实被采样的分布 (base_kj + bias_kj)；用它自身的能量
+            # 时间序列估计统计非效率 g，再对本窗口所有相关数组做同步去相关子采
+            # 样，避免把强相关的逐帧 MD 输出当独立样本喂给 MBAR（会让误差棒系统
+            # 性偏小）。
+            raw_sampled_series = base_kj + bias_kj
+            sub_idx, g_val = subsample_series_by_autocorrelation(raw_sampled_series)
             if sub_idx.size < n_frames:
                 u_kj_raw = u_kj_raw[:, sub_idx]
                 bias_kj = bias_kj[sub_idx]
@@ -11219,19 +10634,11 @@ class GlobalMBARAnalyzer:
             u_mbar = u_mbar * self.beta
 
             # 样本计数：只有第 0 行（采样分布，而非物理 lambda 态）有 N 个样本。
-            # 🔑 [ESS_GATE_PROTOCOL_VERSION=2] 上面 u_mbar 的 vstack 把 row 0 硬编码
-            # 成采样分布、row 1..K 硬编码成物理态，所以 sampled_row 只能是 0。旧代码
-            # 只对"越界"值回退到 0，却放过"合法但非零"的值——那会让 MBAR 以为样本来自
-            # 某个*物理*态（物理错误），并让下面 `i != sampled_row` + zip(win_lams, ...)
-            # 的 ESS→λ 映射整体错位。改为 fail closed。
             sampled_row = int(w.get("sampled_distribution_row", 0))
             n_k_local = np.zeros(len(win_lams) + 1, dtype=np.int32)
-            if sampled_row != 0:
-                raise ValueError(
-                    f"窗口 {w_idx} sampled_distribution_row={sampled_row} != 0；"
-                    "增广矩阵 row 0 固定是 IBS 采样分布、row 1..K 是物理态，非零采样行"
-                    "会同时破坏 MBAR 的采样态声明与 ESS→λ 映射，拒绝继续。"
-                )
+            if not (0 <= sampled_row < len(n_k_local)):
+                print(f"  ⚠️ 窗口 {w_idx} sampled_distribution_row={sampled_row} 非法，回退为 0")
+                sampled_row = 0
             n_k_local[sampled_row] = n_frames
             
             # ------------------------------------------------------------------
@@ -11291,69 +10698,31 @@ class GlobalMBARAnalyzer:
                 # 重叠）。这里改用 compute_effective_sample_number()：它衡量"把 row 0
                 # 的样本重加权到每个目标 λ 态后，还剩多少个等效独立样本"，是这类单向
                 # 重加权场景下物理上正确、数值上已验证有效的重叠代理（详见审查报告）。
-                # 🔑 [ESS_GATE_PROTOCOL_VERSION=2] 受门的 min_ess_ratio 换成"扣掉共模
-                # 因子后的混合覆盖度 ESS(p_k)"；raw 单参考 ESS 降级为只报告不设门。
-                # 理由见 _ibs_reweighting_quality_diagnostics 顶部长注释：raw 量被
-                # Group-4 λ-WCA 防护壳 + LRC 的逐帧共模因子按 exp(σ_r²) 整体压掉
-                # （实测 σ_r 0.95→2.40 kT，对应 ESS/N 上限 0.40→0.003），而那个因子在
-                # 本方法真正报出去的物理态↔物理态自由能差里大部分抵消。
                 min_ess_ratio = None
                 ess_ratio_per_lambda = None
                 min_absolute_ess_this_window = None
-                raw_min_ess_ratio = None
-                raw_min_absolute_ess = None
-                raw_ess_ratio_per_lambda = None
-                min_occ_norm_this_window = None
-                quality = {}
                 try:
                     neff = np.asarray(mbar.compute_effective_sample_number(), dtype=float)
                     denom = max(int(n_k_local[sampled_row]), 1)
-                    # sampled_row 已在上面 fail-closed 保证为 0，所以 target_idx 严格是
-                    # [1..K]，与 win_lams 同序，zip 映射成立。
                     target_idx = [i for i in range(len(neff)) if i != sampled_row]
                     if target_idx:
-                        raw_ratio = neff[target_idx] / denom
-                        raw_min_ess_ratio = float(np.min(raw_ratio))
-                        raw_min_absolute_ess = float(np.min(neff[target_idx]))
-                        # 保留逐态明细而不只是 min：调用方（abfe_preoptimizer.py 的
-                        # refine_stage_lambda_path_by_overlap）需要知道是窗口内*哪个*
-                        # λ 才是瓶颈，而不只是"这个窗口整体没过"。
-                        raw_ess_ratio_per_lambda = {
-                            int(lam): float(r) for lam, r in zip(win_lams, raw_ratio)
-                        }
-
-                    # 必须用 valid_mask 之后的那批帧：denom 是
-                    # n_k_local[sampled_row]=sum(valid_mask)，若 quality 用未过滤
-                    # 的 n_frames 帧，比例的分子分母就来自不同样本集。
-                    quality = _ibs_reweighting_quality_diagnostics(
-                        u_kj_raw[:, valid_mask],
-                        bias_kj[valid_mask],
-                        w.get("f_k"),
-                        self.kt,
-                    )
-                    if quality.get("mixture_ess") is not None:
-                        mix_ess = np.asarray(quality["mixture_ess"], dtype=float)
-                        mix_ratio = mix_ess / denom
-                        min_ess_ratio = float(np.min(mix_ratio))
-                        min_absolute_ess_this_window = float(np.min(mix_ess))
+                        ess_ratio = neff[target_idx] / denom
+                        min_ess_ratio = float(np.min(ess_ratio))
+                        # 🔑 绝对有效样本数（不是比例）：min_ess_ratio 只衡量"相对
+                        # 于本窗口采样帧数"够不够，样本总数本身很少时，比例仍可能
+                        # 轻易超过阈值——最终收敛门需要同时核对绝对数量。
+                        min_absolute_ess_this_window = float(np.min(neff[target_idx]))
+                        # target_idx is strictly [1..K] here (sampled_row is always 0
+                        # from get_stage_data_for_analysis), i.e. rows 1..K of the
+                        # augmented MBAR matrix -- which are win_lams in the same
+                        # order. Keep the per-state breakdown, not just the min, so
+                        # a caller can find *which* lambda inside this window is the
+                        # actual overlap bottleneck instead of only knowing the
+                        # window as a whole failed (needed by
+                        # refine_stage_lambda_path_by_overlap in abfe_preoptimizer.py).
                         ess_ratio_per_lambda = {
-                            int(lam): float(r) for lam, r in zip(win_lams, mix_ratio)
+                            int(lam): float(r) for lam, r in zip(win_lams, ess_ratio)
                         }
-                        occ_norm = quality.get("mixture_occupancy_normalized")
-                        min_occ_norm_this_window = (
-                            float(np.min(occ_norm)) if occ_norm else None
-                        )
-                    elif "f_k" in w:
-                        # 只在调用方**本来打算**给 f_k 的时候才报警。完全没有 'f_k'
-                        # 键的调用方（在线 warmup 的 tmbar_history、λ 重划分探针、
-                        # 合成数据）是刻意不用这个门的，它们每次求解会遍历十几个
-                        # entry，逐 entry 打印会把日志刷爆；对它们 min_ess_ratio=None
-                        # 本身就是信号（converged 因此 fail closed）。
-                        print(
-                            f"  ⚠️ 窗口 {w_idx} 提供了 f_k 但无法计算混合覆盖度 ESS "
-                            f"({quality.get('error')})；该窗口 min_ess_ratio=None，"
-                            "收敛门会因此判失败（fail closed，不当作通过）"
-                        )
                 except Exception as ess_exc:
                     print(f"  ⚠️ 窗口 {w_idx} 有效样本数(ESS)重叠诊断计算失败: {ess_exc}")
                 window_overlap_records.append({
@@ -11366,31 +10735,10 @@ class GlobalMBARAnalyzer:
                     "min_ess_ratio": min_ess_ratio,
                     "ess_ratio_per_lambda": ess_ratio_per_lambda,
                     "absolute_ess": min_absolute_ess_this_window,
-                    # 一阶矩：K*<p_k> 的最小值（理想=1）。与 min_ess_ratio 一起构成
-                    # "权重质量"这一份证据的两半——ESS 是尺度不变的，抓不到"均匀被
-                    # 饿死"的态，必须靠这一项。
-                    "min_occupancy_normalized": min_occ_norm_this_window,
-                    "mixture_occupancy_normalized": quality.get(
-                        "mixture_occupancy_normalized"
-                    ),
                     # 🔑 去相关、剔除 NaN/Inf 列之后真正喂进 MBAR 的样本数（不是
                     # 去相关前的原始帧数）——跟下面 n_k_local[sampled_row]<10 的
                     # 门槛用的是同一个量。
                     "n_frames_decorrelated": int(n_k_local[sampled_row]),
-                    # ---- 只报告、不设门 ----
-                    "ess_gate_protocol_version": int(ESS_GATE_PROTOCOL_VERSION),
-                    "ess_gate_metric": "mixture_coverage_ess_common_mode_removed",
-                    "raw_min_ess_ratio": raw_min_ess_ratio,
-                    "raw_min_absolute_ess": raw_min_absolute_ess,
-                    "raw_ess_ratio_per_lambda": raw_ess_ratio_per_lambda,
-                    "top1pct_raw_weight": quality.get("top1pct_raw_weight"),
-                    "common_mode_log_sigma_kT": quality.get("common_mode_log_sigma_kT"),
-                    "common_mode_log_mean_kJ_mol": quality.get(
-                        "common_mode_log_mean_kJ_mol"
-                    ),
-                    "reweighting_quality_error": quality.get("error"),
-                    "statistical_inefficiency": float(g_val),
-                    "statistical_inefficiency_worst_state": int(g_worst_state),
                 })
 
                 # Delta_f[0, k] 是第 k 个物理态相对于采样态 (Row 0) 的自由能差 (单位: kT)
@@ -11421,10 +10769,6 @@ class GlobalMBARAnalyzer:
                 # 由于所有态都减去了同一个 global_offset，且参考态一致，相对差值是准确的。
                 
                 local_results.append({
-                    # 🔑 [P0-8] 真实来源窗口号；下面 chain_segments 里那个
-                    # "window_index" 其实是 local_results 的位置下标，两者在有窗口被
-                    # 跳过时会分叉，覆盖诊断必须用这个。
-                    "source_window_index": source_window_idx,
                     "lambdas": win_lams,
                     "f": f_phys_kj.astype(float), # 相对于采样参考点的绝对 F
                     "df": df_phys_kj.astype(float),
@@ -11542,12 +10886,7 @@ class GlobalMBARAnalyzer:
             total_dg += segment_dg
             total_variance += segment_error ** 2
             chain_segments.append({
-                # 注意：这个键是 local_results 的位置下标，不是来源窗口号——有窗口被
-                # 跳过时两者会分叉。保持原键以免破坏既有读取方，真实来源见下一行。
                 "window_index": int(local_idx),
-                "source_window_index": int(
-                    local.get("source_window_index", local_idx)
-                ),
                 "join_lambda_index": int(join_lam),
                 "end_lambda_index": int(end_lam),
                 "delta_G_kJ_mol": segment_dg,
@@ -11566,67 +10905,16 @@ class GlobalMBARAnalyzer:
         # 解出 *且* 最差重叠比例不低于阈值。旧的 Δf 间距量保留在
         # lambda_spacing_max_step_kJ_mol 里供参考，但不再冒充"重叠度"。
         # ------------------------------------------------------------------
-        # 🔑 [ESS_GATE_PROTOCOL_VERSION=2] min_ess_ratio 现在是"扣掉共模因子后的混合
-        # 覆盖度"，不再是 raw 单参考 ESS——阈值语义因此才成立（raw 量的上限被防护壳
-        # 按 exp(σ_r²) 压到 0.003，任何 5% 量级的阈值对它都是数学上不可满足的）。
-        # 任一窗口算不出 min_ess_ratio（f_k 缺失/态数不符）时 ess_ratios 会少一项，
-        # 下面 min_overlap 就不是"全部窗口都达标"的证据了——所以额外要求样本齐全。
         ess_ratios = [w["min_ess_ratio"] for w in window_overlap_records if w["min_ess_ratio"] is not None]
-        min_overlap = (
-            float(np.min(ess_ratios))
-            if ess_ratios and len(ess_ratios) == len(window_overlap_records)
-            else None
-        )
-        min_overlap_threshold = float(final_min_ess_ratio)
+        min_overlap = float(np.min(ess_ratios)) if ess_ratios else None
+        min_overlap_threshold = float(final_min_ess_ratio)  # 保守阈值：单分布重加权到目标 λ 态的有效样本占比 <5% 视为不可信
 
         # 🔑 [P1 修复] 只检查 ratio 不够——样本总数很少时绝对有效样本数可能只有
-        # 个位数，比例却轻易超过阈值。补上去相关样本数、端点不确定度硬门槛，
-        # 跟在线 early-stop 用的判据集合一致（不含漂移，一次性拼接没有"上一次
-        # 检查"的基线）。
-        # 🔑 [ESS_GATE_PROTOCOL_VERSION=2] absolute_ess 从"独立硬门"降级为纯诊断。
-        # 它在构造上就是 min_ess_ratio × N_decorrelated（denom 是同一个标量，所以
-        # min(neff)/denom == min(neff/denom) 是恒等式），不是第二份独立证据——给
-        # 同一个量配两个阈值，效果是让 ratio 那个阈值失去意义：final_min_absolute_ess
-        # =50 在 N_decorrelated=114 时等价于要求 ratio ≥ 0.44，而日志里报的门是 0.05，
-        # 真实放行条件其实是 ratio ≥ 50/N_decorrelated，且样本越少门越严——跟"延长
-        # 采样"的修复方向相反。"比例达标但绝对样本数不够"这件事本来就该由
-        # min_decorrelated_samples 直接看（它才是与 ratio 正交的那份证据），端点精度
-        # 由 max_endpoint_uncertainty_kJ_mol 直接看。
-        # min_absolute_ess 继续算、继续落盘；把 min_absolute_ess_threshold 置 None，
-        # 这样 abfe_pipeline.py 里 _assert_stage_result_sane /
-        # _stage_quality_failure_details 那两处"只在字段存在时才检查"的镜像判据会
-        # 自动失活，无需改动 pipeline 侧逻辑。
+        # 个位数，比例却轻易超过阈值。补上绝对 ESS、去相关样本数、端点不确定度
+        # 三项硬门槛，跟在线 early-stop 用的判据集合一致（不含漂移，一次性拼接
+        # 没有"上一次检查"的基线）。
         abs_ess_vals = [w["absolute_ess"] for w in window_overlap_records if w.get("absolute_ess") is not None]
         min_absolute_ess = float(np.min(abs_ess_vals)) if abs_ess_vals else None
-        raw_ess_vals = [
-            w["raw_min_ess_ratio"] for w in window_overlap_records
-            if w.get("raw_min_ess_ratio") is not None
-        ]
-        raw_min_overlap = float(np.min(raw_ess_vals)) if raw_ess_vals else None
-        raw_abs_vals = [
-            w["raw_min_absolute_ess"] for w in window_overlap_records
-            if w.get("raw_min_absolute_ess") is not None
-        ]
-        raw_min_absolute_ess = float(np.min(raw_abs_vals)) if raw_abs_vals else None
-        # 一阶矩伴随门：ESS 尺度不变，抓不到"均匀被饿死"的态（实测一个 f_k 未补偿、
-        # 高出 80 kT 的态 ESS/N 仍报 0.34）。同样要求全部窗口都算得出来才算证据齐全。
-        occ_vals = [
-            w["min_occupancy_normalized"] for w in window_overlap_records
-            if w.get("min_occupancy_normalized") is not None
-        ]
-        min_occupancy_normalized = (
-            float(np.min(occ_vals))
-            if occ_vals and len(occ_vals) == len(window_overlap_records)
-            else None
-        )
-        min_occupancy_normalized_threshold = float(
-            IBS_LOCAL_MBAR_GATE_OCC_MIN_FRACTION
-        )
-        sigma_vals = [
-            w["common_mode_log_sigma_kT"] for w in window_overlap_records
-            if w.get("common_mode_log_sigma_kT") is not None
-        ]
-        max_common_mode_log_sigma_kT = float(np.max(sigma_vals)) if sigma_vals else None
 
         n_frames_vals = [
             w["n_frames_decorrelated"] for w in window_overlap_records
@@ -11648,9 +10936,9 @@ class GlobalMBARAnalyzer:
             len(local_results) == len(valid_windows)
             and min_overlap is not None
             and _meets_minimum_with_roundoff(min_overlap, min_overlap_threshold)
-            and min_occupancy_normalized is not None
+            and min_absolute_ess is not None
             and _meets_minimum_with_roundoff(
-                min_occupancy_normalized, min_occupancy_normalized_threshold
+                min_absolute_ess, float(final_min_absolute_ess)
             )
             and min_decorrelated_samples >= int(final_min_decorrelated_samples)
             and max_endpoint_uncertainty_kJ_mol is not None
@@ -11661,44 +10949,7 @@ class GlobalMBARAnalyzer:
         )
         lambda_spacing_max_step = float(np.max(np.abs(np.diff(f_curve)))) if f_curve.size > 1 else 0.0
 
-        # 🔑 [P0-8] 把"这条曲线到底覆盖了哪些窗口/哪段 λ"落盘。loader 侧
-        # (_assert_expected_windows_all_loaded) 已经挡住了"预期窗口没产出数据"这个
-        # 入口，但求解器自己还会因维度不符/帧数不足 `continue` 掉窗口——那部分由
-        # `len(local_results) == len(valid_windows)` 抓。这里记录的是审计证据：
-        # 光看 total_delta_G 无法判断它积分的是不是完整的 λ 区间。
-        input_window_indices = sorted(
-            int(w.get("window_index", i)) for i, w in enumerate(window_data)
-        )
-        solved_window_indices = sorted(
-            int(r.get("source_window_index", i)) for i, r in enumerate(local_results)
-        )
-        covered_lambda_indices = sorted(int(x) for x in covered_lambdas)
-        coverage_diagnostics = {
-            "input_window_indices": input_window_indices,
-            "valid_window_indices": sorted(
-                int(w.get("window_index", i)) for i, w in enumerate(valid_windows)
-            ),
-            "solved_window_indices": solved_window_indices,
-            "dropped_window_indices": sorted(
-                set(input_window_indices) - set(solved_window_indices)
-            ),
-            "covered_lambda_indices": covered_lambda_indices,
-            "covered_lambda_index_first": (
-                covered_lambda_indices[0] if covered_lambda_indices else None
-            ),
-            "covered_lambda_index_last": (
-                covered_lambda_indices[-1] if covered_lambda_indices else None
-            ),
-            "n_covered_lambda_indices": len(covered_lambda_indices),
-            "note": (
-                "求解器只能证明它积分了这些 λ 索引，无法证明它们就是该 stage 的完整"
-                "路径——'预期窗口是否全部产出数据'必须在 loader 出口用 "
-                "_assert_expected_windows_all_loaded 判定。"
-            ),
-        }
-
         return {
-            "coverage_diagnostics": coverage_diagnostics,
             "total_delta_G": total_dg,
             "total_error": total_err,
             "endpoint_error_after_offset": endpoint_error_after_offset,
@@ -11710,27 +10961,9 @@ class GlobalMBARAnalyzer:
             "converged": converged,
             "min_overlap": min_overlap,
             "min_overlap_threshold": min_overlap_threshold,
-            "min_overlap_method": (
-                "per_window_mixture_coverage_ess_ratio_common_mode_removed"
-            ),
-            "ess_gate_protocol_version": int(ESS_GATE_PROTOCOL_VERSION),
-            "min_occupancy_normalized": min_occupancy_normalized,
-            "min_occupancy_normalized_threshold": min_occupancy_normalized_threshold,
+            "min_overlap_method": "per_window_effective_sample_number_ratio",
             "min_absolute_ess": min_absolute_ess,
-            # None = 该项已降级为纯诊断，见上面 ESS_GATE_PROTOCOL_VERSION=2 的说明。
-            # 置 None 同时让 abfe_pipeline 侧两处镜像检查自动失活。
-            "min_absolute_ess_threshold": None,
-            "min_absolute_ess_gate_retired_reason": (
-                "absolute_ess == min_ess_ratio * n_frames_decorrelated 恒等，不是独立"
-                "证据；给同一个量配两个阈值会让 ratio 阈值失效（final_min_absolute_ess"
-                f"={float(final_min_absolute_ess):.4g} 在 N_decorrelated=114 时等价于"
-                "要求 ratio>=0.44）。改由 min_decorrelated_samples 与 "
-                "max_endpoint_uncertainty_kJ_mol 分别承担样本量与精度这两份正交证据。"
-            ),
-            # ---- 只报告、不设门：防护壳/LRC 共模因子收了多少重加权税 ----
-            "raw_min_overlap": raw_min_overlap,
-            "raw_min_absolute_ess": raw_min_absolute_ess,
-            "max_common_mode_log_sigma_kT": max_common_mode_log_sigma_kT,
+            "min_absolute_ess_threshold": float(final_min_absolute_ess),
             "min_decorrelated_samples": min_decorrelated_samples,
             "min_decorrelated_samples_threshold": int(final_min_decorrelated_samples),
             "max_endpoint_uncertainty_kJ_mol": max_endpoint_uncertainty_kJ_mol,

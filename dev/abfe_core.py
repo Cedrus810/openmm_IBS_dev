@@ -318,7 +318,42 @@ def get_optimal_device_settings():
     return device, support_tf32
 
 
-GLOBAL_DEVICE, SUPPORTS_TF32 = get_optimal_device_settings()
+# 🔑 [ATT-04] 这里原本是模块级的
+#     GLOBAL_DEVICE, SUPPORTS_TF32 = get_optimal_device_settings()
+# 也就是 **import 期** 就会调 `torch.cuda.is_available()` /
+# `torch.cuda.get_device_capability()`（惰性建 CUDA context）并
+# `torch.set_float32_matmul_precision("high")`（改全局 torch 状态）。
+#
+# 并行 stage worker 用 `mp.get_context("spawn")`（abfe_pipeline.py、ibs_engine.py），
+# spawn 反序列化 target 时必然 import `abfe_pipeline → ibs_engine → abfe_core`，
+# 于是每个子进程都在 import 期就抓一次 CUDA。更糟的是子进程的 GPU 归属只通过
+# OpenMM 的 `props["DeviceIndex"]` 表达、从不设 `CUDA_VISIBLE_DEVICES`，所以双 GPU
+# 并行时**两个**子进程都会在 device 0 上建 torch context，然后才各自去用被分配的
+# OpenMM 设备。
+#
+# 注意：OpenMM 侧本来就没有 import 期副作用——abfe_core/ibs_engine/abfe_pipeline 里
+# 所有 `Platform.getPlatformByName` / `Context(...)` 都在函数内。要消除的只有 torch
+# 这一处。
+#
+# 改成惰性 memoized：真正需要 device 的只有下面两个 MACE/ML 入口的默认参数，
+# 它们改成 `device=None` 后在函数体里解析。
+_DEVICE_SETTINGS_CACHE = None
+
+
+def _resolve_device_settings():
+    """首次真正需要时才探测设备；结果缓存，语义与旧的模块级求值一致。"""
+    global _DEVICE_SETTINGS_CACHE
+    if _DEVICE_SETTINGS_CACHE is None:
+        _DEVICE_SETTINGS_CACHE = get_optimal_device_settings()
+    return _DEVICE_SETTINGS_CACHE
+
+
+def get_global_device() -> str:
+    return _resolve_device_settings()[0]
+
+
+def supports_tf32() -> bool:
+    return _resolve_device_settings()[1]
 
 
 # ============================================================================
@@ -371,53 +406,107 @@ class ACESoftcorePotential:
         COUL = 138.935456
         lc, lv = f"({lam_coul}^{self.n_coul})", f"({lam_vdw}^{self.n_lj})"
 
-        # 仅在 r->0 且 lambda->1 的奇异角落启用兜底，不污染正常物理区间。
-        dlj = f"max({self.alpha_lj}*(1.0-{lam_vdw})^{self.m_lj} + r^6, 1e-6)"
-        dc = f"sqrt(max(r^2 + {self.alpha_coul}*(1.0-{lam_coul})^{self.m_coul}, 1e-6))"
-        
         # 必须整体加括号，否则会被解析成 0.5*(sigma1+sigma2)^n，
         # 而不是 ((sigma1+sigma2)/2)^n，短程排斥会被严重放大。
         sigma12 = "(0.5*(sigma1+sigma2))"
+
+        # 🔑 [SOFTCORE_ALPHA_CONVENTION=dimensionless_sigma_scaled_v2] alpha_lj /
+        # alpha_coul 是【无量纲】Beutler 系数，必须乘 sigma_ij^6 / sigma_ij^2 才构成
+        # 长度^6 / 长度^2 的软核偏移（openmmtools 等实现用约化距离 (r/sigma)，等价于
+        # 隐式乘了 sigma^6，所以文献里的 alpha=0.5 是无量纲的）。
+        #
+        # 之前这里把 alpha_lj 当成【绝对 nm^6】直接加在 r^6 上。sigma_ij≈0.3 nm ⇒
+        # sigma^6≈7.3e-4 nm^6，0.5 nm^6 相当于 ~685 sigma^6：软核偏移在
+        # (1-lambda)=0.038（即 lambda≈0.962）处就已越过 sigma^6，于是
+        #   lambda>0.962  → 偏移 ≪ sigma^6，几乎是硬 LJ 核；
+        #   lambda<0.962  → 偏移 ≫ sigma^6，相互作用被整体抹平。
+        # 硬核→全软的整个过程被压缩进 lambda_vdw∈[0.96,1]，实测 Fisher 度规在该段
+        # 峰值 ~2e6，vanishing 路径 87.5% 的热力学长度堆在那 4 条边上（单边长 8.8~11.8，
+        # 其余 18 条边合计仅 5.9），窗口 0 因此零重叠、IBS 占据退化成硬 argmax。
+        #
+        # 两个端点与 alpha 无关（整体乘 lambda_vdw：lambda=0 恒为 0；lambda=1 偏移恒为
+        # 0 即精确 LJ），所以这条修正不改变精确平衡态 ΔG，只改变路径效率——但采样结果、
+        # LRC 与所有旧缓存都属于旧哈密顿量，不能与新路径混用（见
+        # get_parameters_dict 里写入指纹的 alpha_convention）。
+        #
+        # 1e-6 兜底只在 r<0.1 nm（r^6<1e-6）时才生效，是 NaN 防护；该处真实 LJ 同样
+        # 是 ~1e6 kJ/mol 量级的排斥墙，不污染正常物理区间。
+        dlj = (
+            f"max({self.alpha_lj}*{sigma12}^6*(1.0-{lam_vdw})^{self.m_lj} + r^6, 1e-6)"
+        )
+        dc = (
+            f"sqrt(max(r^2 + {self.alpha_coul}*{sigma12}^2"
+            f"*(1.0-{lam_coul})^{self.m_coul}, 1e-6))"
+        )
         lj = f"{lv} * 4 * sqrt(epsilon1*epsilon2) * ({sigma12}^12/({dlj}^2) - {sigma12}^6/{dlj})"
         coul = f"{lc} * {COUL} * q1 * q2 / {dc}"
         
         return f"{lj} + {coul}"
 
+    # 🔑 软核 alpha 语义标签。写进 get_parameters_dict() → 进入协议指纹
+    # (aces_softcore_params)，使得旧的「绝对 nm^6 alpha」缓存与本版本自动指纹不匹配、
+    # fail closed。alpha 的【数值】没变（仍是 0.5/0.3），变的是它在表达式里乘不乘
+    # sigma_ij^6 / sigma_ij^2，因此必须靠这个显式标签来区分，不能靠数值。
+    ALPHA_CONVENTION = "dimensionless_sigma_scaled_v2"
+
     @staticmethod
     def _normalize_alpha_units(alpha_lj, alpha_coul):
+        """alpha 是无量纲 Beutler 系数，缩放在 build_expression 里由 sigma_ij 完成，
+        这里不做任何单位换算（保留此钩子是为了让「不换算」这件事显式可见）。"""
         return float(alpha_lj), float(alpha_coul)
 
     @staticmethod
     def optimize_alpha(n, alpha_coul_nm2=None):
-        """
-        ✅ 修复：OpenMM 软核 alpha 标准单位即为 nm⁶ / nm²
-        文献值 0.5 已对应 nm 尺度，无需额外乘以 1e-6/1e-2
+        """返回无量纲 Beutler 软核系数。
+
+        ⚠️ 历史教训：这里曾写着「OpenMM 软核 alpha 标准单位即为 nm⁶/nm²，文献值 0.5
+        已对应 nm 尺度，无需额外乘以 1e-6/1e-2」——推理方向是反的。openmmtools 一类
+        实现用的是约化距离 (r/sigma)，alpha 隐式乘了 sigma^6，所以文献值 0.5 恰恰是
+        【无量纲】的。把它当绝对 nm^6 用，等于把软核偏移放大了 ~685 倍（sigma≈0.3 nm），
+        后果见 build_expression 的注释。缩放现在由 build_expression 乘 sigma_ij^6 /
+        sigma_ij^2 完成，这里只返回无量纲系数本身。
         """
         if n > 50:
             alpha_lj, alpha_coul = 0.5, (alpha_coul_nm2 or 0.2)
         else:
             alpha_lj, alpha_coul = 0.5, (alpha_coul_nm2 or 0.3)
-            
-        # ✅ 更新断言范围（匹配 nm 标准）
-        assert 0.1 < alpha_lj < 2.0, f"alpha_lj 单位疑似错误: {alpha_lj} (预期 0.1~2.0 nm⁶)"
-        assert 0.05 < alpha_coul < 1.0, f"alpha_coul 超出安全范围: {alpha_coul} (预期 0.05~1.0 nm²)"
-        
+
+        # 无量纲区间：文献常用 alpha_lj=0.5、alpha_coul=0.2~0.3。
+        assert 0.1 < alpha_lj < 2.0, f"alpha_lj 超出安全范围: {alpha_lj} (无量纲，预期 0.1~2.0)"
+        assert 0.05 < alpha_coul < 1.0, f"alpha_coul 超出安全范围: {alpha_coul} (无量纲，预期 0.05~1.0)"
+
         return {
-            "alpha_lj": alpha_lj,        # nm⁶
-            "alpha_coul": alpha_coul,    # nm²
+            "alpha_lj": alpha_lj,        # 无量纲，表达式内乘 sigma_ij^6
+            "alpha_coul": alpha_coul,    # 无量纲，表达式内乘 sigma_ij^2
             "power_lj": [2, 2],
             "power_coul": [1, 1],
+            "alpha_convention": ACESoftcorePotential.ALPHA_CONVENTION,
         }
+
     def get_parameters_dict(self):
         return {
             "alpha_lj": self.alpha_lj,
             "alpha_coul": self.alpha_coul,
             "power_lj": list([self.m_lj, self.n_lj]),
             "power_coul": list([self.m_coul, self.n_coul]),
+            "alpha_convention": self.ALPHA_CONVENTION,
         }
 
     @classmethod
     def from_dict(cls, p):
+        # fail closed：显式给了 alpha 却没带（或带错）convention 标签的 dict，只可能来自
+        # 「绝对 nm^6 alpha」旧协议的缓存/配置。数值相同但物理不同，静默复用会让采样
+        # 哈密顿量与本版本不一致，必须拒绝。空 dict 走默认值，是合法的新建路径。
+        if p and "alpha_lj" in p:
+            convention = p.get("alpha_convention")
+            if convention != cls.ALPHA_CONVENTION:
+                raise ValueError(
+                    "软核 alpha 协议不匹配："
+                    f"alpha_convention={convention!r}，本版本要求 "
+                    f"{cls.ALPHA_CONVENTION!r}（alpha 为无量纲、表达式内乘 sigma_ij^6）。"
+                    "旧协议把 alpha_lj 当绝对 nm^6 使用，两者数值相同但哈密顿量不同，"
+                    "旧的 lambda 路径/pilot 度规/能量缓存一律不可复用，需重新 pilot。"
+                )
         alpha_lj, alpha_coul = cls._normalize_alpha_units(
             p.get("alpha_lj", 0.5),
             p.get("alpha_coul", 0.2),
@@ -445,12 +534,27 @@ class BeutlerSoftcoreBuilder:
         power_coul: int = 1,
         particle_params_override=None,
     ) -> openmm.CustomNonbondedForce:
+        # 🔑 [SOFTCORE_ALPHA_CONVENTION=dimensionless_sigma_scaled_v2] 与
+        # ACESoftcorePotential.build_expression 保持同一约定：alpha_lj / alpha_coul 无量纲，
+        # 表达式内乘 sigma12^6 / sigma12^2。原式把它们当绝对 nm^6 / nm^2 直接相加（详细
+        # 后果见 ACESoftcorePotential.build_expression 的注释）。
+        # 同理，原来那两个绝对数值兜底项也必须一起缩放：1e-4 nm^6 相对 sigma12^6≈7.3e-4
+        # 已占 ~14%，缩放 alpha 之后它自己就会变成一个不该存在的额外软化项；1e-3 nm^2 相对
+        # sigma12^2≈0.09 占 ~1%，同样按 sigma12^2 缩放才是纯数值兜底。
+        d_lj = (
+            f"(r^6 + {alpha_lj}*sigma12^6*(1-lambda_vdw)^{power_lj}"
+            f" + 1e-4*sigma12^6*(1-lambda_vdw))"
+        )
+        d_coul = (
+            f"sqrt(r^2 + {alpha_coul}*sigma12^2*(1-lambda_coul)^{power_coul}"
+            f" + 1e-3*sigma12^2)"
+        )
         expr = (
             f"lambda_vdw * 4*sqrt(epsilon1*epsilon2)*("
-            f"(sigma12^12 / (r^6 + {alpha_lj}*(1-lambda_vdw)^{power_lj} + 1e-4*(1-lambda_vdw))^2) - "
-            f"(sigma12^6 / (r^6 + {alpha_lj}*(1-lambda_vdw)^{power_lj} + 1e-4*(1-lambda_vdw)))"
+            f"(sigma12^12 / {d_lj}^2) - "
+            f"(sigma12^6 / {d_lj})"
             f") + "
-            f"lambda_coul * 138.935456 * q1*q2 / sqrt(r^2 + {alpha_coul}*(1-lambda_coul)^{power_coul} + 1e-3); "
+            f"lambda_coul * 138.935456 * q1*q2 / {d_coul}; "
             f"sigma12=(0.5*(sigma1+sigma2))"
         )
         sc_force = openmm.CustomNonbondedForce(expr)
@@ -930,6 +1034,81 @@ Binding free energy:
   negative, as expected. Terms that are identical in both legs can cancel only
   when the Hamiltonians and correction conventions are documented and matched.
 """.strip()
+
+
+def combine_binding_free_energy(
+    *,
+    dg_complex_kJ_mol: float,
+    dg_solvent_kJ_mol: float,
+    err_complex_kJ_mol: float = 0.0,
+    err_solvent_kJ_mol: float = 0.0,
+    dg_boresch_kJ_mol: float = 0.0,
+    boresch_already_included_in_complex: bool = True,
+    apbs_correction_kJ_mol: float = 0.0,
+) -> Dict[str, Any]:
+    """🔑 [ATT-09] 热力学循环闭合的**唯一**实现。
+
+    上面 `THERMODYNAMIC_CYCLE_DOC` 记的公式：
+
+        ΔG_bind = ΔG_solvent - ΔG_complex + ΔG_APBS
+
+    其中 ΔG_complex **按约定已经包含** Boresch 标准态释放项。若调用方拿到的
+    complex 腿还没烘焙这一项（例如 `TraditionalABFEPipeline.run_full` 是用
+    `boresch_correction=0.0` 调的），把 `boresch_already_included_in_complex=False`
+    传进来，这里会替它减一次——**只减一次**。
+
+    为什么要有这个函数：改之前同一个公式在四处独立维护，而且它们并不等价——
+
+      * `runabfe.main()`：Boresch 已内含，**加了** APBS；
+      * `runabfe.run_traditional_mode()`：Boresch 显式减，**完全没有** APBS；
+      * `runabfe.run_post_analysis()`：Boresch 条件置零，加了 APBS（从
+        `run_provenance.json` 重推）；
+      * `ABFEPipeline.run_full_abfe_loop()`：Boresch 已内含，**完全没有** APBS。
+
+    也就是说后两条路径对带电配体会静默漏掉整项有限尺寸静电修正。这不是代码
+    整洁问题，是数值错误。统一到这里之后，那两条路径的输出会变——那是修复。
+
+    误差：两腿采样独立，`sqrt(err_c² + err_s²)`。Boresch 解析释放项与 APBS 都是
+    确定性解析量，没有独立采样方差，不并入。
+
+    返回一个自带记账字段的 dict，调用方直接摊进自己的结果 JSON，
+    不要再在外面重算任何一项。
+    """
+    dg_complex = float(dg_complex_kJ_mol)
+    dg_solvent = float(dg_solvent_kJ_mol)
+    err_complex = float(err_complex_kJ_mol or 0.0)
+    err_solvent = float(err_solvent_kJ_mol or 0.0)
+    dg_boresch = float(dg_boresch_kJ_mol or 0.0)
+    apbs = float(apbs_correction_kJ_mol or 0.0)
+
+    # 只有 complex 腿还没烘焙释放项时，公式里才再减一次。
+    boresch_term = 0.0 if boresch_already_included_in_complex else dg_boresch
+
+    delta_g_bind_uncorrected = dg_solvent - dg_complex - boresch_term
+    delta_g_bind = delta_g_bind_uncorrected + apbs
+    total_err = float(np.sqrt(err_complex ** 2 + err_solvent ** 2))
+
+    return {
+        "complex_delta_G_kJ_mol": dg_complex,
+        "solvent_delta_G_kJ_mol": dg_solvent,
+        "boresch_correction_kJ_mol": dg_boresch,
+        "boresch_correction_already_included_in_complex_delta_G": bool(
+            boresch_already_included_in_complex
+        ),
+        # 公式里真正被减掉的那一项（已内含时为 0）；与上面那个"物理量本身"区分开，
+        # 下游据此判断能不能再对 complex_delta_G 二次扣减。
+        "boresch_term_subtracted_kJ_mol": boresch_term,
+        "apbs_correction_kJ_mol": apbs,
+        "delta_G_bind_uncorrected_kJ_mol": delta_g_bind_uncorrected,
+        "delta_G_bind_kJ_mol": delta_g_bind,
+        "delta_G_bind_kcal_mol": delta_g_bind / 4.184,
+        "total_error_kJ_mol": total_err,
+        "total_error_kcal_mol": total_err / 4.184,
+        "cycle_formula": (
+            "delta_G_bind = delta_G_solvent - delta_G_complex"
+            " - boresch_term_subtracted + delta_G_APBS"
+        ),
+    }
 
 
 def calculate_boresch_analytical_correction(eq, fc, T=300.0):
@@ -2522,12 +2701,14 @@ class OrbScanner:
         n_order=6,
         charge=0,
         multiplicity=1,
-        device=GLOBAL_DEVICE,
+        device=None,
     ):
         self.n_order = n_order
         self.charge = charge
         self.multiplicity = multiplicity
-        self.device = device
+        # 🔑 [ATT-04] device 默认值原来是模块级的 GLOBAL_DEVICE，等于在 import 期
+        # 就探测 CUDA。改成 None + 这里惰性解析，行为不变。
+        self.device = get_global_device() if device is None else device
         self.model_name = model_name
         self.context = None
         self.system = None
@@ -2778,11 +2959,12 @@ class OrbMMHybridFactory:
 
 
 class Orbv3SurrogatePipeline:
-    def __init__(self, model_name="mace-off24-medium", device=GLOBAL_DEVICE):
+    def __init__(self, model_name="mace-off24-medium", device=None):
         self.orb_calculator = None
         self.default_surrogate = DEXPSurrogatePotential()
         self.ghost_handler = GhostIonHandler()
         if HAS_ORB:
+            # 🔑 [ATT-04] device=None 交给 OrbScanner 惰性解析，避免 import 期探测 CUDA。
             self.orb_calculator = OrbScanner(model_name, device=device)
 
     def fit_surrogate_from_orb_data(self, distances, orb_energies, particle_types=None):
@@ -3480,9 +3662,24 @@ class ChunkedMBARAnalyzer:
 #=============================================================================
 class SolventLegRunner:
     """自动构建并运行 Ligand-in-Water 解耦腿"""
-    def __init__(self, ligand_resname: str, box_size_nm: float = 4.0, platform_name: str = "CUDA"):
+    def __init__(
+        self,
+        ligand_resname: str,
+        box_size_nm: Optional[float] = None,
+        platform_name: str = "CUDA",
+        padding_nm: float = 1.5,
+    ):
         self.ligand_resname = ligand_resname
-        self.box_size = box_size_nm
+        if box_size_nm is not None:
+            warnings.warn(
+                "SolventLegRunner.box_size_nm 已废弃且不再作为完整盒边；"
+                "请使用 padding_nm 指定配体每侧的溶剂厚度。",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        self.padding_nm = float(padding_nm)
+        if not np.isfinite(self.padding_nm) or self.padding_nm <= 0.0:
+            raise ValueError("padding_nm 必须是有限正数")
         self.platform_name = platform_name
         self._cached_system = None
         self._cached_topology = None
@@ -3496,17 +3693,15 @@ class SolventLegRunner:
         top = app.GromacsTopFile(top_file, includeDir=gmx_include_dir)
         modeller = Modeller(top.topology, gro.positions)
         
-        # 动态计算盒子：回旋半径 + 1.5 nm 缓冲，最小 3.5 nm
-        # 正确匹配拓扑与坐标
+        # 让 OpenMM 直接按“每一侧 padding”语义构建盒子，避免把半径+padding
+        # 错当成完整盒边。
         lig_indices = [atom.index for atom in gro.topology.atoms() if atom.residue.name == self.ligand_resname]
-        lig_coords = np.array([gro.positions[i].value_in_unit(unit.nanometer) for i in lig_indices])
-        center = lig_coords.mean(axis=0)
-        max_r = np.max(np.linalg.norm(lig_coords - center, axis=1))
-        box_size = max(max_r + 1.5, 3.5)  # nm
+        if not lig_indices:
+            raise ValueError(f"未在 GRO 中找到配体残基 {self.ligand_resname}")
 
         # ForceField 创建与 System 构建
         ff = ForceField("amber14-all.xml", "amber14/tip3pfb.xml")
-        modeller.addSolvent(ff, boxSize=app.Vec3(box_size, box_size, box_size))
+        modeller.addSolvent(ff, padding=self.padding_nm * unit.nanometer)
         system = ff.createSystem(modeller.topology, nonbondedMethod=app.PME,
                                  nonbondedCutoff=1.0*unit.nanometer, constraints=app.HBonds, rigidWater=True)
         # ✅ 缓存构建结果

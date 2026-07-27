@@ -70,6 +70,33 @@ f_k = F_k + constant
 - learning 只产生预热信息，不产生 production 样本；
 - 得到候选后进入固定 `f_k` 的 burn-in/validation。
 
+权重控制器采用全历史 TMBAR 自洽绝对更新
+（`IBS_WARMUP_UPDATE_PROTOCOL_VERSION=9`）：
+
+- learning 采用统一的定长 minibatch：每累计
+  `IBS_TMBAR_LEARNING_MINIBATCH_FRAMES=20` 帧固定 `f_k` 采样后自洽更新一次，
+  不再按“严重塌缩 / 中间区 / 稳定区”分成 `40/60/100` 三档；warmup 帧间隔为
+  `250 MD steps`。production 的 `steps_per_update=500` 不变；
+- 每个新 block 连同此前所有时变偏置 block 一起进入 `tmbar_history`，通过
+  `solve_stage_integrated`/MBAR 自洽求出绝对物理自由能候选 `f_target`；
+- TMBAR 可解时严格执行
+  `f_new = f_old + 0.20 * (f_target - f_old)`，随后 mean-center 去除 gauge。
+  若目标在后续迭代中不变，10 次更新走完 `1-0.8^10≈89.3%` 的距离；
+- 当前 raw batch 占据、EMA 与 dominant 身份**只作诊断**，不再控制更新方向、
+  升档、刹车、重置，也不再作为冻结候选门；累计样本降低的是估计方差，标准误差
+  按有效独立样本数约以 `sqrt(20/N_total)` 缩小；
+- 若累计历史暂时不足以给出 TMBAR 解，才退回一次固定 `10 kT` pairwise 上限的
+  有界占据更新；该上限不随 dominant 升级或重置；
+- **冻结候选门** = 当前累计 TMBAR 固定点的剩余阻尼步长已经收缩：即本次应用的
+  `0.20*(f_target - f_old)` 的 pairwise spread `≤ IBS_TMBAR_FREEZE_MAX_APPLIED_
+  PAIRWISE_STEP_KT = 1.0 kT`（`tmbar_update["converged"]`）。旧判据对每个历史
+  minibatch 取最差 ESS，一个早期坏块会把候选永久卡死，现只保留为
+  `legacy_per_entry_quality_converged` 质量诊断。raw log 残差不再阻止进入冻结；
+  仍需要连续 3 个新的固定块同时通过该步长门，随后由独立的 fixed-`f_k` 验证做
+  权威终检。
+- 旧控制器尚未完成的 learning checkpoint 不注入 v9；已经完成并锁定的 production
+  数据不因纯预热控制器升级而失效。
+
 ### 3.2 一次完整 fixed-`f_k` 验证
 
 - 先丢弃 `20000` 步 freeze burn-in；
@@ -236,6 +263,23 @@ checkpoint/vanishing_rescue/<plan_id>/
 两个新 ensemble 共享 state 8，并覆盖原范围的所有物理 state。若 rescue 后仍未通过，
 pipeline 最终 fail closed，并在异常中列出新的精确瓶颈，不无限创建 ensemble。
 
+### Stage 2 v20 λ 尾部与 coupled-end bridge 覆盖
+
+真实 v18 运行随后证明，仅用已有 state 拆小 ensemble 无法修复原路径本身的
+`0.838237→0` 空洞。v19 因此把 17 点生产基础路径固定为
+`λ=x², x=linspace(1,0,17)`；Fisher pilot 保留为诊断，但不再有权删除 λ≈0 的
+几何覆盖。λ≈1 一端原有的四点增密仍保留，最终精确 21 点路径的最后四点为：
+
+```text
+0.03515625, 0.015625, 0.00390625, 0.0
+```
+
+v20 保留上述平方锚点，并利用 pilot 的 `∫√g dλ` 在两条最长生产边各插入一个
+热力学中点。本体系得到 `0.9803043327` 和 `0.9628845428`，将原第一个窗口拆成
+两个共享单一边界的 ensemble；最终为 23 态、6 个窗口、28 个采样槽位。
+`THERMODYNAMIC_PATH_PROTOCOL_VERSION=20` 使旧 v18/v19 缓存 fail closed。已经启动的
+旧进程不会在运行中改变 Hamiltonian 网格；必须由新进程加载 v20。生产阶段仍不得修改 `f_k`。
+
 配置：
 
 ```text
@@ -256,6 +300,7 @@ stage2_bridge_production_steps = n_steps_per_window  # 默认 250k
 | 预热/生产数据隔离 | 同上，production history 初始化段 |
 | production `f_k` 硬锁 | 同上，`production_f_k_lock` |
 | 窗口/λ 精确失败定位 | `abfe_pipeline.py::_stage_quality_failure_details` |
+| v20 平方锚点、Fisher bridge 与缓存门 | `abfe_preoptimizer.py::quadratic_vanishing_base_lambdas` / `insert_fisher_bridge_lambdas` / `validate_human_vanishing_anchors_preserved` |
 | 定向 production 补采 | `abfe_pipeline.py::run_full_pipeline` Stage 2 rescue loop |
 | 新 rescue ranges | `abfe_pipeline.py::_build_vanishing_rescue_ranges` |
 | 独立 rescue 数据加载/拼接 | `abfe_pipeline.py::_load_ibs_window_outputs_from_dir` |

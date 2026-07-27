@@ -48,8 +48,10 @@ from abfe_preoptimizer import (
     redistribute_vanishing_lambda_subdomains,
     vanishing_subdomain_ranges_from_lambdas,
     human_vanishing_initial_lambdas,
-    insert_human_vanishing_endpoint_lambdas,
-    validate_human_vanishing_anchors_preserved,
+    quadratic_vanishing_base_lambdas,
+    validate_vanishing_lambda_path_invariants,
+    blended_metric_vanishing_lambdas,
+    VANISHING_FINAL_STATE_COUNT,
     validate_single_shared_boundary_ranges,
     VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS,
     THERMODYNAMIC_PATH_PROTOCOL_VERSION,
@@ -77,6 +79,11 @@ from ibs_engine import (
     _system_has_global_parameter,
     _atomic_write_json,
     _invalidate_production_window_checkpoint,
+    _load_validated_window_data_triplet,
+    _assert_expected_windows_all_loaded,
+    IBSIncompleteStageCoverageError,
+    ibs_lj_tail_lrc_is_applicable,
+    ibs_lj_tail_lrc_inapplicable_reason,
 )
 from abfe_core import (
     calculate_boresch_analytical_correction,
@@ -87,12 +94,41 @@ from abfe_core import (
     UnitFormatter,
     TwoDimensionalLambdaPathPlanner,
     THERMODYNAMIC_CYCLE_DOC,
+    combine_binding_free_energy,  # [ATT-09] 热力学循环闭合的唯一实现
 )
 import warnings
 
 PME_DECHARGE_MODEL_VERSION = "pme_decharge_v2_llfreeze_pmeself_20260523"
 
 logger = logging.getLogger(__name__)
+
+
+def _json_safe(obj):
+    """🔑 [P1-15] 递归转成 `json.dump` 直接可写的原生类型。
+
+    `_atomic_write_json`（ibs_engine）用的是不带 `cls=NumpyEncoder` 的
+    `json.dump`，所以任何混进 payload 的 numpy 标量/数组都会 `TypeError`
+    并让整个 checkpoint 写失败。`solve_stage_integrated` 返回的
+    `window_overlap_diagnostics` / `f_k` / `coverage_diagnostics` 恰恰都含 numpy，
+    把它们纳入落盘范围之前必须先过这一道。
+
+    非有限值（NaN/±Inf）转成 `None`：`json.dump` 默认会写出 `NaN`/`Infinity`
+    这种非标准 JSON，别的工具读不了。
+    """
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return _json_safe(obj.tolist())
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, (np.floating, float)):
+        value = float(obj)
+        return value if math.isfinite(value) else None
+    return obj
 
 
 def _infer_log_level_from_message(message: str) -> int:
@@ -179,6 +215,9 @@ def _pre_equilibration_fingerprint(
     ligand_indices: Optional[List[int]],
     temperature,
     pressure=None,
+    positions=None,
+    box_vectors=None,
+    requested_steps: Optional[int] = None,
 ) -> str:
     """Content fingerprint for one pre-equilibration run: system Hamiltonian +
     which atoms are the ligand + temperature + barostat pressure.
@@ -192,16 +231,9 @@ def _pre_equilibration_fingerprint(
     and can be compared against a freshly recomputed one before trusting the
     cache.
 
-    Deliberately excludes the target step count: the two call sites that
-    invoke ``pre_equilibrate()`` (``resolve_boresch_restraint`` in
-    runabfe.py, and ``run_full_pipeline``'s own internal fallback) don't
-    always agree on it (the latter calls ``pre_equilibrate(resume=resume)``
-    without an explicit ``n_steps``, so it always uses the method's own
-    default regardless of ``config.n_equil_steps``), and a previously
-    completed equilibration of the *same* system/ligand/temperature/pressure
-    run for a different number of steps is still a physically valid starting
-    configuration -- it isn't the kind of staleness this fingerprint is
-    meant to catch.
+    The initial coordinates, periodic box and requested step budget are part
+    of the identity. A different docking pose, box, or a short smoke-test
+    equilibration must never satisfy a later production request.
 
     ``pressure`` is optional only for call-site convenience (old callers that
     haven't been updated pass ``None``, which is distinguishable from any real
@@ -224,6 +256,9 @@ def _pre_equilibration_fingerprint(
         "ligand_indices": sorted(int(i) for i in (ligand_indices or [])),
         "temperature_K": round(float(temp_k), 6),
         "pressure_bar": round(float(pressure_bar), 6) if pressure_bar is not None else None,
+        "positions_sha256": _positions_hash(positions),
+        "box_vectors_sha256": _box_vectors_hash(box_vectors),
+        "requested_steps": int(requested_steps) if requested_steps is not None else None,
     }
     return _sha256_text(json.dumps(payload, sort_keys=True))
 
@@ -280,6 +315,46 @@ def _positions_hash(positions) -> Optional[str]:
     if arr.ndim == 1:
         arr = arr.reshape(-1, 3)
     return hashlib.sha256(np.ascontiguousarray(arr, dtype=np.float64).tobytes()).hexdigest()
+
+
+def _box_vectors_nm_array(box_vectors) -> Optional[np.ndarray]:
+    if box_vectors is None:
+        return None
+    try:
+        rows = []
+        for vec in box_vectors:
+            values = (
+                vec.value_in_unit(unit.nanometer)
+                if hasattr(vec, "value_in_unit")
+                else vec
+            )
+            rows.append([float(x) for x in values])
+        box = np.asarray(rows, dtype=np.float64)
+    except Exception as exc:
+        raise ValueError(f"无法解析周期盒向量: {exc}") from exc
+    if box.shape != (3, 3) or not np.all(np.isfinite(box)):
+        raise ValueError(f"周期盒向量必须是有限 (3, 3) 数组，实际为 {box.shape}")
+    if abs(float(np.linalg.det(box))) <= 1.0e-12:
+        raise ValueError("周期盒向量奇异，无法计算 minimum-image 位移")
+    return box
+
+
+def _box_vectors_hash(box_vectors) -> Optional[str]:
+    box = _box_vectors_nm_array(box_vectors)
+    if box is None:
+        return None
+    return hashlib.sha256(np.ascontiguousarray(box).tobytes()).hexdigest()
+
+
+def _minimum_image_displacement(displacement, box_vectors) -> np.ndarray:
+    """Return the triclinic minimum-image displacement for row-vector boxes."""
+    delta = np.asarray(displacement, dtype=np.float64)
+    box = _box_vectors_nm_array(box_vectors)
+    if box is None:
+        raise ValueError("周期体系缺少 box vectors，无法计算 Boresch minimum-image 距离")
+    fractional = delta @ np.linalg.inv(box)
+    fractional -= np.round(fractional)
+    return fractional @ box
 
 
 _CODE_HASH_CACHE: Optional[str] = None
@@ -1137,6 +1212,40 @@ class ABFEPipeline:
         """物理预平衡 - 【修复】默认使用 GPU，仅在生产采样前清理上下文"""
         traj_file = os.path.join(self.output_dir, "pre_equilibration.dcd")
         chk_file = os.path.join(self.checkpoint_dir, "pre_equil.chk")
+        fp_file = os.path.join(self.output_dir, "pre_equilibration_fingerprint.json")
+        requested_fingerprint = _pre_equilibration_fingerprint(
+            self.system,
+            self.ligand_indices,
+            self.temperature,
+            self.pressure,
+            positions=self.positions,
+            box_vectors=self.box_vectors,
+            requested_steps=n_steps,
+        )
+
+        # A binary OpenMM checkpoint is only meaningful for the exact initial
+        # pose/box/Hamiltonian and requested budget that created it.
+        if resume and os.path.exists(chk_file):
+            try:
+                with open(fp_file, encoding="utf-8") as handle:
+                    recorded_fingerprint = json.load(handle).get("fingerprint")
+            except Exception:
+                recorded_fingerprint = None
+            if recorded_fingerprint != requested_fingerprint:
+                self._log(
+                    "  ⚠️ 预平衡 checkpoint 的坐标/盒子/System/步数指纹不匹配，"
+                    "拒绝恢复并从当前输入重新开始"
+                )
+                resume = False
+        if save_traj:
+            # Persist the identity before the first step so an interrupted run
+            # has a checkpoint identity available on its very next resume.
+            with open(fp_file, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {"fingerprint": requested_fingerprint, "n_steps": int(n_steps)},
+                    handle,
+                    indent=2,
+                )
         
         # ✅ 修复：默认使用实例配置的 platform（通常是 CUDA）
         equil_platform = platform_name or self.platform_name
@@ -1244,13 +1353,16 @@ class ABFEPipeline:
             },
         )
         if save_traj:
-            fp_file = os.path.join(self.output_dir, "pre_equilibration_fingerprint.json")
             try:
-                fingerprint = _pre_equilibration_fingerprint(
-                    self.system, self.ligand_indices, self.temperature, self.pressure
-                )
                 with open(fp_file, "w", encoding="utf-8") as f:
-                    json.dump({"fingerprint": fingerprint, "n_steps": int(n_steps)}, f, indent=2)
+                    json.dump(
+                        {
+                            "fingerprint": requested_fingerprint,
+                            "n_steps": int(n_steps),
+                        },
+                        f,
+                        indent=2,
+                    )
             except Exception as e:
                 self._log(f"  ⚠️ 预平衡指纹写入失败（不影响本次结果，但下次 resume 无法校验缓存是否匹配当前系统）: {e}")
         # 🔑 标记本进程已经做过一次预平衡——run_full_pipeline() 内部的预平衡块
@@ -1378,10 +1490,17 @@ class ABFEPipeline:
             if np.linalg.norm(lig_com - box_center) > 0.4 * np.min(box_lengths):
                 self.positions, self.box_vectors = self._wrap_ligand_to_box(self.positions, self.box_vectors)
                 self._log("  📦 检测到配体偏离主周期，已自动执行 PBC 居中")
+                pos_nm = np.asarray(
+                    self.positions.value_in_unit(unit.nanometer)
+                    if hasattr(self.positions, "value_in_unit")
+                    else self.positions,
+                    dtype=np.float64,
+                )
             # 计算实际距离 (H0-L0: 最近受体锚点 - 配体首锚点)
             H0 = pos_nm[rec_idx[0]]
             L0 = pos_nm[lig_idx[0]]
-            actual_dist = np.linalg.norm(H0 - L0)
+            h0_l0 = _minimum_image_displacement(H0 - L0, self.box_vectors)
+            actual_dist = float(np.linalg.norm(h0_l0))
             target_r0 = eq.get("r0", 1.0)  # nm
 
             if abs(actual_dist - target_r0) > 0.15:
@@ -1873,27 +1992,32 @@ class ABFEPipeline:
             )
             opt_n_states = int(n_states)
             if stage_name == "vanishing":
-                _base_path = human_vanishing_initial_lambdas(opt_n_states)
-                _human_path = insert_human_vanishing_endpoint_lambdas(_base_path)
+                # 🔑 [THERMODYNAMIC_PATH_PROTOCOL_VERSION=21] 无 pilot 度规可用的兜底
+                # 分支：度规驱动布点在这里无从谈起，退回纯几何的平方调度，直接生成
+                # 最终态数（不再走「17 基础 + 4 人工 + 2 bridge」那条链——那条链的
+                # 存在理由是补救被错误 alpha 压缩到 λ≈1 的度规，已随 alpha 修正消失）。
+                _fallback_path = quadratic_vanishing_base_lambdas(
+                    VANISHING_FINAL_STATE_COUNT
+                )
+                validate_vanishing_lambda_path_invariants(_fallback_path)
                 _human_ranges = vanishing_subdomain_ranges_from_lambdas(
-                    _human_path,
+                    _fallback_path,
                     first_ensemble_target_intervals=(
                         VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS
                     ),
                 )
                 validate_single_shared_boundary_ranges(
-                    _human_ranges, len(_human_path)
+                    _human_ranges, len(_fallback_path)
                 )
                 return {
-                    "lambdas_var": _human_path.tolist(),
-                    "n_states": len(_human_path),
+                    "lambdas_var": _fallback_path.tolist(),
+                    "n_states": len(_fallback_path),
                     "window_ranges": _human_ranges,
                     "softcore_params": softcore_obj,
                     "path_protocol_version": THERMODYNAMIC_PATH_PROTOCOL_VERSION,
                     "path_diagnostics": {
-                        "lambda_placement_method": "human_anchors_no_probe_fallback",
-                        "probe_base_lambdas": _base_path.tolist(),
-                        "probe_base_nodes_preserved": True,
+                        "lambda_placement_method": "quadratic_geometric_fallback_v21",
+                        "probe_controls_base_lambda_placement": False,
                         "adaptive_metric_disabled": True,
                     },
                     "path_optimization_disabled_reason": (
@@ -2014,7 +2138,7 @@ class ABFEPipeline:
         probe_max_bias_updates: int = 15,
         probe_max_warmup_steps: int = 150000,
         probe_required_consecutive: int = 2,
-        lse_log_residual_tolerance: float = 0.25,
+        lse_log_residual_tolerance: float = 0.5,
         max_window_splits: int = 32,
         max_lambda_insertions: int = 4,
         max_insertions_per_initial_edge: int = 2,
@@ -2502,7 +2626,7 @@ class ABFEPipeline:
         # Vanishing preserves every immutable human anchor while the Fisher
         # probe may insert additional states. Neighbors share one endpoint.
         if stage_name == "vanishing" and not allow_partial_vanishing_rescue:
-            validate_human_vanishing_anchors_preserved(lambdas_var)
+            validate_vanishing_lambda_path_invariants(lambdas_var)
             expected_subdomain_ranges = vanishing_subdomain_ranges_from_lambdas(
                 lambdas_var,
                 first_ensemble_target_intervals=VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS,
@@ -2615,7 +2739,7 @@ class ABFEPipeline:
             # 最终可用性由生产后的 overlap/ESS/去相关样本/不确定度硬门判断。
             repair_policy="non_mutating_v1",
             lse_log_residual_tolerance=kwargs.get(
-                "ibs_lse_log_residual_tolerance", 0.25
+                "ibs_lse_log_residual_tolerance", 0.5
             ),
             # 🔑 之前 enable_early_stop 在这里是纯空转——_run_dual_lambda_stage
             # 接受这个参数，但从未转发给 run_all_windows，run_all_windows 也
@@ -2673,6 +2797,23 @@ class ABFEPipeline:
             manager.lambdas_coul,
             manager.lambdas_vdw,
         )
+        self._populate_stage_diagnostics(stage_result)
+        return stage_result
+
+    @staticmethod
+    def _populate_stage_diagnostics(stage_result: Dict) -> Dict:
+        """🔑 [P1-15] 把 stage 求解结果里的收敛/覆盖证据汇进 `diagnostics`。
+
+        抽成独立方法是因为**它此前只在 `_run_ibs_stage` 里被调用**，
+        而 vanishing rescue 合并那条路径直接调 `solve_stage_integrated`、绕过了
+        `_run_ibs_stage`，于是 `stage_result["diagnostics"]` 从来没被填过。
+        后果是 `_build_stage_cache_payload` 存下 `diagnostics={}`、
+        `final_results.json` 的 `stage_diagnostics.stage2` 也是空的——
+        2026-07-27 那次 `ΔG_vdw = 145.908 ± 1.384` 因此**没有任何审计痕迹**：
+        逐段 ΔG、逐窗 σ、converged、ESS、乃至"发生过 rescue"全部无处可查。
+
+        这里只做汇总与搬运，不改任何数值。
+        """
         stage_result.setdefault("diagnostics", {})
         stage_result["diagnostics"].update({
             "method": stage_result.get("method"),
@@ -2685,6 +2826,28 @@ class ABFEPipeline:
             "statistical_inefficiency_per_window": stage_result.get("statistical_inefficiency_per_window"),
             "offset_error_contribution": stage_result.get("offset_error_contribution"),
             "uncertainty_note": stage_result.get("uncertainty_note"),
+            # 🔑 [P1-15] 以下这些原本只存在于 solve_stage_integrated 的返回顶层，
+            # 从不进 diagnostics、也就从不落盘。光看 total_delta_G 无法复核为何放行。
+            "converged": stage_result.get("converged"),
+            "coverage_diagnostics": stage_result.get("coverage_diagnostics"),
+            "covariance_chain_segments": stage_result.get("covariance_chain_segments"),
+            "total_error_method": stage_result.get("total_error_method"),
+            "ess_gate_protocol_version": stage_result.get("ess_gate_protocol_version"),
+            "min_occupancy_normalized": stage_result.get("min_occupancy_normalized"),
+            "min_occupancy_normalized_threshold": stage_result.get("min_occupancy_normalized_threshold"),
+            "min_decorrelated_samples": stage_result.get("min_decorrelated_samples"),
+            "min_decorrelated_samples_threshold": stage_result.get("min_decorrelated_samples_threshold"),
+            "max_endpoint_uncertainty_kJ_mol": stage_result.get("max_endpoint_uncertainty_kJ_mol"),
+            "max_endpoint_uncertainty_kJ_mol_threshold": stage_result.get(
+                "max_endpoint_uncertainty_kJ_mol_threshold"
+            ),
+            "min_absolute_ess": stage_result.get("min_absolute_ess"),
+            "min_absolute_ess_threshold": stage_result.get("min_absolute_ess_threshold"),
+            "raw_min_overlap": stage_result.get("raw_min_overlap"),
+            "max_common_mode_log_sigma_kT": stage_result.get("max_common_mode_log_sigma_kT"),
+            # rescue provenance：只有走过 rescue 的 stage 才有，普通 stage 为 None。
+            "immutable_bridge_rescue": stage_result.get("immutable_bridge_rescue"),
+            "production_rescue_targets": stage_result.get("production_rescue_targets"),
         })
         return stage_result
 
@@ -3208,6 +3371,32 @@ class ABFEPipeline:
             dg_phys = sampling_results.get("total_delta_G", 0.0)
             err_phys = sampling_results.get("total_error", 0.0)
 
+        # 🔑 [P2-14] LJ 长程尾项到底有没有被附加，必须来自生产者，不能写死 True。
+        # 两条生产路径各有自己的真相来源：
+        #   * 传统 REMD / single_lambda：TraditionalMBARAnalyzer 已经按正确模式维护
+        #     `lj_lrc_metadata`（初始化 applied=False，真算完系数才翻 True），经
+        #     `result["diagnostics"]["traditional_lj_lrc"]` 上来——直接读它；
+        #   * 双 λ / IBS：真相在 `ibs_wrapper.lj_tail_lrc_coeff_kj_mol is not None`，
+        #     该对象不出 ibs_engine，所以与生产者共用同一个谓词
+        #     `ibs_lj_tail_lrc_is_applicable`（见其 docstring：共用而不是复写，
+        #     DEXP 尾项公式一旦被验证/替换只需改一处）。
+        _lj_lrc_potential_type = str(
+            (getattr(self, "_last_run_config", {}) or {}).get("potential_type", "softcore")
+        )
+        _traditional_lrc = (
+            (sampling_results.get("diagnostics") or {}).get("traditional_lj_lrc")
+            if isinstance(sampling_results, dict)
+            else None
+        )
+        if isinstance(_traditional_lrc, dict) and "applied" in _traditional_lrc:
+            _lj_lrc_applicable = bool(_traditional_lrc.get("applied"))
+            _lj_lrc_truth_source = "traditional_mbar_analyzer_lj_lrc_metadata"
+        else:
+            _lj_lrc_applicable = bool(
+                ibs_lj_tail_lrc_is_applicable(_lj_lrc_potential_type)
+            )
+            _lj_lrc_truth_source = "ibs_lj_tail_lrc_is_applicable(potential_type)"
+
         # ✅ 显式加入 Boresch 修正与约束修正
         dg_boresch = correction_results.get("delta_g_rest", 0.0)
         total_dg = dg_phys + cons_correction + dg_boresch
@@ -3234,11 +3423,35 @@ class ABFEPipeline:
                 "analytical_release_assumption": correction_results.get("analytical_release_assumption", ""),
             },
             "lj_long_range_dispersion_correction": {
-                "applied": True,
+                # 🔑 [P2-14] 这里原来是裸字面量 True，对 DEXP 运行无条件说谎。
+                # 现在与生产者 build_ibs_dual_system 共用同一个谓词
+                # （ibs_engine.ibs_lj_tail_lrc_is_applicable），所以 DEXP 的解析
+                # 尾项公式一旦被验证/替换，行为和报告会一起动，不会再分叉。
+                "applicable": _lj_lrc_applicable,
+                "applied": _lj_lrc_applicable,
+                "potential_type": _lj_lrc_potential_type,
+                "truth_source": _lj_lrc_truth_source,
+                "not_applied_reason": (
+                    None if _lj_lrc_applicable
+                    else ibs_lj_tail_lrc_inapplicable_reason(_lj_lrc_potential_type)
+                ),
                 "delta_G_kJ_mol": None,
-                "status": "implemented_analytic_mean_field_switching_softcore_aware",
+                "status": (
+                    "implemented_analytic_mean_field_switching_softcore_aware"
+                    if _lj_lrc_applicable
+                    else "not_applied_tail_formula_unvalidated_for_this_potential"
+                ),
                 "protocol_version": TRADITIONAL_LJ_LRC_PROTOCOL_VERSION,
-                "note": (
+                "note": ("" if _lj_lrc_applicable else (
+                    f"NOT APPLIED for potential_type={_lj_lrc_potential_type!r}: "
+                    f"{ibs_lj_tail_lrc_inapplicable_reason(_lj_lrc_potential_type)}. "
+                    "ibs_engine.py::build_ibs_dual_system leaves "
+                    "ibs_wrapper.lj_tail_lrc_coeff_kj_mol = None, and every consumer "
+                    "short-circuits to zeros, so the reported free energy contains NO "
+                    "long-range dispersion correction. The description that follows "
+                    "documents what the correction does when it IS applied; it did not "
+                    "run for this result. "
+                )) + (
                     "OpenMM's native CustomNonbondedForce.setUseLongRangeCorrection cannot be used here: "
                     "the softcore VDW CV expression bundles LJ and Coulomb into one CustomNonbondedForce, "
                     "and OpenMM's analytic tail integral diverges (and was empirically observed to crash "
@@ -3313,17 +3526,20 @@ class ABFEPipeline:
         complex_kwargs.setdefault("system_type", "complex")
         complex_res = self.run_full_pipeline(decoupling_scheme=decoupling_scheme, run_equilibration=True, **complex_kwargs)
         
-        # 🔑 与 runabfe.py 主流程同一处修复：标准双解耦循环给出的是
-        # ΔG_bind = ΔG_solvent - ΔG_complex，不是 ΔG_complex - ΔG_solvent。这里先把
-        # complex 侧取成负值，后面 solvent 侧用 += 而不是 -=，效果上等价于整体取负。
-        delta_g_bind = -complex_res.get(
+        # 🔑 [ATT-09] 循环闭合统一走 abfe_core.combine_binding_free_energy（见下方
+        # 溶剂腿分支）。这里只先取出 complex 侧的两个量；没有溶剂腿时保持既有行为，
+        # 但必须说清楚那不是一个结合自由能。
+        dg_complex = complex_res.get(
             "total_delta_G_complex_kJ_mol",
             complex_res.get("total_delta_G", 0.0),
         )
-        total_err_bind = complex_res.get(
+        err_complex = complex_res.get(
             "total_error_kJ_mol",
             complex_res.get("total_error", 0.0),
         )
+        delta_g_bind = -dg_complex
+        total_err_bind = err_complex
+        cycle = None
 
         if run_solvent and solvent_gro and solvent_top:
             print("\n💧 启动溶剂相 (Ligand-in-Water) 计算...")
@@ -3345,17 +3561,52 @@ class ABFEPipeline:
             # ✅ solvent_runner 委托给同一个 run_full_pipeline，其口径与 complex 侧一致，
             # 主键是 total_delta_G_complex_kJ_mol；decoupling_delta_G_kJ_mol 只是
             # _analyze_dual_leg 等旧辅助函数使用的口径，这里只作为兜底，避免误取旧字段。
-            delta_g_bind += solvent_res.get(
+            dg_solvent = solvent_res.get(
                 "total_delta_G_complex_kJ_mol",
                 solvent_res.get("decoupling_delta_G_kJ_mol", solvent_res.get("total_delta_G", 0.0)),
             )
-            total_err_bind = float(np.sqrt(
-                total_err_bind**2
-                + solvent_res.get("total_error_kJ_mol", solvent_res.get("total_error", 0.0))**2
-            ))
-            
+            err_solvent = solvent_res.get(
+                "total_error_kJ_mol", solvent_res.get("total_error", 0.0)
+            )
+            # 🔑 [ATT-09] 这里此前是 `delta_g_bind += dg_solvent` 手写闭合，且
+            # **完全没有 APBS 项**——runabfe.main() 和 run_post_analysis() 一直在读
+            # config["apbs_correction_kJ_mol"]，只有这条路径和 traditional 路径没读，
+            # 对带电配体等于静默漏掉整项有限尺寸静电修正。现在与其余三处共用
+            # abfe_core.combine_binding_free_energy，并从 run kwargs 读同一个标量
+            # （由离线 apbs_correction.py 的 collect 步骤算出并经
+            # --apbs-correction-kj-mol 传入；本流程内不调 APBS）。
+            #
+            # complex 侧取的是 total_delta_G_complex_kJ_mol，Boresch 释放项已烘焙其中
+            # （abfe_pipeline: total_dg = dg_phys + cons_correction + dg_boresch），
+            # 所以 already_included=True，不再减第二次。
+            cycle = combine_binding_free_energy(
+                dg_complex_kJ_mol=dg_complex,
+                dg_solvent_kJ_mol=dg_solvent,
+                err_complex_kJ_mol=err_complex,
+                err_solvent_kJ_mol=err_solvent,
+                dg_boresch_kJ_mol=complex_res.get("boresch_correction_kJ_mol", 0.0),
+                boresch_already_included_in_complex=True,
+                apbs_correction_kJ_mol=float(
+                    kwargs.get("apbs_correction_kJ_mol", 0.0) or 0.0
+                ),
+            )
+            delta_g_bind = cycle["delta_G_bind_kJ_mol"]
+            total_err_bind = cycle["total_error_kJ_mol"]
+
+        if cycle is None:
+            print(
+                "\n⚠️ 未运行溶剂腿：下面这个数只是 -ΔG_complex，**不是**结合自由能，"
+                "热力学循环没有闭合。"
+            )
         print(f"\n🎯 最终结合自由能 ΔG_bind = {delta_g_bind:.2f} ± {total_err_bind:.2f} kJ/mol")
-        return {"delta_g_bind": delta_g_bind, "total_error": total_err_bind, "complex": complex_res}
+        return {
+            "delta_g_bind": delta_g_bind,
+            "total_error": total_err_bind,
+            "complex": complex_res,
+            # [ATT-09] 循环闭合的完整记账；未跑溶剂腿时为 None，明确表示循环未闭合。
+            "thermodynamic_cycle_terms": cycle,
+            "cycle_closed": cycle is not None,
+        }
 
     @staticmethod
     def _load_ibs_window_outputs_from_dir(
@@ -3364,15 +3615,24 @@ class ABFEPipeline:
         lambdas_coul: List[float],
         lambdas_vdw: List[float],
         *,
+        checkpoint_dir: str,
         stage_type: str = "vdw",
         window_index_offset: int = 0,
         window_label_prefix: str = "window",
         excluded_local_windows: Optional[set] = None,
     ) -> List[Dict]:
         outputs: List[Dict] = []
-        excluded = set(excluded_local_windows or set())
+        excluded = {int(x) for x in (excluded_local_windows or set())}
+        # 🔑 [P0-8] 见 ibs_engine._assert_expected_windows_all_loaded 的说明：
+        # 缺首/末窗口不会被协方差链挡下，会静默产出截断的 ΔG 且报 converged=True。
+        # 合法的部分分析（rescue ensemble 取代原始窗口）必须走显式的
+        # excluded_local_windows，不能靠"文件恰好不存在"来隐式决定覆盖范围。
+        expected_windows = [
+            int(i) for i in range(len(ranges)) if int(i) not in excluded
+        ]
+        missing_windows: List[Dict] = []
         for local_idx, (start, end) in enumerate(ranges):
-            if local_idx in excluded:
+            if int(local_idx) in excluded:
                 continue
             energy_path = os.path.join(
                 output_dir, f"dual_window_{local_idx}_{stage_type}_energies.npy"
@@ -3383,24 +3643,62 @@ class ABFEPipeline:
             base_path = os.path.join(
                 output_dir, f"dual_window_{local_idx}_{stage_type}_base.npy"
             )
-            if not os.path.exists(energy_path):
+            convergence_path = os.path.join(
+                output_dir,
+                f"dual_window_{local_idx}_{stage_type}_convergence.json",
+            )
+            absent = [
+                label
+                for label, path in (
+                    ("energies", energy_path),
+                    ("bias", bias_path),
+                    ("base", base_path),
+                )
+                if not os.path.isfile(path)
+            ]
+            if absent:
+                missing_windows.append({
+                    "window_index": int(local_idx),
+                    "lambda_range": [int(start), int(end)],
+                    "missing_files": absent,
+                })
                 continue
-            u_kn = np.load(energy_path)
+            if not os.path.isfile(convergence_path):
+                raise FileNotFoundError(
+                    f"窗口 {local_idx} 有 energies 但缺少 convergence manifest"
+                )
+            with open(convergence_path, encoding="utf-8") as handle:
+                convergence = json.load(handle)
+            u_kn, bias, base = _load_validated_window_data_triplet(
+                energy_path,
+                bias_path,
+                base_path,
+                convergence,
+            )
             if u_kn.ndim != 2 or u_kn.shape[1] == 0:
-                continue
-            bias = (
-                np.load(bias_path)
-                if os.path.exists(bias_path)
-                else np.zeros(u_kn.shape[1])
+                raise ValueError(f"窗口 {local_idx} 没有有效 IBS 帧")
+            n_frames = u_kn.shape[1]
+            # 🔑 [ESS_GATE_PROTOCOL_VERSION=2] 混合覆盖度 ESS 门需要该窗口冻结进生产
+            # 的 f_k，从对应 checkpoint 目录的 ibs_state_*.json 读（与
+            # IBSWindowManagerDualLambda.get_stage_data_for_analysis 同一策略，同样
+            # fail closed）。注意本函数会被 original/rescue 两个不同 output_dir 各调
+            # 一次，checkpoint_dir 必须与 output_dir 配对传入，不能共用一个。
+            state_path = os.path.join(
+                checkpoint_dir, f"ibs_state_{stage_type}_window_{local_idx}.json"
             )
-            base = (
-                np.load(base_path)
-                if os.path.exists(base_path)
-                else np.zeros(u_kn.shape[1])
-            )
-            n_frames = min(u_kn.shape[1], len(bias), len(base))
-            if n_frames <= 0:
-                continue
+            if not os.path.isfile(state_path):
+                raise FileNotFoundError(
+                    f"窗口 {local_idx} 有 energies 但缺少 ibs_state checkpoint "
+                    f"({state_path})；ESS 门需要冻结的 f_k，拒绝在缺判据的情况下继续分析"
+                )
+            with open(state_path, encoding="utf-8") as handle:
+                ibs_state = json.load(handle)
+            f_k_window = np.asarray(ibs_state.get("f_k", []), dtype=np.float64).ravel()
+            if f_k_window.size != u_kn.shape[0] or not np.all(np.isfinite(f_k_window)):
+                raise ValueError(
+                    f"窗口 {local_idx} ibs_state 的 f_k（长度 {f_k_window.size}）与能量"
+                    f"矩阵态数（{u_kn.shape[0]}）不符或含非有限值，拒绝用于 ESS 门"
+                )
             outputs.append({
                 "window_index": int(window_index_offset + local_idx),
                 "window_label": f"{window_label_prefix}_{local_idx}",
@@ -3411,8 +3709,17 @@ class ABFEPipeline:
                 "lambda_indices": list(range(int(start), int(end))),
                 "lambdas_coul": [float(x) for x in lambdas_coul[start:end]],
                 "lambdas_vdw": [float(x) for x in lambdas_vdw[start:end]],
+                "f_k": f_k_window,
                 "sampled_distribution_row": 0,
             })
+        _assert_expected_windows_all_loaded(
+            expected_windows=expected_windows,
+            loaded_windows=[
+                int(o["window_index"]) - int(window_index_offset) for o in outputs
+            ],
+            missing_windows=missing_windows,
+            source=f"{output_dir} (stage_type={stage_type})",
+        )
         return outputs
 
     @staticmethod
@@ -5840,19 +6147,37 @@ class ABFEPipeline:
         清空（overlap 诊断、PME self-correction 诊断、Shadow-IBS 的 experimental
         标记等全部看不到）。这里把 _run_dual_lambda_stage 返回的完整结果落盘，
         resume 命中时可以原样当作 stage1/stage2 使用，不用再退化成一个裸数字。
+
+        🔑 [P1-15] 顶层的 `converged` / `coverage_diagnostics` 也一并落盘。
+        它们此前只在内存里存在，归档结果无法复核"为什么放行"。
+
+        ⚠️ 写入方 `_atomic_write_json` 用的是 `json.dump(payload, handle, indent=2)`，
+        **没有 `cls=NumpyEncoder`**。而 `window_overlap_diagnostics` / `f_k` /
+        `coverage_diagnostics` 里混着 numpy 标量与数组，直接塞进去会 `TypeError`
+        并让整个 checkpoint 写失败。所以这里统一过一遍 `_json_safe`。
         """
         return {
             "stage": stage_name,
-            "total_delta_G": result["total_delta_G"],
-            "total_error": result["total_error"],
+            "total_delta_G": float(result["total_delta_G"]),
+            "total_error": float(result["total_error"]),
             "n_states": n_states,
+            # ⚠️ protocol_key / lambda_path_fingerprint 刻意**不过** _json_safe：
+            # 它们参与缓存身份比对，任何形状变换（tuple→list、int key→str key）
+            # 都可能让 resume 误判。它们本来也不含 numpy。
             "protocol_key": protocol_key,
             "lambda_path_fingerprint": ABFEPipeline._lambda_path_fingerprint(
                 lambdas_var, window_ranges
             ),
             "method": result.get("method"),
-            "diagnostics": result.get("diagnostics", {}),
-            "lambda_endpoint_diagnostics": result.get("lambda_endpoint_diagnostics", {}),
+            # 只有这几项是新纳入落盘、且确实含 numpy 的，逐个过 _json_safe。
+            "diagnostics": _json_safe(result.get("diagnostics", {})),
+            "lambda_endpoint_diagnostics": _json_safe(
+                result.get("lambda_endpoint_diagnostics", {})
+            ),
+            # 顶层收敛与覆盖证据：resume 命中时 _assert_stage_result_sane 需要它们，
+            # 事后审计也需要。
+            "converged": _json_safe(result.get("converged")),
+            "coverage_diagnostics": _json_safe(result.get("coverage_diagnostics")),
         }
 
     # =========================================================================
@@ -6422,7 +6747,8 @@ class ABFEPipeline:
                     # bottleneck"——同样是真实 GPU production 验证过的插点，遗漏这一条
                     # 会让态数增长后的缓存被判定为"未验证"整体丢弃，逼着从头重新优化。
                     _VERIFIED_STAGE2_REPAIR_SOURCES = {
-                        "pilot_fisher_17_plus_human_endpoint_4",
+                        "fisher_metric_blended_with_geometric_floor_v21",
+                        "quadratic_geometric_fallback_v21",
                         "human_anchors_no_probe_fallback",
                     }
                     cached_protocol = cached.get("protocol_key")
@@ -6442,13 +6768,11 @@ class ABFEPipeline:
                     )
                     anchor_contract_match = False
                     try:
-                        validate_human_vanishing_anchors_preserved(
-                            cached_lambdas, stage2_states
-                        )
+                        validate_vanishing_lambda_path_invariants(cached_lambdas)
                         anchor_contract_match = True
                     except Exception as anchor_exc:
                         self._log(
-                            "  ⚠️ Stage 2 缓存违反 v18 人工锚点只增不减契约："
+                            "  ⚠️ Stage 2 缓存违反 v21 vanishing 路径不变量："
                             f"{anchor_exc}"
                         )
                     # 🔑 [预优化缓存范围收窄] 同 Stage 1：比对 _stage2_preopt_key
@@ -6567,9 +6891,7 @@ class ABFEPipeline:
                         finite_difference_delta=kwargs.get("pilot_finite_difference_delta", 0.01),
                     )
                     optimized_lambdas_2 = opt_res["lambdas_var"]
-                    validate_human_vanishing_anchors_preserved(
-                        optimized_lambdas_2, stage2_states
-                    )
+                    validate_vanishing_lambda_path_invariants(optimized_lambdas_2)
                     # [IBS_BIAS_PROTOCOL_VERSION=20] Capture the pilot's real
                     # measured mean gradient alongside its lambda placement,
                     # for run_all_windows to TI-warm-start f_k with later.
@@ -6933,7 +7255,7 @@ class ABFEPipeline:
                             ),
                             max_bias_warmup_steps=kwargs.get("max_bias_warmup_steps", 500000),
                             ibs_lse_log_residual_tolerance=kwargs.get(
-                                "ibs_lse_log_residual_tolerance", 0.25
+                                "ibs_lse_log_residual_tolerance", 0.5
                             ),
                             production_step_overrides=_production_step_overrides,
                             frozen_validation_step_overrides=_frozen_validation_step_overrides,
@@ -6956,7 +7278,7 @@ class ABFEPipeline:
                             first_ensemble_target_intervals=VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS,
                         )
                     )
-                    validate_human_vanishing_anchors_preserved(
+                    validate_vanishing_lambda_path_invariants(
                         optimized_lambdas_2
                     )
                     validate_single_shared_boundary_ranges(
@@ -7123,8 +7445,8 @@ class ABFEPipeline:
                                 max_bias_warmup_steps=kwargs.get(
                                     "max_bias_warmup_steps", 500000
                                 ),
-                                ibs_lse_log_residual_tolerance=kwargs.get(
-                                    "ibs_lse_log_residual_tolerance", 0.25
+                            ibs_lse_log_residual_tolerance=kwargs.get(
+                                "ibs_lse_log_residual_tolerance", 0.5
                                 ),
                                 pilot_lambdas=stage2_pilot_lambdas,
                                 pilot_mean_dU_dlambda=stage2_pilot_mean_dU_dlambda,
@@ -7151,6 +7473,7 @@ class ABFEPipeline:
                                 expected_vanishing_ranges,
                                 full_lambdas_coul,
                                 optimized_lambdas_2,
+                                checkpoint_dir=self.checkpoint_dir,
                                 excluded_local_windows=set(failing_windows),
                                 window_label_prefix="original_window",
                             )
@@ -7159,6 +7482,7 @@ class ABFEPipeline:
                                 rescue_ranges,
                                 full_lambdas_coul,
                                 optimized_lambdas_2,
+                                checkpoint_dir=rescue_checkpoint_dir,
                                 window_index_offset=10_000,
                                 window_label_prefix="rescue_window",
                             )
@@ -7197,6 +7521,31 @@ class ABFEPipeline:
                                 )
                             )
                             stage2["n_states"] = int(stage2_states)
+                            # 🔑 [P1-15] 这条路径绕过了 _run_ibs_stage，此前从不填
+                            # diagnostics，导致合并结果落盘时 diagnostics={}，
+                            # 逐段 ΔG/σ、converged、ESS 与 rescue provenance 全部丢失。
+                            self._populate_stage_diagnostics(stage2)
+                            self._log(
+                                "  🧮 Stage 2 rescue 合并求解完成："
+                                f"ΔG={stage2.get('total_delta_G', float('nan')):.4f} ± "
+                                f"{stage2.get('total_error', float('nan')):.4f} kJ/mol，"
+                                f"converged={stage2.get('converged')}；"
+                                f"被 rescue 取代的原始窗口={failing_windows}，"
+                                f"rescue ranges={rescue_ranges}；"
+                                f"min_overlap={stage2.get('min_overlap')}，"
+                                f"min_occupancy_normalized={stage2.get('min_occupancy_normalized')}，"
+                                f"min_decorrelated_samples={stage2.get('min_decorrelated_samples')}，"
+                                f"max_endpoint_uncertainty="
+                                f"{stage2.get('max_endpoint_uncertainty_kJ_mol')} kJ/mol"
+                            )
+                            for _seg in (stage2.get("covariance_chain_segments") or []):
+                                self._log(
+                                    "     · 段 src_window="
+                                    f"{_seg.get('source_window_index', _seg.get('window_index'))} "
+                                    f"λ[{_seg.get('join_lambda_index')}→{_seg.get('end_lambda_index')}] "
+                                    f"ΔG={_seg.get('delta_G_kJ_mol'):.4f} "
+                                    f"σ={_seg.get('uncertainty_kJ_mol'):.4f} kJ/mol"
+                                )
                     window_ranges_2 = expected_vanishing_ranges
                     # Direct few-state subdomain execution bypasses the retired
                     # overlap-autorepair wrapper, so retain its non-mutating
