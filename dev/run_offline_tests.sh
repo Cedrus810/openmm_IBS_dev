@@ -15,7 +15,17 @@
 #   cat /proc/<pid>/wchan
 # 确认是不是 NFS 争用再判断。
 
-set -euo pipefail
+# 🔑 注意这里**不能**带 `-u`（nounset）。原因不是 mamba hook 本身，而是这个 env
+# 自己的 activate 脚本：
+#   openmm_dev/etc/conda/activate.d/env_vars.sh:2
+#       export CPATH=$CONDA_PREFIX/include:$CPATH
+# `$CPATH` 在干净 shell 里没有定义，`-u` 下这一行直接
+#   "CPATH: 未绑定的变量"
+# 中止激活，脚本还没跑到 pytest 就退出了——表现成"测试入口失败"，
+# 但其实一条测试都没跑。（`LIBRARY_PATH`/`LD_LIBRARY_PATH` 同理。）
+#
+# 所以：激活阶段不开 -u，激活完成后再开，让我们自己的代码仍受 nounset 保护。
+set -eo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAMBA_HOOK="/home/ruigengji/mambaforge/etc/profile.d/mamba.sh"
@@ -29,9 +39,24 @@ if [[ -f "${MAMBA_HOOK}" ]]; then
     # shellcheck disable=SC1090
     source "${MAMBA_HOOK}"
     mamba activate "${ENV_NAME}"
+
+    # 激活可能静默半成功（hook 在，env 名打错/env 损坏）。不核对的话下面会用
+    # 系统 python 跑，import openmm 失败又被读成"测试挂了"。宁可在这里响亮地死。
+    ACTIVE_PY="$(command -v python || true)"
+    case "${ACTIVE_PY}" in
+        *"/envs/${ENV_NAME}/bin/python") ;;
+        *)
+            echo "❌ mamba activate ${ENV_NAME} 之后 python 仍是 '${ACTIVE_PY:-<none>}'，" >&2
+            echo "   不在 envs/${ENV_NAME} 里。拒绝用错误的解释器跑测试。" >&2
+            exit 1
+            ;;
+    esac
 else
     echo "⚠️  找不到 ${MAMBA_HOOK}，沿用当前已激活的 Python 环境。" >&2
 fi
+
+# 激活完成，从这里开始恢复 nounset。
+set -u
 
 cd "${REPO_ROOT}"
 

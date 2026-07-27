@@ -19,6 +19,7 @@ run_once 恰好调用一次、结果原样返回、且所有 mutator 一碰即 A
 import json
 import os
 import types
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -37,6 +38,41 @@ import ibs_engine as ie
 
 STAGE_NAME = "vanishing"
 STAGE_TYPE = "vdw"
+
+
+@pytest.mark.parametrize("resume", [False, True])
+def test_traditional_run_full_passes_resume_to_both_legs(tmp_path, resume):
+    pipeline = ap.TraditionalABFEPipeline.__new__(ap.TraditionalABFEPipeline)
+    pipeline.output_dir = str(tmp_path)
+    calls = []
+
+    def fake_run_leg(
+        self,
+        stage_name,
+        lambdas_coul,
+        lambdas_vdw,
+        n_steps,
+        *,
+        resume,
+        boresch_params,
+        potential_type,
+    ):
+        calls.append((stage_name, resume))
+        return {"delta_G": 1.0, "error": 0.1}
+
+    pipeline.run_leg = types.MethodType(fake_run_leg, pipeline)
+    pipeline.run_full(n_lambda=3, n_steps_per_leg=10, resume=resume)
+    assert calls == [("decharging", resume), ("vanishing", resume)]
+
+
+def test_traditional_cli_disables_resume_under_reset():
+    source = (Path(__file__).resolve().parent / "runabfe.py").read_text(
+        encoding="utf-8"
+    )
+    start = source.index("def run_traditional_mode(")
+    end = source.index("\ndef _load_frozen_stage_result(", start)
+    traditional_body = source[start:end]
+    assert traditional_body.count("resume=config.resume and not config.reset,") == 2
 
 
 def _make_fake_pipeline(tmp_path):

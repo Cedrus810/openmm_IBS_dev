@@ -20,7 +20,7 @@ boresch_source = simple
 ⚠️ **`output/final_binding_results.json` 里现有的数值是用旧的 `Delta G_bind = Delta
 G_complex - Delta G_solvent` 符号约定算出来的，与当前代码（`runabfe.py` 里
 `delta_g_bind_uncorrected = dg_solvent - dg_complex`）不一致，需要重新跑一遍才能
-得到跟当前公式匹配的号（详见下方“结果解读”和 `AUDIT_STATUS.md`）。** 下面这组
+得到跟当前公式匹配的号（详见下方“结果解读”和 `docs/status/AUDIT_STATUS.md`）。** 下面这组
 数字按当前公式重新算过（ΔG_complex/ΔG_solvent 两个原始值不变，只是改了合并符号），
 仅供参考，不代表已经重新采样：
 
@@ -41,7 +41,7 @@ reported error = 1.3178 kJ/mol
 
 - 默认 ACE/`dual_lambda` 的 VDW/vanishing 腿已启用解析 LJ 长程尾项修正（`traditional_lj_lrc_protocol_version=2`）：对每个 λ_vdw 数值积分 switching-aware、softcore-aware 的真实径向尾项，同时包含吸引 `r^-6` 与排斥 `r^-12`；不启用会把组合表达式中的 Coulomb 尾项一并错误积分、并可能令 CUDA 崩溃的 OpenMM `CustomNonbondedForce` 内建 LRC。`single_lambda`/REMD 的 Beutler 路径使用同一公式作离线修正；协议版本低于 2 的旧输出不得与当前结果混用。
 - APBS 修正只作为最终外部项 `Delta G_APBS` 加到 `Delta G_bind`（当前 `apbs_correction_kJ_mol = 0.0`，未启用），不能替代 LJ tail correction。
-- 旧输出中的 `thermodynamic_cycle.md` 和 provenance 里仍可能包含历史 PME self-correction 描述；`output/final_binding_results.json` 里 `provenance.thermodynamic_cycle` 目前就是这种未刷新的旧文本快照。请以 `AUDIT_STATUS.md` 和当前 diagnostics 为准。当前结论是：手动 `+C*lambda^2` PME 自能“修正”已撤销，不应作为生产修正项使用。
+- 旧输出中的 `thermodynamic_cycle.md` 和 provenance 里仍可能包含历史 PME self-correction 描述；`output/final_binding_results.json` 里 `provenance.thermodynamic_cycle` 目前就是这种未刷新的旧文本快照。请以 `docs/status/AUDIT_STATUS.md` 和当前 diagnostics 为准。当前结论是：手动 `+C*lambda^2` PME 自能“修正”已撤销，不应作为生产修正项使用。
 - 当前 Boresch 谐振性校验通过（`diagnostics.boresch.boresch_harmonicity_check.harmonic_assumption_ok = true`），但 6 个力常数里有 3 个（`kr`、`kthetaA`、`kphiA`）被裁剪到保守范围（`force_constant_clipped`），需要在结果解释中保留。
 - Stage 2 采用 `Local-TMBAR-Stitched`，误差已传播窗口 offset 方差（复合物腿 `offset_error_contribution ≈ 0.52 kJ/mol`，溶剂腿 `≈ 0.82 kJ/mol`），但尚未包含完整全局 MBAR 协方差、自相关时间和有效样本数修正。当前实现会把低 overlap/ESS 精确定位到失败窗口、相邻状态和 λ；先只续采失败窗口，仍不足时再用已有 λ 状态建立独立、不可变的重叠 rescue ensembles，原 ensemble 与生产 `f_k` 均不原地修改。
 - 尚未做独立重复运行：`diagnostics.independent_repeats.performed = false`。
@@ -49,7 +49,7 @@ reported error = 1.3178 kJ/mol
 更详细的方法学缺陷、工程审计遗留项和修复状态见 `docs/status/AUDIT_STATUS.md`；文档导航见 `docs/README.md`。
 
 截至 2026-07-22 的实现快照：默认生产主链使用
-`IBS_BIAS_PROTOCOL_VERSION=27`（兼容读取 v27/v28 缓存）、`THERMODYNAMIC_PATH_PROTOCOL_VERSION=18`、
+`IBS_BIAS_PROTOCOL_VERSION=27`（兼容读取 v27/v28 缓存）、`THERMODYNAMIC_PATH_PROTOCOL_VERSION=20`、
 `TRADITIONAL_LJ_LRC_PROTOCOL_VERSION=2` 和 `WCA_ACCOUNTING_VERSION=2`。v12 已加入
 按状态共享、带协议指纹和 OpenMM checkpoint 的 fixed-H 探针轨迹库。当前 IBS 协议已
 修正 pilot-TI/TMBAR 的 `f_k` 符号；预热完成一次完整的固定权重验证后即冻结候选 `f_k`，
@@ -440,7 +440,7 @@ output/vanishing/dual_window_*_energies.npy
 
 ### 结果里的 `thermodynamic_cycle` 和缺陷清单冲突
 
-这是历史 provenance 文本缓存造成的已知问题。当前 README 和 `PHYSICS_DEFECTS.md` 的结论优先：APBS 不替代 LJ tail correction，手动 PME self `+C*lambda^2` 不作为生产修正项，`Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS`（不是 `Delta G_complex - Delta G_solvent`）。如果手头的 `output/final_binding_results.json`/`thermodynamic_cycle.md` 是在这几处文档修正之前生成的，其中的 `delta_G_bind_kJ_mol` 符号可能是反的，`thermodynamic_cycle` 字段文本也会是旧版本——重新跑一遍复合物腿+溶剂腿的最终汇总（不需要重新采样，只要 `complex_results`/`solv_results` 能从缓存加载）即可刷新成当前约定。
+这是历史 provenance 文本缓存造成的已知问题。当前 README 和 `docs/status/AUDIT_STATUS.md` 的结论优先（`PHYSICS_DEFECTS.md` 已被 `docs/status/AUDIT_STATUS.md` 取代，文件已不存在）：APBS 不替代 LJ tail correction，手动 PME self `+C*lambda^2` 不作为生产修正项，`Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS`（不是 `Delta G_complex - Delta G_solvent`）。如果手头的 `output/final_binding_results.json`/`thermodynamic_cycle.md` 是在这几处文档修正之前生成的，其中的 `delta_G_bind_kJ_mol` 符号可能是反的，`thermodynamic_cycle` 字段文本也会是旧版本——重新跑一遍复合物腿+溶剂腿的最终汇总（不需要重新采样，只要 `complex_results`/`solv_results` 能从缓存加载）即可刷新成当前约定。
 
 ## 维护建议
 
@@ -456,11 +456,11 @@ python -c "import ast, pathlib; files=['runabfe.py','abfe_pipeline.py','abfe_pre
 python runabfe.py self-test
 ```
 
-如果 self-test 与 `AUDIT_STATUS.md` 的最新物理结论不一致，应更新测试和热力学循环文档，避免旧假设继续进入新 provenance。完整测试还需要 OpenMM、PyMBAR 和 pytest；缺少运行依赖时，语法检查通过不等价于端到端验证通过。
+如果 self-test 与 `docs/status/AUDIT_STATUS.md` 的最新物理结论不一致，应更新测试和热力学循环文档，避免旧假设继续进入新 provenance。完整测试还需要 OpenMM、PyMBAR 和 pytest；缺少运行依赖时，语法检查通过不等价于端到端验证通过。
 
 推荐下一步优先事项：
 
 1. 在目标环境运行完整 `python -m pytest -q`，重点覆盖 fixed-H bank、native checkpoint、LRC 和 v12 冻结验证状态机。
 2. 在真实 GPU 上复验 v12 的 `calibrated_pending_validation` 续验和 fixed-H `lambda_shield` 同步修复。
 3. 对当前 Atenolol-rank11 配置做至少一次独立重复运行。
-4. 根据 stage diagnostics 判断是否需要进一步加密 vanishing 阶段窗口或增加采样；其余源码级 P2 以 `todolist.md` 为准。
+4. 根据 stage diagnostics 判断是否需要进一步加密 vanishing 阶段窗口或增加采样；其余源码级 P2 以 `docs/TODO.md` 为准。

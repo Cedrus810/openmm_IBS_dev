@@ -4,13 +4,13 @@
 
 ## 2026-07-27 本轮改动摘要
 
-用户决定：**接受当前误差（total σ = 0.695 kcal/mol），先把数出完、验证整条链路对不对。** 取舍原则随之确定——凡是会改变 Hamiltonian、输入坐标、Boresch 限制或任何缓存指纹的改动本轮一律不做，否则会让 `output_lrc_fix/` 已积累的采样失效。本轮只做分析侧 / 报告侧 / 进程侧。
+最新决定：P0-10 已确认旧复合物腿使用了错误的 committed Boresch 平衡值，旧采样不再具有保留价值，下一轮改为 **fresh rerun**。重跑前先完成不改变 Hamiltonian、输入坐标、Boresch、λ 网格、采样步数或统计阈值的局部修整；DEXP 暂时不处理。
 
 已完成（均为纯 CPU 侧改动，不动采样）：**P0-8**（缺首/末窗口 fail closed）、**ATT-09**（统一热力学循环，补上两处缺失的 APBS）、**ATT-04**（消除 import 期 CUDA 初始化）、**P2-14**（LRC 报告诚实性）、以及本文件与 `design/`、`status/`、README 的一批失真同步。新增回归：`test_stage_coverage_fail_closed.py`、`test_thermodynamic_cycle.py`、`test_import_time_side_effects.py`、`test_lrc_reporting_honesty.py`。
 
-**出数之后再做**（都是真 bug，但会毁掉已采数据）：P1-13（可能正是 V-05 里"σ 对 N 不响应"的成因，建议优先）、P1-14、ATT-11。
+重跑前已经完成会影响新采样可信度的 P0-10、P1-13、P1-14 与 ATT-11；旧复合物腿数据明确作废，溶剂腿不受 Boresch 错值影响。
 
-**2026-07-27 复审新增（本轮只登记，整条链跑完后再修）：**P0-9（`--analyze-only` 的 stage checkpoint/coverage/f_k 契约不完整）、P1-15（stage 缓存丢失收敛与覆盖证据）、P1-16（traditional `--resume` 未接通）、P2-15（单阶段 endpoint diagnostics 语义错误），以及 ATT-22/ATT-24 下新增的测试入口和显式输入文件 fail-closed 缺口。这些改动均不影响当前生产 Hamiltonian，本轮不实施。
+**2026-07-27 复审新增项进展：**P1-15（stage 缓存落盘与复用复检）、P1-16（traditional `--resume` 透传）、P2-15（单阶段 endpoint diagnostics）以及 ATT-24 中显式 config/torsion 文件 fail-closed 已完成。P0-9（`--analyze-only` 的 stage checkpoint/coverage/f_k 完整契约）仍单独保留；DEXP 输入与模型问题按用户决定暂缓。
 
 **核实过程中发现三处附件/清单本身失真**，已就地更正：ATT-04 的根因归错了模块、ATT-09 的"公式均正确"不成立、ATT-26 的行数差 2.5 倍；另有 ATT-12/λ-19/V-03 描述的是已退役的 v20 λ 协议。
 
@@ -19,6 +19,37 @@
 以下问题已逐项核对当前源码。打勾项已实现 CPU/OpenMM 回归测试；DEXP 项因已有全新 DEXP 版本，按本轮约定暂不修改。
 
 ### P0
+
+- [x] **P0-10：已提交的 Boresch 平衡值可以无限期沿用，哪怕结构早已变了（2026-07-27 定位并修复）。这是本轮 ΔG_bind 偏差的根因。**
+
+  `run_full_pipeline` 有一条刻意的保护：Boresch 平衡几何量只在一条腿第一次采样时推导一次并落盘（`checkpoints/boresch_equilibrium_committed.json`），之后任何 resume 都原样复用、绝不重算——动机正确（防止同一条腿前后窗口用两套哈密顿量拼接，实测曾造成 vdw 曲线单步跳变 ~200 kJ/mol）。**但它只检查文件是否存在，没有任何一致性校验，文件本身也没有任何身份信息（裸 `{"equilibrium_values": ...}`）。**
+
+  实测后果：该文件写于 **2026-07-10 18:51**，其中 `thetaA0`/`thetaB0` 是对调的、三个二面角完全错乱；体系在 **2026-07-26** 被整体重新平衡（`pre_equilibration.dcd`），但这组 17 天前的错值继续被沿用。
+
+  | 自由度 | committed | 轨迹实测均值 | 偏离 |
+  |---|---|---|---|
+  | r0 | 0.473886 | 0.478318 | **0.13 σ** ← 唯一没问题的 |
+  | thetaA0 | 2.036106 | 1.563422 | 4.23 σ |
+  | thetaB0 | 1.533758 | 1.977043 | 3.97 σ |
+  | phiA0 | −2.128541 | 1.512979 | **23.65 σ** |
+  | phiB0 | 1.772715 | −1.910870 | 21.29 σ |
+  | phiC0 | 1.689600 | −0.530192 | 15.93 σ |
+
+  同期的 `boresch_simple.json`（07-10 **18:01**，几何估计器产出）与轨迹实测是吻合的（0.53 σ / 0.19 σ），所以是 18:51 那次重新锚定写错的，之后被 resume 保护冻住。
+
+  **物理后果，三项全对得上：** 无约束预平衡 5 ns 配体只漂 0.60 Å，一加 Boresch 反而被拽走 **3.42 Å**（`rebalance_traj.dcd`，口袋骨架对齐）→ 方向性氢键丢失 → ⟨U_elec⟩ 口袋 −144.0 vs 水 −180.9 kJ/mol → 复合物腿去电荷偏低约 25 kJ/mol（charging 对 ΔG_bind 的贡献 +5.7 而参考是 −1.68 kcal），解析释放修正也吃这组错值（restraint 差 +2.31 kcal）。**唯一对得上参考的是 vdW（差 0.42 kcal）——它恰好是唯一对取向不敏感的一项。**
+
+  **为什么现有的门抓不住：** `update_boresch_from_last_frame` 的两道校验对这组错值全部放行——2.0361 rad = 116.7° 落在安全域 40–140° 内，r0 更是只差 0.13 σ。只看 r0 恰好是六个自由度里最没有信息量的那个。
+
+  修复：
+  - [x] 新增 `boresch_committed_deviation_sigma()`：逐自由度以 σ_i = sqrt(kT/k_i)（限制势自身的热涨落宽度，`0.5*kr*Δ²` 与 `k*(1−cosΔ)` 小偏离下方差同为 kT/k）衡量偏离；二面角先 `_wrap_to_pi` 回绕，否则 +179°/−179° 会被误判成 358°。
+  - [x] 新增 `ABFEPipeline._assert_committed_boresch_still_matches_pose()`：复用前校验锚点身份 + 几何一致性，超 `BORESCH_COMMITTED_MAX_DEVIATION_SIGMA=4.0` 则 **fail closed**（不静默重新锚定——那会把 resume 保护本身变成另一个 bug），报错里逐自由度列出 σ 并给出「无有效数据就删文件 / 已有数据必须连采样一起作废」两条处置。
+  - [x] 落盘改为带身份：`schema_version` / `receptor_indices` / `ligand_indices` / `force_constants` / `temperature_K` / `derived_at`，经 `_atomic_write_json`。v1 裸格式仍可读，但会打告警并照样走几何校验。
+  - [x] 回归 `test_boresch_committed_gate.py`：真实事故必须被拒（23.65 σ @ phiA0）、只看 r0 会漏（0.13 σ）、正常热涨落必须放行（1.10 σ）、二面角回绕、非正力常数跳过。
+
+  **已知灵敏度边界（写进测试防止误解）：** 纯 thetaA/thetaB 对调只有 **3.70 σ**，压在 4.0 σ 硬门下面。硬门不能再压低——committed 与 current 是两个独立单帧，差值宽度 √2·σ，压到 3σ 会让单次运行误报率升到约 19%。但真实的标签错位必然同时打乱二面角（共用同一批原子），所以实测那次靠 phiA0 的 23.65 σ 被轻松抓住。2.5–4.0 σ 之间设了告警带，逐自由度大声打出但不阻断。
+
+  **数据影响：** `output_lrc_fix/checkpoints/boresch_equilibrium_committed.json` 现已不存在（下次运行会重新锚定）。**复合物腿此前所有采样数据都是在错的限制力下采的，必须作废重跑**；溶剂腿无 Boresch，不受影响。
 
 - [x] **P0-1：主 System 缓存身份已改为 fail closed。** manifest 绑定 GRO/TOP/include 依赖、配体名和构建参数，并校验 System XML、ligand indices、mmCIF topology、box vectors 的哈希；预平衡 DCD 只有在调用方提供完整匹配 fingerprint 时才允许自动读取。
 
@@ -56,11 +87,11 @@
 
 - [x] **P1-12：溶剂盒已改用 OpenMM `padding=1.5 nm` 语义。** `box_size_nm` 仅保留为带警告的兼容参数，不再作为默认构盒公式。
 
-- [ ] **P1-13：生产灾难回退没有同步记录或截断采样历史分支。** 主循环只把坐标回退到最近一次完整力检查的 `production_pos_backup`，却保留该备份之后已经写入的 `energy_history`/`bias_history`/`base_energy_history`，随后从旧坐标和新随机速度重新生成另一条分支。触发灾难的当前帧在 `collect_energies()` 之前已被跳过，并未直接混入数据；真实问题是被放弃分支与重启分支共享祖先，却仍被当作一条连续时间序列做自相关子采样，相关性和有效样本数口径不再可靠。每次刷新备份时应同时保存三份 history 长度并在回退时同步截断，或显式保存独立 trajectory segment 并按多段轨迹估计相关性；三份历史必须始终同长。
+- [x] **P1-13：生产灾难回退已同步截断三份 history（2026-07-27）。** 新增 `ibs_engine._production_history_lengths()`（取长度并强制三份等长——此前从没有地方断言过这个不变量）与 `_truncate_production_history()`。`production_pos_backup` 的三个赋值点（`:9698` 初始化、`:9930` 主循环 force check、`:10173` 余数补齐）现在都成对刷新 `production_history_backup_len`；两处灾难回退（`:9914` 主循环、`:10162` 余数补齐）在退回坐标后同步截断，并把丢弃帧数打进日志。回归 `test_boresch_anchor_and_pbc_fixes.py`（三份不等长必须抛、截断后仍等长、无需截断时为 no-op、坐标备份与长度赋值必须一一对应）。**注：本批数据从未触发过此路径**（`grep -c "触发回退\|灾难检测触发" pipeline.log` = 0，那 21 处 base 不连续来自跨进程续跑边界，不是 P1-13），所以修它是稳健性，不改变已有任何数字。原描述： 主循环只把坐标回退到最近一次完整力检查的 `production_pos_backup`，却保留该备份之后已经写入的 `energy_history`/`bias_history`/`base_energy_history`，随后从旧坐标和新随机速度重新生成另一条分支。触发灾难的当前帧在 `collect_energies()` 之前已被跳过，并未直接混入数据；真实问题是被放弃分支与重启分支共享祖先，却仍被当作一条连续时间序列做自相关子采样，相关性和有效样本数口径不再可靠。每次刷新备份时应同时保存三份 history 长度并在回退时同步截断，或显式保存独立 trajectory segment 并按多段轨迹估计相关性；三份历史必须始终同长。
 
-- [ ] **P1-14：首次预平衡前没有修复输入坐标中已经跨盒的分子。** `runabfe.center_system_rigidly()` 只把整个体系做一次质心平移，却有调用点随后声称“分子完整性修复完毕”；真正的 `mdtraj.image_molecules()` 位于 `ABFEPipeline.run_full_pipeline()` 的预平衡之后，因此 GRO/缓存里已经跨边界的分子会先进入最小化或 NPT 预平衡。应在第一次创建 Context/最小化/预平衡之前，依据拓扑和 triclinic 盒矢量把每个连通分子仅作整分子周期平移，再做全体系/配体居中；禁止旋转、缩放或改变任何分子内相对坐标，修复失败时 fail closed，不能回退为仅质心平移后继续。
+- [x] **P1-14：整分子 PBC 修复已提前到第一次建 Context 之前（2026-07-27）。** 把原 `run_full_pipeline` 第 2 节那段 `image_molecules()` 抽成 `ABFEPipeline.repair_pbc_molecule_integrity()`，并在 `pre_equilibrate()` 开头（早于 `LocalEnergyMinimizer.minimize` 与 NPT 步进、早于 `_pre_equilibration_fingerprint` 计算）先调用一次，幂等标记 `_pbc_integrity_repaired`。失败改为 **fail closed**——原来的回退 `_wrap_ligand_to_box()` 自己的 docstring 就写着「仅做整体刚性平移」，修不了跨盒断裂，只会让断裂构型静默进最小化并被固化进相对坐标。`runabfe.py:3044` 那句「分子完整性修复完毕」是假的（那里只调了 `center_system_rigidly`，纯质心平移），已改成如实描述。**副作用：预平衡指纹会随修复后的坐标改变，旧 `pre_equilibration.dcd` 缓存失效——但复合物腿因 P0-10 本来就要整条重跑。** 原描述： `runabfe.center_system_rigidly()` 只把整个体系做一次质心平移，却有调用点随后声称“分子完整性修复完毕”；真正的 `mdtraj.image_molecules()` 位于 `ABFEPipeline.run_full_pipeline()` 的预平衡之后，因此 GRO/缓存里已经跨边界的分子会先进入最小化或 NPT 预平衡。应在第一次创建 Context/最小化/预平衡之前，依据拓扑和 triclinic 盒矢量把每个连通分子仅作整分子周期平移，再做全体系/配体居中；禁止旋转、缩放或改变任何分子内相对坐标，修复失败时 fail closed，不能回退为仅质心平移后继续。
 
-- [~] **P1-15：stage checkpoint 丢失关键收敛与覆盖证据（2026-07-27 复审新增）。主因已修，resume 侧复检仍待做。** `ABFEPipeline._build_stage_cache_payload()` 的注释声称保存 `_run_dual_lambda_stage` 的“完整结果”，实际只落盘 `stage/total_delta_G/total_error/n_states/protocol_key/lambda_path_fingerprint/method/diagnostics/lambda_endpoint_diagnostics`。`solve_stage_integrated()` 顶层的 `converged`、`coverage_diagnostics`、`window_overlap_diagnostics`、ESS/occupancy、去相关样本数、最大端点 σ、covariance segments 与 rescue provenance 均被丢弃。
+- [x] **P1-15：stage checkpoint 收敛/覆盖证据已完整落盘并在复用前重新验门（2026-07-27）。** `ABFEPipeline._build_stage_cache_payload()` 的注释声称保存 `_run_dual_lambda_stage` 的“完整结果”，实际只落盘 `stage/total_delta_G/total_error/n_states/protocol_key/lambda_path_fingerprint/method/diagnostics/lambda_endpoint_diagnostics`。`solve_stage_integrated()` 顶层的 `converged`、`coverage_diagnostics`、`window_overlap_diagnostics`、ESS/occupancy、去相关样本数、最大端点 σ、covariance segments 与 rescue provenance 均被丢弃。
 
   **2026-07-27 追查到的真正根因（比原描述更具体）：** 不只是 payload 少存字段——vanishing rescue 合并那条路径在 `run_full_pipeline` 里**直接调 `solve_stage_integrated`、绕过 `_run_ibs_stage`**，于是那段 `stage_result["diagnostics"].update({...})` 从来没执行过，payload 存的 `result.get("diagnostics", {})` 自然是空字典。这就是为什么 2026-07-27 那次 `ΔG_vdw = 145.908 ± 1.384` **完全没有审计痕迹**：`stage_diagnostics.stage2 = {}`、`immutable_bridge_rescue` 全盘搜索零命中、`pipeline.log` 在 11:48:00–12:12:21 之间一行都没有。
 
@@ -68,9 +99,9 @@
   - [x] rescue 合并分支也调它，并补一行合并摘要日志 + 逐段 ΔG/σ，消除 24 分钟日志空白。
   - [x] `_build_stage_cache_payload` 落盘 `converged` 与 `coverage_diagnostics`。**陷阱**：`_atomic_write_json` 用的是不带 `cls=NumpyEncoder` 的 `json.dump`，而这些字段含 numpy，直接塞进去会 `TypeError` 让整个 checkpoint 写失败——新增 `_json_safe()` 递归转原生类型（NaN/Inf → `null`）。`protocol_key` / `lambda_path_fingerprint` **刻意不过** `_json_safe`，它们参与缓存身份比对，形状变换会让 resume 误判。
   - [x] 回归 `test_stage_diagnostics_persistence.py`：`_json_safe` 覆盖、payload 必须能被不带 `cls=` 的 `json.dumps` 直接写出、每个直调 solver 的函数必须在**同一函数体内**填 diagnostics（早先只断言"文件里 solve 之后某处有 populate"会因行号顺序平凡通过）。`_run_shadow_ibs_decharging_leg` 显式豁免——它返回的是 bridge+shadow 两段的组合结果，顶层本就没有那些量，且已把子结果嵌在 `diagnostics.shadow_ibs_leg`；另有一条测试钉住这个豁免前提。
-  - [ ] **仍未做**：resume 命中后重新执行 `_assert_stage_result_sane()`（现在只是把证据存下来了，没有在复用时重新验一遍）。
+  - [x] resume 的 Stage 1/2 协议与 λ 指纹匹配后，先由 `_assert_reusable_stage_cache_sane()` 恢复嵌套 diagnostics 中的门量并重新执行 `_assert_stage_result_sane()`；缺 `converged=True`、Stage 2 缺 coverage、或任一门复检失败时保留证据但拒绝复用并重新运行。
 
-- [ ] **P1-16：traditional 模式的 `--resume` 没有接通（2026-07-27 复审新增；出数后修）。** `TraditionalABFEPipeline.run_leg()` 已有 `resume` 参数和 u_kn/REMD 轨迹复用逻辑，但 `run_full()` 没有 resume 参数，并在 decharging/vanishing 两次调用中都硬编码 `resume=False`；`runabfe.run_traditional_mode()` 也无法向下传递 `config.resume`。因此 CLI/配置里的 `--resume` 对 traditional 模式完全无效，会重复运行两条腿。应把同一个显式 resume 值贯穿 `run_traditional_mode → run_full → run_leg`，同时保留现有协议指纹和完整轨迹门。
+- [x] **P1-16：traditional 模式的 `--resume` 已接通（2026-07-27）。** `TraditionalABFEPipeline.run_full(..., resume=False)` 将同一值传给 decharging/vanishing 两次 `run_leg()`；`runabfe.run_traditional_mode()` 传入 `config.resume and not config.reset`。默认行为兼容，reset 永远禁止复用，现有 u_kn/REMD 完整协议指纹与轨迹门保持不变。
 
 ## 附件审查复核
 
@@ -129,7 +160,7 @@ GitHub 跟踪（均为未验证审查发现）：
 
 - [x] **ATT-10：能量查询失败 hard gate 已实现。** 连续失败上限 5、总失败上限 10、失败率上限 1%；生产结束时即使样本不足 100 帧也检查失败率，并把 attempts/failures/reasons/limits 写入诊断。
 
-- [ ] **ATT-11：`GeometricRestraintEstimator` 的 0.22 nm 键距离阈值。** 该阈值可能漏掉边界 S-S/配位键并误判近距离非键接触；需以元素/拓扑信息或可配置、经验证的判据替代单一几何阈值。
+- [x] **ATT-11：Boresch 锚点改用拓扑真实成键关系（2026-07-27）。** 新增 `_build_bond_adjacency()`（同时兼容 mdtraj 的 `Topology.bonds` property 与 OpenMM 的 `bonds()` 方法），`_find_bonded_neighbors()` 增加 `adjacency` 参数；`0.22 nm` 降级为拓扑无键时的**显式** opt-in 回退（`allow_geometric_bond_fallback`，默认 True，回退时大声告警），并把 `bond_source` / `bond_dist_nm_if_geometric` 写进诊断落盘。另加逐侧键覆盖度检查：从 `.gro` 载入时 mdtraj 能给标准残基推出键、但配体（非标准残基）常常一根都没有，那样 `lig_nei` 全空、枚举不出组合，最后会报成一句无关的「未找到锚点-配体接触对」。**旧判据的具体危害**：蛋白侧 haystack 是预筛的锚点名子集（CA/CB/C/N/O），CA-CB≈0.153/CA-C≈0.152 是真键，但**非键**的 i/i+1 残基间 C-N≈0.133、CA…N≈0.146 同样落在 0.22 nm 内，会拼出跨残基的假「化学连通」三元组；S-S≈0.205 贴边、金属配位键普遍超阈值则会漏。原描述： 该阈值可能漏掉边界 S-S/配位键并误判近距离非键接触；需以元素/拓扑信息或可配置、经验证的判据替代单一几何阈值。
 
 - [x] **ATT-12：vanishing 路径/子域范围契约已明确。** ~~v20 采用确定性的 17 点 `λ=x²` 锚点、λ≈1 四点增密及两个数据驱动 Fisher bridge；pilot 只可插入 bridge，不得移动/删除平方锚点。~~
   **⚠️ 2026-07-27：删除线部分描述的是已退役协议。** 代码是 `THERMODYNAMIC_PATH_PROTOCOL_VERSION = 21`，布点整体换成 `blended_metric_vanishing_lambdas`（度规弧长与几何进度按 β=0.3 混合后等分），没有平方锚点、没有 Fisher bridge。仍然成立的只有"六个单边界共享窗口"这一半。当前契约见 [design/LAMBDA_SCHEDULE_CONTRACT.md](design/LAMBDA_SCHEDULE_CONTRACT.md)。
@@ -180,9 +211,9 @@ GitHub 跟踪（均为未验证审查发现）：
 
 - [ ] **ATT-23：运行恢复与资源保护能力不足。** 评估 GPU OOM 的降级/Context 回收、长任务中断后的窗口重跑判定、磁盘空间预检和运行时估计；必须保持科学状态不可变与 fail-closed 原则。
 
-- [ ] **ATT-24：输入验证不足。** 补充 ligand 残基名、TOP include、配体原子数/Boresch 可构建性、最小盒尺寸（至少 2×cutoff）等明确的前置报错和诊断。
+- [~] **ATT-24：输入验证不足；显式 config/torsion 静默降级已修，DEXP 暂缓。** 补充 ligand 残基名、TOP include、配体原子数/Boresch 可构建性、最小盒尺寸（至少 2×cutoff）等明确的前置报错和诊断。
 
-  **2026-07-27 复审新增三个确定的静默降级入口：**显式 `--config missing.json` 时 `RunConfig` 会跳过加载并继续使用 production preset；显式 `--dexp-params missing.json` 时主流程会把 `dexp_params=None` 并使用默认 DEXP 参数；显式 torsion 参数文件不存在时会静默当作无 torsion 修正。用户已经明确指定文件时，文件缺失/不可读/格式不符必须 fail closed，不能换一套 Hamiltonian 或配置继续运行。
+  **2026-07-27 复审新增三个确定的静默降级入口：**显式 config 与 torsion 参数现在对缺失、不可读、非法 JSON/YAML、以及顶层非对象全部 fail closed；未指定时仍合法使用 preset/`None`。显式 DEXP 参数文件的处理按用户决定暂缓，本轮没有修改任何 DEXP 代码或契约。
 
 - [ ] **ATT-25：协议版本矩阵缺少统一注册/迁移工具。** 当前多处独立 protocol version 需要统一注册表、缓存指纹组合规则、迁移说明和兼容性测试，避免单个版本更新遗漏缓存失效。
 
@@ -226,7 +257,8 @@ GitHub 跟踪（均为未验证审查发现）：
 - [x] 五个主模块 `py_compile` 通过。
 - [x] `python runabfe.py self-test` 通过（Boresch、PME helper、λ 端点、缓存指纹、合成 MBAR 与循环文档检查均 PASS）。
 - [x] 直接使用 `openmm_dev` 环境 Python 执行完整 CPU/OpenMM/PyMBAR 套件：**280 passed**。
-- [ ] `run_offline_tests.sh` 入口自身因 ATT-22 新增的 `set -u`/mamba 激活环境变量冲突而失败；这是脚本入口 bug，不是 pytest 失败。
+- [x] **`run_offline_tests.sh` 入口 bug 已修（2026-07-27）。** 根因比原描述更具体：不是 mamba hook 本身，而是 env 自己的 `openmm_dev/etc/conda/activate.d/env_vars.sh:2` `export CPATH=$CONDA_PREFIX/include:$CPATH` —— `$CPATH` 在干净 shell 里没定义，`set -u` 下报 `CPATH: 未绑定的变量` 直接中止激活，脚本根本走不到 pytest，表现成「入口失败」但其实**一条测试都没跑**（`LIBRARY_PATH`/`LD_LIBRARY_PATH` 同理）。改为 `set -eo pipefail` + 激活完成后再 `set -u`，让自己的代码仍受 nounset 保护；并新增激活后核对 `python` 确实落在 `envs/openmm_dev/bin/python`，否则响亮退出（激活半成功会用系统 python 跑，`import openmm` 失败又被误读成测试挂了）。实测：`./run_offline_tests.sh` → **367 passed**（此前入口中止、0 执行）。首次全跑暴露 1 处**测试自身**的错误（`_wrap_to_pi` 的区间约定被写成 (-π, π]，实际是 [-π, π)；在 ±π 对跖点符号本就任意，而门只用 `abs(delta)`，两种约定等价）——已改正并补 `test_antipode_sign_cannot_affect_the_gate`，直接比较 ±π 两份报告的同一个 `|Δ|`、同一个 `σ`、同一个标准化偏离及相同的 warning/hard gate 结果，钉死「符号不影响判定」。
+- [x] **CPU/OpenMM/PyMBAR 全套已在 `openmm_dev` 实跑：367 passed（2026-07-27）。** 本批新增 16 个测试函数（27 个参数化 case），覆盖阶段端点、stage 缓存复检、traditional resume 透传及 config/torsion 显式输入 fail-closed；此前各项物理与协议回归继续全部通过。
 - [ ] 仍没有据此宣称完成真实 CUDA/GPU 验收；GPU 项继续按 `status/VALIDATION_MATRIX.md` 跟踪。
 
 ### 2026-07-26 ESS 门重构（`ESS_GATE_PROTOCOL_VERSION = 2`）
@@ -364,7 +396,7 @@ GitHub 跟踪（均为未验证审查发现）：
 
   **注：本条虽列在 DEXP 缓期组（下方 2026-07-26 条目）里，但它是报告诚实性，与将来 DEXP 怎么实现无关，故独立先落。** 用户的新 DEXP 已在 `dexp_experiment.py` 改过、尚未并入主项目；届时若它开始附加 LRC，只需改上述谓词。回归见 `test_lrc_reporting_honesty.py`。
 
-- [ ] **P2-15：单阶段 endpoint diagnostics 使用了整条双阶段路径的判据（2026-07-27 复审新增；出数后修）。** 当前 `lambda_endpoint_diagnostics()` 的 `ok` 同时要求“起点 fully coupled”与“终点 fully decoupled”，但它分别被用于 Stage 1（`(1,1)→(0,1)`）和 Stage 2（`(0,1)→(0,0)`）；两个合法半程因此都会在 `final_results.json` 中报告 `ok=false`。这不会改变 ΔG 数值，但会把正常路径标成失败，误导自动审计。应为单阶段报告各自的预期端点/固定 λ 不变量，整条双阶段闭合另设组合诊断。
+- [x] **P2-15：单阶段 endpoint diagnostics 已按各自物理端点修正（2026-07-27）。** `lambda_endpoint_diagnostics()` 默认仍检查完整路径 `(1,1)→(0,0)`，并新增显式 `expected_start`/`expected_end`；Stage 1 使用 `(1,1)→(0,1)`，Stage 2 使用 `(0,1)→(0,0)`。输出保留原有事实字段，并新增期望端点及匹配字段；合法半程不再误报 `ok=false`，固定 λ 漂移、端点错误或非单调仍会失败。
 
 ## P2/P3 科学与稳健性评估
 

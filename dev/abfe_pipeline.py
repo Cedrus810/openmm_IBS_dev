@@ -103,6 +103,27 @@ PME_DECHARGE_MODEL_VERSION = "pme_decharge_v2_llfreeze_pmeself_20260523"
 logger = logging.getLogger(__name__)
 
 
+def _stage_lambda_endpoint_diagnostics(
+    stage_name: str,
+    lambdas_coul,
+    lambdas_vdw,
+) -> Dict:
+    """Apply the endpoint contract for one half of the dual-lambda path."""
+    expected = {
+        "decharging": ((1.0, 1.0), (0.0, 1.0)),
+        "vanishing": ((0.0, 1.0), (0.0, 0.0)),
+    }
+    if stage_name not in expected:
+        raise ValueError(f"未知 dual-lambda stage: {stage_name!r}")
+    expected_start, expected_end = expected[stage_name]
+    return lambda_endpoint_diagnostics(
+        lambdas_coul,
+        lambdas_vdw,
+        expected_start=expected_start,
+        expected_end=expected_end,
+    )
+
+
 def _json_safe(obj):
     """🔑 [P1-15] 递归转成 `json.dump` 直接可写的原生类型。
 
@@ -129,6 +150,97 @@ def _json_safe(obj):
         value = float(obj)
         return value if math.isfinite(value) else None
     return obj
+
+
+# 🔑 [BORESCH-COMMIT] `boresch_equilibrium_committed.json` 的 schema 版本。
+# v1 = 只有 {"equilibrium_values": {...}} 的裸格式（无任何身份信息）。
+BORESCH_COMMITTED_SCHEMA_VERSION = 2
+
+# 复用已提交平衡值时，允许它与当前坐标实测几何相差多少个 σ。
+# σ_i = sqrt(kT/k_i)：六个自由度的限制势分别是 0.5*kr*(d-r0)^2 与
+# k*(1-cos(Δ))，小偏离下方差都是 kT/k，所以这是限制势自身的热涨落宽度。
+# 与单帧比较本身就带 ~1σ 噪声，取 4σ 既能放过正常涨落，也能抓住
+# "平衡值根本不描述当前构象"这类错误（实测那次是 4.0-23.6σ）。
+BORESCH_COMMITTED_MAX_DEVIATION_SIGMA = 4.0
+
+# 告警带。硬门为什么不能再压低：committed 值来自过去某一帧、current 来自当前帧，
+# 两个独立单帧之差的宽度是 √2·σ，所以 4σ ≈ 2.8 个"差值 σ"，每个自由度误报率
+# ~0.5%、六个约 2.8%。压到 3σ 会让单次运行误报率升到约 19%，resume 直接没法用。
+# 代价是纯 thetaA/thetaB 对调（实测 3.70 σ）刚好落在硬门下面——但真实的标签错位
+# 必然同时打乱二面角（它们共用同一批原子），实测那次 phiA0 就到了 23.65 σ。
+# 这个区间的东西不阻断，但必须大声打出来。
+BORESCH_COMMITTED_WARN_DEVIATION_SIGMA = 2.5
+
+_BORESCH_EQ_TO_FORCE_CONSTANT = (
+    ("r0", "kr", False),
+    ("thetaA0", "kthetaA", False),
+    ("thetaB0", "kthetaB", False),
+    ("phiA0", "kphiA", True),
+    ("phiB0", "kphiB", True),
+    ("phiC0", "kphiC", True),
+)
+
+
+def _wrap_to_pi(value: float) -> float:
+    """把角度差折回 **[-π, π)**，二面角比较必须先做这一步。
+
+    注意区间是左闭右开：`_wrap_to_pi(math.pi)` 返回 `-π` 而不是 `+π`。
+    在 ±π 这个对跖点上符号本来就是任意的（同一个角距离的两种写法），
+    而下游 `boresch_committed_deviation_sigma` 只取 `abs(delta)` 来判门，
+    所以取哪一侧不影响任何判定。
+    """
+    return float((float(value) + math.pi) % (2.0 * math.pi) - math.pi)
+
+
+def boresch_committed_deviation_sigma(
+    committed_eq: Dict,
+    current_eq: Dict,
+    force_constants: Dict,
+    temperature_k: float,
+) -> Dict[str, Dict[str, float]]:
+    """逐自由度算"已提交平衡值"与"当前坐标实测几何"相差几个 σ。
+
+    🔑 为什么需要这个检查：`run_full_pipeline` 有一条刻意的保护——平衡几何量只在
+    一条腿第一次采样时推导一次并落盘，之后任何 resume 都原样复用，绝不重算
+    （避免同一条腿的前后窗口用两套哈密顿量拼接自由能曲线）。动机是对的，但它
+    **没有任何一致性校验**：只要文件存在就复用。
+
+    实测后果（2026-07-27 定位）：`boresch_equilibrium_committed.json` 写于
+    2026-07-10 18:51，而体系在 2026-07-26 被整体重新平衡过。那份 17 天前的
+    平衡值里 thetaA0/thetaB0 是对调的、三个二面角完全错乱：
+
+        thetaA0  committed 2.0361  vs  轨迹实测 1.5634   (4.2 σ)
+        thetaB0  committed 1.5338  vs  轨迹实测 1.9770   (4.0 σ)
+        phiA0    committed -2.1285 vs  轨迹实测 1.5130   (23.6 σ)
+
+    限制力因此把配体从自己的 pose 上拽走 3.4 Å（无约束预平衡只漂 0.60 Å），
+    方向性氢键丢失 → 复合物腿去电荷偏低约 25 kJ/mol、解析释放修正也是错的。
+    唯一没受影响的是 vdW——它对取向不敏感，这也正是当时唯一对得上参考值的那一项。
+
+    注意：`update_boresch_from_last_frame` 已有的两道门（角度 40-140°、r0 漂移
+    <2.5 Å）对这组错值**全部放行**（2.0361 rad = 116.7° 在安全域内，r0 也没漂），
+    所以必须用"与当前几何的偏离"这个正交判据。
+    """
+    kt = 8.31446261815324e-3 * float(temperature_k)
+    report: Dict[str, Dict[str, float]] = {}
+    for eq_key, k_key, is_dihedral in _BORESCH_EQ_TO_FORCE_CONSTANT:
+        if eq_key not in committed_eq or eq_key not in current_eq:
+            continue
+        k = float(force_constants.get(k_key, 0.0) or 0.0)
+        if k <= 0.0 or not math.isfinite(k):
+            continue
+        sigma = math.sqrt(kt / k)
+        delta = float(current_eq[eq_key]) - float(committed_eq[eq_key])
+        if is_dihedral:
+            delta = _wrap_to_pi(delta)
+        report[eq_key] = {
+            "committed": float(committed_eq[eq_key]),
+            "current": float(current_eq[eq_key]),
+            "delta": delta,
+            "sigma": sigma,
+            "deviation_sigma": abs(delta) / sigma if sigma > 0 else float("inf"),
+        }
+    return report
 
 
 def _infer_log_level_from_message(message: str) -> int:
@@ -1202,6 +1314,74 @@ class ABFEPipeline:
     # =========================================================================
     # 1. 物理预平衡 (10 ns) → 保存轨迹 → 提取稳态坐标
     # =========================================================================
+    def repair_pbc_molecule_integrity(self, *, context: str = "") -> bool:
+        """🔑 [P1-14] 按拓扑把每个连通分子做整分子周期平移，再整体居中。
+
+        **必须在第一次创建 Context / 最小化 / 预平衡之前调用。** 此前这段逻辑只在
+        `run_full_pipeline` 第 2 节出现，也就是 `pre_equilibrate()`（内含
+        `LocalEnergyMinimizer.minimize` 与 NPT 步进）**之后**；而
+        `runabfe.center_system_rigidly()` 只做整体质心平移，却有调用点紧接着打印
+        "分子完整性修复完毕"。结果是：GRO/缓存里本来就跨边界断裂的分子，会带着
+        断裂先进最小化和 NPT——最小化会真实改变原子间相对坐标，把断裂"焊"进构型。
+
+        只做两件事，都不改变任何分子内相对坐标：
+          1. `image_molecules()` —— 按连通分子整体做周期平移；
+          2. `center_coordinates()` —— 全体系整体平移。
+        不旋转、不缩放。
+
+        失败时 **fail closed**。此前的回退是 `_wrap_ligand_to_box()`（自己的
+        docstring 就写着"仅做整体刚性平移"），它根本修不了跨盒断裂，却让流程
+        带着未修复的构型继续——等于把"修复失败"降级成"看起来修好了"。
+        """
+        if self.positions is None or self.box_vectors is None:
+            self._log(f"  ⏭️ 无坐标/盒矢量，跳过 PBC 分子完整性修复{('（' + context + '）') if context else ''}")
+            return False
+
+        self._log(f"  📦 正在执行 PBC 分子完整性修复与配体居中{('（' + context + '）') if context else ''}...")
+        try:
+            import mdtraj as md
+            md_top = md.Topology.from_openmm(self.topology)
+            # ⚠️ Quantity.value_in_unit() 在底层是 list-of-Vec3（而非 numpy 数组）时
+            # 返回的仍是 Python list，没有 .reshape；必须显式再包一层 np.asarray。
+            # 🚨 mdtraj 的 Cython 扩展（含 image_molecules 内部用到的 geometry 例程）
+            # 要求 float32（"float"）缓冲区；用 float64 构造时 Trajectory() 会自动
+            # 转换 xyz，但直接赋值 unitcell_vectors 不会，于是 image_molecules() 必然抛
+            # "Buffer dtype mismatch, expected 'float' but got 'double'"。历史上这个
+            # dtype bug 让每次都静默回退到只居中配体的 numpy 兜底，撕裂的水分子
+            # 从预平衡开始就一路带进所有窗口。
+            pos_nm = np.asarray(
+                self.positions.value_in_unit(unit.nanometer)
+                if hasattr(self.positions, "value_in_unit") else self.positions,
+                dtype=np.float32,
+            )
+            box_nm = np.asarray(
+                [
+                    v.value_in_unit(unit.nanometer) if hasattr(v, "value_in_unit") else v
+                    for v in self.box_vectors
+                ],
+                dtype=np.float32,
+            )
+            traj = md.Trajectory(pos_nm.reshape(1, -1, 3), md_top)
+            # 不传 unitcell_vectors 时 mdtraj 完全不知道盒子形状，
+            # image_molecules() 会直接报 "does not define a periodic unit cell"。
+            traj.unitcell_vectors = box_nm.reshape(1, 3, 3)
+            traj.image_molecules(inplace=True)
+            traj.center_coordinates()
+            self.positions = [
+                openmm.Vec3(float(x), float(y), float(z)) for x, y, z in traj.xyz[0]
+            ] * unit.nanometer
+            self._log("  ✓ PBC 分子完整性已修复，体系已居中至主周期")
+            self._pbc_integrity_repaired = True
+            return True
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"PBC 分子完整性修复失败：{exc}\n"
+                "  拒绝以未修复的构型继续（fail closed）。此前这里会回退到 "
+                "_wrap_ligand_to_box()，但那只是整体质心平移，**修不了跨盒断裂的分子**，\n"
+                "  只会让断裂构型静默进入最小化/NPT，并被最小化固化进相对坐标。\n"
+                "  常见原因：拓扑与坐标原子数不一致、盒矢量非法、mdtraj 未安装。"
+            ) from exc
+
     def pre_equilibrate(
         self,
         n_steps: int = 5_000_000,  # 10ns @ 2fs
@@ -1210,6 +1390,14 @@ class ABFEPipeline:
         resume: bool = False,
     ) -> Dict:
         """物理预平衡 - 【修复】默认使用 GPU，仅在生产采样前清理上下文"""
+        # 🔑 [P1-14] 在建 Context / 最小化 / NPT **之前**做整分子 PBC 修复。
+        # 这段此前只在 run_full_pipeline 第 2 节出现，也就是本函数**之后**——
+        # 于是输入里本来就跨盒断裂的分子会先进最小化，被固化进相对坐标。
+        # 幂等：已经修过就跳过（run_full_pipeline 里那次仍会执行，用于修预平衡
+        # 步进过程中新产生的跨盒，两者不冲突）。
+        if not getattr(self, "_pbc_integrity_repaired", False):
+            self.repair_pbc_molecule_integrity(context="pre_equilibrate 之前")
+
         traj_file = os.path.join(self.output_dir, "pre_equilibration.dcd")
         chk_file = os.path.join(self.checkpoint_dir, "pre_equil.chk")
         fp_file = os.path.join(self.output_dir, "pre_equilibration_fingerprint.json")
@@ -2435,6 +2623,7 @@ class ABFEPipeline:
         allow_partial_vanishing_rescue: bool = False,
         stage_output_dir_override: Optional[str] = None,
         checkpoint_dir_override: Optional[str] = None,
+        remd_max_resident_contexts: Optional[int] = None,
         **kwargs,
     ) -> Dict:
         """
@@ -2550,7 +2739,14 @@ class ABFEPipeline:
                     "total_error": float(res.get("error", 0.0)),
                     "method": "PME-REMD-MBAR",
                     "n_states": int(n_states),
-                    "lambda_endpoint_diagnostics": lambda_endpoint_diagnostics(lambdas_coul, lambdas_vdw),
+                    "lambda_endpoint_diagnostics": _stage_lambda_endpoint_diagnostics(
+                        stage_name, lambdas_coul, lambdas_vdw
+                    ),
+                    "converged": res.get("converged"),
+                    "min_overlap": res.get("min_overlap"),
+                    "min_overlap_threshold": (
+                        res.get("diagnostics", {}).get("min_overlap_threshold")
+                    ),
                     "diagnostics": res.get("diagnostics", {}),
                 }
             elif resume and os.path.exists(u_kn_path):
@@ -2577,6 +2773,7 @@ class ABFEPipeline:
                     platform_name=self.platform_name,
                     output_dir=stage_output_dir,
                     boresch_params=boresch_params,
+                    max_resident_contexts=remd_max_resident_contexts,
                 )
                 traj_files = remd.run(
                     n_steps=n_steps_per_window,
@@ -2618,7 +2815,14 @@ class ABFEPipeline:
                 "total_error": float(res.get("error", 0.0)),
                 "method": "PME-REMD-MBAR",
                 "n_states": int(n_states),
-                "lambda_endpoint_diagnostics": lambda_endpoint_diagnostics(lambdas_coul, lambdas_vdw),
+                "lambda_endpoint_diagnostics": _stage_lambda_endpoint_diagnostics(
+                    stage_name, lambdas_coul, lambdas_vdw
+                ),
+                "converged": res.get("converged"),
+                "min_overlap": res.get("min_overlap"),
+                "min_overlap_threshold": (
+                    res.get("diagnostics", {}).get("min_overlap_threshold")
+                ),
                 "diagnostics": res.get("diagnostics", {}),
             }
 
@@ -2793,7 +2997,8 @@ class ABFEPipeline:
             )
         stage_result.setdefault("stage", stage_name)
         stage_result.setdefault("n_states", int(n_states))
-        stage_result["lambda_endpoint_diagnostics"] = lambda_endpoint_diagnostics(
+        stage_result["lambda_endpoint_diagnostics"] = _stage_lambda_endpoint_diagnostics(
+            stage_name,
             manager.lambdas_coul,
             manager.lambdas_vdw,
         )
@@ -3031,8 +3236,8 @@ class ABFEPipeline:
             "converged": True,
             "min_overlap": float(min(both_min_overlaps)) if both_min_overlaps else None,
             "min_overlap_threshold": shadow_ibs_result.get("min_overlap_threshold"),
-            "lambda_endpoint_diagnostics": lambda_endpoint_diagnostics(
-                lambdas_shadow_coul, [1.0] * n_states
+            "lambda_endpoint_diagnostics": _stage_lambda_endpoint_diagnostics(
+                "decharging", lambdas_shadow_coul, [1.0] * n_states
             ),
             "diagnostics": {
                 "experimental": True,
@@ -3307,6 +3512,124 @@ class ABFEPipeline:
                 "Boresch release correction assumes locally harmonic, approximately Gaussian restraint-coordinate fluctuations."
             ),
         }
+
+    def _assert_committed_boresch_still_matches_pose(
+        self,
+        *,
+        committed_doc: Dict,
+        committed_eq: Dict,
+        boresch_params: Dict,
+        committed_path: str,
+    ) -> None:
+        """🔑 [BORESCH-COMMIT] 复用已提交平衡值前，验证它仍描述当前构象。
+
+        两道检查：
+
+        1. **锚点身份**：committed 文件记录的 receptor/ligand 锚点必须与本次
+           `boresch_params` 一致。锚点变了，平衡值就不是同一个几何量。
+           （v1 裸格式没有这些字段，跳过这道，仍走第 2 道。）
+        2. **几何一致性**：用当前坐标重算六个自由度，与 committed 值逐个比较，
+           偏离以限制势自身的热涨落宽度 σ_i = sqrt(kT/k_i) 为单位。
+
+        第 2 道是主判据，也是唯一能抓住"平衡值比结构还老"这类错误的。
+        `update_boresch_from_last_frame` 已有的两道门（角度 40-140°、r0 漂移）
+        与它正交，且对实测那组错值全部放行。
+
+        不一致时 **fail closed**，不静默重新锚定：这条 resume 保护存在的理由
+        就是防止一条腿中途换哈密顿量，自动重锚会把它变成另一个 bug。
+        """
+        rec = [int(i) for i in boresch_params.get("receptor_indices", [])]
+        lig = [int(i) for i in boresch_params.get("ligand_indices", [])]
+
+        schema = committed_doc.get("schema_version")
+        if schema is not None:
+            rec_c = [int(i) for i in committed_doc.get("receptor_indices", [])]
+            lig_c = [int(i) for i in committed_doc.get("ligand_indices", [])]
+            if rec_c and lig_c and (rec_c != rec or lig_c != lig):
+                raise RuntimeError(
+                    f"已提交的 Boresch 平衡值锚点与本次不一致，拒绝复用：\n"
+                    f"  文件 {committed_path}\n"
+                    f"  committed receptor={rec_c} ligand={lig_c}\n"
+                    f"  本次     receptor={rec}   ligand={lig}\n"
+                    "锚点变了，平衡值描述的就不是同一个几何量。"
+                )
+        else:
+            self._log(
+                f"  ⚠️ {os.path.basename(committed_path)} 是无身份信息的旧格式"
+                f"（schema_version 缺失），无法核对锚点来源；仍将执行几何一致性校验。"
+            )
+
+        force_constants = boresch_params.get("force_constants") or {}
+        if len(rec) != 3 or len(lig) != 3 or not force_constants:
+            self._log("  ⚠️ 缺锚点或力常数，跳过 Boresch 平衡值几何一致性校验。")
+            return
+
+        try:
+            from abfe_core import calc_boresch_from_last_frame
+            current_eq = calc_boresch_from_last_frame(self.positions, rec, lig)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"无法用当前坐标重算 Boresch 几何以校验已提交平衡值：{exc}。"
+                "拒绝在未经校验的情况下复用——这正是 2026-07-10 那组错值能沿用 17 天的原因。"
+            ) from exc
+
+        report = boresch_committed_deviation_sigma(
+            committed_eq, current_eq, force_constants,
+            self.temperature.value_in_unit(unit.kelvin),
+        )
+        if not report:
+            self._log("  ⚠️ 没有可比较的自由度，跳过 Boresch 平衡值几何一致性校验。")
+            return
+
+        worst_key = max(report, key=lambda k: report[k]["deviation_sigma"])
+        worst = report[worst_key]["deviation_sigma"]
+        threshold = float(BORESCH_COMMITTED_MAX_DEVIATION_SIGMA)
+
+        if worst <= threshold:
+            warn_at = float(BORESCH_COMMITTED_WARN_DEVIATION_SIGMA)
+            if worst > warn_at:
+                self._log(
+                    f"  ⚠️ 已提交 Boresch 平衡值与当前坐标偏离 {worst:.2f} σ @ {worst_key}"
+                    f"（告警带 {warn_at:.1f}-{threshold:.1f} σ，未阻断）。"
+                    "单帧比较本身带 ~√2σ 噪声，偶发一次可以忽略；但若每次 resume 都出现、"
+                    "或多个自由度同时进入该带，说明平衡值已经在偏离当前构象，"
+                    "请核对是否该重新锚定。逐自由度："
+                )
+                for k, v in sorted(report.items(), key=lambda kv: -kv[1]["deviation_sigma"]):
+                    self._log(
+                        f"       {k:>8s} committed={v['committed']:+.6f} "
+                        f"current={v['current']:+.6f} ({v['deviation_sigma']:.2f} σ)"
+                    )
+            else:
+                self._log(
+                    f"  ✓ 已提交 Boresch 平衡值与当前坐标一致（最大偏离 "
+                    f"{worst:.2f} σ @ {worst_key}，阈值 {threshold:.1f} σ）"
+                )
+            return
+
+        lines = [
+            f"    {k:>8s}  committed={v['committed']:+10.6f}  current={v['current']:+10.6f}"
+            f"  Δ={v['delta']:+9.6f}  ({v['deviation_sigma']:6.2f} σ)"
+            for k, v in sorted(
+                report.items(), key=lambda kv: -kv[1]["deviation_sigma"]
+            )
+        ]
+        raise RuntimeError(
+            "已提交的 Boresch 平衡值已经不描述当前构象，拒绝复用（fail closed）。\n"
+            f"  文件 {committed_path}\n"
+            f"  最大偏离 {worst:.2f} σ @ {worst_key}，阈值 {threshold:.1f} σ\n"
+            "  逐自由度（σ = sqrt(kT/k)，即该限制势自身的热涨落宽度）：\n"
+            + "\n".join(lines)
+            + "\n\n"
+            "  这意味着限制力会把配体从它当前的构象上拽走：静电（方向性氢键）会因此\n"
+            "  严重偏低，而 vdW 因为对取向不敏感看起来仍然正常——2026-07-27 实测过\n"
+            "  这个组合，复合物腿去电荷偏低约 25 kJ/mol。\n\n"
+            "  处理方式（二选一，不要直接放宽阈值）：\n"
+            f"    A. 若该腿尚无有效采样数据：删除 {committed_path}，\n"
+            "       下次运行会用当前坐标重新锚定并带身份信息落盘。\n"
+            "    B. 若该腿已有采样数据：那些数据是在这组平衡值下采的，与当前结构不匹配，\n"
+            "       必须连同该腿的采样输出一起作废重跑，不能只换平衡值继续拼接。"
+        )
 
     def update_boresch_from_last_frame(self, boresch_params: Optional[Dict] = None) -> Optional[Dict]:
         """🔑 生产级修复：严格拦截奇点角度与异常漂移，防止自动更新引入 NaN 隐患"""
@@ -3948,6 +4271,46 @@ class ABFEPipeline:
                 f"高于阈值 {max_endpoint_uncertainty_kJ_mol_threshold:.4g} kJ/mol，拒绝标记为 "
                 "completed，请延长采样或检查窗口重叠。"
             )
+
+    def _assert_reusable_stage_cache_sane(
+        self,
+        stage_label: str,
+        result: Dict,
+    ) -> None:
+        """Re-run the scientific gates before a completed stage is reused.
+
+        Stage checkpoints keep detailed gate values inside ``diagnostics`` to
+        preserve the public result shape.  Rehydrate those values temporarily
+        at the top level because ``_assert_stage_result_sane`` is also used on
+        fresh in-memory solver results and therefore reads the top-level form.
+        """
+        if result.get("converged") is not True:
+            raise RuntimeError(
+                f"{stage_label} 缓存缺少明确的 converged=True 证据，拒绝复用。"
+            )
+        if result.get("stage") == "vanishing" and not isinstance(
+            result.get("coverage_diagnostics"), dict
+        ):
+            raise RuntimeError(
+                f"{stage_label} 缓存缺少 coverage_diagnostics，拒绝复用。"
+            )
+        diagnostics = result.get("diagnostics")
+        if not isinstance(diagnostics, dict):
+            raise RuntimeError(f"{stage_label} 缓存 diagnostics 非法，拒绝复用。")
+        for key in (
+            "min_overlap",
+            "min_overlap_threshold",
+            "min_absolute_ess",
+            "min_absolute_ess_threshold",
+            "min_decorrelated_samples",
+            "min_decorrelated_samples_threshold",
+            "max_endpoint_uncertainty_kJ_mol",
+            "max_endpoint_uncertainty_kJ_mol_threshold",
+            "window_overlap_diagnostics",
+        ):
+            if key not in result and key in diagnostics:
+                result[key] = diagnostics[key]
+        self._assert_stage_result_sane(stage_label, result)
 
     @staticmethod
     def _is_overlap_failure(result: Dict) -> bool:
@@ -6357,46 +6720,7 @@ class ABFEPipeline:
         # ✅ 无论是否跳过预平衡，只要坐标/盒子有效就执行居中
         # 注：曾计划由 runabfe.py 的 center_and_wrap_molecules 完成此步，但该函数从未实现，
         # 之前用 `if False` 彻底禁用了这段逻辑，导致跨盒断裂的构型无法被修复而悄悄放行。
-        if self.positions is not None and self.box_vectors is not None:
-            self._log("  📦 正在执行 PBC 分子完整性修复与配体居中...")
-            try:
-                import mdtraj as md
-                md_top = md.Topology.from_openmm(self.topology)
-                # ⚠️ Quantity.value_in_unit() 在底层是 list-of-Vec3（而非 numpy 数组）时
-                # 返回的仍是 Python list，没有 .reshape；必须显式再包一层 np.asarray。
-                # 🚨 关键修复：mdtraj 的 Cython 扩展（含 image_molecules 内部用到的
-                # geometry 例程）要求 float32（"float"）缓冲区；这里之前用 float64
-                # （"double"）构造，Trajectory() 构造函数会自动转换 xyz，但直接赋值
-                # unitcell_vectors 不会，导致 image_molecules() 必然抛
-                # "Buffer dtype mismatch, expected 'float' but got 'double'"，
-                # 每次都静默回退到只居中配体、不修复其余分子跨盒撕裂的 numpy 兜底，
-                # 使得撕裂的水分子从预平衡开始就带着隐患一路进入所有窗口。
-                pos_nm = np.asarray(
-                    self.positions.value_in_unit(unit.nanometer)
-                    if hasattr(self.positions, 'value_in_unit') else self.positions,
-                    dtype=np.float32,
-                )
-                box_nm = np.asarray(
-                    [
-                        v.value_in_unit(unit.nanometer) if hasattr(v, "value_in_unit") else v
-                        for v in self.box_vectors
-                    ],
-                    dtype=np.float32,
-                )
-                traj = md.Trajectory(pos_nm.reshape(1, -1, 3), md_top)
-                # 不传 unitcell_vectors 时 mdtraj 完全不知道盒子形状，
-                # image_molecules() 会直接报 "does not define a periodic unit cell"。
-                traj.unitcell_vectors = box_nm.reshape(1, 3, 3)
-                traj.image_molecules(inplace=True)
-                traj.center_coordinates()
-                self.positions = [openmm.Vec3(float(x), float(y), float(z)) 
-                                  for x, y, z in traj.xyz[0]] * unit.nanometer
-                self._log("  ✓ PBC 分子完整性已修复，体系已居中至主周期")
-            except Exception as e:
-                self._log(f"  ⚠️ MDTraj PBC 修复失败: {e}，回退到 numpy 质心平移")
-                self.positions, self.box_vectors = self._wrap_ligand_to_box(
-                    self.positions, self.box_vectors, margin_nm=0.3
-                )
+        self.repair_pbc_molecule_integrity(context="run_full_pipeline 第 2 节")
         # 🔒 PBC 修复到此为止：image_molecules 只按分子整体做周期平移，
         # center_coordinates/_wrap_ligand_to_box 只做整体质心平移；两者都不改变
         # 任何原子间的相对位置。此前这里还有一段"L-E 界面安全弛豫"
@@ -6421,13 +6745,30 @@ class ABFEPipeline:
             committed_path = os.path.join(self.checkpoint_dir, "boresch_equilibrium_committed.json")
             if resume and os.path.exists(committed_path):
                 with open(committed_path, "r") as f:
-                    committed_eq = json.load(f)["equilibrium_values"]
+                    committed_doc = json.load(f)
+                committed_eq = committed_doc["equilibrium_values"]
+
+                # 🔑 [BORESCH-COMMIT] 复用之前必须验证它还描述当前构象。
+                # 这条保护此前**只检查文件是否存在**，于是一份 2026-07-10 写下的
+                # 平衡值（thetaA0/thetaB0 对调、二面角错乱）在体系于 07-26 被整体
+                # 重新平衡之后，仍被沿用了 17 天：限制力把配体从自己的 pose 上拽走
+                # 3.4 Å（无约束预平衡只漂 0.60 Å），复合物腿去电荷因此偏低约
+                # 25 kJ/mol，解析释放修正同样是错的。详见
+                # boresch_committed_deviation_sigma 的 docstring。
+                self._assert_committed_boresch_still_matches_pose(
+                    committed_doc=committed_doc,
+                    committed_eq=committed_eq,
+                    boresch_params=boresch_params,
+                    committed_path=committed_path,
+                )
+
                 boresch_params = dict(boresch_params)
                 boresch_params["equilibrium_values"] = committed_eq
                 r0 = committed_eq.get("r0", 0) * 10  # nm → Å
                 self._log(
                     f"  ♻️ 本腿此前已提交过 Boresch 平衡值 (resume)，复用缓存值 "
                     f"(r0={r0:.2f} Å)，不再从当前坐标重新锚定。"
+                    "（已校验其与当前坐标的几何一致性）"
                 )
             else:
                 self._log("  🔧 正在用当前坐标更新 Boresch 平衡几何量...")
@@ -6435,8 +6776,22 @@ class ABFEPipeline:
                 r0 = boresch_params["equilibrium_values"].get("r0", 0) * 10  # nm → Å
                 self._log(f"  ✓ Boresch 平衡值已更新: r0={r0:.2f} Å")
                 os.makedirs(self.checkpoint_dir, exist_ok=True)
-                with open(committed_path, "w") as f:
-                    json.dump({"equilibrium_values": boresch_params["equilibrium_values"]}, f, indent=2)
+                # 🔑 [BORESCH-COMMIT] 带上身份信息落盘。裸的
+                # {"equilibrium_values": ...} 无法判断它是从哪个锚点/哪套力常数、
+                # 什么时候推出来的——正是它让上面那组错值活过了 17 天。
+                _atomic_write_json(committed_path, _json_safe({
+                    "schema_version": BORESCH_COMMITTED_SCHEMA_VERSION,
+                    "equilibrium_values": boresch_params["equilibrium_values"],
+                    "receptor_indices": list(boresch_params.get("receptor_indices", [])),
+                    "ligand_indices": list(boresch_params.get("ligand_indices", [])),
+                    "force_constants": dict(boresch_params.get("force_constants", {})),
+                    "temperature_K": self.temperature.value_in_unit(unit.kelvin),
+                    "derived_at": datetime.now().isoformat(),
+                    "note": (
+                        "本腿后续 resume 强制复用这组平衡值；复用前会用 "
+                        "boresch_committed_deviation_sigma 校验它是否仍描述当前构象。"
+                    ),
+                }))
                 self._log(f"  📌 Boresch 平衡值已提交落盘，本腿后续 resume 将强制复用: {committed_path}")
 
         # =========================================================================
@@ -6721,6 +7076,9 @@ class ABFEPipeline:
                     ):
                         self._log("  ⚠️ Stage 1 的 λ 内容/窗口边界指纹不匹配，重新运行")
                     else:
+                        self._assert_reusable_stage_cache_sane(
+                            "Stage 1 (decharging)", stage1
+                        )
                         self._log("  ♻️ 双λ Stage 1 (去电荷) 已完成，跳过")
                         should_run_stage1 = False
                 except Exception as e:
@@ -6968,6 +7326,9 @@ class ABFEPipeline:
                     ):
                         self._log("  ⚠️ Stage 2 的 λ 内容/窗口边界指纹不匹配，重新运行")
                     else:
+                        self._assert_reusable_stage_cache_sane(
+                            "Stage 2 (vanishing)", stage2
+                        )
                         self._log("  ♻️ 双λ Stage 2 (去VDW) 已完成，跳过")
                         should_run_stage2 = False
                 except Exception as e:
@@ -7516,8 +7877,10 @@ class ABFEPipeline:
                                 "plan_id": rescue_plan_id,
                             }
                             stage2["lambda_endpoint_diagnostics"] = (
-                                lambda_endpoint_diagnostics(
-                                    full_lambdas_coul, optimized_lambdas_2
+                                _stage_lambda_endpoint_diagnostics(
+                                    "vanishing",
+                                    full_lambdas_coul,
+                                    optimized_lambdas_2,
                                 )
                             )
                             stage2["n_states"] = int(stage2_states)
@@ -8087,6 +8450,7 @@ class TraditionalABFEPipeline:
         boresch_correction: float = 0.0,
         boresch_params: Optional[Dict] = None,
         potential_type: str = "softcore",
+        resume: bool = False,
     ) -> Dict:
         lambdas_coul = np.linspace(1.0, 0.0, n_lambda).tolist()
         lambdas_vdw = [1.0] * n_lambda
@@ -8095,7 +8459,7 @@ class TraditionalABFEPipeline:
             lambdas_coul,
             lambdas_vdw,
             n_steps_per_leg,
-            resume=False,
+            resume=resume,
             boresch_params=boresch_params,
             potential_type=potential_type,
         )
@@ -8107,7 +8471,7 @@ class TraditionalABFEPipeline:
             lambdas_coul,
             lambdas_vdw,
             n_steps_per_leg,
-            resume=False,
+            resume=resume,
             boresch_params=boresch_params,
             potential_type=potential_type,
         )

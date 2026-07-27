@@ -17,7 +17,7 @@ boresch_source = simple
 
 ## Current Status
 
-Warning: the values currently stored in `output/final_binding_results.json` were computed with the old sign convention, `Delta G_bind = Delta G_complex - Delta G_solvent`. That is inconsistent with the current code in `runabfe.py`, where `delta_g_bind_uncorrected = dg_solvent - dg_complex`. The calculation must be rerun to obtain values whose sign matches the current formula. See "Interpreting Results" below and `AUDIT_STATUS.md` for details. The following numbers have been recomputed using the current formula while keeping the original `Delta G_complex` and `Delta G_solvent` values unchanged; they are only a reference and do not mean that new sampling has already been performed:
+Warning: the values currently stored in `output/final_binding_results.json` were computed with the old sign convention, `Delta G_bind = Delta G_complex - Delta G_solvent`. That is inconsistent with the current code in `runabfe.py`, where `delta_g_bind_uncorrected = dg_solvent - dg_complex`. The calculation must be rerun to obtain values whose sign matches the current formula. See "Interpreting Results" below and `docs/status/AUDIT_STATUS.md` for details. The following numbers have been recomputed using the current formula while keeping the original `Delta G_complex` and `Delta G_solvent` values unchanged; they are only a reference and do not mean that new sampling has already been performed:
 
 ```text
 Delta G_complex = 192.8876 kJ/mol
@@ -34,15 +34,15 @@ This is not a fully corrected, closed-cycle result ready to be treated as a fina
 
 - The default ACE/`dual_lambda` VDW/vanishing leg now includes an analytic LJ tail correction (`traditional_lj_lrc_protocol_version=2`): for each λ_vdw it numerically integrates the real switching-aware (restoring the energy the 1.0-1.2nm switching function removes) and softcore-aware (using the real softcore denominator, not a bare `r^6`) radial integral, covering both the attractive `r^-6` and repulsive `r^-12` moments. It intentionally does not enable OpenMM's built-in `CustomNonbondedForce` LRC, which would also integrate the Coulomb term in the combined expression and can crash CUDA. The Beutler `single_lambda`/REMD path now uses the same formula for its offline correction; outputs with `traditional_lj_lrc_protocol_version<2` correspond to the earlier formula, which did not yet account for the switching region, and should not be mixed with the current protocol's results.
 - The APBS correction is only added to the final `Delta G_bind` as an external term, `Delta G_APBS`. The current `apbs_correction_kJ_mol = 0.0`, so it is disabled. APBS cannot replace the LJ tail correction.
-- Older outputs may still contain historical PME self-correction text in `thermodynamic_cycle.md` and provenance. The current `output/final_binding_results.json` includes exactly such a stale text snapshot under `provenance.thermodynamic_cycle`. Treat `AUDIT_STATUS.md` and current diagnostics as authoritative. The current conclusion is that the manual `+C*lambda^2` PME self-energy "correction" has been withdrawn and should not be used as a production correction term.
+- Older outputs may still contain historical PME self-correction text in `thermodynamic_cycle.md` and provenance. The current `output/final_binding_results.json` includes exactly such a stale text snapshot under `provenance.thermodynamic_cycle`. Treat `docs/status/AUDIT_STATUS.md` and current diagnostics as authoritative. The current conclusion is that the manual `+C*lambda^2` PME self-energy "correction" has been withdrawn and should not be used as a production correction term.
 - The current Boresch harmonicity check passes (`diagnostics.boresch.boresch_harmonicity_check.harmonic_assumption_ok = true`), but 3 of the 6 force constants (`kr`, `kthetaA`, `kphiA`) were clipped to conservative ranges (`force_constant_clipped`). This must be retained in the result interpretation.
 - Stage 2 uses `Local-TMBAR-Stitched`, and the uncertainty propagates window offset variance. The complex leg has `offset_error_contribution approx 0.52 kJ/mol`, and the solvent leg has `approx 0.82 kJ/mol`. However, the uncertainty still does not include full global MBAR covariance, autocorrelation time, or effective sample size corrections. The current implementation identifies the exact failing window, adjacent state pair, and lambda values; it first extends production only for failing windows and, if quality remains insufficient, creates separate immutable overlapping rescue ensembles from existing lambda states. It does not mutate the original ensemble or production `f_k` in place.
 - No independent repeat has been performed yet: `diagnostics.independent_repeats.performed = false`.
 
-See `AUDIT_STATUS.md` for a more detailed list of methodological defects, remaining engineering-audit items, and repair status (it has merged and superseded the older `PHYSICS_DEFECTS.md`/`RELEASE_AUDIT_REMAINING.md`/`RE_AUDIT_2026-07-10.md`, which now remain only as compatibility stubs pointing to `AUDIT_STATUS.md`).
+See `docs/status/AUDIT_STATUS.md` for a more detailed list of methodological defects, remaining engineering-audit items, and repair status (it has merged and superseded the older `PHYSICS_DEFECTS.md`/`RELEASE_AUDIT_REMAINING.md`/`RE_AUDIT_2026-07-10.md`, which have since been **deleted** -- they are no longer present as stubs, so any remaining reference to them is stale).
 
 Implementation snapshot as of 2026-07-22: the default production path uses
-`IBS_BIAS_PROTOCOL_VERSION=27` (v27/v28 caches are read-compatible), `THERMODYNAMIC_PATH_PROTOCOL_VERSION=17`,
+`IBS_BIAS_PROTOCOL_VERSION=27` (v27/v28 caches are read-compatible), `THERMODYNAMIC_PATH_PROTOCOL_VERSION=20`,
 `TRADITIONAL_LJ_LRC_PROTOCOL_VERSION=2`, and `WCA_ACCOUNTING_VERSION=2`. v12 adds
 a per-state, fingerprinted, checkpointed fixed-H probe trajectory bank. The current
 IBS protocol fixes the pilot-TI/TMBAR `f_k` sign. After one complete fixed-weight
@@ -437,7 +437,7 @@ output/vanishing/dual_window_*_energies.npy
 
 ### `thermodynamic_cycle` in the results conflicts with the defect list
 
-This is a known issue caused by stale historical provenance text. The current README and `AUDIT_STATUS.md` are authoritative: APBS does not replace the LJ tail correction, the manual PME self `+C*lambda^2` term is not used as a production correction, and `Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS`, not `Delta G_complex - Delta G_solvent`.
+This is a known issue caused by stale historical provenance text. The current README and `docs/status/AUDIT_STATUS.md` are authoritative: APBS does not replace the LJ tail correction, the manual PME self `+C*lambda^2` term is not used as a production correction, and `Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS`, not `Delta G_complex - Delta G_solvent`.
 
 If your `output/final_binding_results.json` or `thermodynamic_cycle.md` was generated before these documentation fixes, its `delta_G_bind_kJ_mol` sign may be reversed, and the `thermodynamic_cycle` field text may still be the old version. Rerun the final aggregation for the complex leg and solvent leg to refresh the result to the current convention. New sampling is not required as long as `complex_results` and `solv_results` can be loaded from cache.
 
@@ -455,11 +455,11 @@ Then run:
 python runabfe.py self-test
 ```
 
-If the self-test disagrees with the latest physical conclusions in `AUDIT_STATUS.md`, update the tests and thermodynamic-cycle documentation so old assumptions do not continue entering new provenance. The full suite also requires OpenMM, PyMBAR, and pytest; a syntax-only pass is not an end-to-end validation when runtime dependencies are absent.
+If the self-test disagrees with the latest physical conclusions in `docs/status/AUDIT_STATUS.md`, update the tests and thermodynamic-cycle documentation so old assumptions do not continue entering new provenance. The full suite also requires OpenMM, PyMBAR, and pytest; a syntax-only pass is not an end-to-end validation when runtime dependencies are absent.
 
 Recommended next priorities:
 
 1. Run the full `python -m pytest -q` suite in the target environment, with particular attention to the fixed-H bank, native checkpoints, LRC, and the v12 frozen-validation state machine.
 2. Revalidate the v12 `calibrated_pending_validation` resume path and fixed-H `lambda_shield` synchronization fix on a real GPU.
 3. Run at least one independent repeat for the current Atenolol-rank11 config.
-4. Use stage diagnostics to decide whether the vanishing-stage windows should be densified or sampled longer; track the remaining source-level P2 items in `todolist.md`.
+4. Use stage diagnostics to decide whether the vanishing-stage windows should be densified or sampled longer; track the remaining source-level P2 items in `docs/TODO.md`.

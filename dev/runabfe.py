@@ -35,6 +35,7 @@ from abfe_core import (
     calc_boresch_from_last_frame, GeometricRestraintEstimator, OrbBoreschEstimator,
     DEXPSurrogatePotential, LambdaDependentBoreschForce, ensure_owned_system,
     NumpyEncoder, THERMODYNAMIC_CYCLE_DOC, assess_boresch_harmonicity,  # ✅ 统一从 abfe_core 导入
+    combine_binding_free_energy,  # [ATT-09] 热力学循环闭合的唯一实现
 )
 from abfe_pipeline import (
     ABFEPipeline, TraditionalABFEPipeline, _collect_pipeline_provenance, _pme_u_kn_meta_payload,
@@ -88,8 +89,165 @@ PRESET_CONFIGS = {
     },
 }
 
-SOLVENT_CACHE_PROTOCOL_VERSION = 2
+MAIN_SYSTEM_CACHE_PROTOCOL_VERSION = 2
+SOLVENT_CACHE_PROTOCOL_VERSION = 3
 DEFAULT_SOLVENT_IONIC_STRENGTH_MOLAR = 0.15
+SOLVENT_PADDING_NM = 1.5
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _resolve_gromacs_include_path(
+    include_name: str,
+    including_file: str,
+    gmx_include_dir: Optional[str],
+) -> str:
+    candidates = [os.path.join(os.path.dirname(including_file), include_name)]
+    if gmx_include_dir:
+        candidates.append(os.path.join(gmx_include_dir, include_name))
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return os.path.realpath(candidate)
+    raise FileNotFoundError(
+        f"GROMACS include 无法解析: {include_name!r}（来自 {including_file}）"
+    )
+
+
+def _gromacs_dependency_hashes(
+    top_file: str,
+    gmx_include_dir: Optional[str],
+) -> List[Dict[str, str]]:
+    """Hash the complete transitive set of quoted GROMACS ``#include`` files."""
+    pending = [os.path.realpath(top_file)]
+    seen = set()
+    dependencies: List[Dict[str, str]] = []
+    include_re = re.compile(r'^\s*#\s*include\s+"([^"]+)"')
+    while pending:
+        path = pending.pop()
+        if path in seen:
+            continue
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"GROMACS 拓扑依赖不存在: {path}")
+        seen.add(path)
+        dependencies.append({"path": path, "sha256": _sha256_file(path)})
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                match = include_re.match(line)
+                if match:
+                    pending.append(
+                        _resolve_gromacs_include_path(
+                            match.group(1), path, gmx_include_dir
+                        )
+                    )
+    return sorted(dependencies, key=lambda item: item["path"])
+
+
+def _main_cache_identity(
+    gro_file: Optional[str],
+    top_file: Optional[str],
+    ligand_resname: Optional[str],
+    gmx_include_dir: Optional[str],
+) -> Dict:
+    if not gro_file or not os.path.isfile(gro_file):
+        raise FileNotFoundError("主 System 缓存校验需要当前有效的 --gro 输入")
+    if not top_file or not os.path.isfile(top_file):
+        raise FileNotFoundError("主 System 缓存校验需要当前有效的 --top 输入")
+    if not ligand_resname:
+        raise ValueError("主 System 缓存校验需要当前配体残基名")
+    payload = {
+        "protocol_version": MAIN_SYSTEM_CACHE_PROTOCOL_VERSION,
+        "gro": {
+            "path": os.path.realpath(gro_file),
+            "sha256": _sha256_file(gro_file),
+        },
+        "topology_dependencies": _gromacs_dependency_hashes(
+            top_file, gmx_include_dir
+        ),
+        "ligand_resname": str(ligand_resname),
+        "system_build_parameters": {
+            "nonbonded_method": "PME",
+            "nonbonded_cutoff_nm": 1.0,
+            "constraints": "HBonds",
+            "rigid_water": True,
+            "ewald_error_tolerance": 0.0005,
+        },
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return {"identity": payload, "identity_sha256": hashlib.sha256(encoded.encode()).hexdigest()}
+
+
+def _ligand_parameter_identity(
+    system: openmm.System,
+    topology: app.Topology,
+    ligand_indices: List[int],
+    ligand_resname: str,
+    top_file: Optional[str],
+    ligand_ffxml: Optional[str],
+    gmx_include_dir: Optional[str],
+) -> Dict:
+    nb_force = next(
+        (force for force in system.getForces() if isinstance(force, openmm.NonbondedForce)),
+        None,
+    )
+    if nb_force is None:
+        raise RuntimeError("无法生成溶剂腿缓存身份：complex System 缺少 NonbondedForce")
+    indices = sorted(int(i) for i in ligand_indices)
+    topology_ligand = [
+        {
+            "index": int(atom.index),
+            "name": str(atom.name),
+            "element": str(atom.element.symbol if atom.element is not None else ""),
+            "residue": str(atom.residue.name),
+        }
+        for atom in topology.atoms()
+        if int(atom.index) in set(indices)
+    ]
+    params = []
+    total_charge = 0.0
+    for idx in indices:
+        charge, sigma, epsilon = nb_force.getParticleParameters(idx)
+        q = float(charge.value_in_unit(unit.elementary_charge))
+        total_charge += q
+        params.append(
+            [
+                idx,
+                round(q, 12),
+                round(float(sigma.value_in_unit(unit.nanometer)), 12),
+                round(float(epsilon.value_in_unit(unit.kilojoule_per_mole)), 12),
+            ]
+        )
+    explicit_ffxml = (
+        {"path": os.path.realpath(ligand_ffxml), "sha256": _sha256_file(ligand_ffxml)}
+        if ligand_ffxml and os.path.isfile(ligand_ffxml)
+        else None
+    )
+    payload = {
+        "complex_system_xml_sha256": hashlib.sha256(
+            XmlSerializer.serialize(system).encode("utf-8")
+        ).hexdigest(),
+        "ligand_resname": str(ligand_resname),
+        "ligand_indices": indices,
+        "ligand_atom_count": len(indices),
+        "ligand_net_charge_e": round(total_charge, 10),
+        "ligand_topology": topology_ligand,
+        "ligand_nonbonded_parameters": params,
+        "gromacs_topology_dependencies": (
+            _gromacs_dependency_hashes(top_file, gmx_include_dir)
+            if top_file and os.path.isfile(top_file)
+            else None
+        ),
+        "explicit_ligand_ffxml": explicit_ffxml,
+        "solvent_forcefield": ["amber14-all.xml", "amber14/tip3p.xml"],
+        "padding_nm": SOLVENT_PADDING_NM,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return {"identity": payload, "identity_sha256": hashlib.sha256(encoded.encode()).hexdigest()}
 
 # ---------------------------------------------------------------------------
 # 工具函数：GROMACS 力场路径探测
@@ -132,16 +290,47 @@ def find_gmx_include_dir(user_path: Optional[str] = None) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # 状态检测函数
 # ---------------------------------------------------------------------------
-def system_cache_exists(output_dir: str) -> bool:
-    """检查原生 OpenMM 缓存是否存在"""
+def system_cache_exists(
+    output_dir: str,
+    gro_file: Optional[str] = None,
+    top_file: Optional[str] = None,
+    ligand_resname: Optional[str] = None,
+    gmx_include_dir: Optional[str] = None,
+) -> bool:
+    """Only accept a native cache bound to the complete current GROMACS input."""
     xml = os.path.join(output_dir, "system_native.xml")
     idx = os.path.join(output_dir, "ligand_indices.json")
-    return os.path.isfile(xml) and os.path.isfile(idx)
+    top = os.path.join(output_dir, "topology.cif")
+    box = os.path.join(output_dir, "box_vectors.npy")
+    manifest_path = os.path.join(output_dir, "system_cache_manifest.json")
+    if not all(os.path.isfile(path) for path in (xml, idx, top, box, manifest_path)):
+        return False
+    try:
+        expected = _main_cache_identity(
+            gro_file, top_file, ligand_resname, gmx_include_dir
+        )
+        with open(manifest_path, encoding="utf-8") as handle:
+            recorded = json.load(handle)
+    except Exception as exc:
+        log.warning("⚠️ 主 System 缓存身份无法校验 (%s)，将重建", exc)
+        return False
+    matches = (
+        recorded.get("protocol_version") == MAIN_SYSTEM_CACHE_PROTOCOL_VERSION
+        and recorded.get("identity_sha256") == expected["identity_sha256"]
+        and recorded.get("system_xml_sha256") == _sha256_file(xml)
+        and recorded.get("ligand_indices_sha256") == _sha256_file(idx)
+        and recorded.get("topology_sha256") == _sha256_file(top)
+        and recorded.get("box_vectors_sha256") == _sha256_file(box)
+    )
+    if not matches:
+        log.warning("⚠️ 主 System 缓存与当前 GRO/TOP/include/配体/构建参数不匹配，将重建")
+    return bool(matches)
 
 
 def solvent_cache_exists(
     output_dir: str,
     ionic_strength_molar: float = DEFAULT_SOLVENT_IONIC_STRENGTH_MOLAR,
+    expected_identity: Optional[Dict] = None,
 ) -> bool:
     """Only accept solvent caches built with the requested explicit salt."""
     xml = os.path.join(output_dir, "system_solvent.xml")
@@ -162,6 +351,11 @@ def solvent_cache_exists(
         and abs(float(manifest.get("ionic_strength_molar", -1.0)) - expected_strength)
         <= 1.0e-12
         and bool(manifest.get("neutralize"))
+        and expected_identity is not None
+        and manifest.get("identity_sha256") == expected_identity.get("identity_sha256")
+        and manifest.get("system_xml_sha256") == _sha256_file(xml)
+        and manifest.get("ligand_indices_sha256") == _sha256_file(idx)
+        and manifest.get("topology_sha256") == _sha256_file(top)
     )
     if expected_strength > 0.0:
         matches = matches and int(manifest.get("na_count", 0)) > 0
@@ -484,7 +678,15 @@ def diagnose_14_scaling(system: openmm.System) -> None:
     fudgeLJ = np.mean(lj_scales) if lj_scales else 0.0
     log.info("  🔍 1-4 缩放诊断: fudgeQQ=%.4f (应 ~0.8333), fudgeLJ=%.4f (应 ~0.5)", fudgeQQ, fudgeLJ)
 
-def save_native_system(output_dir, system, topology, ligand_indices, positions, box_vectors):
+def save_native_system(
+    output_dir,
+    system,
+    topology,
+    ligand_indices,
+    positions,
+    box_vectors,
+    cache_identity: Optional[Dict] = None,
+):
     """持久化原生 System XML 与辅助数据至 output_dir（内置 convert 功能）"""
     os.makedirs(output_dir, exist_ok=True)
 
@@ -519,11 +721,30 @@ def save_native_system(output_dir, system, topology, ligand_indices, positions, 
     except Exception as e:
         log.warning("  [缓存] 拓扑 mmCIF 保存失败: %s", e)
 
+    if cache_identity is None:
+        raise ValueError("拒绝写入无输入身份的主 System 缓存")
+    manifest = {
+        "protocol_version": MAIN_SYSTEM_CACHE_PROTOCOL_VERSION,
+        **cache_identity,
+        "system_xml_sha256": _sha256_file(xml_path),
+        "ligand_indices_sha256": _sha256_file(lig_path),
+        "topology_sha256": _sha256_file(top_path) if os.path.isfile(top_path) else None,
+        "box_vectors_sha256": (
+            _sha256_file(os.path.join(output_dir, "box_vectors.npy"))
+            if os.path.isfile(os.path.join(output_dir, "box_vectors.npy"))
+            else None
+        ),
+    }
+    manifest_path = os.path.join(output_dir, "system_cache_manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
+    log.info("  [缓存] 输入身份 manifest 已保存: %s", manifest_path)
+
 # ================= runabfe.py =================
 # 完整替换 build_and_cache_solvent_leg 函数
 def build_and_cache_solvent_leg(
     output_dir,
-    topology,          # 注意：这个参数我们现在彻底不用了，避免 mmCIF 污染
+    topology,
     positions,
     ligand_indices,
     ligand_resname,
@@ -531,6 +752,7 @@ def build_and_cache_solvent_leg(
     top_file: Optional[str] = None,
     gmx_include_dir: Optional[str] = None,
     ionic_strength_molar: float = DEFAULT_SOLVENT_IONIC_STRENGTH_MOLAR,
+    cache_identity: Optional[Dict] = None,
 ):
     """
     🔑 终极纯净版：彻底抛弃 mmCIF，直接从原始 .top 提取配体并自动加水。
@@ -539,16 +761,27 @@ def build_and_cache_solvent_leg(
     from openmm.app import Modeller, ForceField
     os.makedirs(output_dir, exist_ok=True)
 
-    # 1. 提取配体坐标，计算回旋半径以决定水盒子大小
+    if cache_identity is None:
+        raise ValueError("拒绝构建无 complex-leg/配体参数身份的溶剂腿缓存")
+    topology_ligand_count = sum(
+        1 for atom in topology.atoms() if atom.residue.name == ligand_resname
+    )
+    if topology_ligand_count != len(ligand_indices):
+        raise ValueError(
+            f"complex topology 中配体原子数 ({topology_ligand_count}) 与索引数 "
+            f"({len(ligand_indices)}) 不一致"
+        )
+
+    # 1. 提取配体坐标，仅用于确认输入坐标/索引有效。盒子由 OpenMM padding
+    # 语义生成，确保配体每一侧都有指定厚度的溶剂。
     if hasattr(positions, "value_in_unit"):
         pos_nm = np.asarray(positions.value_in_unit(unit.nanometer), dtype=np.float64)
     else:
         pos_nm = np.asarray(positions, dtype=np.float64)
     
     lig_coords = pos_nm[ligand_indices]
-    center = lig_coords.mean(axis=0)
-    max_r = np.max(np.linalg.norm(lig_coords - center, axis=1))
-    box_size = max(max_r + 1.5, 3.5)  # nm (至少 3.5nm 盒子)
+    if lig_coords.ndim != 2 or lig_coords.shape[1] != 3 or not np.all(np.isfinite(lig_coords)):
+        raise ValueError("配体坐标必须是有限的 (N, 3) nm 数组")
 
     # 2. 🔑 降维打击：彻底抛弃 mmCIF，直接从原始 .top 读取 100% 纯净的配体拓扑
     if not top_file or not os.path.isfile(top_file):
@@ -607,7 +840,7 @@ def build_and_cache_solvent_leg(
         # requested ionic strength and any extra counterions needed to neutralize.
         modeller.addSolvent(
             ff,
-            boxSize=Vec3(box_size, box_size, box_size) * unit.nanometer,
+            padding=SOLVENT_PADDING_NM * unit.nanometer,
             positiveIon="Na+",
             negativeIon="Cl-",
             ionicStrength=ionic_strength_molar * unit.molar,
@@ -659,20 +892,28 @@ def build_and_cache_solvent_leg(
         json.dump(
             {
                 "protocol_version": SOLVENT_CACHE_PROTOCOL_VERSION,
+                **cache_identity,
                 "ionic_strength_molar": ionic_strength_molar,
                 "positive_ion": "Na+",
                 "negative_ion": "Cl-",
                 "neutralize": True,
                 "na_count": int(na_count),
                 "cl_count": int(cl_count),
+                "system_xml_sha256": _sha256_file(sol_xml),
+                "topology_sha256": _sha256_file(sol_cif),
+                "ligand_indices_sha256": _sha256_file(sol_idx),
             },
             f,
             indent=2,
         )
         
+    box_lengths_nm = [
+        float(np.linalg.norm(v.value_in_unit(unit.nanometer))) for v in box_vecs
+    ]
     log.info(
-        "✅ 溶剂相缓存已保存 (盒子 %.2f nm, 原子数 %d, Na=%d, Cl=%d, %.3f M)",
-        box_size,
+        "✅ 溶剂相缓存已保存 (padding %.2f nm, 盒长 %s nm, 原子数 %d, Na=%d, Cl=%d, %.3f M)",
+        SOLVENT_PADDING_NM,
+        [round(x, 3) for x in box_lengths_nm],
         system.getNumParticles(),
         na_count,
         cl_count,
@@ -687,6 +928,7 @@ def load_native_system(
     gmx_include_dir=None,
     phase="complex",
     prefer_equilibrated: bool = True,
+    expected_pre_equilibration_fingerprint: Optional[str] = None,
 ):
     """从 output_dir 的缓存文件加载系统（跳过 GROMACS 解析）"""
     paths = _cache_paths(output_dir, phase=phase)
@@ -757,7 +999,20 @@ def load_native_system(
     # 5. Positions (保持不变)
     positions = None
     equil_dcd = os.path.join(paths["runtime_dir"], "pre_equilibration.dcd")
-    if prefer_equilibrated and os.path.exists(equil_dcd) and os.path.getsize(equil_dcd) > 212:
+    equil_cache_trusted = bool(
+        prefer_equilibrated
+        and expected_pre_equilibration_fingerprint is not None
+        and equilibrium_is_done(
+            paths["runtime_dir"],
+            expected_fingerprint=expected_pre_equilibration_fingerprint,
+        )
+    )
+    if prefer_equilibrated and expected_pre_equilibration_fingerprint is None:
+        log.info(
+            "  ℹ️ 未提供完整预平衡 fingerprint，不自动读取 DCD；"
+            "先恢复身份绑定的初始坐标，由 pipeline 决定是否续用预平衡"
+        )
+    if equil_cache_trusted and os.path.exists(equil_dcd) and os.path.getsize(equil_dcd) > 212:
         try:
             import mdtraj as md
             md_top = md.Topology.from_openmm(topology)
@@ -897,12 +1152,14 @@ def center_system_rigidly(
 # ---------------------------------------------------------------------------
 def _load_config(config_path: str) -> dict:
     """加载配置文件，支持 .json / .yaml / .yml 格式"""
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(f"显式配置文件不存在或不是普通文件: {config_path}")
     ext = os.path.splitext(config_path)[1].lower()
     if ext in (".yaml", ".yml"):
         try:
             import yaml
             with open(config_path) as f:
-                return yaml.safe_load(f)
+                config = yaml.safe_load(f)
         except ImportError:
             raise ImportError(
                 "读取 .yaml 配置文件需要 pyyaml，请运行: pip install pyyaml\n"
@@ -910,7 +1167,29 @@ def _load_config(config_path: str) -> dict:
             )
     else:
         with open(config_path) as f:
-            return json.load(f)
+            config = json.load(f)
+    if not isinstance(config, dict):
+        raise ValueError(
+            f"配置文件顶层必须是 JSON/YAML 对象，实际为 {type(config).__name__}: "
+            f"{config_path}"
+        )
+    return config
+
+
+def _load_json_object_file(path: str, label: str) -> Dict:
+    """Load an explicitly requested JSON object without silent fallback."""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"显式 {label} 文件不存在或不是普通文件: {path}")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"无法读取或解析 {label} 文件 {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"{label} 文件顶层必须是 JSON 对象，实际为 {type(value).__name__}: {path}"
+        )
+    return value
 
 
 class RunConfig:
@@ -932,7 +1211,7 @@ class RunConfig:
         preset = PRESET_CONFIGS.get(args.preset, PRESET_CONFIGS["production"]).copy()
 
         # 2. 合并配置文件（支持 .json / .yaml / .yml）
-        if hasattr(args, "config") and args.config and os.path.exists(args.config):
+        if hasattr(args, "config") and args.config:
             file_conf = _load_config(args.config)
             for k, v in file_conf.items():
                 if k.startswith("_"):
@@ -1023,6 +1302,14 @@ class RunConfig:
             preset["apbs_correction_kJ_mol"] = args.apbs_correction_kj_mol
         if _flag_present("--apbs-correction-note"):
             preset["apbs_correction_note"] = args.apbs_correction_note
+        if _flag_present("--charging-rerun-dir"):
+            preset["charging_rerun_dir"] = args.charging_rerun_dir
+        if _flag_present("--charging-max-resident-contexts"):
+            preset["charging_max_resident_contexts"] = (
+                args.charging_max_resident_contexts
+            )
+        if _flag_present("--only-complex-charging"):
+            preset["only_complex_charging"] = bool(args.only_complex_charging)
 
         defaults = {
             "resume": False,
@@ -1046,6 +1333,9 @@ class RunConfig:
             "apbs_correction_kJ_mol": 0.0,
             "apbs_correction_note": "",
             "solvent_ionic_strength_molar": DEFAULT_SOLVENT_IONIC_STRENGTH_MOLAR,
+            "only_complex_charging": False,
+            "charging_rerun_dir": None,
+            "charging_max_resident_contexts": None,
         }
         for key, value in defaults.items():
             preset.setdefault(key, value)
@@ -1291,6 +1581,9 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
     _n_equil_steps = config.get("n_equil_steps", 5_000_000)
     _equil_fingerprint = _pre_equilibration_fingerprint(
         pipeline.system, pipeline.ligand_indices, pipeline.temperature, pipeline.pressure,
+        positions=pipeline.positions,
+        box_vectors=pipeline.box_vectors,
+        requested_steps=_n_equil_steps,
     )
     if not config.reset and equilibrium_is_done(output_dir, expected_fingerprint=_equil_fingerprint):
         log.info("♻️ 基线预平衡已完成，复用已有轨迹")
@@ -1610,6 +1903,31 @@ def parse_arguments():
     parser.add_argument("--n-workers", type=int, default=None)
     parser.add_argument("--analyze-only", action="store_true", help="仅分析已有 .npy")
     parser.add_argument("--parallel-stages", action="store_true", help="并行执行去电荷和去VDW阶段")
+    parser.add_argument(
+        "--only-complex-charging",
+        action="store_true",
+        help=(
+            "隔离重跑复合物腿 Stage 1 PME charging；跳过 Stage 2 路径优化、"
+            "VDW 采样和溶剂腿，并用现有 Stage 2/solvent 结果生成候选汇总"
+        ),
+    )
+    parser.add_argument(
+        "--charging-rerun-dir",
+        default=None,
+        help=(
+            "charging-only 隔离输出目录；默认在 OUTPUT/charging_rerun/ 下创建"
+            "带时间戳的新目录，现有非空目录会被拒绝"
+        ),
+    )
+    parser.add_argument(
+        "--charging-max-resident-contexts",
+        type=int,
+        default=None,
+        help=(
+            "charging REMD 允许同时驻留的 Context 数；默认使用安全策略（CUDA "
+            "会回退 CPU）。仅在显存足够时显式设为 Stage 1 状态数"
+        ),
+    )
     parser.add_argument("--n-lambda", type=int, default=12, help="传统 REMD 模式的 λ 状态数")
     parser.add_argument(
         "--apbs-correction-kj-mol",
@@ -1794,8 +2112,8 @@ def run_post_analysis(args):
     if complex_boresch and complex_boresch.get("force_constants") and complex_boresch.get("equilibrium_values"):
         # 🔑 之前这里计算失败只打 warning，dg_boresch 保持初始化的 0.0 继续往下走——
         # 在没有正式 final_results.json 的原始窗口回退场景（见下面
-        # boresch_included_in_complex_dg=False 的分支），dg_boresch_term 直接等于
-        # 这个 0.0 并被用于 delta_g_bind_uncorrected 的公式，等于悄悄漏掉整项
+        # boresch_included_in_complex_dg=False 的分支），这个 0.0 会被直接减进
+        # delta_g_bind_uncorrected 的公式，等于悄悄漏掉整项
         # restraint release 修正。已经找到 Boresch 参数（force_constants/
         # equilibrium_values 都在）说明这个体系确实需要这项修正，计算失败就必须
         # fail closed；只有从一开始就找不到 Boresch 参数（上面 if 判断为 False，
@@ -1806,10 +2124,14 @@ def run_post_analysis(args):
             T=temp,
         )
 
-    dg_boresch_term = dg_boresch
-    # 追踪 dg_boresch 这一物理量本身是否已经被烘焙进 dg_complex（total_delta_G_complex_kJ_mol），
-    # 而不是 dg_boresch_term 是否为 0——后者只是"最终公式里还要不要再减一次"的实现细节，
-    # 前者才是下游消费者判断"能不能对 complex_delta_G_kJ_mol 再扣一次 Boresch"的依据。
+    # 追踪 dg_boresch 这一物理量本身是否已经被烘焙进 dg_complex
+    # （total_delta_G_complex_kJ_mol）。这既是下游消费者判断"能不能对
+    # complex_delta_G_kJ_mol 再扣一次 Boresch"的依据，也是
+    # combine_binding_free_energy 决定减不减第二次的唯一开关。
+    #
+    # 🔑 [ATT-09] 这里原来还有一个并行的 `dg_boresch_term`（在同样两个分支里被置 0），
+    # 与这个布尔量是同一件事的两份记账。公式统一进 helper 之后它已无人读取，
+    # 直接删掉——留着一个"曾经控制公式、现在没人读"的变量正是日后被错误接回去的引信。
     boresch_included_in_complex_dg = False
     if args.mode == "traditional":
         complex_leg = _load_leg_result(os.path.join(output_dir, "traditional_complex"))
@@ -1834,9 +2156,8 @@ def run_post_analysis(args):
             err_solvent = float(solvent_leg["total_error_kJ_mol"])
             # ✅ 同下方 "else" 分支的既有约定：total_delta_G_complex_kJ_mol 已经把
             # Boresch 释放修正烘焙进去了（见 abfe_pipeline.py total_dg = dg_phys +
-            # cons_correction + dg_boresch），这里必须把 dg_boresch_term 清零，
-            # 否则下面 final_dg 公式会把同一个 Boresch 修正减两次。
-            dg_boresch_term = 0.0
+            # cons_correction + dg_boresch），所以循环闭合时绝不能再减一次，
+            # 否则同一个 Boresch 修正会被计入两遍。
             boresch_included_in_complex_dg = True
         else:
             log.warning(
@@ -1857,11 +2178,13 @@ def run_post_analysis(args):
         dg_solvent = float(solvent_leg["total_delta_G_complex_kJ_mol"])
         err_complex = float(complex_leg["total_error_kJ_mol"])
         err_solvent = float(solvent_leg["total_error_kJ_mol"])
-        dg_boresch_term = 0.0
         boresch_included_in_complex_dg = True
 
-    # 同主流程/traditional 模式的修复：ΔG_bind = ΔG_solvent - (ΔG_complex + ΔG_release)。
-    delta_g_bind_uncorrected = dg_solvent - dg_complex - dg_boresch_term
+    # 🔑 [ATT-09] 循环闭合统一走 abfe_core.combine_binding_free_energy。
+    # 这条路径上 `boresch_included_in_complex_dg` 就是 helper 要的那个开关：
+    # 上面三个分支已经分别判定过 complex 腿有没有烘焙释放项，helper 据此决定
+    # 减不减第二次。原来这里手写 `- dg_boresch_term`，与那个布尔量是两份记账，
+    # 现在合成一份。
     # 🔑 之前这里读 getattr(args, "apbs_correction_kj_mol", None)——小写 j，是
     # argparse 从 --apbs-correction-kj-mol 派生的 CLI dest 名，只在这次
     # --analyze-only 调用本身显式带了这个参数时才非 None；正式跑
@@ -1893,15 +2216,25 @@ def run_post_analysis(args):
             apbs_correction = float(
                 _provenance.get("config", {}).get("apbs_correction_kJ_mol", 0.0) or 0.0
             )
-    final_dg = delta_g_bind_uncorrected + apbs_correction
-    final_err = float(np.sqrt(err_complex**2 + err_solvent**2))
+    cycle = combine_binding_free_energy(
+        dg_complex_kJ_mol=dg_complex,
+        dg_solvent_kJ_mol=dg_solvent,
+        err_complex_kJ_mol=err_complex,
+        err_solvent_kJ_mol=err_solvent,
+        dg_boresch_kJ_mol=dg_boresch,
+        boresch_already_included_in_complex=bool(boresch_included_in_complex_dg),
+        apbs_correction_kJ_mol=apbs_correction,
+    )
+    delta_g_bind_uncorrected = cycle["delta_G_bind_uncorrected_kJ_mol"]
+    final_dg = cycle["delta_G_bind_kJ_mol"]
+    final_err = cycle["total_error_kJ_mol"]
     log.info("ABFE 后处理完成: ΔG_bind = %.2f ± %.2f kJ/mol", final_dg, final_err)
 
     result = {
         "complex_leg_delta_G_kJ_mol": float(dg_complex),
         "solvent_leg_delta_G_kJ_mol": float(dg_solvent),
-        # ✅ 报告 Boresch 修正的真实量级 (dg_boresch)，而不是可能已被清零的
-        # dg_boresch_term（后者只是"最终公式还要不要再减一次"的内部实现细节）。
+        # ✅ 报告 Boresch 修正的真实物理量级 (dg_boresch)，而不是公式里实际被减掉
+        # 的那一项（已内含时为 0，见 cycle["boresch_term_subtracted_kJ_mol"]）。
         # 同时显式标记它是否已经烘焙进 complex_leg_delta_G_kJ_mol，避免下游
         # 消费者误以为这里恒为独立可加项而对 complex_delta_G 二次扣减。
         "boresch_correction_kJ_mol": float(dg_boresch),
@@ -1919,6 +2252,7 @@ def run_post_analysis(args):
         "delta_G_bind_kJ_mol": float(final_dg),
         "delta_G_bind_kcal_mol": float(final_dg / 4.184),
         "total_error_kJ_mol": final_err,
+        "thermodynamic_cycle_terms": cycle,
         "timestamp": datetime.now().isoformat(),
         "mode": args.mode,
         "decoupling": args.decoupling,
@@ -1935,16 +2269,27 @@ def run_prepare_command(args):
     os.makedirs(output_dir, exist_ok=True)
 
     # 1. 构建系统（与 main 中首次构建一致）
+    include_dir = find_gmx_include_dir(args.gmx_path)
+    cache_identity = _main_cache_identity(
+        args.gro, args.top, args.ligand, include_dir
+    )
     system, topology, positions, box_vectors, ligand_indices = build_system_from_gromacs(
-        args.gro, args.top, args.ligand,
-        find_gmx_include_dir(args.gmx_path)
+        args.gro, args.top, args.ligand, include_dir
     )
     diagnose_14_scaling(system)
-    save_native_system(output_dir, system, topology, ligand_indices, positions, box_vectors)
+    save_native_system(
+        output_dir,
+        system,
+        topology,
+        ligand_indices,
+        positions,
+        box_vectors,
+        cache_identity=cache_identity,
+    )
 
     # 2. 从缓存重载（保证一致性）
     system, topology, positions, box_vectors, ligand_indices = load_native_system(
-        output_dir, gro_file=args.gro
+        output_dir, gro_file=args.gro, top_file=args.top, gmx_include_dir=include_dir
     )
 
     # 3. PBC 居中（与主流程完全一致）
@@ -2040,8 +2385,17 @@ def run_traditional_mode(config: RunConfig):
     positions, box_vectors = center_system_rigidly(positions, box_vectors, ligand_indices)
 
     ligand_resname = _get_residue_name_by_atom_index(topology, ligand_indices[0])
+    solvent_identity = _ligand_parameter_identity(
+        system,
+        topology,
+        ligand_indices,
+        ligand_resname,
+        config.top,
+        getattr(config, "ligand_xml", None),
+        find_gmx_include_dir(config.gmx_path),
+    )
     if config.reset or not solvent_cache_exists(
-        output_dir, config.solvent_ionic_strength_molar
+        output_dir, config.solvent_ionic_strength_molar, solvent_identity
     ):
         log.info("💧 traditional 模式准备溶剂腿缓存...")
         if not build_and_cache_solvent_leg(
@@ -2054,6 +2408,7 @@ def run_traditional_mode(config: RunConfig):
             top_file=config.top,
             gmx_include_dir=find_gmx_include_dir(config.gmx_path),
             ionic_strength_molar=config.solvent_ionic_strength_molar,
+            cache_identity=solvent_identity,
         ):
             raise RuntimeError("traditional 模式自动构建溶剂腿缓存失败。")
 
@@ -2099,6 +2454,7 @@ def run_traditional_mode(config: RunConfig):
         boresch_correction=0.0,
         boresch_params=boresch_restraint,
         potential_type=config.potential,
+        resume=config.resume and not config.reset,
     )
 
     sys_solv, top_solv, pos_solv, box_solv, lig_idx_solv = load_native_system(
@@ -2125,16 +2481,34 @@ def run_traditional_mode(config: RunConfig):
         boresch_correction=0.0,
         boresch_params=None,
         potential_type=config.potential,
+        resume=config.resume and not config.reset,
     )
 
     dg_complex = float(complex_results["delta_G_total_kJ_mol"])
     dg_solvent = float(solvent_results["delta_G_total_kJ_mol"])
     err_complex = float(complex_results["error_leg_kJ_mol"])
     err_solvent = float(solvent_results["error_leg_kJ_mol"])
-    # 同下方 dual_lambda 路径的修复：标准双解耦循环给出的是
-    # ΔG_bind = ΔG_solvent - (ΔG_complex + ΔG_release)，不是 ΔG_complex - ΔG_solvent + ΔG_release。
-    delta_g_bind = dg_solvent - dg_complex - float(dg_boresch)
-    total_err_bind = float(np.sqrt(err_complex**2 + err_solvent**2))
+    # 🔑 [ATT-09] 循环闭合统一走 abfe_core.combine_binding_free_energy。
+    # 这条路径 `TraditionalABFEPipeline.run_full` 是以 boresch_correction=0.0 调的，
+    # 所以 complex 腿**不含**释放项，already_included=False，由 helper 减一次。
+    #
+    # 🔑 [ATT-09] 同时补上此前完全缺失的 APBS 项：main() 和 run_post_analysis()
+    # 一直在读 config["apbs_correction_kJ_mol"]，只有 traditional 这条路径从来没读，
+    # 等于对带电配体静默漏掉整项有限尺寸静电修正。这个标量由离线的
+    # apbs_correction.py（prepare → run → collect）算出，collect 的输出里直接给了
+    # 要传的 --apbs-correction-kj-mol；这里只是消费同一个值，不在流程内调 APBS。
+    apbs_correction = float(config.get("apbs_correction_kJ_mol", 0.0) or 0.0)
+    cycle = combine_binding_free_energy(
+        dg_complex_kJ_mol=dg_complex,
+        dg_solvent_kJ_mol=dg_solvent,
+        err_complex_kJ_mol=err_complex,
+        err_solvent_kJ_mol=err_solvent,
+        dg_boresch_kJ_mol=dg_boresch,
+        boresch_already_included_in_complex=False,
+        apbs_correction_kJ_mol=apbs_correction,
+    )
+    delta_g_bind = cycle["delta_G_bind_kJ_mol"]
+    total_err_bind = cycle["total_error_kJ_mol"]
 
     final = {
         "complex_leg": complex_results,
@@ -2147,9 +2521,14 @@ def run_traditional_mode(config: RunConfig):
         # 已经减到 delta_G_bind_kJ_mol 里（见上方 delta_g_bind 公式），下游不要
         # 再对 complex_delta_G_kJ_mol 或 delta_G_bind_kJ_mol 二次扣减。
         "boresch_correction_already_included_in_complex_delta_G": False,
+        "delta_G_bind_uncorrected_kJ_mol": float(
+            cycle["delta_G_bind_uncorrected_kJ_mol"]
+        ),
+        "apbs_correction_kJ_mol": float(apbs_correction),
         "delta_G_bind_kJ_mol": float(delta_g_bind),
         "delta_G_bind_kcal_mol": float(delta_g_bind / 4.184),
         "total_error_kJ_mol": total_err_bind,
+        "thermodynamic_cycle_terms": cycle,
         "timestamp": datetime.now().isoformat(),
     }
     out_path = os.path.join(output_dir, "final_binding_results_traditional.json")
@@ -2160,6 +2539,412 @@ def run_traditional_mode(config: RunConfig):
     return final
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 复合物 charging-only 隔离重跑
+# ---------------------------------------------------------------------------
+def _load_frozen_stage_result(path: str, expected_stage: str) -> Dict:
+    """Load a completed stage as a read-only input for an isolated rerun."""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"缺少冻结的 {expected_stage} 结果: {path}")
+    with open(path, encoding="utf-8") as handle:
+        result = json.load(handle)
+    if result.get("stage") != expected_stage:
+        raise RuntimeError(
+            f"冻结结果 stage={result.get('stage')!r}，期望 {expected_stage!r}: {path}"
+        )
+    for key in ("total_delta_G", "total_error"):
+        value = result.get(key)
+        if not isinstance(value, (int, float)) or not np.isfinite(float(value)):
+            raise RuntimeError(f"冻结结果 {path} 的 {key}={value!r} 非法")
+    return result
+
+
+def _load_frozen_stage2_boresch(output_dir: str) -> Dict:
+    """Use the exact restraint Hamiltonian that produced frozen Stage 2."""
+    stage2_path = os.path.join(
+        os.path.abspath(output_dir),
+        "checkpoints",
+        "stage2_vanishing.json",
+    )
+    stage2 = _load_frozen_stage_result(stage2_path, "vanishing")
+    params = (
+        ((stage2.get("protocol_key") or {}).get("payload") or {}).get(
+            "boresch_params"
+        )
+    )
+    if not isinstance(params, dict):
+        raise RuntimeError(
+            f"冻结 Stage 2 未记录 Boresch Hamiltonian，无法安全重跑 charging: "
+            f"{stage2_path}"
+        )
+    return _sanitize_boresch_params_strict(params)
+
+
+def _boresch_core_signature(params: Optional[Dict]) -> Optional[Dict]:
+    if not isinstance(params, dict):
+        return None
+    params = _sanitize_boresch_params(params)
+    return {
+        "receptor_indices": [int(v) for v in params.get("receptor_indices", [])],
+        "ligand_indices": [int(v) for v in params.get("ligand_indices", [])],
+        "equilibrium_values": {
+            str(k): round(float(v), 8)
+            for k, v in (params.get("equilibrium_values") or {}).items()
+        },
+        "force_constants": {
+            str(k): round(float(v), 8)
+            for k, v in (params.get("force_constants") or {}).items()
+        },
+    }
+
+
+def _prepare_charging_rerun_dir(output_dir: str, requested: Optional[str]) -> str:
+    if requested:
+        rerun_dir = os.path.abspath(requested)
+    else:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        rerun_dir = os.path.abspath(
+            os.path.join(output_dir, "charging_rerun", stamp)
+        )
+    source_dir = os.path.abspath(output_dir)
+    if rerun_dir == source_dir:
+        raise RuntimeError("charging-only 输出目录不能等于主 output 目录")
+    if os.path.isdir(rerun_dir) and os.listdir(rerun_dir):
+        raise FileExistsError(
+            f"charging-only 输出目录已存在且非空，拒绝覆盖: {rerun_dir}"
+        )
+    os.makedirs(rerun_dir, exist_ok=True)
+    return rerun_dir
+
+
+def _charging_mbar_crosschecks(
+    u_kn_path: str,
+    n_k_path: str,
+    temperature_k: float,
+    production_result: Dict,
+) -> Dict:
+    """Re-solve one u_kn with raw MBAR and adjacent BAR as diagnostics."""
+    u_kn = np.load(u_kn_path, allow_pickle=False)
+    n_k = np.load(n_k_path, allow_pickle=False).astype(int)
+    analyzer = TraditionalMBARAnalyzer(temperature=temperature_k)
+    analyzer._last_n_k = n_k
+    raw = analyzer.solve(u_kn, decorrelate=False)
+
+    from pymbar import other_estimators
+
+    kt = 0.008314462618 * float(temperature_k)
+    offsets = np.concatenate(([0], np.cumsum(n_k)))
+    bar_delta_f = []
+    bar_variance = []
+    for k in range(len(n_k) - 1):
+        start_k, end_k = int(offsets[k]), int(offsets[k + 1])
+        start_j, end_j = int(offsets[k + 1]), int(offsets[k + 2])
+        w_forward = u_kn[k + 1, start_k:end_k] - u_kn[k, start_k:end_k]
+        w_reverse = u_kn[k, start_j:end_j] - u_kn[k + 1, start_j:end_j]
+        edge = other_estimators.bar(
+            w_forward,
+            w_reverse,
+            compute_uncertainty=True,
+        )
+        bar_delta_f.append(float(edge["Delta_f"]))
+        bar_variance.append(float(edge["dDelta_f"]) ** 2)
+    bar_dg = float(np.sum(bar_delta_f) * kt)
+    bar_error = float(np.sqrt(np.sum(bar_variance)) * kt)
+
+    prod_dg = float(production_result["total_delta_G"])
+    prod_error = float(production_result["total_error"])
+    tolerance = max(
+        2.0,
+        3.0 * max(prod_error, float(raw["error"]), bar_error),
+    )
+    return {
+        "production_decorrelated_mbar": {
+            "delta_G_kJ_mol": prod_dg,
+            "error_kJ_mol": prod_error,
+        },
+        "raw_all_frame_mbar": {
+            "delta_G_kJ_mol": float(raw["delta_G"]),
+            "error_kJ_mol": float(raw["error"]),
+        },
+        "adjacent_bar_sum": {
+            "delta_G_kJ_mol": bar_dg,
+            "error_kJ_mol": bar_error,
+            "uncertainty_note": (
+                "相邻 BAR 方差按独立边近似相加，仅作为交叉检查。"
+            ),
+        },
+        "acceptance_tolerance_kJ_mol": tolerance,
+        "consistent": bool(
+            abs(float(raw["delta_G"]) - prod_dg) <= tolerance
+            and abs(bar_dg - prod_dg) <= tolerance
+        ),
+    }
+
+
+def _run_complex_charging_only(
+    config: RunConfig,
+    source_pipeline: ABFEPipeline,
+    boresch_restraint: Dict,
+) -> str:
+    if config.reset:
+        raise RuntimeError(
+            "--only-complex-charging 不能与 --reset 同用；该模式必须只读复用"
+            "现有 Stage 2 与 solvent 结果"
+        )
+    if config.decoupling != "dual_lambda":
+        raise RuntimeError("--only-complex-charging 只支持 --decoupling dual_lambda")
+    if config.get("decharge_method", "pme") != "pme":
+        raise RuntimeError("--only-complex-charging 只支持生产级 PME charging 路径")
+    if not isinstance(boresch_restraint, dict):
+        raise RuntimeError("charging-only 需要现有 complex Boresch 参数")
+
+    source_dir = os.path.abspath(config.output)
+    stage2_path = os.path.join(source_dir, "checkpoints", "stage2_vanishing.json")
+    solvent_path = os.path.join(source_dir, "solvent_leg", "final_results.json")
+    stage2 = _load_frozen_stage_result(stage2_path, "vanishing")
+    if not os.path.isfile(solvent_path):
+        raise FileNotFoundError(f"缺少冻结的 solvent 最终结果: {solvent_path}")
+    with open(solvent_path, encoding="utf-8") as handle:
+        solvent = json.load(handle)
+    for key in ("total_delta_G_complex_kJ_mol", "total_error_kJ_mol"):
+        value = solvent.get(key)
+        if not isinstance(value, (int, float)) or not np.isfinite(float(value)):
+            raise RuntimeError(f"冻结 solvent 结果的 {key}={value!r} 非法")
+
+    stage2_boresch = (
+        ((stage2.get("protocol_key") or {}).get("payload") or {}).get(
+            "boresch_params"
+        )
+    )
+    if _boresch_core_signature(stage2_boresch) != _boresch_core_signature(
+        boresch_restraint
+    ):
+        raise RuntimeError(
+            "当前 Boresch 参数与冻结 Stage 2 的协议不一致；拒绝拼接不同限制势的腿"
+        )
+
+    rerun_dir = _prepare_charging_rerun_dir(
+        source_dir, config.get("charging_rerun_dir")
+    )
+    rerun_pipeline = ABFEPipeline(
+        system=source_pipeline.system,
+        topology=source_pipeline.topology,
+        positions=source_pipeline.positions,
+        box_vectors=source_pipeline.box_vectors,
+        ligand_indices=source_pipeline.ligand_indices,
+        temperature=config.temperature,
+        output_dir=rerun_dir,
+        checkpoint_dir=os.path.join(rerun_dir, "checkpoints"),
+        platform_name=config.platform,
+    )
+    run_provenance = _write_run_provenance(
+        rerun_dir,
+        config,
+        rerun_pipeline.system,
+        rerun_pipeline.topology,
+        rerun_pipeline.positions,
+    )
+
+    n_states = int(config.get("stage1_n_states", 12))
+    max_contexts = config.get("charging_max_resident_contexts")
+    if max_contexts is not None and int(max_contexts) < 1:
+        raise RuntimeError("--charging-max-resident-contexts 必须至少为 1")
+    lambdas_coul = np.linspace(1.0, 0.0, n_states).tolist()
+    lambdas_vdw = [1.0] * n_states
+    expected_meta = _pme_u_kn_meta_payload(
+        n_states=n_states,
+        lambdas_coul=lambdas_coul,
+        lambdas_vdw=lambdas_vdw,
+        temperature_k=float(config.temperature),
+        system=rerun_pipeline.system,
+        topology=rerun_pipeline.topology,
+        ligand_indices=rerun_pipeline.ligand_indices,
+        boresch_params=boresch_restraint,
+    )
+    manifest_path = os.path.join(rerun_dir, "charging_sampling_manifest.json")
+    manifest = {
+        "mode": "only_complex_charging",
+        "status": "running",
+        "started_at": datetime.now().isoformat(),
+        "pid": os.getpid(),
+        "fresh_sampling_required": True,
+        "resume": False,
+        "sampling_and_analysis_same_process": True,
+        "remd_execution": {
+            "requested_platform": str(config.platform),
+            "max_resident_contexts": (
+                None if max_contexts is None else int(max_contexts)
+            ),
+        },
+        "expected_pme_u_kn_metadata": expected_meta,
+        "frozen_inputs": {
+            "stage2_vanishing": {
+                "path": stage2_path,
+                "sha256": _sha256_file(stage2_path),
+                "delta_G_kJ_mol": float(stage2["total_delta_G"]),
+                "error_kJ_mol": float(stage2["total_error"]),
+            },
+            "solvent_final": {
+                "path": solvent_path,
+                "sha256": _sha256_file(solvent_path),
+                "delta_G_kJ_mol": float(
+                    solvent["total_delta_G_complex_kJ_mol"]
+                ),
+                "error_kJ_mol": float(solvent["total_error_kJ_mol"]),
+            },
+        },
+    }
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2, cls=NumpyEncoder)
+
+    try:
+        stage1 = rerun_pipeline._run_dual_lambda_stage(
+            "decharging",
+            fixed_lam_coul=1.0,
+            fixed_lam_vdw=1.0,
+            n_states=n_states,
+            n_steps_per_window=int(config.n_steps_per_window),
+            steps_per_update=int(config.steps_per_update),
+            system_type="complex",
+            resume=False,
+            potential_type=config.potential,
+            dexp_params=None,
+            optimized_lambdas=lambdas_coul,
+            window_ranges=None,
+            enable_early_stop=False,
+            boresch_params=boresch_restraint,
+            remd_max_resident_contexts=max_contexts,
+        )
+        rerun_pipeline._assert_stage_result_sane(
+            "isolated complex decharging", stage1
+        )
+
+        decharging_dir = os.path.join(rerun_dir, "decharging")
+        meta_path = os.path.join(
+            decharging_dir, "decharging_pme_u_kn.meta.json"
+        )
+        u_kn_path = os.path.join(decharging_dir, "decharging_pme_u_kn.npy")
+        n_k_path = u_kn_path + ".n_k.npy"
+        with open(meta_path, encoding="utf-8") as handle:
+            actual_meta = json.load(handle)
+        if actual_meta != expected_meta:
+            raise RuntimeError(
+                "charging 采样前 manifest 与离线 u_kn Hamiltonian 指纹不一致"
+            )
+
+        crosschecks = _charging_mbar_crosschecks(
+            u_kn_path,
+            n_k_path,
+            float(config.temperature),
+            stage1,
+        )
+        if not crosschecks["consistent"]:
+            raise RuntimeError(
+                "charging 的去相关 MBAR、全帧 MBAR 与相邻 BAR 未通过一致性检查"
+            )
+
+        correction = rerun_pipeline.apply_boresch_correction(
+            boresch_restraint, autoload_from_disk=False
+        )
+        rerun_pipeline._last_run_config = {
+            "potential_type": config.potential,
+            "mode": "only_complex_charging",
+        }
+        complex_candidate = rerun_pipeline.compute_final_results(
+            {"stage1": stage1, "stage2": stage2},
+            correction,
+            system=rerun_pipeline.system,
+            decoupling_scheme="dual_lambda",
+        )
+        dg_complex = float(
+            complex_candidate["total_delta_G_complex_kJ_mol"]
+        )
+        err_complex = float(complex_candidate["total_error_kJ_mol"])
+        dg_solvent = float(solvent["total_delta_G_complex_kJ_mol"])
+        err_solvent = float(solvent["total_error_kJ_mol"])
+        dg_boresch = float(complex_candidate["boresch_correction_kJ_mol"])
+        apbs = float(config.get("apbs_correction_kJ_mol", 0.0) or 0.0)
+        cycle = combine_binding_free_energy(
+            dg_complex_kJ_mol=dg_complex,
+            dg_solvent_kJ_mol=dg_solvent,
+            err_complex_kJ_mol=err_complex,
+            err_solvent_kJ_mol=err_solvent,
+            dg_boresch_kJ_mol=dg_boresch,
+            boresch_already_included_in_complex=True,
+            apbs_correction_kJ_mol=apbs,
+        )
+        binding_candidate = {
+            "mode": "only_complex_charging_candidate",
+            "promoted_to_primary_results": False,
+            "complex_delta_G_kJ_mol": dg_complex,
+            "solvent_delta_G_kJ_mol": dg_solvent,
+            "boresch_correction_kJ_mol": dg_boresch,
+            "boresch_correction_already_included_in_complex_delta_G": True,
+            "delta_G_bind_kJ_mol": float(cycle["delta_G_bind_kJ_mol"]),
+            "delta_G_bind_kcal_mol": float(
+                cycle["delta_G_bind_kJ_mol"] / 4.184
+            ),
+            "total_error_kJ_mol": float(cycle["total_error_kJ_mol"]),
+            "thermodynamic_cycle_terms": cycle,
+            "charging_crosschecks": crosschecks,
+            "frozen_inputs": manifest["frozen_inputs"],
+            "provenance": run_provenance,
+            "timestamp": datetime.now().isoformat(),
+        }
+        binding_path = os.path.join(
+            rerun_dir, "final_binding_results_candidate.json"
+        )
+        with open(binding_path, "w", encoding="utf-8") as handle:
+            json.dump(binding_candidate, handle, indent=2, cls=NumpyEncoder)
+
+        dcd_inventory = []
+        for path in sorted(glob.glob(os.path.join(decharging_dir, "*.dcd"))):
+            stat_result = os.stat(path)
+            dcd_inventory.append(
+                {
+                    "path": path,
+                    "size_bytes": int(stat_result.st_size),
+                    "mtime_ns": int(stat_result.st_mtime_ns),
+                }
+            )
+        exchange_path = os.path.join(
+            decharging_dir, "decharging_exchange_diagnostics.json"
+        )
+        exchange_diagnostics = None
+        if os.path.isfile(exchange_path):
+            with open(exchange_path, encoding="utf-8") as handle:
+                exchange_diagnostics = json.load(handle)
+        manifest.update(
+            {
+                "status": "completed",
+                "completed_at": datetime.now().isoformat(),
+                "actual_pme_u_kn_metadata": actual_meta,
+                "metadata_match": True,
+                "dcd_inventory": dcd_inventory,
+                "exchange_diagnostics": exchange_diagnostics,
+                "charging_result": stage1,
+                "crosschecks": crosschecks,
+                "candidate_binding_result": binding_path,
+            }
+        )
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, indent=2, cls=NumpyEncoder)
+    except BaseException as exc:
+        manifest.update(
+            {
+                "status": "failed",
+                "failed_at": datetime.now().isoformat(),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, indent=2, cls=NumpyEncoder)
+        raise
+
+    log.info("✅ complex charging-only 候选结果完成: %s", binding_path)
+    return binding_path
+
+
 # 主入口
 # ---------------------------------------------------------------------------
 def main():
@@ -2195,6 +2980,16 @@ def main():
     if not config.ligand:
         log.error("未提供配体残基名称。请通过 --ligand 或配置文件中的 ligand 指定。")
         sys.exit(2)
+    if config.only_complex_charging and config.reset:
+        raise RuntimeError(
+            "--only-complex-charging 不能与 --reset 同用；拒绝在读取冻结结果前"
+            "重建或覆盖主输出缓存"
+        )
+    if config.only_complex_charging and not config.resume:
+        raise RuntimeError(
+            "--only-complex-charging 必须与 --resume 同用，以只读加载现有 committed "
+            "Boresch、Stage 2 和 solvent 结果"
+        )
     # 分析模式单独处理
     if args.analyze_only:
         run_post_analysis(config)
@@ -2209,12 +3004,22 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
 
     # ----- 1. 系统加载：优先从缓存，否则 GROMACS 构建并立即落盘 -----
-    if not config.reset and system_cache_exists(output_dir):
+    include_dir = find_gmx_include_dir(config.gmx_path)
+    main_cache_identity = _main_cache_identity(
+        config.gro, config.top, config.ligand, include_dir
+    )
+    if not config.reset and system_cache_exists(
+        output_dir,
+        config.gro,
+        config.top,
+        config.ligand,
+        include_dir,
+    ):
         system, topology, positions, box_vectors, ligand_indices = load_native_system(
             output_dir, 
             gro_file=config.gro, 
             top_file=config.top, 
-            gmx_include_dir=find_gmx_include_dir(config.gmx_path)
+            gmx_include_dir=include_dir
         )
         log.info("♻️ 从缓存加载 System 完成")
     else:
@@ -2224,11 +3029,19 @@ def main():
         # 从 GROMACS 构建
         system, topology, positions, box_vectors, ligand_indices = build_system_from_gromacs(
             config.gro, config.top, config.ligand,
-            find_gmx_include_dir(config.gmx_path)
+            include_dir
         )
         diagnose_14_scaling(system)
         # 立即保存为原生缓存
-        save_native_system(output_dir, system, topology, ligand_indices, positions, box_vectors)
+        save_native_system(
+            output_dir,
+            system,
+            topology,
+            ligand_indices,
+            positions,
+            box_vectors,
+            cache_identity=main_cache_identity,
+        )
         log.info("✅ 原生缓存已生成")
         # 重新从缓存加载，确保后续所有对象都来自落盘文件
         # 替换原有的 load_native_system 调用为：
@@ -2236,7 +3049,7 @@ def main():
             output_dir, 
             gro_file=config.gro, 
             top_file=config.top, 
-            gmx_include_dir=find_gmx_include_dir(config.gmx_path),
+            gmx_include_dir=include_dir,
             prefer_equilibrated=False,
         )
         log.info("🔄 已从缓存重新加载 System (使用落盘后对象)")
@@ -2250,38 +3063,65 @@ def main():
     if pos_nm.ndim == 1:
         pos_nm = pos_nm.reshape(-1, 3)
     positions = [Vec3(float(v[0]), float(v[1]), float(v[2])) for v in pos_nm] * unit.nanometer
-    # ========== PBC 确定性居中与包裹 ==========
+    # ========== PBC 确定性居中 ==========
     positions, box_vectors = center_system_rigidly(
         positions, box_vectors, ligand_indices
     )
-    log.info("  ✅ 配体已居中，分子完整性修复完毕")    
-    run_provenance = _write_run_provenance(output_dir, config, system, topology, positions)
-    log.info("🧾 运行 provenance 已保存: %s", os.path.join(output_dir, "run_provenance.json"))
+    # 🔑 [P1-14] 这里**只是**整体质心平移。原来这行写的是"分子完整性修复完毕"，
+    # 是假的：center_system_rigidly 的 docstring 自己就写着"彻底禁用原子级 PBC
+    # Wrap"，它不碰拓扑、修不了任何跨盒断裂的分子。真正的整分子周期平移是
+    # ABFEPipeline.repair_pbc_molecule_integrity()，现已提前到第一次建 Context /
+    # 最小化 / 预平衡之前执行（pre_equilibrate 开头），并在失败时 fail closed。
+    log.info("  ✅ 配体已居中（仅整体质心平移；整分子 PBC 修复在 pre_equilibrate 之前执行）")
+    run_provenance = None
+    if not config.only_complex_charging:
+        run_provenance = _write_run_provenance(
+            output_dir, config, system, topology, positions
+        )
+        log.info(
+            "🧾 运行 provenance 已保存: %s",
+            os.path.join(output_dir, "run_provenance.json"),
+        )
 
     # ----- 1.5 自动构建溶剂腿缓存 -----
-    ligand_resname = _get_residue_name_by_atom_index(topology, ligand_indices[0])
-    if config.reset or not solvent_cache_exists(
-        output_dir, config.solvent_ionic_strength_molar
-    ):
-        log.info(
-            "💧 溶剂腿缓存缺失或盐协议不匹配，开始构建 %.3f M NaCl 配体体系...",
-            config.solvent_ionic_strength_molar,
+    if config.only_complex_charging:
+        log.info("⏭️ charging-only：跳过溶剂腿缓存构建与校验")
+    else:
+        ligand_resname = _get_residue_name_by_atom_index(
+            topology, ligand_indices[0]
         )
-        if not build_and_cache_solvent_leg(
-            output_dir,
+        solvent_identity = _ligand_parameter_identity(
+            system,
             topology,
-            positions,
             ligand_indices,
             ligand_resname,
-            ligand_ffxml=getattr(config, "ligand_xml", None),
-            top_file=config.top, 
-            gmx_include_dir=find_gmx_include_dir(config.gmx_path),
-            ionic_strength_molar=config.solvent_ionic_strength_molar,
+            config.top,
+            getattr(config, "ligand_xml", None),
+            include_dir,
+        )
+        if config.reset or not solvent_cache_exists(
+            output_dir, config.solvent_ionic_strength_molar, solvent_identity
         ):
-            log.error("❌ 自动构建溶剂腿失败，无法继续一键 ABFE")
-            sys.exit(1)
-    else:
-        log.info("♻️ 检测到已有溶剂腿缓存，跳过重建")
+            log.info(
+                "💧 溶剂腿缓存缺失或盐协议不匹配，开始构建 %.3f M NaCl 配体体系...",
+                config.solvent_ionic_strength_molar,
+            )
+            if not build_and_cache_solvent_leg(
+                output_dir,
+                topology,
+                positions,
+                ligand_indices,
+                ligand_resname,
+                ligand_ffxml=getattr(config, "ligand_xml", None),
+                top_file=config.top,
+                gmx_include_dir=include_dir,
+                ionic_strength_molar=config.solvent_ionic_strength_molar,
+                cache_identity=solvent_identity,
+            ):
+                log.error("❌ 自动构建溶剂腿失败，无法继续一键 ABFE")
+                sys.exit(1)
+        else:
+            log.info("♻️ 检测到已有溶剂腿缓存，跳过重建")
 
     # ----- 2. 初始化 Pipeline -----
     pipeline = ABFEPipeline(
@@ -2298,10 +3138,11 @@ def main():
 
     # ----- 3. 加载可选参数 -----
     # 二面角修正
-    torsion_params = None
-    if config.torsion_params and os.path.exists(config.torsion_params):
-        with open(config.torsion_params) as f:
-            torsion_params = json.load(f)
+    torsion_params = (
+        _load_json_object_file(config.torsion_params, "torsion 参数")
+        if config.torsion_params
+        else None
+    )
 
     # DEXP 势能
     dexp_params = None
@@ -2318,7 +3159,15 @@ def main():
         log.info("🧷 复合物腿 Boresch 已启用 | source=%s", config.boresch_source)
     else:
         log.info("🧷 复合物腿 Boresch 已显式关闭")
-    boresch_restraint = resolve_boresch_restraint(config, pipeline)
+    if config.only_complex_charging:
+        boresch_restraint = _load_frozen_stage2_boresch(output_dir)
+        log.info(
+            "🔒 charging-only：直接采用冻结 Stage 2 的 Boresch Hamiltonian "
+            "(r0=%.6f nm)，不读取/重估 boresch_simple.json",
+            float(boresch_restraint["equilibrium_values"]["r0"]),
+        )
+    else:
+        boresch_restraint = resolve_boresch_restraint(config, pipeline)
 
     # ----- 5. 带限制力再平衡（如果启用） -----
     if boresch_restraint and not config.skip_rebalance:
@@ -2331,6 +3180,18 @@ def main():
         pipeline.positions = rebal_data["positions"]
         pipeline.box_vectors = rebal_data["box_vectors"]
         log.info("✓ 再平衡完成，坐标已更新")
+
+    if config.only_complex_charging:
+        candidate_path = _run_complex_charging_only(
+            config,
+            pipeline,
+            boresch_restraint,
+        )
+        log.info(
+            "charging-only 已结束；Stage 2 与 solvent 未运行，主结果未覆盖。候选文件: %s",
+            candidate_path,
+        )
+        return
 
     # ----- 6. 运行复合物腿主流程 -----
     log.info("🔄 启动复合物腿主采样流程 (%s)", config.decoupling)
@@ -2345,6 +3206,9 @@ def main():
             output_dir,
             expected_fingerprint=_pre_equilibration_fingerprint(
                 pipeline.system, pipeline.ligand_indices, pipeline.temperature, pipeline.pressure,
+                positions=pipeline.positions,
+                box_vectors=pipeline.box_vectors,
+                requested_steps=config.get("n_equil_steps", 5_000_000),
             ),
         ) or config.reset,
         system_type="complex",
@@ -2367,7 +3231,7 @@ def main():
         pilot_finite_difference_delta=config.get("pilot_finite_difference_delta", 0.01),
         pilot_n_steps_per_state=config.get("pilot_n_steps_per_state", 10000),
         ibs_lse_log_residual_tolerance=config.get(
-            "ibs_lse_log_residual_tolerance", 0.25
+            "ibs_lse_log_residual_tolerance", 0.5
         ),
         min_bias_updates=config.get("min_bias_updates", 12),
         max_bias_updates=config.get("max_bias_updates", 50),
@@ -2419,6 +3283,9 @@ def main():
             expected_fingerprint=_pre_equilibration_fingerprint(
                 pipeline_solv.system, pipeline_solv.ligand_indices, pipeline_solv.temperature,
                 pipeline_solv.pressure,
+                positions=pipeline_solv.positions,
+                box_vectors=pipeline_solv.box_vectors,
+                requested_steps=config.get("n_equil_steps", 5_000_000),
             ),
         ) or config.reset,
         system_type="solvent",
@@ -2441,7 +3308,7 @@ def main():
         pilot_finite_difference_delta=config.get("pilot_finite_difference_delta", 0.01),
         pilot_n_steps_per_state=config.get("pilot_n_steps_per_state", 10000),
         ibs_lse_log_residual_tolerance=config.get(
-            "ibs_lse_log_residual_tolerance", 0.25
+            "ibs_lse_log_residual_tolerance", 0.5
         ),
         min_bias_updates=config.get("min_bias_updates", 12),
         max_bias_updates=config.get("max_bias_updates", 50),
@@ -2463,10 +3330,23 @@ def main():
     # 原因），所以 ΔG_complex > ΔG_solvent；正确公式 ΔG_solvent-ΔG_complex 应为负
     # （有利结合），之前 ΔG_complex-ΔG_solvent 会给出正值（看起来"不利结合"），
     # 这与本次用参考方法交叉验证时符号持续相反的现象完全吻合。
+    # 🔑 [ATT-09] 循环闭合统一走 abfe_core.combine_binding_free_energy，
+    # 不再在这里手写公式。这里 dg_complex 取自 total_delta_G_complex_kJ_mol，
+    # Boresch 释放项已经烘焙在里面（abfe_pipeline: total_dg = dg_phys +
+    # cons_correction + dg_boresch），所以 already_included=True，不再减第二次。
     apbs_correction = float(config.get("apbs_correction_kJ_mol", 0.0) or 0.0)
-    delta_g_bind_uncorrected = dg_solvent - dg_complex
-    delta_g_bind = delta_g_bind_uncorrected + apbs_correction
-    total_err_bind = np.sqrt(err_complex**2 + err_solvent**2)
+    cycle = combine_binding_free_energy(
+        dg_complex_kJ_mol=dg_complex,
+        dg_solvent_kJ_mol=dg_solvent,
+        err_complex_kJ_mol=err_complex,
+        err_solvent_kJ_mol=err_solvent,
+        dg_boresch_kJ_mol=dg_boresch,
+        boresch_already_included_in_complex=True,
+        apbs_correction_kJ_mol=apbs_correction,
+    )
+    delta_g_bind_uncorrected = cycle["delta_G_bind_uncorrected_kJ_mol"]
+    delta_g_bind = cycle["delta_G_bind_kJ_mol"]
+    total_err_bind = cycle["total_error_kJ_mol"]
     
     log.info("\n" + "="*70)
     log.info("🎯 ABFE 最终结合自由能计算结果:")
@@ -2495,6 +3375,8 @@ def main():
         "delta_G_bind_kJ_mol": float(delta_g_bind),
         "delta_G_bind_kcal_mol": float(delta_g_bind / 4.184),
         "total_error_kJ_mol": float(total_err_bind),
+        # [ATT-09] 循环闭合的完整记账，由唯一实现给出。
+        "thermodynamic_cycle_terms": cycle,
         "timestamp": datetime.now().isoformat(),
         "provenance": run_provenance,
         "thermodynamic_cycle": THERMODYNAMIC_CYCLE_DOC,

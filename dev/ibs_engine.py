@@ -204,6 +204,45 @@ def ibs_lj_tail_lrc_inapplicable_reason(potential_type: Optional[str]) -> str:
     )
 
 
+def _production_history_lengths(sampler) -> int:
+    """🔑 [P1-13] 返回三份生产 history 的公共长度，顺带强制它们等长。
+
+    `energy_history` / `bias_history` / `base_energy_history` 由
+    `collect_energies()` 在同一个 `frame_finite` 门下原子追加，所以实践中总是等长；
+    但此前**没有任何地方断言过**这一点。既然回退要靠这个长度做同步截断，
+    就必须在取用时把这个不变量钉死——不等长意味着某处已经单独动过其中一份，
+    截断会把三者错位，比不截断更糟。
+    """
+    lengths = (
+        len(sampler.energy_history),
+        len(sampler.bias_history),
+        len(sampler.base_energy_history),
+    )
+    if len(set(lengths)) != 1:
+        raise RuntimeError(
+            f"生产 history 三份长度不一致 energy/bias/base = {lengths}；"
+            "它们必须始终由 collect_energies() 原子追加。拒绝在错位状态下继续采样。"
+        )
+    return lengths[0]
+
+
+def _truncate_production_history(sampler, keep: int) -> int:
+    """🔑 [P1-13] 把三份生产 history 同步截断到 `keep` 帧，返回丢弃的帧数。
+
+    用在灾难回退处：坐标已经退回 `production_pos_backup`，那么该备份之后写入的
+    帧属于被放弃的分支，不能与重启后的分支拼成一条连续轨迹交给自相关估计。
+    """
+    current = _production_history_lengths(sampler)
+    keep = max(0, int(keep))
+    if keep >= current:
+        return 0
+    del sampler.energy_history[keep:]
+    del sampler.bias_history[keep:]
+    del sampler.base_energy_history[keep:]
+    _production_history_lengths(sampler)  # 截断后仍须等长
+    return current - keep
+
+
 class IBSIncompleteStageCoverageError(RuntimeError):
     """一个 stage 的预期窗口没有全部加载成功，拒绝在缺口上求解自由能。"""
 
@@ -433,24 +472,73 @@ def pme_offset_charge_square_sum(
     return float(qsq), rows
 
 
-def lambda_endpoint_diagnostics(lambdas_coul, lambdas_vdw, tol: float = 1e-8) -> Dict:
-    """Check whether a lambda path has clear physical endpoints."""
+def lambda_endpoint_diagnostics(
+    lambdas_coul,
+    lambdas_vdw,
+    tol: float = 1e-8,
+    *,
+    expected_start: Optional[Tuple[float, float]] = None,
+    expected_end: Optional[Tuple[float, float]] = None,
+) -> Dict:
+    """Check a lambda path against explicit physical endpoints.
+
+    The backwards-compatible default describes a complete dual-stage path,
+    ``(lambda_coul, lambda_vdw): (1, 1) -> (0, 0)``.  A single stage must pass
+    its own endpoints explicitly: decharging is ``(1, 1) -> (0, 1)`` and
+    vanishing is ``(0, 1) -> (0, 0)``.
+    """
     lc = np.asarray(lambdas_coul, dtype=float)
     lv = np.asarray(lambdas_vdw, dtype=float)
     if lc.size == 0 or lv.size == 0 or lc.size != lv.size:
         return {"ok": False, "reason": "empty_or_mismatched_lambda_arrays"}
+    if expected_start is None:
+        expected_start = (1.0, 1.0)
+    if expected_end is None:
+        expected_end = (0.0, 0.0)
+    if len(expected_start) != 2 or len(expected_end) != 2:
+        raise ValueError("expected_start/expected_end 必须是 (lambda_coul, lambda_vdw)")
+    expected_start_payload = {
+        "lambda_coul": float(expected_start[0]),
+        "lambda_vdw": float(expected_start[1]),
+    }
+    expected_end_payload = {
+        "lambda_coul": float(expected_end[0]),
+        "lambda_vdw": float(expected_end[1]),
+    }
     start = {"lambda_coul": float(lc[0]), "lambda_vdw": float(lv[0])}
     end = {"lambda_coul": float(lc[-1]), "lambda_vdw": float(lv[-1])}
-    ok_start = abs(start["lambda_coul"] - 1.0) <= tol and abs(start["lambda_vdw"] - 1.0) <= tol
-    ok_end = abs(end["lambda_coul"]) <= tol and abs(end["lambda_vdw"]) <= tol
+    matches_expected_start = (
+        abs(start["lambda_coul"] - expected_start_payload["lambda_coul"]) <= tol
+        and abs(start["lambda_vdw"] - expected_start_payload["lambda_vdw"]) <= tol
+    )
+    matches_expected_end = (
+        abs(end["lambda_coul"] - expected_end_payload["lambda_coul"]) <= tol
+        and abs(end["lambda_vdw"] - expected_end_payload["lambda_vdw"]) <= tol
+    )
+    starts_fully_coupled = (
+        abs(start["lambda_coul"] - 1.0) <= tol
+        and abs(start["lambda_vdw"] - 1.0) <= tol
+    )
+    ends_fully_decoupled = (
+        abs(end["lambda_coul"]) <= tol and abs(end["lambda_vdw"]) <= tol
+    )
     monotonic_coul = bool(np.all(np.diff(lc) <= tol))
     monotonic_vdw = bool(np.all(np.diff(lv) <= tol))
     return {
-        "ok": bool(ok_start and ok_end and monotonic_coul and monotonic_vdw),
+        "ok": bool(
+            matches_expected_start
+            and matches_expected_end
+            and monotonic_coul
+            and monotonic_vdw
+        ),
         "start": start,
         "end": end,
-        "starts_fully_coupled": bool(ok_start),
-        "ends_fully_decoupled": bool(ok_end),
+        "expected_start": expected_start_payload,
+        "expected_end": expected_end_payload,
+        "matches_expected_start": bool(matches_expected_start),
+        "matches_expected_end": bool(matches_expected_end),
+        "starts_fully_coupled": bool(starts_fully_coupled),
+        "ends_fully_decoupled": bool(ends_fully_decoupled),
         "monotonic_coul": monotonic_coul,
         "monotonic_vdw": monotonic_vdw,
     }
@@ -9657,6 +9745,13 @@ class IBSWindowManagerDualLambda:
                 sampler.bias_history = []
                 sampler.base_energy_history = []
             production_pos_backup = safety_state.getPositions(asNumpy=True)
+            # 🔑 [P1-13] 与坐标备份**同时**记下三份 history 的长度。灾难回退只把
+            # 坐标退回这个备份点，却把备份之后已经写入的 energy/bias/base history
+            # 留在原地，然后从旧坐标 + 新随机速度长出另一条分支——被放弃的分支与
+            # 重启分支共享祖先，却仍被当作一条连续时间序列做自相关子采样
+            # （_decorrelate_by_worst_target_state），g 与 N_decorr 的口径就不再可靠。
+            # 有了这个长度，回退时才能把三份 history 同步截断回同一个分叉点。
+            production_history_backup_len = _production_history_lengths(sampler)
 
             # ---------- 生产采样 ----------
             # 🔑 防御性断言：走到这里必须已经满足严格收敛判据（sampler.bias_converged
@@ -9861,11 +9956,18 @@ class IBSWindowManagerDualLambda:
                     current_dt_ps = sim.integrator.getStepSize().value_in_unit(unit.picoseconds)
                     new_dt_ps = max(0.0001, current_dt_ps * 0.5)
                     sim.integrator.setStepSize(new_dt_ps * unit.picoseconds)
+                    # 🔑 [P1-13] 坐标退回备份点了，备份之后写入的帧属于被放弃的
+                    # 分支，必须同步截断——否则它们会和重启后长出的新分支拼成一条
+                    # "连续"轨迹交给 _decorrelate_by_worst_target_state 估自相关。
+                    dropped = _truncate_production_history(
+                        sampler, production_history_backup_len
+                    )
                     fmax_report = fmax if fmax is not None else float("nan")
                     print(
                         f"    ⚠️ 灾难检测触发: update={up}/{n_updates}, "
                         f"E_total={e_total_n:.1f}, max|F|={fmax_report:.1f}. "
                         f"已回退坐标并将步长降至 {new_dt_ps*1000.0:.1f} fs"
+                        + (f"；同步丢弃被放弃分支的 {dropped} 帧生产 history" if dropped else "")
                     )
                     if debug_mode:
                         diagnose_force_groups_detailed(sim.context, win_sys, prefix=f"窗口{window_idx}_回退_update{up}")
@@ -9875,6 +9977,8 @@ class IBSWindowManagerDualLambda:
                 if do_force_check:
                     # 复用同一次 getState 里已经取回的坐标，不再单独发一次 getPositions 请求
                     production_pos_backup = state_n.getPositions(asNumpy=True)
+                    # 坐标备份与 history 长度必须成对更新，否则回退会截到错的分叉点。
+                    production_history_backup_len = _production_history_lengths(sampler)
 
                 # 🔑 生产阶段 f_k 已冻结（sampler.bias_converged=True，见上面严格收敛
                 # 判据），不再调用 update_weights()——否则同一窗口的样本会来自随时间
@@ -10102,15 +10206,21 @@ class IBSWindowManagerDualLambda:
                     current_dt_ps = sim.integrator.getStepSize().value_in_unit(unit.picoseconds)
                     new_dt_ps = max(0.0001, current_dt_ps * 0.5)
                     sim.integrator.setStepSize(new_dt_ps * unit.picoseconds)
+                    # 🔑 [P1-13] 同主循环：坐标退回备份点，备份之后的帧必须同步丢弃。
+                    dropped = _truncate_production_history(
+                        sampler, production_history_backup_len
+                    )
                     print(
                         f"    ⚠️ 余数补齐灾难检测触发: E_total={e_total_n:.1f}, max|F|={fmax:.1f}. "
                         f"已回退坐标并将步长降至 {new_dt_ps*1000.0:.1f} fs"
+                        + (f"；同步丢弃被放弃分支的 {dropped} 帧生产 history" if dropped else "")
                     )
                     if debug_mode:
                         diagnose_force_groups_detailed(sim.context, win_sys, prefix=f"窗口{window_idx}_余数补齐回退")
                         diagnose_force_breakdown(sim.context, win_sys, prefix=f"窗口{window_idx}_余数补齐回退")
                 else:
                     production_pos_backup = sim.context.getState(getPositions=True).getPositions(asNumpy=True)
+                    production_history_backup_len = _production_history_lengths(sampler)
                     # 生产阶段 f_k 已冻结，不再调用 update_weights()，见上方主循环同类注释。
                     e = sampler.collect_energies()
                     if len(sampler.energy_buffer) >= 10:

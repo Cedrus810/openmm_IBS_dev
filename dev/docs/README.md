@@ -6,6 +6,7 @@
 
 - [TODO.md](TODO.md)：唯一的当前行动清单；新问题、状态和优先级只在这里维护。
 - [status/IBS_PRODUCTION_PROTOCOL_2026-07-22.md](status/IBS_PRODUCTION_PROTOCOL_2026-07-22.md)：当前 IBS 预热/生产边界、`f_k` 硬锁、定向补采与 immutable rescue ensemble 的权威协议。
+- [status/RESULT_2026-07-27_atenolol_rank11.md](status/RESULT_2026-07-27_atenolol_rank11.md)：2026-07-27 那一轮的结合自由能结果与完整排查记录。**结论不可用**（根因 P0-10：Boresch 平衡值陈旧），保留为审计基线；原 `output_lrc_fix/` 已于同日 18:16 清空。
 - [status/VALIDATION_MATRIX.md](status/VALIDATION_MATRIX.md)：代码已完成、仍需 CPU/GPU/依赖环境证据的验证项。
 - [status/AUDIT_STATUS.md](status/AUDIT_STATUS.md)：历史审计、修复依据和结论。
 

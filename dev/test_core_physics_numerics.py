@@ -32,7 +32,7 @@ from scipy.special import logsumexp
 from abfe_core import calculate_boresch_analytical_correction
 from abfe_preoptimizer import estimate_f_k_from_pilot_ti
 import ibs_engine as ie
-from ibs_engine import IBSBiasForce, solve_stage_integrated
+from ibs_engine import IBSBiasForce, lambda_endpoint_diagnostics, solve_stage_integrated
 
 
 # ============================================================================
@@ -43,6 +43,70 @@ R_KJ = constants.R / 1000.0          # kJ/mol/K —— 与 abfe_core 用的同�
 T_REF = 300.0
 RT_REF = R_KJ * T_REF
 V0_NM3 = 1.6605                      # 标准摩尔体积，nm³
+
+
+# ============================================================================
+# λ 端点诊断 —— 完整路径与两个合法半程使用各自的契约
+# ============================================================================
+
+
+def test_lambda_endpoint_diagnostics_accepts_complete_path_by_default():
+    diag = lambda_endpoint_diagnostics(
+        [1.0, 0.5, 0.0],
+        [1.0, 0.5, 0.0],
+    )
+    assert diag["ok"] is True
+    assert diag["matches_expected_start"] is True
+    assert diag["matches_expected_end"] is True
+    assert diag["starts_fully_coupled"] is True
+    assert diag["ends_fully_decoupled"] is True
+
+
+@pytest.mark.parametrize(
+    "lambdas_coul, lambdas_vdw, expected_start, expected_end",
+    [
+        ([1.0, 0.5, 0.0], [1.0, 1.0, 1.0], (1.0, 1.0), (0.0, 1.0)),
+        ([0.0, 0.0, 0.0], [1.0, 0.5, 0.0], (0.0, 1.0), (0.0, 0.0)),
+    ],
+)
+def test_lambda_endpoint_diagnostics_accepts_each_dual_lambda_stage(
+    lambdas_coul, lambdas_vdw, expected_start, expected_end
+):
+    diag = lambda_endpoint_diagnostics(
+        lambdas_coul,
+        lambdas_vdw,
+        expected_start=expected_start,
+        expected_end=expected_end,
+    )
+    assert diag["ok"] is True
+    assert diag["matches_expected_start"] is True
+    assert diag["matches_expected_end"] is True
+
+
+@pytest.mark.parametrize(
+    "lambdas_coul, lambdas_vdw, expected_start, expected_end, failed_field",
+    [
+        ([1.0, 0.5, 0.0], [1.0, 0.9, 0.9], (1.0, 1.0), (0.0, 1.0), "matches_expected_end"),
+        ([0.1, 0.0], [1.0, 0.0], (0.0, 1.0), (0.0, 0.0), "matches_expected_start"),
+        ([0.0, 0.1, 0.0], [1.0, 0.5, 0.0], (0.0, 1.0), (0.0, 0.0), "monotonic_coul"),
+        ([0.0, 0.0, 0.0, 0.0], [1.0, 0.5, 0.6, 0.0], (0.0, 1.0), (0.0, 0.0), "monotonic_vdw"),
+    ],
+)
+def test_lambda_endpoint_diagnostics_rejects_wrong_stage_contract(
+    lambdas_coul,
+    lambdas_vdw,
+    expected_start,
+    expected_end,
+    failed_field,
+):
+    diag = lambda_endpoint_diagnostics(
+        lambdas_coul,
+        lambdas_vdw,
+        expected_start=expected_start,
+        expected_end=expected_end,
+    )
+    assert diag["ok"] is False
+    assert diag[failed_field] is False
 
 
 # ============================================================================

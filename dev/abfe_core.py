@@ -4073,25 +4073,84 @@ class GeometricRestraintEstimator:
 
     def __init__(self, temperature=300.0,
                  search_dist=0.5,         # nm
-                 bond_dist=0.22,          # nm
-                 anchor_atom_names=None):
+                 bond_dist=0.22,          # nm，仅在拓扑不含键时作为显式回退
+                 anchor_atom_names=None,
+                 allow_geometric_bond_fallback=True):
         self.temperature = temperature
         self.gas_constant_kj_per_mol_k = 8.314e-3
         self.search_dist = search_dist
         self.bond_dist = bond_dist
+        # 🔑 [ATT-11] 拓扑里有键时一律用真实键；这个开关只决定"拓扑没有键"时
+        # 是回退到几何阈值还是直接 fail closed。
+        self.allow_geometric_bond_fallback = bool(allow_geometric_bond_fallback)
+        self.bond_source = None  # "topology" | "geometric_fallback"，供诊断落盘
         if anchor_atom_names is None:
             anchor_atom_names = ["CA", "CB", "C", "N", "O"]
         self.anchor_atom_names = anchor_atom_names
 
     # ----------------------------------------------------------------
-    # 工具：化学键邻居（基于距离阈值）
+    # 工具：化学键邻居
     # ----------------------------------------------------------------
-    def _find_bonded_neighbors(self, atom_idx, haystack, ref_xyz):
-        """寻找与 atom_idx 距离 <= bond_dist 的原子（模拟共价键）"""
+    def _build_bond_adjacency(self, topology) -> Optional[Dict[int, set]]:
+        """🔑 [ATT-11] 从拓扑的真实成键关系建邻接表。
+
+        原实现用 `距离 <= 0.22 nm` 冒充共价键，有三个问题：
+
+        1. **区分不了成键与非键近接**。蛋白侧 haystack 是预筛过的锚点名子集
+           （默认 CA/CB/C/N/O），其中 CA-CB≈0.153 nm、CA-C≈0.152 nm 是真键，
+           但**非键**的 i/i+1 残基间 C-N≈0.133 nm、CA…N≈0.146 nm 同样落在
+           0.22 nm 以内，会被当成键——于是"化学连通"的受体三元组可能跨残基
+           拼出一条根本不存在的链。
+        2. **漏掉长键**。S-S（≈0.205 nm）贴着阈值，金属配位键普遍超过 0.22 nm。
+        3. **只看第 0 帧**（见 `_generate_anchor_combos` 的 `ref_xyz = traj.xyz[0]`），
+           一次热涨落就能翻转键拓扑。
+
+        Boresch 六原子锚点是由这张邻接表枚举出来的，锚点选错会直接改变解析释放
+        修正——2026-07-27 的 P0-10 已经演示过锚点/平衡值出错的代价。
+
+        返回 None 表示拓扑里没有键信息，由调用方决定回退还是 fail closed。
+        """
+        if topology is None:
+            return None
+        bonds = getattr(topology, "bonds", None)
+        # mdtraj 的 Topology.bonds 是 property（生成器），OpenMM 的是方法。
+        if callable(bonds):
+            try:
+                bonds = bonds()
+            except TypeError:
+                return None
+        if bonds is None:
+            return None
+        adjacency: Dict[int, set] = {}
+        n_bonds = 0
+        for bond in bonds:
+            try:
+                a1, a2 = bond[0], bond[1]
+            except (TypeError, KeyError, IndexError):
+                a1, a2 = getattr(bond, "atom1", None), getattr(bond, "atom2", None)
+            if a1 is None or a2 is None:
+                continue
+            i = int(getattr(a1, "index", a1))
+            j = int(getattr(a2, "index", a2))
+            adjacency.setdefault(i, set()).add(j)
+            adjacency.setdefault(j, set()).add(i)
+            n_bonds += 1
+        return adjacency if n_bonds > 0 else None
+
+    def _find_bonded_neighbors(self, atom_idx, haystack, ref_xyz, adjacency=None):
+        """返回 haystack 里与 atom_idx 成键的原子。
+
+        `adjacency` 非空时用真实成键关系；为空时（拓扑无键）才回退到
+        `距离 <= bond_dist` 的几何近似——见 `_build_bond_adjacency` 的说明。
+        """
+        haystack = np.asarray(haystack)
+        if adjacency is not None:
+            neighbors = adjacency.get(int(atom_idx), ())
+            return [int(b) for b in haystack if int(b) in neighbors and int(b) != int(atom_idx)]
         vec = ref_xyz[haystack] - ref_xyz[atom_idx]
         dist = np.linalg.norm(vec, axis=1)
         bonded = haystack[dist <= self.bond_dist]
-        return [b for b in bonded if b != atom_idx]
+        return [int(b) for b in bonded if int(b) != int(atom_idx)]
 
     @staticmethod
     def _clip_force_constant(value, lower, upper):
@@ -4159,8 +4218,51 @@ class GeometricRestraintEstimator:
             raise RuntimeError("未找到锚点-配体接触对，请增大 search_dist")
 
         # 2. 预计算键合邻居字典
-        prot_nei = {idx: self._find_bonded_neighbors(idx, prot_indices, ref_xyz) for idx in prot_indices}
-        lig_nei  = {idx: self._find_bonded_neighbors(idx, lig_heavy_indices, ref_xyz) for idx in lig_heavy_indices}
+        # 🔑 [ATT-11] 优先用拓扑里的真实成键关系；只有拓扑不含键时才回退几何阈值。
+        adjacency = self._build_bond_adjacency(getattr(traj, "topology", None))
+        if adjacency is not None:
+            # 关键：从 .gro 之类不带键的来源载入时，mdtraj 能给标准残基推出键，
+            # 但配体（非标准残基）常常一根键都没有。这时 adjacency 非空却覆盖不到
+            # 配体，lig_nei 会全空、枚举不出任何组合，最后表现成一句无关的
+            # "未找到锚点-配体接触对"。必须逐侧检查覆盖度。
+            missing = [
+                side for side, idxs in (
+                    ("受体锚点", prot_indices), ("配体重原子", lig_heavy_indices)
+                )
+                if not any(adjacency.get(int(i)) for i in idxs)
+            ]
+            if missing:
+                print(
+                    f"  ⚠️ [Boresch 锚点] 拓扑虽有成键信息，但 {'/'.join(missing)} "
+                    "一侧完全没有键（常见于从 .gro 载入、配体是非标准残基）。"
+                )
+                adjacency = None
+
+        if adjacency is None:
+            if not self.allow_geometric_bond_fallback:
+                raise RuntimeError(
+                    "轨迹拓扑不含（或未覆盖配体的）成键信息，且已禁用几何回退：拒绝用 "
+                    f"`距离 <= {self.bond_dist} nm` 冒充共价键来枚举 Boresch 锚点。"
+                    "请提供带完整键的拓扑（如 .pdb/.prmtop/OpenMM Topology），"
+                    "或显式设 allow_geometric_bond_fallback=True。"
+                )
+            self.bond_source = "geometric_fallback"
+            print(
+                f"  ⚠️ [Boresch 锚点] 回退到几何阈值 {self.bond_dist} nm 判定成键。"
+                "该判据区分不了非键近接（残基间 C-N≈0.133 nm 会被误判为键），"
+                "锚点三元组可能跨残基；诊断里会记为 bond_source=geometric_fallback。"
+            )
+        else:
+            self.bond_source = "topology"
+
+        prot_nei = {
+            idx: self._find_bonded_neighbors(idx, prot_indices, ref_xyz, adjacency)
+            for idx in prot_indices
+        }
+        lig_nei = {
+            idx: self._find_bonded_neighbors(idx, lig_heavy_indices, ref_xyz, adjacency)
+            for idx in lig_heavy_indices
+        }
 
         anclig_combos = []
         for anc, lig in contact_pairs:
@@ -4348,6 +4450,13 @@ class GeometricRestraintEstimator:
             "diagnostics": {
                 "n_frames": int(n_frames),
                 "n_candidates": int(n_combos),
+                # 🔑 [ATT-11] 锚点三元组是靠成键关系枚举出来的；这里记录用的是
+                # 拓扑真实键还是 0.22 nm 几何近似，后者会把残基间非键近接
+                # （C-N≈0.133 nm）误判成键。锚点选错直接改变解析释放修正。
+                "bond_source": self.bond_source,
+                "bond_dist_nm_if_geometric": (
+                    float(self.bond_dist) if self.bond_source == "geometric_fallback" else None
+                ),
                 "n_angle_banned_candidates": int(np.sum(banned)),
                 "best_total_variance_score": float(total_var[best_idx]),
                 "fluctuation_distribution": fluctuation_diagnostics,
