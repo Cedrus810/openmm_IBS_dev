@@ -17,27 +17,75 @@ import openmm
 from openmm import app, unit, XmlSerializer
 import numpy as np
 import os
+import glob
 import json
 import shutil
 import multiprocessing as mp
 import time
 import logging
 import builtins
+import hashlib
+import platform
+import sys
+import math
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Sequence, Tuple, Optional
 
 # 项目内部模块依赖
 from abfe_preoptimizer import ABFEPreOptimizer, DualLambdaPreOptimizer
 from abfe_preoptimizer import generate_overlapping_windows
 from abfe_preoptimizer import build_aces_probe_system, build_aces_probe_system_dual_lambda
 from abfe_preoptimizer import generate_overlapping_windows   # ✅ 保留这个
+from abfe_preoptimizer import refine_stage_lambda_path_from_data
+from abfe_preoptimizer import (
+    refine_stage_lambda_path_by_overlap,
+    split_window_from_warmup_failure,
+    insert_lambda_from_overlap_failure,
+    plan_vdw_overlap_repair_targets,
+    canonicalize_window_ranges,
+    split_window_from_ibs_lse_failure,
+    insert_thermodynamic_midpoint_from_ibs_lse_failure,
+    redistribute_vanishing_lambda_subdomains,
+    vanishing_subdomain_ranges_from_lambdas,
+    human_vanishing_initial_lambdas,
+    quadratic_vanishing_base_lambdas,
+    validate_vanishing_lambda_path_invariants,
+    blended_metric_vanishing_lambdas,
+    VANISHING_FINAL_STATE_COUNT,
+    validate_single_shared_boundary_ranges,
+    VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS,
+    THERMODYNAMIC_PATH_PROTOCOL_VERSION,
+)
 from ibs_engine import (
     IBSWindowManagerDualLambda,
+    IBSWindowManagerShadowCoul,
     GlobalMBARAnalyzer,
     solve_stage_integrated,
     REMDManager,
     TraditionalMBARAnalyzer,
     generate_overlapping_windows,
+    lambda_endpoint_diagnostics,
+    run_shadow_bridge_leg,
+    run_boresch_attachment_leg,
+    DEFAULT_BORESCH_ATTACHMENT_LAMBDAS,
+    WCA_ACCOUNTING_VERSION,
+    IBS_BIAS_PROTOCOL_VERSION,
+    TRADITIONAL_LJ_LRC_PROTOCOL_VERSION,
+    FROZEN_VALIDATION_LADDER_SCHEDULE_STEPS,
+    IBSWarmupConvergenceError,
+    IBSFrozenCalibrationValidationError,
+    probe_bidirectional_overlap,
+    probe_bidirectional_overlap_for_bias_calibration,
+    _resolve_periodic_box_vectors,
+    _build_platform_properties,
+    _system_has_global_parameter,
+    _atomic_write_json,
+    _invalidate_production_window_checkpoint,
+    _load_validated_window_data_triplet,
+    _assert_expected_windows_all_loaded,
+    IBSIncompleteStageCoverageError,
+    ibs_lj_tail_lrc_is_applicable,
+    ibs_lj_tail_lrc_inapplicable_reason,
 )
 from abfe_core import (
     calculate_boresch_analytical_correction,
@@ -47,12 +95,154 @@ from abfe_core import (
     run_orbv3_dexp_fitting,
     UnitFormatter,
     TwoDimensionalLambdaPathPlanner,
+    THERMODYNAMIC_CYCLE_DOC,
+    combine_binding_free_energy,  # [ATT-09] 热力学循环闭合的唯一实现
 )
 import warnings
 
 PME_DECHARGE_MODEL_VERSION = "pme_decharge_v2_llfreeze_pmeself_20260523"
 
 logger = logging.getLogger(__name__)
+
+
+def _stage_lambda_endpoint_diagnostics(
+    stage_name: str,
+    lambdas_coul,
+    lambdas_vdw,
+) -> Dict:
+    """Apply the endpoint contract for one half of the dual-lambda path."""
+    expected = {
+        "decharging": ((1.0, 1.0), (0.0, 1.0)),
+        "vanishing": ((0.0, 1.0), (0.0, 0.0)),
+    }
+    if stage_name not in expected:
+        raise ValueError(f"未知 dual-lambda stage: {stage_name!r}")
+    expected_start, expected_end = expected[stage_name]
+    return lambda_endpoint_diagnostics(
+        lambdas_coul,
+        lambdas_vdw,
+        expected_start=expected_start,
+        expected_end=expected_end,
+    )
+
+
+def _json_safe(obj):
+    """🔑 [P1-15] 递归转成 `json.dump` 直接可写的原生类型。
+
+    `_atomic_write_json`（ibs_engine）用的是不带 `cls=NumpyEncoder` 的
+    `json.dump`，所以任何混进 payload 的 numpy 标量/数组都会 `TypeError`
+    并让整个 checkpoint 写失败。`solve_stage_integrated` 返回的
+    `window_overlap_diagnostics` / `f_k` / `coverage_diagnostics` 恰恰都含 numpy，
+    把它们纳入落盘范围之前必须先过这一道。
+
+    非有限值（NaN/±Inf）转成 `None`：`json.dump` 默认会写出 `NaN`/`Infinity`
+    这种非标准 JSON，别的工具读不了。
+    """
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return _json_safe(obj.tolist())
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, (np.floating, float)):
+        value = float(obj)
+        return value if math.isfinite(value) else None
+    return obj
+
+
+# 🔑 [BORESCH-COMMIT] `boresch_equilibrium_committed.json` 的 schema 版本。
+# v1 = 只有 {"equilibrium_values": {...}} 的裸格式（无任何身份信息）。
+BORESCH_COMMITTED_SCHEMA_VERSION = 2
+
+# 复用已提交平衡值时，允许它与当前坐标实测几何相差多少个 σ。
+# σ_i = sqrt(kT/k_i)：六个自由度的限制势分别是 0.5*kr*(d-r0)^2 与
+# k*(1-cos(Δ))，小偏离下方差都是 kT/k，所以这是限制势自身的热涨落宽度。
+# 与单帧比较本身就带 ~1σ 噪声，取 4σ 既能放过正常涨落，也能抓住
+# "平衡值根本不描述当前构象"这类错误（实测那次是 4.0-23.6σ）。
+BORESCH_COMMITTED_MAX_DEVIATION_SIGMA = 4.0
+
+# 告警带。硬门为什么不能再压低：committed 值来自过去某一帧、current 来自当前帧，
+# 两个独立单帧之差的宽度是 √2·σ，所以 4σ ≈ 2.8 个"差值 σ"，每个自由度误报率
+# ~0.5%、六个约 2.8%。压到 3σ 会让单次运行误报率升到约 19%，resume 直接没法用。
+# 代价是纯 thetaA/thetaB 对调（实测 3.70 σ）刚好落在硬门下面——但真实的标签错位
+# 必然同时打乱二面角（它们共用同一批原子），实测那次 phiA0 就到了 23.65 σ。
+# 这个区间的东西不阻断，但必须大声打出来。
+BORESCH_COMMITTED_WARN_DEVIATION_SIGMA = 2.5
+
+_BORESCH_EQ_TO_FORCE_CONSTANT = (
+    ("r0", "kr", False),
+    ("thetaA0", "kthetaA", False),
+    ("thetaB0", "kthetaB", False),
+    ("phiA0", "kphiA", True),
+    ("phiB0", "kphiB", True),
+    ("phiC0", "kphiC", True),
+)
+
+
+def _wrap_to_pi(value: float) -> float:
+    """把角度差折回 **[-π, π)**，二面角比较必须先做这一步。
+
+    注意区间是左闭右开：`_wrap_to_pi(math.pi)` 返回 `-π` 而不是 `+π`。
+    在 ±π 这个对跖点上符号本来就是任意的（同一个角距离的两种写法），
+    而下游 `boresch_committed_deviation_sigma` 只取 `abs(delta)` 来判门，
+    所以取哪一侧不影响任何判定。
+    """
+    return float((float(value) + math.pi) % (2.0 * math.pi) - math.pi)
+
+
+def boresch_committed_deviation_sigma(
+    committed_eq: Dict,
+    current_eq: Dict,
+    force_constants: Dict,
+    temperature_k: float,
+) -> Dict[str, Dict[str, float]]:
+    """逐自由度算"已提交平衡值"与"当前坐标实测几何"相差几个 σ。
+
+    🔑 为什么需要这个检查：`run_full_pipeline` 有一条刻意的保护——平衡几何量只在
+    一条腿第一次采样时推导一次并落盘，之后任何 resume 都原样复用，绝不重算
+    （避免同一条腿的前后窗口用两套哈密顿量拼接自由能曲线）。动机是对的，但它
+    **没有任何一致性校验**：只要文件存在就复用。
+
+    实测后果（2026-07-27 定位）：`boresch_equilibrium_committed.json` 写于
+    2026-07-10 18:51，而体系在 2026-07-26 被整体重新平衡过。那份 17 天前的
+    平衡值里 thetaA0/thetaB0 是对调的、三个二面角完全错乱：
+
+        thetaA0  committed 2.0361  vs  轨迹实测 1.5634   (4.2 σ)
+        thetaB0  committed 1.5338  vs  轨迹实测 1.9770   (4.0 σ)
+        phiA0    committed -2.1285 vs  轨迹实测 1.5130   (23.6 σ)
+
+    限制力因此把配体从自己的 pose 上拽走 3.4 Å（无约束预平衡只漂 0.60 Å），
+    方向性氢键丢失 → 复合物腿去电荷偏低约 25 kJ/mol、解析释放修正也是错的。
+    唯一没受影响的是 vdW——它对取向不敏感，这也正是当时唯一对得上参考值的那一项。
+
+    注意：`update_boresch_from_last_frame` 已有的两道门（角度 40-140°、r0 漂移
+    <2.5 Å）对这组错值**全部放行**（2.0361 rad = 116.7° 在安全域内，r0 也没漂），
+    所以必须用"与当前几何的偏离"这个正交判据。
+    """
+    kt = 8.31446261815324e-3 * float(temperature_k)
+    report: Dict[str, Dict[str, float]] = {}
+    for eq_key, k_key, is_dihedral in _BORESCH_EQ_TO_FORCE_CONSTANT:
+        if eq_key not in committed_eq or eq_key not in current_eq:
+            continue
+        k = float(force_constants.get(k_key, 0.0) or 0.0)
+        if k <= 0.0 or not math.isfinite(k):
+            continue
+        sigma = math.sqrt(kt / k)
+        delta = float(current_eq[eq_key]) - float(committed_eq[eq_key])
+        if is_dihedral:
+            delta = _wrap_to_pi(delta)
+        report[eq_key] = {
+            "committed": float(committed_eq[eq_key]),
+            "current": float(current_eq[eq_key]),
+            "delta": delta,
+            "sigma": sigma,
+            "deviation_sigma": abs(delta) / sigma if sigma > 0 else float("inf"),
+        }
+    return report
 
 
 def _infer_log_level_from_message(message: str) -> int:
@@ -67,9 +257,9 @@ def _log_print(*args, sep=" ", end="\n", file=None, flush=False):
     message = sep.join(str(arg) for arg in args)
     if end and end != "\n":
         message += end.rstrip("\n")
-    logger.log(_infer_log_level_from_message(message), message)
-    if flush and not logger.handlers:
-        builtins.print(message, end=end, file=file, flush=flush)
+    if logger.handlers:
+        logger.log(_infer_log_level_from_message(message), message)
+    builtins.print(*args, sep=sep, end=end, file=file, flush=flush)
 
 
 print = _log_print
@@ -91,29 +281,553 @@ def _pme_u_kn_meta_path(stage_output_dir: str, stage_name: str) -> str:
     return os.path.join(stage_output_dir, f"{stage_name}_pme_u_kn.meta.json")
 
 
-def _is_pme_u_kn_cache_compatible(stage_output_dir: str, stage_name: str, n_states: int) -> bool:
+def _lambda_signature(values: List[float]) -> List[float]:
+    return [round(float(v), 8) for v in values]
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _system_xml_hash(system: Optional[openmm.System]) -> Optional[str]:
+    if system is None:
+        return None
+    return _sha256_text(XmlSerializer.serialize(system))
+
+
+def _topology_hash(topology: Optional[app.Topology]) -> Optional[str]:
+    if topology is None:
+        return None
+    atoms = [
+        (
+            int(atom.index),
+            str(atom.name),
+            str(atom.element.symbol if atom.element is not None else ""),
+            str(atom.residue.name),
+            int(atom.residue.index),
+            str(atom.residue.chain.id),
+        )
+        for atom in topology.atoms()
+    ]
+    bonds = sorted((int(a1.index), int(a2.index)) for a1, a2 in topology.bonds())
+    box = topology.getPeriodicBoxVectors()
+    if box is not None:
+        box_nm = []
+        for vec in box:
+            if hasattr(vec, "value_in_unit"):
+                values = vec.value_in_unit(unit.nanometer)
+            else:
+                values = vec
+            box_nm.append([round(float(v), 10) for v in values])
+    else:
+        box_nm = None
+    return _sha256_text(json.dumps({"atoms": atoms, "bonds": bonds, "box_nm": box_nm}, sort_keys=True))
+
+
+def _pre_equilibration_fingerprint(
+    system: Optional[openmm.System],
+    ligand_indices: Optional[List[int]],
+    temperature,
+    pressure=None,
+    positions=None,
+    box_vectors=None,
+    requested_steps: Optional[int] = None,
+) -> str:
+    """Content fingerprint for one pre-equilibration run: system Hamiltonian +
+    which atoms are the ligand + temperature + barostat pressure.
+
+    ``equilibrium_is_done()`` (runabfe.py) previously only checked that
+    ``pre_equilibration.dcd``/``pre_equil.chk`` exist and are non-trivially
+    sized -- it had no way to tell whether those files actually correspond to
+    the *current* system/config or are stale leftovers from a differently
+    configured run reusing the same --output directory without --reset. This
+    fingerprint is written alongside the trajectory by ``pre_equilibrate()``
+    and can be compared against a freshly recomputed one before trusting the
+    cache.
+
+    The initial coordinates, periodic box and requested step budget are part
+    of the identity. A different docking pose, box, or a short smoke-test
+    equilibration must never satisfy a later production request.
+
+    ``pressure`` is optional only for call-site convenience (old callers that
+    haven't been updated pass ``None``, which is distinguishable from any real
+    pressure value in the hash) -- omitting it silently would mean a changed
+    barostat pressure (different target density/ensemble) could reuse a
+    stale equilibration undetected.
+    """
+    temp_k = (
+        temperature.value_in_unit(unit.kelvin)
+        if hasattr(temperature, "value_in_unit")
+        else float(temperature)
+    )
+    pressure_bar = (
+        pressure.value_in_unit(unit.bar)
+        if hasattr(pressure, "value_in_unit")
+        else (float(pressure) if pressure is not None else None)
+    )
+    payload = {
+        "system_xml_hash": _system_xml_hash(system),
+        "ligand_indices": sorted(int(i) for i in (ligand_indices or [])),
+        "temperature_K": round(float(temp_k), 6),
+        "pressure_bar": round(float(pressure_bar), 6) if pressure_bar is not None else None,
+        "positions_sha256": _positions_hash(positions),
+        "box_vectors_sha256": _box_vectors_hash(box_vectors),
+        "requested_steps": int(requested_steps) if requested_steps is not None else None,
+    }
+    return _sha256_text(json.dumps(payload, sort_keys=True))
+
+
+def _rebalance_fingerprint(system: Optional[openmm.System], boresch_params: Optional[Dict]) -> str:
+    """Content fingerprint for one Boresch-restrained rebalance run: system
+    Hamiltonian + the actual Boresch anchors/equilibrium values/force
+    constants used to build the restraint.
+
+    ``rebalance_state.json`` previously only recorded ``status``/``n_steps``
+    -- a completed rebalance from a run with different Boresch anchors or
+    force constants (different receptor/ligand restraint atoms, a
+    re-estimated r0, a different force constant clip) would still read as
+    "completed" and get its stale ``rebalance.chk``/``rebalance_traj.dcd``
+    loaded, silently mismatched against the *current* restraint. The
+    checkpoint itself is tied to a specific System (including the injected
+    ``LambdaDependentBoreschForce`` parameters), so loading it under a
+    different Boresch configuration doesn't error -- it just resumes from a
+    state that was never equilibrated under the restraint now in effect.
+    """
+    if not _has_valid_boresch_restraint(boresch_params):
+        boresch_payload = None
+    else:
+        boresch_payload = {
+            "receptor_indices": [int(i) for i in boresch_params["receptor_indices"]],
+            "ligand_indices": [int(i) for i in boresch_params["ligand_indices"]],
+            "equilibrium_values": {
+                k: round(float(v), 8) for k, v in sorted(boresch_params["equilibrium_values"].items())
+            },
+            "force_constants": {
+                k: round(float(v), 8) for k, v in sorted(boresch_params["force_constants"].items())
+            },
+        }
+    payload = {
+        "system_xml_hash": _system_xml_hash(system),
+        "boresch": boresch_payload,
+    }
+    return _sha256_text(json.dumps(payload, sort_keys=True, default=str))
+
+
+def _positions_hash(positions) -> Optional[str]:
+    if positions is None:
+        return None
+    try:
+        if hasattr(positions, "value_in_unit"):
+            arr = np.asarray(positions.value_in_unit(unit.nanometer), dtype=np.float64)
+        else:
+            arr = np.asarray(positions, dtype=np.float64)
+    except Exception:
+        try:
+            arr = np.asarray([[p.x, p.y, p.z] for p in positions], dtype=np.float64)
+        except Exception:
+            return None
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 3)
+    return hashlib.sha256(np.ascontiguousarray(arr, dtype=np.float64).tobytes()).hexdigest()
+
+
+def _box_vectors_nm_array(box_vectors) -> Optional[np.ndarray]:
+    if box_vectors is None:
+        return None
+    try:
+        rows = []
+        for vec in box_vectors:
+            values = (
+                vec.value_in_unit(unit.nanometer)
+                if hasattr(vec, "value_in_unit")
+                else vec
+            )
+            rows.append([float(x) for x in values])
+        box = np.asarray(rows, dtype=np.float64)
+    except Exception as exc:
+        raise ValueError(f"无法解析周期盒向量: {exc}") from exc
+    if box.shape != (3, 3) or not np.all(np.isfinite(box)):
+        raise ValueError(f"周期盒向量必须是有限 (3, 3) 数组，实际为 {box.shape}")
+    if abs(float(np.linalg.det(box))) <= 1.0e-12:
+        raise ValueError("周期盒向量奇异，无法计算 minimum-image 位移")
+    return box
+
+
+def _box_vectors_hash(box_vectors) -> Optional[str]:
+    box = _box_vectors_nm_array(box_vectors)
+    if box is None:
+        return None
+    return hashlib.sha256(np.ascontiguousarray(box).tobytes()).hexdigest()
+
+
+def _minimum_image_displacement(displacement, box_vectors) -> np.ndarray:
+    """Return the triclinic minimum-image displacement for row-vector boxes."""
+    delta = np.asarray(displacement, dtype=np.float64)
+    box = _box_vectors_nm_array(box_vectors)
+    if box is None:
+        raise ValueError("周期体系缺少 box vectors，无法计算 Boresch minimum-image 距离")
+    fractional = delta @ np.linalg.inv(box)
+    fractional -= np.round(fractional)
+    return fractional @ box
+
+
+_CODE_HASH_CACHE: Optional[str] = None
+_DEBUG_CODE_HASH_WARNED = False
+
+
+def _debug_code_hash_frozen() -> Optional[str]:
+    """开发/调试专用逃生舱：设置环境变量 ABFE_DEBUG_FREEZE_CODE_HASH=1 时，
+    `_code_hash()`/`_preopt_code_hash()` 都返回同一个固定常量，而不是真的
+    读盘算哈希——这样反复修改 abfe_pipeline.py/ibs_engine.py 等文件本身
+    （调试修复循环/收敛逻辑时几乎每轮都要改代码）不会连带让 stage 完成
+    缓存/fixed-H 探针缓存/IBS 状态/λ 路径预优化缓存全部失效重算。
+
+    🔑 这不是"删掉哈希校验"——system_xml/topology/坐标/potential_type/
+    Boresch 参数以及各个手动维护的 protocol version 常量（IBS_BIAS_
+    PROTOCOL_VERSION 等）仍然正常参与比较，真正改变了物理/协议含义的
+    改动照样会让缓存失效。只有"我又手改了一遍 Python 代码本身"这一件事
+    被冻结掉，代价是：这段时间里，如果某次代码改动恰好改了会影响已采样
+    结果正确性的逻辑（不只是修 bug/重构控制流），旧缓存不会自动感知到。
+    这是有意识的、显式 opt-in 的临时状态，只应该在同一次调试会话内密集
+    改代码、跑收敛时打开；确认收敛后做最终会计入结果的正式运行前，必须
+    取消设置这个环境变量，让哈希校验真正生效一次，排除"这段时间内某次
+    改动其实动了物理逻辑却被跳过检查"的可能。
+    """
+    global _DEBUG_CODE_HASH_WARNED
+    if os.environ.get("ABFE_DEBUG_FREEZE_CODE_HASH") != "1":
+        return None
+    if not _DEBUG_CODE_HASH_WARNED:
+        print(
+            "  🚨 [DEBUG] ABFE_DEBUG_FREEZE_CODE_HASH=1：code_sha256/preopt_code_sha256 "
+            "已冻结为固定常量，不反映当前磁盘上的代码改动——仅供调试收敛逻辑时使用，"
+            "正式出结果前必须取消设置这个环境变量并至少完整跑一次真正的哈希校验。"
+        )
+        _DEBUG_CODE_HASH_WARNED = True
+    return "DEBUG_CODE_HASH_FROZEN_ABFE_DEBUG_FREEZE_CODE_HASH"
+
+
+def _code_hash() -> str:
+    """进程级代码指纹，只在本进程第一次调用时读盘计算一次并缓存。
+
+    🔑 [live-edit 指纹漂移 bug] 之前每次调用都重新读盘哈希这几个源文件——
+    但一个长时间运行的进程，其真正在执行的字节码在 import 时就已经固定，
+    源文件之后被编辑（这个项目里开发时经常发生，同一个会话里就多次边跑
+    边改）不会让运行中的进程重新加载。之前的写法会让同一个进程在不同时刻
+    算出不同的 code_sha256——纯粹因为磁盘上的文件变了，跟这个进程实际在跑
+    的代码毫无关系，会污染 stage/probe 缓存的失效判断（可能把同一进程内
+    本该复用的旧结果误判为"协议不匹配"而白白重算，或者反过来掩盖两次不同
+    进程之间代码其实不同）。改成只在本进程第一次用到时读盘一次、后续调用
+    直接返回缓存值，让这个指纹真正反映"这个进程从 import 起就固定的代码"，
+    而不是"调用这一刻磁盘上恰好是什么"。
+    """
+    debug_frozen = _debug_code_hash_frozen()
+    if debug_frozen is not None:
+        return debug_frozen
+    global _CODE_HASH_CACHE
+    if _CODE_HASH_CACHE is not None:
+        return _CODE_HASH_CACHE
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    payload = {}
+    for name in ("abfe_pipeline.py", "abfe_core.py", "ibs_engine.py", "abfe_preoptimizer.py"):
+        path = os.path.join(base_dir, name)
+        try:
+            with open(path, "rb") as handle:
+                payload[name] = hashlib.sha256(handle.read()).hexdigest()
+        except OSError:
+            payload[name] = None
+    _CODE_HASH_CACHE = _sha256_text(json.dumps(payload, sort_keys=True))
+    return _CODE_HASH_CACHE
+
+
+_PREOPT_CODE_HASH_CACHE: Optional[str] = None
+
+
+def _preopt_code_hash() -> str:
+    """λ 路径预优化（thermodynamic-length 逐点扫描）专用的、范围更窄的代码指纹。
+
+    🔑 [预优化被无关 bug 修复连带失效] `_code_hash()` 把 abfe_pipeline.py/
+    abfe_core.py/ibs_engine.py/abfe_preoptimizer.py 四个文件哈希成一个整体，
+    任何一处改动（哪怕只是修 ibs_engine.py 里窗口修复循环/reseed_resample
+    续采这类跟预优化完全无关的 bug）都会让它变化，进而让 _stage_protocol_key
+    里嵌的 code_sha256 跟着变，连带把 Stage 1/Stage 2 那份跑一次要几个小时的
+    λ 路径预优化缓存也判定失效、逼着重新跑一遍——预优化（
+    optimize_stage1_decharging/optimize_stage2_vanishing，见 abfe_preoptimizer.py）
+    只是在探针 Context 上测 dU/dλ 的方差来定 λ 路径，完全不涉及 IBS bias/f_k/
+    窗口修复循环，本不该被这些代码的改动连带作废。这里只哈希预优化真正会
+    执行到的代码：abfe_preoptimizer.py 本身，以及它复用的力场/软核势构建代码
+    abfe_core.py（AlchemicalPotentialFactory/ensure_owned_system/
+    create_ligand_internal_force/sync_all_exclusions，见 abfe_preoptimizer.py
+    顶部 import）——不包含 abfe_pipeline.py/ibs_engine.py，所以修复窗口管理/
+    修复循环/production checkpoint 续采这类 bug 不会再连带让预优化缓存失效。
+    如果将来预优化本身用到的代码（这两个文件）真的改了，这份指纹会正确
+    变化，缓存依然会失效重算——收窄范围不等于放弃校验。
+    """
+    debug_frozen = _debug_code_hash_frozen()
+    if debug_frozen is not None:
+        return debug_frozen
+    global _PREOPT_CODE_HASH_CACHE
+    if _PREOPT_CODE_HASH_CACHE is not None:
+        return _PREOPT_CODE_HASH_CACHE
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    payload = {}
+    for name in ("abfe_preoptimizer.py", "abfe_core.py"):
+        path = os.path.join(base_dir, name)
+        try:
+            with open(path, "rb") as handle:
+                payload[name] = hashlib.sha256(handle.read()).hexdigest()
+        except OSError:
+            payload[name] = None
+    _PREOPT_CODE_HASH_CACHE = _sha256_text(json.dumps(payload, sort_keys=True))
+    return _PREOPT_CODE_HASH_CACHE
+
+
+PROTOCOL_FINGERPRINT_SCHEMA_VERSION = 1
+
+
+def _file_sha256(path: str) -> Optional[str]:
+    try:
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _canonical_protocol_value(value):
+    """Convert protocol inputs to deterministic, JSON-safe values."""
+    if isinstance(value, np.generic):
+        value = value.item()
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not np.isfinite(value):
+            raise ValueError(f"协议指纹不接受 NaN/Inf: {value!r}")
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return _canonical_protocol_value(value.tolist())
+    if isinstance(value, dict):
+        return {
+            str(key): _canonical_protocol_value(value[key])
+            for key in sorted(value, key=lambda item: str(item))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_protocol_value(item) for item in value]
+    if isinstance(value, set):
+        canonical = [_canonical_protocol_value(item) for item in value]
+        return sorted(
+            canonical,
+            key=lambda item: json.dumps(item, sort_keys=True, ensure_ascii=False),
+        )
+    if hasattr(value, "unit") and hasattr(value, "value_in_unit"):
+        raw = value.value_in_unit(value.unit)
+        return {
+            "value": _canonical_protocol_value(raw),
+            "unit": str(value.unit),
+        }
+    raise TypeError(
+        f"协议指纹遇到不支持的值类型 {type(value).__name__}: {value!r}"
+    )
+
+
+def _protocol_fingerprint(payload: Dict) -> Dict:
+    canonical = _canonical_protocol_value(payload)
+    encoded = json.dumps(
+        canonical,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return {
+        "schema_version": PROTOCOL_FINGERPRINT_SCHEMA_VERSION,
+        "sha256": _sha256_text(encoded),
+        # Payload is deliberately retained: a mismatch is auditable instead of
+        # being an opaque hash-only cache miss.
+        "payload": canonical,
+    }
+
+
+def _package_version(package_name: str) -> Optional[str]:
+    try:
+        from importlib import metadata
+        return metadata.version(package_name)
+    except Exception:
+        return None
+
+
+def _collect_pipeline_provenance(
+    *,
+    config: Optional[Dict],
+    system: Optional[openmm.System],
+    topology: Optional[app.Topology],
+    positions,
+    command_line: Optional[List[str]] = None,
+) -> Dict:
+    env_seed_keys = ("OPENMM_RANDOM_SEED", "ABFE_RANDOM_SEED", "PYTHONHASHSEED")
+    return {
+        "config": config or {},
+        "command_line": command_line if command_line is not None else sys.argv,
+        "hashes": {
+            "system_xml_sha256": _system_xml_hash(system),
+            "topology_sha256": _topology_hash(topology),
+            "coordinates_nm_sha256": _positions_hash(positions),
+            "code_sha256": _code_hash(),
+        },
+        "random_seeds": {
+            key: os.environ.get(key)
+            for key in env_seed_keys
+            if os.environ.get(key) is not None
+        },
+        "software_versions": {
+            "python": sys.version,
+            "platform": platform.platform(),
+            "openmm": getattr(openmm, "__version__", None),
+            "numpy": getattr(np, "__version__", None),
+            "pymbar": _package_version("pymbar"),
+            "mdtraj": _package_version("mdtraj"),
+        },
+        "thermodynamic_cycle": THERMODYNAMIC_CYCLE_DOC,
+    }
+
+
+def _pme_u_kn_meta_payload(
+    n_states: int,
+    lambdas_coul: List[float],
+    lambdas_vdw: List[float],
+    temperature_k: float,
+    system: Optional[openmm.System],
+    topology: Optional[app.Topology],
+    ligand_indices: Optional[List[int]],
+    boresch_params: Optional[Dict],
+) -> Dict:
+    boresch_sig = None
+    if boresch_params:
+        boresch_sig = {
+            "receptor_indices": [int(i) for i in boresch_params.get("receptor_indices", [])],
+            "ligand_indices": [int(i) for i in boresch_params.get("ligand_indices", [])],
+            "equilibrium_values": {
+                str(k): round(float(v), 8)
+                for k, v in (boresch_params.get("equilibrium_values") or {}).items()
+            },
+            "force_constants": {
+                str(k): round(float(v), 8)
+                for k, v in (boresch_params.get("force_constants") or {}).items()
+            },
+        }
+    return {
+        "model_version": PME_DECHARGE_MODEL_VERSION,
+        "n_states": int(n_states),
+        "temperature_k": round(float(temperature_k), 6),
+        "lambdas_coul": _lambda_signature(lambdas_coul),
+        "lambdas_vdw": _lambda_signature(lambdas_vdw),
+        "n_particles": int(system.getNumParticles()) if system is not None else None,
+        "n_forces": int(system.getNumForces()) if system is not None else None,
+        "system_xml_sha256": _system_xml_hash(system),
+        "topology_sha256": _topology_hash(topology),
+        "code_sha256": _code_hash(),
+        "runtime": {
+            "python": sys.version,
+            "platform": platform.platform(),
+            "openmm": getattr(openmm, "__version__", None),
+            "pymbar": _package_version("pymbar"),
+        },
+        "ligand_indices": [int(i) for i in (ligand_indices or [])],
+        "boresch": boresch_sig,
+    }
+
+
+# 🔑 [ESTIMATOR_ANALYSIS_PROTOCOL_VERSION=2, 2026-07-28] charging（decharging 腿）
+# 的估计量口径。**只用于 stage1 = charging**，vdW/stage2 与此无关（那条腿只能用
+# TMBAR，见 ibs_engine.ESTIMATOR_ANALYSIS_PROTOCOL_VERSION 的注释）。
+#
+# 主值改成相邻 BAR 的依据（2026-07-28 实测同一批 u_kn）：
+#   相邻 BAR 65.0762±0.6148 / 重加权 FD-TI 65.1262 / 全帧 MBAR 65.0032 三者一致，
+#   而**去相关 MBAR 64.4113** 偏低 0.6649；溶剂腿同样偏低 0.5252。
+#   根因是自相关子采样在有限样本下选帧不稳定（丢帧后那个子集不稳），**不是 MBAR
+#   有偏**。BAR 逐边只用相邻两态自己的样本，不受全局选帧影响。
+# ⚠️ 两条腿的偏移基本抵消：净移动只有 (0.5252−0.6649)/4.184 = **−0.033 kcal/mol**。
+#   这是个真问题，但**不是** result.txt 那 1.3 kcal charging 缺口的解释。
+CHARGING_TI_GATE_TOL_KJ_MOL = 0.5
+
+
+def _CHARGING_ESTIMATOR_KWARGS(lambdas_coul: Sequence[float]) -> Dict:
+    """decharging 腿两处 `analyzer.solve()` 共用的估计量参数。
+
+    抽成一个函数而不是在两处各写一遍：缓存命中路径与正常路径必须用**完全相同**的
+    口径，否则 resume 与首次运行会报出两个不同定义的 ΔG。
+
+    `ti_gate_tolerance_kJ_mol` 必须显式给：实测 |BAR−FD-TI| = 0.050（复合物）/
+    0.226（溶剂）kJ/mol。0.5 是绝对下限；实际判据是
+    `max(0.5, 3*sigma_BAR)`，当前两腿约为 1.84 / 1.98 kJ/mol。
+    **刻意不沿用 attachment 的 `ATTACHMENT_BAR_TI_ABS_TOL_KJ = 1.0`**——两条腿的
+    量级与 TI 变体都不同。
+    """
+    return dict(
+        primary_estimator="adjacent_bar",
+        # 真实（非均匀）λ 表。FD-TI 的中心差分必须用它，不能用态序号。
+        lambdas=[float(x) for x in lambdas_coul],
+        ti_gate_tolerance_kJ_mol=CHARGING_TI_GATE_TOL_KJ_MOL,
+        # 四个口径全部落盘：主值换了，旧口径必须留下可比的痕迹。
+        crosschecks=True,
+    )
+
+
+def _is_pme_u_kn_cache_compatible(
+    stage_output_dir: str,
+    stage_name: str,
+    n_states: int,
+    lambdas_coul: List[float],
+    lambdas_vdw: List[float],
+    temperature_k: float,
+    system: Optional[openmm.System],
+    topology: Optional[app.Topology],
+    ligand_indices: Optional[List[int]],
+    boresch_params: Optional[Dict],
+) -> bool:
     meta_path = _pme_u_kn_meta_path(stage_output_dir, stage_name)
     if not os.path.exists(meta_path):
         return False
     try:
         with open(meta_path, "r", encoding="utf-8") as f:
             meta = json.load(f)
-        return (
-            meta.get("model_version") == PME_DECHARGE_MODEL_VERSION
-            and int(meta.get("n_states", -1)) == int(n_states)
+        return meta == _pme_u_kn_meta_payload(
+            n_states=n_states,
+            lambdas_coul=lambdas_coul,
+            lambdas_vdw=lambdas_vdw,
+            temperature_k=temperature_k,
+            system=system,
+            topology=topology,
+            ligand_indices=ligand_indices,
+            boresch_params=boresch_params,
         )
     except Exception:
         return False
 
 
-def _write_pme_u_kn_meta(stage_output_dir: str, stage_name: str, n_states: int) -> None:
+def _write_pme_u_kn_meta(
+    stage_output_dir: str,
+    stage_name: str,
+    n_states: int,
+    lambdas_coul: List[float],
+    lambdas_vdw: List[float],
+    temperature_k: float,
+    system: Optional[openmm.System],
+    topology: Optional[app.Topology],
+    ligand_indices: Optional[List[int]],
+    boresch_params: Optional[Dict],
+) -> None:
     meta_path = _pme_u_kn_meta_path(stage_output_dir, stage_name)
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(
-            {
-                "model_version": PME_DECHARGE_MODEL_VERSION,
-                "n_states": int(n_states),
-            },
+            _pme_u_kn_meta_payload(
+                n_states=n_states,
+                lambdas_coul=lambdas_coul,
+                lambdas_vdw=lambdas_vdw,
+                temperature_k=temperature_k,
+                system=system,
+                topology=topology,
+                ligand_indices=ligand_indices,
+                boresch_params=boresch_params,
+            ),
             f,
             indent=2,
         )
@@ -194,14 +908,15 @@ def attach_simulation_reporters(
     output_dir: str,
     traj_interval: int = 5000,      # 轨迹保存间隔 (步)
     energy_interval: int = 1000,    # 能量日志间隔
-    chk_interval: int = 10000       # Checkpoint 间隔
+    chk_interval: int = 10000,      # Checkpoint 间隔
+    append_traj: bool = False
 ):
     """为任意 Simulation 实例统一挂载轨迹、能量、Checkpoint Reporter"""
     os.makedirs(output_dir, exist_ok=True)
     
     # 1. 轨迹
     dcd_path = os.path.join(output_dir, f"{prefix}_traj.dcd")
-    simulation.reporters.append(app.DCDReporter(dcd_path, traj_interval, enforcePeriodicBox=False))
+    simulation.reporters.append(app.DCDReporter(dcd_path, traj_interval, append=append_traj, enforcePeriodicBox=False))
     
     # 2. 能量日志 (包含势能、温度、密度等)
     log_path = os.path.join(output_dir, f"{prefix}_energy.log")
@@ -263,6 +978,12 @@ def _is_traj_valid(dcd_path: str, min_frames: int = 1) -> bool:
 
 def _expected_remd_traj_files(stage_output_dir: str, stage_name: str, n_replicas: int) -> List[str]:
     return [os.path.join(stage_output_dir, f"{stage_name}_rep{i}.dcd") for i in range(int(n_replicas))]
+
+
+def _expected_remd_frame_count(n_steps: int, save_interval: int = 5000) -> int:
+    if n_steps <= 0 or save_interval <= 0:
+        return 0
+    return int(n_steps // save_interval)
 
 
 def _all_remd_trajs_valid(stage_output_dir: str, stage_name: str, n_replicas: int, min_frames: int = 1) -> bool:
@@ -343,77 +1064,6 @@ class NumpyEncoder(json.JSONEncoder):
 # =============================================================================
 # 多进程工作函数：双阶段并行采样
 # =============================================================================
-def _run_stage_worker_process(
-    state_dir: str,
-    temperature_k: float,
-    platform_name: str,
-    output_dir: str,
-    stage_name: str,
-    fixed_lam_coul: float,
-    fixed_lam_vdw: float,
-    n_states: int,
-    n_steps_per_window: int,
-    steps_per_update: int,
-    system_type: str,
-    potential_type: str,
-    dexp_params: Optional[Dict],
-    optimized_lambdas: Optional[List[float]],
-    enable_early_stop: bool,
-    boresch_params: Optional[Dict],
-    enable_gradual_warmup: bool,
-    warmup_steps: int,
-    result_file: str,
-):
-    """子进程工作函数：加载保存的Pipeline状态并执行一个双λ阶段"""
-    import sys
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    import json as _json
-    import numpy as _np
-    from openmm import app as _app, unit as _unit, Vec3 as _Vec3, XmlSerializer as _XmlSerializer
-
-    with open(os.path.join(state_dir, "system.xml")) as _f:
-        _system = _XmlSerializer.deserialize(_f.read())
-    _pdbx = app.PDBxFile(os.path.join(state_dir, "topology.cif"))
-    _topology = _pdbx.topology
-    _pos_np = _np.load(os.path.join(state_dir, "positions.npy"))
-    _positions = [_Vec3(float(_v[0]), float(_v[1]), float(_v[2])) for _v in _pos_np] * _unit.nanometer
-    _bv_np = _np.load(os.path.join(state_dir, "box_vectors.npy"))
-    _box_vectors = [_Vec3(float(_v[0]), float(_v[1]), float(_v[2])) for _v in _bv_np] * _unit.nanometer
-    with open(os.path.join(state_dir, "ligand_indices.json")) as _f:
-        _ligand_indices = _json.load(_f)
-
-    from abfe_pipeline import ABFEPipeline as _Pipeline
-    _stage_ckpt_dir = os.path.join(output_dir, "checkpoints", stage_name)
-    _pipeline = _Pipeline(
-        system=_system,
-        topology=_topology,
-        positions=_positions,
-        box_vectors=_box_vectors,
-        ligand_indices=_ligand_indices,
-        temperature=temperature_k,
-        output_dir=output_dir,
-        checkpoint_dir=_stage_ckpt_dir,
-        platform_name=platform_name,
-    )
-    _result = _pipeline._run_dual_lambda_stage(
-        stage_name=stage_name,
-        fixed_lam_coul=fixed_lam_coul,
-        fixed_lam_vdw=fixed_lam_vdw,
-        n_states=n_states,
-        n_steps_per_window=n_steps_per_window,
-        steps_per_update=steps_per_update,
-        system_type=system_type,
-        resume=False,
-        potential_type=potential_type,
-        dexp_params=dexp_params,
-        optimized_lambdas=optimized_lambdas,
-        enable_early_stop=enable_early_stop,
-        boresch_params=boresch_params,
-        enable_gradual_warmup=enable_gradual_warmup,
-        warmup_steps=warmup_steps,
-    )
-    with open(result_file, "w") as _f:
-        _json.dump(_result, _f, indent=2)
 
 
 class ABFEPipeline:
@@ -463,6 +1113,17 @@ class ABFEPipeline:
         self.results = {}
         self.platform_name = platform_name
 
+        # 🔑 双重预平衡防护：这两个标记只反映"本进程这个 pipeline 实例这次调用
+        # 里是否已经跑过"，不是磁盘缓存状态（那由 equilibrium_is_done() 单独判断）。
+        # pre_equilibrate() 在跑完（无论是否带 Boresch 限制力）后置位第一个；
+        # _rebalance_with_boresch() 在其每一个 return 分支（含"已完成、跳过"分支）
+        # 都会置位第二个，因为两种情况下 self.positions 都已经是可信的、带 Boresch
+        # 限制力平衡过的坐标。run_full_pipeline() 的内部预平衡块用它们短路，
+        # 避免用一次无约束的预平衡覆盖掉刚做完的 Boresch 再平衡坐标——这个覆盖
+        # 之前在 --reset 或外部 Boresch 参数的全新运行里都会真实发生。
+        self._pre_equilibration_done_this_process = False
+        self._boresch_rebalance_done_this_process = False
+
         self._log(f"{'=' * 60}")
         self._log(f"ABFE Pipeline v4.0 初始化完成 | {datetime.now().isoformat()}")
         self._log(f"输出目录: {self.output_dir}")
@@ -495,7 +1156,8 @@ class ABFEPipeline:
     @staticmethod
     def get_device_strategy(n_windows: int = 1, min_free_mb: int = 2000, platform_name: str = "CUDA"):
         import warnings
-        if platform_name.upper() != "CUDA":
+        platform_base, _ = _split_platform_spec(platform_name)
+        if platform_base.upper() != "CUDA":
             return {"strategy": "cpu", "devices": [], "n_gpus": 0}
         
         try:
@@ -526,34 +1188,6 @@ class ABFEPipeline:
     # =========================================================================
     # 0.3 并行阶段状态序列化
     # =========================================================================
-    def _save_state_to_dir(self, state_dir: str):
-        """将 Pipeline 状态序列化至磁盘，供子进程加载"""
-        os.makedirs(state_dir, exist_ok=True)
-        with open(os.path.join(state_dir, "system.xml"), "w") as f:
-            f.write(XmlSerializer.serialize(self.system))
-        with open(os.path.join(state_dir, "topology.cif"), "w") as f:
-            app.PDBxFile.writeFile(self.topology, self.positions, f)
-
-        pos = self.positions
-        if hasattr(pos, "value_in_unit"):
-            pos_np = np.array([[float(v[i]) for i in range(3)] for v in pos.value_in_unit(unit.nanometer)])
-        else:
-            pos_np = np.asarray(pos, dtype=np.float64)
-        np.save(os.path.join(state_dir, "positions.npy"), pos_np)
-
-        if self.box_vectors is not None:
-            bv = self.box_vectors
-            if hasattr(bv, "value_in_unit"):
-                bv_np = np.array([[float(v[i]) for i in range(3)] for v in bv.value_in_unit(unit.nanometer)])
-            else:
-                bv_np = np.asarray(bv, dtype=np.float64)
-        else:
-            bv_np = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
-        np.save(os.path.join(state_dir, "box_vectors.npy"), bv_np)
-
-        with open(os.path.join(state_dir, "ligand_indices.json"), "w") as f:
-            json.dump(self.ligand_indices, f)
-        self._log(f"  💾 Pipeline 状态已保存至 {state_dir}")
 
     # =========================================================================
     # 0.5 全局状态管理 (断点续传)
@@ -608,6 +1242,74 @@ class ABFEPipeline:
     # =========================================================================
     # 1. 物理预平衡 (10 ns) → 保存轨迹 → 提取稳态坐标
     # =========================================================================
+    def repair_pbc_molecule_integrity(self, *, context: str = "") -> bool:
+        """🔑 [P1-14] 按拓扑把每个连通分子做整分子周期平移，再整体居中。
+
+        **必须在第一次创建 Context / 最小化 / 预平衡之前调用。** 此前这段逻辑只在
+        `run_full_pipeline` 第 2 节出现，也就是 `pre_equilibrate()`（内含
+        `LocalEnergyMinimizer.minimize` 与 NPT 步进）**之后**；而
+        `runabfe.center_system_rigidly()` 只做整体质心平移，却有调用点紧接着打印
+        "分子完整性修复完毕"。结果是：GRO/缓存里本来就跨边界断裂的分子，会带着
+        断裂先进最小化和 NPT——最小化会真实改变原子间相对坐标，把断裂"焊"进构型。
+
+        只做两件事，都不改变任何分子内相对坐标：
+          1. `image_molecules()` —— 按连通分子整体做周期平移；
+          2. `center_coordinates()` —— 全体系整体平移。
+        不旋转、不缩放。
+
+        失败时 **fail closed**。此前的回退是 `_wrap_ligand_to_box()`（自己的
+        docstring 就写着"仅做整体刚性平移"），它根本修不了跨盒断裂，却让流程
+        带着未修复的构型继续——等于把"修复失败"降级成"看起来修好了"。
+        """
+        if self.positions is None or self.box_vectors is None:
+            self._log(f"  ⏭️ 无坐标/盒矢量，跳过 PBC 分子完整性修复{('（' + context + '）') if context else ''}")
+            return False
+
+        self._log(f"  📦 正在执行 PBC 分子完整性修复与配体居中{('（' + context + '）') if context else ''}...")
+        try:
+            import mdtraj as md
+            md_top = md.Topology.from_openmm(self.topology)
+            # ⚠️ Quantity.value_in_unit() 在底层是 list-of-Vec3（而非 numpy 数组）时
+            # 返回的仍是 Python list，没有 .reshape；必须显式再包一层 np.asarray。
+            # 🚨 mdtraj 的 Cython 扩展（含 image_molecules 内部用到的 geometry 例程）
+            # 要求 float32（"float"）缓冲区；用 float64 构造时 Trajectory() 会自动
+            # 转换 xyz，但直接赋值 unitcell_vectors 不会，于是 image_molecules() 必然抛
+            # "Buffer dtype mismatch, expected 'float' but got 'double'"。历史上这个
+            # dtype bug 让每次都静默回退到只居中配体的 numpy 兜底，撕裂的水分子
+            # 从预平衡开始就一路带进所有窗口。
+            pos_nm = np.asarray(
+                self.positions.value_in_unit(unit.nanometer)
+                if hasattr(self.positions, "value_in_unit") else self.positions,
+                dtype=np.float32,
+            )
+            box_nm = np.asarray(
+                [
+                    v.value_in_unit(unit.nanometer) if hasattr(v, "value_in_unit") else v
+                    for v in self.box_vectors
+                ],
+                dtype=np.float32,
+            )
+            traj = md.Trajectory(pos_nm.reshape(1, -1, 3), md_top)
+            # 不传 unitcell_vectors 时 mdtraj 完全不知道盒子形状，
+            # image_molecules() 会直接报 "does not define a periodic unit cell"。
+            traj.unitcell_vectors = box_nm.reshape(1, 3, 3)
+            traj.image_molecules(inplace=True)
+            traj.center_coordinates()
+            self.positions = [
+                openmm.Vec3(float(x), float(y), float(z)) for x, y, z in traj.xyz[0]
+            ] * unit.nanometer
+            self._log("  ✓ PBC 分子完整性已修复，体系已居中至主周期")
+            self._pbc_integrity_repaired = True
+            return True
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"PBC 分子完整性修复失败：{exc}\n"
+                "  拒绝以未修复的构型继续（fail closed）。此前这里会回退到 "
+                "_wrap_ligand_to_box()，但那只是整体质心平移，**修不了跨盒断裂的分子**，\n"
+                "  只会让断裂构型静默进入最小化/NPT，并被最小化固化进相对坐标。\n"
+                "  常见原因：拓扑与坐标原子数不一致、盒矢量非法、mdtraj 未安装。"
+            ) from exc
+
     def pre_equilibrate(
         self,
         n_steps: int = 5_000_000,  # 10ns @ 2fs
@@ -616,8 +1318,50 @@ class ABFEPipeline:
         resume: bool = False,
     ) -> Dict:
         """物理预平衡 - 【修复】默认使用 GPU，仅在生产采样前清理上下文"""
+        # 🔑 [P1-14] 在建 Context / 最小化 / NPT **之前**做整分子 PBC 修复。
+        # 这段此前只在 run_full_pipeline 第 2 节出现，也就是本函数**之后**——
+        # 于是输入里本来就跨盒断裂的分子会先进最小化，被固化进相对坐标。
+        # 幂等：已经修过就跳过（run_full_pipeline 里那次仍会执行，用于修预平衡
+        # 步进过程中新产生的跨盒，两者不冲突）。
+        if not getattr(self, "_pbc_integrity_repaired", False):
+            self.repair_pbc_molecule_integrity(context="pre_equilibrate 之前")
+
         traj_file = os.path.join(self.output_dir, "pre_equilibration.dcd")
         chk_file = os.path.join(self.checkpoint_dir, "pre_equil.chk")
+        fp_file = os.path.join(self.output_dir, "pre_equilibration_fingerprint.json")
+        requested_fingerprint = _pre_equilibration_fingerprint(
+            self.system,
+            self.ligand_indices,
+            self.temperature,
+            self.pressure,
+            positions=self.positions,
+            box_vectors=self.box_vectors,
+            requested_steps=n_steps,
+        )
+
+        # A binary OpenMM checkpoint is only meaningful for the exact initial
+        # pose/box/Hamiltonian and requested budget that created it.
+        if resume and os.path.exists(chk_file):
+            try:
+                with open(fp_file, encoding="utf-8") as handle:
+                    recorded_fingerprint = json.load(handle).get("fingerprint")
+            except Exception:
+                recorded_fingerprint = None
+            if recorded_fingerprint != requested_fingerprint:
+                self._log(
+                    "  ⚠️ 预平衡 checkpoint 的坐标/盒子/System/步数指纹不匹配，"
+                    "拒绝恢复并从当前输入重新开始"
+                )
+                resume = False
+        if save_traj:
+            # Persist the identity before the first step so an interrupted run
+            # has a checkpoint identity available on its very next resume.
+            with open(fp_file, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {"fingerprint": requested_fingerprint, "n_steps": int(n_steps)},
+                    handle,
+                    indent=2,
+                )
         
         # ✅ 修复：默认使用实例配置的 platform（通常是 CUDA）
         equil_platform = platform_name or self.platform_name
@@ -682,7 +1426,7 @@ class ABFEPipeline:
         # 添加 Reporter
         if save_traj and steps_remaining > 0:
             simulation.reporters.append(
-                app.DCDReporter(traj_file, 10000, enforcePeriodicBox=False)
+                app.DCDReporter(traj_file, 10000, append=resume_from_chk, enforcePeriodicBox=False)
             )
             simulation.reporters.append(app.CheckpointReporter(chk_file, 100000))
         
@@ -713,7 +1457,7 @@ class ABFEPipeline:
                 self._log(f"  ⚠️ 上下文清理警告: {e}（通常不影响后续运行）")
         
         self._log(f"  ✓ 预平衡完成 | 最终势能: {final_energy:.2f} kJ/mol")
-        
+
         self._update_stage_status(
             "equilibration",
             "completed",
@@ -724,6 +1468,22 @@ class ABFEPipeline:
                 "platform_used": equil_platform,
             },
         )
+        if save_traj:
+            try:
+                with open(fp_file, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "fingerprint": requested_fingerprint,
+                            "n_steps": int(n_steps),
+                        },
+                        f,
+                        indent=2,
+                    )
+            except Exception as e:
+                self._log(f"  ⚠️ 预平衡指纹写入失败（不影响本次结果，但下次 resume 无法校验缓存是否匹配当前系统）: {e}")
+        # 🔑 标记本进程已经做过一次预平衡——run_full_pipeline() 内部的预平衡块
+        # 会用这个标记短路，不再重新跑一次并覆盖这里刚更新的 self.positions。
+        self._pre_equilibration_done_this_process = True
 
         return {
             "positions": self.positions,
@@ -797,31 +1557,19 @@ class ABFEPipeline:
         chk_path = os.path.join(self.output_dir, "rebalance.chk")
         traj_path = os.path.join(self.output_dir, "rebalance_traj.dcd")
         state_path = os.path.join(self.output_dir, "rebalance_state.json")
-
-        if resume and os.path.exists(state_path) and _is_checkpoint_valid(chk_path) and _is_traj_valid(traj_path, min_frames=1):
-            try:
-                with open(state_path, "r", encoding="utf-8") as f:
-                    rebalance_state = json.load(f)
-                if rebalance_state.get("status") == "completed" and rebalance_state.get("n_steps") == int(n_steps):
-                    self._log("  ♻️ 再平衡状态已完成，且 Checkpoint/轨迹有效，跳过重复再平衡。")
-                    return {
-                        "positions": self.positions,
-                        "box_vectors": self.box_vectors,
-                        "resumed": True,
-                        "skipped": True,
-                    }
-            except Exception as e:
-                self._log(f"  ⚠️ 再平衡完成态读取失败 ({e})，继续按 Checkpoint 续跑逻辑处理")
-
-        # ✅ 新增：初始距离检查，防止拉力过载
+        # ✅ 初始距离检查，防止拉力过载（必须在计算/比对 fingerprint 之前做，
+        # 否则下面 _rebalance_fingerprint() 用的是校正前的 r0，而实际注入
+        # LambdaDependentBoreschForce、写进 rebalance.chk 的却是这里校正后的
+        # r0——fingerprint 描述的与 checkpoint 里真正生效的限制力对不上，缓存
+        # 校验形同虚设）。
         if _has_valid_boresch_restraint(boresch_params):
             import numpy as np
             from openmm import unit
-            
+
             rec_idx = boresch_params["receptor_indices"]
             lig_idx = boresch_params["ligand_indices"]
             eq = boresch_params["equilibrium_values"]
-            
+
             # ✅ 替换原有 pos_nm 转换逻辑 (约第 480 行)
             # 1. 强制转为 (N, 3) float64 numpy 数组，彻底杜绝 object 数组与索引报错
             if hasattr(self.positions, 'value_in_unit'):
@@ -857,16 +1605,77 @@ class ABFEPipeline:
             box_lengths = np.linalg.norm(box_nm, axis=1)
             if np.linalg.norm(lig_com - box_center) > 0.4 * np.min(box_lengths):
                 self.positions, self.box_vectors = self._wrap_ligand_to_box(self.positions, self.box_vectors)
-                self._log("  📦 检测到配体偏离主周期，已自动执行 PBC 居中")            
+                self._log("  📦 检测到配体偏离主周期，已自动执行 PBC 居中")
+                pos_nm = np.asarray(
+                    self.positions.value_in_unit(unit.nanometer)
+                    if hasattr(self.positions, "value_in_unit")
+                    else self.positions,
+                    dtype=np.float64,
+                )
             # 计算实际距离 (H0-L0: 最近受体锚点 - 配体首锚点)
             H0 = pos_nm[rec_idx[0]]
             L0 = pos_nm[lig_idx[0]]
-            actual_dist = np.linalg.norm(H0 - L0)
+            h0_l0 = _minimum_image_displacement(H0 - L0, self.box_vectors)
+            actual_dist = float(np.linalg.norm(h0_l0))
             target_r0 = eq.get("r0", 1.0)  # nm
-            
+
             if abs(actual_dist - target_r0) > 0.15:
                 self._log(f"  🔧 动态校正 Boresch r0: {target_r0*10:.2f}Å → {actual_dist*10:.2f}Å (防爬坡撕裂)")
                 boresch_params["equilibrium_values"]["r0"] = float(actual_dist)
+
+        # ✅ fingerprint 必须在上面的动态 r0 校正之后计算：它要描述的是"最终
+        # 实际会被注入 LambdaDependentBoreschForce、写进 rebalance.chk 的那组
+        # Boresch 参数"，而不是校正前的原始值。
+        expected_rebalance_fingerprint = _rebalance_fingerprint(self.system, boresch_params)
+
+        # 🔑 rebalance_state.json 之前只记录 status/n_steps，不记录 system/
+        # Boresch 锚点/力常数指纹。rebalance.chk 是绑定到具体 System（含注入的
+        # LambdaDependentBoreschForce 参数）的二进制状态；如果 Boresch 锚点、
+        # 平衡值或力常数变了（重新估算过、或上面的动态 r0 校正给出了
+        # 不同值），加载旧 checkpoint 不会报错，只会从一个"从未在当前限制力下
+        # 平衡过"的状态继续——必须显式比对指纹，不一致就整体视为缓存失效，
+        # 不能只看 status/n_steps 是否对得上。
+        rebalance_cache_trusted = True
+        rebalance_cache_reject_reason = None
+        if resume and os.path.exists(state_path):
+            try:
+                with open(state_path, "r", encoding="utf-8") as f:
+                    _cached_rebalance_state_for_fp = json.load(f)
+                if _cached_rebalance_state_for_fp.get("fingerprint") != expected_rebalance_fingerprint:
+                    rebalance_cache_trusted = False
+                    rebalance_cache_reject_reason = "system/Boresch 锚点或力常数指纹不匹配"
+            except Exception:
+                rebalance_cache_trusted = False
+                rebalance_cache_reject_reason = "rebalance_state.json 读取失败"
+        if not rebalance_cache_trusted:
+            self._log(
+                f"  ⚠️ 再平衡缓存视为无效（{rebalance_cache_reject_reason}），将忽略已有 "
+                "Checkpoint/轨迹，从当前坐标重新做一次完整的 Boresch 限制力再平衡。"
+            )
+
+        # 🔑 之前这里检测到 rebalance_state.json 标记为 completed 时会直接
+        # `return self.positions/self.box_vectors`——但 self.positions 此时是
+        # pipeline 构造时加载的坐标（通常来自基线预平衡 pre_equilibration.dcd
+        # 的最后一帧，见 runabfe.py::load_native_system 的 prefer_equilibrated
+        # 逻辑），根本不是 rebalance.chk/rebalance_traj.dcd 里真正带 Boresch
+        # 限制力平衡过的那一帧——等于把还没做完 Boresch 限制力再平衡的坐标当成
+        # 已经做完的结果直接返回。真正正确的"跳过"不是提前 return，而是让下面
+        # 的续跑逻辑（resume_enabled=True + loadCheckpoint + steps_remaining=
+        # max(0, n_steps-currentStep)==0）自然处理：steps_remaining<=0 时不会
+        # 再步进，但仍会从刚加载的 checkpoint 里正确提取出已经完成再平衡的
+        # 坐标/盒子。这里只做提示性日志，不再提前返回。
+        if (
+            resume and rebalance_cache_trusted and os.path.exists(state_path)
+            and _is_checkpoint_valid(chk_path) and _is_traj_valid(traj_path, min_frames=1)
+        ):
+            try:
+                with open(state_path, "r", encoding="utf-8") as f:
+                    rebalance_state = json.load(f)
+                if rebalance_state.get("status") == "completed" and rebalance_state.get("n_steps") == int(n_steps):
+                    self._log("  ♻️ 再平衡状态已完成，Checkpoint/轨迹有效，将从 Checkpoint 加载真实再平衡坐标（不重新步进）。")
+            except Exception as e:
+                self._log(f"  ⚠️ 再平衡完成态读取失败 ({e})，继续按 Checkpoint 续跑逻辑处理")
+
         # 1. 系统深拷贝 + 强制声明 Python 所有权
         sys_xml = XmlSerializer.serialize(self.system)
         rebal_sys = XmlSerializer.deserialize(sys_xml)
@@ -908,15 +1717,19 @@ class ABFEPipeline:
         # 3. 创建 Simulation
         simulation = app.Simulation(self.topology, rebal_sys, integrator, platform, props)
         
-        # ✅ 挂载统一 Reporter
+        # ✅ 挂载统一 Reporter（rebalance_cache_trusted=False 时同 resume 一样
+        # 不追加旧轨迹——那份轨迹是在不同的 Boresch 限制力下产生的，续接只会
+        # 拼出一条物理上不连续的假轨迹）
         dcd_path, log_path, _ = attach_simulation_reporters(
             simulation, "rebalance", self.output_dir,
-            traj_interval=2000, energy_interval=500, chk_interval=5000
+            traj_interval=2000, energy_interval=500, chk_interval=5000,
+            append_traj=resume and rebalance_cache_trusted and _is_checkpoint_valid(chk_path),
         )
-        
-        # ✅ 续跑逻辑
+
+        # ✅ 续跑逻辑（rebalance_cache_trusted=False 时强制不加载旧 checkpoint，
+        # 即使文件本身格式有效——它是在不同的 Boresch 限制力下产生的状态）
         resume_enabled = False
-        if resume and _is_checkpoint_valid(chk_path):
+        if resume and rebalance_cache_trusted and _is_checkpoint_valid(chk_path):
             self._log(f"  ♻️ 检测到再平衡 Checkpoint ({chk_path})，恢复状态...")
             try:
                 simulation.loadCheckpoint(chk_path)
@@ -966,6 +1779,7 @@ class ABFEPipeline:
                         "checkpoint": chk_path,
                         "trajectory": dcd_path,
                         "log": log_path,
+                        "fingerprint": expected_rebalance_fingerprint,
                     },
                     f,
                     indent=2,
@@ -974,6 +1788,9 @@ class ABFEPipeline:
             self._log(f"  ⚠️ 再平衡完成态保存失败: {e}")
 
         self._log(f"  ✓ 再平衡完成 | 坐标已更新")
+        # 标记本进程已完成 Boresch 再平衡（见 __init__ 里的说明和
+        # run_full_pipeline() 内部预平衡块对这个标记的使用）。
+        self._boresch_rebalance_done_this_process = True
         return {"positions": new_positions, "box_vectors": new_box}
 
     # =========================================================================
@@ -1262,18 +2079,67 @@ class ABFEPipeline:
     # ================= abfe_pipeline.py -> _run_dual_lambda_optimization =================
     # ================= abfe_pipeline.py =================
     # 替换原 _run_dual_lambda_optimization 方法
-    def _run_dual_lambda_optimization(self, stage_name: str, n_states: int = 12, n_steps_per_state: int = 10000) -> Dict:
+    def _run_dual_lambda_optimization(
+        self,
+        stage_name: str,
+        n_states: int = 12,
+        n_steps_per_state: int = 10000,
+        potential_type: str = "softcore",
+        finite_difference_delta: float = 0.01,
+    ) -> Dict:
         from abfe_preoptimizer import DualLambdaPreOptimizer
         
         self._log(f"\n[PIPELINE] 开始优化 {stage_name} 阶段...")
         softcore_obj = ACESoftcorePotential.from_dict(ACESoftcorePotential.optimize_alpha(len(self.ligand_indices)))
 
-        if stage_name == "decharging":
+        if stage_name == "decharging" or str(potential_type).lower() != "softcore":
+            if str(potential_type).lower() != "softcore":
+                self._log(
+                    f"[PIPELINE] {stage_name} 预优化已禁用：当前 potential_type={potential_type}，"
+                    "避免用 ACES-softcore 探针优化非 softcore 生产 Hamiltonian，改用线性 λ 路径。"
+                )
+            else:
+                self._log(
+                    "[PIPELINE] Stage 1 去电荷预优化已强制禁用自适应 Pathfinding："
+                    "Cutoff 型 CustomNonbonded 探针无法保真 PME 长程静电，直接回退线性 λ 路径。"
+                )
             self._log(
-                "[PIPELINE] Stage 1 去电荷预优化已强制禁用自适应 Pathfinding："
-                "Cutoff 型 CustomNonbonded 探针无法保真 PME 长程静电，直接回退线性 λ 路径。"
+                f"[PIPELINE] {stage_name} 使用线性 λ 路径 ({n_states} 状态)。"
             )
             opt_n_states = int(n_states)
+            if stage_name == "vanishing":
+                # 🔑 [THERMODYNAMIC_PATH_PROTOCOL_VERSION=21] 无 pilot 度规可用的兜底
+                # 分支：度规驱动布点在这里无从谈起，退回纯几何的平方调度，直接生成
+                # 最终态数（不再走「17 基础 + 4 人工 + 2 bridge」那条链——那条链的
+                # 存在理由是补救被错误 alpha 压缩到 λ≈1 的度规，已随 alpha 修正消失）。
+                _fallback_path = quadratic_vanishing_base_lambdas(
+                    VANISHING_FINAL_STATE_COUNT
+                )
+                validate_vanishing_lambda_path_invariants(_fallback_path)
+                _human_ranges = vanishing_subdomain_ranges_from_lambdas(
+                    _fallback_path,
+                    first_ensemble_target_intervals=(
+                        VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS
+                    ),
+                )
+                validate_single_shared_boundary_ranges(
+                    _human_ranges, len(_fallback_path)
+                )
+                return {
+                    "lambdas_var": _fallback_path.tolist(),
+                    "n_states": len(_fallback_path),
+                    "window_ranges": _human_ranges,
+                    "softcore_params": softcore_obj,
+                    "path_protocol_version": THERMODYNAMIC_PATH_PROTOCOL_VERSION,
+                    "path_diagnostics": {
+                        "lambda_placement_method": "quadratic_geometric_fallback_v21",
+                        "probe_controls_base_lambda_placement": False,
+                        "adaptive_metric_disabled": True,
+                    },
+                    "path_optimization_disabled_reason": (
+                        f"unsupported_probe_for_{potential_type}"
+                    ),
+                }
             return {
                 "lambdas_var": np.linspace(1.0, 0.0, opt_n_states).tolist(),
                 "n_states": opt_n_states,
@@ -1284,6 +2150,11 @@ class ABFEPipeline:
                     overlap=2,
                 ),
                 "softcore_params": softcore_obj,
+                "path_optimization_disabled_reason": (
+                    "pme_decharging_probe_disabled"
+                    if stage_name == "decharging"
+                    else f"unsupported_probe_for_{potential_type}"
+                ),
             }
         
         probe_sys = build_aces_probe_system_dual_lambda(self.system, self.ligand_indices, softcore_obj, fixed_lam_coul=0.0, fixed_lam_vdw=1.0)
@@ -1330,7 +2201,11 @@ class ABFEPipeline:
             if stage_name == "decharging":
                 opt_res = optimizer.optimize_stage1_decharging(n_states=n_states, n_steps_per_state=n_steps_per_state)
             else:
-                opt_res = optimizer.optimize_stage2_vanishing(n_states=n_states, n_steps_per_state=n_steps_per_state)
+                opt_res = optimizer.optimize_stage2_vanishing(
+                    n_states=n_states,
+                    n_steps_per_state=n_steps_per_state,
+                    finite_difference_delta=finite_difference_delta,
+                )
             self._log(f"[OUTPUT] 优化成功返回: keys={list(opt_res.keys())}")
         except Exception as e:
             self._log(f"[OUTPUT] 优化器异常捕获: {e}")
@@ -1339,21 +2214,24 @@ class ABFEPipeline:
                 self._log(traceback.format_exc())
             except Exception:
                 pass
-            opt_res = {
-                "stage": stage_name,
-                "lambdas_coul": np.linspace(1.0, 0.0, n_states).tolist() if stage_name=="decharging" else [0.0]*n_states,
-                "lambdas_vdw": np.linspace(1.0, 0.0, n_states).tolist() if stage_name=="vanishing" else [1.0]*n_states,
-                "n_states": n_states
-            }
-            self._log(f"[OUTPUT] 降级返回线性路径: {opt_res['n_states']} 状态")
+            raise RuntimeError(
+                f"{stage_name} 热力学路径 pilot 失败；拒绝静默回退线性 λ 路径: {e}"
+            ) from e
         
         opt_n_states = int(opt_res["n_states"])
-        opt_window_ranges = generate_overlapping_windows(
-            n_states=opt_n_states,
-            n_windows=None,
-            pts_per_window=6,
-            overlap=2,
-        )
+        opt_window_ranges = opt_res.get("window_ranges")
+        if opt_window_ranges is None:
+            if stage_name == "vanishing":
+                raise RuntimeError(
+                    "vanishing 优化器未返回论文双子区间 window_ranges；"
+                    "拒绝回退 overlap=2 自动划窗。"
+                )
+            opt_window_ranges = generate_overlapping_windows(
+                n_states=opt_n_states,
+                n_windows=None,
+                pts_per_window=6,
+                overlap=2,
+            )
 
         del context, integrator, probe_sys
         return {
@@ -1361,7 +2239,11 @@ class ABFEPipeline:
             "n_states": opt_res["n_states"],
             "window_ranges": opt_window_ranges,
             "softcore_params": softcore_obj,
+            "path_protocol_version": opt_res.get("path_protocol_version"),
+            "path_diagnostics": opt_res.get("path_diagnostics", {}),
         }
+
+
 
     # ================= abfe_pipeline.py =================
     # 替换 _run_dual_lambda_stage 方法
@@ -1378,6 +2260,7 @@ class ABFEPipeline:
         potential_type: str = "softcore",
         dexp_params: Optional[Dict] = None,
         optimized_lambdas: Optional[List[float]] = None,
+        window_ranges: Optional[List[Tuple[int, int]]] = None,
         enable_early_stop: bool = False,
         boresch_params: Optional[Dict] = None,
         enable_gradual_warmup: bool = True,
@@ -1385,11 +2268,62 @@ class ABFEPipeline:
         parallel: bool = True,
         device_indices: Optional[list] = None,
         n_workers: int = None,
+        decharge_method: str = "pme",
+        shadow_bridge_lambdas: Optional[List[float]] = None,
+        shadow_bridge_n_steps: int = 200000,
+        shadow_bridge_exchange_interval: int = 1000,
+        production_step_overrides: Optional[Dict[int, int]] = None,
+        frozen_validation_step_overrides: Optional[Dict[int, int]] = None,
+        frozen_validation_is_final_rung: Optional[Dict[int, bool]] = None,
+        pilot_lambdas: Optional[List[float]] = None,
+        pilot_mean_dU_dlambda: Optional[List[float]] = None,
+        allow_partial_vanishing_rescue: bool = False,
+        stage_output_dir_override: Optional[str] = None,
+        checkpoint_dir_override: Optional[str] = None,
+        remd_max_resident_contexts: Optional[int] = None,
         **kwargs,
     ) -> Dict:
         """
         执行单个双λ阶段 (去电荷 或 去VDW)
         职责：路由采样 -> 获取结果
+
+        pilot_lambdas/pilot_mean_dU_dlambda: [IBS_BIAS_PROTOCOL_VERSION=20]
+            可选的 Stage 2 pilot 探针真实测出的 λ 网格与对应的平均梯度
+            （mean_dU_dlambda_kJ_mol，不是用于摆 λ 点密度的方差代理
+            metric_g），透传给 IBSWindowManagerDualLambda 供
+            run_all_windows 给每个全新（非 resume）窗口的 f_k 做 TI 热启动，
+            而不是从 0.0 冷启动。只有 vanishing/vdw 阶段有意义；decharging
+            传 None 即可（走 REMD/PME-MBAR，不消费这两个参数）。
+
+        production_step_overrides: 可选的 {window_idx: 该窗口实际生产步数} 覆盖表，
+            透传给 ibs_engine.py::run_all_windows（仅 vdw/"vanishing" 阶段的
+            manager.run_all_windows 调用会用到；decharging 走 REMD/PME-MBAR 分支，
+            不消费这个参数）。供 _run_stage_with_overlap_autorepair 的
+            production ESS sampling-repair 分支使用，真正延长某个窗口的采样，
+            而不是删旧样本后用同样步数重采一次。
+
+        frozen_validation_step_overrides: 可选的 {window_idx: 该窗口冻结验证的
+            累计目标预算步数} 覆盖表 [IBS_BIAS_PROTOCOL_VERSION=12]，透传给
+            ibs_engine.py::run_all_windows。fixed-H overlap 全通过、MBAR 校准
+            探针也已达标，但冻结验证没能在默认的 mbar_calibration_reserved_steps
+            内通过覆盖门时使用；供 _run_stage_with_overlap_autorepair 的
+            calibration_pending_validation 分支使用，按 50k→150k→300k 阶梯延长，
+            resume 时跳过 SGD 和 fixed-H 探针/重新校准，只续验累计预算里还没跑
+            完的差值（ibs_engine.py 内部按 frozen_validation_cumulative_steps
+            记账，不会把这个字段当成"这次要新跑多少步"）。
+
+        frozen_validation_is_final_rung: 可选的 {window_idx: 这次是否已经是
+            冻结验证阶梯的最后一档} 表，透传给 ibs_engine.py::run_all_windows。
+            标记为 True 后如果仍未通过独立验证，该窗口会被直接判定为终态失败
+            （bias_status="calibrated_validation_failed"，raise
+            IBSFrozenCalibrationValidationError(terminal=True)），不再落盘为
+            "calibrated_pending_validation"、不再暗示还能自动继续延长。
+
+        decharge_method 只影响 stage_name == "decharging"：
+          - "pme" (默认，原有接口/行为不变)：NonbondedForce ParameterOffset +
+            传统 REMD/MBAR，保留完整 PME 长程静电。
+          - "shadow_ibs" (实验性，尚未经物理验证)：改走 Shadow-Coulomb IBS，
+            见 _run_shadow_ibs_decharging_leg。
         """
         self._log(f"\n{'=' * 60}")
         self._log(f"[双λ阶段] {stage_name.upper()} | λ_coul={fixed_lam_coul} | λ_vdw={fixed_lam_vdw}")
@@ -1409,6 +2343,21 @@ class ABFEPipeline:
             fixed_lam_vdw if stage_name == "decharging" else fixed_lam_coul
         ] * n_states
 
+        if stage_name == "decharging" and decharge_method == "shadow_ibs":
+            return self._run_shadow_ibs_decharging_leg(
+                lambdas_shadow_coul=lambdas_var,
+                n_steps_per_window=n_steps_per_window,
+                steps_per_update=steps_per_update,
+                resume=resume,
+                boresch_params=boresch_params,
+                window_ranges=window_ranges,
+                enable_gradual_warmup=enable_gradual_warmup,
+                warmup_steps=warmup_steps,
+                shadow_bridge_lambdas=shadow_bridge_lambdas or [0.0, 0.5, 1.0],
+                shadow_bridge_n_steps=shadow_bridge_n_steps,
+                shadow_bridge_exchange_interval=shadow_bridge_exchange_interval,
+            )
+
         if stage_name == "decharging":
             self._log(
                 "  ⚠️ Coulomb 去电荷阶段已禁用 IBS-CustomNonbondedForce；"
@@ -1421,22 +2370,67 @@ class ABFEPipeline:
             temp_k = self.temperature.value_in_unit(unit.kelvin)
             traj_files = _expected_remd_traj_files(stage_output_dir, stage_name, len(lambdas_coul))
             u_kn_path = os.path.join(stage_output_dir, f"{stage_name}_pme_u_kn.npy")
-            if resume and os.path.exists(u_kn_path) and _is_pme_u_kn_cache_compatible(stage_output_dir, stage_name, n_states):
+            n_k_path = u_kn_path + ".n_k.npy"
+            if resume and os.path.exists(u_kn_path) and _is_pme_u_kn_cache_compatible(
+                stage_output_dir,
+                stage_name,
+                n_states,
+                lambdas_coul,
+                lambdas_vdw,
+                temp_k,
+                self.system,
+                self.topology,
+                self.ligand_indices,
+                boresch_params,
+            ):
                 self._log("  ♻️ 检测到已有 PME u_kn，跳过 REMD 采样与重算，直接求解 MBAR")
                 u_kn = np.load(u_kn_path)
                 analyzer = TraditionalMBARAnalyzer(temperature=temp_k)
-                res = analyzer.solve(u_kn)
+                if not os.path.exists(n_k_path):
+                    raise RuntimeError(f"PME u_kn 缓存缺少样本数 sidecar: {n_k_path}")
+                analyzer._last_n_k = np.load(n_k_path)
+                res = analyzer.solve(u_kn, **_CHARGING_ESTIMATOR_KWARGS(lambdas_coul))
                 return {
                     "stage": stage_name,
                     "total_delta_G": float(res.get("delta_G", 0.0)),
                     "total_error": float(res.get("error", 0.0)),
-                    "method": "PME-REMD-MBAR",
+                    "method": res.get("method", "PME-REMD-MBAR"),
+                    "primary_estimator": res.get("primary_estimator"),
+                    "estimator_analysis_protocol_version": res.get(
+                        "estimator_analysis_protocol_version"
+                    ),
+                    "estimator_policy_fingerprint": res.get("estimator_policy_fingerprint"),
+                    "crosschecks": res.get("crosschecks"),
+                    "ti_gate": res.get("ti_gate"),
+                    "charging_frame_selection": res.get("charging_frame_selection"),
+                    "sigma_policy": res.get("sigma_policy"),
+                    "sigma_suspect_underestimated": res.get(
+                        "sigma_suspect_underestimated"
+                    ),
+                    "sigma_suspect_underestimated_reason": res.get(
+                        "sigma_suspect_underestimated_reason"
+                    ),
                     "n_states": int(n_states),
+                    "lambda_endpoint_diagnostics": _stage_lambda_endpoint_diagnostics(
+                        stage_name, lambdas_coul, lambdas_vdw
+                    ),
+                    "converged": res.get("converged"),
+                    "min_overlap": res.get("min_overlap"),
+                    "min_overlap_threshold": (
+                        res.get("diagnostics", {}).get("min_overlap_threshold")
+                    ),
+                    "diagnostics": res.get("diagnostics", {}),
                 }
             elif resume and os.path.exists(u_kn_path):
                 self._log("  ♻️ 检测到旧版 PME u_kn 缓存，但模型版本不兼容；保留轨迹并重新执行离线 MBAR 重算。")
 
-            if resume and _all_remd_trajs_valid(stage_output_dir, stage_name, len(lambdas_coul), min_frames=1):
+            expected_frames = max(1, _expected_remd_frame_count(n_steps_per_window))
+            if resume and _all_remd_trajs_valid(
+                stage_output_dir,
+                stage_name,
+                len(lambdas_coul),
+                min_frames=expected_frames,
+            ):
                 self._log("  ♻️ 检测到完整 REMD DCD，视为采样已完成，跳过 REMD 继续离线 MBAR")
             else:
                 remd = REMDManager(
@@ -1450,6 +2444,8 @@ class ABFEPipeline:
                     temperature=temp_k,
                     platform_name=self.platform_name,
                     output_dir=stage_output_dir,
+                    boresch_params=boresch_params,
+                    max_resident_contexts=remd_max_resident_contexts,
                 )
                 traj_files = remd.run(
                     n_steps=n_steps_per_window,
@@ -1468,31 +2464,115 @@ class ABFEPipeline:
                 topology=self.topology,
                 reference_positions=self.positions,
                 reference_box_vectors=self.box_vectors,
+                boresch_params=boresch_params,
             )
-            np.save(os.path.join(stage_output_dir, f"{stage_name}_pme_u_kn.npy"), u_kn)
-            _write_pme_u_kn_meta(stage_output_dir, stage_name, n_states)
-            res = analyzer.solve(u_kn)
+            np.save(u_kn_path, u_kn)
+            np.save(n_k_path, analyzer._last_n_k)
+            _write_pme_u_kn_meta(
+                stage_output_dir,
+                stage_name,
+                n_states,
+                lambdas_coul,
+                lambdas_vdw,
+                temp_k,
+                self.system,
+                self.topology,
+                self.ligand_indices,
+                boresch_params,
+            )
+            res = analyzer.solve(u_kn, **_CHARGING_ESTIMATOR_KWARGS(lambdas_coul))
             return {
                 "stage": stage_name,
                 "total_delta_G": float(res.get("delta_G", 0.0)),
                 "total_error": float(res.get("error", 0.0)),
-                "method": "PME-REMD-MBAR",
+                "method": res.get("method", "PME-REMD-MBAR"),
+                "primary_estimator": res.get("primary_estimator"),
+                "estimator_analysis_protocol_version": res.get(
+                    "estimator_analysis_protocol_version"
+                ),
+                "estimator_policy_fingerprint": res.get("estimator_policy_fingerprint"),
+                "crosschecks": res.get("crosschecks"),
+                "ti_gate": res.get("ti_gate"),
+                "charging_frame_selection": res.get("charging_frame_selection"),
+                "sigma_policy": res.get("sigma_policy"),
+                "sigma_suspect_underestimated": res.get(
+                    "sigma_suspect_underestimated"
+                ),
+                "sigma_suspect_underestimated_reason": res.get(
+                    "sigma_suspect_underestimated_reason"
+                ),
                 "n_states": int(n_states),
+                "lambda_endpoint_diagnostics": _stage_lambda_endpoint_diagnostics(
+                    stage_name, lambdas_coul, lambdas_vdw
+                ),
+                "converged": res.get("converged"),
+                "min_overlap": res.get("min_overlap"),
+                "min_overlap_threshold": (
+                    res.get("diagnostics", {}).get("min_overlap_threshold")
+                ),
+                "diagnostics": res.get("diagnostics", {}),
             }
 
-        # 2. 划分窗口
-        from abfe_preoptimizer import generate_overlapping_windows
-        pts_per_window, overlap = 6, 2
-        window_ranges = generate_overlapping_windows(
-            n_states=n_states,
-            n_windows=kwargs.get("n_windows", None),
-            pts_per_window=pts_per_window,
-            overlap=overlap
-        )
-        self._log(f"  🪟 自动划分 {len(window_ranges)} 个 IBS 窗口")
+        # 2. 划分 IBS ensembles
+        # Vanishing preserves every immutable human anchor while the Fisher
+        # probe may insert additional states. Neighbors share one endpoint.
+        if stage_name == "vanishing" and not allow_partial_vanishing_rescue:
+            validate_vanishing_lambda_path_invariants(lambdas_var)
+            expected_subdomain_ranges = vanishing_subdomain_ranges_from_lambdas(
+                lambdas_var,
+                first_ensemble_target_intervals=VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS,
+            )
+            normalized_ranges = [
+                tuple(int(x) for x in r) for r in (window_ranges or [])
+            ]
+            if normalized_ranges != expected_subdomain_ranges:
+                raise RuntimeError(
+                    "vanishing v12 只接受热力学坐标上的 few-state IBS 子区间："
+                    f"expected={expected_subdomain_ranges}, got={normalized_ranges}. "
+                    "禁止共享两个节点（从而重复一条 λ interval）的 legacy overlap=2 "
+                    "或滑动窗口布局。"
+                )
+            validate_single_shared_boundary_ranges(
+                expected_subdomain_ranges, len(lambdas_var)
+            )
+            window_ranges = expected_subdomain_ranges
+        if window_ranges is not None:
+            covered = sorted({idx for s, e in window_ranges for idx in range(s, e)})
+            if not allow_partial_vanishing_rescue and covered != list(range(n_states)):
+                raise RuntimeError(
+                    f"显式传入的 window_ranges 覆盖范围与 n_states={n_states} 不匹配"
+                    f"（覆盖 {covered[:3]}...{covered[-3:] if covered else []}，"
+                    f"共 {len(covered)} 个索引），拒绝使用可能导致漏采样/越界的窗口划分。"
+                )
+            _edge_ranges = [(int(s), int(e) - 1) for s, e in window_ranges]
+            _shared_boundary_nodes = [
+                int(window_ranges[i][0])
+                for i in range(1, len(window_ranges))
+                if int(window_ranges[i - 1][1]) - 1 == int(window_ranges[i][0])
+            ]
+            self._log(
+                f"  🪟 {len(window_ranges)} 个 IBS ensemble："
+                f"λ 节点范围（半开）={window_ranges}；"
+                f"λ interval 分区（半开、互不重复）={_edge_ranges}；"
+                f"复用的共同边界节点={_shared_boundary_nodes}"
+            )
+        else:
+            from abfe_preoptimizer import generate_overlapping_windows
+            pts_per_window, overlap = 6, 2
+            window_ranges = generate_overlapping_windows(
+                n_states=n_states,
+                n_windows=kwargs.get("n_windows", None),
+                pts_per_window=pts_per_window,
+                overlap=overlap
+            )
+            self._log(f"  🪟 自动划分 {len(window_ranges)} 个 IBS 窗口")
 
         # 3. 初始化 Manager
-        stage_output_dir = os.path.join(self.output_dir, stage_name)
+        stage_output_dir = (
+            str(stage_output_dir_override)
+            if stage_output_dir_override is not None
+            else os.path.join(self.output_dir, stage_name)
+        )
         os.makedirs(stage_output_dir, exist_ok=True)
         
         stage_type = "coul" if stage_name == "decharging" else "vdw"
@@ -1511,12 +2591,18 @@ class ABFEPipeline:
             alchemical_params=alchemical_params,
             potential_type=potential_type,
             restraint_params=boresch_params,
-            prefix="abfe_dual",
+            prefix=("abfe_dual_rescue" if allow_partial_vanishing_rescue else "abfe_dual"),
             platform_name=self.platform_name,
             output_dir=stage_output_dir,
-            checkpoint_dir=self.checkpoint_dir,
+            checkpoint_dir=(
+                str(checkpoint_dir_override)
+                if checkpoint_dir_override is not None
+                else self.checkpoint_dir
+            ),
+            pilot_lambdas=pilot_lambdas,
+            pilot_mean_dU_dlambda=pilot_mean_dU_dlambda,
         )
-        
+
         # 🔑 关键：设置输出目录，确保 combine_results 能找到文件
         manager.output_dir = stage_output_dir
 
@@ -1530,6 +2616,39 @@ class ABFEPipeline:
             resume=resume,
             enable_gradual_warmup=enable_gradual_warmup,
             warmup_steps=warmup_steps,
+            min_bias_updates=kwargs.get("min_bias_updates", 12),
+            max_bias_updates=kwargs.get("max_bias_updates", 50),
+            required_consecutive_bias_updates=kwargs.get(
+                "required_consecutive_bias_updates", 3
+            ),
+            max_bias_warmup_steps=kwargs.get("max_bias_warmup_steps", 500000),
+            production_step_overrides=production_step_overrides,
+            frozen_validation_step_overrides=frozen_validation_step_overrides,
+            frozen_validation_is_final_rung=frozen_validation_is_final_rung,
+            # 🔑 [non_mutating_v1] 显式声明非变异策略：预热完成一次足额 fixed-f
+            # attempt 后即锁定 f_k 进入独立生产；不跑 fixed-H 探针、不就地重校准。
+            # 最终可用性由生产后的 overlap/ESS/去相关样本/不确定度硬门判断。
+            repair_policy="non_mutating_v1",
+            lse_log_residual_tolerance=kwargs.get(
+                "ibs_lse_log_residual_tolerance", 0.5
+            ),
+            # 🔑 之前 enable_early_stop 在这里是纯空转——_run_dual_lambda_stage
+            # 接受这个参数，但从未转发给 run_all_windows，run_all_windows 也
+            # 从未定义对应参数，打开这个开关不会有任何效果。现在真正接入；
+            # 默认仍是 False，且阈值尚未做离线轨迹回放校准（见
+            # ibs_engine.py::EARLY_STOP_PROTOCOL_VERSION 定义处），不要在生产
+            # 配置里显式打开它。
+            enable_early_stop=enable_early_stop,
+            early_stop_min_steps=kwargs.get("early_stop_min_steps", 100000),
+            early_stop_check_interval_steps=kwargs.get("early_stop_check_interval_steps", 20000),
+            early_stop_required_consecutive_passes=kwargs.get(
+                "early_stop_required_consecutive_passes", 3
+            ),
+            early_stop_min_ess_ratio=kwargs.get("early_stop_min_ess_ratio", 0.05),
+            early_stop_min_absolute_ess=kwargs.get("early_stop_min_absolute_ess", 50.0),
+            early_stop_min_decorrelated_samples=kwargs.get("early_stop_min_decorrelated_samples", 20),
+            early_stop_max_delta_g_drift_kJ_mol=kwargs.get("early_stop_max_delta_g_drift_kJ_mol", 0.5),
+            early_stop_max_uncertainty_kJ_mol=kwargs.get("early_stop_max_uncertainty_kJ_mol", 1.0),
         )
 
 
@@ -1550,13 +2669,281 @@ class ABFEPipeline:
         stage_result = solve_stage_integrated(
             window_outputs=window_outputs,
             kt=kt_val,
-            stage_name=stage_name
+            stage_name=stage_name,
+            # 🔑 [P1 修复] 最终收敛门四项阈值，跟 run_full_pipeline 里构建
+            # _final_gate_thresholds 时用的 kwargs.get(..., 默认值) 必须完全
+            # 一致，否则协议指纹记录的阈值和这里真正生效的阈值会对不上。
+            final_min_ess_ratio=kwargs.get("final_min_ess_ratio", 0.05),
+            final_min_absolute_ess=kwargs.get("final_min_absolute_ess", 50.0),
+            final_min_decorrelated_samples=kwargs.get("final_min_decorrelated_samples", 20),
+            final_max_uncertainty_kJ_mol=kwargs.get("final_max_uncertainty_kJ_mol", 1.0),
         )
         if stage_result.get("error"):
             raise RuntimeError(
                 f"{stage_name} 阶段全局 TMBAR 失败: {stage_result['error']}"
             )
+        stage_result.setdefault("stage", stage_name)
+        stage_result.setdefault("n_states", int(n_states))
+        stage_result["lambda_endpoint_diagnostics"] = _stage_lambda_endpoint_diagnostics(
+            stage_name,
+            manager.lambdas_coul,
+            manager.lambdas_vdw,
+        )
+        self._populate_stage_diagnostics(stage_result)
         return stage_result
+
+    @staticmethod
+    def _populate_stage_diagnostics(stage_result: Dict) -> Dict:
+        """🔑 [P1-15] 把 stage 求解结果里的收敛/覆盖证据汇进 `diagnostics`。
+
+        抽成独立方法是因为**它此前只在 `_run_ibs_stage` 里被调用**，
+        而 vanishing rescue 合并那条路径直接调 `solve_stage_integrated`、绕过了
+        `_run_ibs_stage`，于是 `stage_result["diagnostics"]` 从来没被填过。
+        后果是 `_build_stage_cache_payload` 存下 `diagnostics={}`、
+        `final_results.json` 的 `stage_diagnostics.stage2` 也是空的——
+        2026-07-27 那次 `ΔG_vdw = 145.908 ± 1.384` 因此**没有任何审计痕迹**：
+        逐段 ΔG、逐窗 σ、converged、ESS、乃至"发生过 rescue"全部无处可查。
+
+        这里只做汇总与搬运，不改任何数值。
+        """
+        stage_result.setdefault("diagnostics", {})
+        stage_result["diagnostics"].update({
+            "method": stage_result.get("method"),
+            # 🔑 曾经是自由能间距的假代理指标，现在是真实的重加权有效样本比例
+            # （见 ibs_engine.py::GlobalMBARAnalyzer.solve_stage_integrated，审查报告 #2）。
+            "min_overlap": stage_result.get("min_overlap"),
+            "min_overlap_threshold": stage_result.get("min_overlap_threshold"),
+            "min_overlap_method": stage_result.get("min_overlap_method"),
+            "window_overlap_diagnostics": stage_result.get("window_overlap_diagnostics"),
+            "statistical_inefficiency_per_window": stage_result.get("statistical_inefficiency_per_window"),
+            "offset_error_contribution": stage_result.get("offset_error_contribution"),
+            "uncertainty_note": stage_result.get("uncertainty_note"),
+            # 🔑 [P1-15] 以下这些原本只存在于 solve_stage_integrated 的返回顶层，
+            # 从不进 diagnostics、也就从不落盘。光看 total_delta_G 无法复核为何放行。
+            "converged": stage_result.get("converged"),
+            "coverage_diagnostics": stage_result.get("coverage_diagnostics"),
+            "covariance_chain_segments": stage_result.get("covariance_chain_segments"),
+            "total_error_method": stage_result.get("total_error_method"),
+            "ess_gate_protocol_version": stage_result.get("ess_gate_protocol_version"),
+            "min_occupancy_normalized": stage_result.get("min_occupancy_normalized"),
+            "min_occupancy_normalized_threshold": stage_result.get("min_occupancy_normalized_threshold"),
+            "min_occupancy_normalized_diagnostic_reference": stage_result.get(
+                "min_occupancy_normalized_diagnostic_reference"
+            ),
+            "min_occupancy_is_gate": stage_result.get("min_occupancy_is_gate"),
+            "min_occupancy_gate_retired_reason": stage_result.get(
+                "min_occupancy_gate_retired_reason"
+            ),
+            "min_decorrelated_samples": stage_result.get("min_decorrelated_samples"),
+            "min_decorrelated_samples_threshold": stage_result.get("min_decorrelated_samples_threshold"),
+            "max_endpoint_uncertainty_kJ_mol": stage_result.get("max_endpoint_uncertainty_kJ_mol"),
+            "max_endpoint_uncertainty_kJ_mol_threshold": stage_result.get(
+                "max_endpoint_uncertainty_kJ_mol_threshold"
+            ),
+            "min_absolute_ess": stage_result.get("min_absolute_ess"),
+            "min_absolute_ess_threshold": stage_result.get("min_absolute_ess_threshold"),
+            "raw_min_overlap": stage_result.get("raw_min_overlap"),
+            "max_common_mode_log_sigma_kT": stage_result.get("max_common_mode_log_sigma_kT"),
+            # rescue provenance：只有走过 rescue 的 stage 才有，普通 stage 为 None。
+            "immutable_bridge_rescue": stage_result.get("immutable_bridge_rescue"),
+            "production_rescue_targets": stage_result.get("production_rescue_targets"),
+        })
+        return stage_result
+
+    # =========================================================================
+    # 4.4 Shadow-Coulomb IBS 去电荷 (实验性备选路径，见 decharge_method="shadow_ibs")
+    # =========================================================================
+    def _run_shadow_ibs_decharging_leg(
+        self,
+        lambdas_shadow_coul: List[float],
+        n_steps_per_window: int,
+        steps_per_update: int,
+        resume: bool,
+        boresch_params: Optional[Dict],
+        window_ranges: Optional[List[Tuple[int, int]]],
+        enable_gradual_warmup: bool,
+        warmup_steps: int,
+        shadow_bridge_lambdas: List[float],
+        shadow_bridge_n_steps: int,
+        shadow_bridge_exchange_interval: int,
+    ) -> Dict:
+        """
+        Shadow-Coulomb IBS 去电荷完整入口 (实验性，尚未经物理验证)。
+
+        两段独立的热力学循环腿，ΔG 直接相加、误差按平方和开根合并：
+          1. Bridge 腿：真实 PME 满电荷 -> Shadow 满电荷 端点转换
+             (run_shadow_bridge_leg，传统 REMD+MBAR，只有几个窗口)。
+          2. Shadow-IBS 腿：Shadow 满电荷 -> Shadow 去电荷
+             (IBSWindowManagerShadowCoul，真正的 IBS 多态偏置采样)。
+
+        与默认的 decharge_method="pme" (NonbondedForce ParameterOffset +
+        REMD/MBAR) 相比，这条路径的电荷维度全程留在 IBS 偏置框架内，代价是
+        多引入一段 Bridge 腿，且目前没有独立物理验证，只应视为实验性尝试。
+        """
+        stage_name = "decharging"
+        stage_output_dir = os.path.join(self.output_dir, stage_name)
+        os.makedirs(stage_output_dir, exist_ok=True)
+        temp_k = self.temperature.value_in_unit(unit.kelvin)
+
+        self._log(f"\n{'=' * 60}")
+        self._log(f"[双λ阶段] {stage_name.upper()} | decharge_method=shadow_ibs (实验性)")
+        self._log(f"{'=' * 60}")
+
+        # ---------- 1. Bridge 腿：PME 满电荷 <-> Shadow 满电荷 ----------
+        bridge_result_file = os.path.join(stage_output_dir, "shadow_bridge_result.json")
+        if resume and os.path.exists(bridge_result_file):
+            self._log("  ♻️ 检测到已有 Shadow-Bridge 结果缓存，跳过重新采样")
+            with open(bridge_result_file) as f:
+                bridge_result = json.load(f)
+        else:
+            self._log(f"  🌉 [Bridge 腿] 运行 {len(shadow_bridge_lambdas)} 个窗口 (PME↔Shadow 满电荷端点)...")
+            bridge_result = run_shadow_bridge_leg(
+                system=self.system,
+                topology=self.topology,
+                positions=self.positions,
+                box_vectors=self.box_vectors,
+                perturbed_indices=self.ligand_indices,
+                lambdas_bridge_s=shadow_bridge_lambdas,
+                temperature_k=temp_k,
+                platform_name=self.platform_name,
+                output_dir=os.path.join(stage_output_dir, "shadow_bridge"),
+                n_steps_per_state=shadow_bridge_n_steps,
+                exchange_interval=shadow_bridge_exchange_interval,
+                restraint_params=boresch_params,
+            )
+            with open(bridge_result_file, "w") as f:
+                json.dump(bridge_result, f, indent=2)
+        # 🔑 之前这里（以及缓存命中分支）从不检查 Bridge 腿自己的 converged/
+        # min_overlap——run_shadow_bridge_leg 内部的 TraditionalMBARAnalyzer.solve()
+        # 早就算出了这两项（min_overlap_threshold=0.03 硬门），但只要没抛异常就
+        # 被当作"腿完成"直接往下用，一条重叠度低到不可信的 Bridge 腿也能悄悄
+        # 混进最终 Stage1 结果。这里和下面的 Shadow-IBS 腿一样，执行与正式
+        # stage（_assert_stage_result_sane）同等级的硬门。
+        if bridge_result.get("converged") is False:
+            raise RuntimeError(
+                f"Shadow-Bridge 腿报告 converged=False（min_overlap="
+                f"{bridge_result.get('min_overlap')}，阈值="
+                f"{bridge_result.get('min_overlap_threshold')}）；拒绝把这条子腿的"
+                "结果并入 Stage1 去电荷总量。"
+            )
+        self._log(
+            f"  ✓ Bridge 腿完成: ΔG={bridge_result['total_delta_G']:.2f} ± "
+            f"{bridge_result['total_error']:.2f} kJ/mol"
+        )
+
+        # ---------- 2. Shadow-IBS 腿：Shadow 满电荷 -> Shadow 去电荷 ----------
+        n_states = len(lambdas_shadow_coul)
+        if window_ranges is not None:
+            covered = sorted({idx for s, e in window_ranges for idx in range(s, e)})
+            if covered != list(range(n_states)):
+                raise RuntimeError(
+                    f"显式传入的 window_ranges 覆盖范围与 n_states={n_states} 不匹配，"
+                    "拒绝使用可能导致漏采样/越界的窗口划分。"
+                )
+        else:
+            window_ranges = generate_overlapping_windows(
+                n_states=n_states, n_windows=None, pts_per_window=6, overlap=2
+            )
+            self._log(f"  🪟 自动划分 {len(window_ranges)} 个 Shadow-IBS 窗口")
+
+        manager = IBSWindowManagerShadowCoul(
+            system_template=self.system,
+            topology=self.topology,
+            perturbed_atom_indices=self.ligand_indices,
+            lambdas_shadow_coul=lambdas_shadow_coul,
+            temperature=self.temperature,
+            window_ranges=window_ranges,
+            restraint_params=boresch_params,
+            prefix="abfe_shadow",
+            platform_name=self.platform_name,
+            output_dir=stage_output_dir,
+            checkpoint_dir=self.checkpoint_dir,
+        )
+        manager.output_dir = stage_output_dir
+
+        manager.run_all_windows(
+            positions=self.positions,
+            box_vectors=self.box_vectors,
+            n_steps_per_window=n_steps_per_window,
+            steps_per_update=steps_per_update,
+            stage_type="shadow_coul",
+            resume=resume,
+            enable_gradual_warmup=enable_gradual_warmup,
+            warmup_steps=warmup_steps,
+        )
+
+        kt_val = (unit.MOLAR_GAS_CONSTANT_R * self.temperature).value_in_unit(unit.kilojoule_per_mole)
+        window_outputs = manager.get_stage_data_for_analysis(stage_type="shadow_coul")
+        if not window_outputs:
+            raise RuntimeError(
+                "Shadow-IBS 去电荷阶段未找到任何窗口能量文件，无法执行全局 TMBAR。"
+            )
+        shadow_ibs_result = solve_stage_integrated(
+            window_outputs=window_outputs, kt=kt_val, stage_name="decharging_shadow_ibs"
+        )
+        if shadow_ibs_result.get("error"):
+            raise RuntimeError(f"Shadow-IBS 去电荷阶段全局 TMBAR 失败: {shadow_ibs_result['error']}")
+        # 🔑 之前这里只检查了 error 字段，不检查 converged/min_overlap——
+        # solve_stage_integrated 已经实现了同正式 stage 一样的 ESS ratio/绝对
+        # ESS/去相关样本数/不确定度四项硬门（见 GlobalMBARAnalyzer.
+        # solve_stage_integrated），一个重叠不足但没有报错的 Shadow-IBS 腿会
+        # 被当作成功结果直接并入 Stage1 总量。两条子腿必须都执行同等级的硬门，
+        # 任一失败即整腿失败。
+        if shadow_ibs_result.get("converged") is not True:
+            raise RuntimeError(
+                f"Shadow-IBS 去电荷子腿未收敛（converged="
+                f"{shadow_ibs_result.get('converged')!r}，min_overlap="
+                f"{shadow_ibs_result.get('min_overlap')}，阈值="
+                f"{shadow_ibs_result.get('min_overlap_threshold')}）；拒绝把这条"
+                "子腿的结果并入 Stage1 去电荷总量。"
+            )
+        self._log(
+            f"  ✓ Shadow-IBS 腿完成: ΔG={shadow_ibs_result['total_delta_G']:.2f} ± "
+            f"{shadow_ibs_result['total_error']:.2f} kJ/mol"
+        )
+
+        # ---------- 3. 合并两段腿 ----------
+        total_delta_G = float(bridge_result["total_delta_G"]) + float(shadow_ibs_result["total_delta_G"])
+        total_error = float(np.sqrt(bridge_result["total_error"] ** 2 + shadow_ibs_result["total_error"] ** 2))
+        self._log(f"  Σ 去电荷总计: ΔG={total_delta_G:.2f} ± {total_error:.2f} kJ/mol")
+
+        # 🔑 两条子腿到这里都已经各自通过了硬门（上面任一失败已经 raise），但
+        # 组合后的 Stage1 结果此前从不带顶层 converged/min_overlap/
+        # min_overlap_threshold——_assert_stage_result_sane 对这三个字段的检查是
+        # "只在结果带有这些诊断字段时才检查"，字段缺失时会被直接跳过，一个已经
+        # 用不可信数据拼出来的 Stage1 结果本该被这道门拦下，却因为字段缺失静默
+        # 放行。这里显式带上"两条子腿共同的最差重叠度"，让最终写入 checkpoint
+        # 的结果也过一遍同样的硬门（此处理论上恒为 converged=True，因为不满足
+        # 就已经在上面 raise 了；这里落盘纯粹是让 _assert_stage_result_sane 和
+        # 未来任何读这份 checkpoint 的代码都能看到这两条子腿真实的重叠度，而不是
+        # 只能看到最终拼接后的 delta_G/error）。
+        both_min_overlaps = [
+            m for m in (bridge_result.get("min_overlap"), shadow_ibs_result.get("min_overlap"))
+            if m is not None
+        ]
+        return {
+            "stage": stage_name,
+            "total_delta_G": total_delta_G,
+            "total_error": total_error,
+            "method": "Shadow-Bridge+Shadow-IBS-TMBAR",
+            "n_states": int(n_states),
+            "converged": True,
+            "min_overlap": float(min(both_min_overlaps)) if both_min_overlaps else None,
+            "min_overlap_threshold": shadow_ibs_result.get("min_overlap_threshold"),
+            "lambda_endpoint_diagnostics": _stage_lambda_endpoint_diagnostics(
+                "decharging", lambdas_shadow_coul, [1.0] * n_states
+            ),
+            "diagnostics": {
+                "experimental": True,
+                "physically_validated": False,
+                "note": (
+                    "decharge_method=shadow_ibs 是实验性路径，尚未经过独立物理验证，"
+                    "生产结果请优先使用默认的 decharge_method=pme。"
+                ),
+                "bridge_leg": bridge_result,
+                "shadow_ibs_leg": shadow_ibs_result,
+            },
+        }
 
     # =========================================================================
     # 4.5 2D λ 路径采样 (对角线 / 测地线)
@@ -1584,6 +2971,11 @@ class ABFEPipeline:
         n_states = len(path_2d)
         lambdas_coul = [p[0] for p in path_2d]
         lambdas_vdw = [p[1] for p in path_2d]
+        if potential_type == "dexp":
+            raise NotImplementedError(
+                "single_lambda / 2D 的 PME-REMD 路径当前尚未实现 DEXP Hamiltonian；"
+                "请改用 IBS dual_lambda + dexp，或先切回 softcore。"
+            )
         self._log(f"\n{'=' * 60}")
         self._log(f"[2D 路径] {label} | {n_states} 个状态")
         self._log(f"  λ_coul: {lambdas_coul[0]:.3f} → {lambdas_coul[-1]:.3f}")
@@ -1595,18 +2987,33 @@ class ABFEPipeline:
 
         traj_files = _expected_remd_traj_files(stage_output_dir, label, n_states)
         u_kn_path = os.path.join(stage_output_dir, f"{label}_pme_u_kn.npy")
+        n_k_path = u_kn_path + ".n_k.npy"
+        temp_k = self.temperature.value_in_unit(unit.kelvin)
         if resume and os.path.exists(u_kn_path) and _is_pme_u_kn_cache_compatible(
-            stage_output_dir, label, n_states
+            stage_output_dir,
+            label,
+            n_states,
+            lambdas_coul,
+            lambdas_vdw,
+            temp_k,
+            self.system,
+            self.topology,
+            self.ligand_indices,
+            boresch_params,
         ):
             self._log("  ♻️ 检测到兼容的 PME u_kn 缓存，直接求解 MBAR")
             u_kn = np.load(u_kn_path)
             analyzer = TraditionalMBARAnalyzer(
                 temperature=self.temperature.value_in_unit(unit.kelvin)
             )
+            if not os.path.exists(n_k_path):
+                raise RuntimeError(f"PME u_kn 缓存缺少样本数 sidecar: {n_k_path}")
+            analyzer._last_n_k = np.load(n_k_path)
             res = analyzer.solve(u_kn)
         else:
+            expected_frames = max(1, _expected_remd_frame_count(n_steps_per_window))
             if resume and _all_remd_trajs_valid(
-                stage_output_dir, label, n_states, min_frames=1
+                stage_output_dir, label, n_states, min_frames=expected_frames
             ):
                 self._log("  ♻️ 检测到完整 REMD 轨迹，跳过采样直接重算 u_kn")
             else:
@@ -1619,9 +3026,10 @@ class ABFEPipeline:
                     ligand_indices=self.ligand_indices,
                     lambdas_coul=lambdas_coul,
                     lambdas_vdw=lambdas_vdw,
-                    temperature=self.temperature.value_in_unit(unit.kelvin),
+                    temperature=temp_k,
                     platform_name=self.platform_name,
                     output_dir=stage_output_dir,
+                    boresch_params=boresch_params,
                 )
                 traj_files = remd.run(
                     n_steps=n_steps_per_window,
@@ -1630,7 +3038,7 @@ class ABFEPipeline:
                 )
 
             analyzer = TraditionalMBARAnalyzer(
-                temperature=self.temperature.value_in_unit(unit.kelvin)
+                temperature=temp_k
             )
             u_kn = analyzer.compute_u_kn(
                 traj_files=traj_files,
@@ -1642,9 +3050,22 @@ class ABFEPipeline:
                 topology=self.topology,
                 reference_positions=self.positions,
                 reference_box_vectors=self.box_vectors,
+                boresch_params=boresch_params,
             )
             np.save(u_kn_path, u_kn)
-            _write_pme_u_kn_meta(stage_output_dir, label, n_states)
+            np.save(n_k_path, analyzer._last_n_k)
+            _write_pme_u_kn_meta(
+                stage_output_dir,
+                label,
+                n_states,
+                lambdas_coul,
+                lambdas_vdw,
+                temp_k,
+                self.system,
+                self.topology,
+                self.ligand_indices,
+                boresch_params,
+            )
             res = analyzer.solve(u_kn)
 
         stage_result = {
@@ -1654,6 +3075,8 @@ class ABFEPipeline:
             "method": "PME-REMD-MBAR",
             "n_states": int(n_states),
             "lambda_path": [list(map(float, p)) for p in path_2d],
+            "lambda_endpoint_diagnostics": lambda_endpoint_diagnostics(lambdas_coul, lambdas_vdw),
+            "diagnostics": res.get("diagnostics", {}),
         }
         self._log(
             f"  ✓ {label} 路径完成: ΔG={stage_result['total_delta_G']:.2f} ± "
@@ -1692,8 +3115,7 @@ class ABFEPipeline:
                 with open(boresch_path, "r") as f:
                     boresch_params = json.load(f)
             else:
-                self._log("⚠️ 未提供 Boresch 参数且未找到缓存文件，跳过解析修正。")
-                return {"delta_g_rest": 0.0, "error": 0.0}
+                raise RuntimeError("未提供 Boresch 参数且未找到缓存文件；拒绝以 0.0 kJ/mol 修正继续生产 ABFE。")
                 
         # 1. 兼容嵌套结构提取
         fc = boresch_params.get("force_constants")
@@ -1705,44 +3127,65 @@ class ABFEPipeline:
             eq = anchors.get("equilibrium_values", {})
             
         if not fc or not eq:
-            self._log("⚠️ Boresch 参数字典结构异常，跳过解析修正。")
-            return {"delta_g_rest": 0.0, "error": 0.0}
+            raise RuntimeError("Boresch 参数字典结构异常：缺失 force_constants 或 equilibrium_values。")
             
         # 2. 智能剥离单位后缀
+        fc_targets = {
+            "kr": "kr",
+            "kthetaA": "kthetaA",
+            "kthetaB": "kthetaB",
+            "kphiA": "kphiA",
+            "kphiB": "kphiB",
+            "kphiC": "kphiC",
+        }
+        eq_targets = {
+            "r0": "r0",
+            "thetaA0": "thetaA0",
+            "thetaB0": "thetaB0",
+            "phiA0": "phiA0",
+            "phiB0": "phiB0",
+            "phiC0": "phiC0",
+        }
         fc_norm = {}
         for k, v in fc.items():
-            clean_k = k.rsplit("_", 1)[0] if "_" in k else k
+            clean_k = self._strip_unit_suffix(str(k), fc_targets) or str(k)
             fc_norm[clean_k] = v
         eq_norm = {}
         for k, v in eq.items():
-            clean_k = k.rsplit("_", 1)[0] if "_" in k else k
-            eq_norm[clean_k] = v
+            clean_k = self._strip_unit_suffix(str(k), eq_targets) or str(k)
+            eq_norm[clean_k] = float(v)
+        fc_norm = {k: float(v) for k, v in fc_norm.items()}
+
+        required_eq = ("r0", "thetaA0", "thetaB0", "phiA0", "phiB0", "phiC0")
+        required_fc = ("kr", "kthetaA", "kthetaB", "kphiA", "kphiB", "kphiC")
+        missing_eq = [k for k in required_eq if k not in eq_norm]
+        missing_fc = [k for k in required_fc if k not in fc_norm]
+        if missing_eq or missing_fc:
+            raise RuntimeError(
+                "Boresch 参数缺失必要字段："
+                f"equilibrium missing={missing_eq}, force_constants missing={missing_fc}"
+            )
+        if not np.all(np.isfinite([eq_norm[k] for k in required_eq] + [fc_norm[k] for k in required_fc])):
+            raise RuntimeError("Boresch 参数包含 NaN/Inf；拒绝计算解析修正。")
             
         # 3. 防御性拦截
         kr_val = fc_norm.get("kr", 0)
         if kr_val <= 0:
-            self._log(f"  ⚠️ 检测到异常 kr={kr_val}，自动替换为保守默认值 418.4 kJ/mol/nm²")
-            fc_norm["kr"] = 418.4
+            raise RuntimeError(f"Boresch kr={kr_val} 非正；拒绝替换为默认力常数继续。")
 
         thA_val = float(eq_norm.get("thetaA0", 1.5708))
         thB_val = float(eq_norm.get("thetaB0", 1.5708))
         sin_guard = min(abs(np.sin(thA_val)), abs(np.sin(thB_val)))
         if sin_guard < 0.1:
-            self._log(
-                f"  ⚠️ Boresch 平衡角接近奇点: "
+            raise RuntimeError(
+                f"Boresch 平衡角接近奇点: "
                 f"θA={np.degrees(thA_val):.2f}°, θB={np.degrees(thB_val):.2f}° "
-                f"(min|sinθ|={sin_guard:.4f})，跳过解析修正。"
+                f"(min|sinθ|={sin_guard:.4f})；拒绝以 0.0 kJ/mol 修正继续。"
             )
-            return {"delta_g_rest": 0.0, "error": 0.0}
             
-        # 4. 计算修正项 (移除 try...except 静默吞没，改为明确日志)
-        delta_g = 0.0
-        try:
-            delta_g = calculate_boresch_analytical_correction(eq=eq_norm, fc=fc_norm, T=self.temperature)
-            self._log(f"[Boresch] 解析修正: {delta_g:.3f} kJ/mol ({delta_g/4.184:.3f} kcal/mol)")
-        except ValueError as e:
-            self._log(f"  ⚠️ Boresch 解析修正计算失败 ({e})，跳过修正项。")
-            delta_g = 0.0
+        # 4. 计算“restrained decoupling → 标准态释放”的修正项；失败必须中止。
+        delta_g = calculate_boresch_analytical_correction(eq=eq_norm, fc=fc_norm, T=self.temperature)
+        self._log(f"[Boresch] 标准态释放修正: {delta_g:.3f} kJ/mol ({delta_g/4.184:.3f} kcal/mol)")
 
         # ✅ 唯一出口：参数落盘 + 返回
         boresch_json = UnitFormatter.format_boresch_json(boresch_params)
@@ -1751,7 +3194,136 @@ class ABFEPipeline:
             json.dump(boresch_json, f, indent=2)
         self._log(f"  ✓ Boresch 参数已保存 (JSON): {boresch_json_path}")
         
-        return {"delta_g_rest": float(delta_g), "error": 0.0}
+        return {
+            "delta_g_rest": float(delta_g),
+            "error": 0.0,
+            "diagnostics": boresch_params.get("diagnostics", {}) if isinstance(boresch_params, dict) else {},
+            "method": boresch_params.get("method") if isinstance(boresch_params, dict) else None,
+            "force_constants_raw": boresch_params.get("force_constants_raw", {}) if isinstance(boresch_params, dict) else {},
+            "force_constant_clipped": boresch_params.get("force_constant_clipped", {}) if isinstance(boresch_params, dict) else {},
+            "uses_analytical_release_formula": True,
+            "analytical_release_assumption": (
+                "Boresch release correction assumes locally harmonic, approximately Gaussian restraint-coordinate fluctuations."
+            ),
+        }
+
+    def _assert_committed_boresch_still_matches_pose(
+        self,
+        *,
+        committed_doc: Dict,
+        committed_eq: Dict,
+        boresch_params: Dict,
+        committed_path: str,
+    ) -> None:
+        """🔑 [BORESCH-COMMIT] 复用已提交平衡值前，验证它仍描述当前构象。
+
+        两道检查：
+
+        1. **锚点身份**：committed 文件记录的 receptor/ligand 锚点必须与本次
+           `boresch_params` 一致。锚点变了，平衡值就不是同一个几何量。
+           （v1 裸格式没有这些字段，跳过这道，仍走第 2 道。）
+        2. **几何一致性**：用当前坐标重算六个自由度，与 committed 值逐个比较，
+           偏离以限制势自身的热涨落宽度 σ_i = sqrt(kT/k_i) 为单位。
+
+        第 2 道是主判据，也是唯一能抓住"平衡值比结构还老"这类错误的。
+        `update_boresch_from_last_frame` 已有的两道门（角度 40-140°、r0 漂移）
+        与它正交，且对实测那组错值全部放行。
+
+        不一致时 **fail closed**，不静默重新锚定：这条 resume 保护存在的理由
+        就是防止一条腿中途换哈密顿量，自动重锚会把它变成另一个 bug。
+        """
+        rec = [int(i) for i in boresch_params.get("receptor_indices", [])]
+        lig = [int(i) for i in boresch_params.get("ligand_indices", [])]
+
+        schema = committed_doc.get("schema_version")
+        if schema is not None:
+            rec_c = [int(i) for i in committed_doc.get("receptor_indices", [])]
+            lig_c = [int(i) for i in committed_doc.get("ligand_indices", [])]
+            if rec_c and lig_c and (rec_c != rec or lig_c != lig):
+                raise RuntimeError(
+                    f"已提交的 Boresch 平衡值锚点与本次不一致，拒绝复用：\n"
+                    f"  文件 {committed_path}\n"
+                    f"  committed receptor={rec_c} ligand={lig_c}\n"
+                    f"  本次     receptor={rec}   ligand={lig}\n"
+                    "锚点变了，平衡值描述的就不是同一个几何量。"
+                )
+        else:
+            self._log(
+                f"  ⚠️ {os.path.basename(committed_path)} 是无身份信息的旧格式"
+                f"（schema_version 缺失），无法核对锚点来源；仍将执行几何一致性校验。"
+            )
+
+        force_constants = boresch_params.get("force_constants") or {}
+        if len(rec) != 3 or len(lig) != 3 or not force_constants:
+            self._log("  ⚠️ 缺锚点或力常数，跳过 Boresch 平衡值几何一致性校验。")
+            return
+
+        try:
+            from abfe_core import calc_boresch_from_last_frame
+            current_eq = calc_boresch_from_last_frame(self.positions, rec, lig)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"无法用当前坐标重算 Boresch 几何以校验已提交平衡值：{exc}。"
+                "拒绝在未经校验的情况下复用——这正是 2026-07-10 那组错值能沿用 17 天的原因。"
+            ) from exc
+
+        report = boresch_committed_deviation_sigma(
+            committed_eq, current_eq, force_constants,
+            self.temperature.value_in_unit(unit.kelvin),
+        )
+        if not report:
+            self._log("  ⚠️ 没有可比较的自由度，跳过 Boresch 平衡值几何一致性校验。")
+            return
+
+        worst_key = max(report, key=lambda k: report[k]["deviation_sigma"])
+        worst = report[worst_key]["deviation_sigma"]
+        threshold = float(BORESCH_COMMITTED_MAX_DEVIATION_SIGMA)
+
+        if worst <= threshold:
+            warn_at = float(BORESCH_COMMITTED_WARN_DEVIATION_SIGMA)
+            if worst > warn_at:
+                self._log(
+                    f"  ⚠️ 已提交 Boresch 平衡值与当前坐标偏离 {worst:.2f} σ @ {worst_key}"
+                    f"（告警带 {warn_at:.1f}-{threshold:.1f} σ，未阻断）。"
+                    "单帧比较本身带 ~√2σ 噪声，偶发一次可以忽略；但若每次 resume 都出现、"
+                    "或多个自由度同时进入该带，说明平衡值已经在偏离当前构象，"
+                    "请核对是否该重新锚定。逐自由度："
+                )
+                for k, v in sorted(report.items(), key=lambda kv: -kv[1]["deviation_sigma"]):
+                    self._log(
+                        f"       {k:>8s} committed={v['committed']:+.6f} "
+                        f"current={v['current']:+.6f} ({v['deviation_sigma']:.2f} σ)"
+                    )
+            else:
+                self._log(
+                    f"  ✓ 已提交 Boresch 平衡值与当前坐标一致（最大偏离 "
+                    f"{worst:.2f} σ @ {worst_key}，阈值 {threshold:.1f} σ）"
+                )
+            return
+
+        lines = [
+            f"    {k:>8s}  committed={v['committed']:+10.6f}  current={v['current']:+10.6f}"
+            f"  Δ={v['delta']:+9.6f}  ({v['deviation_sigma']:6.2f} σ)"
+            for k, v in sorted(
+                report.items(), key=lambda kv: -kv[1]["deviation_sigma"]
+            )
+        ]
+        raise RuntimeError(
+            "已提交的 Boresch 平衡值已经不描述当前构象，拒绝复用（fail closed）。\n"
+            f"  文件 {committed_path}\n"
+            f"  最大偏离 {worst:.2f} σ @ {worst_key}，阈值 {threshold:.1f} σ\n"
+            "  逐自由度（σ = sqrt(kT/k)，即该限制势自身的热涨落宽度）：\n"
+            + "\n".join(lines)
+            + "\n\n"
+            "  这意味着限制力会把配体从它当前的构象上拽走：静电（方向性氢键）会因此\n"
+            "  严重偏低，而 vdW 因为对取向不敏感看起来仍然正常——2026-07-27 实测过\n"
+            "  这个组合，复合物腿去电荷偏低约 25 kJ/mol。\n\n"
+            "  处理方式（二选一，不要直接放宽阈值）：\n"
+            f"    A. 若该腿尚无有效采样数据：删除 {committed_path}，\n"
+            "       下次运行会用当前坐标重新锚定并带身份信息落盘。\n"
+            "    B. 若该腿已有采样数据：那些数据是在这组平衡值下采的，与当前结构不匹配，\n"
+            "       必须连同该腿的采样输出一起作废重跑，不能只换平衡值继续拼接。"
+        )
 
     def update_boresch_from_last_frame(self, boresch_params: Optional[Dict] = None) -> Optional[Dict]:
         """🔑 生产级修复：严格拦截奇点角度与异常漂移，防止自动更新引入 NaN 隐患"""
@@ -1809,33 +3381,205 @@ class ABFEPipeline:
             err_decharge = sampling_results.get("stage1", {}).get("total_error", 0.0)
             err_vdw = sampling_results.get("stage2", {}).get("total_error", 0.0)
             
-            dg_phys = dg_decharge + dg_vdw
-            err_phys = np.sqrt(err_decharge**2 + err_vdw**2)
-            self._log(f"  🔗 双λ解耦: ΔG_charge={dg_decharge:.2f} + ΔG_vdw={dg_vdw:.2f} = {dg_phys:.2f} ± {err_phys:.2f} kJ/mol")
+            # 🔑 [P1-17] Boresch attachment 腿 A′→A。
+            # ΔG_complex 此前是 ΔG(A→B)+ΔG_release，其中 A =「配体耦合 + 限制已打开」；
+            # 但物理结合态是 A′ =「配体耦合 + 无限制」。缺的这一步会让 charging/vdW
+            # 在受约束系综里测出的值无处安放，表现为与参考方法的逐项差异。
+            # 补上之后循环对任意限制强度严格闭合——**不要**再单独修正 charging，
+            # 那会重复计数。
+            # 符号：stage0 报的是 A′→A 方向，Boresch 势处处 ≥0 ⟹ 该项恒 ≥0，
+            # 直接相加，不取负号。字段名与 stage1/stage2 的 total_delta_G 刻意不同，
+            # 就是为了防止被当成同一种量反号求和。
+            stage0 = sampling_results.get("stage0") or {}
+            _system_type = str(
+                (getattr(self, "_last_run_config", {}) or {}).get(
+                    "system_type", "complex"
+                )
+            ).lower()
+            _requires_attachment = bool(
+                _system_type == "complex"
+                and correction_results.get("uses_analytical_release_formula", False)
+            )
+            if _requires_attachment and not stage0:
+                raise RuntimeError(
+                    "复合物腿使用了 Boresch 解析释放修正，但缺少 attachment stage0；"
+                    "拒绝把 attachment=0 静默写成最终闭合结果。"
+                )
+            dg_attach = float(stage0.get("attachment_delta_G_kJ_mol", 0.0) or 0.0)
+            err_attach = float(stage0.get("attachment_error_kJ_mol", 0.0) or 0.0)
+            if dg_attach < 0.0:
+                raise RuntimeError(
+                    f"stage0 attachment ΔG(A′→A)={dg_attach:.4f} < 0，数学上不可能，拒绝合成结果"
+                )
+
+            dg_phys = dg_attach + dg_decharge + dg_vdw
+            err_phys = np.sqrt(err_attach**2 + err_decharge**2 + err_vdw**2)
+            if stage0:
+                self._log(
+                    f"  🔗 双λ解耦: ΔG_attach={dg_attach:.2f} + ΔG_charge={dg_decharge:.2f} "
+                    f"+ ΔG_vdw={dg_vdw:.2f} = {dg_phys:.2f} ± {err_phys:.2f} kJ/mol"
+                )
+            elif _system_type == "complex":
+                self._log(
+                    f"  🔗 双λ解耦: ΔG_charge={dg_decharge:.2f} + ΔG_vdw={dg_vdw:.2f} "
+                    f"= {dg_phys:.2f} ± {err_phys:.2f} kJ/mol"
+                )
+                self._log(
+                    "  ⚠️ [P1-17] 未提供 Boresch attachment 腿 (stage0)，"
+                    "复合物腿缺 A′→A 项；该结果不是闭合循环。"
+                )
         else:
             dg_phys = sampling_results.get("total_delta_G", 0.0)
             err_phys = sampling_results.get("total_error", 0.0)
 
+        # 🔑 [P2-14] LJ 长程尾项到底有没有被附加，必须来自生产者，不能写死 True。
+        # 两条生产路径各有自己的真相来源：
+        #   * 传统 REMD / single_lambda：TraditionalMBARAnalyzer 已经按正确模式维护
+        #     `lj_lrc_metadata`（初始化 applied=False，真算完系数才翻 True），经
+        #     `result["diagnostics"]["traditional_lj_lrc"]` 上来——直接读它；
+        #   * 双 λ / IBS：真相在 `ibs_wrapper.lj_tail_lrc_coeff_kj_mol is not None`，
+        #     该对象不出 ibs_engine，所以与生产者共用同一个谓词
+        #     `ibs_lj_tail_lrc_is_applicable`（见其 docstring：共用而不是复写，
+        #     DEXP 尾项公式一旦被验证/替换只需改一处）。
+        _lj_lrc_potential_type = str(
+            (getattr(self, "_last_run_config", {}) or {}).get("potential_type", "softcore")
+        )
+        _traditional_lrc = (
+            (sampling_results.get("diagnostics") or {}).get("traditional_lj_lrc")
+            if isinstance(sampling_results, dict)
+            else None
+        )
+        if isinstance(_traditional_lrc, dict) and "applied" in _traditional_lrc:
+            _lj_lrc_applicable = bool(_traditional_lrc.get("applied"))
+            _lj_lrc_truth_source = "traditional_mbar_analyzer_lj_lrc_metadata"
+        else:
+            _lj_lrc_applicable = bool(
+                ibs_lj_tail_lrc_is_applicable(_lj_lrc_potential_type)
+            )
+            _lj_lrc_truth_source = "ibs_lj_tail_lrc_is_applicable(potential_type)"
+
         # ✅ 显式加入 Boresch 修正与约束修正
         dg_boresch = correction_results.get("delta_g_rest", 0.0)
         total_dg = dg_phys + cons_correction + dg_boresch
-        total_err = np.sqrt(err_phys**2 + cons_correction**2 * 0.01**2 + correction_results.get("error", 0.0)**2)
+        # 约束 Jacobian 修正是解析确定性项；没有独立采样误差时不并入方差。
+        total_err = np.sqrt(err_phys**2 + correction_results.get("error", 0.0)**2)
 
         final = {
             "decoupling_scheme": decoupling_scheme,
             "decoupling_delta_G_kJ_mol": dg_phys,
+            # [P1-17] attachment 项已计入 decoupling_delta_G_kJ_mol，这里单列供审计。
+            # present=False 表示这一轮没跑 attachment 腿，循环未闭合。
+            "boresch_attachment": {
+                "present": bool(sampling_results.get("stage0")),
+                "delta_G_kJ_mol": float(
+                    (sampling_results.get("stage0") or {}).get("attachment_delta_G_kJ_mol", 0.0) or 0.0
+                ),
+                "error_kJ_mol": float(
+                    (sampling_results.get("stage0") or {}).get("attachment_error_kJ_mol", 0.0) or 0.0
+                ),
+                "direction": "A_prime_to_A (restraint OFF -> ON), always >= 0",
+                "already_included_in_decoupling_delta_G": True,
+            },
             "constraint_correction_kJ_mol": cons_correction,
             "boresch_correction_kJ_mol": dg_boresch,
+            # ✅ total_delta_G_complex_kJ_mol (见下方 total_dg) 恒等于
+            # dg_phys + cons_correction + dg_boresch，即 Boresch 释放修正已经烘焙
+            # 进 total_delta_G_complex_kJ_mol。runabfe.py 等下游消费者读取本文件时，
+            # 不应再对 total_delta_G_complex_kJ_mol 或最终 ΔG_bind 二次扣减
+            # boresch_correction_kJ_mol，否则会重复计入该修正项。
+            "boresch_correction_already_included_in_total_delta_G": True,
+            "boresch_correction_diagnostics": {
+                "method": correction_results.get("method"),
+                "diagnostics": correction_results.get("diagnostics", {}),
+                "force_constants_raw": correction_results.get("force_constants_raw", {}),
+                "force_constant_clipped": correction_results.get("force_constant_clipped", {}),
+                "uses_analytical_release_formula": bool(correction_results.get("uses_analytical_release_formula", False)),
+                "analytical_release_assumption": correction_results.get("analytical_release_assumption", ""),
+            },
+            "lj_long_range_dispersion_correction": {
+                # 🔑 [P2-14] 这里原来是裸字面量 True，对 DEXP 运行无条件说谎。
+                # 现在与生产者 build_ibs_dual_system 共用同一个谓词
+                # （ibs_engine.ibs_lj_tail_lrc_is_applicable），所以 DEXP 的解析
+                # 尾项公式一旦被验证/替换，行为和报告会一起动，不会再分叉。
+                "applicable": _lj_lrc_applicable,
+                "applied": _lj_lrc_applicable,
+                "potential_type": _lj_lrc_potential_type,
+                "truth_source": _lj_lrc_truth_source,
+                "not_applied_reason": (
+                    None if _lj_lrc_applicable
+                    else ibs_lj_tail_lrc_inapplicable_reason(_lj_lrc_potential_type)
+                ),
+                "delta_G_kJ_mol": None,
+                "status": (
+                    "implemented_analytic_mean_field_switching_softcore_aware"
+                    if _lj_lrc_applicable
+                    else "not_applied_tail_formula_unvalidated_for_this_potential"
+                ),
+                "protocol_version": TRADITIONAL_LJ_LRC_PROTOCOL_VERSION,
+                "note": ("" if _lj_lrc_applicable else (
+                    f"NOT APPLIED for potential_type={_lj_lrc_potential_type!r}: "
+                    f"{ibs_lj_tail_lrc_inapplicable_reason(_lj_lrc_potential_type)}. "
+                    "ibs_engine.py::build_ibs_dual_system leaves "
+                    "ibs_wrapper.lj_tail_lrc_coeff_kj_mol = None, and every consumer "
+                    "short-circuits to zeros, so the reported free energy contains NO "
+                    "long-range dispersion correction. The description that follows "
+                    "documents what the correction does when it IS applied; it did not "
+                    "run for this result. "
+                )) + (
+                    "OpenMM's native CustomNonbondedForce.setUseLongRangeCorrection cannot be used here: "
+                    "the softcore VDW CV expression bundles LJ and Coulomb into one CustomNonbondedForce, "
+                    "and OpenMM's analytic tail integral diverges (and was empirically observed to crash "
+                    "the CUDA backend) once real nonzero charges are present in that combined expression "
+                    "(see test_lrc_interaction_group_compat.py Q3). Instead, a hand-derived analytic "
+                    "correction is precomputed once per window in ibs_engine.py::build_ibs_dual_system "
+                    "(_lj_tail_lrc_coefficients_kj_mol) and added per-frame, per-lambda_vdw-state inside "
+                    "IBSSampler.collect_energies() before MBAR sees the energies. As of protocol version 2, "
+                    "this is a real switching-aware + softcore-aware numerical integral -- it restores both "
+                    "the energy the 1.0-1.2nm switching function removes AND the standard tail beyond the "
+                    "1.2nm cutoff, integrated against the actual softcore denominator D(r) = "
+                    "alpha_lj*(1-lambda_vdw)^m_lj + r^6 (not a bare r^6), and includes both the attractive "
+                    "r^-6 and repulsive r^-12 moments (S6, S12) rather than dispersion-only. (Protocol "
+                    "version 1, superseded, only integrated the plain r^-6 tail beyond the hard cutoff and "
+                    "ignored the switching region entirely.) Because it is folded into the raw interaction "
+                    "energies feeding MBAR rather than applied as a separate additive scalar afterward, it "
+                    "is not separable into its own delta_G_kJ_mol contribution the way the Boresch "
+                    "correction is -- it is already included in total_delta_G_complex_kJ_mol below. Shared "
+                    "by three consumers of the same per-lambda coefficient array "
+                    "(ibs_wrapper.lj_tail_lrc_coeff_kj_mol): IBSSampler production sampling, the fixed-H "
+                    "overlap probe, and (via a parallel construction using BeutlerSoftcoreBuilder's default "
+                    "alpha_lj/power_lj) TraditionalMBARAnalyzer.compute_u_kn for the "
+                    "BeutlerSoftcoreBuilder/--decoupling single_lambda REMD path, which now has an "
+                    "equivalent correction rather than none."
+                ),
+            },
             "total_delta_G_complex_kJ_mol": float(total_dg),
             "total_delta_G_complex_kcal_mol": float(total_dg / 4.184),
             "total_error_kJ_mol": float(total_err),
             "total_error_kcal_mol": float(total_err / 4.184),
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "diagnostics": sampling_results.get("diagnostics", {}),
+            "stage_diagnostics": {
+                "stage1": sampling_results.get("stage1", {}).get("diagnostics", {}),
+                "stage2": sampling_results.get("stage2", {}).get("diagnostics", {}),
+                "stage1_lambda_endpoints": sampling_results.get("stage1", {}).get("lambda_endpoint_diagnostics", {}),
+                "stage2_lambda_endpoints": sampling_results.get("stage2", {}).get("lambda_endpoint_diagnostics", {}),
+            },
+            "provenance": _collect_pipeline_provenance(
+                config=getattr(self, "_last_run_config", {}),
+                system=system or self.system,
+                topology=self.topology,
+                positions=self.positions,
+                command_line=getattr(self, "_command_line", None),
+            ),
         }
         
         out_path = os.path.join(self.output_dir, "final_results.json")
         with open(out_path, "w") as f: json.dump(final, f, indent=2, cls=NumpyEncoder)
+        cycle_path = os.path.join(self.output_dir, "thermodynamic_cycle.md")
+        with open(cycle_path, "w", encoding="utf-8") as f:
+            f.write(THERMODYNAMIC_CYCLE_DOC + "\n")
         self._log(f"\n✅ 最终结果已保存: {out_path}")
+        self._log(f"  ✓ 热力学循环说明已保存: {cycle_path}")
         self._log(UnitFormatter.format_results_human(final))
         return final
 
@@ -1852,17 +3596,25 @@ class ABFEPipeline:
         self._log(f"\n{'='*60}")
         self._log(f"🔬 开始复合物相 ABFE 计算...")
         self._log(f"{'='*60}")
-        complex_res = self.run_full_pipeline(decoupling_scheme=decoupling_scheme, run_equilibration=True, **kwargs)
+        complex_kwargs = dict(kwargs)
+        complex_kwargs.setdefault("system_type", "complex")
+        complex_res = self.run_full_pipeline(decoupling_scheme=decoupling_scheme, run_equilibration=True, **complex_kwargs)
         
-        delta_g_bind = complex_res.get(
+        # 🔑 [ATT-09] 循环闭合统一走 abfe_core.combine_binding_free_energy（见下方
+        # 溶剂腿分支）。这里只先取出 complex 侧的两个量；没有溶剂腿时保持既有行为，
+        # 但必须说清楚那不是一个结合自由能。
+        dg_complex = complex_res.get(
             "total_delta_G_complex_kJ_mol",
             complex_res.get("total_delta_G", 0.0),
         )
-        total_err_bind = complex_res.get(
+        err_complex = complex_res.get(
             "total_error_kJ_mol",
             complex_res.get("total_error", 0.0),
         )
-        
+        delta_g_bind = -dg_complex
+        total_err_bind = err_complex
+        cycle = None
+
         if run_solvent and solvent_gro and solvent_top:
             print("\n💧 启动溶剂相 (Ligand-in-Water) 计算...")
             from abfe_core import SolventLegRunner  # ✅ 修复 E10：正确导入路径
@@ -1875,19 +3627,1832 @@ class ABFEPipeline:
                 if atom.residue.name == ligand_resname
             ]
             
-            # 复用配置
-            solvent_res = solvent_runner.run_solvent_decoupling(pos_solv, top_solv, solvent_ligand_indices, **kwargs)
-            delta_g_bind -= solvent_res.get(
-                "decoupling_delta_G_kJ_mol",
-                solvent_res.get("total_delta_G_complex_kJ_mol", solvent_res.get("total_delta_G", 0.0)),
+            solvent_kwargs = dict(kwargs)
+            solvent_kwargs.setdefault("decoupling_scheme", decoupling_scheme)
+            solvent_kwargs["system_type"] = "solvent"
+            solvent_kwargs["boresch_params"] = None
+            solvent_res = solvent_runner.run_solvent_decoupling(pos_solv, top_solv, solvent_ligand_indices, **solvent_kwargs)
+            # ✅ solvent_runner 委托给同一个 run_full_pipeline，其口径与 complex 侧一致，
+            # 主键是 total_delta_G_complex_kJ_mol；decoupling_delta_G_kJ_mol 只是
+            # _analyze_dual_leg 等旧辅助函数使用的口径，这里只作为兜底，避免误取旧字段。
+            dg_solvent = solvent_res.get(
+                "total_delta_G_complex_kJ_mol",
+                solvent_res.get("decoupling_delta_G_kJ_mol", solvent_res.get("total_delta_G", 0.0)),
             )
-            total_err_bind = float(np.sqrt(
-                total_err_bind**2
-                + solvent_res.get("total_error_kJ_mol", solvent_res.get("total_error", 0.0))**2
-            ))
-            
+            err_solvent = solvent_res.get(
+                "total_error_kJ_mol", solvent_res.get("total_error", 0.0)
+            )
+            # 🔑 [ATT-09] 这里此前是 `delta_g_bind += dg_solvent` 手写闭合，且
+            # **完全没有 APBS 项**——runabfe.main() 和 run_post_analysis() 一直在读
+            # config["apbs_correction_kJ_mol"]，只有这条路径和 traditional 路径没读，
+            # 对带电配体等于静默漏掉整项有限尺寸静电修正。现在与其余三处共用
+            # abfe_core.combine_binding_free_energy，并从 run kwargs 读同一个标量
+            # （由离线 apbs_correction.py 的 collect 步骤算出并经
+            # --apbs-correction-kj-mol 传入；本流程内不调 APBS）。
+            #
+            # complex 侧取的是 total_delta_G_complex_kJ_mol，Boresch 释放项已烘焙其中
+            # （abfe_pipeline: total_dg = dg_phys + cons_correction + dg_boresch），
+            # 所以 already_included=True，不再减第二次。
+            cycle = combine_binding_free_energy(
+                dg_complex_kJ_mol=dg_complex,
+                dg_solvent_kJ_mol=dg_solvent,
+                err_complex_kJ_mol=err_complex,
+                err_solvent_kJ_mol=err_solvent,
+                dg_boresch_kJ_mol=complex_res.get("boresch_correction_kJ_mol", 0.0),
+                boresch_already_included_in_complex=True,
+                apbs_correction_kJ_mol=float(
+                    kwargs.get("apbs_correction_kJ_mol", 0.0) or 0.0
+                ),
+            )
+            delta_g_bind = cycle["delta_G_bind_kJ_mol"]
+            total_err_bind = cycle["total_error_kJ_mol"]
+
+        if cycle is None:
+            print(
+                "\n⚠️ 未运行溶剂腿：下面这个数只是 -ΔG_complex，**不是**结合自由能，"
+                "热力学循环没有闭合。"
+            )
         print(f"\n🎯 最终结合自由能 ΔG_bind = {delta_g_bind:.2f} ± {total_err_bind:.2f} kJ/mol")
-        return {"delta_g_bind": delta_g_bind, "total_error": total_err_bind, "complex": complex_res}
+        return {
+            "delta_g_bind": delta_g_bind,
+            "total_error": total_err_bind,
+            "complex": complex_res,
+            # [ATT-09] 循环闭合的完整记账；未跑溶剂腿时为 None，明确表示循环未闭合。
+            "thermodynamic_cycle_terms": cycle,
+            "cycle_closed": cycle is not None,
+        }
+
+    @staticmethod
+    def _load_ibs_window_outputs_from_dir(
+        output_dir: str,
+        ranges: List[Tuple[int, int]],
+        lambdas_coul: List[float],
+        lambdas_vdw: List[float],
+        *,
+        checkpoint_dir: str,
+        stage_type: str = "vdw",
+        window_index_offset: int = 0,
+        window_label_prefix: str = "window",
+        excluded_local_windows: Optional[set] = None,
+    ) -> List[Dict]:
+        outputs: List[Dict] = []
+        excluded = {int(x) for x in (excluded_local_windows or set())}
+        # 🔑 [P0-8] 见 ibs_engine._assert_expected_windows_all_loaded 的说明：
+        # 缺首/末窗口不会被协方差链挡下，会静默产出截断的 ΔG 且报 converged=True。
+        # 合法的部分分析（rescue ensemble 取代原始窗口）必须走显式的
+        # excluded_local_windows，不能靠"文件恰好不存在"来隐式决定覆盖范围。
+        expected_windows = [
+            int(i) for i in range(len(ranges)) if int(i) not in excluded
+        ]
+        missing_windows: List[Dict] = []
+        for local_idx, (start, end) in enumerate(ranges):
+            if int(local_idx) in excluded:
+                continue
+            energy_path = os.path.join(
+                output_dir, f"dual_window_{local_idx}_{stage_type}_energies.npy"
+            )
+            bias_path = os.path.join(
+                output_dir, f"dual_window_{local_idx}_{stage_type}_bias.npy"
+            )
+            base_path = os.path.join(
+                output_dir, f"dual_window_{local_idx}_{stage_type}_base.npy"
+            )
+            convergence_path = os.path.join(
+                output_dir,
+                f"dual_window_{local_idx}_{stage_type}_convergence.json",
+            )
+            absent = [
+                label
+                for label, path in (
+                    ("energies", energy_path),
+                    ("bias", bias_path),
+                    ("base", base_path),
+                )
+                if not os.path.isfile(path)
+            ]
+            if absent:
+                missing_windows.append({
+                    "window_index": int(local_idx),
+                    "lambda_range": [int(start), int(end)],
+                    "missing_files": absent,
+                })
+                continue
+            if not os.path.isfile(convergence_path):
+                raise FileNotFoundError(
+                    f"窗口 {local_idx} 有 energies 但缺少 convergence manifest"
+                )
+            with open(convergence_path, encoding="utf-8") as handle:
+                convergence = json.load(handle)
+            u_kn, bias, base = _load_validated_window_data_triplet(
+                energy_path,
+                bias_path,
+                base_path,
+                convergence,
+            )
+            if u_kn.ndim != 2 or u_kn.shape[1] == 0:
+                raise ValueError(f"窗口 {local_idx} 没有有效 IBS 帧")
+            n_frames = u_kn.shape[1]
+            # 🔑 [ESS_GATE_PROTOCOL_VERSION=2] 混合覆盖度 ESS 门需要该窗口冻结进生产
+            # 的 f_k，从对应 checkpoint 目录的 ibs_state_*.json 读（与
+            # IBSWindowManagerDualLambda.get_stage_data_for_analysis 同一策略，同样
+            # fail closed）。注意本函数会被 original/rescue 两个不同 output_dir 各调
+            # 一次，checkpoint_dir 必须与 output_dir 配对传入，不能共用一个。
+            state_path = os.path.join(
+                checkpoint_dir, f"ibs_state_{stage_type}_window_{local_idx}.json"
+            )
+            if not os.path.isfile(state_path):
+                raise FileNotFoundError(
+                    f"窗口 {local_idx} 有 energies 但缺少 ibs_state checkpoint "
+                    f"({state_path})；ESS 门需要冻结的 f_k，拒绝在缺判据的情况下继续分析"
+                )
+            with open(state_path, encoding="utf-8") as handle:
+                ibs_state = json.load(handle)
+            f_k_window = np.asarray(ibs_state.get("f_k", []), dtype=np.float64).ravel()
+            if f_k_window.size != u_kn.shape[0] or not np.all(np.isfinite(f_k_window)):
+                raise ValueError(
+                    f"窗口 {local_idx} ibs_state 的 f_k（长度 {f_k_window.size}）与能量"
+                    f"矩阵态数（{u_kn.shape[0]}）不符或含非有限值，拒绝用于 ESS 门"
+                )
+            outputs.append({
+                "window_index": int(window_index_offset + local_idx),
+                "window_label": f"{window_label_prefix}_{local_idx}",
+                "window_range": [int(start), int(end)],
+                "u_kn": u_kn[:, :n_frames],
+                "bias_energies": bias[:n_frames],
+                "base_energies": base[:n_frames],
+                "lambda_indices": list(range(int(start), int(end))),
+                "lambdas_coul": [float(x) for x in lambdas_coul[start:end]],
+                "lambdas_vdw": [float(x) for x in lambdas_vdw[start:end]],
+                "f_k": f_k_window,
+                "sampled_distribution_row": 0,
+            })
+        _assert_expected_windows_all_loaded(
+            expected_windows=expected_windows,
+            loaded_windows=[
+                int(o["window_index"]) - int(window_index_offset) for o in outputs
+            ],
+            missing_windows=missing_windows,
+            source=f"{output_dir} (stage_type={stage_type})",
+        )
+        return outputs
+
+    @staticmethod
+    def _build_vanishing_rescue_ranges(
+        failing_window_indices: List[int],
+        base_ranges: List[Tuple[int, int]],
+    ) -> List[Tuple[int, int]]:
+        """Replace each failed ensemble by smaller overlapping ensembles.
+
+        The lambda grid is immutable.  These are new sampling ensembles over
+        existing states, kept in a separate rescue directory.
+        """
+        rescue_ranges: List[Tuple[int, int]] = []
+        for window_idx in sorted(set(int(x) for x in failing_window_indices)):
+            start, end = (int(x) for x in base_ranges[window_idx])
+            n_states = end - start
+            if n_states <= 2:
+                rescue_ranges.append((start, end))
+                continue
+            midpoint = start + (n_states - 1) // 2
+            left = (start, midpoint + 1)
+            right = (midpoint, end)
+            for child in (left, right):
+                if child[1] - child[0] >= 2 and child not in rescue_ranges:
+                    rescue_ranges.append(child)
+        return rescue_ranges
+
+    @staticmethod
+    def _stage_quality_failure_details(result: Dict) -> List[Dict]:
+        """Return per-window final-gate failures with the exact worst state."""
+        diagnostics = result.get("window_overlap_diagnostics") or []
+        ratio_threshold = result.get("min_overlap_threshold")
+        absolute_threshold = result.get("min_absolute_ess_threshold")
+        decorrelated_threshold = result.get("min_decorrelated_samples_threshold")
+        uncertainty_threshold = result.get(
+            "max_endpoint_uncertainty_kJ_mol_threshold"
+        )
+        failures: List[Dict] = []
+        for record in diagnostics:
+            reasons = []
+            ratio = record.get("min_ess_ratio")
+            absolute = record.get("absolute_ess")
+            n_decorrelated = record.get("n_frames_decorrelated")
+            uncertainty = record.get("endpoint_diff_uncertainty_kJ_mol")
+            if ratio_threshold is not None and (
+                ratio is None or float(ratio) < float(ratio_threshold)
+            ):
+                reasons.append("ess_ratio")
+            if absolute_threshold is not None and (
+                absolute is None or float(absolute) < float(absolute_threshold)
+            ):
+                reasons.append("absolute_ess")
+            if decorrelated_threshold is not None and (
+                n_decorrelated is None
+                or int(n_decorrelated) < int(decorrelated_threshold)
+            ):
+                reasons.append("decorrelated_samples")
+            if uncertainty_threshold is not None and (
+                uncertainty is None
+                or not np.isfinite(float(uncertainty))
+                or float(uncertainty) > float(uncertainty_threshold)
+            ):
+                reasons.append("endpoint_uncertainty")
+            if not reasons:
+                continue
+
+            per_lambda = record.get("ess_ratio_per_lambda") or {}
+            worst_state = None
+            worst_ratio = None
+            if per_lambda:
+                worst_key, worst_value = min(
+                    per_lambda.items(), key=lambda item: float(item[1])
+                )
+                worst_state = int(worst_key)
+                worst_ratio = float(worst_value)
+            global_states = [int(x) for x in (record.get("lambdas") or [])]
+            state_position = (
+                global_states.index(worst_state)
+                if worst_state is not None and worst_state in global_states
+                else None
+            )
+            lambdas_coul = [float(x) for x in (record.get("lambdas_coul") or [])]
+            lambdas_vdw = [float(x) for x in (record.get("lambdas_vdw") or [])]
+            failures.append({
+                "window_index": int(record.get("window_index", -1)),
+                "window_label": record.get("window_label"),
+                "window_range": record.get("window_range"),
+                "global_states": global_states,
+                "lambdas_coul": lambdas_coul,
+                "lambdas_vdw": lambdas_vdw,
+                "worst_global_state": worst_state,
+                "worst_lambda_coul": (
+                    lambdas_coul[state_position]
+                    if state_position is not None and state_position < len(lambdas_coul)
+                    else None
+                ),
+                "worst_lambda_vdw": (
+                    lambdas_vdw[state_position]
+                    if state_position is not None and state_position < len(lambdas_vdw)
+                    else None
+                ),
+                "worst_ess_ratio": worst_ratio,
+                "min_ess_ratio": ratio,
+                "absolute_ess": absolute,
+                "n_frames_decorrelated": n_decorrelated,
+                "endpoint_uncertainty_kJ_mol": uncertainty,
+                "failed_gates": reasons,
+            })
+        return failures
+
+    @staticmethod
+    def _format_stage_quality_failure_details(details: List[Dict]) -> str:
+        if not details:
+            return "未能从 window_overlap_diagnostics 定位具体窗口"
+        rows = []
+        for item in details:
+            label = item.get("window_label") or f"window {item['window_index']}"
+            rows.append(
+                f"{label} range={item.get('window_range')} states={item.get('global_states')} "
+                f"lambda_vdw={item.get('lambdas_vdw')}；worst_state="
+                f"{item.get('worst_global_state')} (lambda_vdw={item.get('worst_lambda_vdw')})，"
+                f"ESS_ratio={item.get('min_ess_ratio')}, absolute_ESS="
+                f"{item.get('absolute_ess')}, N_decorrelated="
+                f"{item.get('n_frames_decorrelated')}, endpoint_sigma="
+                f"{item.get('endpoint_uncertainty_kJ_mol')} kJ/mol，failed="
+                f"{item.get('failed_gates')}"
+            )
+        return " | ".join(rows)
+
+    def _assert_stage_result_sane(self, stage_label: str, result: Dict) -> None:
+        """
+        🔑 熔断检查：MBAR/TMBAR 求解失败或协方差不可用时，此前的代码会把
+        total_error=NaN、甚至 total_delta_G 精确等于 0.0 这类明显不可信的结果当作
+        "合法完成"写入 checkpoint、标记 completed，并一路传播到最终 ΔG_bind——除了
+        日志里一句容易被淹没的警告，没有任何硬性拦截（曾实测出现过 decharging 腿
+        total_delta_G=0.0、total_error=NaN 仍被当正常结果使用）。这里把"完全没有
+        误差棒"或"自由能/误差不是有限数"当作阶段失败处理，拒绝继续，逼迫先解决
+        采样/重叠/Boresch 一致性问题，而不是让一个已知不可信的数字悄悄流入生产结果。
+        """
+        dg = result.get("total_delta_G")
+        err = result.get("total_error")
+        if dg is None or not np.isfinite(dg):
+            raise RuntimeError(
+                f"{stage_label} 阶段 total_delta_G={dg} 不是有限数，拒绝标记为 completed。"
+            )
+        if err is None or not np.isfinite(err):
+            raise RuntimeError(
+                f"{stage_label} 阶段 total_error={err}（非有限，通常意味着 MBAR 协方差/BAR "
+                "求解在 default 和 robust 两种 solver protocol 下均失败）。这条腿的结果不可信，"
+                "拒绝标记为 completed 并写入最终 ΔG_bind；请检查窗口重叠率、采样长度，或该阶段"
+                "是否跨越了一次 --resume 重启导致 Boresch/restraint 基准不一致，再重新采样该阶段。"
+            )
+
+        # charging 的 BAR 主值只有在 FD-TI 一致性门明确通过时才允许完成。
+        # `passed=None` 表示 TI 缺失/异常或容差没声明，不是“软警告”。
+        if result.get("primary_estimator") == "adjacent_bar":
+            ti_gate = result.get("ti_gate")
+            if not isinstance(ti_gate, dict) or ti_gate.get("passed") is not True:
+                reason = (
+                    ti_gate.get("reason")
+                    if isinstance(ti_gate, dict)
+                    else "ti_gate 缺失"
+                )
+                raise RuntimeError(
+                    f"{stage_label} 使用 adjacent BAR 主值，但 FD-TI 一致性门没有明确通过"
+                    f"（{reason}），拒绝标记为 completed。"
+                )
+
+        # 🔑 修复（审查报告 #2）：此前 GlobalMBARAnalyzer/TraditionalMBARAnalyzer
+        # 返回的 converged/min_overlap 字段从未被这里检查过——即使它们现在已经是
+        # 真实的重叠/收敛诊断（见 ibs_engine.py 的 solve / solve_stage_integrated），
+        # 一个重叠度低到不可信的阶段仍然会被当作"合法完成"写进最终 ΔG_bind。这里
+        # 补上硬性检查：只在结果里带有这些诊断字段时才检查（兼容不提供这些字段的
+        # 旧路径），重叠度低于阶段自己报告的阈值就直接拒绝，而不是把一个已知不可靠
+        # 的数字悄悄传下去。
+        converged = result.get("converged")
+        min_overlap = result.get("min_overlap")
+        min_overlap_threshold = result.get("min_overlap_threshold")
+        if converged is False:
+            failure_details = self._stage_quality_failure_details(result)
+            raise RuntimeError(
+                f"{stage_label} 阶段报告 converged=False"
+                + (f"，min_overlap={min_overlap:.4g}（阈值 {min_overlap_threshold:.4g}）" if min_overlap is not None and min_overlap_threshold is not None else "")
+                + "。Reweighting-quality gate failed. Preserve data and run "
+                "rescue/coverage analysis; do not mutate the sampling grid in place. "
+                f"具体瓶颈：{self._format_stage_quality_failure_details(failure_details)}。"
+                "（完整诊断见 window_overlap_diagnostics / statistical_inefficiency；由 rescue/"
+                "coverage 审计决定是否需要新 ensemble，不在原地拆窗/插 λ/重校准 f_k。）"
+            )
+        if min_overlap is not None and min_overlap_threshold is not None and min_overlap < min_overlap_threshold:
+            raise RuntimeError(
+                f"{stage_label} 阶段单参考重要性 ESS 比值 min_overlap={min_overlap:.4g} 低于阈值 "
+                f"{min_overlap_threshold:.4g}（此处 min_overlap 是 compute_effective_sample_number "
+                "重要性 ESS 比值，非 fixed-H adjacent overlap），拒绝标记为 completed。"
+                "Reweighting-quality gate failed. Preserve data and run rescue/coverage analysis; "
+                "do not mutate the sampling grid in place."
+            )
+
+        # 🔑 [P1 修复] 最终收敛门此前只检查 ESS ratio；样本总数很少时，即使绝对
+        # 有效样本数只有个位数，只要比例超过阈值仍会被判定 completed。这里对
+        # ibs_engine.py::GlobalMBARAnalyzer.solve_stage_integrated 新增的三项
+        # 硬门槛做同样的镜像检查（同 min_overlap 的模式：只在结果带这些字段时
+        # 才检查，兼容不提供这些诊断的旧/其它求解路径）。
+        min_absolute_ess = result.get("min_absolute_ess")
+        min_absolute_ess_threshold = result.get("min_absolute_ess_threshold")
+        if (
+            min_absolute_ess is not None
+            and min_absolute_ess_threshold is not None
+            and min_absolute_ess < min_absolute_ess_threshold
+        ):
+            raise RuntimeError(
+                f"{stage_label} 阶段最小绝对有效样本数 min_absolute_ess="
+                f"{min_absolute_ess:.4g} 低于阈值 {min_absolute_ess_threshold:.4g}，拒绝标记为 "
+                "completed。ESS ratio 达标不代表绝对样本数足够，请延长重叠最差窗口的采样。"
+            )
+        min_decorrelated_samples = result.get("min_decorrelated_samples")
+        min_decorrelated_samples_threshold = result.get("min_decorrelated_samples_threshold")
+        if (
+            min_decorrelated_samples is not None
+            and min_decorrelated_samples_threshold is not None
+            and min_decorrelated_samples < min_decorrelated_samples_threshold
+        ):
+            raise RuntimeError(
+                f"{stage_label} 阶段最少去相关样本数 min_decorrelated_samples="
+                f"{min_decorrelated_samples} 低于阈值 {min_decorrelated_samples_threshold}，"
+                "拒绝标记为 completed，请延长采样。"
+            )
+        max_endpoint_uncertainty_kJ_mol = result.get("max_endpoint_uncertainty_kJ_mol")
+        max_endpoint_uncertainty_kJ_mol_threshold = result.get("max_endpoint_uncertainty_kJ_mol_threshold")
+        if (
+            max_endpoint_uncertainty_kJ_mol is not None
+            and max_endpoint_uncertainty_kJ_mol_threshold is not None
+            and (
+                not np.isfinite(max_endpoint_uncertainty_kJ_mol)
+                or max_endpoint_uncertainty_kJ_mol > max_endpoint_uncertainty_kJ_mol_threshold
+            )
+        ):
+            raise RuntimeError(
+                f"{stage_label} 阶段最大端点自由能差不确定度 "
+                f"max_endpoint_uncertainty_kJ_mol={max_endpoint_uncertainty_kJ_mol:.4g} kJ/mol "
+                f"高于阈值 {max_endpoint_uncertainty_kJ_mol_threshold:.4g} kJ/mol，拒绝标记为 "
+                "completed，请延长采样或检查窗口重叠。"
+            )
+
+    def _assert_reusable_stage_cache_sane(
+        self,
+        stage_label: str,
+        result: Dict,
+    ) -> None:
+        """Re-run the scientific gates before a completed stage is reused.
+
+        Stage checkpoints keep detailed gate values inside ``diagnostics`` to
+        preserve the public result shape.  Rehydrate those values temporarily
+        at the top level because ``_assert_stage_result_sane`` is also used on
+        fresh in-memory solver results and therefore reads the top-level form.
+        """
+        if result.get("converged") is not True:
+            raise RuntimeError(
+                f"{stage_label} 缓存缺少明确的 converged=True 证据，拒绝复用。"
+            )
+        if result.get("stage") == "vanishing" and not isinstance(
+            result.get("coverage_diagnostics"), dict
+        ):
+            raise RuntimeError(
+                f"{stage_label} 缓存缺少 coverage_diagnostics，拒绝复用。"
+            )
+        diagnostics = result.get("diagnostics")
+        if not isinstance(diagnostics, dict):
+            raise RuntimeError(f"{stage_label} 缓存 diagnostics 非法，拒绝复用。")
+        for key in (
+            "min_overlap",
+            "min_overlap_threshold",
+            "min_absolute_ess",
+            "min_absolute_ess_threshold",
+            "min_decorrelated_samples",
+            "min_decorrelated_samples_threshold",
+            "max_endpoint_uncertainty_kJ_mol",
+            "max_endpoint_uncertainty_kJ_mol_threshold",
+            "window_overlap_diagnostics",
+        ):
+            if key not in result and key in diagnostics:
+                result[key] = diagnostics[key]
+        self._assert_stage_result_sane(stage_label, result)
+
+    @staticmethod
+    def _is_overlap_failure(result: Dict) -> bool:
+        """结果没通过 sanity check 的原因是不是"重叠不足"（而不是 NaN/求解失败）——
+        只有这种失败才是 refine_stage_lambda_path_by_overlap 有能力自动修的。"""
+        min_overlap = result.get("min_overlap")
+        min_overlap_threshold = result.get("min_overlap_threshold")
+        dg = result.get("total_delta_G")
+        err = result.get("total_error")
+        if dg is None or not np.isfinite(dg):
+            return False
+        if err is None or not np.isfinite(err):
+            return False
+        if (
+            min_overlap is None
+            or min_overlap_threshold is None
+            or not np.isfinite(min_overlap)
+            or not np.isfinite(min_overlap_threshold)
+            or min_overlap >= min_overlap_threshold
+        ):
+            return False
+
+        # converged=False alone is not an overlap failure: MBAR solver failure,
+        # missing windows, NaN, and warmup failure must keep their own failure
+        # types.  Auto-insertion is allowed only when every reported window has
+        # the ESS detail needed to locate a concrete lambda bottleneck.
+        diagnostics = result.get("window_overlap_diagnostics")
+        if not isinstance(diagnostics, list) or not diagnostics:
+            return False
+        for record in diagnostics:
+            if not isinstance(record, dict):
+                return False
+            ratio = record.get("min_ess_ratio")
+            per_lambda = record.get("ess_ratio_per_lambda")
+            lambdas = record.get("lambdas")
+            if (
+                ratio is None
+                or not np.isfinite(ratio)
+                or not isinstance(per_lambda, dict)
+                or not per_lambda
+                or not isinstance(lambdas, list)
+                or len(lambdas) < 2
+            ):
+                return False
+        return True
+
+    @staticmethod
+    def _window_lambda_key(lambdas: List[float], lo: int, hi: int) -> Tuple[float, ...]:
+        """一个窗口的内容指纹：它包含的 λ 值（四舍五入避免浮点噪声导致误判不等）。
+        跟 window_idx 无关——路径变了之后，同一段 λ 完全可能挪到不同的 idx 上，
+        这个指纹才是判断"是不是同一个窗口"唯一可信的依据。原是
+        `_invalidate_stage_window_files` 内部的私有嵌套函数，提出来给
+        `_remap_window_by_lambda_content` 共用，避免两处各自维护一份同样的逻辑。
+        """
+        return tuple(round(float(x), 8) for x in lambdas[lo:hi])
+
+    def _remap_window_by_lambda_content(
+        self,
+        old_range: Tuple[int, int],
+        old_lambdas: List[float],
+        new_lambdas: List[float],
+        new_ranges: List[Tuple[int, int]],
+    ) -> Optional[Tuple[int, int]]:
+        """给定一个窗口在旧方案里的 (start,end)，按它包含的 λ 值集合在新方案
+        new_ranges 里找到内容完全一致的新 (start,end)——不依赖 window_idx（拆窗/
+        插 λ 之后会整体重排）。找不到（比如被 canonicalize_window_ranges 归约掉、
+        或被相邻拆窗的邻窗重排吞并）时返回 None，调用方必须把这种情况当成"这个
+        窗口本轮暂时定位不到"来处理（跳过/推迟），不能假装还能找到一个近似匹配。
+        """
+        target_key = self._window_lambda_key(old_lambdas, old_range[0], old_range[1])
+        for (ns, ne) in new_ranges:
+            if self._window_lambda_key(new_lambdas, ns, ne) == target_key:
+                return (ns, ne)
+        return None
+
+    def _apply_already_good_repairs(
+        self,
+        stage_name: str,
+        stage_type: str,
+        stage_label: str,
+        threshold: float,
+        repair_round: int,
+        entries: List[Tuple[Tuple[int, int], Tuple[int, int], List[Tuple[int, int]]]],
+        probe_results: Dict[Tuple[int, int], List[Dict]],
+        pending_step_overrides: Dict[int, int],
+        n_steps_per_window: Optional[int],
+        resample_step_growth_factor: float,
+        max_resample_step_multiplier: float,
+    ) -> List[Dict]:
+        """对一批 fixed-H 全通过但 production ESS 低的窗口跑
+        `_diagnose_and_repair_all_pass_low_ess_window` 并落盘/打印结果。
+
+        `entries` 是 `(probe_key, lookup_range, lookup_ranges)` 三元组列表：
+        `probe_key` 用于取 `probe_results[probe_key]`（探针结果永远按探测时的
+        原始 λ 内容为键，不随窗口重排变化）；`lookup_range`/`lookup_ranges` 是
+        实际要传给 `_diagnose_and_repair_all_pass_low_ess_window` 的窗口范围/
+        全量范围列表——路径本轮没变时就是原始 se/`effective_old_ranges`，路径
+        本轮变了就必须是重映射之后的新 (start,end)/`new_ranges`（否则函数内部
+        `new_ranges.index(...)` 式的 window_idx 推导会找错窗口，或找不到）。
+        两条调用路径（未变路径 vs 已变路径重映射后）共用这同一段诊断/落盘/
+        打印逻辑，避免维护两份几乎一样的代码。
+        """
+        repair_actions = []
+        for probe_key, lookup_range, lookup_ranges in entries:
+            action = self._diagnose_and_repair_all_pass_low_ess_window(
+                stage_name, stage_type, lookup_range, probe_results[probe_key], lookup_ranges,
+            )
+            repair_actions.append(action)
+        if not repair_actions:
+            return repair_actions
+        repair_file = self._persist_sampling_repair_actions(stage_name, repair_round, repair_actions)
+        for action in repair_actions:
+            se = tuple(action["window_range"])
+            if action["decision"] == "recalibrate_f_k":
+                bad_edges = [i for i, m in enumerate(action["mismatched_edges"]) if m]
+                self._log(
+                    f"  🎯 {stage_label}: 窗口 {se} fixed-H 全通过但 production ESS 低于阈值 "
+                    f"{threshold:.4g}；相邻边 {bad_edges} 的生产冻结 f_k 增量与 fixed-H "
+                    f"BAR/MBAR ΔF 差异超出各自噪声阈值（max|Δ|="
+                    f"{action['max_abs_edge_diff_kJ_mol']:.3f} kJ/mol，阈值="
+                    f"max({action['f_k_edge_mismatch_floor_kJ_mol']:.2f}, "
+                    f"{action['f_k_edge_mismatch_sigma_multiplier']:.1f}×σ_probe)）——判定 "
+                    "warmup 学到的偏置不准。已用 fixed-H 校准的 f_k 覆盖该窗口的 ibs_state "
+                    "缓存（bias_converged=True），只清空该窗口自己的 production 产物，下一轮"
+                    "只对它重新做冻结 burn-in + 只读验证 + 生产重采样，不影响其它窗口。"
+                )
+            elif action["decision"] == "reseed_resample":
+                window_idx = action["window_idx"]
+                if n_steps_per_window:
+                    # 🔑 真正延长，而不是原地打转：每次这个窗口触发
+                    # reseed_resample，把它下一轮的生产步数在当前覆盖值
+                    # （首次为默认 n_steps_per_window）基础上乘以
+                    # resample_step_growth_factor，封顶
+                    # max_resample_step_multiplier 倍默认步数，避免
+                    # 一个持续不收敛的窗口无界烧 GPU。
+                    current_steps = pending_step_overrides.get(window_idx, int(n_steps_per_window))
+                    current_multiplier = current_steps / float(n_steps_per_window)
+                    new_multiplier = min(
+                        current_multiplier * resample_step_growth_factor,
+                        max_resample_step_multiplier,
+                    )
+                    new_steps = int(round(n_steps_per_window * new_multiplier))
+                    pending_step_overrides[window_idx] = new_steps
+                    self._log(
+                        f"  🔁 {stage_label}: 窗口 {se} fixed-H 全通过但 production ESS 低于阈值 "
+                        f"{threshold:.4g}；每条相邻边的生产冻结 f_k 增量与 fixed-H BAR/MBAR ΔF 都"
+                        f"在各自噪声阈值内一致（max|Δ|={action['max_abs_edge_diff_kJ_mol']:.3f} "
+                        "kJ/mol）——偏置本身没问题，更可能是构象弛豫慢/采样太短；只清空该窗口"
+                        f"自己的 production 产物，下一轮用 {new_steps} 步（默认的 "
+                        f"{new_multiplier:.2f}×）真正延长该窗口的生产采样，不影响其它窗口。"
+                    )
+                else:
+                    self._log(
+                        f"  🔁 {stage_label}: 窗口 {se} fixed-H 全通过但 production ESS 低于阈值 "
+                        f"{threshold:.4g}；每条相邻边的生产冻结 f_k 增量与 fixed-H BAR/MBAR ΔF 都"
+                        f"在各自噪声阈值内一致（max|Δ|={action['max_abs_edge_diff_kJ_mol']:.3f} "
+                        "kJ/mol）——偏置本身没问题，更可能是构象弛豫慢/采样太短；但本次调用未"
+                        "提供 n_steps_per_window 基准，无法计算延长后的步数，只能清空该窗口的 "
+                        "production 产物，下一轮用默认步数重采一批独立样本（不是延长，只是换"
+                        "一批同样长度的样本），不影响其它窗口。"
+                    )
+            else:
+                self._log(
+                    f"  ⚠️ {stage_label}: 窗口 {se} fixed-H 全通过但 production ESS 低于阈值 "
+                    f"{threshold:.4g}，且无法自动诊断/修复（{action.get('note')}）——详情见 "
+                    f"{repair_file}，需要人工检查；不插 λ、不拆窗，production 结果保留不动。"
+                )
+        return repair_actions
+
+    def _invalidate_stage_window_files(
+        self,
+        stage_name: str,
+        stage_type: str,
+        old_lambdas: Optional[List[float]] = None,
+        old_ranges: Optional[List[Tuple[int, int]]] = None,
+        new_lambdas: Optional[List[float]] = None,
+        new_ranges: Optional[List[Tuple[int, int]]] = None,
+    ) -> None:
+        """λ 路径/窗口边界被自动修复改变后，旧的每窗口产物（能量/偏置/基准能量、
+        收敛诊断、IBS 断点状态）按新方案的窗口编号可能对不上号——window_idx 相同
+        不代表覆盖同一段 λ，必须显式清掉，不能依赖隐式的形状校验（ibs_engine.py
+        run_all_windows 的 resume 判断现在会额外校验 convergence.json 里记的真实
+        λ 值，见该文件改动，但这里如果留着"位置对得上、λ 对不上"的旧文件，至少也
+        是白占磁盘、且容易在别处被误读）。
+
+        但"λ 路径变了"不代表*每个*窗口都变了：插值加密通常只让重叠不足的那一段
+        λ 区间受影响，其余窗口在新方案里往往覆盖的还是完全相同的一段 λ（可能挪到
+        了不同的 window_idx）。如果调用方提供了 old_lambdas/old_ranges/new_lambdas/
+        new_ranges，就按"这个窗口包含的 λ 值集合"逐一比对旧窗口与新窗口——集合
+        完全相同的直接重命名旧产物到新 window_idx（不重新采样），只有真正内容变了
+        的窗口才清掉、留给重新采样。不提供这些参数时退化为原来的"全部清空"行为。
+        """
+        stage_dir = os.path.join(self.output_dir, stage_name)
+        _window_key = self._window_lambda_key
+
+        def _paths_for(idx: int) -> List[str]:
+            return [
+                os.path.join(stage_dir, f"dual_window_{idx}_{stage_type}_energies.npy"),
+                os.path.join(stage_dir, f"dual_window_{idx}_{stage_type}_bias.npy"),
+                os.path.join(stage_dir, f"dual_window_{idx}_{stage_type}_base.npy"),
+                os.path.join(stage_dir, f"dual_window_{idx}_{stage_type}_convergence.json"),
+                os.path.join(self.checkpoint_dir, f"ibs_state_{stage_type}_window_{idx}.json"),
+            ]
+
+        def _old_window_accounting_ok(old_idx: int) -> bool:
+            """旧窗口的 base/bias 力组切分口径（WCA_ACCOUNTING_VERSION）、IBS 偏置
+            预热/冻结协议（IBS_BIAS_PROTOCOL_VERSION）和 LJ 长程尾项修正公式版本
+            （TRADITIONAL_LJ_LRC_PROTOCOL_VERSION，均见 ibs_engine.py）是否都跟
+            当前一致——λ 集合再怎么完全相同，任一口径变了就是不同/不可信的数值，
+            绝不能复用。读不到 convergence.json 或缺字段的一律保守地判"不一致"。"""
+            conv_path = os.path.join(stage_dir, f"dual_window_{old_idx}_{stage_type}_convergence.json")
+            try:
+                with open(conv_path, "r", encoding="utf-8") as f:
+                    conv = json.load(f)
+            except Exception:
+                return False
+            return (
+                conv.get("wca_accounting_version") == WCA_ACCOUNTING_VERSION
+                and conv.get("ibs_bias_protocol_version") == IBS_BIAS_PROTOCOL_VERSION
+                and conv.get("lj_tail_lrc_protocol_version") == TRADITIONAL_LJ_LRC_PROTOCOL_VERSION
+                # 🔑 [non_mutating_v1] 旧变异策略缓存（f_k 可能被就地重校准过）不得复用。
+                and conv.get("sampling_repair_policy") == "non_mutating_v1"
+            )
+
+        reuse_map: Dict[int, int] = {}  # new_idx -> old_idx，λ 集合 + 记账口径完全一致
+        if old_lambdas is not None and old_ranges is not None and new_lambdas is not None and new_ranges is not None:
+            old_keys = {
+                old_idx: _window_key(old_lambdas, lo, hi)
+                for old_idx, (lo, hi) in enumerate(old_ranges)
+                if _old_window_accounting_ok(old_idx)
+            }
+            new_keys = {new_idx: _window_key(new_lambdas, lo, hi) for new_idx, (lo, hi) in enumerate(new_ranges)}
+            used_old = set()
+            for new_idx, key in new_keys.items():
+                for old_idx, okey in old_keys.items():
+                    if old_idx in used_old:
+                        continue
+                    if okey == key:
+                        reuse_map[new_idx] = old_idx
+                        used_old.add(old_idx)
+                        break
+
+        # 第一阶段：把要复用的旧窗口产物先挪到临时文件名，避免 new_idx/old_idx
+        # 数字发生交换（比如新窗口1要用旧窗口3的数据，同时新窗口3要用旧窗口1的
+        # 数据）时互相覆盖。
+        pending_moves = []  # (tmp_path, final_path, new_idx)
+        for new_idx, old_idx in reuse_map.items():
+            if old_idx == new_idx:
+                continue
+            for old_path, new_path in zip(_paths_for(old_idx), _paths_for(new_idx)):
+                if os.path.exists(old_path):
+                    tmp_path = old_path + ".reuse_tmp"
+                    os.replace(old_path, tmp_path)
+                    pending_moves.append((tmp_path, new_path, new_idx))
+
+        for tmp_path, final_path, new_idx in pending_moves:
+            os.replace(tmp_path, final_path)
+            if final_path.endswith("_convergence.json"):
+                try:
+                    with open(final_path, "r", encoding="utf-8") as f:
+                        conv = json.load(f)
+                    conv["window_idx"] = int(new_idx)
+                    with open(final_path, "w", encoding="utf-8") as f:
+                        json.dump(conv, f, indent=2)
+                except Exception:
+                    pass  # 元数据字段更新失败不影响正确性，文件名/内容才是真正依据
+
+        reused_new_idx = set(reuse_map.keys())
+
+        # 第二阶段：清掉所有不在"本轮被复用"名单里的窗口产物——包括真正内容变了
+        # 的窗口，以及没被任何新窗口认领的旧编号残留。
+        import re as _re
+        removed = []
+        patterns_with_regex = (
+            (os.path.join(stage_dir, f"dual_window_*_{stage_type}_energies.npy"), rf"dual_window_(\d+)_{stage_type}_energies\.npy$"),
+            (os.path.join(stage_dir, f"dual_window_*_{stage_type}_bias.npy"), rf"dual_window_(\d+)_{stage_type}_bias\.npy$"),
+            (os.path.join(stage_dir, f"dual_window_*_{stage_type}_base.npy"), rf"dual_window_(\d+)_{stage_type}_base\.npy$"),
+            (os.path.join(stage_dir, f"dual_window_*_{stage_type}_convergence.json"), rf"dual_window_(\d+)_{stage_type}_convergence\.json$"),
+            (os.path.join(self.checkpoint_dir, f"ibs_state_{stage_type}_window_*.json"), rf"ibs_state_{stage_type}_window_(\d+)\.json$"),
+        )
+        for glob_pattern, regex in patterns_with_regex:
+            for path in glob.glob(glob_pattern):
+                m = _re.search(regex, path)
+                idx = int(m.group(1)) if m else None
+                if idx is not None and idx in reused_new_idx:
+                    continue
+                os.remove(path)
+                removed.append(path)
+
+        if reused_new_idx:
+            self._log(
+                f"  ♻️  λ 路径已变更，其中 {len(reused_new_idx)} 个窗口覆盖的 λ 集合与之前完全一致，"
+                "直接复用旧产物（未重新采样）"
+            )
+        if removed:
+            self._log(f"  🧹 λ 路径已变更，清理 {len(removed)} 个受影响的旧窗口产物，强制重新采样")
+
+    def _load_window_bias_warmup_status(
+        self,
+        stage_name: str,
+        stage_type: str,
+        window_ranges: List[Tuple[int, int]],
+        window_range: Tuple[int, int],
+    ) -> Optional[str]:
+        """Read one window's own bias_warmup.status from its convergence.json.
+
+        The on-disk window index is its position in ``window_ranges`` -- that
+        list IS exactly ``self.ranges`` as passed to the manager for this run
+        (``effective_old_ranges`` at the call site), so this matches the same
+        enumeration ``run_all_windows`` used when naming
+        ``dual_window_{idx}_{stage_type}_convergence.json``. Returns None if
+        the window isn't found, the file is missing, or it can't be parsed --
+        callers must treat None as "not confirmed", not as a pass.
+        """
+        try:
+            window_idx = window_ranges.index(tuple(window_range))
+        except ValueError:
+            return None
+        conv_path = os.path.join(
+            self.output_dir, stage_name, f"dual_window_{window_idx}_{stage_type}_convergence.json"
+        )
+        try:
+            with open(conv_path, "r", encoding="utf-8") as f:
+                conv = json.load(f)
+            return conv.get("bias_warmup", {}).get("status")
+        except Exception:
+            return None
+
+    @staticmethod
+    def _merge_overlapping_ranges_into_components(
+        ranges: List[Tuple[int, int]],
+    ) -> List[List[Tuple[int, int]]]:
+        """Group ranges into connected components by state-index overlap.
+
+        Two windows are "connected" here iff their global lambda-index spans
+        overlap -- true by construction for any two IBS-adjacent windows,
+        since neighboring windows always share states. Windows failing in one
+        contiguous stretch of the path form one component; windows failing in
+        separate, non-adjacent stretches (with passing windows in between)
+        form separate components.
+        """
+        ordered = sorted(tuple(r) for r in ranges)
+        components: List[List[Tuple[int, int]]] = []
+        current: List[Tuple[int, int]] = []
+        current_end = None
+        for (s, e) in ordered:
+            if current and s >= current_end:
+                components.append(current)
+                current = []
+                current_end = None
+            current.append((s, e))
+            current_end = e if current_end is None else max(current_end, e)
+        if current:
+            components.append(current)
+        return components
+
+    def _fixed_h_probe_file(self, stage_name: str) -> str:
+        return os.path.join(self.output_dir, stage_name, "production_fixed_h_overlap.json")
+
+    def _fixed_h_probe_fingerprint(
+        self,
+        protocol_key: Optional[Dict],
+        window_range: Tuple[int, int],
+        current_lambdas: List[float],
+        threshold: float = 0.03,
+    ) -> str:
+        """Content-based cache key for one window's fixed-H overlap probe.
+
+        Keyed on the window's actual lambda_vdw values (not its (start,end)
+        global-state indices, which shift whenever a lambda is inserted
+        elsewhere in the path) plus the stage protocol fingerprint and the
+        probe threshold, so a cached result is only reused when the physical
+        Hamiltonian and window content are unchanged -- including across a
+        fresh process (resume), where recomputing every probe from scratch
+        would otherwise burn the same expensive burn-in + sampling per edge
+        again for no reason.
+        """
+        start, end = window_range
+        payload = {
+            "protocol_key": protocol_key,
+            "lambda_vdw_window": [round(float(x), 10) for x in current_lambdas[start:end]],
+            "probe_threshold": float(threshold),
+        }
+        blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha256(blob).hexdigest()
+
+    def _load_fixed_h_probe_cache(self, stage_name: str) -> Dict[str, Dict]:
+        probe_file = self._fixed_h_probe_file(stage_name)
+        if not os.path.exists(probe_file):
+            return {}
+        try:
+            with open(probe_file, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            return payload.get("windows", {})
+        except Exception:
+            return {}
+
+    def _persist_fixed_h_probe_edge(
+        self,
+        stage_name: str,
+        stage_type: str,
+        attempt: int,
+        fingerprint: str,
+        window_range: Tuple[int, int],
+        pairs_so_far: List[Dict],
+        complete: bool,
+    ) -> str:
+        """Write one window's fixed-H probe entry to disk immediately after
+        each edge finishes (called as the per-edge callback from
+        ``_probe_vdw_window_fixed_overlap``), keyed by the content fingerprint
+        computed in ``_fixed_h_probe_fingerprint`` so a later resume/round can
+        find and reuse it.
+
+        Each edge burns real GPU time (independent NVT burn-in + sampling);
+        previously all edges for a window only lived in a local list held by
+        the caller, so a crash on (say) the last edge of a multi-edge window
+        threw away every earlier edge's result too. Writing after every edge
+        means a crash never loses more than the one in-flight edge.
+        """
+        probe_file = self._fixed_h_probe_file(stage_name)
+        os.makedirs(os.path.dirname(probe_file), exist_ok=True)
+        payload = {"stage_name": stage_name, "stage_type": stage_type, "windows": {}}
+        if os.path.exists(probe_file):
+            try:
+                with open(probe_file, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+            except Exception:
+                pass
+        windows = payload.setdefault("windows", {})
+        entry = windows.setdefault(fingerprint, {
+            "window_range": [int(window_range[0]), int(window_range[1])],
+            "pairs": [],
+            "all_passed": None,
+            "complete": False,
+            "first_round": int(attempt) + 1,
+            "rounds_seen": [],
+        })
+        entry["window_range"] = [int(window_range[0]), int(window_range[1])]
+        entry["pairs"] = pairs_so_far
+        entry["complete"] = bool(complete)
+        if complete:
+            entry["all_passed"] = bool(pairs_so_far) and all(p.get("passed") for p in pairs_so_far)
+        if (int(attempt) + 1) not in entry["rounds_seen"]:
+            entry["rounds_seen"].append(int(attempt) + 1)
+        # 🔑 每条边都要落盘一次，中途被杀不能损坏整份 JSON——否则下一次加载
+        # 失败后又会以空 payload 覆写，丢掉其它窗口已经跑完的昂贵探针结果。
+        # 用临时文件+os.replace 保证要么是旧的完整版本，要么是新的完整版本。
+        _atomic_write_json(probe_file, payload)
+        return probe_file
+
+    def _invalidate_single_window_production(
+        self,
+        stage_name: str,
+        stage_type: str,
+        window_idx: int,
+        keep_ibs_state: bool = False,
+        keep_production_data: bool = False,
+    ) -> None:
+        """Force exactly one window (by its current on-disk index) to
+        resample, without touching any other window's cached production
+        files, renumbering anything, or going through the λ-content
+        reuse-mapping in ``_invalidate_stage_window_files`` (which is for
+        whole-path λ/window changes, not a single targeted resample).
+
+        Used by the fixed-H-all-pass / production-ESS-low sampling repair
+        path below, which only ever targets one already-identified window
+        index and must leave the rest of the stage's already-good production
+        data completely alone.
+
+        🔑 [reseed_resample 真续算修复] ``keep_production_data=True`` is for
+        the ``reseed_resample`` decision specifically: that branch's whole
+        premise is "the frozen f_k is confirmed correct (matches fixed-H
+        BAR/MBAR ΔF within noise), production ESS is just low because
+        sampling hasn't run long enough yet" -- the physical Hamiltonian and
+        sampling distribution have NOT changed, so the already-collected
+        ``energies``/``bias``/``base``/``convergence.json`` are still valid
+        data from the SAME distribution, not stale data from a different one.
+        Deleting them (the old behaviour, still the default here) meant every
+        "extend the step budget" repair actually threw away everything
+        already sampled and resampled an independent batch from scratch at
+        the new (larger) budget -- not a real extension, just a bigger
+        from-scratch resample every time. With ``keep_production_data=True``,
+        these files are left alone; ``run_all_windows``'s production-entry
+        checkpoint-continuation logic (see ``_build_production_window_checkpoint_manifest``/
+        ``_production_window_checkpoint_is_usable`` in ``ibs_engine.py``) then
+        detects the still-present files + a still-valid, content-matching
+        production checkpoint and genuinely continues the same trajectory
+        instead of resampling. ``recalibrate_f_k`` must keep the default
+        ``False`` -- there, the frozen f_k is being OVERWRITTEN because it was
+        found wrong, so any production data sampled under the old (wrong) f_k
+        really is from a different distribution and must be discarded; the
+        production checkpoint is invalidated alongside it for the same reason
+        (a checkpoint's saved state is a snapshot taken under the old f_k).
+        """
+        stage_dir = os.path.join(self.output_dir, stage_name)
+        if not keep_production_data:
+            for suffix in ("energies", "bias", "base"):
+                p = os.path.join(stage_dir, f"dual_window_{window_idx}_{stage_type}_{suffix}.npy")
+                if os.path.exists(p):
+                    os.remove(p)
+            conv_path = os.path.join(stage_dir, f"dual_window_{window_idx}_{stage_type}_convergence.json")
+            if os.path.exists(conv_path):
+                os.remove(conv_path)
+            _invalidate_production_window_checkpoint(self.checkpoint_dir, stage_type, window_idx)
+        if not keep_ibs_state:
+            ibs_path = os.path.join(self.checkpoint_dir, f"ibs_state_{stage_type}_window_{window_idx}.json")
+            if os.path.exists(ibs_path):
+                os.remove(ibs_path)
+
+    def _diagnose_and_repair_all_pass_low_ess_window(
+        self,
+        stage_name: str,
+        stage_type: str,
+        window_range: Tuple[int, int],
+        pairs: List[Dict],
+        effective_old_ranges: List[Tuple[int, int]],
+        f_k_edge_mismatch_floor_kJ_mol: float = 1.0,
+        f_k_edge_mismatch_sigma_multiplier: float = 2.0,
+    ) -> Dict:
+        """For one window whose fixed-H probe passed but production ESS is
+        still low, decide whether the SGD-learned production f_k is actually
+        wrong or the bias is fine and the problem is short sampling/slow
+        relaxation, then trigger the corresponding repair. "fixed-H all
+        passed" only means the λ grid has reached the minimum connectivity
+        bar (threshold 0.03) -- it is not evidence the production f_k (learned
+        under a different, possibly-still-oscillating SGD threshold of 0.05)
+        is actually correct, so this must not be silently treated as "stage
+        converged" while the final free energy still comes from low-ESS
+        production data.
+
+        Decision rule: compare PER-EDGE increments, not absolute (de-meaned)
+        state values -- ``diff(production_f_k)[i]`` (the increment the
+        production-frozen f_k implies for edge i) vs. that edge's own
+        ``delta_f_bias_kJ_mol`` from ``pairs`` (the WCA-preserving, no-LRC
+        bias-calibration sub-probe that ``_probe_vdw_window_fixed_overlap``
+        now runs on every edge whose path-overlap probe already passed --
+        NOT ``delta_f_kJ_mol``, which comes from the path-overlap probe
+        itself: WCA-less dynamics, LRC-inclusive energy, i.e. a different
+        ensemble/energy than what the production Group 1 bias CV's f_k
+        actually needs to reproduce. Using ``delta_f_kJ_mol`` here used to be
+        the same "wrong ensemble, wrong energy" bug the warmup-time
+        calibration probe had [see IBS_BIAS_PROTOCOL_VERSION=10] -- it just
+        surfaced during production-ESS repair instead of during warmup, and
+        directly overwrote production f_k with values derived from it).
+        Comparing diffs rather than absolute f_k makes the test invariant to
+        the arbitrary additive constant either vector is defined up to,
+        without needing to force a shared zero-point convention first. The
+        mismatch threshold is per-edge and noise-aware: ``max(
+        f_k_edge_mismatch_floor_kJ_mol, f_k_edge_mismatch_sigma_multiplier *
+        delta_f_bias_uncertainty_kJ_mol)`` -- a flat floor alone (e.g. 1.0
+        kJ/mol) is too tight when the probe itself is noisy (real fixed-H ΔF
+        uncertainties observed here run ~2-3 kJ/mol/edge), which would make
+        recalibration trigger on probe noise almost every time; scaling by
+        the probe's own reported uncertainty keeps the comparison honest
+        about how well the "independent ground truth" is actually known. Any
+        edge exceeding its own threshold is enough to call the warmup bias
+        unreliable.
+
+        Every edge in ``pairs`` must have ``bias_calibration_sufficient is
+        True`` (the calibration sub-probe met its decorrelated-sample-count
+        and ΔF-uncertainty gates, extending sampling up to 3 times first) --
+        if any edge is missing this or has it False/None, this function
+        refuses to compare or recalibrate at all
+        (``decision="skipped_insufficient_bias_calibration"``): with no
+        trustworthy independent ΔF for at least one edge, neither branch of
+        the decision (recalibrate vs. reseed) is safe to take automatically.
+
+        If any edge mismatches: overwrite the cached ibs_state with the
+        f_k implied by cumulating the probe's edge deltas (f_0=0, de-meaned
+        for reporting only -- the decision itself never depended on this
+        choice of zero-point), bias_converged=True, so the next repair round
+        skips learning and goes straight to frozen burn-in + read-only
+        validation on the better f_k, then invalidate only this window's
+        production files so it is the only one resampled
+        (``decision="recalibrate_f_k"``). If every edge agrees within its
+        threshold, the bias is judged fine and the likely cause is slow
+        relaxation/short sampling: keep the existing ibs_state as-is and
+        call ``_invalidate_single_window_production`` with
+        ``keep_production_data=True`` (``decision="reseed_resample"``).
+
+        🔑 [production checkpoint 续采 fix] This USED to be a true reseed, not
+        a longer run: the old code path deleted the existing production
+        files unconditionally and ``_run_dual_lambda_stage``'s window
+        ``Simulation``/``setVelocitiesToTemperature`` calls never pass an
+        explicit seed, so a from-scratch resample drew an independent batch
+        at the (possibly larger, via the caller's step-count growth factor)
+        target budget -- not an extension, a discard-and-redo every time.
+        That is fixed now: ``keep_production_data=True`` leaves
+        ``energies``/``bias``/``base``/``convergence.json`` and the
+        production-window OpenMM checkpoint in place (the physical
+        Hamiltonian/sampling distribution is unchanged here, unlike
+        ``recalibrate_f_k``), and ``run_all_windows``'s production-entry
+        checkpoint-continuation logic (see
+        ``_build_production_window_checkpoint_manifest``/
+        ``_production_window_checkpoint_is_usable`` in ``ibs_engine.py``)
+        detects the still-present, content-matching checkpoint and genuinely
+        continues the same trajectory from where it left off, appending new
+        samples instead of resampling independently from scratch.
+
+        Caller contract [starvation fix]: this MAY be called in the same
+        round as a split/insert, but only *after* ``_invalidate_stage_window_
+        files`` has fully completed its rename/purge pass for that round --
+        it depends on each window's ``convergence.json`` still existing at
+        the position it runs at, and this function's own repair branches
+        delete that same file, so running it first would get the just-
+        recalibrated window caught in that same purge (misread as "unmatched
+        leftover"). ``window_range``/``effective_old_ranges`` must be this
+        window's CURRENT (post-split/insert) position/range list, resolved
+        via ``_remap_window_by_lambda_content`` against its pre-round
+        position if the path changed this round -- not blindly the pre-round
+        tuple, which may no longer exist positionally. ``pairs`` (probe
+        results) stays keyed by the window's pre-round identity regardless
+        (probe results describe sampled lambda content, not a position).
+        This function never slices any lambda array by position -- only
+        ``effective_old_ranges.index(tuple(window_range))`` (to locate the
+        on-disk ``ibs_state_*.json``) and a size check against ``pairs`` --
+        so passing the post-remap range/ranges list here needs no other
+        change on the caller's part.
+
+        Never touches any window other than ``window_range``. Returns a dict
+        describing what was decided/done, for the caller to log/persist.
+        """
+        start, end = window_range
+        # 🔑 [IBS_BIAS_PROTOCOL_VERSION=10] fail closed：任何一条边的 bias 校准
+        # 子探针没跑（None，path-overlap 本身没过）或跑了但延长采样 3 次后仍
+        # 不够精确（False）都拒绝继续——两个分支（recalibrate_f_k/
+        # reseed_resample）都需要对每条边的独立 ΔF 有信心，其中任何一条边缺失
+        # 都会让下面的比较不完整、决策不可信。这不应该发生：本函数的调用点
+        # 只在 all(p["passed"] for p in probe_results[se]) 之后才调用，也就是
+        # 每条边的 path-overlap 都通过了，calibration 子探针理应都跑过；这里
+        # 仍显式校验，防止调用契约将来被违反时静默用错误字段。
+        insufficient = [
+            i for i, p in enumerate(pairs) if p.get("bias_calibration_sufficient") is not True
+        ]
+        if insufficient:
+            return {
+                "window_range": [int(start), int(end)],
+                "decision": "skipped_insufficient_bias_calibration",
+                "note": (
+                    f"边 {insufficient} 的 bias 校准子探针未达标（去相关样本数/ΔF"
+                    "不确定度门槛，延长采样 3 次后仍不够，或 path-overlap 本身未通过），"
+                    "拒绝用其 delta_f_bias_kJ_mol 做 f_k 比较/覆盖，跳过自动修复，需人工检查。"
+                ),
+            }
+        delta_f_edges = np.asarray([float(p["delta_f_bias_kJ_mol"]) for p in pairs], dtype=np.float64)
+        delta_f_sigmas = np.asarray([float(p["delta_f_bias_uncertainty_kJ_mol"]) for p in pairs], dtype=np.float64)
+        # 🔑 fail closed，不静默传播：ibs_engine.py::_compute_bidirectional_overlap_from_u_kn
+        # 已经对这个不确定度做了 isfinite/>=0 校验并 fail closed，这里是第二道防线
+        # （防止将来有其它 probe 实现路径绕过那处校验）。若放过 NaN/负值，下面
+        # edge_mismatch_thresholds = max(floor, sigma_multiplier * sigma) 会是 NaN，
+        # Python 的 `>` 比较对 NaN 恒为 False，会让任何真实差异都被误判为"在噪声
+        # 阈值内"、错误地把该 recalibrate_f_k 的窗口放行成 reseed_resample。
+        if not np.all(np.isfinite(delta_f_sigmas)) or np.any(delta_f_sigmas < 0.0):
+            return {
+                "window_range": [int(start), int(end)],
+                "decision": "skipped_invalid_probe_uncertainty",
+                "note": (
+                    f"fixed-H 校准探针返回的 delta_f_bias_uncertainty_kJ_mol 存在非有限或负值"
+                    f"（{delta_f_sigmas.tolist()}），拒绝用它做噪声感知阈值比较，跳过自动"
+                    "修复，需人工检查探针本身。"
+                ),
+            }
+        f_calibrated = np.concatenate(([0.0], np.cumsum(delta_f_edges)))
+        f_calibrated = f_calibrated - np.mean(f_calibrated)
+
+        base_info = {
+            "window_range": [int(start), int(end)],
+            "calibrated_f_k_kJ_mol": f_calibrated.tolist(),
+        }
+        try:
+            window_idx = effective_old_ranges.index(tuple(window_range))
+        except ValueError:
+            return {
+                **base_info,
+                "decision": "skipped_window_index_not_found",
+                "note": "窗口范围在当前 effective_old_ranges 里找不到匹配的 window_idx，无法定位 ibs_state 缓存。",
+            }
+
+        ibs_state_path = os.path.join(
+            self.checkpoint_dir, f"ibs_state_{stage_type}_window_{window_idx}.json"
+        )
+        cached_state = None
+        production_f_k = None
+        if os.path.exists(ibs_state_path):
+            try:
+                with open(ibs_state_path, "r", encoding="utf-8") as f:
+                    cached_state = json.load(f)
+                cached_f_k = cached_state.get("f_k")
+                if cached_state.get("bias_converged") and cached_f_k is not None and len(cached_f_k) == (end - start):
+                    production_f_k = np.asarray(cached_f_k, dtype=np.float64)
+            except Exception:
+                cached_state = None
+                production_f_k = None
+
+        if production_f_k is None:
+            return {
+                **base_info,
+                "window_idx": int(window_idx),
+                "decision": "skipped_missing_production_f_k",
+                "note": (
+                    f"无法从 {ibs_state_path} 读取该窗口生产冻结的 f_k"
+                    "（文件缺失/不是 bias_converged 状态/态数不匹配），无法比较，跳过自动修复，需人工检查。"
+                ),
+            }
+
+        production_edge_diffs = np.diff(production_f_k)
+        edge_abs_diffs = np.abs(production_edge_diffs - delta_f_edges)
+        edge_thresholds = np.maximum(
+            float(f_k_edge_mismatch_floor_kJ_mol),
+            float(f_k_edge_mismatch_sigma_multiplier) * delta_f_sigmas,
+        )
+        mismatched_edges = edge_abs_diffs > edge_thresholds
+        decision = "recalibrate_f_k" if bool(np.any(mismatched_edges)) else "reseed_resample"
+
+        if decision == "recalibrate_f_k":
+            new_state = dict(cached_state)
+            new_state["f_k"] = f_calibrated.tolist()
+            new_state["bias_converged"] = True
+            new_state["t"] = 0
+            with open(ibs_state_path, "w", encoding="utf-8") as f:
+                json.dump(new_state, f, indent=2)
+            # 🔑 f_k 真的被覆盖了——旧 production 数据是在错误 f_k 下采的，
+            # 不是同一个采样分布，必须丢弃（keep_production_data 默认 False）。
+            self._invalidate_single_window_production(stage_name, stage_type, window_idx, keep_ibs_state=True)
+        else:
+            # 🔑 [reseed_resample 真续算修复] f_k 已确认没问题（跟 fixed-H
+            # BAR/MBAR ΔF 在噪声阈值内一致），production ESS 低只是采样还不够
+            # 长——物理 Hamiltonian/采样分布完全没变，不能再像以前一样把已经
+            # 采到的样本整批扔掉重采。保留 energies/bias/base/convergence.json
+            # 和生产 checkpoint，run_all_windows 的续算检测会用它们真正接着跑，
+            # 而不是从头开始独立重采一批。
+            self._invalidate_single_window_production(
+                stage_name, stage_type, window_idx, keep_ibs_state=True, keep_production_data=True,
+            )
+
+        payload = {
+            **base_info,
+            "window_idx": int(window_idx),
+            "decision": decision,
+            "production_f_k_kJ_mol": production_f_k.tolist(),
+            "production_edge_diffs_kJ_mol": production_edge_diffs.tolist(),
+            "probe_delta_f_bias_edges_kJ_mol": delta_f_edges.tolist(),
+            "probe_delta_f_bias_sigmas_kJ_mol": delta_f_sigmas.tolist(),
+            "edge_abs_diffs_kJ_mol": edge_abs_diffs.tolist(),
+            "edge_mismatch_thresholds_kJ_mol": edge_thresholds.tolist(),
+            "mismatched_edges": mismatched_edges.tolist(),
+            "max_abs_edge_diff_kJ_mol": float(np.max(edge_abs_diffs)),
+            "f_k_edge_mismatch_floor_kJ_mol": float(f_k_edge_mismatch_floor_kJ_mol),
+            "f_k_edge_mismatch_sigma_multiplier": float(f_k_edge_mismatch_sigma_multiplier),
+        }
+
+    def _persist_sampling_repair_actions(
+        self, stage_name: str, attempt: int, actions: List[Dict],
+    ) -> str:
+        """Append this round's fixed-H-all-pass/low-ESS diagnosis+repair
+        decisions to disk (recalibrate_f_k / reseed_resample / skipped_*, with
+        the per-edge diffs/thresholds and calibrated vs. production f_k
+        values that drove the decision), alongside the raw probe results, so
+        the reasoning behind each repair is auditable without re-deriving it
+        from ibs_state snapshots later.
+        """
+        repair_file = os.path.join(self.output_dir, stage_name, "sampling_repair_decisions.json")
+        os.makedirs(os.path.dirname(repair_file), exist_ok=True)
+        payload = {"stage_name": stage_name, "rounds": []}
+        if os.path.exists(repair_file):
+            try:
+                with open(repair_file, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+            except Exception:
+                pass
+        payload.setdefault("rounds", []).append({"round": int(attempt) + 1, "actions": actions})
+        # 🔑 同上（见 _persist_fixed_h_probe_edge）：原子写，避免写入中途被杀
+        # 损坏整份 JSON、下一次加载失败后又以空 payload 覆写掉之前几轮的记录。
+        _atomic_write_json(repair_file, payload)
+        return repair_file
+
+    def _probe_vdw_window_fixed_overlap(
+        self,
+        window_range: Tuple[int, int],
+        lambdas_vdw_full: List[float],
+        potential_type: str,
+        dexp_params,
+        boresch_params,
+        threshold: float = 0.03,
+        on_edge_done=None,
+        resume_pairs: Optional[List[Dict]] = None,
+    ) -> List[Dict]:
+        """Measure real fixed-Hamiltonian bidirectional overlap on every adjacent
+        pair of an already-completed vdw window, for production-time ESS
+        auto-repair (mirrors the warmup-time probe in ibs_engine.py's
+        ``run_all_windows``, which cannot be reused directly here because by the
+        time production ESS diagnostics exist, that window's live Simulation is
+        long gone -- ``run_all_windows`` explicitly deletes it, ibs_engine.py
+        ~3944-3951).
+
+        Two-phase edge processing (see inline comments below for the full
+        rationale): phase 1 runs every edge's cheap path-overlap probe first,
+        with NO calibration attempted yet; only if *every* edge in the window
+        passes path-overlap does phase 2 run the expensive bias-calibration
+        probe per edge. Any single failing edge means the window is very
+        likely about to be split/have a lambda inserted, so calibration on
+        the edges that did pass would be wasted GPU time -- skip it entirely
+        for the whole window rather than partially calibrating.
+
+        ``on_edge_done``, if given, is called with each edge's result dict as
+        soon as that edge's *current phase* result is ready (path result in
+        phase 1, then again with the final calibration result in phase 2 if
+        the window proceeds to phase 2) -- so it may be called twice for the
+        same edge (identified by its ``global_edge`` field), once per phase.
+        The caller must upsert by ``global_edge`` (replace an existing entry
+        with the same ``global_edge``, not blindly append) to avoid
+        duplicating that edge in its accumulated list -- see
+        ``_run_stage_with_overlap_autorepair``'s ``_on_edge_done`` closure.
+        Persisting after every phase-1 edge means a crash partway through the
+        (cheap) path-probe loop only loses the one in-flight edge, not
+        anything computed so far; a crash during phase 2 similarly only
+        loses the one in-flight edge's calibration attempt, with every
+        edge's phase-1 path result already safely on disk.
+
+        ``resume_pairs``, if given, seeds the result with edges already
+        computed in an earlier (possibly interrupted) call for this exact
+        window content -- every edge is independent (all start from the same
+        ``relaxed_positions``/``relaxed_box`` computed once below, regardless
+        of edge order), so skipping already-cached leading edges and only
+        computing the remaining ones is exactly equivalent to computing all
+        of them in one pass. Without this, a crash after edge 5 of 9 would
+        recompute all 9 edges from scratch on the next attempt even though
+        the caller's fingerprint-keyed cache still has edges 0-4 on disk.
+        Resumed pairs whose ``bias_calibration_sufficient`` is still ``None``
+        (phase 1 only, from an interrupted earlier call, or because that
+        earlier call's window failed path-overlap) are re-examined by phase 2
+        exactly like freshly-computed phase-1 pairs -- if the window later
+        turns out all-passed, they get calibrated; if not, they stay ``None``.
+
+        No per-window final configuration is ever persisted to disk -- every
+        window, including the original production run, starts from the same
+        stage-wide ``self.positions``/``self.box_vectors`` and relaxes
+        internally (confirmed: the resume path rebuilds from the same stage-wide
+        input too, never from a saved per-window frame). So this rebuilds the
+        window via the identical ``IBSWindowManagerDualLambda`` construction
+        ``_run_dual_lambda_stage`` uses for the vdw stage (same kwargs, same
+        ``alchemical_params``/``potential_type``/``restraint_params``), which
+        guarantees the same Hamiltonian rather than an accidentally-different
+        one, then does its own short minimization before handing frames to
+        ``probe_bidirectional_overlap``.
+        """
+        start, end = window_range
+        lc_win = [0.0] * (end - start)
+        lv_win = list(lambdas_vdw_full[start:end])
+        alchemical_params = _resolve_alchemical_params(
+            potential_type, dexp_params, self.ligand_indices
+        )
+        stage_output_dir = os.path.join(self.output_dir, "vanishing")
+        manager = IBSWindowManagerDualLambda(
+            system_template=self.system,
+            topology=self.topology,
+            perturbed_atom_indices=self.ligand_indices,
+            lambdas_coul=[0.0] * len(lambdas_vdw_full),
+            lambdas_vdw=list(lambdas_vdw_full),
+            temperature=self.temperature,
+            window_ranges=[window_range],
+            alchemical_params=alchemical_params,
+            potential_type=potential_type,
+            restraint_params=boresch_params,
+            prefix="abfe_dual",
+            platform_name=self.platform_name,
+            output_dir=stage_output_dir,
+            checkpoint_dir=self.checkpoint_dir,
+        )
+        resolved_box = _resolve_periodic_box_vectors(
+            self.box_vectors, topology=self.topology, system=self.system
+        )
+        win_sys, ibs_wrap = manager._build_window_system(
+            lc_win, lv_win, resolved_box, self.positions
+        )
+
+        resolved_platform, props = _build_platform_properties(self.platform_name)
+        platform = openmm.Platform.getPlatformByName(resolved_platform)
+        integrator = openmm.LangevinMiddleIntegrator(
+            self.temperature, 1.0 / unit.picosecond, 0.001 * unit.picoseconds
+        )
+        relax_sim = app.Simulation(self.topology, win_sys, integrator, platform, props)
+        relax_sim.context.setPeriodicBoxVectors(*resolved_box)
+        relax_sim.context.setPositions(self.positions)
+        # 🔑 [live crash fix] lambda_shield 必须在最小化*之前*就同步成这个窗口
+        # 校准探针实际会用的 mean(lv_win)——否则 Group 4 WCA 力的
+        # addGlobalParameter 默认值 0.0 会让最小化在"防护壳完全关闭"的势能面上
+        # 进行，允许溶剂原子逼近到防护壳生效距离以内；随后
+        # probe_bidirectional_overlap_for_bias_calibration 用同一份
+        # relaxed_positions 但把 lambda_shield 显式设成 mean(lv_win)（非零），
+        # 防护壳在动力学开始的第一步就从 0 跳到全强度，对着一个从未在该力下
+        # 弛豫过的构型——真实运行中在窗口 (5,9) 边 [7,8] 上正是这样炸成
+        # "Particle coordinate is NaN"。run_all_windows 里对应的活体 warmup
+        # 路径（ibs_engine.py ~4918-4921）在最小化前就做了这个同步，这里必须
+        # 保持一致。
+        lam_vdw_shield_for_calibration = float(np.mean(lv_win))
+        if _system_has_global_parameter(win_sys, "lambda_shield"):
+            relax_sim.context.setParameter("lambda_shield", lam_vdw_shield_for_calibration)
+        # The stage-wide starting configuration was equilibrated under the fully
+        # interacting force field, not this window's (possibly heavily
+        # decoupled) lambda -- unlike the warmup-time probe, which reuses an
+        # already-relaxed live configuration, this one must minimize first or
+        # the fixed-H burn-in below can start from a clashing configuration.
+        relax_sim.minimizeEnergy(maxIterations=2000)
+        relaxed_state = relax_sim.context.getState(getPositions=True)
+        relaxed_positions = relaxed_state.getPositions()
+        relaxed_box = relaxed_state.getPeriodicBoxVectors()
+        del relax_sim, integrator
+
+        n_edges = len(lv_win) - 1
+        # Truncate defensively if a corrupted/stale cache entry somehow has
+        # more entries than this window actually has edges.
+        pairs = list(resume_pairs)[:n_edges] if resume_pairs else []
+        resume_count = len(pairs)
+
+        # =====================================================================
+        # 阶段一：先把这个窗口全部 path edge 的双向 overlap 探针跑完（不碰任何
+        # bias calibration）。理由：只要窗口里*任意*一条边 path-overlap 没过，
+        # 这个窗口大概率马上要被拆分/插 λ，此时花在其它已经通过的边上的
+        # 校准探针（burn-in + 最多 3 次翻倍重试的采样，比 path-overlap 贵得多）
+        # 就白烧了——先把全部边的 path 结果收集齐，既给下游拆窗/插 λ 的诊断
+        # 提供完整信息，又避免在窗口即将改变形状时提前投入昂贵的校准算力。
+        # 每条边算完仍然立刻通过 on_edge_done 落盘（crash 只丢这一条 path
+        # 探针，不丢calibration，因为 calibration 这一阶段还没开始）。
+        # =====================================================================
+        for local_i in range(resume_count, n_edges):
+            pair = probe_bidirectional_overlap(
+                topology=self.topology,
+                common_system_xml=ibs_wrap._common_system_xml,
+                ibs_wrapper=ibs_wrap,
+                state_i=local_i,
+                state_j=local_i + 1,
+                positions=relaxed_positions,
+                box_vectors=relaxed_box,
+                temperature=self.temperature,
+                platform_name=self.platform_name,
+                threshold=threshold,
+            )
+            pair["global_edge"] = [int(start + local_i), int(start + local_i + 1)]
+            # 占位：这一阶段还不知道窗口是否会进入 calibration，先标 None
+            # （跟"path 本身没过、calibration 无意义"用的是同一个值，但含义
+            # 不同——None 在这里只表示"calibration 阶段尚未处理"，阶段二
+            # 会按需要改写成 True/False，或者在 all_passed=False 时保持
+            # None 作为最终值）。
+            pair["bias_calibration_sufficient"] = None
+            pairs.append(pair)
+            if on_edge_done is not None:
+                on_edge_done(pair)
+
+        # 🔑 只有全部 path edge 都通过，才进入阶段二的 bias calibration；任意
+        # 一条边失败，立刻返回，完全跳过整个窗口的 calibration。
+        all_path_edges_passed = bool(pairs) and all(p.get("passed") for p in pairs)
+        if not all_path_edges_passed:
+            return pairs
+
+        # =====================================================================
+        # 阶段二：全部 path edge 都通过后，才对每条边做 bias calibration。
+        # 跳过已经有真实校准结果（True/False，来自更早一轮已完整跑过 calibration
+        # 的缓存）的边，只对仍是 None 占位的边补算——这样 resume 时不会重复烧
+        # 已经算好的 calibration。
+        # =====================================================================
+        for local_i in range(n_edges):
+            pair = pairs[local_i]
+            if pair.get("bias_calibration_sufficient") is not None:
+                continue
+            # 🔑 [IBS_BIAS_PROTOCOL_VERSION=10] pair["delta_f_kJ_mol"] 上面来自
+            # probe_bidirectional_overlap：WCA-less 动力学 + LRC-inclusive 能量——
+            # 这正是校准 f_k 时用错的 ensemble/能量定义（见该函数与
+            # probe_bidirectional_overlap_for_bias_calibration 的 docstring）。
+            # _diagnose_and_repair_all_pass_low_ess_window 会用这个窗口每条边
+            # 的探针 ΔF 去判断是否要覆盖生产冻结的 f_k，这跟 warmup 阶段校准
+            # f_k 是同一件事、同一个正确性要求，必须用同一个 WCA-preserving、
+            # 不含 LRC 的校准探针，不能继续用 path-overlap 探针的 delta_f_kJ_mol。
+            # 不达标（去相关样本数/ΔF 不确定度）就延长采样重试，最多 3 次
+            # （每次采样步数翻倍），仍不达标就把 bias_calibration_sufficient
+            # 标为 False，交给调用方决定如何处理，绝不用不够精确的估计去
+            # 覆盖 f_k。
+            calib_pair = None
+            attempt_sample_steps = 20000
+            for _extend_attempt in range(3):
+                calib_pair = probe_bidirectional_overlap_for_bias_calibration(
+                    topology=self.topology,
+                    common_plus_wca_system_xml=ibs_wrap._common_plus_wca_system_xml,
+                    ibs_wrapper=ibs_wrap,
+                    state_i=local_i,
+                    state_j=local_i + 1,
+                    positions=relaxed_positions,
+                    box_vectors=relaxed_box,
+                    temperature=self.temperature,
+                    platform_name=self.platform_name,
+                    lambda_shield=lam_vdw_shield_for_calibration,
+                    sample_steps=attempt_sample_steps,
+                )
+                if calib_pair is not None:
+                    break
+                attempt_sample_steps *= 2
+            if calib_pair is not None:
+                pair["delta_f_bias_kJ_mol"] = calib_pair["delta_f_bias_kJ_mol"]
+                pair["delta_f_bias_uncertainty_kJ_mol"] = calib_pair["delta_f_bias_uncertainty_kJ_mol"]
+                pair["bias_calibration_sufficient"] = True
+                pair["bias_calibration_lambda_shield"] = lam_vdw_shield_for_calibration
+                pair["bias_calibration_n_k_decorrelated"] = calib_pair.get("n_k_decorrelated")
+            else:
+                pair["bias_calibration_sufficient"] = False
+                pair["bias_calibration_lambda_shield"] = lam_vdw_shield_for_calibration
+            if on_edge_done is not None:
+                on_edge_done(pair)
+        return pairs
+
+    def _run_stage_with_overlap_autorepair(
+        self,
+        stage_label: str,
+        stage_name: str,
+        preopt_file: str,
+        n_states: int,
+        lambdas_var: List[float],
+        window_ranges: Optional[List[Tuple[int, int]]],
+        run_once,
+        protocol_key: Optional[Dict] = None,
+        max_repair_rounds: int = 5,
+        probe_window_overlap_fn=None,
+        n_steps_per_window: Optional[int] = None,
+        preopt_protocol_key: Optional[Dict] = None,
+    ) -> Tuple[Dict, int, List[float], Optional[List[Tuple[int, int]]]]:
+        """运行一个双 lambda 阶段；如果失败原因是 ESS 重叠不足，就用这次采样
+        自己算出的 window_overlap_diagnostics（而不是任何手填的数字）自动在
+        重叠最差的 λ 区间插点、重新划分窗口、清掉旧窗口产物，然后重新采样，
+        最多重复 max_repair_rounds 轮。
+
+        probe_window_overlap_fn: Optional[Callable[[Tuple[int,int], List[float], Optional[Callable]], List[Dict]]]。
+        只有 vdw（"vanishing"）阶段的调用方会传入这个闭包（见 run_full_pipeline
+        里的 _probe_stage2_window_overlap，它闭包住了跟 run_once 完全相同的
+        potential_type/dexp_params/boresch_params，保证探针重建的是同一个
+        Hamiltonian）。第二个参数是调用时刻的 current_lambdas（每轮修复都可能
+        变，必须显式传，不能让闭包捕获修复循环开始前的旧值）。第三个可选参数
+        是逐边完成回调（on_edge_done），本方法用它在每条边算完后立即落盘，不
+        依赖窗口整体算完才持久化。传入后，
+        production ESS 低的分支改用「先拆窗、最小窗口才做 fixed-H 双向 overlap
+        探针、探针证实真有缺口才插 λ」，跟 warmup 失败分支统一；不传（目前是
+        coul/"decharging" 阶段）则维持 refine_stage_lambda_path_by_overlap 的旧
+        行为，因为 fixed-H 探针依赖的 ibs_wrap._common_system_xml 目前只有 vdw
+        builder 会构造。
+
+        max_repair_rounds 是有限的，不是"重试到天荒地老"：如果 5 轮加密过后
+        重叠依然不达标，说明问题很可能不是 λ 密度不够（比如 IBS 偏置本身没
+        收敛、构象弛豫太慢、restraint 有问题），继续无限加密只会无意义地烧
+        GPU 时间，此时应该交回人工检查，而不是让流水线在一个真实的采样问题
+        上假装"自动修复"、无限重跑。
+
+        run_once(n_states, lambdas_var, window_ranges, production_step_overrides=None,
+        frozen_validation_step_overrides=None, frozen_validation_is_final_rung=None)
+        -> stage_result dict，由调用方决定具体怎么跑（串行直接调用
+        _run_dual_lambda_stage，并行则走子进程 worker），本方法只负责判断失败
+        原因、生成新方案、清理产物、更新 preopt 缓存并重试。第四、五、六个参数
+        只有 vdw/"vanishing" 阶段会用到（分别对应生产 ESS 的 reseed_resample
+        分支、warmup 阶段 MBAR 校准后冻结验证的 calibration_pending_validation
+        分支 [IBS_BIAS_PROTOCOL_VERSION=12]、该分支的阶梯终态标记），decharging
+        的 run_once 接受但忽略它们。
+
+        返回最终通过（或耗尽重试后抛出异常前）的
+        (stage_result, n_states, lambdas_var, window_ranges)，调用方应当用
+        返回的 n_states/lambdas_var/window_ranges（而不是调用前的原值）去写
+        stage 结果缓存，因为它们可能已经被自动修复改写过。
+
+        n_steps_per_window: 本阶段每窗口默认生产步数，只用作 reseed_resample
+        判定"该延长多少步"的基准（乘上增长倍数后写入下一轮的
+        production_step_overrides）；不传时 reseed_resample 只能退化为按默认
+        步数重采一次（不真正延长），并会打印一条说明。
+
+        preopt_protocol_key: [预优化缓存范围收窄] 落盘到 preopt_file 里
+        "protocol_key" 字段用的指纹——必须是 `_preopt_protocol_key()` 算出的窄
+        指纹，不能是这里的 `protocol_key` 参数本身（那是宽指纹，服务
+        `_fixed_h_probe_fingerprint` 这个探针结果缓存，两者用途不同：探针结果
+        依赖实际探针构建代码，理应在代码变了之后失效；但 preopt_file 存的是
+        λ 路径/窗口边界这份纯数据，不应该因为修了窗口修复循环/reseed_resample
+        续采这类无关代码就连带失效）。不传时退化为跟 protocol_key 相同（向后
+        兼容旧调用方），但两个真正的调用点（stage1/stage2）都应显式传入窄
+        指纹。
+        """
+        if preopt_protocol_key is None:
+            preopt_protocol_key = protocol_key
+        stage_type = "vdw" if stage_name == "vanishing" else "coul"
+        current_n_states = n_states
+        current_lambdas = list(lambdas_var)
+        current_ranges = window_ranges
+
+        # ════════════════════════════════════════════════════════════════
+        # [deprecated_non_mutating_policy]  IBS non-mutating stage policy.
+        #
+        # IBS recovers each state's ΔG by reweighting ONE frozen integrated
+        # mixture → each target state; adjacent-state fixed-H overlap is NOT a
+        # correctness criterion for it. The stage therefore runs ONCE:
+        #   • f_k convergence (the frozen OCCUPATION gate) is validated inside
+        #     run_once (ibs_engine.run_all_windows, repair_policy="non_mutating_v1");
+        #     if it fails it raises IBSWarmupConvergenceError → surfaced for
+        #     human / rescue-audit review (nothing mutated).
+        #   • _assert_stage_result_sane then applies ONLY the legitimate hard
+        #     gates on the frozen production: single-reference importance-ESS
+        #     ratio (result["min_overlap"] == compute_effective_sample_number
+        #     ratio from GlobalMBARAnalyzer, NOT fixed-H overlap), absolute ESS,
+        #     decorrelated samples, endpoint uncertainty.
+        # On any hard-gate failure all data is preserved, the stage is NOT
+        # marked completed, and the failure is surfaced — λ / f_k / ensemble
+        # fingerprint are never touched.
+        #
+        # ALL ensemble-MUTATING auto-repair below (split window, insert
+        # sampling λ, tail renumber, invalidate/remap production,
+        # recalibrate_f_k, auto-extend/re-run) is DISABLED: the entire
+        # `while True` loop that follows is now UNREACHABLE. It is kept verbatim
+        # for review and will be excised in a separate change after code review
+        # + one maintainer-run GPU verification. Adjacent fixed-H overlap and
+        # the asymmetric-overlap / ΔF-slope arbiter live only inside that dead
+        # loop (and inside run_all_windows' now-gated branch), so they are
+        # hereby demoted to unused diagnostics.
+        # Plan: a-relative-binding-free-energy-framewor-immutable-starlight.md
+        # ════════════════════════════════════════════════════════════════
+        result = run_once(current_n_states, current_lambdas, current_ranges)
+        self._assert_stage_result_sane(stage_label, result)
+        return result, current_n_states, current_lambdas, current_ranges
+
+
+        # 🔑 [E-03 / ATT-27] 上面那个 `return` 之后原本还有 881 行
+        # ensemble 变异自动修复逻辑（拆窗 / 插 λ / tail renumber /
+        # invalidate-remap production / recalibrate_f_k / auto-extend），
+        # 全部不可达。2026-07-27 已移除，逐字归档在
+        #   docs/archive/removed_overlap_autorepair_mutation_loop.md
+        # 不要搬回来：把相邻态 fixed-H overlap 当成 IBS 收敛仲裁是设计错误，
+        # 那套循环曾烧掉约一周 GPU 而没产出任何 ΔG。守护见
+        # test_att27_dead_code_removed.py。
+
+    def _stage_protocol_key(
+        self,
+        stage_name: str,
+        potential_type: str,
+        boresch_params: Optional[Dict],
+        decharge_method: str = "pme",
+        n_states: Optional[int] = None,
+        dexp_params: Optional[Dict] = None,
+        final_gate_thresholds: Optional[Dict] = None,
+    ) -> Dict:
+        """
+        双λ阶段结果缓存的"协议指纹"。
+
+        之前 stage1/stage2 的 resume 判定只比较 n_states，同一个 output 目录里
+        换了 decharge_method（比如从默认 pme 切到实验性 shadow_ibs）、potential_type
+        或 Boresch 开关之后再 --resume，n_states 不变的话会直接复用旧协议算出来的
+        stage 结果，而不会报错或重算——这是一个真实的静默串协议 bug，不是假设的
+        边界情况。这里把决定"这个 stage 结果是用什么协议算出来的"的关键字段收敛
+        成一个可比较的 dict，连同 n_states 一起写进 stage 缓存文件，resume 时逐字
+        段比较，任何一项不一致都视为缓存失效、强制重新采样。
+        """
+        run_config = dict(getattr(self, "_last_run_config", {}) or {})
+        run_config.pop("resume", None)
+        run_config.pop("run_equilibration", None)
+        return _protocol_fingerprint({
+            "kind": "dual_lambda_stage",
+            "stage_name": stage_name,
+            "potential_type": str(potential_type),
+            "dexp_params": dexp_params,
+            "boresch_params": boresch_params,
+            "decharge_method": str(decharge_method) if stage_name == "decharging" else "n/a",
+            "requested_n_states": None if n_states is None else int(n_states),
+            "run_config": run_config,
+            "temperature_K": self.temperature.value_in_unit(unit.kelvin),
+            "pressure_bar": self.pressure.value_in_unit(unit.bar),
+            "ligand_indices": [int(i) for i in self.ligand_indices],
+            "system_xml_sha256": _system_xml_hash(self.system),
+            "topology_sha256": _topology_hash(self.topology),
+            "coordinates_nm_sha256": _positions_hash(self.positions),
+            "code_sha256": _code_hash(),
+            "aces_softcore_params": ACESoftcorePotential.optimize_alpha(
+                len(self.ligand_indices)
+            ),
+            # 🔑 stage1/stage2 的"completed"缓存是聚合过的最终 ΔG/误差，命中时完全
+            # 不会碰每窗口的 base/bias 文件，也就绕过了 run_all_windows 里的
+            # wca_accounting_version 校验。必须把这个版本号也编进协议指纹，否则
+            # WCA base/bias 记账口径变了之后，旧的"completed"缓存还会被当成有效
+            # 结果直接复用，静默沿用旧口径算出来的 ΔG。
+            "wca_accounting_version": WCA_ACCOUNTING_VERSION,
+            # 🔑 同理：IBS 偏置预热/冻结协议（是否满足严格收敛判据才放行进生产、
+            # 生产阶段是否冻结 f_k）变了之后，旧协议下产出的 stage 结果同样不能
+            # 被当成有效缓存直接复用。
+            "ibs_bias_protocol_version": IBS_BIAS_PROTOCOL_VERSION,
+            # 🔑 [non_mutating_v1] 采样修复策略必须进入协议指纹：旧的变异策略
+            # （fixed-H 探针 + 就地重校准 f_k + 拆窗/插 λ）产出的 stage 结果，其
+            # f_k/λ 网格来源与非变异策略不同一个参考系，绝不能被非变异策略的
+            # run 静默复用；也防止旧策略下写好的 "completed" 缓存在进入非变异
+            # early-return 之前就把 stage 跳过。
+            "sampling_repair_policy": "non_mutating_v1",
+            "thermodynamic_path_protocol_version": (
+                THERMODYNAMIC_PATH_PROTOCOL_VERSION
+                if stage_name == "vanishing"
+                else "n/a"
+            ),
+            # 🔑 [P1 修复] 最终收敛门（GlobalMBARAnalyzer.solve_stage_integrated
+            # 的 final_min_ess_ratio/final_min_absolute_ess/
+            # final_min_decorrelated_samples/final_max_uncertainty_kJ_mol）的
+            # 实际生效阈值必须编进协议指纹——这些是决定"这个 stage 结果算不算
+            # 收敛"的关键参数，改了阈值（无论是用户显式传参还是代码默认值本身
+            # 变化）而不让旧的"completed"缓存失效，等于允许一个用旧的、更宽松
+            # 门槛判定过关的结果继续被当成通过了新门槛。传入调用方实际解析出的
+            # 阈值字典（而不是只看用户是否显式传参），这样即使只是代码默认值本身
+            # 变了，缓存也会正确失效。
+            "final_gate_thresholds": final_gate_thresholds,
+        })
+
+    def _preopt_protocol_key(
+        self,
+        stage_name: str,
+        potential_type: str,
+        boresch_params: Optional[Dict],
+        decharge_method: str = "pme",
+        dexp_params: Optional[Dict] = None,
+    ) -> Dict:
+        """λ 路径预优化（optimize_stage1_decharging/optimize_stage2_vanishing）
+        专用的、范围更窄的协议指纹——只保留真正影响"这次预优化测到的 dU/dλ
+        路径还有效吗"的字段，故意不包含 `_stage_protocol_key` 里那些只跟
+        *实际生产采样*相关、预优化根本不会碰到的字段：
+          - `wca_accounting_version`：管 base/bias 力组切分记账口径，预优化
+            没有这个概念（探针系统只有一个 group1 力 + 有限差分，没有
+            base/bias 拆分）。
+          - `ibs_bias_protocol_version`：管 IBS SGD 学习/冻结验证协议，预优化
+            完全不涉及 IBS bias/f_k。
+          - `final_gate_thresholds`：管最终聚合 ΔG 是否通过收敛门，是 stage
+            完成之后才有意义的判据，预优化阶段还没有任何 ΔG 可言。
+          - 完整版 `code_sha256`（四文件合并哈希）：换成范围更窄的
+            `_preopt_code_hash()`（只哈希 abfe_preoptimizer.py + abfe_core.py），
+            这样修 ibs_engine.py/abfe_pipeline.py 里跟预优化无关的 bug
+            （窗口修复循环、production checkpoint 续采等）不会连带让这份
+            要跑好几个小时的预优化缓存失效——这正是收窄这份指纹的直接原因。
+        `thermodynamic_path_protocol_version` 仍然保留：它是预优化算法本身
+        的版本号，理应让这份指纹随之变化。
+        """
+        run_config = dict(getattr(self, "_last_run_config", {}) or {})
+        run_config.pop("resume", None)
+        run_config.pop("run_equilibration", None)
+        return _protocol_fingerprint({
+            "kind": "dual_lambda_preopt",
+            "stage_name": stage_name,
+            "potential_type": str(potential_type),
+            "dexp_params": dexp_params,
+            "boresch_params": boresch_params,
+            "decharge_method": str(decharge_method) if stage_name == "decharging" else "n/a",
+            "run_config": run_config,
+            "temperature_K": self.temperature.value_in_unit(unit.kelvin),
+            "pressure_bar": self.pressure.value_in_unit(unit.bar),
+            "ligand_indices": [int(i) for i in self.ligand_indices],
+            "system_xml_sha256": _system_xml_hash(self.system),
+            "topology_sha256": _topology_hash(self.topology),
+            "coordinates_nm_sha256": _positions_hash(self.positions),
+            "preopt_code_sha256": _preopt_code_hash(),
+            "aces_softcore_params": ACESoftcorePotential.optimize_alpha(
+                len(self.ligand_indices)
+            ),
+            "thermodynamic_path_protocol_version": (
+                THERMODYNAMIC_PATH_PROTOCOL_VERSION
+                if stage_name == "vanishing"
+                else "n/a"
+            ),
+        })
+
+    @staticmethod
+    def _preopt_cache_matches_ignoring_code_hash(
+        cached_protocol: Optional[Dict], fresh_preopt_key: Dict
+    ) -> bool:
+        """[预优化缓存 schema 迁移兼容] 判断磁盘上缓存的 protocol_key——无论是
+        `_preopt_protocol_key` 上线之前的旧宽指纹（`_stage_protocol_key`，含
+        `code_sha256`/`wca_accounting_version`/`ibs_bias_protocol_version`/
+        `final_gate_thresholds`）还是现在的新窄指纹——除了这几个字段本身之外，
+        物理相关的其余字段是否跟当前这次运行完全一致。
+
+        目的：旧缓存文件的 protocol_key 是按宽指纹写的，跟新窄指纹连顶层键
+        集合都不一样，永远不可能逐字节相等——直接比较会把"物理输入完全没变、
+        只是指纹 schema 换了"误判成"协议不一致"，逼着重新跑一遍代价高达数
+        小时的 λ 路径预优化。只要除了那几个刻意跟预优化物理内容无关的字段
+        之外，其余每一项都完全一致，就认为这份旧缓存仍然可信；调用方应据此
+        直接复用 lambdas_var/window_ranges，并把 protocol_key 原地重新盖成
+        新窄指纹（自愈式迁移一次即可，之后的 resume 都是正常的窄指纹比较）。
+
+        任何一步比较失败（缺字段、类型不对、payload 结构变了）都保守地返回
+        False，交由调用方按"协议不一致"的原有逻辑处理——这个函数只放行
+        "确认物理输入没变"的情况，不放行"看起来大概没变"。
+        """
+        if not isinstance(cached_protocol, dict) or not isinstance(fresh_preopt_key, dict):
+            return False
+        cached_payload = cached_protocol.get("payload")
+        fresh_payload = fresh_preopt_key.get("payload")
+        if not isinstance(cached_payload, dict) or not isinstance(fresh_payload, dict):
+            return False
+        legacy_only_fields = ("code_sha256", "wca_accounting_version", "ibs_bias_protocol_version")
+        if not all(field in cached_payload for field in legacy_only_fields):
+            return False
+        code_identity_fields = {"kind", "preopt_code_sha256"}
+        for key, fresh_value in fresh_payload.items():
+            if key in code_identity_fields:
+                continue
+            if key not in cached_payload or cached_payload[key] != fresh_value:
+                return False
+        return True
+
+    @staticmethod
+    def _lambda_path_fingerprint(lambdas_var, window_ranges) -> Dict:
+        lambda_values = [] if lambdas_var is None else list(lambdas_var)
+        ranges = [] if window_ranges is None else list(window_ranges)
+        return _protocol_fingerprint({
+            "lambdas_var": _lambda_signature(lambda_values),
+            "window_ranges": [list(map(int, r)) for r in ranges],
+        })
+
+    @staticmethod
+    def _build_stage_cache_payload(
+        stage_name: str,
+        result: Dict,
+        n_states: int,
+        protocol_key: Dict,
+        lambdas_var,
+        window_ranges,
+    ) -> Dict:
+        """
+        构造 stage1/stage2 缓存文件的完整落盘内容。
+
+        之前这里只存 stage/total_delta_G/total_error/n_states 四个字段，resume
+        命中时 method/diagnostics/lambda_endpoint_diagnostics 全部丢失，导致
+        compute_final_results 里的 stage_diagnostics 在 resumed run 上被静默
+        清空（overlap 诊断、PME self-correction 诊断、Shadow-IBS 的 experimental
+        标记等全部看不到）。这里把 _run_dual_lambda_stage 返回的完整结果落盘，
+        resume 命中时可以原样当作 stage1/stage2 使用，不用再退化成一个裸数字。
+
+        🔑 [P1-15] 顶层的 `converged` / `coverage_diagnostics` 也一并落盘。
+        它们此前只在内存里存在，归档结果无法复核"为什么放行"。
+
+        ⚠️ 写入方 `_atomic_write_json` 用的是 `json.dump(payload, handle, indent=2)`，
+        **没有 `cls=NumpyEncoder`**。而 `window_overlap_diagnostics` / `f_k` /
+        `coverage_diagnostics` 里混着 numpy 标量与数组，直接塞进去会 `TypeError`
+        并让整个 checkpoint 写失败。所以这里统一过一遍 `_json_safe`。
+        """
+        return {
+            "stage": stage_name,
+            "total_delta_G": float(result["total_delta_G"]),
+            "total_error": float(result["total_error"]),
+            "n_states": n_states,
+            # ⚠️ protocol_key / lambda_path_fingerprint 刻意**不过** _json_safe：
+            # 它们参与缓存身份比对，任何形状变换（tuple→list、int key→str key）
+            # 都可能让 resume 误判。它们本来也不含 numpy。
+            "protocol_key": protocol_key,
+            "lambda_path_fingerprint": ABFEPipeline._lambda_path_fingerprint(
+                lambdas_var, window_ranges
+            ),
+            "method": result.get("method"),
+            # 只有这几项是新纳入落盘、且确实含 numpy 的，逐个过 _json_safe。
+            "diagnostics": _json_safe(result.get("diagnostics", {})),
+            "lambda_endpoint_diagnostics": _json_safe(
+                result.get("lambda_endpoint_diagnostics", {})
+            ),
+            # 顶层收敛与覆盖证据：resume 命中时 _assert_stage_result_sane 需要它们，
+            # 事后审计也需要。
+            "converged": _json_safe(result.get("converged")),
+            "coverage_diagnostics": _json_safe(result.get("coverage_diagnostics")),
+        }
+        # 估计量 provenance/一致性证据必须随 stage checkpoint 往返；否则首次运行
+        # 有证据而 --resume 后只剩一个裸数。条件式保存避免给未采用该协议的
+        # vdW/stage2 人为添一组看似适用的空字段。
+        for field in (
+            "primary_estimator",
+            "estimator_analysis_protocol_version",
+            "estimator_policy_fingerprint",
+            "crosschecks",
+            "ti_gate",
+            "charging_frame_selection",
+            "sigma_policy",
+            "sigma_suspect_underestimated",
+            "sigma_suspect_underestimated_reason",
+        ):
+            if field in result:
+                payload[field] = _json_safe(result[field])
+        return payload
 
     # =========================================================================
     # 6. 主流程控制器
@@ -1911,6 +5476,49 @@ class ABFEPipeline:
         **kwargs,
     ) -> Dict:
         """完整 ABFE 计算入口 (已集成全局断点续传、势能路由、二面角修正)"""
+        # 🔑 [ATT-27] 这道拒绝原来埋在函数体第 ~795 行，也就是**预平衡、Boresch
+        # 锚定、Stage 1 全跑完之后**才炸——配置里手滑设了 true，要烧掉几小时才知道。
+        # 它守的实现（_refine_lambda_path_with_medium_probe）已经移除
+        # （docs/archive/removed_refine_lambda_path_with_medium_probe.md），
+        # 守卫本身保留并提到入口，几秒内失败。
+        if kwargs.get("parallel_stages", False):
+            raise RuntimeError(
+                "--parallel-stages 已于 2026-07-27 整体移除。它此前被无条件禁用"
+                "（跨进程 warmup 失败反馈尚未序列化），并行分支与 spawn worker 都不可达；"
+                "归档见 docs/archive/removed_parallel_stages.md。请去掉该参数，直接串行运行。"
+            )
+
+        if kwargs.get("enable_lambda_refine", False):
+            raise RuntimeError(
+                "enable_lambda_refine 的旧实现按 |Δf| 重排 λ 路径，会覆盖当前 "
+                "beta^2 Var[dU/dlambda] 的 Fisher-度规混合布点（协议 v21），"
+                "并重新引入已被否决的 refine_overlap=2；明确禁止启用。\n"
+                "  实现已于 2026-07-27 移除（ATT-27），归档见 "
+                "docs/archive/removed_refine_lambda_path_with_medium_probe.md。\n"
+                "  需要重做 λ 路径精修请基于 abfe_preoptimizer 当前实现重写，"
+                "评估项见 docs/TODO.md 的 R-03。"
+            )
+
+        self._last_run_config = {
+            "decoupling_scheme": decoupling_scheme,
+            "potential_type": potential_type,
+            "n_states_per_stage": n_states_per_stage,
+            "stage1_n_states": stage1_n_states,
+            "stage2_n_states": stage2_n_states,
+            "n_steps_per_window": n_steps_per_window,
+            "steps_per_update": steps_per_update,
+            "system_type": system_type,
+            "resume": resume,
+            "run_equilibration": run_equilibration,
+            "enable_early_stop": enable_early_stop,
+            "temperature_K": self.temperature.value_in_unit(unit.kelvin),
+            "platform_name": self.platform_name,
+            "kwargs": {
+                str(k): v for k, v in kwargs.items()
+                if isinstance(v, (str, int, float, bool, type(None), list, tuple, dict))
+            },
+        }
+        self._command_line = sys.argv
         self._log(f"\n{'#' * 60}")
         self._log(
             f"# 启动完整 ABFE 流程 | 方案: {decoupling_scheme} | 势能: {potential_type} | Resume: {resume}"
@@ -1944,10 +5552,33 @@ class ABFEPipeline:
         # =========================================================================
         # 1. 物理预平衡 (支持智能跳过)
         # =========================================================================
-        if run_equilibration:
+        # 🔑 双重预平衡防护：run_equilibration 是调用方（runabfe.py）根据磁盘上
+        # equilibrium_is_done()/config.reset 算出来的，它并不知道这个 pipeline
+        # 实例在*本次调用*里是否已经在别处（resolve_boresch_restraint() 里的
+        # pre_equilibrate()、或 _rebalance_with_boresch()）做过预平衡/Boresch
+        # 再平衡。真实 bug 场景：--reset 时 run_equilibration 会被强制置 True；
+        # 外部 Boresch 参数来源（traditional/orb_ml）从不写
+        # pre_equilibration.dcd，所以 equilibrium_is_done() 恒为 False、
+        # run_equilibration 恒为 True。两种情况下，如果本进程已经做过 Boresch
+        # 再平衡，这里再跑一次无约束预平衡会直接覆盖 self.positions，把刚做完
+        # 的、带限制力的平衡坐标扔掉——不是"重复浪费"而是"结果被静默改写"。
+        # 这两个标记只反映本进程真实发生过什么，比 run_equilibration 这个
+        # 磁盘/config 推导值更可信，因此在这里短路，而不是依赖调用方把
+        # run_equilibration 算对。
+        if self._boresch_rebalance_done_this_process:
+            self._log(
+                "  ⏭️ 本进程已完成 Boresch 限制力再平衡，跳过 run_full_pipeline 内部的"
+                "预平衡块（避免用无约束预平衡覆盖刚完成的 Boresch 平衡坐标）。"
+            )
+        elif self._pre_equilibration_done_this_process:
+            self._log(
+                "  ⏭️ 本进程已完成一次预平衡（未带 Boresch），跳过 run_full_pipeline "
+                "内部重复的预平衡块。"
+            )
+        elif run_equilibration:
             equil_traj = os.path.join(self.output_dir, "pre_equilibration.dcd")
             eq_status = stages.get("equilibration", {}).get("status")
-            
+
             # === 前置跳过逻辑 ===
             skip_equil = False
             chk_file = os.path.join(self.checkpoint_dir, "pre_equil.chk")
@@ -1999,7 +5630,9 @@ class ABFEPipeline:
                     integrator = openmm.LangevinMiddleIntegrator(
                         self.temperature, 2.0/unit.picosecond, 0.002*unit.picosecond
                     )
-                    sim = app.Simulation(self.topology, temp_sys, integrator)
+                    resolved_platform, props = _build_platform_props(self.platform_name)
+                    platform = openmm.Platform.getPlatformByName(resolved_platform)
+                    sim = app.Simulation(self.topology, temp_sys, integrator, platform, props)
                     sim.context.setPositions(self.positions)
                     if self.box_vectors is not None:
                         sim.context.setPeriodicBoxVectors(*self.box_vectors)
@@ -2019,78 +5652,328 @@ class ABFEPipeline:
         # 2. PBC 居中处理（防止配体跨越周期性边界）
         # =========================================================================
         # ✅ 无论是否跳过预平衡，只要坐标/盒子有效就执行居中
-        if False:   # 由 runabfe.py 的 center_and_wrap_molecules 完成
-            self._log("  📦 正在执行 PBC 分子完整性修复与配体居中...")
-            try:
-                import mdtraj as md
-                md_top = md.Topology.from_openmm(self.topology)
-                pos_nm = self.positions.value_in_unit(unit.nanometer) if hasattr(self.positions, 'value_in_unit') else np.asarray(self.positions)
-                traj = md.Trajectory(pos_nm.reshape(1, -1, 3), md_top)
-                traj.image_molecules(inplace=True)
-                traj.center_coordinates()
-                self.positions = [openmm.Vec3(float(x), float(y), float(z)) 
-                                  for x, y, z in traj.xyz[0]] * unit.nanometer
-                self._log("  ✓ PBC 分子完整性已修复，体系已居中至主周期")
-            except Exception as e:
-                self._log(f"  ⚠️ MDTraj PBC 修复失败: {e}，回退到 numpy 质心平移")
-                self.positions, self.box_vectors = self._wrap_ligand_to_box(
-                    self.positions, self.box_vectors, margin_nm=0.3
-                )
-        
+        # 注：曾计划由 runabfe.py 的 center_and_wrap_molecules 完成此步，但该函数从未实现，
+        # 之前用 `if False` 彻底禁用了这段逻辑，导致跨盒断裂的构型无法被修复而悄悄放行。
+        self.repair_pbc_molecule_integrity(context="run_full_pipeline 第 2 节")
+        # 🔒 PBC 修复到此为止：image_molecules 只按分子整体做周期平移，
+        # center_coordinates/_wrap_ligand_to_box 只做整体质心平移；两者都不改变
+        # 任何原子间的相对位置。此前这里还有一段"L-E 界面安全弛豫"
+        # (sim.minimizeEnergy(maxIterations=500))，会真实改变原子间相对坐标——
+        # 不是平移，明确不允许，已删除。若 PBC 重新成像后确实出现瞬时穿模，应在
+        # 下游窗口构建时各自做能量极小化（已有此步骤），而不是在这里预先"抹平"，
+        # 否则每次 resume 都会用一份被悄悄弛豫过的构型重新推导 Boresch 平衡值，
+        # 导致同一条腿前后窗口的限制力基准不一致。
 
-        # 🔑 【新增】PBC后处理安全协议：强制松弛水-配体瞬态穿模
-        self._log("  🛡️ 执行 L-E 界面安全弛豫 (500步) 以消除 PBC/抽帧引入的水分子冲突...")
-        try:
-            temp_sys = XmlSerializer.deserialize(XmlSerializer.serialize(self.system))
-            integrator = openmm.LangevinMiddleIntegrator(
-                self.temperature, 5.0/unit.picosecond, 0.001*unit.picosecond
-            )
-            sim = app.Simulation(self.topology, temp_sys, integrator)
-            sim.context.setPositions(self.positions)
-            if self.box_vectors is not None:
-                sim.context.setPeriodicBoxVectors(*self.box_vectors)
-            # 仅松弛，不改变整体构象
-            sim.minimizeEnergy(maxIterations=500)
-            state = sim.context.getState(getPositions=True)
-            self.positions = state.getPositions()
-            del sim.context; del sim; del temp_sys
-            self._log("  ✓ L-E 界面弛豫完成，水-配体接触已软化")
-        except Exception as e:
-            self._log(f"  ⚠️ 安全弛豫跳过: {e}")
         # =========================================================================
         # 3. 用最后一帧更新 Boresch 平衡几何量
         # =========================================================================
-        # ✅ 无论是否跳过预平衡，只要挂载了限制力就更新平衡值
+        # 🔑 关键修复：此前每次调用 run_full_pipeline（包括每一次 --resume 重启）都会
+        # 无条件重新从当前坐标推导 Boresch 平衡几何量。但 IBS 窗口/REMD 副本是按窗口
+        # 粒度做断点续传的——一条腿（decharging/vanishing）完全可能跨越多次进程重启；
+        # 如果"重启前已完成的窗口"和"重启后继续采样的窗口"被喂进两套不同的 Boresch
+        # 平衡值，就是在用两个不同的哈密顿量拼接同一条自由能曲线，会在拼接处产生
+        # 不属于任何真实物理过程的能量跳变（实测曾导致 vdw 腿拼接曲线单步跳变
+        # ~200 kJ/mol）。因此：平衡几何量只在该条腿第一次开始采样时推导一次并落盘；
+        # 之后同一条腿的任何 resume 都必须原样复用，不再重算。
         if _has_valid_boresch_restraint(boresch_params):
-            self._log("  🔧 正在用当前坐标更新 Boresch 平衡几何量...")
-            boresch_params = self.update_boresch_from_last_frame(boresch_params)
-            r0 = boresch_params["equilibrium_values"].get("r0", 0) * 10  # nm → Å
-            self._log(f"  ✓ Boresch 平衡值已更新: r0={r0:.2f} Å")
+            committed_path = os.path.join(self.checkpoint_dir, "boresch_equilibrium_committed.json")
+            if resume and os.path.exists(committed_path):
+                with open(committed_path, "r") as f:
+                    committed_doc = json.load(f)
+                committed_eq = committed_doc["equilibrium_values"]
+
+                # 🔑 [BORESCH-COMMIT] 复用之前必须验证它还描述当前构象。
+                # 这条保护此前**只检查文件是否存在**，于是一份 2026-07-10 写下的
+                # 平衡值（thetaA0/thetaB0 对调、二面角错乱）在体系于 07-26 被整体
+                # 重新平衡之后，仍被沿用了 17 天：限制力把配体从自己的 pose 上拽走
+                # 3.4 Å（无约束预平衡只漂 0.60 Å），复合物腿去电荷因此偏低约
+                # 25 kJ/mol，解析释放修正同样是错的。详见
+                # boresch_committed_deviation_sigma 的 docstring。
+                self._assert_committed_boresch_still_matches_pose(
+                    committed_doc=committed_doc,
+                    committed_eq=committed_eq,
+                    boresch_params=boresch_params,
+                    committed_path=committed_path,
+                )
+
+                boresch_params = dict(boresch_params)
+                boresch_params["equilibrium_values"] = committed_eq
+                r0 = committed_eq.get("r0", 0) * 10  # nm → Å
+                self._log(
+                    f"  ♻️ 本腿此前已提交过 Boresch 平衡值 (resume)，复用缓存值 "
+                    f"(r0={r0:.2f} Å)，不再从当前坐标重新锚定。"
+                    "（已校验其与当前坐标的几何一致性）"
+                )
+            else:
+                self._log("  🔧 正在用当前坐标更新 Boresch 平衡几何量...")
+                boresch_params = self.update_boresch_from_last_frame(boresch_params)
+                r0 = boresch_params["equilibrium_values"].get("r0", 0) * 10  # nm → Å
+                self._log(f"  ✓ Boresch 平衡值已更新: r0={r0:.2f} Å")
+                os.makedirs(self.checkpoint_dir, exist_ok=True)
+                # 🔑 [BORESCH-COMMIT] 带上身份信息落盘。裸的
+                # {"equilibrium_values": ...} 无法判断它是从哪个锚点/哪套力常数、
+                # 什么时候推出来的——正是它让上面那组错值活过了 17 天。
+                _atomic_write_json(committed_path, _json_safe({
+                    "schema_version": BORESCH_COMMITTED_SCHEMA_VERSION,
+                    "equilibrium_values": boresch_params["equilibrium_values"],
+                    "receptor_indices": list(boresch_params.get("receptor_indices", [])),
+                    "ligand_indices": list(boresch_params.get("ligand_indices", [])),
+                    "force_constants": dict(boresch_params.get("force_constants", {})),
+                    "temperature_K": self.temperature.value_in_unit(unit.kelvin),
+                    "derived_at": datetime.now().isoformat(),
+                    "note": (
+                        "本腿后续 resume 强制复用这组平衡值；复用前会用 "
+                        "boresch_committed_deviation_sigma 校验它是否仍描述当前构象。"
+                    ),
+                }))
+                self._log(f"  📌 Boresch 平衡值已提交落盘，本腿后续 resume 将强制复用: {committed_path}")
 
         # =========================================================================
         # 2. 路由采样 (支持阶段级 Resume)
         # =========================================================================
+        # 🔑 [P0] 这是整条 resume 链路里最先被检查的一环——status=="completed" 就
+        # 直接把整份 final_results.json 读回来当最终结果 return，连下面 stage1/2
+        # 的 protocol_key 校验都不会走到。之前只判断 status，不比对协议指纹，导致
+        # 任何"记账口径变了但状态还标着 completed"的旧 output_dir（比如 WCA
+        # e_base/e_bias 切分方式改变之前跑完的结果）会被无条件当成最终答案直接
+        # 返回。这里必须先算出本次运行的协议指纹，任何环节缺失/不匹配都不能走这条
+        # 早退路径。
+        def _build_top_level_protocol_key() -> Dict:
+            config = dict(self._last_run_config)
+            config.pop("resume", None)
+            config.pop("run_equilibration", None)
+            return _protocol_fingerprint({
+                "kind": "abfe_final_result",
+                "run_config": config,
+                "potential_type": potential_type,
+                "dexp_params": dexp_params,
+                "boresch_params": boresch_params,
+                "torsion_params": torsion_params,
+                "decharge_method": kwargs.get("decharge_method", "pme"),
+                "system_xml_sha256": _system_xml_hash(self.system),
+                "topology_sha256": _topology_hash(self.topology),
+                "coordinates_nm_sha256": _positions_hash(self.positions),
+                "code_sha256": _code_hash(),
+                "ligand_indices": [int(i) for i in self.ligand_indices],
+                "temperature_K": self.temperature.value_in_unit(unit.kelvin),
+                "pressure_bar": self.pressure.value_in_unit(unit.bar),
+                "aces_softcore_params": ACESoftcorePotential.optimize_alpha(
+                    len(self.ligand_indices)
+                ),
+                "wca_accounting_version": WCA_ACCOUNTING_VERSION,
+                "ibs_bias_protocol_version": IBS_BIAS_PROTOCOL_VERSION,
+                "thermodynamic_path_protocol_version": (
+                    THERMODYNAMIC_PATH_PROTOCOL_VERSION
+                ),
+                "traditional_lj_lrc_protocol_version": (
+                    TRADITIONAL_LJ_LRC_PROTOCOL_VERSION
+                ),
+                # The actual optimized/refined lambda contents are committed in
+                # these files.  Hash their bytes so a same-length edited path can
+                # never hit the top-level completed-result cache.
+                "preopt_cache_sha256": {
+                    "decharging": _file_sha256(os.path.join(
+                        self.checkpoint_dir, "preopt_dual_decharging.json"
+                    )),
+                    "vanishing": _file_sha256(os.path.join(
+                        self.checkpoint_dir, "preopt_dual_vanishing.json"
+                    )),
+                },
+            })
+
+        _top_level_protocol_key = _build_top_level_protocol_key()
+
         sampling_key = f"sampling_{decoupling_scheme}"
         samp_status = stages.get(sampling_key, {}).get("status")
 
         if resume and samp_status == "completed":
-            self._log(f"  ♻️ {decoupling_scheme} 采样已完成，跳过")
             results_file = os.path.join(self.output_dir, "final_results.json")
             if os.path.exists(results_file):
                 with open(results_file, "r") as f:
                     final = json.load(f)
-                self.results["final"] = final
-                self._log("  ✓ 已加载已有最终结果")
-                return final
+                cached_top_key = final.get("protocol_key")
+                if cached_top_key is None:
+                    self._log(
+                        "  ⚠️ 已有 final_results.json 缺少协议指纹（旧版本产物，可能产生于本次"
+                        "WCA 记账口径修复之前），拒绝直接复用，将重新校验/运行各阶段"
+                    )
+                elif cached_top_key != _top_level_protocol_key:
+                    self._log(
+                        f"  ⚠️ 已有 final_results.json 协议指纹不匹配"
+                        f"（缓存={cached_top_key}, 当前={_top_level_protocol_key}），"
+                        "拒绝直接复用，将重新校验/运行各阶段"
+                    )
+                else:
+                    self._log(f"  ♻️ {decoupling_scheme} 采样已完成，协议指纹一致，跳过")
+                    self.results["final"] = final
+                    self._log("  ✓ 已加载已有最终结果")
+                    return final
             else:
                 self._log("  ⚠️ 状态标记为完成但未找到结果文件，重新运行采样")
         if decoupling_scheme == "dual_lambda":
+            _decharge_method = kwargs.get("decharge_method", "pme")
+            # 🔑 实际生效的最终收敛门阈值（不是只看用户是否显式传参）——
+            # 跟下面 _run_dual_lambda_stage/solve_stage_integrated 调用时解析
+            # 出来的默认值必须完全一致，否则协议指纹和真正生效的判据会对不上。
+            _final_gate_thresholds = {
+                "final_min_ess_ratio": kwargs.get("final_min_ess_ratio", 0.05),
+                "final_min_absolute_ess": kwargs.get("final_min_absolute_ess", 50.0),
+                "final_min_decorrelated_samples": kwargs.get("final_min_decorrelated_samples", 20),
+                "final_max_uncertainty_kJ_mol": kwargs.get("final_max_uncertainty_kJ_mol", 1.0),
+            }
+            _stage1_protocol_key = self._stage_protocol_key(
+                "decharging", potential_type, boresch_params, _decharge_method,
+                n_states=stage1_states, dexp_params=dexp_params,
+                final_gate_thresholds=_final_gate_thresholds,
+            )
+            _stage2_protocol_key = self._stage_protocol_key(
+                "vanishing", potential_type, boresch_params, _decharge_method,
+                n_states=stage2_states, dexp_params=dexp_params,
+                final_gate_thresholds=_final_gate_thresholds,
+            )
+            # 🔑 [预优化缓存范围收窄] λ 路径预优化（跑一次要几个小时）用这份
+            # 单独的、更窄的指纹判定缓存有效性，不用上面完整的
+            # _stage1_protocol_key/_stage2_protocol_key——否则任何跟预优化无关
+            # 的代码修复（窗口修复循环、production checkpoint 续采等）都会
+            # 通过完整 code_sha256 连带让预优化缓存失效，见 _preopt_protocol_key
+            # 的完整说明。
+            _stage1_preopt_key = self._preopt_protocol_key(
+                "decharging", potential_type, boresch_params, _decharge_method,
+                dexp_params=dexp_params,
+            )
+            _stage2_preopt_key = self._preopt_protocol_key(
+                "vanishing", potential_type, boresch_params, _decharge_method,
+                dexp_params=dexp_params,
+            )
             stage1_key = "sampling_dual_decharging"
             stage2_key = "sampling_dual_vanishing"
             stage1_status = stages.get(stage1_key, {}).get("status")
             stage2_status = stages.get(stage2_key, {}).get("status")
             stage1_file = os.path.join(self.checkpoint_dir, "stage1_decharging.json")
             stage2_file = os.path.join(self.checkpoint_dir, "stage2_vanishing.json")
+            # Stage 0: 在完整复合物主线中显式计算 Boresch attachment A′→A。
+            # 它必须与随后 stage1/stage2 使用同一个 committed Boresch Hamiltonian；
+            # 溶剂腿没有 Boresch，因此不运行 stage0。
+            stage0 = None
+            if system_type == "complex" and _has_valid_boresch_restraint(boresch_params):
+                attachment_lambdas = [
+                    float(x)
+                    for x in (
+                        kwargs.get("attachment_lambdas")
+                        or DEFAULT_BORESCH_ATTACHMENT_LAMBDAS
+                    )
+                ]
+                attachment_config = {
+                    "lambdas": attachment_lambdas,
+                    "n_steps_per_state": int(
+                        kwargs.get("attachment_n_steps_per_state", 250_000)
+                    ),
+                    "equil_steps_per_state": int(
+                        kwargs.get("attachment_equil_steps_per_state", 50_000)
+                    ),
+                    "steps_per_sample": int(
+                        kwargs.get("attachment_steps_per_sample", 1_000)
+                    ),
+                    "seed": int(kwargs.get("attachment_seed", 20260728)),
+                    "n_seeds": int(kwargs.get("attachment_n_seeds", 1)),
+                }
+                stage0_protocol_key = _protocol_fingerprint({
+                    "kind": "boresch_attachment_stage0",
+                    "boresch_params": boresch_params,
+                    "attachment_config": attachment_config,
+                    "system_xml_sha256": _system_xml_hash(self.system),
+                    "topology_sha256": _topology_hash(self.topology),
+                    "coordinates_nm_sha256": _positions_hash(self.positions),
+                    "box_vectors_sha256": _box_vectors_hash(self.box_vectors),
+                    "ligand_indices": [int(i) for i in self.ligand_indices],
+                    "temperature_K": self.temperature.value_in_unit(unit.kelvin),
+                    "platform_name": self.platform_name,
+                    "code_sha256": _code_hash(),
+                })
+                stage0_file = os.path.join(
+                    self.checkpoint_dir, "stage0_attachment.json"
+                )
+                if resume and os.path.isfile(stage0_file):
+                    try:
+                        with open(stage0_file, encoding="utf-8") as handle:
+                            stage0_doc = json.load(handle)
+                        cached_stage0 = stage0_doc.get("result") or {}
+                        cached_values = (
+                            cached_stage0.get("attachment_delta_G_kJ_mol"),
+                            cached_stage0.get("attachment_error_kJ_mol"),
+                        )
+                        if (
+                            stage0_doc.get("protocol_key") == stage0_protocol_key
+                            and all(
+                                isinstance(v, (int, float)) and np.isfinite(float(v))
+                                for v in cached_values
+                            )
+                            and float(cached_values[0]) >= 0.0
+                            and float(cached_values[1]) >= 0.0
+                        ):
+                            stage0 = cached_stage0
+                            self._log(
+                                "  ♻️ Boresch attachment stage0 协议指纹一致，复用缓存: "
+                                f"ΔG={float(cached_values[0]):.4f} ± "
+                                f"{float(cached_values[1]):.4f} kJ/mol"
+                            )
+                        else:
+                            self._log(
+                                "  ⚠️ Boresch attachment stage0 缓存缺失、非法或协议指纹不匹配，"
+                                "重新运行"
+                            )
+                    except Exception as exc:
+                        self._log(
+                            f"  ⚠️ Boresch attachment stage0 缓存读取失败: {exc}；重新运行"
+                        )
+
+                if stage0 is None:
+                    self._log("\n[双λ] Stage 0: Boresch attachment (A′→A)")
+                    stage0 = run_boresch_attachment_leg(
+                        self.system,
+                        self.topology,
+                        self.positions,
+                        self.box_vectors,
+                        boresch_params,
+                        temperature_k=float(
+                            self.temperature.value_in_unit(unit.kelvin)
+                        ),
+                        lambdas=attachment_lambdas,
+                        n_steps_per_state=attachment_config["n_steps_per_state"],
+                        equil_steps_per_state=attachment_config["equil_steps_per_state"],
+                        steps_per_sample=attachment_config["steps_per_sample"],
+                        platform_name=self.platform_name,
+                        seed=attachment_config["seed"],
+                        n_seeds=attachment_config["n_seeds"],
+                        output_dir=os.path.join(self.output_dir, "attachment"),
+                        log=self._log,
+                    )
+                    attachment_dg = float(
+                        stage0.get("attachment_delta_G_kJ_mol", float("nan"))
+                    )
+                    attachment_err = float(
+                        stage0.get("attachment_error_kJ_mol", float("nan"))
+                    )
+                    if (
+                        not np.isfinite(attachment_dg)
+                        or not np.isfinite(attachment_err)
+                        or attachment_dg < 0.0
+                        or attachment_err < 0.0
+                    ):
+                        raise RuntimeError(
+                            "Boresch attachment stage0 返回非法结果: "
+                            f"ΔG={attachment_dg}, error={attachment_err}"
+                        )
+                    os.makedirs(self.checkpoint_dir, exist_ok=True)
+                    _atomic_write_json(stage0_file, _json_safe({
+                        "protocol_key": stage0_protocol_key,
+                        "result": stage0,
+                    }))
+                    self._update_stage_status(
+                        "sampling_dual_attachment",
+                        "completed",
+                        {"total_delta_G": attachment_dg},
+                    )
             preopt1_file = os.path.join(
                 self.checkpoint_dir, "preopt_dual_decharging.json"
             )
@@ -2099,6 +5982,15 @@ class ABFEPipeline:
             )
             window_ranges_1 = None
             window_ranges_2 = None
+            # [IBS_BIAS_PROTOCOL_VERSION=20] Stage 2 pilot's real measured mean
+            # gradient (mean_dU_dlambda_kJ_mol per pilot lambda point) -- set
+            # below whichever path optimized_lambdas_2 comes from (cache hit or
+            # fresh generation), consumed by _run_stage2_once further down to
+            # let run_all_windows TI-warm-start f_k instead of cold-starting at
+            # 0.0. Stays None (no warm-start, today's behavior) for stale
+            # caches predating this field, or for decharging (unused there).
+            stage2_pilot_lambdas = None
+            stage2_pilot_mean_dU_dlambda = None
 
             # === Stage 1: pre-opt + resume check ===
             optimized_lambdas_1 = None
@@ -2107,15 +5999,86 @@ class ABFEPipeline:
                     with open(preopt1_file, "r") as f:
                         cached = json.load(f)
                     cached_lambdas = cached["lambdas_var"]
-                    if len(cached_lambdas) == stage1_states:
+                    # 🔑 [P0] n_states 相等只是"缓存态数没变"的一种情况；另一种合法情况
+                    # 是本协议下的自动加密（refine_stage_lambda_path_by_overlap）已经把
+                    # 态数从最初的猜测值（stage1_states）真实地涨到了更高的值——那是
+                    # 花了真实 GPU production 才验证出来的更好起点，不能因为进程重启后
+                    # n_states 对不上就当成"不匹配"整个丢弃、逼着从最初的猜测值重来。
+                    # 只有当 provenance.source=="auto_repair_by_overlap" 且协议指纹
+                    # （potential_type/Boresch/decharge_method/WCA/IBS 偏置协议版本）
+                    # 跟当前完全一致时，才信任这份态数已变的缓存并采用它的态数。
+                    cached_protocol = cached.get("protocol_key")
+                    cached_source = cached.get("provenance", {}).get("source")
+                    # 🔑 [P1 修复] 之前只有 is_verified_auto_repair（态数变了的分支）
+                    # 才会检查协议指纹，态数恰好没变的分支完全不检查
+                    # cached_protocol == _stage1_protocol_key——切换势函数/Boresch/
+                    # 体系坐标/softcore 变体/代码版本后，只要凑巧态数相同，就会静默
+                    # 复用旧协议优化出的 λ 路径和窗口划分（stage 结果缓存本身仍会
+                    # 因指纹不匹配正确重跑，所以不会导致 ΔG 静默算错，但会在错误的
+                    # 路径上浪费 GPU、提高 overlap 失败概率）。现在两个分支都先要求
+                    # 协议指纹严格一致，态数是否变化只决定"指纹一致后还要不要额外
+                    # 检查态数变化本身是否来自已验证的自动加密"。
+                    # 🔑 [预优化缓存范围收窄] 这里比对的是 _stage1_preopt_key（窄
+                    # 指纹），不是 _stage1_protocol_key（宽指纹，含完整四文件
+                    # code_sha256）——预优化缓存的有效性不应该被 stage 采样/
+                    # 窗口修复循环相关的代码修复连带作废，见 _preopt_protocol_key。
+                    protocol_match = cached_protocol is not None and cached_protocol == _stage1_preopt_key
+                    if not protocol_match and self._preopt_cache_matches_ignoring_code_hash(
+                        cached_protocol, _stage1_preopt_key
+                    ):
+                        # 🔑 [预优化缓存 schema 迁移] 缓存是 _preopt_protocol_key 上线
+                        # 之前写的旧宽指纹，跟新窄指纹逐字节比较必然不相等——但物理
+                        # 输入逐项核对完全一致，判定为纯 schema 迁移，不重新优化，
+                        # 原地把 protocol_key 重新盖成新窄指纹（自愈一次即可）。
+                        self._log(
+                            "  🩹 Stage 1 预优化缓存是旧 schema（_preopt_protocol_key 上线之前写入的"
+                            "宽指纹），但物理输入（potential_type/Boresch/温度/压力/坐标/预优化代码本身"
+                            "等）逐项核对完全一致——判定为 schema 迁移，不重新优化，原地重盖 protocol_key。"
+                        )
+                        cached["protocol_key"] = _stage1_preopt_key
+                        with open(preopt1_file, "w") as f:
+                            json.dump(cached, f, indent=2)
+                        protocol_match = True
+                    is_verified_auto_repair = (
+                        cached_source == "auto_repair_by_overlap"
+                        and protocol_match
+                    )
+                    if protocol_match and (len(cached_lambdas) == stage1_states or is_verified_auto_repair):
                         optimized_lambdas_1 = cached_lambdas
+                        if len(cached_lambdas) != stage1_states:
+                            self._log(
+                                f"  ♻️ Stage 1 缓存态数 ({len(cached_lambdas)}) 与初始请求 "
+                                f"({stage1_states}) 不同，但协议指纹一致且来自本协议下已验证的"
+                                "自动加密结果——采用缓存态数，而不是丢弃重新优化。"
+                            )
+                            stage1_states = len(cached_lambdas)
+                        # 🔑 之前这里只读 lambdas_var，缓存里同时存着的 window_ranges
+                        # 从未被读回来用——导致手动往缓存文件里塞自定义窗口边界（比如
+                        # 只放大某一个窗口去加密局部 λ）完全不会生效，_run_dual_lambda_stage
+                        # 还是会用 generate_overlapping_windows 重新自动划分。这里补上，
+                        # 并校验覆盖范围与 lambdas_var 长度一致才采用，否则保留 None
+                        # 让下游按默认自动划分处理。
+                        cached_ranges = cached.get("window_ranges")
+                        if cached_ranges:
+                            covered = sorted({i for s, e in cached_ranges for i in range(s, e)})
+                            if covered == list(range(len(cached_lambdas))):
+                                window_ranges_1 = [tuple(r) for r in cached_ranges]
+                            else:
+                                self._log("  ⚠️ Stage 1 缓存里的 window_ranges 覆盖范围与 lambdas_var 不匹配，忽略并回退自动划分")
                         self._log(
                             f"  ♻️ 已加载 Stage 1 优化路径缓存 ({len(optimized_lambdas_1)} 个状态)"
+                            + ("，含手动窗口边界" if window_ranges_1 else "")
+                        )
+                    elif not protocol_match:
+                        self._log(
+                            "  ⚠️ Stage 1 预优化缓存协议指纹不一致（potential_type/Boresch/"
+                            "decharge_method/WCA/IBS 偏置协议版本等已变化），将重新优化完整 "
+                            "λ 路径（此前版本会在态数恰好相同时静默复用旧协议下的缓存）。"
                         )
                     else:
                         self._log(
                             f"  ⚠️ Stage 1 优化路径缓存状态数不匹配 "
-                            f"({len(cached_lambdas)} != {stage1_states})，重新优化"
+                            f"({len(cached_lambdas)} != {stage1_states})，且非本协议下已验证的自动加密结果，重新优化"
                         )
                 except Exception as e:
                     self._log(f"  ⚠️ 加载 Stage 1 优化缓存失败: {e}，将重新优化")
@@ -2126,6 +6089,7 @@ class ABFEPipeline:
                         "decharging",
                         n_states=stage1_states,
                         n_steps_per_state=10000,
+                        potential_type=potential_type,
                     )
                     optimized_lambdas_1 = opt_res["lambdas_var"]
                     window_ranges_1 = opt_res.get("window_ranges")
@@ -2134,23 +6098,46 @@ class ABFEPipeline:
                         json.dump({
                             "lambdas_var": optimized_lambdas_1,
                             "window_ranges": window_ranges_1,
+                            # 🔑 [预优化缓存范围收窄] 存窄指纹 _stage1_preopt_key，
+                            # 不是宽指纹 _stage1_protocol_key——否则下次加载时会跟
+                            # 上面改成比对窄指纹的读取逻辑对不上，写完立刻判定
+                            # "不匹配"。
+                            "protocol_key": _stage1_preopt_key,
                             "n_states": len(optimized_lambdas_1),
                         }, f, indent=2)
                     self._log(f"  ✓ Stage 1 优化路径已缓存")
                 except Exception as e:
-                    self._log(f"  ⚠️ Stage 1 自适应优化失败 ({e})，回退到线性路径")
-                    optimized_lambdas_1 = None
+                    raise RuntimeError(f"Stage 1 自适应优化失败，拒绝静默回退线性路径: {e}") from e
 
             should_run_stage1 = True
             if resume and stage1_status == "completed" and os.path.exists(stage1_file):
                 try:
                     with open(stage1_file, "r") as f:
                         stage1 = json.load(f)
-                    if stage1.get("n_states") == stage1_states:
+                    cached_protocol_1 = stage1.get("protocol_key")
+                    if stage1.get("n_states") != stage1_states:
+                        self._log("  ⚠️ Stage 1 结果缓存状态数不匹配，重新运行")
+                    elif cached_protocol_1 is None:
+                        # 🔑 [P0] 之前这里是"信任并跳过"——旧格式缓存(在 protocol_key
+                        # 字段存在之前生成，包括 WCA e_base/e_bias 记账口径修复之前的
+                        # 所有历史结果)会被直接当成有效结果复用。缺指纹就是没法校验，
+                        # 必须 fail closed 视为缓存失效，而不是"大概率没变"。
+                        self._log("  ⚠️ Stage 1 结果缓存无协议指纹（旧版本产物），视为缓存失效，重新运行")
+                    elif cached_protocol_1 != _stage1_protocol_key:
+                        self._log(
+                            f"  ⚠️ Stage 1 结果缓存协议指纹不匹配 (缓存={cached_protocol_1}, "
+                            f"当前={_stage1_protocol_key})，拒绝静默复用，重新运行"
+                        )
+                    elif stage1.get("lambda_path_fingerprint") != self._lambda_path_fingerprint(
+                        optimized_lambdas_1, window_ranges_1
+                    ):
+                        self._log("  ⚠️ Stage 1 的 λ 内容/窗口边界指纹不匹配，重新运行")
+                    else:
+                        self._assert_reusable_stage_cache_sane(
+                            "Stage 1 (decharging)", stage1
+                        )
                         self._log("  ♻️ 双λ Stage 1 (去电荷) 已完成，跳过")
                         should_run_stage1 = False
-                    else:
-                        self._log("  ⚠️ Stage 1 结果缓存状态数不匹配，重新运行")
                 except Exception as e:
                     self._log(f"  ⚠️ Stage 1 缓存读取失败: {e}，重新运行")
 
@@ -2161,15 +6148,149 @@ class ABFEPipeline:
                     with open(preopt2_file, "r") as f:
                         cached = json.load(f)
                     cached_lambdas = cached["lambdas_var"]
-                    if len(cached_lambdas) == stage2_states:
-                        optimized_lambdas_2 = cached_lambdas
+                    # 🔑 [P0] 同 Stage 1：n_states 不等于最初请求值，不代表缓存无效——
+                    # 可能是本协议下的自动加密已经把它真实地涨到了更高的、花了真实
+                    # GPU production 验证过的值。只有 provenance.source 属于下方受信
+                    # 白名单且协议指纹一致时才信任并采用其态数。白名单曾经只认
+                    # "auto_repair_by_overlap"（旧的按 ESS-per-lambda 算术二分插点），
+                    # 但 warmup 失败分支现在写出 "fixed_hamiltonian_bidirectional_overlap"、
+                    # production ESS 修复分支现在写出
+                    # "production_overlap_repair_split_then_probe"——态数变化时这两种
+                    # 缓存会被错误当成"未验证"丢弃，逼着已经用真实 GPU production 验证
+                    # 过 fixed-H overlap 的插点重新跑一遍。fixed-H 全通过但检测到局部
+                    # 热力学瓶颈的分支写出 "fixed_hamiltonian_passed_but_asymmetric_
+                    # bottleneck"——同样是真实 GPU production 验证过的插点，遗漏这一条
+                    # 会让态数增长后的缓存被判定为"未验证"整体丢弃，逼着从头重新优化。
+                    _VERIFIED_STAGE2_REPAIR_SOURCES = {
+                        "fisher_metric_blended_with_geometric_floor_v21",
+                        "quadratic_geometric_fallback_v21",
+                        "human_anchors_no_probe_fallback",
+                    }
+                    cached_protocol = cached.get("protocol_key")
+                    cached_source = cached.get("provenance", {}).get("source")
+                    # 🔑 [P1 修复] path_protocol_version 只是 _stage2_protocol_key
+                    # 完整指纹里的一个子字段（thermodynamic_path_protocol_version
+                    # 已经折叠进 _stage_protocol_key），之前把它单独当顶层门槛，
+                    # 态数恰好没变时完整的 cached_protocol == _stage2_protocol_key
+                    # 从未被检查——跟 Stage 1 是同一个漏洞。现在顶层门槛改为完整
+                    # 协议指纹匹配；path_protocol_version 的检查保留在
+                    # is_verified_auto_repair 内部作为额外防御，不再单独作为
+                    # 顶层旁路条件（否则相当于重新开一个可以绕过完整指纹检查的
+                    # 后门）。
+                    path_protocol_match = (
+                        cached.get("path_protocol_version")
+                        == THERMODYNAMIC_PATH_PROTOCOL_VERSION
+                    )
+                    anchor_contract_match = False
+                    try:
+                        validate_vanishing_lambda_path_invariants(cached_lambdas)
+                        anchor_contract_match = True
+                    except Exception as anchor_exc:
                         self._log(
-                            f"  ♻️ 已加载 Stage 2 优化路径缓存 ({len(optimized_lambdas_2)} 个状态)"
+                            "  ⚠️ Stage 2 缓存违反 v21 vanishing 路径不变量："
+                            f"{anchor_exc}"
+                        )
+                    # 🔑 [预优化缓存范围收窄] 同 Stage 1：比对 _stage2_preopt_key
+                    # （窄指纹），不是 _stage2_protocol_key（宽指纹，含完整四文件
+                    # code_sha256）——理由同上，见 _preopt_protocol_key。
+                    protocol_match = cached_protocol is not None and cached_protocol == _stage2_preopt_key
+                    # 🔑 [P1-20, 2026-07-28] 这里曾有一条 fail-open 旁路：
+                    # 环境变量 `ABFE_DEBUG_SKIP_STAGE2_FINGERPRINT=1` 会在指纹不匹配时
+                    # 强制 `protocol_match = True`，直接复用磁盘上的 lambdas_var/window_ranges。
+                    # 它是 2026-07-19 为省一次 ~20 min pilot 加的临时口子。
+                    #
+                    # **已删除，且不再提供任何等价开关。** 理由：作业环境里残留一个
+                    # 环境变量，就足以让一次完全重跑静默复用另一套代码/Hamiltonian/
+                    # 坐标/Boresch 下算出来的 λ 路径 —— 那正是 P0-10 那类「错值活了 17 天」
+                    # 的成因，而且这次连一行日志都不会留在结果 JSON 里。
+                    # 指纹不匹配就必须重跑 pilot；确实需要一次性迁移旧缓存的，
+                    # 走独立离线工具并逐字段核验，不要在生产入口开旁路。
+                    if os.environ.get("ABFE_DEBUG_SKIP_STAGE2_FINGERPRINT") is not None:
+                        raise RuntimeError(
+                            "检测到已废弃的环境变量 ABFE_DEBUG_SKIP_STAGE2_FINGERPRINT。"
+                            "该 fail-open 旁路已于 2026-07-28 (P1-20) 删除：它能让完全重跑"
+                            "静默复用另一套协议下的 λ 路径。请 unset 后重跑；"
+                            "若确需迁移旧预优化缓存，使用独立离线工具并逐字段核验。"
+                        )
+                    if not protocol_match and self._preopt_cache_matches_ignoring_code_hash(
+                        cached_protocol, _stage2_preopt_key
+                    ):
+                        # 🔑 [预优化缓存 schema 迁移] 同 Stage 1：缓存是旧宽指纹，物理
+                        # 输入逐项核对完全一致时判定为纯 schema 迁移，不重新优化，原地
+                        # 重盖 protocol_key。
+                        self._log(
+                            "  🩹 Stage 2 预优化缓存是旧 schema（_preopt_protocol_key 上线之前写入的"
+                            "宽指纹），但物理输入（potential_type/Boresch/温度/压力/坐标/预优化代码本身"
+                            "等）逐项核对完全一致——判定为 schema 迁移，不重新优化，原地重盖 protocol_key。"
+                        )
+                        cached["protocol_key"] = _stage2_preopt_key
+                        with open(preopt2_file, "w") as f:
+                            json.dump(cached, f, indent=2)
+                        protocol_match = True
+                    is_verified_auto_repair = (
+                        cached_source in _VERIFIED_STAGE2_REPAIR_SOURCES
+                        and path_protocol_match
+                        and protocol_match
+                        and anchor_contract_match
+                    )
+                    if protocol_match and anchor_contract_match and (
+                        len(cached_lambdas) == stage2_states or is_verified_auto_repair
+                    ):
+                        optimized_lambdas_2 = cached_lambdas
+                        if len(cached_lambdas) != stage2_states:
+                            self._log(
+                                f"  ♻️ Stage 2 缓存态数 ({len(cached_lambdas)}) 与初始请求 "
+                                f"({stage2_states}) 不同，但协议指纹一致且来自本协议下已验证的"
+                                "自动加密结果——采用缓存态数，而不是丢弃重新优化。"
+                            )
+                            stage2_states = len(cached_lambdas)
+                        cached_ranges = cached.get("window_ranges")
+                        expected_subdomain_ranges = (
+                            vanishing_subdomain_ranges_from_lambdas(
+                                cached_lambdas,
+                                first_ensemble_target_intervals=VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS,
+                            )
+                        )
+                        normalized_cached_ranges = (
+                            [tuple(int(x) for x in r) for r in cached_ranges]
+                            if cached_ranges else []
+                        )
+                        if normalized_cached_ranges != expected_subdomain_ranges:
+                            self._log(
+                                "  ⚠️ Stage 2 缓存不是 vanishing v12 的热力学 few-state 子区间布局；"
+                                "拒绝单一 [0:K]、overlap=2 或滑动窗口缓存并重新优化。"
+                            )
+                            optimized_lambdas_2 = None
+                            window_ranges_2 = None
+                        else:
+                            window_ranges_2 = expected_subdomain_ranges
+                            self._log(
+                                f"  ♻️ 已加载 Stage 2 热力学 few-state IBS 子区间 "
+                                f"({len(optimized_lambdas_2)} 个状态, ranges={window_ranges_2})"
+                            )
+                            # [IBS_BIAS_PROTOCOL_VERSION=20] Old caches
+                            # predating pilot_points won't have this -- stays
+                            # None, estimate_f_k_from_pilot_ti() itself also
+                            # treats missing/short data as "no seed".
+                            _cached_diag = cached.get("path_diagnostics") or {}
+                            stage2_pilot_lambdas = _cached_diag.get("pilot_lambdas")
+                            _cached_pilot_points = _cached_diag.get("pilot_points")
+                            if _cached_pilot_points:
+                                stage2_pilot_mean_dU_dlambda = [
+                                    p.get("mean_dU_dlambda_kJ_mol") for p in _cached_pilot_points
+                                ]
+                    elif not protocol_match:
+                        self._log(
+                            "  ⚠️ Stage 2 预优化缓存协议指纹不一致（potential_type/Boresch/"
+                            "decharge_method/WCA/IBS 偏置协议版本/热力学路径协议版本等已变化），"
+                            "将重新优化完整 λ 路径（此前版本会在态数恰好相同时静默复用旧协议下"
+                            "的缓存）。"
                         )
                     else:
                         self._log(
                             f"  ⚠️ Stage 2 优化路径缓存状态数不匹配 "
-                            f"({len(cached_lambdas)} != {stage2_states})，重新优化"
+                            f"({len(cached_lambdas)} != {stage2_states})，"
+                            "且非本协议下已验证的自动加密结果，重新优化"
                         )
                 except Exception as e:
                     self._log(f"  ⚠️ 加载 Stage 2 优化缓存失败: {e}，将重新优化")
@@ -2179,247 +6300,587 @@ class ABFEPipeline:
                     opt_res = self._run_dual_lambda_optimization(
                         "vanishing",
                         n_states=stage2_states,
-                        n_steps_per_state=10000,
+                        # 🔑 2026-07-19: window 0 (lambda_vdw->1 端点) 反复
+                        # IBSWarmupConvergenceError，诊断发现 pilot 用 10000 步的
+                        # 有限差分探针系统性低估了该区域由稀有/发作性事件主导的
+                        # beta^2*Var[dU/dlambda]，导致这段真实热力学长度极大的
+                        # 区域分不到足够密度。改为可配置并默认拉长，而不是保持
+                        # 硬编码的短探针窗口。
+                        n_steps_per_state=int(kwargs.get("pilot_n_steps_per_state", 10000)),
+                        potential_type=potential_type,
+                        finite_difference_delta=kwargs.get("pilot_finite_difference_delta", 0.01),
                     )
                     optimized_lambdas_2 = opt_res["lambdas_var"]
-                    window_ranges_2 = opt_res.get("window_ranges")
+                    validate_vanishing_lambda_path_invariants(optimized_lambdas_2)
+                    # [IBS_BIAS_PROTOCOL_VERSION=20] Capture the pilot's real
+                    # measured mean gradient alongside its lambda placement,
+                    # for run_all_windows to TI-warm-start f_k with later.
+                    _fresh_diag = opt_res.get("path_diagnostics") or {}
+                    stage2_pilot_lambdas = _fresh_diag.get("pilot_lambdas")
+                    _fresh_pilot_points = _fresh_diag.get("pilot_points")
+                    if _fresh_pilot_points:
+                        stage2_pilot_mean_dU_dlambda = [
+                            p.get("mean_dU_dlambda_kJ_mol") for p in _fresh_pilot_points
+                        ]
+                    # Lambda density is set by measured thermodynamic length;
+                    # consecutive thermodynamic intervals are then grouped into
+                    # few-state ensembles.  No fixed 0.5 or overlap=2 cut.
+                    window_ranges_2 = vanishing_subdomain_ranges_from_lambdas(
+                        optimized_lambdas_2,
+                        first_ensemble_target_intervals=VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS,
+                    )
+                    opt_res["window_ranges"] = window_ranges_2
+                    opt_res.setdefault("path_diagnostics", {})[
+                        "ibs_ensemble_layout"
+                    ] = "few_state_thermodynamic_subdomains"
+                    opt_res["path_diagnostics"][
+                        "schedule_design_probes_used"
+                    ] = bool(
+                        _fresh_diag.get("probe_controls_base_lambda_placement", False)
+                    )
+                    opt_res["n_states"] = len(optimized_lambdas_2)
+                    _placement_source = _fresh_diag.get(
+                        "lambda_placement_method",
+                        "unknown_vanishing_lambda_placement",
+                    )
+                    opt_res["provenance"] = {
+                        "source": _placement_source,
+                        "fixed_h_overlap_used": False,
+                        "overlap_two_windowing_used": False,
+                        "shared_endpoint_states_per_neighbor": 1,
+                    }
+                    stage2_states = len(optimized_lambdas_2)
                     os.makedirs(self.checkpoint_dir, exist_ok=True)
                     with open(preopt2_file, "w") as f:
                         json.dump({
                             "lambdas_var": optimized_lambdas_2,
                             "window_ranges": window_ranges_2,
                             "n_states": len(optimized_lambdas_2),
+                            # 🔑 [预优化缓存范围收窄] 同 Stage 1：存窄指纹
+                            # _stage2_preopt_key，不是宽指纹 _stage2_protocol_key。
+                            "protocol_key": _stage2_preopt_key,
+                            "path_protocol_version": opt_res.get("path_protocol_version"),
+                            "path_diagnostics": opt_res.get("path_diagnostics", {}),
+                            "provenance": opt_res.get("provenance", {}),
                         }, f, indent=2)
                     self._log(f"  ✓ Stage 2 优化路径已缓存")
                 except Exception as e:
-                    self._log(f"  ⚠️ Stage 2 自适应优化失败 ({e})，回退到线性路径")
-                    optimized_lambdas_2 = None
+                    raise RuntimeError(f"Stage 2 自适应优化失败，拒绝静默回退线性路径: {e}") from e
 
             should_run_stage2 = True
             if resume and stage2_status == "completed" and os.path.exists(stage2_file):
                 try:
                     with open(stage2_file, "r") as f:
                         stage2 = json.load(f)
-                    if stage2.get("n_states") == stage2_states:
+                    cached_protocol_2 = stage2.get("protocol_key")
+                    if stage2.get("n_states") != stage2_states:
+                        self._log("  ⚠️ Stage 2 结果缓存状态数不匹配，重新运行")
+                    elif cached_protocol_2 is None:
+                        # 🔑 [P0] 同 Stage 1：缺协议指纹一律 fail closed，不再"信任并跳过"。
+                        self._log("  ⚠️ Stage 2 结果缓存无协议指纹（旧版本产物），视为缓存失效，重新运行")
+                    elif cached_protocol_2 != _stage2_protocol_key:
+                        self._log(
+                            f"  ⚠️ Stage 2 结果缓存协议指纹不匹配 (缓存={cached_protocol_2}, "
+                            f"当前={_stage2_protocol_key})，拒绝静默复用，重新运行"
+                        )
+                    elif stage2.get("lambda_path_fingerprint") != self._lambda_path_fingerprint(
+                        optimized_lambdas_2, window_ranges_2
+                    ):
+                        self._log("  ⚠️ Stage 2 的 λ 内容/窗口边界指纹不匹配，重新运行")
+                    else:
+                        self._assert_reusable_stage_cache_sane(
+                            "Stage 2 (vanishing)", stage2
+                        )
                         self._log("  ♻️ 双λ Stage 2 (去VDW) 已完成，跳过")
                         should_run_stage2 = False
-                    else:
-                        self._log("  ⚠️ Stage 2 结果缓存状态数不匹配，重新运行")
                 except Exception as e:
                     self._log(f"  ⚠️ Stage 2 缓存读取失败: {e}，重新运行")
 
-            # === Sampling: parallel or sequential ===
-            _parallel_stages = kwargs.get("parallel_stages", False)
+            # === Stage 2: 精修阶段（中等步数探针，基于实测 |Δf| 精修 λ 路径/窗口边界）===
+            # 只对 Stage 2 (去VDW/vanishing) 生效：Stage 1 (去电荷) 走的是
+            # PME-REMD-MBAR 路径（见 _run_dual_lambda_stage 里 decharging 分支），
+            # 不产出 dual_window_*_coul_energies.npy，refine_stage_lambda_path_from_data
+            # 无从下手。粗扫(几千步/态) → 精修(中等步数/窗口，本节) → 生产(满步数)，
+            # 精修用独立 scratch 目录采样，绝不写入生产目录，避免被生产阶段的 resume
+            # 形状校验误判为"已采样完成"而跳过真正的生产步数。
+            # enable_lambda_refine 的拒绝已提前到 run_full_pipeline 入口（ATT-27），
+            # 走到这里时它必然为 False，不再重复判断。
 
-            if _parallel_stages and should_run_stage1 and should_run_stage2:
-                self._log("\n[双λ] 🚀 并行执行 Stage 1 (去电荷) + Stage 2 (去VDW)")
-                state_dir = os.path.join(self.checkpoint_dir, "parallel_state")
-                self._save_state_to_dir(state_dir)
+            # 🔑 [2026-07-27] `--parallel-stages` 已整体移除（上古代码）。
+            # 它此前被无条件禁用（"跨进程异常反馈尚未序列化"），所以那 149 行并行分支
+            # 与 87 行 spawn worker 都不可达；归档见
+            #   docs/archive/removed_parallel_stages.md
+            # 现在只有这一条顺序执行路径。若传了 parallel_stages 会在入口被拒绝。
 
-                _res_dir = os.path.join(self.checkpoint_dir, "parallel_results")
-                os.makedirs(_res_dir, exist_ok=True)
-                _res1 = os.path.join(_res_dir, "stage1.json")
-                _res2 = os.path.join(_res_dir, "stage2.json")
+            # === Sequential execution ===
+            if should_run_stage1:
+                self._log("\n[双λ] Stage 1: 去电荷 (λ_coul: 1→0, λ_vdw=1)")
 
-                _temp_k = self.temperature.value_in_unit(unit.kelvin)
-                _common = dict(
-                    n_states_stage1=stage1_states,
-                    n_states_stage2=stage2_states,
-                    n_steps_per_window=n_steps_per_window,
-                    steps_per_update=steps_per_update,
-                    system_type=system_type,
-                    potential_type=potential_type,
-                    dexp_params=dexp_params,
-                    enable_early_stop=enable_early_stop,
-                    boresch_params=boresch_params,
-                    enable_gradual_warmup=kwargs.get("enable_gradual_warmup", True),
-                    warmup_steps=kwargs.get("warmup_steps", 500000),
-                )
-                stage1_platform = self.platform_name
-                stage2_platform = self.platform_name
-                if str(self.platform_name).upper().startswith("CUDA"):
-                    env_stage1 = os.environ.get("IBS_STAGE1_CUDA_DEVICE")
-                    env_stage2 = os.environ.get("IBS_STAGE2_CUDA_DEVICE")
-                    if env_stage1 is not None and env_stage2 is not None and env_stage1 != env_stage2:
-                        stage1_platform = f"CUDA:{env_stage1}"
-                        stage2_platform = f"CUDA:{env_stage2}"
-                        self._log(f"  🔀 并行阶段将分别使用 CUDA 设备 {env_stage1} 和 {env_stage2}")
-                    else:
-                        self._log("  ⚠️ 检测到并行双阶段 + CUDA，但未提供两个不同 GPU；为避免上下文冲突，回退为串行执行。")
-                        _parallel_stages = False
-
-                if _parallel_stages:
-                    ctx = mp.get_context("spawn")
-                    p1 = ctx.Process(
-                        target=_run_stage_worker_process,
-                        args=(state_dir, _temp_k, stage1_platform, self.output_dir,
-                              "decharging", 1.0, 1.0,
-                              _common["n_states_stage1"], _common["n_steps_per_window"],
-                              _common["steps_per_update"], _common["system_type"],
-                              _common["potential_type"], _common["dexp_params"],
-                              optimized_lambdas_1, _common["enable_early_stop"],
-                              _common["boresch_params"], _common["enable_gradual_warmup"],
-                              _common["warmup_steps"], _res1),
-                    )
-                    p2 = ctx.Process(
-                        target=_run_stage_worker_process,
-                        args=(state_dir, _temp_k, stage2_platform, self.output_dir,
-                              "vanishing", 0.0, 1.0,
-                              _common["n_states_stage2"], _common["n_steps_per_window"],
-                              _common["steps_per_update"], _common["system_type"],
-                              _common["potential_type"], _common["dexp_params"],
-                              optimized_lambdas_2, _common["enable_early_stop"],
-                              _common["boresch_params"], _common["enable_gradual_warmup"],
-                              _common["warmup_steps"], _res2),
-                    )
-                    p1.start()
-                    p2.start()
-                    p1.join()
-                    p2.join()
-                else:
-                    _run_stage_worker_process(
-                        state_dir, _temp_k, stage1_platform, self.output_dir,
-                        "decharging", 1.0, 1.0,
-                        _common["n_states_stage1"], _common["n_steps_per_window"],
-                        _common["steps_per_update"], _common["system_type"],
-                        _common["potential_type"], _common["dexp_params"],
-                        optimized_lambdas_1, _common["enable_early_stop"],
-                        _common["boresch_params"], _common["enable_gradual_warmup"],
-                        _common["warmup_steps"], _res1,
-                    )
-                    _run_stage_worker_process(
-                        state_dir, _temp_k, stage2_platform, self.output_dir,
-                        "vanishing", 0.0, 1.0,
-                        _common["n_states_stage2"], _common["n_steps_per_window"],
-                        _common["steps_per_update"], _common["system_type"],
-                        _common["potential_type"], _common["dexp_params"],
-                        optimized_lambdas_2, _common["enable_early_stop"],
-                        _common["boresch_params"], _common["enable_gradual_warmup"],
-                        _common["warmup_steps"], _res2,
-                    )
-
-                # Check for errors
-                for _rf, _label in [(_res1, "Stage 1"), (_res2, "Stage 2")]:
-                    with open(_rf) as f:
-                        _r = json.load(f)
-                    if "error" in _r:
-                        raise RuntimeError(f"{_label} 子进程失败: {_r['error']}")
-
-                with open(_res1) as f:
-                    stage1 = json.load(f)
-                with open(_res2) as f:
-                    stage2 = json.load(f)
-
-                # Save checkpoint files
-                _s1 = {"stage": "decharging", "total_delta_G": stage1["total_delta_G"],
-                        "total_error": stage1["total_error"], "n_states": stage1_states}
-                with open(stage1_file, "w") as f:
-                    json.dump(_s1, f, indent=2)
-                self._update_stage_status(stage1_key, "completed",
-                                          {"total_delta_G": stage1["total_delta_G"]})
-
-                _s2 = {"stage": "vanishing", "total_delta_G": stage2["total_delta_G"],
-                        "total_error": stage2["total_error"], "n_states": stage2_states}
-                with open(stage2_file, "w") as f:
-                    json.dump(_s2, f, indent=2)
-                self._update_stage_status(stage2_key, "completed",
-                                          {"total_delta_G": stage2["total_delta_G"]})
-
-            else:
-                # === Sequential execution ===
-                if should_run_stage1:
-                    self._log("\n[双λ] Stage 1: 去电荷 (λ_coul: 1→0, λ_vdw=1)")
-                    stage1 = self._run_dual_lambda_stage(
+                def _run_stage1_once(_n_states, _lambdas, _ranges, _production_step_overrides=None,
+                                      _frozen_validation_step_overrides=None,
+                                      _frozen_validation_is_final_rung=None):
+                    # decharging has no probe_window_overlap_fn / sampling-repair /
+                    # IBS-bias-calibration branch, so _production_step_overrides and
+                    # _frozen_validation_step_overrides/_frozen_validation_is_final_rung
+                    # are always None here; accepted (and ignored) only so run_once()
+                    # can be called with a uniform signature regardless of stage.
+                    return self._run_dual_lambda_stage(
                         "decharging",
+                        # 🔑 完整 dual_lambda 链路此前**没有**透传这个参数，
+                        # REMDManager 于是拿默认值、预防性回退 CPU（慢 ~100×）。
+                        remd_max_resident_contexts=kwargs.get(
+                            "charging_max_resident_contexts"
+                        ),
                         fixed_lam_coul=1.0,
                         fixed_lam_vdw=1.0,
                         potential_type=potential_type,
                         dexp_params=dexp_params,
-                        n_states=stage1_states,
+                        n_states=_n_states,
                         n_steps_per_window=n_steps_per_window,
                         steps_per_update=steps_per_update,
                         system_type=system_type,
                         resume=resume,
-                        optimized_lambdas=optimized_lambdas_1,
+                        optimized_lambdas=_lambdas,
+                        window_ranges=_ranges,
                         enable_early_stop=enable_early_stop,
                         boresch_params=boresch_params,
                         enable_gradual_warmup=kwargs.get("enable_gradual_warmup", True),
                         warmup_steps=kwargs.get("warmup_steps", 500000),
-                    )
-                    stage1_save = {
-                        "stage": "decharging",
-                        "total_delta_G": stage1["total_delta_G"],
-                        "total_error": stage1["total_error"],
-                        "n_states": stage1_states,
-                    }
-                    os.makedirs(self.checkpoint_dir, exist_ok=True)
-                    with open(stage1_file, "w") as f:
-                        json.dump(stage1_save, f, indent=2)
-                    self._update_stage_status(
-                        stage1_key,
-                        "completed",
-                        {
-                            "total_delta_G": stage1["total_delta_G"],
-                        },
+                        min_bias_updates=kwargs.get("min_bias_updates", 12),
+                        max_bias_updates=kwargs.get("max_bias_updates", 50),
+                        required_consecutive_bias_updates=kwargs.get(
+                            "required_consecutive_bias_updates", 3
+                        ),
+                        max_bias_warmup_steps=kwargs.get("max_bias_warmup_steps", 500000),
+                        decharge_method=_decharge_method,
+                        shadow_bridge_lambdas=kwargs.get("shadow_bridge_lambdas"),
+                        shadow_bridge_n_steps=kwargs.get("shadow_bridge_n_steps", 200000),
+                        shadow_bridge_exchange_interval=kwargs.get("shadow_bridge_exchange_interval", 1000),
                     )
 
-                if should_run_stage2:
-                    self._log("\n[双λ] Stage 2: 去VDW (λ_coul=0, λ_vdw: 1→0)")
-                    stage2 = self._run_dual_lambda_stage(
+                stage1, stage1_states, optimized_lambdas_1, window_ranges_1 = (
+                    self._run_stage_with_overlap_autorepair(
+                        "Stage 1 (decharging)",
+                        "decharging",
+                        preopt1_file,
+                        stage1_states,
+                        optimized_lambdas_1,
+                        window_ranges_1,
+                        _run_stage1_once,
+                        protocol_key=_stage1_protocol_key,
+                        # 🔑 [defense-in-depth] 5->8：批量插边(§4)/消除
+                        # already_good 饥饿(§5) 修好之后，理论上不该再需要
+                        # 靠加大轮次上限硬扛——但一条严重碎片化的 λ 路径仍
+                        # 可能需要超过 5 轮才能彻底稳定，这里只是留个安全
+                        # 余量，不是替代上面两处真正的修复（用户明确否决了
+                        # 直接调到 10-15：那只会在真正的 bug 上继续烧 GPU）。
+                        max_repair_rounds=kwargs.get("max_overlap_repair_rounds", 8),
+                        preopt_protocol_key=_stage1_preopt_key,
+                    )
+                )
+                stage1_save = self._build_stage_cache_payload(
+                    "decharging", stage1, stage1_states, _stage1_protocol_key,
+                    optimized_lambdas_1, window_ranges_1,
+                )
+                os.makedirs(self.checkpoint_dir, exist_ok=True)
+                with open(stage1_file, "w") as f:
+                    json.dump(stage1_save, f, indent=2)
+                self._update_stage_status(
+                    stage1_key,
+                    "completed",
+                    {
+                        "total_delta_G": stage1["total_delta_G"],
+                    },
+                )
+
+            if should_run_stage2:
+                self._log("\n[双λ] Stage 2: 去VDW (λ_coul=0, λ_vdw: 1→0)")
+
+                def _run_stage2_once(_n_states, _lambdas, _ranges, _production_step_overrides=None,
+                                      _frozen_validation_step_overrides=None,
+                                      _frozen_validation_is_final_rung=None,
+                                      _resume_override=None):
+                    return self._run_dual_lambda_stage(
                         "vanishing",
+                        remd_max_resident_contexts=kwargs.get(
+                            "charging_max_resident_contexts"
+                        ),
                         fixed_lam_coul=0.0,
                         fixed_lam_vdw=1.0,
                         potential_type=potential_type,
                         dexp_params=dexp_params,
-                        n_states=stage2_states,
+                        n_states=_n_states,
                         n_steps_per_window=n_steps_per_window,
                         steps_per_update=steps_per_update,
                         system_type=system_type,
-                        resume=resume,
-                        optimized_lambdas=optimized_lambdas_2,
+                        resume=(
+                            resume
+                            if _resume_override is None
+                            else bool(_resume_override)
+                        ),
+                        optimized_lambdas=_lambdas,
+                        window_ranges=_ranges,
                         enable_early_stop=enable_early_stop,
                         boresch_params=boresch_params,
                         enable_gradual_warmup=kwargs.get("enable_gradual_warmup", True),
                         warmup_steps=kwargs.get("warmup_steps", 500000),
-                    )
-                    stage2_save = {
-                        "stage": "vanishing",
-                        "total_delta_G": stage2["total_delta_G"],
-                        "total_error": stage2["total_error"],
-                        "n_states": stage2_states,
-                    }
-                    os.makedirs(self.checkpoint_dir, exist_ok=True)
-                    with open(stage2_file, "w") as f:
-                        json.dump(stage2_save, f, indent=2)
-                    self._update_stage_status(
-                        stage2_key,
-                        "completed",
-                        {
-                            "total_delta_G": stage2["total_delta_G"],
-                        },
+                        min_bias_updates=kwargs.get("min_bias_updates", 12),
+                        max_bias_updates=kwargs.get("max_bias_updates", 50),
+                        required_consecutive_bias_updates=kwargs.get(
+                            "required_consecutive_bias_updates", 3
+                        ),
+                        max_bias_warmup_steps=kwargs.get("max_bias_warmup_steps", 500000),
+                        ibs_lse_log_residual_tolerance=kwargs.get(
+                            "ibs_lse_log_residual_tolerance", 0.5
+                        ),
+                        production_step_overrides=_production_step_overrides,
+                        frozen_validation_step_overrides=_frozen_validation_step_overrides,
+                        frozen_validation_is_final_rung=_frozen_validation_is_final_rung,
+                        pilot_lambdas=stage2_pilot_lambdas,
+                        pilot_mean_dU_dlambda=stage2_pilot_mean_dU_dlambda,
+                        final_min_ess_ratio=kwargs.get("final_min_ess_ratio", 0.05),
+                        final_min_absolute_ess=kwargs.get("final_min_absolute_ess", 50.0),
+                        final_min_decorrelated_samples=kwargs.get(
+                            "final_min_decorrelated_samples", 20
+                        ),
+                        final_max_uncertainty_kJ_mol=kwargs.get(
+                            "final_max_uncertainty_kJ_mol", 1.0
+                        ),
                     )
 
+                expected_vanishing_ranges = (
+                    vanishing_subdomain_ranges_from_lambdas(
+                        optimized_lambdas_2,
+                        first_ensemble_target_intervals=VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS,
+                    )
+                )
+                validate_vanishing_lambda_path_invariants(
+                    optimized_lambdas_2
+                )
+                validate_single_shared_boundary_ranges(
+                    expected_vanishing_ranges, len(optimized_lambdas_2)
+                )
+                normalized_vanishing_ranges = [
+                    tuple(int(x) for x in r) for r in (window_ranges_2 or [])
+                ]
+                if normalized_vanishing_ranges != expected_vanishing_ranges:
+                    raise RuntimeError(
+                        "vanishing v12 要求热力学 few-state IBS 子区间: "
+                        f"expected={expected_vanishing_ranges}, got={normalized_vanishing_ranges}. "
+                        "拒绝共享两个节点（从而重复一条 λ interval）的 legacy overlap=2、"
+                        "滑动窗口或单一 [0:K] ensemble。"
+                    )
+                vanishing_edge_ranges = [
+                    (int(start), int(end) - 1)
+                    for start, end in expected_vanishing_ranges
+                ]
+                vanishing_boundary_nodes = [
+                    int(expected_vanishing_ranges[i][0])
+                    for i in range(1, len(expected_vanishing_ranges))
+                ]
+                self._log(
+                    "  🧩 Vanishing few-state："
+                    f"λ interval 分区（半开、互不重复）={vanishing_edge_ranges}；"
+                    f"各 ensemble 使用的 λ 节点范围（半开）={expected_vanishing_ranges}；"
+                    f"共同边界节点={vanishing_boundary_nodes}。"
+                    "边界节点会在相邻 ensemble 中各出现一次以对齐自由能参考；"
+                    "未使用固定 λ=0.5，也未使用会重复一条 λ interval 的 legacy overlap=2，"
+                    "基础 ensemble 不原地拆窗/插点；若生产 coverage 补采仍失败，"
+                    "只会在独立目录新建使用现有 λ 节点的 rescue ensembles"
+                )
+                stage2 = _run_stage2_once(
+                    stage2_states,
+                    optimized_lambdas_2,
+                    expected_vanishing_ranges,
+                )
+                # Production-quality rescue is deliberately separate from
+                # warmup: only the failing production windows are extended,
+                # from their existing production checkpoint, under the same
+                # already-frozen f_k.  Good windows remain cache hits.  This
+                # never changes the lambda grid or carries warmup frames into
+                # production.
+                production_rescue_targets: Dict[int, int] = {}
+                production_rescue_rounds = max(
+                    0, int(kwargs.get("stage2_production_rescue_rounds", 2))
+                )
+                production_rescue_growth = max(
+                    1.1, float(kwargs.get("stage2_production_rescue_growth", 2.0))
+                )
+                for rescue_round in range(1, production_rescue_rounds + 1):
+                    if stage2.get("converged") is True:
+                        break
+                    failure_details = self._stage_quality_failure_details(stage2)
+                    failing_windows = sorted({
+                        int(item["window_index"])
+                        for item in failure_details
+                        if 0 <= int(item.get("window_index", -1))
+                        < len(expected_vanishing_ranges)
+                    })
+                    if not failing_windows:
+                        break
+                    for failing_window in failing_windows:
+                        old_target = int(
+                            production_rescue_targets.get(
+                                failing_window, n_steps_per_window
+                            )
+                        )
+                        production_rescue_targets[failing_window] = int(
+                            math.ceil(old_target * production_rescue_growth)
+                        )
+                    self._log(
+                        f"  🛟 Stage 2 production coverage rescue round "
+                        f"{rescue_round}/{production_rescue_rounds}: 仅追加窗口 "
+                        f"{failing_windows}，累计生产目标={production_rescue_targets}。"
+                        "沿用各窗口 production checkpoint 与已锁定 f_k；不重新学习、"
+                        "不修改 f_k、不丢弃已有生产帧。当前瓶颈："
+                        f"{self._format_stage_quality_failure_details(failure_details)}"
+                    )
+                    stage2 = _run_stage2_once(
+                        stage2_states,
+                        optimized_lambdas_2,
+                        expected_vanishing_ranges,
+                        _production_step_overrides=dict(production_rescue_targets),
+                        _resume_override=True,
+                    )
+                stage2["production_rescue_targets"] = dict(
+                    production_rescue_targets
+                )
+                # If extra samples do not improve an ESS *ratio*, the
+                # bottleneck is usually the ensemble span rather than raw
+                # frame count.  Build new, smaller overlapping ensembles on
+                # the existing immutable lambda grid in a separate rescue
+                # directory.  Original production files remain untouched;
+                # the failed ensemble is replaced only in the combined
+                # analysis cover.
+                if (
+                    stage2.get("converged") is not True
+                    and bool(kwargs.get("stage2_enable_bridge_rescue", True))
+                ):
+                    failure_details = self._stage_quality_failure_details(stage2)
+                    failing_windows = sorted({
+                        int(item["window_index"])
+                        for item in failure_details
+                        if 0 <= int(item.get("window_index", -1))
+                        < len(expected_vanishing_ranges)
+                    })
+                    rescue_ranges = self._build_vanishing_rescue_ranges(
+                        failing_windows, expected_vanishing_ranges
+                    )
+                    if rescue_ranges:
+                        rescue_plan_id = hashlib.sha256(
+                            json.dumps(rescue_ranges, sort_keys=True).encode("utf-8")
+                        ).hexdigest()[:12]
+                        rescue_output_dir = os.path.join(
+                            self.output_dir,
+                            "vanishing_rescue",
+                            rescue_plan_id,
+                        )
+                        rescue_checkpoint_dir = os.path.join(
+                            self.checkpoint_dir,
+                            "vanishing_rescue",
+                            rescue_plan_id,
+                        )
+                        rescue_steps = int(
+                            kwargs.get(
+                                "stage2_bridge_production_steps",
+                                n_steps_per_window,
+                            )
+                        )
+                        self._log(
+                            "  🌉 Stage 2 追加采样后仍未通过：保留原生产数据，"
+                            f"为失败窗口 {failing_windows} 新建 immutable rescue "
+                            f"ensembles={rescue_ranges}（仅使用现有 λ 节点，"
+                            f"{rescue_steps} production steps/ensemble）。"
+                            "新 ensemble 各自预热一次后锁定自己的 f_k；生产阶段"
+                            "仍禁止修改 f_k。"
+                        )
+                        self._run_dual_lambda_stage(
+                            "vanishing_rescue",
+                            remd_max_resident_contexts=kwargs.get(
+                                "charging_max_resident_contexts"
+                            ),
+                            fixed_lam_coul=0.0,
+                            fixed_lam_vdw=1.0,
+                            potential_type=potential_type,
+                            dexp_params=dexp_params,
+                            n_states=stage2_states,
+                            n_steps_per_window=rescue_steps,
+                            steps_per_update=steps_per_update,
+                            system_type=system_type,
+                            resume=True,
+                            optimized_lambdas=optimized_lambdas_2,
+                            window_ranges=rescue_ranges,
+                            enable_early_stop=enable_early_stop,
+                            boresch_params=boresch_params,
+                            enable_gradual_warmup=kwargs.get(
+                                "enable_gradual_warmup", True
+                            ),
+                            warmup_steps=kwargs.get("warmup_steps", 500000),
+                            min_bias_updates=kwargs.get("min_bias_updates", 12),
+                            max_bias_updates=kwargs.get("max_bias_updates", 50),
+                            required_consecutive_bias_updates=kwargs.get(
+                                "required_consecutive_bias_updates", 3
+                            ),
+                            max_bias_warmup_steps=kwargs.get(
+                                "max_bias_warmup_steps", 500000
+                            ),
+                        ibs_lse_log_residual_tolerance=kwargs.get(
+                            "ibs_lse_log_residual_tolerance", 0.5
+                            ),
+                            pilot_lambdas=stage2_pilot_lambdas,
+                            pilot_mean_dU_dlambda=stage2_pilot_mean_dU_dlambda,
+                            final_min_ess_ratio=kwargs.get(
+                                "final_min_ess_ratio", 0.05
+                            ),
+                            final_min_absolute_ess=kwargs.get(
+                                "final_min_absolute_ess", 50.0
+                            ),
+                            final_min_decorrelated_samples=kwargs.get(
+                                "final_min_decorrelated_samples", 20
+                            ),
+                            final_max_uncertainty_kJ_mol=kwargs.get(
+                                "final_max_uncertainty_kJ_mol", 1.0
+                            ),
+                            allow_partial_vanishing_rescue=True,
+                            stage_output_dir_override=rescue_output_dir,
+                            checkpoint_dir_override=rescue_checkpoint_dir,
+                        )
+
+                        full_lambdas_coul = [0.0] * len(optimized_lambdas_2)
+                        original_outputs = self._load_ibs_window_outputs_from_dir(
+                            os.path.join(self.output_dir, "vanishing"),
+                            expected_vanishing_ranges,
+                            full_lambdas_coul,
+                            optimized_lambdas_2,
+                            checkpoint_dir=self.checkpoint_dir,
+                            excluded_local_windows=set(failing_windows),
+                            window_label_prefix="original_window",
+                        )
+                        rescue_outputs = self._load_ibs_window_outputs_from_dir(
+                            rescue_output_dir,
+                            rescue_ranges,
+                            full_lambdas_coul,
+                            optimized_lambdas_2,
+                            checkpoint_dir=rescue_checkpoint_dir,
+                            window_index_offset=10_000,
+                            window_label_prefix="rescue_window",
+                        )
+                        combined_outputs = original_outputs + rescue_outputs
+                        stage2 = solve_stage_integrated(
+                            window_outputs=combined_outputs,
+                            kt=(
+                                unit.MOLAR_GAS_CONSTANT_R * self.temperature
+                            ).value_in_unit(unit.kilojoule_per_mole),
+                            stage_name="vanishing",
+                            final_min_ess_ratio=kwargs.get(
+                                "final_min_ess_ratio", 0.05
+                            ),
+                            final_min_absolute_ess=kwargs.get(
+                                "final_min_absolute_ess", 50.0
+                            ),
+                            final_min_decorrelated_samples=kwargs.get(
+                                "final_min_decorrelated_samples", 20
+                            ),
+                            final_max_uncertainty_kJ_mol=kwargs.get(
+                                "final_max_uncertainty_kJ_mol", 1.0
+                            ),
+                        )
+                        stage2["production_rescue_targets"] = dict(
+                            production_rescue_targets
+                        )
+                        stage2["immutable_bridge_rescue"] = {
+                            "replaced_original_windows_in_analysis": failing_windows,
+                            "rescue_ranges": [list(x) for x in rescue_ranges],
+                            "output_dir": rescue_output_dir,
+                            "plan_id": rescue_plan_id,
+                        }
+                        stage2["lambda_endpoint_diagnostics"] = (
+                            _stage_lambda_endpoint_diagnostics(
+                                "vanishing",
+                                full_lambdas_coul,
+                                optimized_lambdas_2,
+                            )
+                        )
+                        stage2["n_states"] = int(stage2_states)
+                        # 🔑 [P1-15] 这条路径绕过了 _run_ibs_stage，此前从不填
+                        # diagnostics，导致合并结果落盘时 diagnostics={}，
+                        # 逐段 ΔG/σ、converged、ESS 与 rescue provenance 全部丢失。
+                        self._populate_stage_diagnostics(stage2)
+                        self._log(
+                            "  🧮 Stage 2 rescue 合并求解完成："
+                            f"ΔG={stage2.get('total_delta_G', float('nan')):.4f} ± "
+                            f"{stage2.get('total_error', float('nan')):.4f} kJ/mol，"
+                            f"converged={stage2.get('converged')}；"
+                            f"被 rescue 取代的原始窗口={failing_windows}，"
+                            f"rescue ranges={rescue_ranges}；"
+                            f"min_overlap={stage2.get('min_overlap')}，"
+                            f"min_occupancy_normalized={stage2.get('min_occupancy_normalized')}，"
+                            f"min_decorrelated_samples={stage2.get('min_decorrelated_samples')}，"
+                            f"max_endpoint_uncertainty="
+                            f"{stage2.get('max_endpoint_uncertainty_kJ_mol')} kJ/mol"
+                        )
+                        for _seg in (stage2.get("covariance_chain_segments") or []):
+                            self._log(
+                                "     · 段 src_window="
+                                f"{_seg.get('source_window_index', _seg.get('window_index'))} "
+                                f"λ[{_seg.get('join_lambda_index')}→{_seg.get('end_lambda_index')}] "
+                                f"ΔG={_seg.get('delta_G_kJ_mol'):.4f} "
+                                f"σ={_seg.get('uncertainty_kJ_mol'):.4f} kJ/mol"
+                            )
+                window_ranges_2 = expected_vanishing_ranges
+                # Direct few-state subdomain execution bypasses the retired
+                # overlap-autorepair wrapper, so retain its non-mutating
+                # postcondition gate explicitly.
+                self._assert_stage_result_sane("Stage 2 (vanishing)", stage2)
+                stage2_save = self._build_stage_cache_payload(
+                    "vanishing", stage2, stage2_states, _stage2_protocol_key,
+                    optimized_lambdas_2, window_ranges_2,
+                )
+                os.makedirs(self.checkpoint_dir, exist_ok=True)
+                with open(stage2_file, "w") as f:
+                    json.dump(stage2_save, f, indent=2)
+                self._update_stage_status(
+                    stage2_key,
+                    "completed",
+                    {
+                        "total_delta_G": stage2["total_delta_G"],
+                    },
+                )
+
             sampling = {
-                "total_delta_G": stage1["total_delta_G"] + stage2["total_delta_G"],
-                "total_error": np.sqrt(stage1["total_error"] ** 2 + stage2["total_error"] ** 2),
+                "total_delta_G": (
+                    float((stage0 or {}).get("attachment_delta_G_kJ_mol", 0.0) or 0.0)
+                    + stage1["total_delta_G"]
+                    + stage2["total_delta_G"]
+                ),
+                "total_error": np.sqrt(
+                    float((stage0 or {}).get("attachment_error_kJ_mol", 0.0) or 0.0) ** 2
+                    + stage1["total_error"] ** 2
+                    + stage2["total_error"] ** 2
+                ),
+                "stage0": stage0,
                 "stage1": stage1,
                 "stage2": stage2,
             }
             
             # ✅ 【修复 1】延迟状态更新：确保 Boresch 修正与结果落盘成功后再标记 completed
-            try:
+            if system_type == "solvent" and not _has_valid_boresch_restraint(boresch_params):
+                correction = {"delta_g_rest": 0.0, "error": 0.0}
+            else:
                 correction = self.apply_boresch_correction(
                     boresch_params,
                     autoload_from_disk=kwargs.get("allow_disk_boresch_autoload", True),
                 )
-            except Exception as e:
-                self._log(f"  🚨 Boresch 修正流程抛出未捕获异常: {e}")
-                self._log(f"  → 请检查 boresch_params.json 格式或几何奇异性。本次 ΔG_rest 暂设为 0.0")
-                correction = {"delta_g_rest": 0.0, "error": 0.0}
                 
-            final = self.compute_final_results(sampling, correction)
+            final = self.compute_final_results(sampling, correction, system=self.system)
+            # 🔑 落盘的 final_results.json 必须带上本次运行的协议指纹，否则下次
+            # --resume 时最上层的 "status==completed" 早退检查（见上面）无从校验，
+            # 只能保守地拒绝复用——这里补写，就能在协议不变的情况下正常复用。
+            final["protocol_key"] = _build_top_level_protocol_key()
+            with open(os.path.join(self.output_dir, "final_results.json"), "w") as f:
+                json.dump(final, f, indent=2, cls=NumpyEncoder)
             self.results["final"] = final
-            
+
             # 仅当最终结果成功生成后，才标记阶段完成
             self._update_stage_status(
                 sampling_key,
@@ -2493,20 +6954,23 @@ class ABFEPipeline:
                 "total_error": sample_result["total_error"],
             }
 
-            try:
+            if system_type == "solvent" and not _has_valid_boresch_restraint(boresch_params):
+                correction = {"delta_g_rest": 0.0, "error": 0.0}
+            else:
                 correction = self.apply_boresch_correction(
                     boresch_params,
                     autoload_from_disk=kwargs.get("allow_disk_boresch_autoload", True),
                 )
-            except Exception as e:
-                self._log(f"  🚨 Boresch 修正异常: {e}")
-                correction = {"delta_g_rest": 0.0, "error": 0.0}
 
             final = self.compute_final_results(
                 sampling,
                 correction,
+                system=self.system,
                 decoupling_scheme="single_lambda",
             )
+            final["protocol_key"] = _build_top_level_protocol_key()
+            with open(os.path.join(self.output_dir, "final_results.json"), "w") as f:
+                json.dump(final, f, indent=2, cls=NumpyEncoder)
             self.results["final"] = final
             return final
         elif decoupling_scheme == "2d_diagonal":
@@ -2573,16 +7037,20 @@ class ABFEPipeline:
             sampling = {"total_delta_G": sample_result["total_delta_G"],
                         "total_error": sample_result["total_error"]}
 
-            try:
+            if system_type == "solvent" and not _has_valid_boresch_restraint(boresch_params):
+                correction = {"delta_g_rest": 0.0, "error": 0.0}
+            else:
                 correction = self.apply_boresch_correction(
                     boresch_params,
                     autoload_from_disk=kwargs.get("allow_disk_boresch_autoload", True),
                 )
-            except Exception as e:
-                self._log(f"  🚨 Boresch 修正异常: {e}")
-                correction = {"delta_g_rest": 0.0, "error": 0.0}
 
-            final = self.compute_final_results(sampling, correction, decoupling_scheme="2d_diagonal")
+            final = self.compute_final_results(
+                sampling, correction, system=self.system, decoupling_scheme="2d_diagonal"
+            )
+            final["protocol_key"] = _build_top_level_protocol_key()
+            with open(os.path.join(self.output_dir, "final_results.json"), "w") as f:
+                json.dump(final, f, indent=2, cls=NumpyEncoder)
             self.results["final"] = final
             return final
         elif decoupling_scheme == "2d_geodesic":
@@ -2657,16 +7125,20 @@ class ABFEPipeline:
             sampling = {"total_delta_G": sample_result["total_delta_G"],
                         "total_error": sample_result["total_error"]}
 
-            try:
+            if system_type == "solvent" and not _has_valid_boresch_restraint(boresch_params):
+                correction = {"delta_g_rest": 0.0, "error": 0.0}
+            else:
                 correction = self.apply_boresch_correction(
                     boresch_params,
                     autoload_from_disk=kwargs.get("allow_disk_boresch_autoload", True),
                 )
-            except Exception as e:
-                self._log(f"  🚨 Boresch 修正异常: {e}")
-                correction = {"delta_g_rest": 0.0, "error": 0.0}
 
-            final = self.compute_final_results(sampling, correction, decoupling_scheme="2d_geodesic")
+            final = self.compute_final_results(
+                sampling, correction, system=self.system, decoupling_scheme="2d_geodesic"
+            )
+            final["protocol_key"] = _build_top_level_protocol_key()
+            with open(os.path.join(self.output_dir, "final_results.json"), "w") as f:
+                json.dump(final, f, indent=2, cls=NumpyEncoder)
             self.results["final"] = final
             return final
         else:
@@ -2742,19 +7214,102 @@ class TraditionalABFEPipeline:
         n_steps: int = 500000,
         exchange_interval: int = 1000,
         resume: bool = False,
+        boresch_params: Optional[Dict] = None,
+        potential_type: str = "softcore",
     ) -> Dict:
         print(f"\n{'='*60}\n🧪 开始 {stage_name} 腿解耦\n{'='*60}")
+        if len(lambdas_coul) != len(lambdas_vdw):
+            raise ValueError("传统 REMD 腿的 lambdas_coul/lambdas_vdw 长度必须一致。")
+        if potential_type == "dexp":
+            raise NotImplementedError(
+                "traditional / PME-REMD 路径当前未实现 DEXP 或混合 softcore 替代势；"
+                "如需 DEXP，请使用 IBS dual_lambda。"
+            )
         stage_output_dir = os.path.join(self.output_dir, stage_name)
         os.makedirs(stage_output_dir, exist_ok=True)
         traj_files = _expected_remd_traj_files(stage_output_dir, stage_name, len(lambdas_coul))
         u_kn_path = os.path.join(self.output_dir, f"{stage_name}_u_kn.npy")
+        n_k_path = u_kn_path + ".n_k.npy"
+        u_kn_meta_path = u_kn_path + ".meta.json"
+        remd_meta_path = os.path.join(stage_output_dir, f"{stage_name}_remd.meta.json")
+        sampling_fingerprint = _protocol_fingerprint({
+            "kind": "traditional_remd_sampling",
+            "stage_name": stage_name,
+            "system_xml_sha256": _system_xml_hash(self.system),
+            "topology_sha256": _topology_hash(self.topology),
+            "initial_positions_sha256": _positions_hash(self.positions),
+            "ligand_indices": [int(i) for i in self.ligand_indices],
+            "lambdas_coul": _lambda_signature(lambdas_coul),
+            "lambdas_vdw": _lambda_signature(lambdas_vdw),
+            "temperature_K": float(self.temperature),
+            "n_steps": int(n_steps),
+            "exchange_interval": int(exchange_interval),
+            "boresch_params": boresch_params,
+            "potential_type": potential_type,
+            "code_sha256": _code_hash(),
+        })
+        analysis_fingerprint = _protocol_fingerprint({
+            "kind": "traditional_mbar_u_kn",
+            "sampling_fingerprint_sha256": sampling_fingerprint["sha256"],
+            "traditional_lj_lrc_protocol_version": (
+                TRADITIONAL_LJ_LRC_PROTOCOL_VERSION
+            ),
+            "pme_decharge_model_version": PME_DECHARGE_MODEL_VERSION,
+        })
 
         if resume and os.path.exists(u_kn_path):
-            print("  ♻️ 检测到已有 u_kn，跳过 REMD 采样与重算，直接求解 MBAR")
-            u_kn = np.load(u_kn_path)
-            return TraditionalMBARAnalyzer(temperature=self.temperature).solve(u_kn)
+            cached_meta = None
+            if os.path.exists(u_kn_meta_path):
+                try:
+                    with open(u_kn_meta_path, "r", encoding="utf-8") as handle:
+                        cached_meta = json.load(handle)
+                except Exception as exc:
+                    print(f"  ⚠️ u_kn 元数据不可读 ({exc})，拒绝复用")
+            if (
+                cached_meta is not None
+                and cached_meta.get("analysis_fingerprint") == analysis_fingerprint
+                and os.path.exists(n_k_path)
+            ):
+                u_kn = np.load(u_kn_path)
+                n_k = np.load(n_k_path)
+                if (
+                    u_kn.ndim == 2
+                    and u_kn.shape[0] == len(lambdas_coul)
+                    and int(np.sum(n_k)) == u_kn.shape[1]
+                    and np.all(np.isfinite(u_kn))
+                ):
+                    print("  ♻️ u_kn 完整协议指纹一致，跳过 REMD 与能量重算")
+                    analyzer = TraditionalMBARAnalyzer(temperature=self.temperature)
+                    analyzer._last_n_k = n_k
+                    analyzer._last_lj_lrc_metadata = cached_meta.get(
+                        "traditional_lj_lrc", {}
+                    )
+                    result = analyzer.solve(u_kn)
+                    result.setdefault("diagnostics", {})["traditional_lj_lrc"] = (
+                        analyzer._last_lj_lrc_metadata
+                    )
+                    return result
+                print("  ⚠️ u_kn/n_k 内容或形状无效，拒绝复用")
+            else:
+                print("  ⚠️ u_kn 缺少或不匹配完整协议指纹，拒绝复用")
 
-        if resume and _all_remd_trajs_valid(stage_output_dir, stage_name, len(lambdas_coul), min_frames=1):
+        expected_frames = max(1, _expected_remd_frame_count(n_steps))
+        remd_fingerprint_matches = False
+        if resume and os.path.exists(remd_meta_path):
+            try:
+                with open(remd_meta_path, "r", encoding="utf-8") as handle:
+                    remd_fingerprint_matches = (
+                        json.load(handle).get("sampling_fingerprint")
+                        == sampling_fingerprint
+                    )
+            except Exception as exc:
+                print(f"  ⚠️ REMD 元数据不可读 ({exc})，拒绝复用轨迹")
+        if resume and remd_fingerprint_matches and _all_remd_trajs_valid(
+            stage_output_dir,
+            stage_name,
+            len(lambdas_coul),
+            min_frames=expected_frames,
+        ):
             print("  ♻️ 检测到完整 REMD DCD，视为采样已完成，跳过 REMD 继续离线 MBAR")
         else:
             remd = REMDManager(
@@ -2768,12 +7323,20 @@ class TraditionalABFEPipeline:
                 temperature=self.temperature,
                 platform_name=self.platform_name,
                 output_dir=stage_output_dir,
+                boresch_params=boresch_params,
             )
             traj_files = remd.run(
                 n_steps=n_steps,
                 exchange_interval=exchange_interval,
                 stage_name=stage_name,
             )
+            with open(remd_meta_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {"sampling_fingerprint": sampling_fingerprint},
+                    handle,
+                    indent=2,
+                    ensure_ascii=False,
+                )
 
         analyzer = TraditionalMBARAnalyzer(temperature=self.temperature)
         u_kn = analyzer.compute_u_kn(
@@ -2786,23 +7349,59 @@ class TraditionalABFEPipeline:
             topology=self.topology,
             reference_positions=self.positions,
             reference_box_vectors=self.box_vectors,
+            boresch_params=boresch_params,
         )
-        np.save(os.path.join(self.output_dir, f"{stage_name}_u_kn.npy"), u_kn)
-        return analyzer.solve(u_kn)
+        np.save(u_kn_path, u_kn)
+        np.save(n_k_path, analyzer._last_n_k)
+        with open(u_kn_meta_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "analysis_fingerprint": analysis_fingerprint,
+                    "sampling_fingerprint": sampling_fingerprint,
+                    "traditional_lj_lrc": analyzer._last_lj_lrc_metadata,
+                },
+                handle,
+                indent=2,
+                ensure_ascii=False,
+            )
+        result = analyzer.solve(u_kn)
+        result.setdefault("diagnostics", {})["traditional_lj_lrc"] = (
+            analyzer._last_lj_lrc_metadata
+        )
+        return result
 
     def run_full(
         self,
         n_lambda: int = 12,
         n_steps_per_leg: int = 500000,
         boresch_correction: float = 0.0,
+        boresch_params: Optional[Dict] = None,
+        potential_type: str = "softcore",
+        resume: bool = False,
     ) -> Dict:
         lambdas_coul = np.linspace(1.0, 0.0, n_lambda).tolist()
         lambdas_vdw = [1.0] * n_lambda
-        res_coul = self.run_leg("decharging", lambdas_coul, lambdas_vdw, n_steps_per_leg, resume=False)
+        res_coul = self.run_leg(
+            "decharging",
+            lambdas_coul,
+            lambdas_vdw,
+            n_steps_per_leg,
+            resume=resume,
+            boresch_params=boresch_params,
+            potential_type=potential_type,
+        )
 
         lambdas_coul = [0.0] * n_lambda
         lambdas_vdw = np.linspace(1.0, 0.0, n_lambda).tolist()
-        res_vdw = self.run_leg("vanishing", lambdas_coul, lambdas_vdw, n_steps_per_leg, resume=False)
+        res_vdw = self.run_leg(
+            "vanishing",
+            lambdas_coul,
+            lambdas_vdw,
+            n_steps_per_leg,
+            resume=resume,
+            boresch_params=boresch_params,
+            potential_type=potential_type,
+        )
 
         dg_leg = res_coul["delta_G"] + res_vdw["delta_G"]
         err_leg = np.sqrt(res_coul["error"]**2 + res_vdw["error"]**2)
@@ -2814,6 +7413,12 @@ class TraditionalABFEPipeline:
             "delta_G_leg_kJ_mol": dg_leg,
             "error_leg_kJ_mol": err_leg,
             "boresch_correction_kJ_mol": boresch_correction,
+            # ✅ dg_total = dg_leg + boresch_correction：本函数的 delta_G_total_kJ_mol
+            # 恒已把传入的 boresch_correction 加总在内。调用方（如 runabfe.py 的
+            # traditional 模式）若显式传 boresch_correction=0.0 并在外层单独扣减
+            # Boresch，则本文件里的 boresch_correction_kJ_mol 会是 0，如实反映"未包含"；
+            # 但只要调用方传入非零值，此标记即为 True，不应再对 delta_G_total_kJ_mol 二次扣减。
+            "boresch_correction_already_included_in_total_delta_G": True,
             "delta_G_total_kJ_mol": dg_total,
             "delta_G_total_kcal_mol": dg_total / 4.184,
         }
