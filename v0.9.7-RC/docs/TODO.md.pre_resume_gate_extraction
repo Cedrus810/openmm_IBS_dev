@@ -1,0 +1,165 @@
+# 当前行动清单
+
+更新：2026-07-26。此文件合并并取代根目录旧 `todo2.txt` 审查报告和 `todolist.md`；历史原文保存在 [archive/todolist-2026-07-20.md](archive/todolist-2026-07-20.md)，审计证据见 [status/AUDIT_STATUS.md](status/AUDIT_STATUS.md)。
+
+## P0/P1
+
+以下问题已逐项核对当前源码。打勾项已实现 CPU/OpenMM 回归测试；DEXP 项因已有全新 DEXP 版本，按本轮约定暂不修改。
+
+### P0
+
+- [x] **P0-1：主 System 缓存身份已改为 fail closed。** manifest 绑定 GRO/TOP/include 依赖、配体名和构建参数，并校验 System XML、ligand indices、mmCIF topology、box vectors 的哈希；预平衡 DCD 只有在调用方提供完整匹配 fingerprint 时才允许自动读取。
+
+- [x] **P0-2：溶剂腿缓存已绑定配体和力场身份。** v3 manifest 绑定 complex-leg/配体拓扑、参数、FFXML/TOP include 身份及产物哈希；旧缓存或身份不匹配时重建。
+
+- [x] **P0-3：Boresch 再平衡已使用 triclinic minimum-image 距离。** 周期盒缺失、非有限或奇异时直接拒绝计算，不再用裸笛卡尔跨盒距离改写 `r0`。
+
+- [x] **P0-4：会令两个锚点重叠的 IBS 坐标移动已删除。** Boresch 安全检查只以 minimum-image 几何诊断，不再修改配体坐标。
+
+- [x] **P0-5：IBS energy/bias/base 已作为不可分割三文件处理。** 保存时记录协议、shape、帧数及逐文件 SHA-256；resume、skip、pipeline 收集和最终分析均要求三者存在、等长、有限且 manifest 完全匹配，不再补零或按最短长度截断。
+
+- [ ] **P0-6：DEXP 拟合模型与生产模型身份不一致。** Orb fitter 拟合全局 `alpha_vdw`、`beta_vdw`、`r0_vdw`、`A_fit`、`B_fit`、`offset_c0` 模型；生产 `DEXPSurrogatePotential` 却使用 pair-specific `sigma_ij`/`epsilon_ij` 形式，`from_dict()` 不读取 `r0_vdw`、`A_fit`、`B_fit`。CLI 加载拟合 JSON 后会静默丢弃核心拟合参数；必须统一拟合与生产 Hamiltonian，或拒绝不兼容参数文件。
+
+- [ ] **P0-7：DEXP 的 `offset_c0` 被保存但未进入能量。** fitter 计算并保存最优常数偏移，`DEXPSurrogatePotential` 也保存该字段，但 `build_expression()` 不使用它。该偏移随 λ 消失时会贡献自由能差，不能随意忽略，也不能按 pair 重复加入；需以每系统一次、λ-dependent constant 的正确形式进入能量或明确从拟合模型移除。
+
+- [ ] **P0-8：IBS 阶段可在预期窗口完全缺失时静默求解不完整自由能曲线。** `get_stage_data_for_analysis()` 遇到某个预期窗口连 energies 文件都没有时直接 `continue`；`GlobalMBARAnalyzer.solve_stage_integrated()` 的完整性判据只比较 `local_results` 与已经被加载的 `valid_windows`，因此缺少首/末窗口而剩余窗口内部仍连通时，仍可能返回 `converged=True`。必须在求解前要求 `self.ranges` 中每个窗口都有完整且经 manifest 验证的 energies/bias/base 三文件，结果中同时记录 expected/loaded/covered window 与 λ 端点，并补“缺首窗口/缺末窗口均 fail closed”的回归测试；不能只依赖 `_assert_stage_result_sane()` 检查求解器返回值。
+
+### P1
+
+- [ ] **P1-8：IBS 中 DEXP 的 cutoff/switch 配置失效。** DEXP 配置为 `cutoff_distance=0.70`、`switch_width=0.20`，但 `_create_softcore_force()` 无条件使用 1.2 nm cutoff/1.0 nm switch，未区分 DEXP。生产势、成本和拟合范围不一致；必须传递并验证 DEXP 专用参数。
+
+- [x] **P1-9：共炼金反离子选择已改为 PBC-aware bulk-water 判据。** 以离子到最近溶质的 minimum-image 距离为主评分、水配位为次评分；配体电荷在取整前必须落在整数容差内，并支持用多个单价反离子中和多价配体。
+
+- [x] **P1-10：全局 TMBAR 最终误差已使用端点差协方差。** 每个独立窗口段直接读取 `dDelta_f[join,end]`，总误差合并独立段方差；结果中记录 chain segments 和误差方法，uncertainty hard gate 使用同一估计。
+
+- [x] **P1-11：预平衡 fingerprint 已绑定起始坐标、盒子和请求步数。** 所有生产调用点都传入完整身份；缺少完整 fingerprint 时 `load_native_system()` 保守加载初始缓存而不自动读取 DCD。
+
+- [x] **P1-12：溶剂盒已改用 OpenMM `padding=1.5 nm` 语义。** `box_size_nm` 仅保留为带警告的兼容参数，不再作为默认构盒公式。
+
+- [ ] **P1-13：生产灾难回退没有同步记录或截断采样历史分支。** 主循环只把坐标回退到最近一次完整力检查的 `production_pos_backup`，却保留该备份之后已经写入的 `energy_history`/`bias_history`/`base_energy_history`，随后从旧坐标和新随机速度重新生成另一条分支。触发灾难的当前帧在 `collect_energies()` 之前已被跳过，并未直接混入数据；真实问题是被放弃分支与重启分支共享祖先，却仍被当作一条连续时间序列做自相关子采样，相关性和有效样本数口径不再可靠。每次刷新备份时应同时保存三份 history 长度并在回退时同步截断，或显式保存独立 trajectory segment 并按多段轨迹估计相关性；三份历史必须始终同长。
+
+- [ ] **P1-14：首次预平衡前没有修复输入坐标中已经跨盒的分子。** `runabfe.center_system_rigidly()` 只把整个体系做一次质心平移，却有调用点随后声称“分子完整性修复完毕”；真正的 `mdtraj.image_molecules()` 位于 `ABFEPipeline.run_full_pipeline()` 的预平衡之后，因此 GRO/缓存里已经跨边界的分子会先进入最小化或 NPT 预平衡。应在第一次创建 Context/最小化/预平衡之前，依据拓扑和 triclinic 盒矢量把每个连通分子仅作整分子周期平移，再做全体系/配体居中；禁止旋转、缩放或改变任何分子内相对坐标，修复失败时 fail closed，不能回退为仅质心平移后继续。
+
+## 附件审查复核
+
+以下项来自用户提供的审查文本；打勾项已经源码核实并关闭或修复，未打勾项仍保留为待办。
+
+GitHub 跟踪（均为未验证审查发现）：
+
+- P0：ATT-01 [#42](https://github.com/Cedrus810/openmm_IBS_dev/issues/42)、ATT-02 [#43](https://github.com/Cedrus810/openmm_IBS_dev/issues/43)、ATT-03 [#44](https://github.com/Cedrus810/openmm_IBS_dev/issues/44)、ATT-04 [#45](https://github.com/Cedrus810/openmm_IBS_dev/issues/45)、ATT-05 [#46](https://github.com/Cedrus810/openmm_IBS_dev/issues/46)、ATT-06/07 [#47](https://github.com/Cedrus810/openmm_IBS_dev/issues/47)。
+- P1：ATT-08 [#48](https://github.com/Cedrus810/openmm_IBS_dev/issues/48)、ATT-09 [#49](https://github.com/Cedrus810/openmm_IBS_dev/issues/49)、ATT-10 [#50](https://github.com/Cedrus810/openmm_IBS_dev/issues/50)、ATT-11 [#51](https://github.com/Cedrus810/openmm_IBS_dev/issues/51)、ATT-12 [#52](https://github.com/Cedrus810/openmm_IBS_dev/issues/52)、ATT-13 [#53](https://github.com/Cedrus810/openmm_IBS_dev/issues/53)、ATT-14 [#54](https://github.com/Cedrus810/openmm_IBS_dev/issues/54)、ATT-15 [#55](https://github.com/Cedrus810/openmm_IBS_dev/issues/55)、ATT-16 [#56](https://github.com/Cedrus810/openmm_IBS_dev/issues/56)、ATT-17 [#57](https://github.com/Cedrus810/openmm_IBS_dev/issues/57)、ATT-18 [#58](https://github.com/Cedrus810/openmm_IBS_dev/issues/58)。
+- P2：ATT-19 [#59](https://github.com/Cedrus810/openmm_IBS_dev/issues/59)、ATT-20 [#60](https://github.com/Cedrus810/openmm_IBS_dev/issues/60)、ATT-21 [#61](https://github.com/Cedrus810/openmm_IBS_dev/issues/61)、ATT-22 [#62](https://github.com/Cedrus810/openmm_IBS_dev/issues/62)、ATT-23 [#63](https://github.com/Cedrus810/openmm_IBS_dev/issues/63)、ATT-24 [#64](https://github.com/Cedrus810/openmm_IBS_dev/issues/64)、ATT-25 [#65](https://github.com/Cedrus810/openmm_IBS_dev/issues/65)、ATT-26 [#66](https://github.com/Cedrus810/openmm_IBS_dev/issues/66)；ATT-27 复用 [#35](https://github.com/Cedrus810/openmm_IBS_dev/issues/35)，ATT-28 复用 [#41](https://github.com/Cedrus810/openmm_IBS_dev/issues/41)。
+
+### P0 候选
+
+- [x] **ATT-01：附件结论不成立。** `scan_boresch_1d_pes` 是 `OrbScanner` 的实例方法，`self` 并非孤立顶层参数。
+
+- [x] **ATT-02：附件结论不成立。** 当前常量拼写为 `VANISHING_TARGET_INTERVALS_PER_ENSEMBLE`，模块可导入且相关路径测试通过。
+
+- [x] **ATT-03：单 GPU Context 无界常驻风险已消除。** GPU/OpenCL 默认上限为一个常驻 Context；当前交换实现超过上限时会在创建任何 GPU Context 前回退 CPU，避免 OOM 后补救。若构建仍发生 GPU OOM，也会先释放已建 Context 再回退；这是安全优先的实现，尚未实现 GPU 分批加速。
+
+- [ ] **ATT-04：并行 stage worker 的 spawn 循环导入/CUDA 顶层副作用。** `_run_stage_worker_process()` 中重新 import `abfe_pipeline`，可能触发 `ibs_engine`/`abfe_core` 顶层 CUDA 初始化。需审查 spawn 安全性，并移除导入期设备初始化或建立明确的子进程初始化边界。
+
+- [x] **ATT-05：同 P0-5，已实现三文件 manifest 与 fail-closed 验证。**
+
+- [ ] **ATT-06：DEXP 拟合模型与生产 Hamiltonian 不同。** 附件称 Orb fitter 的全局 `r0_vdw`、`A_fit`、`B_fit` 等参数未被生产 `DEXPSurrogatePotential.from_dict()` 读取，造成拟合参数静默丢失。需统一拟合/生产模型或拒绝不兼容拟合 JSON。
+
+- [ ] **ATT-07：DEXP `offset_c0` 未进入能量。** 附件称 offset 被拟合、保存但未在 `build_expression()` 使用；若其随 λ 消失会贡献 ΔG。需要以每系统一次的 λ-dependent constant 正确纳入，或从拟合契约中显式移除。
+
+### P1 候选
+
+- [x] **ATT-08：附件结论不成立。** `topology` 用于核对 complex topology 中的配体原子数与 `ligand_indices`，是输入一致性 hard gate。
+
+- [ ] **ATT-09：热力学循环符号存在四处独立实现。** 附件认为当前公式均正确，但 `main()`、`run_traditional_mode()`、`run_post_analysis()`、`run_full_abfe_loop()` 分散维护。应提取单一、带解析 toy-cycle 测试的绑定自由能组合函数。
+
+- [x] **ATT-10：能量查询失败 hard gate 已实现。** 连续失败上限 5、总失败上限 10、失败率上限 1%；生产结束时即使样本不足 100 帧也检查失败率，并把 attempts/failures/reasons/limits 写入诊断。
+
+- [ ] **ATT-11：`GeometricRestraintEstimator` 的 0.22 nm 键距离阈值。** 该阈值可能漏掉边界 S-S/配位键并误判近距离非键接触；需以元素/拓扑信息或可配置、经验证的判据替代单一几何阈值。
+
+- [x] **ATT-12：vanishing 路径/子域范围契约已明确。** v20 采用确定性的 17 点 `λ=x²` 锚点、λ≈1 四点增密及两个数据驱动 Fisher bridge，并固定为六个单边界共享窗口；pilot 只可插入 bridge，不得移动/删除平方锚点。
+
+- [x] **ATT-13：TMBAR history 已设有界契约。** 最多保留 200 个 minibatch，保存累计丢弃计数，恢复时只校验并加载最新有界后缀。
+
+- [ ] **ATT-14：IBS 中 DEXP cutoff/switch 配置可能被硬编码覆盖。** 附件称 `_create_softcore_force()` 对 DEXP 也无条件写 1.2 nm cutoff/1.0 nm switch，而配置为 0.70/0.20。需验证参数实际传递并禁止配置/生产势不一致。
+
+- [x] **ATT-15：同 P1-9，PBC/bulk-water、电荷整数性及多价配体均已修复。**
+
+- [x] **ATT-16：同 P1-10，已使用逐窗口段的直接 `dDelta_f`。**
+
+- [x] **ATT-17：同 P1-11，完整预平衡身份已接入所有生产调用点。**
+
+- [x] **ATT-18：同 P1-12，已改用 `addSolvent(..., padding=1.5 nm)`。**
+
+### P2/发布质量候选
+
+- [ ] **ATT-19：核心物理单元测试覆盖不足。** 附件列出软核势 λ=0/0.5/1、DEXP LJ-matching、IBS log-sum-exp 稳定性、窗口拼接连续性、PBC、离子计数、resume、并行 worker 等缺口；需先盘点现有测试，形成最小覆盖矩阵。
+
+- [ ] **ATT-20：缺少已知 ABFE 基准的端到端集成验证。** 需为公开基准体系建立可复现脚本，覆盖中性/带电配体、两腿循环闭合与实验对比；在此之前不能以发布级精度宣称生产结果。
+
+- [ ] **ATT-21：文档、安装/API/输入格式与独立热力学循环说明不足。** 附件称 README、用户手册、API、输入格式、部署安装及 cycle 推导文档缺失；需先核对现有 `docs/`，再补齐用户面向的最小文档集。
+
+- [ ] **ATT-22：缺少 CI/CD、静态检查与格式化。** 建立 GitHub Actions（或等价 CI）、pytest、ruff/flake8、mypy、black/isort 等分层门槛，并避免把需要 GPU 的作业误放入普通 CI。
+
+- [ ] **ATT-23：运行恢复与资源保护能力不足。** 评估 GPU OOM 的降级/Context 回收、长任务中断后的窗口重跑判定、磁盘空间预检和运行时估计；必须保持科学状态不可变与 fail-closed 原则。
+
+- [ ] **ATT-24：输入验证不足。** 补充 ligand 残基名、TOP include、配体原子数/Boresch 可构建性、最小盒尺寸（至少 2×cutoff）等明确的前置报错和诊断。
+
+- [ ] **ATT-25：协议版本矩阵缺少统一注册/迁移工具。** 当前多处独立 protocol version 需要统一注册表、缓存指纹组合规则、迁移说明和兼容性测试，避免单个版本更新遗漏缓存失效。
+
+- [ ] **ATT-26：`run_all_windows` 过长且职责混杂。** 将约 1200 行流程逐步拆分为恢复/建系/最小化与 Boresch/预热状态机/生产采样/落盘与 checkpoint 等独立方法，并保持行为回归覆盖。
+
+- [ ] **ATT-27：死代码与不可达逻辑清理。** 包括已标记 deprecated 的 overlap autorepair、withdrawn 协议注释、未调用扫描函数和立即 raise 的 `enable_lambda_refine`；与 E-03 协同，先归档再移除可执行死路径。
+
+- [ ] **ATT-28：日志实现分裂。** 多个模块分别覆盖 `print` 或使用标准 `logging`，可能导致导入顺序相关行为；需统一结构化日志入口、级别和文件/控制台策略。
+
+本轮从旧 `todo2.txt` 复核并完成：
+
+- [x] A-01/A-02：传统 REMD LRC 生产者当前采用 v3 逐 λ、switching+softcore-aware `r^-6/r^-12` 系数，并使用 worker 实际读取的 `lj_tail_lrc_coeff_kj_mol` 键。
+- [x] A-03：PME context 查询失败后改用 cutoff/tolerance 闭式派生 alpha，不再读取自动 PME 下通常为零的静态参数。
+- [x] A-04：`tmbar_history` 上限设为 200 个 minibatch，checkpoint 保存丢弃计数，resume 只恢复最新有界后缀。
+- [x] A-09：`ensure_owned_system` 的早退路径先验证底层 OpenMM 对象仍可访问。
+- [x] A-11：base 能量第一次失败时立即检查坐标和力；发现非有限值则停止 MD。
+- [x] A-18：JSON checkpoint 在原子替换前执行 flush/fsync；POSIX 额外同步父目录。
+- [x] λ-19：真实 v18 运行暴露 Fisher 排点把去耦尾部压缩为 `0.9225, 0.8382, 0`。v20 生产路径固定保留 17 点 `λ=x²` 和 λ≈1 的 4 个增密点，再由 pilot 只插入 2 个 Fisher bridge，形成 23 态、6 个单边界共享窗口，总采样槽位 28。
+- [x] SOLV-ION：溶剂腿从隐式纯水/仅中和改为显式 0.15 M NaCl，并保留必要中和离子；当前 v3 manifest 绑定完整输入身份，旧的 `0 Na / 0 Cl` 或旧身份缓存自动失效重建。
+
+上述修改仍需按 [status/VALIDATION_MATRIX.md](status/VALIDATION_MATRIX.md) 的环境门槛补齐完整依赖/GPU 证据。
+
+### 2026-07-26 本地验证
+
+- [x] 全量 CPU/OpenMM pytest：119 passed。
+- [x] 新增 `test_todo_verified_fixes.py`，覆盖三文件 manifest、缺文件/篡改/长度不符拒绝、1%/10 帧/连续 5 帧能量失败阈值、triclinic minimum-image、PBC 反离子与多价/非整数电荷、预平衡 pose/box/steps 身份、主缓存 topology hash，以及 REMD 在创建 GPU Context 前的上限回退。
+- [x] DEXP 相关 P0-6/P0-7、P1-8、ATT-06/07/14、P2-14 本轮明确不改，等待新 DEXP 版本接入后按新实现重新审计。
+- [ ] 仍需真实 CUDA/GPU 与生产体系运行证据；本轮测试没有宣称完成这些环境验收。
+
+## 当前运行验证
+
+- [ ] V-01：用全新 GPU 进程 resume vanishing 窗口 0，确认进入冻结验证/production，而不是再次 `IBSWarmupConvergenceError`。复现和验收细节见 [handoffs/VANISHING_WINDOW0_HANDOFF.md](handoffs/VANISHING_WINDOW0_HANDOFF.md) 与验证矩阵 `VAL-GPU-007`。
+- [ ] V-02：运行传统 `single_lambda`/REMD 的小型固定盒回归，确认每个 task 收到有限、长度等于态数的 v3 LRC 数组，且 worker 的每帧修正等于 `coeff[k]/V(t)`；GitHub [#32](https://github.com/Cedrus810/openmm_IBS_dev/issues/32)。
+- [ ] V-03：在 OpenMM/CUDA 环境重新生成 Stage 2 v20 路径，确认旧 v18/v19 缓存失效；输出须为 23 个唯一 λ、两个 Fisher bridge、末边 `0.00390625→0`、窗口槽位 28，并完成前两个 vanishing 窗口的真实启动验证；见验证矩阵 `VAL-TEST-004`。
+- [ ] V-04：重建溶剂腿缓存并核对 `solvent_cache_manifest.json` 与 `topology_solvent.cif`：Na/Cl 均非零、目标浓度 0.15 M，随后确认旧溶剂腿 checkpoint 因 System 指纹变化被拒绝；GitHub [#34](https://github.com/Cedrus810/openmm_IBS_dev/issues/34)。
+
+## P2 工程工作
+
+- [ ] E-01：production ESS 自动修复的第二调用点迁移到 per-state trajectory bank；对应 GitHub `openmm_IBS_dev#1`。
+- [ ] E-02：为 pilot 热力学长度探测设计安全的长探针重测机制；对应 GitHub `openmm_IBS_dev#29`。不得复活已废弃的 fixed-H adjacent-overlap 自动变异环。
+- [ ] E-03：把 `_run_stage_with_overlap_autorepair` 中早退之后约 900 行不可达旧变异逻辑移出生产类；保留历史可读性时放入归档文档，不得保留可被误激活的可执行代码；GitHub [#35](https://github.com/Cedrus810/openmm_IBS_dev/issues/35)。
+- [ ] E-04：为膜/各向异性盒实现并验证适用的有限尺寸静电修正；当前 `apbs_correction.py` 对纵横比大于 1.10 的盒子应继续 fail closed；GitHub [#36](https://github.com/Cedrus810/openmm_IBS_dev/issues/36)。
+- [x] **P2-13：LSE 默认容差已统一为 0.5。** engine、pipeline、complex/solvent CLI 调用路径和 `abfe_config.json` 不再显式覆盖为 0.25。
+- [ ] **P2-14：DEXP 最终结果谎报 LJ LRC 已应用。** IBS 构建 DEXP 时明确不附加 LRC，但 `final_results.json` 无条件声称 `lj_long_range_dispersion_correction.applied=true`。必须把 DEXP 标为未应用/不适用，或仅在实际附加修正且有证据时记录为 applied。
+
+## P2/P3 科学与稳健性评估
+
+- [ ] R-01：量化 Boresch `k(1-cos(delta))` 角度/二面角势相对纯谐波解析释放公式的非谐性误差；`GeometricRestraintEstimator` 当前又以纯谐波关系 `kBT/var` 估力常数，而现有 harmonicity 诊断只报警、不阻断。需用解析积分或数值积分给出误差界，并基于实际涨落宽度确定可审计的 hard gate；“涨落 >15°”和“偏差 1–3 kJ/mol”目前没有被本仓库证据定量证实，不能先把它们写成硬阈值，也不能在有依据前直接改生产公式；GitHub [#37](https://github.com/Cedrus810/openmm_IBS_dev/issues/37)。
+- [ ] R-02：用真实 bridge 数据重新标定 Shadow-Coulomb 的窗口数和 overlap 阈值；GitHub [#38](https://github.com/Cedrus810/openmm_IBS_dev/issues/38)。
+- [ ] R-03：评估 `refine_stage_lambda_path_by_overlap` 的点 ESS 插点启发式；它目前不在 `non_mutating_v1` 生产路径上；GitHub [#39](https://github.com/Cedrus810/openmm_IBS_dev/issues/39)。
+- [ ] R-04：评估 ACE softcore 分母 `1e-6` floor、pilot metric 最小样本数、PBC 重居中对 Boresch 几何的影响；GitHub [#40](https://github.com/Cedrus810/openmm_IBS_dev/issues/40)。
+- [ ] R-05：统一 warning/stdout 日志，并评估 DEXP 多随机种子优化；均不改变当前数值定义；GitHub [#41](https://github.com/Cedrus810/openmm_IBS_dev/issues/41)。
+
+## 复核关闭（不再作为待办）
+
+- [x] A-05：`gauss_coul` 在当前 `dexp_experiment.py` 中按 fit mode 参与 `delta_gauss_replacement`，并非“构建后从未使用”；旧报告已过时。
+- [x] A-07：裁剪后的 Boresch 力常数同时用于实际施力和解析修正；原始轨迹只是估计器输入，旧报告所称“施力与修正使用不同 k”不成立。裁剪仍会留下显式诊断。
+- [x] A-12：各向异性 APBS 目前是明确不支持并 fail closed，不是静默错误；功能扩展保留为 E-04。
+- [x] A-14/A-17/A-19：属于开发期缓存语义、数值敏感性或日志体验，不是已确认的生产数值缺陷；归入 R-04/R-05 或不再单列。
+- [x] 2026-07-26 新清单中的其余六项未形成新的生产缺陷：传统 Beutler LRC 对固定盒 NVT 可作为逐态常数离线补入，体积明显变化时现有代码已 fail closed；`addSolvent(padding=1.5 nm)` 的最小立方盒边长为 3.0 nm，不会因“小配体”低于 2×1.2 nm cutoff；主窗口与 production checkpoint manifest 均已绑定 `lambda_shield`；vanishing 度规插值前后均用运行时有限性/严格单调检查，不是仅开发期 `assert`；base-energy 连续失败计数在每次成功查询时重置，清空 `energy_buffer` 不应打断“连续查询”语义；旧窗口 remap 逻辑虽未比较目标步数，但当前 `non_mutating_v1` 生产路径不可达，且 `run_all_windows` 的独立 resume gate 会拒绝 `n_steps_per_window_effective` 低于当前预算的缓存。

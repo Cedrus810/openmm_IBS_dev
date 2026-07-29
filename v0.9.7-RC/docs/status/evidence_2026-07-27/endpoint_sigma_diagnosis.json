@@ -1,0 +1,1216 @@
+{
+  "run_dir": "/home/ruigengji/ABFE_IBS/Atenolol-rank11/output_lrc_fix",
+  "temperature_K": 300.0,
+  "A1_reproduce": {
+    "coverage_diagnostics": {
+      "input_window_indices": [
+        0,
+        1,
+        2,
+        4,
+        5,
+        10000,
+        10001
+      ],
+      "valid_window_indices": [
+        0,
+        1,
+        2,
+        4,
+        5,
+        10000,
+        10001
+      ],
+      "solved_window_indices": [
+        0,
+        1,
+        2,
+        4,
+        5,
+        10000,
+        10001
+      ],
+      "dropped_window_indices": [],
+      "covered_lambda_indices": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22
+      ],
+      "covered_lambda_index_first": 0,
+      "covered_lambda_index_last": 22,
+      "n_covered_lambda_indices": 23,
+      "note": "求解器只能证明它积分了这些 λ 索引，无法证明它们就是该 stage 的完整路径——'预期窗口是否全部产出数据'必须在 loader 出口用 _assert_expected_windows_all_loaded 判定。"
+    },
+    "total_delta_G": 145.90847168207642,
+    "total_error": 1.384443322336141,
+    "endpoint_error_after_offset": 1.384443322336141,
+    "covariance_chain_segments": [
+      {
+        "window_index": 0,
+        "source_window_index": 0,
+        "join_lambda_index": 0,
+        "end_lambda_index": 4,
+        "delta_G_kJ_mol": 76.28422639073081,
+        "uncertainty_kJ_mol": 0.9339715337337055
+      },
+      {
+        "window_index": 1,
+        "source_window_index": 1,
+        "join_lambda_index": 4,
+        "end_lambda_index": 7,
+        "delta_G_kJ_mol": 25.44148116832917,
+        "uncertainty_kJ_mol": 0.8462611932640411
+      },
+      {
+        "window_index": 2,
+        "source_window_index": 2,
+        "join_lambda_index": 7,
+        "end_lambda_index": 11,
+        "delta_G_kJ_mol": 17.688140007031404,
+        "uncertainty_kJ_mol": 0.32557881465991534
+      },
+      {
+        "window_index": 3,
+        "source_window_index": 10000,
+        "join_lambda_index": 11,
+        "end_lambda_index": 13,
+        "delta_G_kJ_mol": 5.861320339490229,
+        "uncertainty_kJ_mol": 0.24960564486533918
+      },
+      {
+        "window_index": 4,
+        "source_window_index": 10001,
+        "join_lambda_index": 13,
+        "end_lambda_index": 15,
+        "delta_G_kJ_mol": 5.195286427691698,
+        "uncertainty_kJ_mol": 0.2126329645996375
+      },
+      {
+        "window_index": 5,
+        "source_window_index": 4,
+        "join_lambda_index": 15,
+        "end_lambda_index": 19,
+        "delta_G_kJ_mol": 9.391635034273733,
+        "uncertainty_kJ_mol": 0.33721074303694704
+      },
+      {
+        "window_index": 6,
+        "source_window_index": 5,
+        "join_lambda_index": 19,
+        "end_lambda_index": 22,
+        "delta_G_kJ_mol": 6.0463823145293425,
+        "uncertainty_kJ_mol": 0.03152894469539445
+      }
+    ],
+    "total_error_method": "independent_window_segment_variances_using_direct_dDelta_f",
+    "offset_error_contribution": 6.917549743032208,
+    "converged": true,
+    "min_overlap": 0.4851948394810641,
+    "min_overlap_threshold": 0.05,
+    "min_overlap_method": "per_window_mixture_coverage_ess_ratio_common_mode_removed",
+    "ess_gate_protocol_version": 2,
+    "min_occupancy_normalized": 0.527241212354111,
+    "min_occupancy_normalized_threshold": 0.5,
+    "min_absolute_ess": 26.31284239976273,
+    "min_absolute_ess_threshold": null,
+    "min_absolute_ess_gate_retired_reason": "absolute_ess == min_ess_ratio * n_frames_decorrelated 恒等，不是独立证据；给同一个量配两个阈值会让 ratio 阈值失效（final_min_absolute_ess=50 在 N_decorrelated=114 时等价于要求 ratio>=0.44）。改由 min_decorrelated_samples 与 max_endpoint_uncertainty_kJ_mol 分别承担样本量与精度这两份正交证据。",
+    "raw_min_overlap": 0.011847992051120122,
+    "raw_min_absolute_ess": 1.2914311335720934,
+    "max_common_mode_log_sigma_kT": 2.3453588445660545,
+    "min_decorrelated_samples": 52,
+    "min_decorrelated_samples_threshold": 20,
+    "max_endpoint_uncertainty_kJ_mol": 0.9339715337337055,
+    "max_endpoint_uncertainty_kJ_mol_threshold": 1.0,
+    "lambda_spacing_max_step_kJ_mol": 26.778894109340676,
+    "window_overlap_diagnostics": [
+      {
+        "window_index": 0,
+        "window_label": "original_window_0",
+        "window_range": [
+          0,
+          5
+        ],
+        "lambdas": [
+          0,
+          1,
+          2,
+          3,
+          4
+        ],
+        "lambdas_coul": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "lambdas_vdw": [
+          1.0,
+          0.9230089181937715,
+          0.8538466563309642,
+          0.7930538927968828,
+          0.7373940656616108
+        ],
+        "min_ess_ratio": 0.5060161999954371,
+        "ess_ratio_per_lambda": {
+          "0": 0.5387282108822088,
+          "1": 0.8014021402793314,
+          "2": 0.8739594109148143,
+          "3": 0.8098687301416556,
+          "4": 0.5060161999954371
+        },
+        "absolute_ess": 26.31284239976273,
+        "min_occupancy_normalized": 0.9481307980178127,
+        "mixture_occupancy_normalized": [
+          1.0407363242816676,
+          0.951156301350419,
+          0.9481307980178127,
+          0.9756959632448231,
+          1.0842806131052782
+        ],
+        "n_frames_decorrelated": 52,
+        "ess_gate_protocol_version": 2,
+        "ess_gate_metric": "mixture_coverage_ess_common_mode_removed",
+        "raw_min_ess_ratio": 0.20722127151530043,
+        "raw_min_absolute_ess": 10.775506118795622,
+        "raw_ess_ratio_per_lambda": {
+          "0": 0.24233303983097737,
+          "1": 0.37658485399187164,
+          "2": 0.28987144281560845,
+          "3": 0.21446908567350548,
+          "4": 0.20722127151530043
+        },
+        "top1pct_raw_weight": [
+          0.1958720777187062,
+          0.10711369012572082,
+          0.1751171841292714,
+          0.23633552732828103,
+          0.2195348187312915
+        ],
+        "common_mode_log_sigma_kT": 1.0234067069287989,
+        "common_mode_log_mean_kJ_mol": 8.36072960524535,
+        "reweighting_quality_error": null,
+        "statistical_inefficiency": 19.575649636198676,
+        "statistical_inefficiency_worst_state": 0,
+        "endpoint_diff_uncertainty_kJ_mol": 0.9339715337337055
+      },
+      {
+        "window_index": 1,
+        "window_label": "original_window_1",
+        "window_range": [
+          4,
+          8
+        ],
+        "lambdas": [
+          4,
+          5,
+          6,
+          7
+        ],
+        "lambdas_coul": [
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "lambdas_vdw": [
+          0.7373940656616108,
+          0.6848828273013132,
+          0.6385915279325989,
+          0.5956079435096497
+        ],
+        "min_ess_ratio": 0.4851948394810641,
+        "ess_ratio_per_lambda": {
+          "4": 0.7294744391247938,
+          "5": 0.9398585930212141,
+          "6": 0.8058852460298527,
+          "7": 0.4851948394810641
+        },
+        "absolute_ess": 32.99324908471236,
+        "min_occupancy_normalized": 0.6712441577551151,
+        "mixture_occupancy_normalized": [
+          1.518492466964448,
+          1.020593381465093,
+          0.7896699938153445,
+          0.6712441577551151
+        ],
+        "n_frames_decorrelated": 68,
+        "ess_gate_protocol_version": 2,
+        "ess_gate_metric": "mixture_coverage_ess_common_mode_removed",
+        "raw_min_ess_ratio": 0.07713144513167396,
+        "raw_min_absolute_ess": 5.244938268953829,
+        "raw_ess_ratio_per_lambda": {
+          "4": 0.12620762705067382,
+          "5": 0.08942509088087855,
+          "6": 0.07713144513167396,
+          "7": 0.08010218120373522
+        },
+        "top1pct_raw_weight": [
+          0.22227688597667572,
+          0.3548692716424447,
+          0.3797694084672287,
+          0.3210932092442481
+        ],
+        "common_mode_log_sigma_kT": 1.4097466257934652,
+        "common_mode_log_mean_kJ_mol": 9.373630512353426,
+        "reweighting_quality_error": null,
+        "statistical_inefficiency": 14.803860057530231,
+        "statistical_inefficiency_worst_state": 0,
+        "endpoint_diff_uncertainty_kJ_mol": 0.8462611932640411
+      },
+      {
+        "window_index": 2,
+        "window_label": "original_window_2",
+        "window_range": [
+          7,
+          12
+        ],
+        "lambdas": [
+          7,
+          8,
+          9,
+          10,
+          11
+        ],
+        "lambdas_coul": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "lambdas_vdw": [
+          0.5956079435096497,
+          0.5544822667534879,
+          0.5152379925205295,
+          0.4778390575389583,
+          0.441611452047198
+        ],
+        "min_ess_ratio": 0.5207088929401984,
+        "ess_ratio_per_lambda": {
+          "7": 0.7889247569167382,
+          "8": 0.9559055336127812,
+          "9": 0.9297301894659555,
+          "10": 0.756879722737505,
+          "11": 0.5207088929401984
+        },
+        "absolute_ess": 53.63301597284043,
+        "min_occupancy_normalized": 0.527241212354111,
+        "mixture_occupancy_normalized": [
+          1.6901129881941659,
+          1.2119680523924097,
+          0.8965905847819672,
+          0.674087162277346,
+          0.527241212354111
+        ],
+        "n_frames_decorrelated": 103,
+        "ess_gate_protocol_version": 2,
+        "ess_gate_metric": "mixture_coverage_ess_common_mode_removed",
+        "raw_min_ess_ratio": 0.03353776826038572,
+        "raw_min_absolute_ess": 3.4543901308197293,
+        "raw_ess_ratio_per_lambda": {
+          "7": 0.048463588255183807,
+          "8": 0.03659318158837619,
+          "9": 0.03370567065736896,
+          "10": 0.03353776826038572,
+          "11": 0.03448654998159205
+        },
+        "top1pct_raw_weight": [
+          0.3816626370925369,
+          0.43890759441852006,
+          0.45655712942204973,
+          0.45798108755194955,
+          0.45194076336150235
+        ],
+        "common_mode_log_sigma_kT": 1.6559612169839681,
+        "common_mode_log_mean_kJ_mol": 9.617665398271944,
+        "reweighting_quality_error": null,
+        "statistical_inefficiency": 19.523587374115923,
+        "statistical_inefficiency_worst_state": 4,
+        "endpoint_diff_uncertainty_kJ_mol": 0.32557881465991534
+      },
+      {
+        "window_index": 10000,
+        "window_label": "rescue_window_0",
+        "window_range": [
+          11,
+          14
+        ],
+        "lambdas": [
+          11,
+          12,
+          13
+        ],
+        "lambdas_coul": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "lambdas_vdw": [
+          0.441611452047198,
+          0.4101871210204696,
+          0.37937769652875314
+        ],
+        "min_ess_ratio": 0.9448653055114605,
+        "ess_ratio_per_lambda": {
+          "11": 0.9567404042415045,
+          "12": 0.9985351748340314,
+          "13": 0.9448653055114605
+        },
+        "absolute_ess": 60.471379552733474,
+        "min_occupancy_normalized": 0.870333500736264,
+        "mixture_occupancy_normalized": [
+          1.1357445538349409,
+          0.9939219454287951,
+          0.870333500736264
+        ],
+        "n_frames_decorrelated": 64,
+        "ess_gate_protocol_version": 2,
+        "ess_gate_metric": "mixture_coverage_ess_common_mode_removed",
+        "raw_min_ess_ratio": 0.11017755829469777,
+        "raw_min_absolute_ess": 7.051363730860658,
+        "raw_ess_ratio_per_lambda": {
+          "11": 0.13594017783539775,
+          "12": 0.1185644114070739,
+          "13": 0.11017755829469777
+        },
+        "top1pct_raw_weight": [
+          0.2845266589968659,
+          0.3161576756876954,
+          0.3275049907035186
+        ],
+        "common_mode_log_sigma_kT": 1.86221433560411,
+        "common_mode_log_mean_kJ_mol": 10.879292339919305,
+        "reweighting_quality_error": null,
+        "statistical_inefficiency": 7.869258340202441,
+        "statistical_inefficiency_worst_state": 0,
+        "endpoint_diff_uncertainty_kJ_mol": 0.24960564486533918
+      },
+      {
+        "window_index": 10001,
+        "window_label": "rescue_window_1",
+        "window_range": [
+          13,
+          16
+        ],
+        "lambdas": [
+          13,
+          14,
+          15
+        ],
+        "lambdas_coul": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "lambdas_vdw": [
+          0.37937769652875314,
+          0.3494792859360132,
+          0.3197317600069161
+        ],
+        "min_ess_ratio": 0.9705597054490455,
+        "ess_ratio_per_lambda": {
+          "13": 0.9839074421854049,
+          "14": 0.9987936830327465,
+          "15": 0.9705597054490455
+        },
+        "absolute_ess": 105.79100789394596,
+        "min_occupancy_normalized": 0.755534907330474,
+        "mixture_occupancy_normalized": [
+          1.2780803823704636,
+          0.9663847102990624,
+          0.755534907330474
+        ],
+        "n_frames_decorrelated": 109,
+        "ess_gate_protocol_version": 2,
+        "ess_gate_metric": "mixture_coverage_ess_common_mode_removed",
+        "raw_min_ess_ratio": 0.027336591184545938,
+        "raw_min_absolute_ess": 2.9796884391155074,
+        "raw_ess_ratio_per_lambda": {
+          "13": 0.030931648406706362,
+          "14": 0.0287697972988887,
+          "15": 0.027336591184545938
+        },
+        "top1pct_raw_weight": [
+          0.48155255551494897,
+          0.5182301150588103,
+          0.5431643505199267
+        ],
+        "common_mode_log_sigma_kT": 2.2660419767336504,
+        "common_mode_log_mean_kJ_mol": 12.590937803091437,
+        "reweighting_quality_error": null,
+        "statistical_inefficiency": 4.614819826432709,
+        "statistical_inefficiency_worst_state": 2,
+        "endpoint_diff_uncertainty_kJ_mol": 0.2126329645996375
+      },
+      {
+        "window_index": 4,
+        "window_label": "original_window_4",
+        "window_range": [
+          15,
+          20
+        ],
+        "lambdas": [
+          15,
+          16,
+          17,
+          18,
+          19
+        ],
+        "lambdas_coul": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "lambdas_vdw": [
+          0.3197317600069161,
+          0.2894447420218245,
+          0.25898444647255525,
+          0.22774165582124237,
+          0.19617150743267622
+        ],
+        "min_ess_ratio": 0.9441353141312792,
+        "ess_ratio_per_lambda": {
+          "15": 0.9441353141312792,
+          "16": 0.9917573554741483,
+          "17": 0.9984736124275839,
+          "18": 0.9824089745559935,
+          "19": 0.9576190204403021
+        },
+        "absolute_ess": 69.86601324571465,
+        "min_occupancy_normalized": 0.9235955262308627,
+        "mixture_occupancy_normalized": [
+          1.0827603436332152,
+          1.0385757371065516,
+          0.9969839630586147,
+          0.9580844299707558,
+          0.9235955262308627
+        ],
+        "n_frames_decorrelated": 74,
+        "ess_gate_protocol_version": 2,
+        "ess_gate_metric": "mixture_coverage_ess_common_mode_removed",
+        "raw_min_ess_ratio": 0.04794097370000752,
+        "raw_min_absolute_ess": 3.5476320538005566,
+        "raw_ess_ratio_per_lambda": {
+          "15": 0.04794097370000752,
+          "16": 0.05506273164111952,
+          "17": 0.06136195193144277,
+          "18": 0.06633583525666631,
+          "19": 0.06968292882801691
+        },
+        "top1pct_raw_weight": [
+          0.5087307659463489,
+          0.46752053410021904,
+          0.4358921063887859,
+          0.4129988630575836,
+          0.398052354553722
+        ],
+        "common_mode_log_sigma_kT": 2.247348543479406,
+        "common_mode_log_mean_kJ_mol": 13.39530617541048,
+        "reweighting_quality_error": null,
+        "statistical_inefficiency": 13.573096360986005,
+        "statistical_inefficiency_worst_state": 0,
+        "endpoint_diff_uncertainty_kJ_mol": 0.33721074303694704
+      },
+      {
+        "window_index": 5,
+        "window_label": "original_window_5",
+        "window_range": [
+          19,
+          23
+        ],
+        "lambdas": [
+          19,
+          20,
+          21,
+          22
+        ],
+        "lambdas_coul": [
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "lambdas_vdw": [
+          0.19617150743267622,
+          0.15517994476050945,
+          0.1000485162943067,
+          0.0
+        ],
+        "min_ess_ratio": 0.9880271658593176,
+        "ess_ratio_per_lambda": {
+          "19": 0.9880271658593176,
+          "20": 0.9994068130953812,
+          "21": 0.9977208018970506,
+          "22": 0.9926486462320533
+        },
+        "absolute_ess": 107.69496107866561,
+        "min_occupancy_normalized": 0.9957705241071684,
+        "mixture_occupancy_normalized": [
+          1.0015163131735476,
+          1.0025410705602864,
+          1.0001720921589978,
+          0.9957705241071684
+        ],
+        "n_frames_decorrelated": 109,
+        "ess_gate_protocol_version": 2,
+        "ess_gate_metric": "mixture_coverage_ess_common_mode_removed",
+        "raw_min_ess_ratio": 0.011847992051120122,
+        "raw_min_absolute_ess": 1.2914311335720934,
+        "raw_ess_ratio_per_lambda": {
+          "19": 0.012149109662054418,
+          "20": 0.011932056955948641,
+          "21": 0.011847992051120122,
+          "22": 0.011862477319113848
+        },
+        "top1pct_raw_weight": [
+          0.8680334435121567,
+          0.8759901559569209,
+          0.8791127205239037,
+          0.8785474929288252
+        ],
+        "common_mode_log_sigma_kT": 2.3453588445660545,
+        "common_mode_log_mean_kJ_mol": 13.367166240497673,
+        "reweighting_quality_error": null,
+        "statistical_inefficiency": 7.3531660395664,
+        "statistical_inefficiency_worst_state": 0,
+        "endpoint_diff_uncertainty_kJ_mol": 0.03152894469539445
+      }
+    ],
+    "statistical_inefficiency_per_window": [
+      19.575649636198676,
+      14.803860057530231,
+      19.523587374115923,
+      7.869258340202441,
+      4.614819826432709,
+      13.573096360986005,
+      7.3531660395664
+    ],
+    "method": "Local-TMBAR covariance-chain (ESS-overlap-checked)",
+    "uncertainty_note": "总误差对每个独立窗口直接读取连接态到新增端点的 dDelta_f，并合并独立窗口段方差；同一窗口内的端点协方差因此不会重复丢失。converged 同时要求 ESS ratio、绝对 ESS、去相关样本数、端点差不确定度四项达标。不同窗口来自独立采样，未假设跨窗口协方差。",
+    "f_k": [
+      -48.587468595679034,
+      -21.808574486338358,
+      -1.120224282820115,
+      14.827504013115496,
+      27.696757795051766,
+      37.98469110891689,
+      46.16047820754118,
+      53.138238963380935,
+      57.73158842675239,
+      62.19400492978621,
+      66.55340923113818,
+      70.82637897041235,
+      73.78771621494036,
+      76.68769930990258,
+      79.28890978052631,
+      81.88298573759428,
+      84.33375764207172,
+      86.73409143487322,
+      89.07854972168332,
+      91.274620771868,
+      93.2622714838015,
+      95.50708448105695,
+      97.32100308639734
+    ],
+    "df_k": [
+      0.6116269698841434,
+      0.4450522675846601,
+      0.5414016072892518,
+      0.6619924836540896,
+      0.6014466280444514,
+      1.4222785590875047,
+      1.4784968575086523,
+      1.205258835394651,
+      2.2177175656650014,
+      2.2493745281901525,
+      2.2513679961041024,
+      1.668724839711477,
+      2.521851287289872,
+      1.9774896321086186,
+      3.183924588333664,
+      2.4163018465845485,
+      3.6543052044933786,
+      3.6327945153285377,
+      3.618626655375218,
+      2.8684541001404016,
+      4.7330187769273095,
+      4.736603093809205,
+      4.73598204998222
+    ],
+    "lambdas": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22
+    ],
+    "stage": "vanishing",
+    "_reproduced": true,
+    "_replaced_windows": [
+      3
+    ]
+  },
+  "A2_repeat_measurement": {
+    "lambda_range": [
+      11,
+      15
+    ],
+    "replaced_window": 3,
+    "rescue_ranges": [
+      [
+        11,
+        14
+      ],
+      [
+        13,
+        16
+      ]
+    ],
+    "comparisons": [
+      {
+        "method": "① 各自单独求解",
+        "old_delta_G": 8.877894518257879,
+        "old_sigma": 1.4933745810691323,
+        "new_delta_G": 11.056606767181927,
+        "new_sigma": 0.3278959523737256,
+        "difference": 2.1787122489240485,
+        "z": 1.424974291261866
+      },
+      {
+        "method": "② 全链内该区间段",
+        "old_delta_G": 8.877894518257879,
+        "old_sigma": 1.4933745810691323,
+        "new_delta_G": 11.056606767181927,
+        "new_sigma": 0.3278959523737256,
+        "difference": 2.1787122489240485,
+        "z": 1.424974291261866
+      },
+      {
+        "method": "③ 全链总 ΔG",
+        "old_delta_G": 143.72975943315237,
+        "old_sigma": 2.009809741383862,
+        "new_delta_G": 145.90847168207642,
+        "new_sigma": 1.384443322336141,
+        "difference": 2.1787122489240573,
+        "z": 0.8927335485726544
+      }
+    ],
+    "primary_z": 0.8927335485726544,
+    "old_solo": {
+      "coverage_diagnostics": {
+        "input_window_indices": [
+          3
+        ],
+        "valid_window_indices": [
+          3
+        ],
+        "solved_window_indices": [
+          3
+        ],
+        "dropped_window_indices": [],
+        "covered_lambda_indices": [
+          11,
+          12,
+          13,
+          14,
+          15
+        ],
+        "covered_lambda_index_first": 11,
+        "covered_lambda_index_last": 15,
+        "n_covered_lambda_indices": 5,
+        "note": "求解器只能证明它积分了这些 λ 索引，无法证明它们就是该 stage 的完整路径——'预期窗口是否全部产出数据'必须在 loader 出口用 _assert_expected_windows_all_loaded 判定。"
+      },
+      "total_delta_G": 8.877894518257879,
+      "total_error": 1.4933745810691323,
+      "endpoint_error_after_offset": 1.4933745810691323,
+      "covariance_chain_segments": [
+        {
+          "window_index": 0,
+          "source_window_index": 3,
+          "join_lambda_index": 11,
+          "end_lambda_index": 15,
+          "delta_G_kJ_mol": 8.877894518257879,
+          "uncertainty_kJ_mol": 1.4933745810691323
+        }
+      ],
+      "total_error_method": "independent_window_segment_variances_using_direct_dDelta_f",
+      "offset_error_contribution": 0.0,
+      "converged": false,
+      "min_overlap": 0.7252438390522735,
+      "min_overlap_threshold": 0.05,
+      "min_overlap_method": "per_window_mixture_coverage_ess_ratio_common_mode_removed",
+      "ess_gate_protocol_version": 2,
+      "min_occupancy_normalized": 0.7376132648796803,
+      "min_occupancy_normalized_threshold": 0.5,
+      "min_absolute_ess": 52.94280025081597,
+      "min_absolute_ess_threshold": null,
+      "min_absolute_ess_gate_retired_reason": "absolute_ess == min_ess_ratio * n_frames_decorrelated 恒等，不是独立证据；给同一个量配两个阈值会让 ratio 阈值失效（final_min_absolute_ess=50 在 N_decorrelated=114 时等价于要求 ratio>=0.44）。改由 min_decorrelated_samples 与 max_endpoint_uncertainty_kJ_mol 分别承担样本量与精度这两份正交证据。",
+      "raw_min_overlap": 0.040455449773724395,
+      "raw_min_absolute_ess": 2.953247833481881,
+      "max_common_mode_log_sigma_kT": 2.2553424972800555,
+      "min_decorrelated_samples": 73,
+      "min_decorrelated_samples_threshold": 20,
+      "max_endpoint_uncertainty_kJ_mol": 1.4933745810691323,
+      "max_endpoint_uncertainty_kJ_mol_threshold": 1.0,
+      "lambda_spacing_max_step_kJ_mol": 2.3283923175948473,
+      "window_overlap_diagnostics": [
+        {
+          "window_index": 3,
+          "window_label": "old_window_3",
+          "window_range": [
+            11,
+            16
+          ],
+          "lambdas": [
+            11,
+            12,
+            13,
+            14,
+            15
+          ],
+          "lambdas_coul": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "lambdas_vdw": [
+            0.441611452047198,
+            0.4101871210204696,
+            0.37937769652875314,
+            0.3494792859360132,
+            0.3197317600069161
+          ],
+          "min_ess_ratio": 0.7252438390522735,
+          "ess_ratio_per_lambda": {
+            "11": 0.7252438390522735,
+            "12": 0.9153444933701829,
+            "13": 0.9937778316740294,
+            "14": 0.9593487973506533,
+            "15": 0.8688216472543829
+          },
+          "absolute_ess": 52.94280025081597,
+          "min_occupancy_normalized": 0.7376132648796803,
+          "mixture_occupancy_normalized": [
+            0.7376132648796803,
+            0.8511767977533912,
+            0.9866949397181847,
+            1.1347948704933817,
+            1.2897201271553624
+          ],
+          "n_frames_decorrelated": 73,
+          "ess_gate_protocol_version": 2,
+          "ess_gate_metric": "mixture_coverage_ess_common_mode_removed",
+          "raw_min_ess_ratio": 0.040455449773724395,
+          "raw_min_absolute_ess": 2.953247833481881,
+          "raw_ess_ratio_per_lambda": {
+            "11": 0.04321263668081257,
+            "12": 0.05391088623795578,
+            "13": 0.05825806375353356,
+            "14": 0.05004342237792216,
+            "15": 0.040455449773724395
+          },
+          "top1pct_raw_weight": [
+            0.528597920746511,
+            0.4379344705636039,
+            0.32885898588556023,
+            0.4473141733729578,
+            0.543987646006653
+          ],
+          "common_mode_log_sigma_kT": 2.2553424972800555,
+          "common_mode_log_mean_kJ_mol": 13.067861684964429,
+          "reweighting_quality_error": null,
+          "statistical_inefficiency": 27.512712675533773,
+          "statistical_inefficiency_worst_state": 0,
+          "endpoint_diff_uncertainty_kJ_mol": 1.4933745810691323
+        }
+      ],
+      "statistical_inefficiency_per_window": [
+        27.512712675533773
+      ],
+      "method": "Local-TMBAR covariance-chain (ESS-overlap-checked)",
+      "uncertainty_note": "总误差对每个独立窗口直接读取连接态到新增端点的 dDelta_f，并合并独立窗口段方差；同一窗口内的端点协方差因此不会重复丢失。converged 同时要求 ESS ratio、绝对 ESS、去相关样本数、端点差不确定度四项达标。不同窗口来自独立采样，未假设跨窗口协方差。",
+      "f_k": [
+        -21.544663434923,
+        -19.21627111732815,
+        -16.977419481604006,
+        -14.821860678434158,
+        -12.66676891666512
+      ],
+      "df_k": [
+        1.3737140559411436,
+        1.2229868764024967,
+        1.1737671250428057,
+        1.2719568704864759,
+        1.4217985414064158
+      ],
+      "lambdas": [
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "stage": "old_w3_only"
+    },
+    "new_solo": {
+      "coverage_diagnostics": {
+        "input_window_indices": [
+          10000,
+          10001
+        ],
+        "valid_window_indices": [
+          10000,
+          10001
+        ],
+        "solved_window_indices": [
+          10000,
+          10001
+        ],
+        "dropped_window_indices": [],
+        "covered_lambda_indices": [
+          11,
+          12,
+          13,
+          14,
+          15
+        ],
+        "covered_lambda_index_first": 11,
+        "covered_lambda_index_last": 15,
+        "n_covered_lambda_indices": 5,
+        "note": "求解器只能证明它积分了这些 λ 索引，无法证明它们就是该 stage 的完整路径——'预期窗口是否全部产出数据'必须在 loader 出口用 _assert_expected_windows_all_loaded 判定。"
+      },
+      "total_delta_G": 11.056606767181927,
+      "total_error": 0.3278959523737256,
+      "endpoint_error_after_offset": 0.3278959523737256,
+      "covariance_chain_segments": [
+        {
+          "window_index": 0,
+          "source_window_index": 10000,
+          "join_lambda_index": 11,
+          "end_lambda_index": 13,
+          "delta_G_kJ_mol": 5.861320339490229,
+          "uncertainty_kJ_mol": 0.24960564486533918
+        },
+        {
+          "window_index": 1,
+          "source_window_index": 10001,
+          "join_lambda_index": 13,
+          "end_lambda_index": 15,
+          "delta_G_kJ_mol": 5.195286427691698,
+          "uncertainty_kJ_mol": 0.2126329645996375
+        }
+      ],
+      "total_error_method": "independent_window_segment_variances_using_direct_dDelta_f",
+      "offset_error_contribution": 1.6041851611112228,
+      "converged": true,
+      "min_overlap": 0.9448653055114605,
+      "min_overlap_threshold": 0.05,
+      "min_overlap_method": "per_window_mixture_coverage_ess_ratio_common_mode_removed",
+      "ess_gate_protocol_version": 2,
+      "min_occupancy_normalized": 0.755534907330474,
+      "min_occupancy_normalized_threshold": 0.5,
+      "min_absolute_ess": 60.471379552733474,
+      "min_absolute_ess_threshold": null,
+      "min_absolute_ess_gate_retired_reason": "absolute_ess == min_ess_ratio * n_frames_decorrelated 恒等，不是独立证据；给同一个量配两个阈值会让 ratio 阈值失效（final_min_absolute_ess=50 在 N_decorrelated=114 时等价于要求 ratio>=0.44）。改由 min_decorrelated_samples 与 max_endpoint_uncertainty_kJ_mol 分别承担样本量与精度这两份正交证据。",
+      "raw_min_overlap": 0.027336591184545938,
+      "raw_min_absolute_ess": 2.9796884391155074,
+      "max_common_mode_log_sigma_kT": 2.2660419767336504,
+      "min_decorrelated_samples": 64,
+      "min_decorrelated_samples_threshold": 20,
+      "max_endpoint_uncertainty_kJ_mol": 0.24960564486533918,
+      "max_endpoint_uncertainty_kJ_mol_threshold": 1.0,
+      "lambda_spacing_max_step_kJ_mol": 2.9613372445280106,
+      "window_overlap_diagnostics": [
+        {
+          "window_index": 10000,
+          "window_label": "rescue_window_0",
+          "window_range": [
+            11,
+            14
+          ],
+          "lambdas": [
+            11,
+            12,
+            13
+          ],
+          "lambdas_coul": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "lambdas_vdw": [
+            0.441611452047198,
+            0.4101871210204696,
+            0.37937769652875314
+          ],
+          "min_ess_ratio": 0.9448653055114605,
+          "ess_ratio_per_lambda": {
+            "11": 0.9567404042415045,
+            "12": 0.9985351748340314,
+            "13": 0.9448653055114605
+          },
+          "absolute_ess": 60.471379552733474,
+          "min_occupancy_normalized": 0.870333500736264,
+          "mixture_occupancy_normalized": [
+            1.1357445538349409,
+            0.9939219454287951,
+            0.870333500736264
+          ],
+          "n_frames_decorrelated": 64,
+          "ess_gate_protocol_version": 2,
+          "ess_gate_metric": "mixture_coverage_ess_common_mode_removed",
+          "raw_min_ess_ratio": 0.11017755829469777,
+          "raw_min_absolute_ess": 7.051363730860658,
+          "raw_ess_ratio_per_lambda": {
+            "11": 0.13594017783539775,
+            "12": 0.1185644114070739,
+            "13": 0.11017755829469777
+          },
+          "top1pct_raw_weight": [
+            0.2845266589968659,
+            0.3161576756876954,
+            0.3275049907035186
+          ],
+          "common_mode_log_sigma_kT": 1.86221433560411,
+          "common_mode_log_mean_kJ_mol": 10.879292339919305,
+          "reweighting_quality_error": null,
+          "statistical_inefficiency": 7.869258340202441,
+          "statistical_inefficiency_worst_state": 0,
+          "endpoint_diff_uncertainty_kJ_mol": 0.24960564486533918
+        },
+        {
+          "window_index": 10001,
+          "window_label": "rescue_window_1",
+          "window_range": [
+            13,
+            16
+          ],
+          "lambdas": [
+            13,
+            14,
+            15
+          ],
+          "lambdas_coul": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "lambdas_vdw": [
+            0.37937769652875314,
+            0.3494792859360132,
+            0.3197317600069161
+          ],
+          "min_ess_ratio": 0.9705597054490455,
+          "ess_ratio_per_lambda": {
+            "13": 0.9839074421854049,
+            "14": 0.9987936830327465,
+            "15": 0.9705597054490455
+          },
+          "absolute_ess": 105.79100789394596,
+          "min_occupancy_normalized": 0.755534907330474,
+          "mixture_occupancy_normalized": [
+            1.2780803823704636,
+            0.9663847102990624,
+            0.755534907330474
+          ],
+          "n_frames_decorrelated": 109,
+          "ess_gate_protocol_version": 2,
+          "ess_gate_metric": "mixture_coverage_ess_common_mode_removed",
+          "raw_min_ess_ratio": 0.027336591184545938,
+          "raw_min_absolute_ess": 2.9796884391155074,
+          "raw_ess_ratio_per_lambda": {
+            "13": 0.030931648406706362,
+            "14": 0.0287697972988887,
+            "15": 0.027336591184545938
+          },
+          "top1pct_raw_weight": [
+            0.48155255551494897,
+            0.5182301150588103,
+            0.5431643505199267
+          ],
+          "common_mode_log_sigma_kT": 2.2660419767336504,
+          "common_mode_log_mean_kJ_mol": 12.590937803091437,
+          "reweighting_quality_error": null,
+          "statistical_inefficiency": 4.614819826432709,
+          "statistical_inefficiency_worst_state": 2,
+          "endpoint_diff_uncertainty_kJ_mol": 0.2126329645996375
+        }
+      ],
+      "statistical_inefficiency_per_window": [
+        7.869258340202441,
+        4.614819826432709
+      ],
+      "method": "Local-TMBAR covariance-chain (ESS-overlap-checked)",
+      "uncertainty_note": "总误差对每个独立窗口直接读取连接态到新增端点的 dDelta_f，并合并独立窗口段方差；同一窗口内的端点协方差因此不会重复丢失。converged 同时要求 ESS ratio、绝对 ESS、去相关样本数、端点差不确定度四项达标。不同窗口来自独立采样，未假设跨窗口协方差。",
+      "f_k": [
+        -15.300355325972529,
+        -12.339018081444518,
+        -9.439034986482302,
+        -6.83782451585858,
+        -4.243748558790601
+      ],
+      "df_k": [
+        0.7860740176136126,
+        0.8501265284949081,
+        0.8156963287393537,
+        2.12140448369492,
+        2.1457809281770506
+      ],
+      "lambdas": [
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "stage": "rescue_only"
+    }
+  },
+  "history_scan": {
+    "mad_factor": 12.0,
+    "per_window": {
+      "vanishing_w0": {
+        "bias_jumps": 0,
+        "bias_mad": 8.779418455661286,
+        "bias_max_abs_diff": 44.141773923470566,
+        "base_jumps": 0,
+        "base_mad": 818.0133163784631,
+        "base_max_abs_diff": 4478.758665196132,
+        "decorr_worst_state": 0,
+        "decorr_jumps": 0,
+        "decorr_mad_kT": 1.6440284368309719,
+        "decorr_max_abs_diff_kT": 12.942394389749335
+      },
+      "vanishing_w1": {
+        "bias_jumps": 0,
+        "bias_mad": 8.282818005050856,
+        "bias_max_abs_diff": 45.48237194542303,
+        "base_jumps": 4,
+        "base_mad": 695.9032588084228,
+        "base_max_abs_diff": 87716.65996172698,
+        "decorr_worst_state": 0,
+        "decorr_jumps": 0,
+        "decorr_mad_kT": 1.330039774251004,
+        "decorr_max_abs_diff_kT": 10.994852212731459
+      },
+      "vanishing_w2": {
+        "bias_jumps": 0,
+        "bias_mad": 6.24281470644695,
+        "bias_max_abs_diff": 36.10828926760428,
+        "base_jumps": 0,
+        "base_mad": 752.5929859075695,
+        "base_max_abs_diff": 4090.536853540223,
+        "decorr_worst_state": 0,
+        "decorr_jumps": 0,
+        "decorr_mad_kT": 1.3926619802797227,
+        "decorr_max_abs_diff_kT": 12.05740355768737
+      },
+      "vanishing_w3": {
+        "bias_jumps": 0,
+        "bias_mad": 5.618416956006513,
+        "bias_max_abs_diff": 39.66950296431568,
+        "base_jumps": 9,
+        "base_mad": 742.0960863870569,
+        "base_max_abs_diff": 89789.67534453189,
+        "decorr_worst_state": 0,
+        "decorr_jumps": 0,
+        "decorr_mad_kT": 1.7446435573568575,
+        "decorr_max_abs_diff_kT": 11.555021103270342
+      },
+      "vanishing_w4": {
+        "bias_jumps": 0,
+        "bias_mad": 5.434013996803465,
+        "bias_max_abs_diff": 31.665339090418733,
+        "base_jumps": 4,
+        "base_mad": 696.889701864915,
+        "base_max_abs_diff": 89260.45075685624,
+        "decorr_worst_state": 0,
+        "decorr_jumps": 0,
+        "decorr_mad_kT": 1.9536731003980081,
+        "decorr_max_abs_diff_kT": 11.370462418436901
+      },
+      "vanishing_w5": {
+        "bias_jumps": 0,
+        "bias_mad": 4.855331565838763,
+        "bias_max_abs_diff": 35.96580257564216,
+        "base_jumps": 0,
+        "base_mad": 729.8404168877751,
+        "base_max_abs_diff": 4015.5823350669816,
+        "decorr_worst_state": 0,
+        "decorr_jumps": 0,
+        "decorr_mad_kT": 1.9356171133488127,
+        "decorr_max_abs_diff_kT": 13.994828961953175
+      },
+      "rescue_w0": {
+        "bias_jumps": 0,
+        "bias_mad": 5.315430893127818,
+        "bias_max_abs_diff": 30.255819904638816,
+        "base_jumps": 0,
+        "base_mad": 750.7126647261903,
+        "base_max_abs_diff": 4398.137291078921,
+        "decorr_worst_state": 0,
+        "decorr_jumps": 0,
+        "decorr_mad_kT": 1.5213601228697562,
+        "decorr_max_abs_diff_kT": 7.751160047474249
+      },
+      "rescue_w1": {
+        "bias_jumps": 0,
+        "bias_mad": 5.4146361671450425,
+        "bias_max_abs_diff": 29.416436231996318,
+        "base_jumps": 4,
+        "base_mad": 737.8714429929387,
+        "base_max_abs_diff": 88687.84981205082,
+        "decorr_worst_state": 0,
+        "decorr_jumps": 0,
+        "decorr_mad_kT": 1.9297896117398587,
+        "decorr_max_abs_diff_kT": 11.604140287409216
+      }
+    },
+    "base_bias_jumps": 21,
+    "decorrelation_series_jumps": 0,
+    "total_jumps": 21
+  }
+}

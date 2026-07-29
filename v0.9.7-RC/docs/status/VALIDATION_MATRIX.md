@@ -1,0 +1,305 @@
+# 运行验证监控表
+
+更新日期：2026-07-26（新增 VAL-TEST-006）；2026-07-22（新增 VAL-GPU-008）；2026-07-21（新增 VAL-TEST-003）；2026-07-19（旧自动修复验证结项，新增 VAL-GPU-007/VAL-NM-001）
+
+本文件只跟踪“代码已经修复，但尚未获得完整运行证据”的项目。尚未实现的代码工作放在
+[`../TODO.md`](../TODO.md)；问题背景、修复理由和最终审计结论放在
+[`AUDIT_STATUS.md`](AUDIT_STATUS.md)。
+
+## 状态定义
+
+| 状态 | 含义 |
+|---|---|
+| `待运行` | 修复与测试代码已准备，但尚未在目标环境执行 |
+| `运行中` | 已启动验证，尚未得到完整结论 |
+| `通过` | 验收条件全部满足，证据已归档 |
+| `失败` | 已得到可复现的失败证据，需要重新进入 `todolist.md` |
+| `阻塞` | 缺少环境、硬件、输入或外部依赖，暂时无法运行 |
+
+## 当前监控矩阵
+
+| ID | GitHub Issue | 验证对象 | 代码状态 | 已有静态/回归覆盖 | 目标环境 | 当前状态 | 最后更新 |
+|---|---|---|---|---|---|---|---|
+| `VAL-GPU-001` | [`#2`](https://github.com/Cedrus810/openmm_IBS_dev/issues/2) | IBS v12 `calibrated_pending_validation` 状态机与精确 log-sum-exp | 历史修复 | 原验证依赖已禁用的旧校准/自动修复流程 | — | `已取代` / Issue closed / Project `Done` | 2026-07-19 |
+| `VAL-GPU-002` | [`#3`](https://github.com/Cedrus810/openmm_IBS_dev/issues/3) | fixed-H bias 校准探针的 `lambda_shield` 同步与 NaN 修复 | 历史修复 | 原验证依赖已禁用的旧 fixed-H 校准流程 | — | `已取代` / Issue closed / Project `Done` | 2026-07-19 |
+| `VAL-TEST-001` | [`#4`](https://github.com/Cedrus810/openmm_IBS_dev/issues/4) | 当前 `non_mutating_v1` OpenMM/PyMBAR 完整回归套件 | 已修复 | NM-01/NM-02、策略 fail-closed、checkpoint 与现有协议回归已补 | `openmm_dev` + OpenMM + PyMBAR + pytest | `待运行` / Project `In review` | 2026-07-19 |
+| `VAL-GPU-003` | [`#24`](https://github.com/Cedrus810/openmm_IBS_dev/issues/24) | fixed-H 探针 Boresch Context 修复（v13） | 历史修复 | 原验证依赖已禁用的旧 fixed-H 校准流程 | — | `已取代` / Issue closed / Project `Done` | 2026-07-19 |
+| `VAL-GPU-004` | [`#25`](https://github.com/Cedrus810/openmm_IBS_dev/issues/25) | production ESS 自动修复循环 | 历史修复 | `non_mutating_v1` 已禁止 production-time split/insert/recalibrate | — | `已取代` / Issue closed / Project `Done` | 2026-07-19 |
+| `VAL-GPU-005` | [`#26`](https://github.com/Cedrus810/openmm_IBS_dev/issues/26) | `reseed_resample` 生产 checkpoint 续算 | 历史修复 | `non_mutating_v1` 已禁止该生产修复路径 | — | `已取代` / Issue closed / Project `Done` | 2026-07-19 |
+| `VAL-TEST-002` | [`#27`](https://github.com/Cedrus810/openmm_IBS_dev/issues/27) | 预优化缓存范围收窄与旧 schema 迁移兼容 | 已修复 | 已有部分真实运行证据，仍缺失效正例与 debug hash 开关验证 | `openmm_dev` + 真实 pipeline resume | `部分通过` / Project `In review` | 2026-07-19 |
+| `VAL-GPU-006` | [`#4`](https://github.com/Cedrus810/openmm_IBS_dev/issues/4) | 冻结验证累计步数与跨进程 rung 恢复 | 已修复 | 针对性单测已补，合并进当前完整回归套件 | OpenMM + CUDA | `待运行` / Project `In review` | 2026-07-19 |
+| `VAL-GPU-007` | [`#28`](https://github.com/Cedrus810/openmm_IBS_dev/issues/28) | ~~在线 IBS 学习以 TMBAR 取代朴素 TA（`IBS_BIAS_PROTOCOL_VERSION=19`）~~ **条目已过期，见下方说明** | 历史修复 | 代码已推进到 v29；本条描述的 v21/v22 反号已在 v27 被证实为错并撤销 | — | `已取代`（待按 v29 重写或关闭） | 2026-07-27 |
+| `VAL-NM-001` | [`#30`](https://github.com/Cedrus810/openmm_IBS_dev/issues/30) | `non_mutating_v1` 旧缓存/旧状态 fail-closed 与只读保护 | 已修复 | NM-01/NM-02 和策略门控回归已写 | `openmm_dev` + OpenMM + PyMBAR + pytest | `待运行` / Project `In review` | 2026-07-19 |
+| `VAL-TEST-003` | [#32](https://github.com/Cedrus810/openmm_IBS_dev/issues/32) | todo2 A-01/A-02/A-03/A-04/A-09/A-11/A-18：传统 REMD v2 LRC、PME alpha fallback、TMBAR history 上限、System/base/checkpoint 加固 | 已修复 | `py_compile` 与 source-contract 测试已补；本机 K: 卷 Python `Path.resolve`/`__pycache__` 受限 | OpenMM + PyMBAR + pytest；另需一个固定盒传统 REMD 小例 | `待运行` / Project `In review` | 2026-07-21 |
+| `VAL-TEST-004` | [#33](https://github.com/Cedrus810/openmm_IBS_dev/issues/33) | **Stage 2 v21**：`blended_metric_vanishing_lambdas`（`(1-β)·s_hat + β·(1-λ)` 等分，β=0.3）；六个单边界共享窗口。~~v20 的 17 点 `λ=x²` 锚点 + 2 个 Fisher bridge 已退役~~ | 已修复 | 缓存证据 `output_lrc_fix/checkpoints/preopt_dual_vanishing.json`：`path_protocol_version=21`、23 唯一 λ、末边 `0.100049→0`、`realized_max_lambda_gap=0.100049 ≤ bound 0.151515`、28 槽位；v18/v19/**v20** 缓存 fail-closed | OpenMM + CUDA + PyMBAR + pytest | `待运行` | 2026-07-27 |
+| `VAL-TEST-005` | [#34](https://github.com/Cedrus810/openmm_IBS_dev/issues/34) | 溶剂腿显式 0.15 M NaCl、中和及 v2 缓存 manifest | 已修复 | 已确认旧缓存为 `0 Na / 0 Cl`、复合物为 `68 Na / 75 Cl`；源码契约覆盖显式离子参数和旧缓存失效门 | OpenMM + Amber14 + 实际溶剂盒重建 | `待运行` / Project `In review` | 2026-07-21 |
+| `VAL-TEST-006` | [#59](https://github.com/Cedrus810/openmm_IBS_dev/issues/59) | 核心物理/数值单测（Boresch 解析修正、`solve_stage_integrated` 合成已知 ΔG、`IBSBiasForce` log-sum-exp、pilot-TI 种子符号）+ `run_all_windows` resume 8 门抽成纯函数 `_resume_cached_window_gate_status` | 已修复 | 新增 `test_core_physics_numerics.py` / `test_resume_reuse_contracts.py`；`ast.parse` 与模块属性引用 AST 交叉核对已过；抽函数逐门语义未改、调用侧诊断打印保持原样 | `openmm_dev` + OpenMM + PyMBAR + pytest（**CPU 即可，无需 GPU**） | `待运行` | 2026-07-26 |
+| `VAL-GPU-008` | — | 2026-07-22 IBS production 协议：TI/TMBAR 符号、全历史自洽预热更新、一次 fixed-f 验证、production `f_k` 硬锁、数据隔离、失败定位、定向续采及 immutable rescue ensembles | 已修复 | v9 用全部累计 minibatch 的 TMBAR 绝对 `f_target` 做 `f←f+0.2(f_target-f)`；TMBAR 暂不可解时才用固定10 kT bounded-SGD；dominant/EMA/raw 占据仅诊断；warmup stride 500→250 steps/frame；learning minibatch 统一 20 帧；冻结候选门改看应用阻尼步 `0.2(f_target-f_old) ≤ 1 kT`（旧逐-entry ESS 判据降级为 `legacy_per_entry_quality_converged` 诊断），raw residual 不再阻止早冻，fixed-f 验证仍是终检 | Linux + OpenMM + CUDA + PyMBAR；复用真实 Stage 2 失败输出 | `待运行` | 2026-07-22 |
+
+> **2026-07-27 一致性复核（读本表前必看）**
+>
+> 1. **`VAL-GPU-007` 落后 10 个协议版本，且它要验的东西已被撤销。** 本表跟踪
+>    `IBS_BIAS_PROTOCOL_VERSION=19`，代码是 `ibs_engine.py:3373 = 29`。changelog
+>    `ibs_engine.py:3216-3228` 明确记载 **v21/v22 的反号在 v27 已被证实为错并撤销**。
+>    要么按 v29 重写验收条件，要么关闭该条。
+> 2. **`VAL-TEST-004` 已从 v20 改写为 v21。** 原验收条件（两个 Fisher bridge、
+>    末边 `0.00390625→0`）在当前代码上**物理上不可能满足**——布点算法整体换了。
+>    权威描述见 [`../design/LAMBDA_SCHEDULE_CONTRACT.md`](../design/LAMBDA_SCHEDULE_CONTRACT.md)（已同步 v21）。
+> 3. **本表与 `TODO.md` 对同一天的 pytest 结论互相矛盾。** `TODO.md:144,160` 打勾
+>    "119 passed"/"231 passed"，而 `VAL-TEST-006`（验收命令正是这批）日期同为
+>    2026-07-26、状态仍是 `待运行`。本表**没有任何一项是 `通过`**——需要一次真实
+>    运行来决定是把这些条目关掉，还是把 TODO 里的勾去掉。
+> 4. `VAL-TEST-003` 记的阻塞理由是 Windows `K:` 卷的 `Path.resolve`/`__pycache__`
+>    限制，对当前 Linux 检出不适用，该阻塞已过期。
+>
+> `VAL-GPU-001`～`005` 的详细验收段落保留为历史审计记录，不再作为当前执行清单；
+> 当前执行入口以 #4、#27、#28、#30、`VAL-TEST-003` 和
+> [`NON_MUTATING_V1_STATUS.md`](NON_MUTATING_V1_STATUS.md) 为准。
+
+## 验收条件与证据
+
+### VAL-TEST-006 — 核心物理/数值单测与 resume 门抽函数
+
+目标命令（CPU 即可，不需要提交 GPU 节点）：
+
+```bash
+source /home/ruigengji/mambaforge/etc/profile.d/mamba.sh
+mamba activate openmm_dev
+cd /home/ruigengji/ABFE_IBS/Atenolol-rank11
+python -m pytest -q test_core_physics_numerics.py test_resume_reuse_contracts.py
+./run_offline_tests.sh
+```
+
+验收条件：
+
+- 两个新文件全绿。
+- **`test_audit_protocol_regressions.py` 与 `test_warmup_overlap_protocol.py` 仍全绿。**
+  这两个文件含读 `run_all_windows` 源码文本的契约断言，resume 门抽函数可能让某些
+  文本锚点失配；若失配，说明断言锚在实现细节上，**跟着更新锚点，不允许放宽断言**。
+- 抽函数是纯重构的证据：`run_all_windows` 里那串逐门诊断打印（含 `legacy_mutating`
+  分支与 `ExistingEnsembleRequiresRescueAudit` 的 raise）与改动前逐字节一致，
+  `_resume_cached_window_gate_status` 的与链顺序为
+  shape → lambdas → wca → ibs_bias → lse → lrc → repair_policy → early_stop。
+- `test_solve_stage_integrated_recovers_known_delta_g_with_nontrivial_weights` 若
+  失败，先看它打印的 `min_absolute_ess` / `min_decorrelated_samples`：这条要求
+  `converged is True`，而 `converged` 的四项硬门槛依赖合成帧数（当前 1500 帧 iid）。
+  是门槛没过而非 ΔG 偏了的话，属于测试参数问题，**调帧数，不要放宽 converged 断言**。
+
+建议证据：pytest 完整输出（含 `-ra` 的跳过原因汇总）、`python -c "import openmm,pymbar"`
+的版本、代码 SHA256。
+
+不在本项范围内（ATT-19 仍 open）：软核势 λ 端点、DEXP LJ-matching、并行 stage
+worker、热力学循环 toy-cycle（ATT-09）。
+
+### VAL-GPU-001 — v12 冻结校准续验
+
+验收条件：
+
+- 复跑曾出现 `p=[0.8485, 0.1502, 0.00126]` 的 VDW 窗口。
+- MBAR 校准后按 50k→150k→300k **累计目标预算**续验，每档只运行尚未完成的差值。
+- resume 保持冻结 `f_k`，不进入 SGD learning，不误触发拆窗或插 λ。
+- 主窗口 native checkpoint 能恢复坐标、速度、盒子和积分器 RNG 状态；指纹漂移时拒绝复用。
+- 最后一档仍失败时进入 `calibrated_validation_failed`，不再自动无限重试。
+- 精确 log-sum-exp 偏置在此前正常窗口上无收敛回归。
+
+建议证据：运行命令、作业 ID、代码 SHA256、对应的 `ibs_state_*.json`、
+`dual_window_*_convergence.json`、主窗口 checkpoint manifest、窗口日志和最终判断。
+
+### VAL-GPU-002 — fixed-H `lambda_shield` NaN 修复
+
+验收条件：
+
+- 复跑原窗口 `(5,9)`，bias 校准探针在真实 `lambda_shield` 和本态 CV 下完成局部最小化。
+- burn-in 第一阶段不再出现 `Particle coordinate is NaN`。
+- 边 `[5,6]`/`[6,7]` 若仍得到约 0.0037/0.0076 的真实低 overlap，应进入正常插 λ 流程；
+  不能把物理低 overlap 与已修复的数值 NaN 混为一谈。
+- 用 `nvidia-smi` 同时记录 fixed-H bank 的 Context/显存峰值，确认 evaluator 释放后没有
+  无界累积旧 dynamics Context。
+
+建议证据：窗口日志、`production_fixed_h_overlap.json`、probe manifest、逐边 overlap、
+异常栈（若失败）和 `nvidia-smi` 采样记录。
+
+### VAL-TEST-001 — 完整依赖测试
+
+目标命令：
+
+```bash
+python -m pytest -q
+```
+
+除完整测试套件外，至少确认：
+
+- fixed-H bank 短 segment 不进入 MBAR，缺失 `volume.npy` 会判坏并重采。
+- evaluator Context 释放后显存/Context 数量符合预期。
+- 主窗口 native checkpoint roundtrip、内容指纹拒绝和累计验证步数正确。
+- Shadow-Bridge/Shadow-IBS 任一子腿低重叠时 fail closed。
+- `finalize_descending_lambda_path` 在退化输入下仍满足端点、单调性和最小间距。
+- APBS 网格体积与各向异性盒保护测试通过。
+- 2D geodesic 分段积分会比旧端点近似更保守地避开高方差脊。
+
+建议证据：环境导出、完整 pytest 输出、失败用例日志、GPU/平台信息和代码 SHA256。
+
+### VAL-GPU-003 — fixed-H 探针 Boresch Context 修复
+
+验收条件：
+
+- 复跑一个此前用旧代码校准/验证过的窗口，确认 `IBS_BIAS_PROTOCOL_VERSION=13` 门控
+  正确拒绝其旧 `frozen_f_k_pending`（日志出现“协议已变更，视为无效缓存”），从
+  learning 重新开始，不静默复用旧 Boresch=0 校准出的 f_k。
+- 该窗口冻结验证在新 Hamiltonian 下应能收敛（连续通过覆盖门），且不应再出现此前报告
+  的“29 批全部卡在门槛以下”的持续偏斜模式。
+- fixed-H overlap/bias 校准探针本身的日志/诊断（`min_overlap`、`delta_f_bias_kJ_mol`
+  等）应与主窗口生产 Boresch 爬坡完成后的构型一致，不应出现探针构建阶段的
+  Boresch-related 异常。
+- 最终该窗口 production ESS 应该有实质改善（不是必然通过，但不应再表现出跟修复前
+  完全一致的系统性偏斜特征）。
+
+建议证据：修复前后同一窗口的 `ibs_state_*.json`、`convergence.json`、fixed-H 探针诊断
+JSON、窗口日志逐批 `p_k` 序列对比。
+
+### VAL-GPU-004 — production ESS 修复循环批量插边 / `already_good` 饥饿修复
+
+验收条件：
+
+- 一轮修复中若同时存在多个 `still_failing` 窗口，日志应在同一轮内出现多条“插入待重测
+  λ”记录（而不是每轮只处理一个窗口）。
+- `already_good` 窗口（fixed-H 全通过但 production ESS 低）应能在本轮路径变化后的
+  同一轮完成 `recalibrate_f_k`/`reseed_resample` 决策并记录，不应再出现“⏸ 暂缓”被
+  连续多轮推迟、最终耗尽 `max_repair_rounds` 硬停止的模式。
+- `repair_round` 计数应能反映“本轮修了多少东西”而不是被 starve；同一次运行里
+  `max_repair_rounds`（默认 8）应该足够覆盖真实碎片化路径的收敛，除非确有更深层
+  的采样问题。
+
+建议证据：完整 pipeline 日志（尤其是自动修复循环的每一轮输出）、`sampling_repair_decisions.json`、
+`production_fixed_h_overlap.json`。
+
+### VAL-GPU-005 — `reseed_resample` 生产 checkpoint 真续算
+
+验收条件：
+
+- 触发 `reseed_resample` 后，`checkpoints/production_window/<stage_type>/window_<idx>/`
+  下应存在 `openmm.chk`+`manifest.json`，且该窗口的 `energies`/`bias`/`base.npy` 未被
+  删除。
+- 下一轮日志应出现“🧊 ... 从生产 checkpoint 续算：累计已完成 N 步，本次只需再跑 M 步”，
+  且 `M + N` 应等于目标步数，不应出现步数被重复计入的证据。
+- 续算后的 `energies.npy` 帧数应等于续算前帧数加上本轮新增帧数（验证追加而非覆盖）。
+- 若中途人为 kill 掉进程（每 100 update 落盘一次的周期性 checkpoint 之后），resume 应
+  从最近一次周期性落盘续算，不应从零开始。
+- `recalibrate_f_k` 路径应继续表现为整窗丢弃重采（`keep_production_data` 默认
+  `False`），确认没有被误改成两条决策共用续算逻辑。
+
+建议证据：`convergence.json` 里 `cumulative_production_steps` 的连续多轮取值、
+production checkpoint manifest、窗口日志、人为中断测试的 stdout/stderr。
+
+### VAL-TEST-002 — 预优化缓存范围收窄与 schema 迁移兼容
+
+验收条件：
+
+- 修完跟预优化无关的 bug（如 `ibs_engine.py`/`abfe_pipeline.py` 里窗口修复循环/
+  production checkpoint 代码）后，重跑 Stage 1/2 不应触发“协议指纹不一致...重新优化”，
+  应直接复用已有的 `lambdas_var`/`window_ranges`。
+- 若确实修改了 `abfe_preoptimizer.py`/`abfe_core.py` 里预优化真正会执行到的代码，
+  Stage 1/2 预优化缓存应该正确失效重算——收窄范围不等于放弃校验，需要一个正例验证
+  这条路径没有被误关掉。
+- 首次遇到旧宽指纹缓存时，日志应出现“🩹 ... 判定为 schema 迁移，不重新优化”且随后
+  `preopt1_file`/`preopt2_file` 的 `protocol_key` 字段应变成新窄指纹结构；第二次
+  resume 应走正常的窄指纹相等比较，不应每次都重新判定迁移。
+- 设置 `ABFE_DEBUG_FREEZE_CODE_HASH=1` 后连续两次运行，`code_sha256`/`preopt_code_sha256`
+  应保持不变（即使中途编辑了源码），且启动时应打印调试警告；取消设置后应恢复正常
+  哈希计算。
+
+（本轮已获得部分真实运行证据：迁移兼容路径确认触发，见 `AUDIT_STATUS.md` 对应章节；
+仍需覆盖“预优化代码真的变了应该正确失效”这个正例，以及 `ABFE_DEBUG_FREEZE_CODE_HASH`
+本身的显式验证。）
+
+建议证据：修复前后的 `preopt1_file`/`preopt2_file` 内容 diff、pipeline 日志、
+`ABFE_DEBUG_FREEZE_CODE_HASH` 开关前后的 `code_sha256` 取值对比。
+
+### VAL-GPU-006 — 冻结验证累计步数重复计数与阶梯跨进程重启丢失
+
+背景：window 1 在 VAL-GPU-001 三处修复均已就位、且本轮**没有改任何代码**的情况下，仅因
+进程被杀后 `--resume` 重新拉起，再次触发 `calibrated_validation_failed` 终态，报告的
+`frozen_validation_cumulative_steps=350000` 超过阶梯最终目标 `300000`。两个只读 Explore
+agent 逐行核实后确认：`ibs_engine.py` 的失败路径把已经被循环内 checkpoint 落盘代码更新过
+的 `sampler.frozen_validation_cumulative_steps` 又重新加了一次 `steps_spent_this_attempt`，
+把每次 `resumed_calibration_pending` 失败都算重了一遍；同时 `abfe_pipeline.py` 的阶梯 rung
+状态（`frozen_validation_step_overrides`/`frozen_validation_is_final_rung`）只存在进程内存
+里，`--resume` 后会清空，导致回退逻辑忽略磁盘上已持久化的真实进度。详见
+`project_ibs_resume_validation_fix.md` 记忆条目"第四、五处修复"。
+
+验收条件：
+
+- 复跑此前触发 350000/300000 累计步数不一致的窗口（或任何 `resumed_calibration_pending`
+  场景），确认失败或成功后 `frozen_validation_cumulative_steps` 精确等于历次 attempt 的
+  真实步数之和，不应再出现超过阶梯最终目标（300000）的虚高值。
+- 人为在一个正处于 `resumed_calibration_pending` 续验中的窗口上 kill 掉进程，用 `--resume`
+  重新拉起，日志/落盘状态应显示 `effective_frozen_validation_budget`/`is_final_rung` 正确
+  从磁盘持久化的 `frozen_validation_cumulative_steps` 推导出"下一档未完成的目标"，而不是
+  退回第一档（50000）、把这次 attempt 浪费在一个几乎为零的 500 步空转上。
+- 若窗口在正确的、未被腐蚀的累计预算下确实无法通过（真实物理/统计问题导致），应该在
+  300000 这个真正的最终目标、且给到完整应有的差值步数之后，才判定
+  `calibrated_validation_failed` 终态——不能因为预算被腐蚀/提前耗尽而过早终态失败。
+- `test_warmup_overlap_protocol.py` 里新增的
+  `test_resolve_frozen_validation_budget_prefers_explicit_override`、
+  `test_resolve_frozen_validation_budget_falls_back_to_next_unfinished_rung`、
+  `test_resolve_frozen_validation_is_final_rung_prefers_explicit_override`、
+  `test_resolve_frozen_validation_is_final_rung_falls_back_to_schedule_comparison`、
+  `test_frozen_validation_cumulative_steps_not_double_counted_across_attempts` 应在
+  `openmm_dev` 环境下随 `python -m pytest` 通过（本次会话只跑过 `py_compile` 和脱离
+  pytest 的手动逻辑重算，尚未实际执行 pytest）。
+
+建议证据：修复前后同一窗口 `ibs_state_*.json`/`dual_window_*_vdw_warmup_failure.json` 里
+`frozen_validation_cumulative_steps` 的连续多轮取值对比、人为 kill+resume 测试的窗口日志、
+`openmm_dev` 环境下的 pytest 输出。
+
+### VAL-GPU-007 — 在线 IBS 学习改用 TMBAR
+
+背景：window 0（λ_vdw=1.0→0.968649751561061，6 态）反复 `IBSWarmupConvergenceError`，
+旧的在线学习（`IBSSampler.update_weights` → 已删除的 `ibs_lse_time_averaged_update`）
+测出 state0↔state5 落差约 **300+ kJ/mol**，但 pilot 阶段独立的 TI 交叉验证对同一段 λ
+只给出 **~16.7 kJ/mol**——量级对不上，判断为在线学习估计器自身的数值病理，而不是真实
+物理量或采样密度问题。论文 Sec 2.3 本身要求用 eq.15 TMBAR 聚合时变 IBS 分布样本，但
+旧代码只用了更简单、未加权、每轮就丢弃原始能量的 TA 滚动平均（eq.11-13）。修复复用了
+本仓库已经实现、已在 production 最终分析里跑过的 `GlobalMBARAnalyzer.
+solve_stage_integrated`：`IBSSampler.tmbar_history` 持久保存每个 minibatch
+`(u_kn, bias_energies, base_energies)`（不再像 TA 那样每轮丢弃），`update_weights()`
+与冻结验证失败后的 feedback 分支都改为对累计历史重新解一次 TMBAR，取
+mean-centered 的 `f_k`；learning 候选门也从旧的单一 LSE 残差改为 TMBAR 自己的四项联合
+`converged`（新增、刻意宽松的 `candidate_min_ess_ratio`/`candidate_min_absolute_ess`/
+`candidate_min_decorrelated_samples`/`candidate_max_uncertainty_kJ_mol`，默认
+0.05/5.0/5/5.0，明显松于 `final_*` 的 0.05/50.0/20/1.0——独立、未变的冻结验证阶段仍是
+真正的严格接受/拒绝判据）。`IBS_BIAS_PROTOCOL_VERSION` 由 18 升到 19，旧
+`ibs_state_*.json`（`ta_relative_q_sum`/`ta_iteration_count`）会被版本门控拒绝、
+安全地从 f_k=0 重新学习，不会被静默误读成空的 `tmbar_history`。详见
+`ibs_engine.py` 里该常量定义处的完整 changelog。
+
+验收条件：
+
+- 复跑此前反复 `IBSWarmupConvergenceError` 的 window 0（vdW stage），确认在线学习不再
+  产出数量级为 ~300+ kJ/mol 的 state0↔state5 落差；若仍不收敛，新落差量级应与 pilot TI
+  的 ~16.7 kJ/mol 同量级，而不是此前的数量级偏差。
+- `openmm_dev` 环境下 `python -m pytest test_warmup_overlap_protocol.py
+  test_non_mutating_policy.py test_audit_protocol_regressions.py -v` 全部通过，尤其是
+  新增的 `test_tmbar_recovers_equal_free_energy_of_equal_width_wells`（验证 TMBAR
+  聚合本身在已知解析解场景下给出正确的 mean-centered `f_k`）。
+- 候选门的宽松阈值（0.05/5.0/5/5.0）在真实窗口上不应导致"候选一直冻结不上、
+  `bias_update_count` 撞到 `max_bias_updates` 上限"或"候选冻结过快、频繁被后续冻结
+  验证打回 learning"这两种极端之一；若观测到任一极端，这组阈值需要作为已知调参点
+  重新评估（不是本次实现遗留的 bug，是有意选择的初始默认值）。
+- resume 一个曾用旧 v18 协议 `ibs_state_*.json` 的窗口，日志应出现"协议版本不匹配…
+  完全忽略旧状态"，从 f_k=0 重新学习，不应把旧 TA 状态误注入或崩溃。
+- 已被此前 window 3 尾段密度不足问题（见 `todolist.md` 的 pilot 加密待设计项）独立影响
+  的窗口，不应被误判为"TMBAR 修复后应该收敛"——该项与本修复范围不重叠。
+
+建议证据：修复前后同一窗口的 `ibs_state_*.json`、`dual_window_*_vdw_warmup_failure.json`
+（`tmbar_update`/`lse_residual_history` 里 `phase=learning_tmbar` 的条目）、窗口日志逐批
+TMBAR `converged`/`min_overlap`/`min_absolute_ess` 序列、`openmm_dev` 环境下的 pytest 输出。
+
+## 更新规则
+
+1. 尚未实现或需要继续改代码：加入 `todolist.md`，监控行标为 `失败` 并链接对应待办。
+2. 代码修复完成但尚未实测：从 `todolist.md` 移到本表，状态设为 `待运行`。
+3. 开始作业：状态改为 `运行中`，补充命令、作业 ID、输出目录和开始时间。
+4. 验证完成：记录证据路径；通过则把结论追加到 `AUDIT_STATUS.md`，失败则重新进入
+   `todolist.md`。
+5. 不用“代码已修复”代替“运行验证通过”，也不因缺少运行环境把项目标成通过。

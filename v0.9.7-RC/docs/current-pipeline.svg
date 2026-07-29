@@ -1,0 +1,215 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1940" viewBox="0 0 1600 1940" role="img" aria-labelledby="title desc">
+  <title id="title">Current ABFE dual-lambda production pipeline</title>
+  <desc id="desc">The current softcore ABFE workflow from configuration and system construction through complex and solvent preparation, Boresch restraint handling, Stage 1 PME decharging, Stage 2 IBS vanishing, scientific gates, corrections, and final binding free energy.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#8b9bb0"/>
+    </marker>
+    <marker id="arrow-muted" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#8b9bb0"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="2" stdDeviation="4" flood-opacity="0.10"/>
+    </filter>
+    <style>
+      text { font-family: Inter, "Noto Sans SC", "Microsoft YaHei", sans-serif; fill: #172033; }
+      .title { font-size: 34px; font-weight: 600; }
+      .subtitle { font-size: 17px; fill: #526176; }
+      .section { font-size: 19px; font-weight: 600; letter-spacing: .02em; }
+      .node-title { font-size: 18px; font-weight: 600; }
+      .body { font-size: 15px; }
+      .small { font-size: 13px; fill: #526176; }
+      .mono { font-family: "SFMono-Regular", Consolas, monospace; font-size: 13px; }
+      .surface { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; }
+      .blue { fill: #e8f0ff; stroke: #2563eb; stroke-width: 1.6; }
+      .teal { fill: #e6f7f4; stroke: #0f766e; stroke-width: 1.6; }
+      .violet { fill: #f1eafe; stroke: #7c3aed; stroke-width: 1.6; }
+      .amber { fill: #fff4db; stroke: #b45309; stroke-width: 1.6; }
+      .green { fill: #eaf8ee; stroke: #15803d; stroke-width: 1.6; }
+      .red { fill: #feeceb; stroke: #b42318; stroke-width: 1.6; }
+      .lane { fill: none; stroke: #cbd5e1; stroke-width: 1.4; stroke-dasharray: 7 7; }
+      .arrow { fill: none; stroke: #8b9bb0; stroke-width: 2.2; marker-end: url(#arrow); }
+      .arrow-blue { fill: none; stroke: #2563eb; stroke-width: 2.3; marker-end: url(#arrow); }
+      .arrow-violet { fill: none; stroke: #7c3aed; stroke-width: 2.3; marker-end: url(#arrow); }
+      .arrow-dashed { fill: none; stroke: #8b9bb0; stroke-width: 1.8; stroke-dasharray: 7 6; marker-end: url(#arrow-muted); }
+      .divider { stroke: #cbd5e1; stroke-width: 1.2; }
+      .badge { font-size: 12px; font-weight: 600; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1940" fill="#f8fafc"/>
+
+  <text x="80" y="66" class="title">当前 ABFE / IBS 生产 Pipeline</text>
+  <text x="80" y="98" class="subtitle">默认路线：softcore · dual_lambda · complex + solvent · fail-closed · non_mutating_v1</text>
+  <rect x="1270" y="45" width="250" height="42" rx="21" class="surface"/>
+  <text x="1395" y="71" text-anchor="middle" class="body">DEXP：暂缓，不在本图展开</text>
+
+  <!-- Inputs and orchestration -->
+  <rect x="80" y="140" width="1440" height="188" rx="18" class="surface" filter="url(#shadow)"/>
+  <text x="110" y="177" class="section">1 · 入口与运行身份</text>
+
+  <rect x="110" y="200" width="385" height="96" rx="14" class="blue"/>
+  <text x="135" y="230" class="node-title">CLI / RunConfig</text>
+  <text x="135" y="255" class="body">preset → config → 显式 CLI 覆盖</text>
+  <text x="135" y="278" class="small">显式 config / torsion 缺失或坏格式：立即失败</text>
+
+  <rect x="607" y="200" width="385" height="96" rx="14" class="surface"/>
+  <text x="632" y="230" class="node-title">输入与 System 构建</text>
+  <text x="632" y="255" class="body">GRO + TOP/includes + ligand identity</text>
+  <text x="632" y="278" class="small">System XML · topology · positions · box · indices</text>
+
+  <rect x="1104" y="200" width="385" height="96" rx="14" class="amber"/>
+  <text x="1129" y="230" class="node-title">Provenance / Protocol fingerprint</text>
+  <text x="1129" y="255" class="body">输入哈希 + 配置 + 代码 + 协议版本</text>
+  <text x="1129" y="278" class="small">身份不完整或不匹配：拒绝缓存复用</text>
+
+  <path d="M495 248 H607" class="arrow"/>
+  <path d="M992 248 H1104" class="arrow"/>
+
+  <path d="M800 328 V374" class="arrow"/>
+
+  <!-- Preparation lanes -->
+  <rect x="80" y="374" width="700" height="312" rx="18" class="lane"/>
+  <rect x="820" y="374" width="700" height="312" rx="18" class="lane"/>
+  <text x="110" y="410" class="section">2A · Complex leg 准备</text>
+  <text x="850" y="410" class="section">2B · Solvent leg 准备</text>
+
+  <rect x="110" y="438" width="640" height="92" rx="14" class="teal"/>
+  <text x="135" y="468" class="node-title">预平衡前整分子 PBC 修复</text>
+  <text x="135" y="493" class="body">拓扑连通分子周期平移 → 刚性居中 → NPT 预平衡</text>
+  <text x="135" y="515" class="small">修复失败 fail closed；fingerprint 绑定坐标 / box / steps</text>
+
+  <rect x="110" y="552" width="640" height="106" rx="14" class="violet"/>
+  <text x="135" y="582" class="node-title">Boresch 估算、提交与再平衡</text>
+  <text x="135" y="607" class="body">拓扑真实成键锚点 → equilibrium / force constants</text>
+  <text x="135" y="631" class="small">committed identity + 几何 σ gate；不匹配不静默重锚</text>
+  <text x="135" y="651" class="small">带限制力 rebalance，参数进入 Hamiltonian 与缓存身份</text>
+
+  <rect x="850" y="438" width="640" height="92" rx="14" class="teal"/>
+  <text x="875" y="468" class="node-title">显式溶剂腿构建 / 缓存</text>
+  <text x="875" y="493" class="body">配体参数身份 + padding 1.5 nm + 0.15 M NaCl</text>
+  <text x="875" y="515" class="small">必要反离子保持中性；manifest 与产物哈希绑定</text>
+
+  <rect x="850" y="552" width="640" height="106" rx="14" class="surface"/>
+  <text x="875" y="582" class="node-title">溶剂腿预平衡</text>
+  <text x="875" y="607" class="body">独立 System / topology / positions / checkpoint</text>
+  <text x="875" y="631" class="small">无 Boresch 限制；其余单腿协议与 complex 对齐</text>
+  <text x="875" y="651" class="small">complex 的 committed Boresch 事故不污染 solvent 数据</text>
+
+  <path d="M430 686 V726 H700" class="arrow-blue"/>
+  <path d="M1170 686 V726 H900" class="arrow-blue"/>
+
+  <!-- Shared per-leg engine -->
+  <rect x="80" y="726" width="1440" height="832" rx="20" class="surface" filter="url(#shadow)"/>
+  <text x="110" y="765" class="section">3 · ABFEPipeline.run_full_pipeline（complex 与 solvent 各执行一次）</text>
+  <text x="110" y="791" class="small">两条腿使用独立 output/checkpoint；下面的阶段身份、科学门和落盘契约相同</text>
+
+  <rect x="110" y="820" width="1380" height="72" rx="14" class="amber"/>
+  <text x="140" y="850" class="node-title">Top-level + stage protocol keys</text>
+  <text x="140" y="875" class="body">System / topology / coordinates / Boresch / λ path / LRC / WCA / IBS bias / code identity</text>
+
+  <path d="M800 892 V930" class="arrow"/>
+
+  <!-- Stage 1 -->
+  <rect x="110" y="930" width="600" height="378" rx="18" class="blue"/>
+  <text x="140" y="968" class="section">Stage 1 · Decharging</text>
+  <text x="140" y="993" class="small">期望端点：(λcoul, λvdW) = (1,1) → (0,1)</text>
+
+  <rect x="140" y="1020" width="540" height="70" rx="12" class="surface"/>
+  <text x="165" y="1049" class="node-title">PME-preserving λ-REMD</text>
+  <text x="165" y="1073" class="small">NonbondedForce ParameterOffset；保留长程静电</text>
+
+  <path d="M410 1090 V1116" class="arrow-blue"/>
+
+  <rect x="140" y="1116" width="540" height="70" rx="12" class="surface"/>
+  <text x="165" y="1145" class="node-title">离线 u_kn + MBAR</text>
+  <text x="165" y="1169" class="small">轨迹、n_k 与完整分析指纹一致才允许复用</text>
+
+  <path d="M410 1186 V1212" class="arrow-blue"/>
+
+  <rect x="140" y="1212" width="540" height="68" rx="12" class="green"/>
+  <text x="165" y="1241" class="node-title">Stage 1 scientific gate</text>
+  <text x="165" y="1265" class="small">finite ΔG/σ · converged · overlap · endpoint contract</text>
+
+  <!-- Stage 2 -->
+  <rect x="750" y="930" width="740" height="566" rx="18" class="violet"/>
+  <text x="780" y="968" class="section">Stage 2 · Vanishing / IBS</text>
+  <text x="780" y="993" class="small">期望端点：(λcoul, λvdW) = (0,1) → (0,0)</text>
+
+  <rect x="780" y="1020" width="680" height="66" rx="12" class="surface"/>
+  <text x="805" y="1048" class="node-title">热力学路径预优化</text>
+  <text x="805" y="1071" class="small">pilot 度规 → λ nodes → 单边界共享 window ranges</text>
+
+  <path d="M1120 1086 V1110" class="arrow-violet"/>
+
+  <rect x="780" y="1110" width="680" height="90" rx="12" class="surface"/>
+  <text x="805" y="1138" class="node-title">每个 IBS window：学习 → 冻结 → 验证</text>
+  <text x="805" y="1162" class="small">更新 f_k → freeze burn-in → frozen local-MBAR loose gate</text>
+  <text x="805" y="1183" class="small">验证期不再修改 production Hamiltonian</text>
+
+  <path d="M1120 1200 V1224" class="arrow-violet"/>
+
+  <rect x="780" y="1224" width="680" height="88" rx="12" class="surface"/>
+  <text x="805" y="1252" class="node-title">固定 f_k 的 production sampling</text>
+  <text x="805" y="1276" class="small">energy / bias / base 三文件不可分割；manifest + SHA-256</text>
+  <text x="805" y="1297" class="small">灾难坐标回退同步截断三份 history</text>
+
+  <path d="M1120 1312 V1336" class="arrow-violet"/>
+
+  <rect x="780" y="1336" width="680" height="80" rx="12" class="surface"/>
+  <text x="805" y="1364" class="node-title">Global TMBAR / covariance-chain</text>
+  <text x="805" y="1388" class="small">expected-window coverage · frozen f_k · decorrelation · ESS / σ</text>
+
+  <path d="M1120 1416 V1440" class="arrow-violet"/>
+
+  <rect x="780" y="1440" width="680" height="34" rx="10" class="green"/>
+  <text x="1120" y="1462" text-anchor="middle" class="body">不通过 → immutable rescue；通过 → Stage 2 checkpoint</text>
+
+  <!-- Stage merge -->
+  <path d="M410 1308 V1518 H760" class="arrow"/>
+  <path d="M1120 1496 V1518 H840" class="arrow"/>
+  <rect x="600" y="1502" width="400" height="42" rx="21" class="green"/>
+  <text x="800" y="1529" text-anchor="middle" class="body">复检 stage cache → 合并单腿 ΔG / covariance</text>
+
+  <!-- Cache side rail -->
+  <rect x="111" y="1334" width="565" height="142" rx="14" class="amber"/>
+  <text x="136" y="1364" class="node-title">可选 resume 路径（fresh rerun 不走）</text>
+  <text x="136" y="1389" class="body">协议指纹 + λ 内容 + manifest 全匹配</text>
+  <text x="136" y="1413" class="body">再执行 scientific sanity / coverage gate</text>
+  <text x="136" y="1437" class="small">任一证据缺失：保留旧文件，但拒绝复用并重新运行</text>
+  <path d="M676 1405 H748" class="arrow-dashed"/>
+
+  <path d="M800 1558 V1602" class="arrow"/>
+
+  <!-- Per-leg outputs -->
+  <rect x="80" y="1602" width="700" height="122" rx="18" class="blue"/>
+  <text x="110" y="1638" class="section">Complex 单腿结果</text>
+  <text x="110" y="1666" class="body">Stage 1 + Stage 2 + Boresch analytical release</text>
+  <text x="110" y="1692" class="small">LJ LRC / endpoint / coverage / rescue / gate diagnostics 一并落盘</text>
+
+  <rect x="820" y="1602" width="700" height="122" rx="18" class="teal"/>
+  <text x="850" y="1638" class="section">Solvent 单腿结果</text>
+  <text x="850" y="1666" class="body">Stage 1 + Stage 2；Boresch correction = 0</text>
+  <text x="850" y="1692" class="small">使用独立 System、轨迹、窗口数据和 stage checkpoints</text>
+
+  <path d="M430 1724 V1770 H700" class="arrow"/>
+  <path d="M1170 1724 V1770 H900" class="arrow"/>
+
+  <!-- Final cycle -->
+  <rect x="400" y="1750" width="800" height="104" rx="18" class="amber" filter="url(#shadow)"/>
+  <text x="800" y="1785" text-anchor="middle" class="section">4 · 统一热力学循环</text>
+  <text x="800" y="1815" text-anchor="middle" class="body">combine_binding_free_energy(complex, solvent, Boresch, APBS)</text>
+  <text x="800" y="1840" text-anchor="middle" class="small">显式记录 Boresch 是否已烘焙进 complex，防止二次扣减</text>
+
+  <path d="M800 1854 V1882" class="arrow"/>
+  <rect x="400" y="1882" width="800" height="42" rx="21" class="green"/>
+  <text x="800" y="1909" text-anchor="middle" class="node-title">final_binding_results.json · ΔG_bind ± σ · provenance</text>
+
+  <!-- Legend -->
+  <circle cx="1282" cy="1780" r="7" fill="#2563eb"/>
+  <text x="1298" y="1785" class="small">PME / orchestrator</text>
+  <circle cx="1282" cy="1810" r="7" fill="#7c3aed"/>
+  <text x="1298" y="1815" class="small">IBS / vanishing</text>
+  <circle cx="1282" cy="1840" r="7" fill="#15803d"/>
+  <text x="1298" y="1845" class="small">通过的科学门</text>
+</svg>
