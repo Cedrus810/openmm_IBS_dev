@@ -1,20 +1,44 @@
 # 当前行动清单
 
-更新：2026-07-28。完整 2026-07-27 审计长记录已移入 [archive/TODO-2026-07-27-full.md](archive/TODO-2026-07-27-full.md)。历史原文见 [archive/todolist-2026-07-20.md](archive/todolist-2026-07-20.md)，审计证据见 [status/AUDIT_STATUS.md](status/AUDIT_STATUS.md)，运行验证见 [status/VALIDATION_MATRIX.md](status/VALIDATION_MATRIX.md)。
+更新：2026-07-29。完整 2026-07-27 审计长记录已移入 [archive/TODO-2026-07-27-full.md](archive/TODO-2026-07-27-full.md)。历史原文见 [archive/todolist-2026-07-20.md](archive/todolist-2026-07-20.md)，审计证据见 [status/AUDIT_STATUS.md](status/AUDIT_STATUS.md)，运行验证见 [status/VALIDATION_MATRIX.md](status/VALIDATION_MATRIX.md)。
 
 ## 当前决策
 
-- **charging（stage1）主值已改为相邻 BAR 并接上生产**（P1-21，2026-07-28）：
-  ΔG_bind −3.4464 → **−3.4797**，与 `result.txt` 的缺口 **2.799 kcal**。
-  净移动只有 −0.033 kcal（两腿偏移抵消），**不是** charging 那 1.3 kcal 缺口的解释。
+- **Boresch 二面角符号反号根因已修（BOR-01，2026-07-29）。** `abfe_core.py` 四份手写
+  二面角副本都返回 **−φ**，其中 `calc_boresch_from_last_frame` 会用镜像参考值覆盖
+  正确的 `boresch_simple.json`。现统一走 `abfe_core.boresch_dihedral_rad()`
+  （`abfe_core.py:1142`）。全量记录见
+  [handoffs/BORESCH_DIHEDRAL_SIGN_HANDOFF.md](handoffs/BORESCH_DIHEDRAL_SIGN_HANDOFF.md)。
+- **当前生产结果（2026-07-29 11:02，符号修复后全量）**：
+
+  ```
+  复合物腿 ΔG_cplx = 181.00 ± 1.76    溶剂腿 ΔG_solv = 157.84 ± 1.79
+  Boresch attachment = 4.39 ± 0.08    解析修正 = −38.76    APBS = 0.00
+  ΔG_bind = −23.16 ± 2.51 kJ/mol = −5.54 ± 0.60 kcal/mol
+  参考 result.txt total = −6.279 ± 0.457 → 差 +0.74，0.98σ，1σ 内一致
+  ```
+
+  对比 07-06 符号 bug 期的 −9.76 kcal/mol，**2.7 kcal 的改善基本全部来自本次符号修复**
+  （复合物腿 192.89 → 181.00）。⚠️ ±0.60 是乐观的，真实约 **±1.0 kcal/mol**。
+  这组数取代此前所有 ΔG_bind 候选（−2.121 / −3.460 / −3.4797）与 attachment
+  5.601 ± 0.223 —— 那些都是符号 bug 期的值，不得再引用。
+- **口径纪律：`result.txt` 只有 total 可比，分项不可比。** 它是旧方法的参考值，本仓库
+  实现的是 IBS，分项拆法本来就不同；restraint 与被限制腿的采样还会结构性抵消，把
+  charging 的差和 restraint 的差当成两条独立线索是重复计数。**「与 result.txt 差
+  2.8 kcal，逐项归因」这条旧结论已整体撤销**，P1-18 因此关闭（见该条）。
 - **vdW（stage2）只能用 TMBAR，本轮一字未动。** 不得引入 BAR / TI / 全帧主值 /
-  √g σ / bootstrap σ。同日曾有一批这样的扩张被整批撤回，见 P1-21 末尾与 P1-22。
+  √g σ / bootstrap σ。07-28 曾有一批这样的扩张被整批撤回，见 P1-21 末尾与 P1-22。
+  charging（stage1）主值为相邻 BAR（P1-21，2026-07-28）。
 
 - **当前没有尚未修复、会阻挡生产全量重跑的 P0。**
-- P0-10 的生产代码已修；旧复合物腿采样作废，下一轮只需用 fresh full rerun 验证修复后的采样结果。
-- P0-11 已结案（2026-07-28）：溶剂腿盒子缺陷已修，生产默认 `SOLVENT_PADDING_NM = 1.5`（盒边 4.257 nm）。三档盒子实测证明**对 ΔG_bind 零影响**（−2.121 → −2.111）。
-- P1-17 已闭环：attachment 腿 ΔG(A′→A) = **5.601 ± 0.223 kJ/mol = 1.339 ± 0.053 kcal/mol**，ΔG_bind 候选 **−3.460 kcal/mol**（区间 −3.513 ~ −3.406）。误差棒取两轮独立测量的半程差，**不是**任一单轮的 σ。HREMD 路径作废（二面角反转 → 指数平均被单帧支配）。
-- **剩余与 `result.txt` 的差距 2.82 kcal 尚未解释**：解析释放 +1.95（最大）、charging +1.32、vdW +0.45、attachment −0.89。其中只有 charging 有硬证据（两腿共同偏低 5.21 kJ/mol → Hamiltonian 口径不一致），但那部分在 ΔG_bind 里抵消；进缺口的是复合物腿特有的 1.31 kcal，同源与否待验。
+- P0-10 的生产代码已修；旧复合物腿采样作废，07-29 那轮已是修复后的 fresh full rerun。
+- P0-11 已结案（2026-07-28）：溶剂腿盒子缺陷已修，生产默认 `SOLVENT_PADDING_NM = 1.5`（盒边 4.257 nm）。
+  ⚠️ 当时「三档盒子对 ΔG_bind 零影响」的结论口径已被 07-29 修正：pad1.5→pad2.4 的
+  −7.15 kJ/mol **不是**有限尺寸效应，而是 vanishing 腿的跑间散布（同盒子两次独立跑
+  差 2.34σ，比跨盒子 1.13σ 还大）。见 P1-19。
+- **当前最高优先的物理问题是 vanishing 腿的误差估计偏小（P1-19），不是盒子尺寸。**
+  它**不是代码 bug**（渐近协方差在正确地算 within-run 统计误差），而是不确定度量化
+  加采样不足；同一带里真正的代码 bug 是 P1-23 的 σ 采纳 fail-open。
 - 新 DEXP 已按 `experiments/DEXP_KERNEL_PHYSICS_ISSUES.md` 冻结为
   pair-specific LJ-matched 解析核，并拆出 `dexp_NEW.py` 生产入口；旧 Orb 全局 fitter
   不再属于生产协议，旧参数 JSON fail closed。
@@ -57,7 +81,7 @@
   `abfe_core.resolve_water_model_xml()` 从复合物 `.top` 的 `#include` 反推，
   认不出来 fail closed，绝不回退默认值；`solvent_forcefield` 也进缓存身份指纹。
 
-  **已测并结案（2026-07-28）**：`diagnose_solvent_box_scan.py` 跑了 3.000 / 4.257 / 6.057 nm：
+  **已测并结案（2026-07-28）**：`tools/diagnostics/diagnose_solvent_box_scan.py` 跑了 3.000 / 4.257 / 6.057 nm：
 
   | 盒边 | 粒子 | decharging | vanishing | 总计 | ΔG_bind |
   |---|---|---|---|---|---|
@@ -107,7 +131,7 @@
   （默认值 = 旧行为），生产接线在 `abfe_pipeline._CHARGING_ESTIMATOR_KWARGS()` +
   decharging 两处调用点。TI 门容差 **0.5 kJ/mol**（实测 |BAR−TI| = 0.050 / 0.226），
   刻意不沿用 attachment 的 1.0。缓存失效由既有 `_code_hash()` 承担，未新增指纹字段。
-  回归：`test_charging_estimator_protocol.py` 14 条；全离线套件 434 passed。
+  回归：`tests/test_charging_estimator_protocol.py` 14 条；全离线套件 434 passed。
 
   ⛔ **同批教训**：此前一版把全帧主值、√g σ 缩放、独立样本数门改口径、移动块
   bootstrap、σ evidence、crosscheck 接线加进了 `GlobalMBARAnalyzer`（= vdW/stage2），
@@ -140,7 +164,14 @@
   `converged`**——等于"抬高了 σ 而门还在读抬高前的小 σ"。该标志默认关闭，所以不是
   P0；但任何 σ 采纳路径都应当重算端点 σ 门并重判收敛。属 vdW 侧，与 P1-22 一并设计。
 
-- [ ] **P1-19：per-window σ 系统性低估 2–4 倍，五道门全都看不见（2026-07-28）。**
+- [ ] **P1-19：per-window σ 系统性低估 2–4 倍，五道门全都看不见（2026-07-28；2026-07-29 并入原 BOR-04 的跨跑证据，当前最高优先物理项）。**
+
+  **定性：这不是代码 bug。** `segment_error` 取 pymbar 渐近协方差，代码在正确地做它
+  声称的事——渐近协方差算的就是「单次运行内、样本 iid 且已收敛」前提下的统计误差。
+  缺陷在于**这个数被当成别的东西用**（进 ΔG_bind 误差棒、进收敛门），而它低估真实
+  跑间散布 2–3 倍。根子多半在采样侧（vanishing 腿系综仍在慢移），σ 偏小只是盖住了它。
+  归类为**不确定度量化 + 采样不足**，不是崩溃级缺陷。
+  ⚠️ 与此相邻的 **P1-23 才是真 bug**（σ 采纳路径 fail-open：抬高了 σ 而门还在读小 σ）。
 
   措辞统一：这是**渐近协方差在"看起来独立、系综仍在慢移"时的低估**，
   与 P1-21 那条「自相关子采样导致有限样本点估计不稳定」是两件不同的事；
@@ -179,7 +210,35 @@
   ±0.62 kcal/mol 变成 ±1.0–1.5，与 `result.txt` 那 4.16 kcal 的差距性质从
   「约 7σ」变成「约 3σ」。**stage1 不受影响**（三轮 z 全 < 2，已验证）。
 
-  工具：`diagnose_split_half_convergence.py --stage both`（纯离线，秒级）。
+  工具：`tools/diagnostics/diagnose_split_half_convergence.py --stage both`（纯离线，秒级）。
+
+  **跨跑证据（2026-07-29 从原 BOR-04 并入，与上面的 split-half 是同一现象的两个视角）：**
+  同 padding 1.5、同一个盒子（`box_edge_nm=4.257`、Na=7 Cl=7）两次独立跑，
+  vanishing 差 **4.675 kJ/mol = 2.34σ**，**比跨盒子差异（1.13σ）还大**；
+  decharging 反而干净（同盒子 0.24σ、跨盒子 1.14σ）。所以问题精确定位在 **vanishing 腿**。
+
+  | 运行 | decharging | vanishing | 总计 |
+  |---|---|---|---|
+  | pad 1.5 scan（07-28） | 63.115 ± 1.104 | **101.639** ± 1.100 | 162.826 ± 1.559 |
+  | pad 1.5 主跑（07-29 11:02） | 62.800 ± 0.671 | **96.964** ± 1.663 | 157.836 ± 1.793 |
+  | pad 2.4 scan（07-28） | 64.249 ± 1.078 | **94.491** ± 1.431 | 156.812 ± 1.792 |
+
+  **推论：pad1.5→pad2.4 那 −7.15 kJ/mol 不是有限尺寸效应，就是这个跑间散布。**
+  这同时否掉了 P0-11 当时「三档盒子对 ΔG_bind 零影响」的口径。
+
+  **行动顺序（不得跳步）：**
+
+  1. **在固定 padding 1.5 下再跑 1–2 次重复**，把 vanishing 的真实跑间 σ 钉下来
+     （现在只有 2 个样本，σ ≈ 3.31 是极粗估计）。这是判断后续任何盒子扫描结果是否
+     显著的**唯一基准**。
+  2. 重新评估上面那条 `σ_win ← max(σ_MBAR, |漂移|/2)` 下界是否该默认启用
+     （目前 `默认未采用`）。
+  3. **只有 1 做完之后**才决定要不要为盒子尺寸加档。**现在别再扫盒子**——
+     `--padding 3.0` 单跑一档分不清散布与尺寸效应，纯属浪费 2–3 h。
+     若最终要改生产默认，改 `runabfe.py:101` 的 `SOLVENT_PADDING_NM`（目前 1.5）；
+     改后 `solvent_cache_manifest.json` 的 `identity.padding_nm` 不匹配会自动重建缓存，
+     **无需手工删文件，更不要把扫描目录的 `final_results.json` 拷进
+     `output_lrc_fix/solvent_leg/`**（那是改产物不改生成器）。
 
 - [x] **P1-8 / ATT-14：IBS 中 DEXP cutoff/switch 配置失效。**
   GitHub [#54](https://github.com/Cedrus810/openmm_IBS_dev/issues/54)，2026-07-28 结案。
@@ -221,7 +280,7 @@
     会校验冻结 stage1/stage2 的 Boresch 指纹与当前一致，不同就拒绝拼接。
   - `abfe_core.THERMODYNAMIC_CYCLE_DOC` 已改写为
     `ΔG_complex = ΔG_attach + ΔG_decouple,restrained + ΔG_release_to_1M`。
-  - 回归 `test_boresch_attachment_leg.py`：λ 阶梯方向、力组冲突、全局参数注册、
+  - 回归 `tests/test_boresch_attachment_leg.py`：λ 阶梯方向、力组冲突、全局参数注册、
     合成期符号门（纯逻辑，毫秒级）+ 6 粒子玩具体系上的 ΔG≥0 / 弱限制极限 /
     力常数单调性（`cpu_only`，几秒）。
 
@@ -326,14 +385,28 @@
      它本该被缺的那条腿和解耦腿吃掉一部分。`RESULT_2026-07-27...md` §6 的逐项表
      在锚点变了之后只有「总计」那一行仍然有效。
 
-- [ ] **P1-18：定位 charging 相对 `result.txt` 残留的 1.32 kcal/mol 差异（受约束系综与配体内部静电口径）。**
+- [x] **P1-18：已关闭（2026-07-29）——立项前提被撤销，不要按原计划排查。**
+
+  原命题是「charging 相对 `result.txt` 残留 1.32 kcal/mol」。**它建立在拿 `result.txt`
+  的分项当真值这个方法论错误上**：本仓库实现的是 IBS，与参考的分项拆法本就不同，分项
+  对不上不构成偏差；而且 restraint 与被限制腿的采样结构性抵消，把 charging 的差和
+  restraint 的差当成两条线索是重复计数。07-29 全量结果的 **total 与参考相差 0.98σ，
+  1σ 内一致**，没有需要归因的缺口。理由详见
+  [handoffs/BORESCH_DIHEDRAL_SIGN_HANDOFF.md](handoffs/BORESCH_DIHEDRAL_SIGN_HANDOFF.md) §7.2 / §9.4。
+
+  真正剩下的物理问题是 vanishing 腿的误差估计（P1-19），它的证据**完全来自内部
+  复现性**，不依赖任何与参考的比较。
+
+  下面原文仅供追溯，**不是待办**：
+
+  ---
 
   当前生产结果为复合物 `64.4113`、溶剂 `62.8865 kJ/mol`，所以 charging 对
   `ΔG_bind` 的贡献仅 `−1.5249 kJ/mol = −0.3645 kcal/mol`；`result.txt` 为
   `−1.680 kcal/mol`，残差 `+1.316 kcal/mol`。现有证据不支持先改 MBAR：
   对当前 `u_kn` 的逐 λ 梯形 TI 为复合物约 `65.22`、溶剂约 `63.54 kJ/mol`，
   分别只比 MBAR 高约 `0.81/0.65 kJ/mol`；REMD 平均交换率也有
-  `0.615/0.604`。`diagnose_charging_linear_response.py` 的两端平均会虚高
+  `0.615/0.604`。`tools/diagnostics/diagnose_charging_linear_response.py` 的两端平均会虚高
   20–30 kJ/mol，不能再拿它判 MBAR 错误；这里只认逐 λ 梯形 TI、MBAR 和相邻
   BAR 三口径。
 
@@ -376,28 +449,40 @@
      Hamiltonian 和 restraint 口径逐项对齐，再比较自由能；不能仅凭
      `charging-complex/-lig` 两行反推代码缺陷。
 
-- [ ] **P1-20：删除 Stage 2 预优化缓存指纹的临时 fail-open 旁路。**
+- [x] **P1-20：Stage 2 预优化缓存指纹的 fail-open 旁路已删除（2026-07-28 完成；本条 2026-07-29 才勾掉，此前状态记错）。**
 
-  `abfe_pipeline.py` 的 Stage 2 缓存恢复仍识别
-  `ABFE_DEBUG_SKIP_STAGE2_FINGERPRINT=1`，并在指纹不匹配时强制
-  `protocol_match = True`。它默认关闭、需要显式环境变量且会打印醒目标记，因此
-  **不是 P0**；但一旦作业环境残留该变量，就可能把不同代码、Hamiltonian、坐标或
-  Boresch 参数下的 `lambdas_var/window_ranges` 当成本轮缓存复用，属于会污染物理
-  协议的 **P1 fail-open**。
+  `ABFE_DEBUG_SKIP_STAGE2_FINGERPRINT` 已**不再是旁路**：`abfe_pipeline.py:6208` 现在检测到
+  该环境变量就直接 `raise RuntimeError`，报文说明它已于 P1-20 删除、指纹不匹配必须重跑 pilot。
+  回归测试在 `tests/test_charging_estimator_protocol.py:348-367`（断言「不得再有任何
+  fail-open 通路」）。全仓 grep 确认无其它 `SKIP_*FINGERPRINT` 旁路。
 
-  **修复要求**：删除该旁路；确有一次性迁移需求时，改用显式离线迁移工具，逐字段
-  核验物理输入并重写新指纹，不允许生产入口用环境变量跳过；补回归测试证明即使设置
-  旧变量，指纹不匹配仍会 fail closed。
+  ✅ 保留的两处 `protocol_match = True`（`abfe_pipeline.py:6041` Stage 1 / `:6229` Stage 2）
+  **不是** fail-open：它们是 schema 迁移路径，先由 `_preopt_cache_matches_ignoring_code_hash()`
+  把物理输入（potential_type/Boresch/温度/压力/坐标/预优化代码本身）逐项核对一致，
+  才原地重盖窄指纹。
+
+  ⚠️ 同类风险仍有一个 opt-in 开关：`ABFE_DEBUG_FREEZE_CODE_HASH=1`
+  （`abfe_pipeline.py:497`）会把 `code_sha256/preopt_code_sha256` 冻成常量。它每次运行都打印
+  🚨 警告、docstring 也写明「正式出结果前必须取消设置并至少完整跑一次真哈希校验」，
+  属于有意识的显式 opt-in，暂不列为缺陷；但**作业环境残留它的后果与被删的那条旁路同级**。
+
+- [ ] **P2-17：`tools/repairs/repair_stage2_window0_real_delta_f.py` 的文档化流程已跑不通（2026-07-29 发现）。**
+
+  该修复工具在三处（`:42`、`:72`、`:230`）指导用户用
+  `ABFE_DEBUG_SKIP_STAGE2_FINGERPRINT=1 python runabfe.py ...` 续跑，其中 `:230` 是运行时
+  直接打印给用户的下一步命令。但该环境变量自 P1-20 起会让 `runabfe.py` **直接 raise**，
+  所以照着这个提示走必然失败。改法：删掉这三处提示，改为说明「指纹不匹配就重跑 pilot」，
+  或给该工具补一条真正的离线迁移路径（逐字段核验后重写指纹）。纯文本/提示修改，不动物理逻辑。
 
 ## P2 工程 / 发布质量
 
-- [ ] **ATT-19：核心物理单元测试覆盖仍不足。** GitHub [#59](https://github.com/Cedrus810/openmm_IBS_dev/issues/59)。已补一批数值/协议测试，但仍缺软核势端点、DEXP LJ matching、PBC/离子计数更完整覆盖、并行 worker 等最小矩阵。
+- [ ] **ATT-19：核心物理单元测试覆盖仍不足。** GitHub [#59](https://github.com/Cedrus810/openmm_IBS_dev/issues/59)。已补一批数值/协议测试，但仍缺软核势端点、DEXP LJ matching、PBC/离子计数更完整覆盖、并行 worker 等最小矩阵。**新增测试一律只放 `tests/`**（2026-07-29 起全部自动化测试已归位该目录，入口 `./tests/run_offline_tests.sh`，单文件 `./tests/run_offline_tests.sh tests/<file>.py`）。
 
 - [ ] **ATT-20：缺少公开 ABFE benchmark 端到端集成验证。** GitHub [#60](https://github.com/Cedrus810/openmm_IBS_dev/issues/60)。需要中性/带电配体、两腿循环闭合、实验对比的可复现脚本。
 
-- [ ] **ATT-21：文档缺口。** GitHub [#61](https://github.com/Cedrus810/openmm_IBS_dev/issues/61)。README 主体已存在且死链已修；仍缺 API 参考、独立热力学循环推导文档、打包元数据。
+- [ ] **ATT-21：文档缺口。** GitHub [#61](https://github.com/Cedrus810/openmm_IBS_dev/issues/61)。2026-07-29 已完成仓库与文档整理：目录导航见根 `PROJECT_LAYOUT.md`，文档导航见 `docs/README.md`，教程拆为 `GETTING_STARTED` / `OUTPUTS_AND_RESUME` / `TROUBLESHOOTING` / `MIGRATING_TO_A_NEW_SYSTEM` / `MAINTAINING`，旧 README 状态段迁入 `status/README_STATUS_SNAPSHOT_2026-07-29.md`。仍缺 API 参考、独立热力学循环推导文档、打包元数据。
 
-- [ ] **ATT-22：CI/CD、静态检查与格式化仍缺。** GitHub [#62](https://github.com/Cedrus810/openmm_IBS_dev/issues/62)。`run_offline_tests.sh` 已修并跑出 367 passed；仍需 GitHub Actions、ruff/flake8、mypy、black/isort，并隔离 GPU 作业。顺带清掉 `abfe_core.py`、`abfe_pipeline.py`、`abfe_preoptimizer.py` 中仍会捕获 `KeyboardInterrupt/SystemExit` 的 3 处裸 `except:`。
+- [ ] **ATT-22：CI/CD、静态检查与格式化仍缺。** GitHub [#62](https://github.com/Cedrus810/openmm_IBS_dev/issues/62)。`tests/run_offline_tests.sh` 已修并跑出 367 passed（2026-07-29 起测试统一在 `tests/`，CI 配置应指向该入口）；仍需 GitHub Actions、ruff/flake8、mypy、black/isort，并隔离 GPU 作业。顺带清掉 `abfe_core.py`、`abfe_pipeline.py`、`abfe_preoptimizer.py` 中仍会捕获 `KeyboardInterrupt/SystemExit` 的 3 处裸 `except:`。
 
 - [ ] **ATT-23：运行恢复与资源保护能力不足。** GitHub [#63](https://github.com/Cedrus810/openmm_IBS_dev/issues/63)。继续评估 GPU OOM 降级/Context 回收、长任务中断恢复、磁盘空间预检和运行时估计。新增明确缺口：`_is_checkpoint_valid()` 目前只检查文件 ≥512 B 且可 seek，`_is_traj_valid()` 只检查粗略大小、`CORD` 和首个记录长度；二者都不能证明 checkpoint 可加载或 DCD 帧完整。恢复流程应以真实 `loadCheckpoint`/DCD 解析为准，并避免在 checkpoint 加载成功前决定追加旧轨迹。
 
@@ -421,13 +506,102 @@
 
 - [ ] **V-02：传统 `single_lambda`/REMD 小型固定盒回归。** GitHub [#32](https://github.com/Cedrus810/openmm_IBS_dev/issues/32)。确认每个 task 收到有限、长度等于态数的 v3 LRC 数组，且每帧修正为 `coeff[k]/V(t)`。
 
-- [ ] **V-03：Stage 2 v21 blended-metric lambda schedule CUDA 验证。** GitHub [#33](https://github.com/Cedrus810/openmm_IBS_dev/issues/33)。验收条件见 [design/LAMBDA_SCHEDULE_CONTRACT.md](design/LAMBDA_SCHEDULE_CONTRACT.md)。
+- [x] **V-03：Stage 2 v21 blended-metric lambda schedule CUDA 验证 —— 已由 2026-07-29 生产跑满足，结案。**
+  GitHub [#33](https://github.com/Cedrus810/openmm_IBS_dev/issues/33)（可关）。
+  验收条件见 [design/LAMBDA_SCHEDULE_CONTRACT.md](design/LAMBDA_SCHEDULE_CONTRACT.md)，逐条核对落盘证据：
+  - 两条腿 `protocol_key.payload.thermodynamic_path_protocol_version = **21**` → v21 确实在 CUDA 上跑过。
+  - `stage_diagnostics.stage2.window_overlap_diagnostics[*].window_range`
+    = `[[0,5],[4,8],[7,12],[11,16],[15,20],[19,23]]`，与契约「窗口画线」的半开区间**逐字相同**。
+  - **6 个 ensemble** ✓；程序核对相邻窗口只共享一个节点 ✓；覆盖到最终 state **22** ✓。
+  - `validate_single_shared_boundary_ranges`（`abfe_preoptimizer.py:362`）已接入
+    `abfe_pipeline.py`，回归在 `tests/test_audit_protocol_regressions.py`、
+    `tests/test_warmup_overlap_protocol.py`。
 
-- [ ] **V-04：重建溶剂腿显式 0.15 M NaCl 缓存。** GitHub [#34](https://github.com/Cedrus810/openmm_IBS_dev/issues/34)。核对 Na/Cl 非零、目标浓度、旧 checkpoint 因 System 指纹变化被拒绝。
+- [ ] **V-08：核对 `stage2_n_states = 17` 与实际落地 23 个唯一 λ 的语义（2026-07-29 登记，低优先）。**
+  V-03 的窗口契约完全满足，但 `provenance.config.stage2_n_states` 是 **17**，而实际落地的是
+  23 个唯一 λ（6 窗口 × 槽位 − 5 次边界复用）。两个数都对得上各自的定义时没问题，
+  但配置名叫 `n_states` 却不等于实际态数，容易被下一个人误读成契约违规。
+  只需确认语义并在契约文档里写明二者关系，不改数值。
 
-## Boresch 拓扑后续
+- [x] **V-07：离线全套已重跑通过，ESS 门断言全部确认（2026-07-29 结案）。**
+  入口是 `./tests/run_offline_tests.sh` = `pytest -m "not needs_gpu"`。
+  ⚠️ 口径说明：`cpu_only` / `needs_gpu` 是 `tests/pytest.ini:30-32` 注册的 marker，
+  `cpu_only` 的语义是「只需 OpenMM Reference/CPU platform，可在登录节点跑」——
+  **它标注硬件需求，不是测试选择门**。当前 22 个测试文件里**没有一个**打 `needs_gpu`，
+  所以离线入口排除不掉任何东西，等于跑全套。
+  上一轮 285 项里只有 `ess_gate_protocol_version` 失败（已按 BOR-01 改为 3），该断言短路在
+  版本号那一行，后面几条（`min_absolute_ess_threshold is None`、
+  `min_absolute_ess_gate_retired_reason` 存在、`raw_*` 四项非 None、`ess_gate_metric` 标签）
+  当轮未执行；本次重跑已全部执行并通过，无遗留。
 
-- [ ] **让 mdtraj 拿到带配体键的拓扑（新登记）。** 上述配体侧几何回退是当前唯一可用判据，
+- [x] **V-04：重建溶剂腿显式 0.15 M NaCl 缓存 —— 已满足，结案（2026-07-29 核对）。**
+  GitHub [#34](https://github.com/Cedrus810/openmm_IBS_dev/issues/34)（可关）。
+  证据全在 `output_lrc_fix/solvent_cache_manifest.json`：
+  `protocol_version = 4`、`ionic_strength_molar = 0.15`、**`na_count = 7` / `cl_count = 7`（非零）**、
+  `positive_ion = Na+` / `negative_ion = Cl-`、`box_edge_nm = 4.257`、`padding_nm = 1.5`、
+  `nonbonded_cutoff_nm = 1.0`。第三条验收（旧 checkpoint 因指纹变化被拒）由
+  `SOLVENT_CACHE_PROTOCOL_VERSION` 3→4 达成，且盒边从 3.000 变成 4.257 本身就证明缓存真的重建过。
+
+## Boresch 二面角符号事故（2026-07-29）与后续
+
+全量诊断、证据链、时间线见
+[handoffs/BORESCH_DIHEDRAL_SIGN_HANDOFF.md](handoffs/BORESCH_DIHEDRAL_SIGN_HANDOFF.md)。
+下面只留仍需行动的部分。
+
+- [x] **BOR-01：四份手写二面角返回 −φ 的根因已修并实测确认（2026-07-29）。**
+
+  `(n1×b2̂)·n2 = −(n1×n2)·b2̂`，所以 `abfe_core.py` 那四份副本（`1962`
+  `OrbBoreschEstimator.estimate_from_trajectory`、`2029` `_finalize_candidate`、
+  `2837` `scan_boresch_1d_pes._calc_geom`、`3375` `calc_boresch_from_last_frame`）
+  返回的都是标准约定的**镜像**。OpenMM `dihedral()` 与 `mdtraj.compute_dihedrals`
+  都用 IUPAC 约定，所以只有三个二面角整体反号，`r0/θ` 不受影响（`arccos` 无符号）。
+
+  症状是 attachment 腿 λ=0 整个系综坐在 `k(1−cosΔ)` 势壁顶上（mean=777，std 只有 67），
+  BAR/TI 门失败只是表征。**不要因此加密 λ**——同一张 4 态表 07-28 跑出 BAR/TI 差
+  0.12 kJ/mol。
+
+  已改：新增模块级 `abfe_core.boresch_dihedral_rad()`（`abfe_core.py:1142`，带完整事故
+  docstring），四份副本全部替换，一次修完三个注入点（`abfe_pipeline.py:3338`、
+  `runabfe.py:1777`、`abfe_pipeline.py:3263` 的 resume 校验）。
+  `tests/test_boresch_attachment_leg.py` 改为复用该函数，不再自带公式。
+  新增 `tests/test_boresch_dihedral_convention.py`（8 条 `cpu_only`，6 粒子，不跑动力学）：
+  手算基准、与 OpenMM 自己的 `dihedral()` 对比、与 mdtraj 对比、fixture 判别力自检
+  （三个 φ 的 `|sin|` > 0.2）、端到端 `U_Boresch ≈ 0`、反号后必须暴涨到 `Σ2k_φ`。
+  **原则：测试绝不自己写二面角公式，只拿 OpenMM/mdtraj 当基准。**
+
+  同批顺带修正：`tests/test_core_physics_numerics.py` 的 `ess_gate_protocol_version`
+  钉子 2 → 3（`ibs_engine.py:11505` 已在 07-29 05:30 bump 到 3，v3 只取消了最终 stage
+  的 occupancy 反向否决，warmup 的 production-entry 占据门未变，与二面角无关）。
+
+- [ ] **BOR-02：`update_boresch_from_last_frame` 的校验门不看二面角。**
+
+  `abfe_pipeline.py:3328` 的两道强校验只看 θ 和 r0，所以这次的反号值畅通无阻。应复用
+  现成的 `boresch_committed_deviation_sigma`（`abfe_pipeline.py:197`，同文件模块级可直接调）
+  比较新推导的 `new_eq` 与它要覆盖的 `orig_eq`，阈值沿用现成常量
+  `BORESCH_COMMITTED_MAX_DEVIATION_SIGMA = 4.0` / `..._WARN_... = 2.5`，二面角先过
+  `_wrap_to_pi`。
+
+  **超限行为必须是「告警 + 保留 `orig_eq`」，不是 raise**：与同一函数已有两道门风格一致；
+  `orig_eq` 来自 `boresch_simple.json` 的 500 帧系综均值，本来就比单帧重锚可靠，退回它
+  是严格更优；4σ 在 6 个自由度上误报率约 2.8%，硬门会以约 1/36 概率无故杀掉一次 9 小时
+  生产跑。真正的守门人是 `tests/test_boresch_dihedral_convention.py`。
+  测试就近扩进 `tests/test_boresch_committed_gate.py`（已 import 该函数、同套阈值常量）。
+
+- [x] **BOR-03：`BORESCH_GEOMETRY_CONVENTION_VERSION` 2 → 3 —— 决定不做（2026-07-29 关闭）。**
+
+  `runabfe.py:1633` 保持 **2**。理由：v2 缓存的 `simple`/`fluctuation` 文件本身数值没问题
+  （实测 `output_lrc_fix/boresch_simple.json` 的 `equilibrium_values` 与
+  `diagnostics.fluctuation_distribution.mean` 逐位相等），真正的污染路径是
+  `auto`/`orb_simple` 分支用反号值覆盖，**那条路径已由 BOR-01 从根上修掉**。
+  升版只会强制重建一批数值本来就正确的缓存，收益为零。
+  handoff §9.2 里那条建议按此作废，不要照做。
+
+- [→] **BOR-04：vanishing 腿的报出 σ 偏小 —— 已并入 P1-19，不在本节重复登记。**
+  同 padding 两次独立跑差 2.34σ（比跨盒子的 1.13σ 还大）这条跨跑证据，与 P1-19 的
+  split-half 是同一现象的两个视角、同一个拟议修法，故合并。**不是代码 bug，是不确定度
+  量化 + 采样不足**；真 bug 在 P1-23。行动顺序（先固定 padding 重复跑、别再扫盒子）见 P1-19。
+
+- [ ] **BOR-05：让 mdtraj 拿到带配体键的拓扑（原「Boresch 拓扑后续」）。** 配体侧几何回退是当前唯一可用判据，
   但管线本来就有真实键：`GromacsTopFile` 的 `top.topology.bonds()` 含配体键
   （`generate_ligand_xml_from_top` 就靠它建 `bond_neighbors`）。可选路径是把 OpenMM 拓扑
   连 CONECT 写成 PDB 供 mdtraj 读，或给估计器传 `bond_overrides`。这会让配体侧也用上真实键、

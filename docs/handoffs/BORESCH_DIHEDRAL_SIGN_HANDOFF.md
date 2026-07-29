@@ -1,7 +1,10 @@
 # Boresch 二面角符号反号事故 —— 诊断、修复、遗留项
 
 日期：2026-07-29
-状态：**根因已修复并实测确认**；遗留三项未动（见最后一节），等溶剂盒扫描结果再决定。
+状态：**根因已修复并实测确认**，CPU 全套回归已跑通（第 10 节）。
+遗留只剩两项：9.1 → `../TODO.md` 的 **BOR-02**（committed 门加二面角校验）、
+9.3 → **P1-19**（vanishing 腿误差估计；原 BOR-04 已并入该条）。9.2 已决定不做。
+**不要再扫溶剂盒尺寸**，理由见 7.1 / 9.3。行动状态一律以 `../TODO.md` 为准。
 
 ---
 
@@ -114,10 +117,10 @@ kphiC(1−cos 1.300) = 130.1×0.732 =  95   → Σ ≈ 943 kJ/mol
   这样三个注入点一次修完：`abfe_pipeline.py:3338`、`runabfe.py:1777`、
   `abfe_pipeline.py:3263`（resume 校验的 `current_eq`）。
 
-- **`test_boresch_attachment_leg.py`**：`_dihedral_rad = boresch_dihedral_rad`，
+- **`tests/test_boresch_attachment_leg.py`**：`_dihedral_rad = boresch_dihedral_rad`，
   不再自带公式。
 
-- **`test_boresch_dihedral_convention.py`**（新，8 条 `cpu_only`，6 粒子，不跑动力学）。
+- **`tests/test_boresch_dihedral_convention.py`**（新，8 条 `cpu_only`，6 粒子，不跑动力学）。
   原则：**绝不自己写二面角公式**，只拿 OpenMM/mdtraj 当基准。
   1. 手算基准 → `+π/2`
   2. 三个 Boresch 四元组逐个与 **OpenMM 自己的 `dihedral()`** 比（把能量表达式直接
@@ -142,7 +145,7 @@ kphiC(1−cos 1.300) = 130.1×0.732 =  95   → Σ ≈ 943 kJ/mol
   ⚠️ 第一版 L2 取 `(0.55,−0.38,0.33)` 是坏的 —— φC = −3.105 rad，离 ±π 只有 2°，
   镜像代价塌到 0.36 kJ/mol，那条断言等于空转。现在的 L2 是反解出来的（注释里有构造）。
 
-- **`test_core_physics_numerics.py`**：`ess_gate_protocol_version` 钉子 2 → 3。
+- **`tests/test_core_physics_numerics.py`**：`ess_gate_protocol_version` 钉子 2 → 3。
   与二面角无关：`ibs_engine.py:11505` 在 07-29 05:30 被 bump 到 3
   （`v3: occupancy 与 warmup 协议统一为诊断项`），而这个测试写于 07-27。
   v3 只取消了「最终 stage 在全部采样完成后用 occupancy 反向否决」
@@ -367,11 +370,15 @@ vanishing 的采样并做重复跑确认，**不是改口径**。
   退回它是严格更优，不是「放过一个错值」。
 - 4σ 在 6 个自由度上误报率约 2.8%（见 `BORESCH_COMMITTED_WARN_DEVIATION_SIGMA`
   上方推导），硬门会以约 1/36 概率无故杀掉一次 9 小时的生产跑。真正的守门人是
-  `test_boresch_dihedral_convention.py`。
+  `tests/test_boresch_dihedral_convention.py`。
 
-测试就近扩进 `test_boresch_committed_gate.py`（已 import 该函数、同套阈值常量）。
+测试就近扩进 `tests/test_boresch_committed_gate.py`（已 import 该函数、同套阈值常量）。
 
-### 9.2 `BORESCH_GEOMETRY_CONVENTION_VERSION` 2 → 3
+### 9.2 ~~`BORESCH_GEOMETRY_CONVENTION_VERSION` 2 → 3~~ —— **决定不做（2026-07-29 关闭）**
+
+**下面这条建议已作废，不要照做。** 常量保持 2。污染路径（`auto`/`orb_simple` 用反号值
+覆盖）已由第 4 节从根上修掉，而 v2 缓存本身数值正确，升版只会强制重建一批正确的缓存，
+收益为零。当前状态以 `../TODO.md` 的 BOR-03 为准。原文如下，仅供追溯：
 
 `runabfe.py:1633`。v2 缓存的 `simple`/`fluctuation` 文件本身没问题（实测
 `output_lrc_fix/boresch_simple.json` 的 `equilibrium_values` 与
@@ -409,7 +416,8 @@ vanishing 的采样并做重复跑确认，**不是改口径**。
 本来就不同，分项对不上不构成偏差；而且 restraint 与被限制腿的采样结构性抵消，
 把 charging 的差和 restraint 的差当成两条线索是重复计数。详见 7.2。
 
-真正的遗留项只有 9.1 / 9.2（两道 Boresch 防护）和 9.3（vanishing 的误差估计）。
+真正的遗留项只剩 **9.1**（committed 门加二面角校验 → `../TODO.md` BOR-02）和
+**9.3**（vanishing 的误差估计 → P1-19，原 BOR-04 已并入该条）。9.2 已决定不做，见上。
 9.3 之所以成立，是因为它的证据**完全来自内部复现性**（同盒子两次独立跑差 2.34σ、
 split-half 漂移 4.46×2σ），不依赖任何与参考的比较。
 
@@ -420,12 +428,13 @@ split-half 漂移 4.46×2σ），不依赖任何与参考的比较。
 ```bash
 mamba activate openmm_dev && cd /home/ruigengji/ABFE_IBS/Atenolol-rank11
 
-# 符号约定 + 全部 CPU 回归
-python -m pytest test_boresch_dihedral_convention.py -v
-python -m pytest -m cpu_only -q
+# 符号约定 + 全部 CPU 回归（测试已归位 tests/）
+python -m pytest tests/test_boresch_dihedral_convention.py -v
+./tests/run_offline_tests.sh          # = pytest -m "not needs_gpu"；当前没有测试打
+                                      # needs_gpu，所以这条就是跑全套 22 个文件
 ```
 
-（`-m cpu_only` 已跑过一轮：285 项里只有 `ess_gate_protocol_version` 那一条失败，
-已按第 4 节修正。注意该断言短路在版本号那一行，它后面几条
+✅ **已跑完并全部通过（2026-07-29）。** 第一轮 285 项里只有 `ess_gate_protocol_version`
+失败（已按第 4 节改为 3）；该断言短路在版本号那一行，后面几条
 （`min_absolute_ess_threshold is None`、`min_absolute_ess_gate_retired_reason` 存在、
-`raw_*` 四项非 None、`ess_gate_metric` 标签）那轮**没有执行过**，需要这次重跑确认。）
+`raw_*` 四项非 None、`ess_gate_metric` 标签）当轮未执行，重跑后已全部执行并通过，无遗留。
