@@ -1241,6 +1241,22 @@ def _load_json_object_file(path: str, label: str) -> Dict:
     return value
 
 
+def _load_dexp_params_fail_closed(
+    potential_type: str,
+    params_path: Optional[str],
+) -> Optional[Dict]:
+    """Load the narrow production DEXP contract, or return None for other potentials."""
+    if str(potential_type).strip().lower() != "dexp":
+        return None
+    if not params_path:
+        raise ValueError(
+            "potential='dexp' 必须显式提供 --dexp-params JSON；"
+            "拒绝静默使用默认参数。"
+        )
+    dexp_dict = _load_json_object_file(params_path, "DEXP 参数")
+    return DEXPSurrogatePotential.from_dict(dexp_dict).get_parameters_dict()
+
+
 class RunConfig:
     """统一运行时配置，优先级：命令行 > 配置文件 > 预设"""
 
@@ -1889,14 +1905,6 @@ def parse_arguments():
     prep_parser.add_argument("--gmx-path", default=None)
     prep_parser.add_argument("--output-dir", default="./prep_output")
     prep_parser.add_argument("--save-boresch", default=None, help="保存 Boresch 文件")
-    prep_parser.add_argument("--save-dexp", default=None, help="保存 DEXP 文件")
-    prep_parser.add_argument("--fit-dexp", action="store_true")
-    prep_parser.add_argument("--fit-frames", type=int, default=200, help="DEXP 拟合使用的最大帧数")
-    prep_parser.add_argument("--fit-last-ns", type=float, default=None, help="仅使用轨迹最后多少 ns 做 DEXP 拟合")
-    prep_parser.add_argument("--fit-env-radius", type=float, default=0.85, help="DEXP 环境筛选半径 (nm)")
-    prep_parser.add_argument("--fit-env-max-atoms", type=int, default=0, help="DEXP 环境原子上限；<=0 表示不裁剪")
-    prep_parser.add_argument("--fit-r-min", type=float, default=0.20, help="DEXP 拟合距离下限 (nm)")
-    prep_parser.add_argument("--fit-r-max", type=float, default=0.45, help="DEXP 拟合距离上限 (nm)")
     prep_parser.add_argument("--temperature", type=float, default=300.0)
     prep_parser.add_argument("--platform", default="CUDA")
     prep_parser.add_argument("--n-steps", type=int, default=5_000_000)
@@ -2464,24 +2472,6 @@ def run_prepare_command(args):
             output_path=os.path.join(output_dir, args.save_boresch)
         )
         log.info("Boresch 参数已保存至 %s", args.save_boresch)
-
-    # DEXP 拟合（若需要）
-    if args.fit_dexp and args.save_dexp:
-        log.info("🧪 启动 Orbv3 → DEXP 拟合...")
-        dexp_json = pipeline.fit_dexp_parameters(
-            ligand_resname=args.ligand,
-            top_file=args.top,
-            output_name=args.save_dexp,
-            device="cuda" if args.platform.upper() == "CUDA" else "cpu",
-            n_frames=args.fit_frames,
-            env_radius_nm=args.fit_env_radius,
-            env_max_atoms=(args.fit_env_max_atoms if args.fit_env_max_atoms > 0 else None),
-            fit_last_ns=args.fit_last_ns,
-            fit_r_min=args.fit_r_min,
-            fit_r_max=args.fit_r_max,
-            gmx_include_dir=find_gmx_include_dir(args.gmx_path),
-        )
-        log.info("DEXP 参数已保存至 %s", dexp_json)
 
     log.info("✅ prepare 完成，文件已输出至 %s", output_dir)
 
@@ -3149,7 +3139,10 @@ def _run_complex_charging_only(
             system_type="complex",
             resume=False,
             potential_type=config.potential,
-            dexp_params=None,
+            dexp_params=_load_dexp_params_fail_closed(
+                config.potential,
+                config.dexp_params,
+            ),
             optimized_lambdas=lambdas_coul,
             window_ranges=None,
             enable_early_stop=False,
@@ -3318,6 +3311,10 @@ def main():
 
     # 创建配置对象
     config = RunConfig(args)
+    dexp_params = _load_dexp_params_fail_closed(
+        config.potential,
+        config.dexp_params,
+    )
     if not config.ligand:
         log.error("未提供配体残基名称。请通过 --ligand 或配置文件中的 ligand 指定。")
         sys.exit(2)
@@ -3500,15 +3497,6 @@ def main():
     )
 
     # DEXP 势能
-    dexp_params = None
-    if config.potential == "dexp" and config.dexp_params and os.path.exists(config.dexp_params):
-        with open(config.dexp_params) as f:
-            dexp_dict = json.load(f)
-        potential_obj = DEXPSurrogatePotential.from_dict(dexp_dict)
-        dexp_params = potential_obj.get_parameters_dict()
-    else:
-        dexp_params = None
-
     # ----- 4. Boresch 参数获取（可能触发预平衡估算） -----
     if config.boresch:
         log.info("🧷 复合物腿 Boresch 已启用 | source=%s", config.boresch_source)

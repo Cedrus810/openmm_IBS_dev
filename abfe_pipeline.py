@@ -92,7 +92,6 @@ from abfe_core import (
     ACESoftcorePotential,
     BeutlerSoftcoreBuilder,
     DEXPSurrogatePotential,
-    run_orbv3_dexp_fitting,
     UnitFormatter,
     TwoDimensionalLambdaPathPlanner,
     THERMODYNAMIC_CYCLE_DOC,
@@ -1493,52 +1492,6 @@ class ABFEPipeline:
             "resumed": resume_from_chk,
             "platform": equil_platform,
         }
-
-    def fit_dexp_parameters(
-        self,
-        ligand_resname: str,
-        top_file: str,
-        output_name: str = "dexp_fitted_params.json",
-        device: Optional[str] = None,
-        n_frames: int = 200,
-        env_radius_nm: float = 0.85,
-        env_max_atoms: Optional[int] = None,
-        fit_last_ns: Optional[float] = None,
-        fit_r_min: float = 0.20,
-        fit_r_max: float = 0.45,
-        gmx_include_dir: Optional[str] = None,
-    ) -> str:
-        traj_file = os.path.join(self.output_dir, "pre_equilibration.dcd")
-        if not _is_traj_valid(traj_file, min_frames=1):
-            raise FileNotFoundError(
-                f"未找到可用预平衡轨迹: {traj_file}。请先运行 pre_equilibrate(save_traj=True)。"
-            )
-
-        output_path = os.path.join(self.output_dir, output_name)
-        platform_upper = str(self.platform_name).upper()
-        resolved_device = device or ("cuda" if platform_upper == "CUDA" else "cpu")
-        self._log(
-            f"🧪 启动 DEXP 拟合 | device={resolved_device} | "
-            f"frames={n_frames} | tail_ns={fit_last_ns} | env_radius={env_radius_nm}"
-        )
-        generated_path = run_orbv3_dexp_fitting(
-            traj_file=traj_file,
-            top_file=top_file,
-            ligand_resname=ligand_resname,
-            output_dir=self.output_dir,
-            device=resolved_device,
-            n_frames=n_frames,
-            env_radius_nm=env_radius_nm,
-            env_max_atoms=env_max_atoms,
-            fit_last_ns=fit_last_ns,
-            fit_r_min=fit_r_min,
-            fit_r_max=fit_r_max,
-            gmx_include_dir=gmx_include_dir,
-        )
-        if os.path.abspath(generated_path) != os.path.abspath(output_path):
-            shutil.copy(generated_path, output_path)
-        self._log(f"✅ DEXP 参数已生成: {output_path}")
-        return output_path
 
     # =========================================================================
     # 1.5 带 Boresch 限制力的再平衡

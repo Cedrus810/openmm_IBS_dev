@@ -40,8 +40,24 @@
   它**不是代码 bug**（渐近协方差在正确地算 within-run 统计误差），而是不确定度量化
   加采样不足；同一带里真正的代码 bug 是 P1-23 的 σ 采纳 fail-open。
 - 新 DEXP 已按 `experiments/DEXP_KERNEL_PHYSICS_ISSUES.md` 冻结为
-  pair-specific LJ-matched 解析核，并拆出 `dexp_NEW.py` 生产入口；旧 Orb 全局 fitter
-  不再属于生产协议，旧参数 JSON fail closed。
+  `abfe_core.py` 内唯一的 pair-specific LJ-matched 解析核；配置契约只接受
+  `alpha_vdw/beta_vdw`。旧 Orb 全局 fitter 已隔离到 `dexp_退役.py`，不再属于生产协议，
+  旧参数 JSON fail closed。
+- **DEXP core 合并已完成（DEXP-MERGE-01，2026-07-29）。** `dexp_NEW.py` 已删除；
+  `cutoff/switch` 与 Gaussian-Coulomb 参数分别归入命名常量，三斜 minimum-image
+  校验已进入 `SurrogateSystemBuilder`；生产 Orb 拟合 CLI/pipeline 入口已移除。
+  `dexp_退役.py` 只显式 import 所需 core 符号，不使用 `import *`，生产四文件对它零引用。
+  `tests/test_dexp_new_production.py` 已改测 core 契约，覆盖未知/旧字段、非有限
+  alpha/beta、缺失参数文件、旧拟合 JSON、minimum-image、井深与曲率；定向测试
+  **24 passed**。softcore 壳仍为 1.2/1.0 nm，落盘基线逐位保持
+  181.00 / 157.84 / −5.535906 kcal/mol。
+- **测试契约修正（TEST-GATE-01，2026-07-29）。**
+  `tests/test_audit_protocol_regressions.py::
+  test_final_convergence_gate_uses_orthogonal_evidence_not_duplicated_ess`
+  原先错误要求 diagnostics-only 的 `min_occupancy_normalized` 进入最终
+  `converged` 门，与 `ibs_engine.py` 已落盘的 `min_occupancy_is_gate=False` 协议矛盾。
+  测试现改为断言 occupancy 不进入最终门，并钉住 threshold=None、退役原因与
+  diagnostics-only 元数据；不修改任何生产收敛判据。
 - 主 TODO 只保留仍需行动的事项；已修复项目、长表格、诊断过程与 2026-07-27 复审细节都归档。
 
 ## P0 / P1 当前待办

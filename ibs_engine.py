@@ -33,6 +33,8 @@ from abfe_core import (
     ACESoftcorePotential,
     AlchemicalPotentialFactory,
     DEXPSurrogatePotential,
+    DEXP_VDW_CUTOFF_NM,
+    DEXP_VDW_SWITCH_WIDTH_NM,
     LambdaDependentBoreschForce,
     create_ligand_internal_force,
     ensure_owned_system,
@@ -54,6 +56,8 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 IBS_WINDOW_DATA_PROTOCOL_VERSION = 1
+SOFTCORE_CUTOFF_NM = 1.2
+SOFTCORE_SWITCH_NM = 1.0
 
 # 🔑 [2026-07-28] 「分析协议」版本，与「采样协议」版本严格分离。
 #
@@ -2385,8 +2389,8 @@ def _create_softcore_force(
     sc_force.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
     is_dexp = str(potential_type or "").strip().lower() == "dexp"
     if is_dexp:
-        cutoff_nm = float(resolved_params["cutoff_distance"])
-        switch_width_nm = float(resolved_params["switch_width"])
+        cutoff_nm = DEXP_VDW_CUTOFF_NM
+        switch_width_nm = DEXP_VDW_SWITCH_WIDTH_NM
         switch_nm = cutoff_nm - switch_width_nm
         if not (cutoff_nm > switch_nm > 0.0):
             raise ValueError(
@@ -2395,7 +2399,7 @@ def _create_softcore_force(
                 f"derived_switch={switch_nm} nm"
             )
     else:
-        cutoff_nm, switch_nm = 1.2, 1.0
+        cutoff_nm, switch_nm = SOFTCORE_CUTOFF_NM, SOFTCORE_SWITCH_NM
     sc_force.setCutoffDistance(cutoff_nm * unit.nanometer)
     print(
         "  ⚠️ [VDW softcore] OpenMM 原生 CustomNonbondedForce.setUseLongRangeCorrection 已禁用"
