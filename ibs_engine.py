@@ -3134,7 +3134,7 @@ def build_ibs_dual_system(
         # Boresch CV 保持零力（物理限制已在 Group 3）
         rest_f_cv = openmm.CustomExternalForce("0")
         ibs_wrapper.addCollectiveVariable(f"cv_{k}_rest", rest_f_cv)
-        
+
     new_sys.addForce(ibs_wrapper.get_force())
 
     # ---------- 8. 统一排除表同步 ----------
@@ -3680,8 +3680,6 @@ class IBSBiasForce:
                 context.setParameter(f"{self.prefix}_f_{k}", float(f_values[k]))
             except Exception as e:
                 print(f"  ⚠️ 参数更新失败: {e}")
-
-
 # 🔑 e_base/e_bias 的力组切分方式（哪些 Force Group 算"物理"、哪些算"纯采样偏置"）
 # 每次改变时必须递增此版本号：resume/窗口产物复用逻辑靠这个字段判断一份旧的
 # dual_window_*_base.npy/*_bias.npy/convergence.json 是否是在当前口径下算出来的，
@@ -4829,6 +4827,7 @@ class IBSSampler:
         for k, gid in enumerate(self._probe_groups[:self.n_states]):
             state = self._probe_context.getState(getEnergy=True, groups={gid})
             interaction_energies[k] = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+
         return interaction_energies
 
     def _collect_interaction_energies(self) -> np.ndarray:

@@ -4,14 +4,20 @@
   "platform": "CUDA",
   "output": "./output",
   "temperature": 300.0,
+  "solvent_ionic_strength_molar": 0.15,
 
   "decoupling": "dual_lambda",
   "potential": "softcore",
 
+  "_comment_membrane": "膜受体体系（memtodolist.md §3.1/§3.2，B1）。system_type=null 或 \"soluble\" 时**行为与加入本功能之前逐位一致**：仍是 MonteCarloBarostat(pressure, temperature, 25)，预平衡指纹不变，已有 checkpoint 不失效。改成 \"membrane\" 才启用 MonteCarloMembraneBarostat，且只作用于复合物腿——溶剂腿是配体在体相水里，永远用普通各向同性恒压器。⚠️ 命名撞车：这个顶层 system_type 是**环境类型**(soluble/membrane)，与代码里 run_full_pipeline(system_type=\"complex\"|\"solvent\") 那个**腿身份**参数是两个不相干的轴，不要混。membrane.normal_axis 只能是 z——OpenMM 的膜 barostat 把膜法向硬编码在 z，其它值 fail closed。",
+  "system_type": null,
+  "membrane": null,
+  "confirm_soluble_with_lipids": false,
+
   "n_steps_per_window": 250000,
   "steps_per_update": 500,
-  "stage1_n_states": 16,
-  "stage2_n_states": 16,
+  "stage1_n_states": 12,
+  "stage2_n_states": 17,
 
   "boresch": true,
   "boresch_source": "simple",
@@ -24,6 +30,20 @@
   "enable_early_stop": false,
   "enable_gradual_warmup": true,
   "warmup_steps": 500000,
+  "min_bias_updates": 12,
+  "max_bias_updates": 50,
+  "required_consecutive_bias_updates": 3,
+  "max_bias_warmup_steps": 500000,
+
+  "pilot_finite_difference_delta": 0.01,
+  "pilot_n_steps_per_state": 30000,
+  "ibs_lse_log_residual_tolerance": 0.5,
+
+  "_comment_lambda_refine": "关掉了：第一次开启时 partition_windows_by_delta_f_budget 有 bug（净位移代替累积总变差），把 18 态/4窗口重分成了畸形的 12 窗口（其中一个窗口吞了7个态）。bug 已修，但当时已经把坏结果写进 checkpoints/preopt_dual_vanishing.json 并标记成'已精修'。改用 repair_stage2_tail_gap_local.py 手动局部修复了尾部（只重分窗口 12-18 那段，不动窗口 0/1/2），再打开这个开关会立刻重新跑一次全局重分布，把局部修复覆盖掉——所以先保持 false，除非要重新走一次全局精修。",
+  "enable_lambda_refine": false,
+  "refine_n_steps_per_window": 30000,
+  "refine_steps_per_update": 500,
+  "refine_max_window_span_kJ": 35.0,
 
   "n_workers": null,
 

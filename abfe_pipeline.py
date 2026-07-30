@@ -96,6 +96,13 @@ from abfe_core import (
     TwoDimensionalLambdaPathPlanner,
     THERMODYNAMIC_CYCLE_DOC,
     combine_binding_free_energy,  # [ATT-09] 热力学循环闭合的唯一实现
+    # 膜体系协议（memtodolist §3.1/§3.2，B1）。默认 soluble，行为与改动前一致。
+    # 注意：这里的 soluble/membrane 是**环境类型**，与本文件里既有的
+    # `system_type="complex"|"solvent"`（腿身份）是两个互不相干的轴。
+    ENVIRONMENT_TYPE_MEMBRANE,
+    barostat_fingerprint_payload,
+    ensure_barostat_for_protocol,
+    resolve_membrane_protocol,
 )
 import warnings
 
@@ -331,6 +338,7 @@ def _pre_equilibration_fingerprint(
     positions=None,
     box_vectors=None,
     requested_steps: Optional[int] = None,
+    barostat_protocol: Optional[Dict] = None,
 ) -> str:
     """Content fingerprint for one pre-equilibration run: system Hamiltonian +
     which atoms are the ligand + temperature + barostat pressure.
@@ -373,6 +381,18 @@ def _pre_equilibration_fingerprint(
         "box_vectors_sha256": _box_vectors_hash(box_vectors),
         "requested_steps": int(requested_steps) if requested_steps is not None else None,
     }
+    # memtodolist §3.2：barostat 类型/压力/表面张力/XY-Z 模式/频率进入预平衡
+    # fingerprint，改任一项都必须让旧 checkpoint 失效。
+    #
+    # 但 §7.7 同时要求"不传 system_type 时行为与改动前逐位一致"。这两条靠
+    # barostat_fingerprint_payload() 调和：它对 legacy soluble 协议
+    # （MonteCarloBarostat + 频率 25，即改动前唯一存在的协议）返回 None，
+    # 于是**一个键都不加**，json.dumps 的结果与改动前逐字节相同，已有的生产预平衡
+    # checkpoint 继续有效。只要 system_type 变成 membrane 或频率偏离 25，
+    # payload 非 None，指纹立刻改变，旧 checkpoint 自动失效。
+    barostat_payload = barostat_fingerprint_payload(barostat_protocol)
+    if barostat_payload is not None:
+        payload["barostat_protocol"] = barostat_payload
     return _sha256_text(json.dumps(payload, sort_keys=True))
 
 
@@ -1080,6 +1100,9 @@ class ABFEPipeline:
         output_dir: str = "./output",
         checkpoint_dir: Optional[str] = None,
         platform_name: str = "CUDA",
+        environment_type: Optional[str] = None,
+        membrane: Optional[Dict] = None,
+        confirm_soluble_with_lipids: bool = False,
     ):
 
         # 统一温度/压力单位
@@ -1098,6 +1121,23 @@ class ABFEPipeline:
         self.positions = positions
         self.box_vectors = box_vectors
         self.ligand_indices = ligand_indices or []
+
+        # 膜体系协议（memtodolist §3.1/§3.2，B1）。**纯增量**：不声明 system_type 时
+        # 解析结果是 legacy soluble 协议（MonteCarloBarostat，频率 25），
+        # barostat_fingerprint_payload() 对它返回 None，预平衡 fingerprint 与本次
+        # 改动前逐位一致，已有生产 checkpoint 不失效（§7.7）。
+        # 在这里而不是在 pre_equilibrate() 里解析，是为了满足 §6.1
+        # "在创建任何 Context 前完成协议组合的 fail-closed 检查"。
+        # ⚠️ 形参叫 environment_type 而不是 system_type：本文件里 `system_type`
+        # 已经被 run_full_pipeline 用作腿身份（"complex"/"solvent"），占用它会
+        # 静默改掉 Boresch 与盒子逻辑。两个轴必须分开。
+        self.barostat_protocol = resolve_membrane_protocol(
+            environment_type,
+            membrane_config=membrane,
+            topology=topology,
+            confirm_soluble_with_lipids=confirm_soluble_with_lipids,
+        )
+        self.environment_type = self.barostat_protocol["system_type"]
 
         # 路径配置
         self.output_dir = os.path.abspath(output_dir)
@@ -1336,6 +1376,7 @@ class ABFEPipeline:
             positions=self.positions,
             box_vectors=self.box_vectors,
             requested_steps=n_steps,
+            barostat_protocol=self.barostat_protocol,
         )
 
         # A binary OpenMM checkpoint is only meaningful for the exact initial
@@ -1373,15 +1414,41 @@ class ABFEPipeline:
         equil_sys.thisown = 1
         _ = equil_sys.getNumParticles()  # 触发底层指针验证，固化状态
         
-        # 添加 Barostat（如果缺失）
-        has_barostat = any(
-            isinstance(f, openmm.MonteCarloBarostat) for f in equil_sys.getForces()
+        # 添加 Barostat（如果缺失）。
+        #
+        # 旧代码只用 `isinstance(f, openmm.MonteCarloBarostat)` 判断，而
+        # MonteCarloMembraneBarostat / MonteCarloAnisotropicBarostat **不是**它的子类——
+        # 输入 System 若已带膜或各向异性 barostat，旧逻辑检测不到，会在其上再叠一个
+        # 各向同性的，两个 barostat 同时做体积移动且不报错。
+        # ensure_barostat_for_protocol() 按类名检测全部三种，并按 memtodolist §3.2
+        # 分三种结局：复用 / 添加 / fail closed。
+        #
+        # 对 environment_type=soluble（默认）来说，这里添加的仍是
+        # MonteCarloBarostat(self.pressure, self.temperature, 25)，与改动前完全一致。
+        barostat_result = ensure_barostat_for_protocol(
+            equil_sys,
+            self.barostat_protocol,
+            temperature=self.temperature,
+            pressure=self.pressure,
         )
-        if not has_barostat:
-            equil_sys.addForce(
-                openmm.MonteCarloBarostat(self.pressure, self.temperature, 25)
+        if barostat_result["action"] == "added":
+            self._log(
+                f"  🧊 已添加 {barostat_result['barostat_class']}"
+                f"（environment_type={self.environment_type}，"
+                f"频率={self.barostat_protocol['barostat_frequency']}）"
             )
-        
+        else:
+            self._log(
+                f"  ♻️ 复用输入 System 已有的 {barostat_result['barostat_class']}，不重复添加"
+            )
+        if self.environment_type == ENVIRONMENT_TYPE_MEMBRANE:
+            membrane_cfg = self.barostat_protocol["membrane"]
+            self._log(
+                f"  🧫 膜恒压协议: 法向={membrane_cfg['normal_axis']}, "
+                f"表面张力={membrane_cfg['surface_tension_bar_nm']} bar·nm, "
+                f"XY={membrane_cfg['xy_mode']}, Z={membrane_cfg['z_mode']}"
+            )
+
         # 创建 Integrator
         integrator = openmm.LangevinMiddleIntegrator(
             self.temperature, 1.0 / unit.picosecond, 0.002 * unit.picosecond

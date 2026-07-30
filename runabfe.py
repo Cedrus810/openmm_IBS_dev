@@ -38,6 +38,7 @@ from abfe_core import (
     combine_binding_free_energy,  # [ATT-09] 热力学循环闭合的唯一实现
     solvent_box_edge_nm, SOLVENT_NONBONDED_CUTOFF_NM,  # 溶剂盒唯一实现，勿在此重复
     resolve_water_model_xml,  # 溶剂腿水模型必须从复合物 .top 反推
+    resolve_membrane_protocol,  # 膜体系协议唯一解析实现（B1）
 )
 from abfe_pipeline import (
     ABFEPipeline, TraditionalABFEPipeline, _collect_pipeline_provenance, _pme_u_kn_meta_payload,
@@ -1390,6 +1391,37 @@ class RunConfig:
         if _flag_present("--only-boresch-attachment"):
             preset["only_boresch_attachment"] = bool(args.only_boresch_attachment)
 
+        # ---- 膜体系（B1）。配置键按 memtodolist §3.1：顶层 system_type + 嵌套 membrane.* ----
+        if _flag_present("--system-type"):
+            preset["system_type"] = args.system_type
+        if _flag_present("--confirm-soluble-with-lipids"):
+            preset["confirm_soluble_with_lipids"] = bool(
+                args.confirm_soluble_with_lipids
+            )
+        _membrane_cli = {
+            "normal_axis": ("--membrane-normal-axis", "membrane_normal_axis"),
+            "surface_tension_bar_nm": (
+                "--membrane-surface-tension-bar-nm",
+                "membrane_surface_tension_bar_nm",
+            ),
+            "xy_mode": ("--membrane-xy-mode", "membrane_xy_mode"),
+            "z_mode": ("--membrane-z-mode", "membrane_z_mode"),
+            "barostat_frequency": (
+                "--membrane-barostat-frequency",
+                "membrane_barostat_frequency",
+            ),
+        }
+        _membrane_overrides = {
+            key: getattr(args, attr)
+            for key, (flag, attr) in _membrane_cli.items()
+            if _flag_present(flag)
+        }
+        if _membrane_overrides:
+            # 命令行只覆盖显式给出的子键，不清空配置文件里的其余 membrane.* 设置。
+            merged_membrane = dict(preset.get("membrane") or {})
+            merged_membrane.update(_membrane_overrides)
+            preset["membrane"] = merged_membrane
+
         defaults = {
             "resume": False,
             "reset": False,
@@ -1424,6 +1456,10 @@ class RunConfig:
             "attachment_steps_per_sample": 1000,
             "attachment_seed": 20260728,
             "attachment_n_seeds": 1,
+            # 膜功能默认关闭（§7.7）：不声明时与改动前逐位一致。
+            "system_type": None,
+            "membrane": None,
+            "confirm_soluble_with_lipids": False,
         }
         for key, value in defaults.items():
             preset.setdefault(key, value)
@@ -1462,6 +1498,7 @@ def _write_run_provenance(
     system: Optional[openmm.System] = None,
     topology: Optional[app.Topology] = None,
     positions=None,
+    barostat_protocol: Optional[Dict] = None,
 ) -> Dict:
     provenance = _collect_pipeline_provenance(
         config=config.as_dict(),
@@ -1470,6 +1507,12 @@ def _write_run_provenance(
         positions=positions,
         command_line=sys.argv,
     )
+    # memtodolist §10：system_type / barostat_protocol 必须落进 provenance，
+    # 且 §3.2 要求 XY/Z 模式与膜法向可审计。这里写的是**已解析**的协议，
+    # 不是原始配置字段——原始字段已在 provenance["config"] 里，两者可对照。
+    if barostat_protocol is not None:
+        provenance["barostat_protocol"] = barostat_protocol
+        provenance["system_type"] = barostat_protocol.get("system_type")
     provenance["input_files"] = {
         "gro": config.get("gro"),
         "top": config.get("top"),
@@ -1675,6 +1718,7 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
         positions=pipeline.positions,
         box_vectors=pipeline.box_vectors,
         requested_steps=_n_equil_steps,
+        barostat_protocol=pipeline.barostat_protocol,
     )
     if not config.reset and equilibrium_is_done(output_dir, expected_fingerprint=_equil_fingerprint):
         log.info("♻️ 基线预平衡已完成，复用已有轨迹")
@@ -1998,6 +2042,52 @@ def parse_arguments():
         help="溶剂腿 NaCl 浓度 (M)，默认 0.15；另加必要反离子保持中性",
     )
     parser.add_argument("--platform", default="CUDA", choices=["CUDA", "OpenCL", "CPU"])
+
+    # ---- 膜受体体系（memtodolist §3.1/§3.2，B1）。默认 soluble，不传等于关闭 ----
+    # ⚠️ 这里的 --system-type 是**环境类型**（soluble/membrane），决定用哪种
+    # barostat。它与 run_full_pipeline(system_type="complex"|"solvent") 那个
+    # 同名的**腿身份**参数是两个不相干的轴，不要混。
+    parser.add_argument(
+        "--system-type",
+        default=None,
+        choices=["soluble", "membrane"],
+        help="体系环境类型；membrane 启用 MonteCarloMembraneBarostat。默认 soluble（不改变任何现有行为）",
+    )
+    parser.add_argument(
+        "--membrane-normal-axis",
+        default=None,
+        choices=["x", "y", "z"],
+        help="膜法向轴；OpenMM 的膜 barostat 只支持 z，其它值 fail closed",
+    )
+    parser.add_argument(
+        "--membrane-surface-tension-bar-nm",
+        type=float,
+        default=None,
+        help="膜表面张力 (bar·nm)，默认 0.0",
+    )
+    parser.add_argument(
+        "--membrane-xy-mode",
+        default=None,
+        choices=["isotropic", "anisotropic"],
+        help="XY 平面缩放模式，默认 isotropic（XY 等比例）",
+    )
+    parser.add_argument(
+        "--membrane-z-mode",
+        default=None,
+        choices=["free", "fixed", "constant_volume"],
+        help="Z 轴模式，默认 free（Z 独立变化）",
+    )
+    parser.add_argument(
+        "--membrane-barostat-frequency",
+        type=int,
+        default=None,
+        help="膜 barostat 体积移动频率，默认 25",
+    )
+    parser.add_argument(
+        "--confirm-soluble-with-lipids",
+        action="store_true",
+        help="确认 system_type=soluble 但拓扑含大量脂质残基（留记录，不静默放行）",
+    )
 
     # 高级选项
     parser.add_argument("--torsion-params", default=None)
@@ -2923,6 +3013,7 @@ def _run_boresch_attachment_only(
         rerun_pipeline.system,
         rerun_pipeline.topology,
         rerun_pipeline.positions,
+        barostat_protocol=rerun_pipeline.barostat_protocol,
     )
 
     stage0 = run_boresch_attachment_leg(
@@ -3074,6 +3165,7 @@ def _run_complex_charging_only(
         rerun_pipeline.system,
         rerun_pipeline.topology,
         rerun_pipeline.positions,
+        barostat_protocol=rerun_pipeline.barostat_protocol,
     )
 
     n_states = int(config.get("stage1_n_states", 12))
@@ -3425,10 +3517,29 @@ def main():
     # ABFEPipeline.repair_pbc_molecule_integrity()，现已提前到第一次建 Context /
     # 最小化 / 预平衡之前执行（pre_equilibrate 开头），并在失败时 fail closed。
     log.info("  ✅ 配体已居中（仅整体质心平移；整分子 PBC 修复在 pre_equilibrate 之前执行）")
+    # 膜协议在这里先解析一次：provenance 写在 Pipeline 构建之前，而 §6.1 要求
+    # 协议组合的 fail-closed 检查在创建任何 Context 之前完成。下面 ABFEPipeline
+    # 会用同一个纯函数、同一份输入再解析一次，结果必然一致（单一实现，无第二套判据）。
+    _barostat_protocol = resolve_membrane_protocol(
+        config.get("system_type"),
+        membrane_config=config.get("membrane"),
+        topology=topology,
+        confirm_soluble_with_lipids=bool(
+            config.get("confirm_soluble_with_lipids", False)
+        ),
+    )
+    if _barostat_protocol["system_type"] != "soluble":
+        log.info(
+            "🧫 环境类型=%s，复合物腿将使用 %s",
+            _barostat_protocol["system_type"],
+            _barostat_protocol["barostat_class"],
+        )
+
     run_provenance = None
     if not config.only_complex_charging:
         run_provenance = _write_run_provenance(
-            output_dir, config, system, topology, positions
+            output_dir, config, system, topology, positions,
+            barostat_protocol=_barostat_protocol,
         )
         log.info(
             "🧾 运行 provenance 已保存: %s",
@@ -3486,6 +3597,13 @@ def main():
         output_dir=output_dir,
         checkpoint_dir=os.path.join(output_dir, "checkpoints"),
         platform_name=config.platform,
+        # 膜体系只影响复合物腿（memtodolist §3.2 / docs/TODO.md 的膜受体前置条）。
+        # 协议在这里解析，即在创建任何 Context 之前完成 fail-closed 检查（§6.1）。
+        environment_type=config.get("system_type"),
+        membrane=config.get("membrane"),
+        confirm_soluble_with_lipids=bool(
+            config.get("confirm_soluble_with_lipids", False)
+        ),
     )
 
     # ----- 3. 加载可选参数 -----
@@ -3580,8 +3698,12 @@ def main():
                 positions=pipeline.positions,
                 box_vectors=pipeline.box_vectors,
                 requested_steps=config.get("n_equil_steps", 5_000_000),
+                barostat_protocol=pipeline.barostat_protocol,
             ),
         ) or config.reset,
+        # 注意：这个 system_type 是**腿身份**（complex/solvent），与膜协议的
+        # 环境类型（soluble/membrane）是两个不同的轴，后者走
+        # ABFEPipeline(environment_type=...)。
         system_type="complex",
         n_steps_per_window=config.n_steps_per_window,
         steps_per_update=config.steps_per_update,
@@ -3646,6 +3768,10 @@ def main():
     pos_solv, box_solv = center_system_rigidly(pos_solv, box_solv, lig_idx_solv)
     
     solvent_out_dir = os.path.join(output_dir, "solvent_leg")
+    # 🔑 溶剂腿**刻意不接** environment_type / membrane：memtodolist §3.2
+    # "溶剂腿继续使用普通 MonteCarloBarostat"。溶剂腿是配体在体相水里，与膜无关，
+    # 即使复合物腿跑 membrane，这里也必须保持各向同性恒压器。
+    # 不要"为了一致"把 config 的 system_type 传进来——那会给纯水盒装上膜 barostat。
     pipeline_solv = ABFEPipeline(
         system=sys_solv, topology=top_solv, positions=pos_solv, box_vectors=box_solv,
         ligand_indices=lig_idx_solv, temperature=config.temperature,
@@ -3669,6 +3795,9 @@ def main():
                 positions=pipeline_solv.positions,
                 box_vectors=pipeline_solv.box_vectors,
                 requested_steps=config.get("n_equil_steps", 5_000_000),
+                # 溶剂腿永远是 soluble（§3.2：溶剂腿继续用普通 MonteCarloBarostat），
+                # 所以这里的 payload 恒为 None，指纹与改动前一致。
+                barostat_protocol=pipeline_solv.barostat_protocol,
             ),
         ) or config.reset,
         system_type="solvent",
