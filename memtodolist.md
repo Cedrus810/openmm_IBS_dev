@@ -124,6 +124,48 @@ charge-transfer。** 下面每条都带 `file:line`，Phase A 必须逐条裁决
   不在生产路径上。** §2.2 那条警告仍然成立（不要拿它当 PME co-ion），但**它不是当前
   真正的风险源**，MEM-00a–00e 才是。
 
+### 0.5.4 真实膜体系（`memtest/`）暴露的五处身份判定缺陷（2026-07-30 已修）
+
+`memtest/` 是 CHARMM-GUI FF-Converter 产的 **AMBER** 膜体系
+（PROA 1 + POPC 90 + Na⁺ 25 + Cl⁻ 36 + TP3 9542 + 配体 1，共 45354 原子，
+盒 6.096 × 6.096 × 11.867 nm 长方体、法向 z）。它把此前所有**基于残基名**的判据
+全打穿了，而且**四处是静默出错、不是报错**：
+
+| 实际 | 旧判据 | 后果 |
+| --- | --- | --- |
+| include 全是 `toppar/*.itp`，**不含 `amber` 字样** | 只看 include 路径 token | 力场族 fail closed，**跑不起来** |
+| 一个 `POPC` = `PA` + `PC` + `OL` **三个残基**（一个 moleculetype、134 原子） | 按残基计数 | 脂质数 ×3、**APL 错 3 倍**；尾链残基无磷原子 → 直接 raise |
+| 水叫 `TP3`（mdtraj `_WATER_RESIDUES` 只有 `TIP3`） | `select("water")` | 疏水核内水、co-ion 首层水配位数**静默为 0** |
+| 离子叫 `Na+` / `Cl-`（带符号） | 名字集合无 `NA+`/`CL-` | 离子计数**静默为 0** |
+| 蛋白含 `HID`/`ASH`/`NTRP`/`CCYS` | mdtraj `protein`（表里只有 `HIP`） | 骨架原子**静默少选 85 个** |
+
+**根因不是"少了几个名字"。** 往硬编码集合里补名字是改产物不改生成器，换一套体系
+又挂。`.top` 里本来就写着权威答案，所以身份一律从 `[ molecules ]` + `[ moleculetype ]` 来：
+
+- `abfe_core.parse_gromacs_topology()`：递归展开 include，取 `[ defaults ]` /
+  `[ moleculetype ]`（含残基构成与原子数）/ `[ molecules ]`。
+- `abfe_core.molecule_atom_ranges()`：由 `[ molecules ]` 展开顺序算出每个分子的**精确**
+  原子区间。已实测对齐：`PROA` 4566 原子 → 第一个 POPC 原子在 index 4566，
+  与 `step7_production.gro` 里第一个 `PA` 的位置逐一致；末端 stop = 45354 = `.gro` 原子数。
+- `abfe_core.classify_system_composition()`：判 protein / lipid / water / ion / ligand，
+  判不出即 fail closed（静默归入 "other" 等于让它从所有原子选择里消失）；
+  允许 `declared_roles` 显式覆盖并留记录。
+- 力场族改以 **`[ defaults ]` 的 1-4 缩放**为主判据（Amber 0.5/0.8333 vs CHARMM 1.0/1.0），
+  递归跟随 include 去找它（`[ defaults ]` 在 `toppar/forcefield.itp` 里，不在顶层 `.top`）；
+  include 路径 token 降为次要信号，两者冲突时 fail closed 要求人工裁决。
+  §1.1 原文写的就是"从 `#include` **与** `[ defaults ]` 判定"——此前只实现了一半。
+- 叶片划分与 APL 改为**按分子**（`assign_lipid_leaflets(lipid_molecules=…)`）。
+- 蛋白残基名自带一份含 Amber 变体的表 + N-/C- 端前缀归一（`NTRP`→`TRP`、`CCYS`→`CYS`），
+  不再依赖 mdtraj 的 `protein` 关键字；没有组成兜底时会把 mdtraj 漏掉的残基**报出来**。
+- 水氧原子解析**空集即报错**（膜体系必然有水，空集是识别失败而非事实）。
+- `runabfe._resolve_gromacs_include_path` 收敛为 `abfe_core.resolve_gromacs_include`
+  的薄包装，解析顺序只有一处实现。
+
+证据：`tests/test_gromacs_composition.py`（直接对真实 `memtest/topol.top` 与仓库根
+`topol.top` 断言，纯文本、无 GPU）。
+
+---
+
 ### 0.5.2 已存在的、进膜之前必须先收口的非键协议不一致
 
 - [ ] **MEM-00h：ligand–environment 与 environment–environment 的 LJ cutoff 目前就不一致。**
@@ -328,10 +370,15 @@ SERT 特有的坑，**必须在 Phase A 就处理，否则会静默选错 co-ion
 - [ ] 普通 `NonbondedForce` 与炼金 softcore 力使用同一非键协议。
 - [ ] 明确区分 energy-switch 与 force-switch；不能因为距离同为 1.0–1.2 nm
   就认为 Hamiltonian 相同。
-- [ ] 复合物腿和溶剂腿使用同一套 ligand–environment 非键定义。
-- [ ] 关闭当前 `lrc_coeff/V`，metadata 写
-  `disabled_by_membrane_forcefield_protocol`，不能写成遗漏。
-  （**仅当所选脂质力场本身不要求 LRC 时**；Amber 脂质见上方修正框。）
+- [x] 复合物腿和溶剂腿使用同一套 ligand–environment 非键定义。✅ 2026-07-30
+  溶剂腿 pipeline 接同一个已解析的 `dispersion_protocol`（但**不**接膜恒压协议）。
+  有 AST 契约测试钉住全部 6 个 `ABFEPipeline` 构造点。
+- [x] 关闭当前 `lrc_coeff/V`，metadata 写
+  `disabled_by_membrane_forcefield_protocol`，不能写成遗漏。✅ 2026-07-30（B6 接线）
+  实现口径：被关掉的**只有炼金 ligand–environment 那一项**（它假设配体周围是均匀
+  体相密度，埋在脂双层口袋里直接不成立）；环境–环境色散仍按所选力场的原始参数化
+  条件由基础 `NonbondedForce` 处理——所以这不是"膜体系一律禁用长程色散修正"。
+  理由字符串会进 `final_results.json`，措辞不要改。
 - [ ] **OpenMM 的 `NonbondedForce` 没有 force-switch，只有 potential-switch
   （`setUseSwitchingFunction`）。**
   若脂质力场要求 force-switch（CHARMM36 系），OpenMM 侧**无法复现同一个 Hamiltonian**，
@@ -546,18 +593,28 @@ sum(q_lig(lambda_q)) + q_coion(lambda_q) = q_L
 
 ### 3.3 膜输入与拓扑
 
-- [ ] 输入必须是已经完成膜构建和主要平衡的 protein–lipid–ligand–water–ion 体系。
-- [ ] 不依赖当前通用 10 ns 预平衡去完成脂质重排或蛋白插膜。
-- [ ] `.gro`、`.top`、全部 `.itp`、位置限制文件和力场 include 一起归档。
-- [ ] 记录输入 SHA256、构建工具、构建参数和最终平衡作业。
-- [ ] 核对：
-  - [ ] 坐标/拓扑原子数；
-  - [ ] 上下叶脂质数；
-  - [ ] 水和离子数；
-  - [ ] 蛋白跨膜方向；
-  - [ ] 配体 pose；
-  - [ ] 辅因子、结构水、二硫键和质子化态；
-  - [ ] 周期盒无膜间异常接触。
+✅ 校验层完成 2026-07-30：`abfe_core.validate_membrane_input()` /
+`assign_lipid_leaflets()`，测试 `tests/test_membrane_input_and_quality_gate.py`。
+
+- [x] 输入必须是已经完成膜构建和主要平衡的 protein–lipid–ligand–water–ion 体系。
+  实现为 `MEMBRANE_INPUT_REQUIRED_PROVENANCE_FIELDS` 全部必填，缺一项 fail closed。
+- [x] 不依赖当前通用 10 ns 预平衡去完成脂质重排或蛋白插膜。
+  由 §9 的"预平衡时长 ≥ 一个脂质横向弛豫时间"判据强制（弛豫尺度 30 ns 时 10 ns 必不过）。
+- [x] `.gro`、`.top`、全部 `.itp`、位置限制文件和力场 include 一起归档。
+  **复用**既有 `runabfe._gromacs_dependency_hashes()`——它已递归哈希整棵
+  `#include` 树（含 `posre.itp` / 力场 include），未另造第二套。
+- [x] 记录输入 SHA256、构建工具、构建参数和最终平衡作业。
+- [x] 核对：
+  - [x] 坐标/拓扑原子数；
+  - [x] 上下叶脂质数 —— **实测而非假设对半分**：按头基参考原子相对膜中面分叶，
+    报出每叶计数、组成与不平衡度；声明值与实测不符即报错；
+    识别不到头基参考原子的脂质残基单独报出，不静默丢弃。
+  - [x] 水和离子数（实测并与声明交叉核对）；
+  - [ ] 蛋白跨膜方向（倾角进了 §9 质量门；建系期的插膜方向核对仍待做）；
+  - [ ] 配体 pose（RMSD 进了 §9 质量门；建系期 pose 核对仍待做）；
+  - [ ] 辅因子、结构水、二硫键和质子化态（仍待做，需要真实膜输入才好定判据）；
+  - [x] 周期盒无膜间异常接触（`membrane_periodic_image_contacts` 必须为 0）。
+  - [x] 追加：**盒型必须是长方体**，三斜/截角盒直接拒绝（§1.1）。
 
 ### 3.4 co-ion 选择
 
@@ -714,7 +771,14 @@ manifest
   - 膜不被错误重排；
   - 蛋白–配体保持同一周期镜像。
 - [ ] pipeline state 和 checkpoint 写入 co-ion identity。
-- [ ] 复合物腿结果写膜质量诊断摘要。
+- [x] 复合物腿结果写膜质量诊断摘要。✅ 2026-07-30
+  `ABFEPipeline._evaluate_membrane_quality_gate_after_equilibration()` 在**预平衡
+  轨迹刚落盘时**就跑提取器 + 判定层，写 `membrane_quality_gate.json`，
+  门未过直接 raise（§9 末句要求阻断，不是 warning）。位置选在这里是因为 §9 的要求
+  是"**进入 ABFE 前**至少保存并审查"——门没过不该继续烧 λ 窗口。
+  可溶体系不进这个分支。
+  口袋原子 / co-ion 索引 / 文献 APL / 声明预平衡时长由 `--membrane-input-declaration`
+  显式给出，不做运行时推断（同一体系两次跑必须用同一口袋定义，MEM-00c 的教训）。
 
 ### 6.3 `abfe_core.py`
 
@@ -736,8 +800,12 @@ manifest
 - [ ] energy collection、fixed-H、REMD/bridge、BAR/MBAR 重算都看到同一 co-ion Hamiltonian。
 - [ ] stage 2 固定 co-ion 在 fully charged 端点。
 - [ ] 充电协议版本升级，旧 charging checkpoint 全部失效。
-- [ ] membrane + legacy uniform-density LRC 必须 fail closed。
-- [ ] 新 LJ 协议进入窗口 manifest、energy cache 和 resume gate。
+- [x] membrane + legacy uniform-density LRC 必须 fail closed。✅ 2026-07-30
+  `resolve_dispersion_protocol()` 里判死；`ABFEPipeline` 走同一个校验实现，
+  所以 pipeline 层自动继承这条，不需要第二套判据。
+- [x] 新 LJ 协议进入窗口 manifest、energy cache 和 resume gate。✅ 2026-07-30
+  非 legacy 时写进 `_stage_protocol_key` 协议指纹；legacy 时刻意不写以保住
+  已有生产 stage 缓存（§7.7）。
 
 与 IBS 机制本身的耦合（原稿缺，这部分不做会静默出错）：
 
@@ -916,10 +984,25 @@ manifest
 
 补充（原稿只列了量，没列"看多久、怎么判"）：
 
-- [ ] 每个量都必须给出**时间序列**和**末段窗口的漂移斜率**，不能只报平均值。
-- [ ] 判据统一为"末段 ≥ 20 ns 内线性漂移小于阈值"，阈值见 §13。
-- [ ] 记录脂质横向弛豫的估计时间尺度（脂质横向 MSD 或首层脂质交换时间），
-  用它论证预平衡时长够——**通用 10 ns（当前 `n_equil_steps = 5e6`）几乎肯定不够**。
+✅ 判定层完成 2026-07-30：`abfe_core.evaluate_membrane_quality_gate()` /
+`linear_drift_per_ns()`，测试 `tests/test_membrane_input_and_quality_gate.py`（30 条）。
+阈值全部取自 §13.3 的命名常量，判定层不自带魔数。
+
+- [x] 每个量都必须给出**时间序列**和**末段窗口的漂移斜率**，不能只报平均值。
+  传标量会被拒（"不接受只报平均值"）；`REQUIRED_MEMBRANE_QUALITY_OBSERVABLES` /
+  `REQUIRED_MEMBRANE_QUALITY_DIAGNOSTICS` 缺任一项 fail closed。
+  co-ion 相关量只在共炼金路线下额外要求。
+- [x] 判据统一为"末段 ≥ 20 ns 内线性漂移小于阈值"，阈值见 §13。
+  序列跨度覆盖不了末段窗口时**报错而不是拿短轨迹凑**；
+  实际使用的窗口写进报告，"缩窗口换绿灯"在 provenance 里藏不住。
+  ⚠️ co-ion 几何几项判的是**整条序列最小值**（§13.1 写的是"全程 ≥"），
+  不是末段也不是均值——只看均值会漏掉"末段掉进膜里"（有专门测试构造这一情形）。
+- [x] 记录脂质横向弛豫的估计时间尺度，用它论证预平衡时长够。
+  实现为硬判据：`equilibration_length_ns ≥ 弛豫尺度 ×
+  MEMBRANE_EQUILIBRATION_MIN_RELAXATION_MULTIPLE`（=1.0，本实现补的，§13 未给此倍数）。
+  弛豫 30 ns 时通用 10 ns 预平衡必然不过。
+- [x] 报告里带 `remediation`：质量门失败时回到膜体系平衡，
+  **不允许靠增加 ABFE 窗口、放宽阈值或缩短末段窗口掩盖**（§9 末句，有测试钉住）。
 - [ ] 上下叶脂质数如何确定必须有依据（按每叶面积匹配，不是随手对半分），
   并记录膜是否出现整体起伏（undulation）或残余张力。
 - [ ] 记录 co-ion 的 z 分布直方图，而不只是瞬时距离；它必须整段留在体相水层。
@@ -1004,8 +1087,29 @@ independent_repeat_id
 - [ ] B3. 实现 PME co-alchemical ion charging Hamiltonian。
 - [ ] B4. 重写溶剂腿 builder，显式返回 co-ion identity。
 - [ ] B5. complex/solvent cache 加 co-ion 指纹。
-- [x] B6. membrane 模式禁用 legacy uniform-density LRC。✅ 2026-07-30
-  `abfe_core.resolve_dispersion_protocol()` 是唯一校验实现，5 值枚举。
+- [x] B6. membrane 模式禁用 legacy uniform-density LRC。✅ 2026-07-30（校验层 + **接线**）
+  ⚠️ **首版只做了校验层，是个真缺陷**：`resolve_dispersion_protocol()` 会接受
+  `ff_native_isotropic_lrc`，但当时**没有任何代码消费它**——`build_ibs_dual_system`
+  照旧只按 `potential_type` 决定要不要算 `lj_tail_lrc_coeff_kj_mol`。一次膜运行会
+  通过校验、写进 provenance、然后照旧把均匀体相密度 LRC 加到炼金 ligand–environment
+  项上，完全静默。同日补齐接线：
+  - `ibs_engine.ibs_lj_tail_lrc_is_applicable(potential_type, dispersion_protocol)`
+    ——**扩展同一个谓词**而不是加第二道门（该谓词 docstring 本就要求生产者与报告者
+    共用同一真相），非 legacy 路线一律关闭炼金均匀密度 LRC，理由字符串按 §1.3 用
+    `disabled_by_membrane_forcefield_protocol`（"不能写成遗漏"）。
+  - 链路：`ABFEPipeline(dispersion_protocol=…)` → `IBSWindowManagerDualLambda`
+    → `build_ibs_dual_system`；报告侧 `compute_final_results` 读同一谓词并落盘
+    `dispersion_protocol` / `environment_type`，避免只看到 `applied=False` 时误判成 DEXP。
+  - §6.4 resume gate：非 legacy 时写进 `_stage_protocol_key` 的协议指纹
+    （legacy 时刻意不写，保证已有生产 stage 缓存不失效，§7.7）。
+  - ⚠️ **两腿规矩方向相反，别搞混**：恒压器是溶剂腿**不**接膜协议；
+    色散路线是溶剂腿**必须**接、且与复合物腿相同（§1.3 路线 A / §7.5
+    "复合物腿和溶剂腿使用同一套 ligand–environment 非键定义"）。否则
+    ΔG_bind = ΔG_solv − ΔG_cplx 的差值里会混进一个纯协议差且不报错。
+  - 证据：`tests/test_dispersion_protocol_is_honored.py`、
+    `tests/test_membrane_barostat_protocol.py`（AST 契约覆盖全部 6 个构造点）。
+
+  校验层部分：`abfe_core.resolve_dispersion_protocol()` 是唯一校验实现，5 值枚举。
   soluble 不声明 → `legacy_uniform_density_lrc`（行为逐位不变）；
   membrane 不声明 → fail closed；membrane + legacy → fail closed。
   路线 B（`lj_pme`）与路线 C（`membrane_inhomogeneous`）作为**已识别但未实现**收进

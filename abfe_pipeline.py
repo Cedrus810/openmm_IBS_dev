@@ -100,6 +100,10 @@ from abfe_core import (
     # 注意：这里的 soluble/membrane 是**环境类型**，与本文件里既有的
     # `system_type="complex"|"solvent"`（腿身份）是两个互不相干的轴。
     ENVIRONMENT_TYPE_MEMBRANE,
+    DISPERSION_PROTOCOL_LEGACY_UNIFORM_LRC,
+    resolve_dispersion_protocol,
+    membrane_observables_from_trajectory,
+    evaluate_membrane_quality_gate,
     barostat_fingerprint_payload,
     ensure_barostat_for_protocol,
     resolve_membrane_protocol,
@@ -1103,6 +1107,9 @@ class ABFEPipeline:
         environment_type: Optional[str] = None,
         membrane: Optional[Dict] = None,
         confirm_soluble_with_lipids: bool = False,
+        dispersion_protocol: Optional[str] = None,
+        forcefield_family: Optional[str] = None,
+        membrane_quality_inputs: Optional[Dict] = None,
     ):
 
         # 统一温度/压力单位
@@ -1138,6 +1145,21 @@ class ABFEPipeline:
             confirm_soluble_with_lipids=confirm_soluble_with_lipids,
         )
         self.environment_type = self.barostat_protocol["system_type"]
+
+        # [B6] LJ/色散路线。用同一个校验实现，所以"membrane 必须显式声明""membrane
+        # 不得用 legacy 均匀密度 LRC"这些 fail-closed 在这里也生效，不需要第二套判据。
+        # 结果被 `_run_dual_lambda_stage` 传给 IBSWindowManagerDualLambda，最终决定
+        # `ibs_wrapper.lj_tail_lrc_coeff_kj_mol` 算不算——报告侧读同一个谓词。
+        self.dispersion_protocol_info = resolve_dispersion_protocol(
+            dispersion_protocol,
+            environment_type=environment_type,
+            forcefield_family=forcefield_family,
+        )
+        self.dispersion_protocol = self.dispersion_protocol_info["dispersion_protocol"]
+
+        # [§9] 膜质量门需要的、无法从轨迹自动可靠推断的输入：口袋原子、co-ion 索引、
+        # 该脂质力场的文献 APL、声明的预平衡时长。膜体系必填，可溶体系不用。
+        self.membrane_quality_inputs = dict(membrane_quality_inputs or {})
 
         # 路径配置
         self.output_dir = os.path.abspath(output_dir)
@@ -1349,6 +1371,74 @@ class ABFEPipeline:
                 "  常见原因：拓扑与坐标原子数不一致、盒矢量非法、mdtraj 未安装。"
             ) from exc
 
+    def _evaluate_membrane_quality_gate_after_equilibration(self, traj_path: str) -> Dict:
+        """预平衡结束后判膜质量门并落盘摘要（§9 / §6.2）。
+
+        门没过就 raise —— §9 末句："质量门失败时回到膜体系平衡，不允许靠增加
+        ABFE 窗口掩盖。"所以这里必须阻断，而不是打个 warning 继续烧 λ 窗口。
+
+        需要的口袋定义 / co-ion 索引由 `membrane_quality_inputs` 显式给出，
+        不做运行时推断——同一体系两次跑必须用同一个口袋定义（MEM-00c 那类漂移的教训）。
+        """
+        import mdtraj as md
+
+        inputs = self.membrane_quality_inputs
+        pocket = inputs.get("pocket_atom_indices")
+        if not pocket:
+            raise RuntimeError(
+                "膜体系必须在 membrane_quality_inputs 里给出 pocket_atom_indices："
+                "口袋定义直接决定 §9 的 pocket_rmsd 这一道门，不接受运行时推断。"
+            )
+        ligand_resname = inputs.get("ligand_resname")
+        if not ligand_resname:
+            ligand_resname = self.topology.atom(self.ligand_indices[0]).residue.name
+
+        self._log("\n[膜质量门] 读取预平衡轨迹并计算 §9 观测量...")
+        traj = md.load(traj_path, top=md.Topology.from_openmm(self.topology))
+        observables, diagnostics = membrane_observables_from_trajectory(
+            traj,
+            ligand_resname=ligand_resname,
+            normal_axis=(self.barostat_protocol["membrane"] or {}).get("normal_axis", "z"),
+            pocket_atom_indices=[int(i) for i in pocket],
+            coion_atom_index=inputs.get("coion_atom_index"),
+            equilibration_length_ns=inputs.get("equilibration_length_ns"),
+            # 身份以 `.top` 组成为准：脂质按分子分叶、水/离子/蛋白用权威原子集合，
+            # 不靠残基名（TP3 / Na+ / Cl- / HID / NTRP 都会被残基名判据漏掉）。
+            composition=inputs.get("composition"),
+        )
+        report = evaluate_membrane_quality_gate(
+            observables,
+            diagnostics,
+            literature_apl_nm2=inputs.get("literature_apl_nm2"),
+            require_coion=inputs.get("coion_atom_index") is not None,
+        )
+
+        summary_path = os.path.join(self.output_dir, "membrane_quality_gate.json")
+        with open(summary_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {"report": report, "observables": observables},
+                handle,
+                indent=2,
+                ensure_ascii=False,
+                cls=NumpyEncoder,
+            )
+        self._log(f"  ✓ 膜质量门摘要已保存: {summary_path}")
+
+        for check in report["checks"]:
+            flag = "✓" if check["passed"] else "✗"
+            self._log(
+                f"    {flag} {check['observable']} [{check['criterion']}] "
+                f"{check['measured']:.6g} vs 阈值 {check['threshold']:.6g}"
+            )
+
+        if not report["passed"]:
+            raise RuntimeError(
+                f"膜质量门未通过，失败项：{report['failed_checks']}。"
+                f"{report['remediation']} 详情见 {summary_path}。"
+            )
+        self._log("  ✅ 膜质量门通过")
+        return report
+
     def pre_equilibrate(
         self,
         n_steps: int = 5_000_000,  # 10ns @ 2fs
@@ -1550,6 +1640,14 @@ class ABFEPipeline:
         # 🔑 标记本进程已经做过一次预平衡——run_full_pipeline() 内部的预平衡块
         # 会用这个标记短路，不再重新跑一次并覆盖这里刚更新的 self.positions。
         self._pre_equilibration_done_this_process = True
+
+        # [§9 / §6.2] 膜体系：预平衡轨迹刚落盘，就在这里判膜质量门并写诊断摘要。
+        # 位置选在这里而不是更晚，是因为 §9 的要求是"**进入 ABFE 前**至少保存并审查"——
+        # 门没过就不该继续烧 λ 窗口。可溶体系完全不进这个分支。
+        if self.environment_type == ENVIRONMENT_TYPE_MEMBRANE and save_traj:
+            self._evaluate_membrane_quality_gate_after_equilibration(
+                os.path.join(self.output_dir, "pre_equilibration.dcd")
+            )
 
         return {
             "positions": self.positions,
@@ -2610,6 +2708,7 @@ class ABFEPipeline:
             window_ranges=window_ranges,
             alchemical_params=alchemical_params,
             potential_type=potential_type,
+            dispersion_protocol=self.dispersion_protocol,
             restraint_params=boresch_params,
             prefix=("abfe_dual_rescue" if allow_partial_vanishing_rescue else "abfe_dual"),
             platform_name=self.platform_name,
@@ -3473,10 +3572,19 @@ class ABFEPipeline:
             _lj_lrc_applicable = bool(_traditional_lrc.get("applied"))
             _lj_lrc_truth_source = "traditional_mbar_analyzer_lj_lrc_metadata"
         else:
+            # ⚠️ 用 getattr 而不是直接取属性：`compute_final_results` 会被
+            # `ABFEPipeline.__new__` 出来的裸实例调用（tests/test_lrc_reporting_honesty.py
+            # 刻意绕过 __init__ 只设必要字段）。缺属性时按 None 处理 = legacy 协议，
+            # 与本改动前同义，不会让报告口径悄悄变。
             _lj_lrc_applicable = bool(
-                ibs_lj_tail_lrc_is_applicable(_lj_lrc_potential_type)
+                ibs_lj_tail_lrc_is_applicable(
+                    _lj_lrc_potential_type,
+                    getattr(self, "dispersion_protocol", None),
+                )
             )
-            _lj_lrc_truth_source = "ibs_lj_tail_lrc_is_applicable(potential_type)"
+            _lj_lrc_truth_source = (
+                "ibs_lj_tail_lrc_is_applicable(potential_type, dispersion_protocol)"
+            )
 
         # ✅ 显式加入 Boresch 修正与约束修正
         dg_boresch = correction_results.get("delta_g_rest", 0.0)
@@ -3527,8 +3635,15 @@ class ABFEPipeline:
                 "truth_source": _lj_lrc_truth_source,
                 "not_applied_reason": (
                     None if _lj_lrc_applicable
-                    else ibs_lj_tail_lrc_inapplicable_reason(_lj_lrc_potential_type)
+                    else ibs_lj_tail_lrc_inapplicable_reason(
+                        _lj_lrc_potential_type,
+                        getattr(self, "dispersion_protocol", None),
+                    )
                 ),
+                # [B6] 膜协议这一维必须一并落盘：否则看到 applied=False 只会以为
+                # 是 DEXP，看不出是"膜体系按 §1.3 主动关闭了均匀密度 LRC"。
+                "dispersion_protocol": getattr(self, "dispersion_protocol", None),
+                "environment_type": getattr(self, "environment_type", None),
                 "delta_G_kJ_mol": None,
                 "status": (
                     "implemented_analytic_mean_field_switching_softcore_aware"
@@ -3537,8 +3652,9 @@ class ABFEPipeline:
                 ),
                 "protocol_version": TRADITIONAL_LJ_LRC_PROTOCOL_VERSION,
                 "note": ("" if _lj_lrc_applicable else (
-                    f"NOT APPLIED for potential_type={_lj_lrc_potential_type!r}: "
-                    f"{ibs_lj_tail_lrc_inapplicable_reason(_lj_lrc_potential_type)}. "
+                    f"NOT APPLIED for potential_type={_lj_lrc_potential_type!r}, "
+                    f"dispersion_protocol={getattr(self, 'dispersion_protocol', None)!r}: "
+                    f"{ibs_lj_tail_lrc_inapplicable_reason(_lj_lrc_potential_type, getattr(self, 'dispersion_protocol', None))}. "
                     "ibs_engine.py::build_ibs_dual_system leaves "
                     "ibs_wrapper.lj_tail_lrc_coeff_kj_mol = None, and every consumer "
                     "short-circuits to zeros, so the reported free energy contains NO "
@@ -4960,6 +5076,7 @@ class ABFEPipeline:
             window_ranges=[window_range],
             alchemical_params=alchemical_params,
             potential_type=potential_type,
+            dispersion_protocol=self.dispersion_protocol,
             restraint_params=boresch_params,
             prefix="abfe_dual",
             platform_name=self.platform_name,
@@ -5251,7 +5368,7 @@ class ABFEPipeline:
         run_config = dict(getattr(self, "_last_run_config", {}) or {})
         run_config.pop("resume", None)
         run_config.pop("run_equilibration", None)
-        return _protocol_fingerprint({
+        payload = {
             "kind": "dual_lambda_stage",
             "stage_name": stage_name,
             "potential_type": str(potential_type),
@@ -5301,7 +5418,17 @@ class ABFEPipeline:
             # 阈值字典（而不是只看用户是否显式传参），这样即使只是代码默认值本身
             # 变了，缓存也会正确失效。
             "final_gate_thresholds": final_gate_thresholds,
-        })
+        }
+        # 🔑 [B6 / memtodolist §6.4] 新 LJ 色散协议必须进 resume gate：换了
+        # dispersion_protocol 之后，炼金 ligand–environment 的均匀密度 LRC 从"加"
+        # 变成"不加"，u_kn 口径就变了，旧的 "completed" stage 缓存不能再复用。
+        #
+        # 只在**非 legacy**时写入这个键：`legacy_uniform_density_lrc` 是本改动前
+        # 唯一存在的协议，对它保持沉默才能让已有生产 stage 缓存继续有效（§7.7）。
+        _dispersion = getattr(self, "dispersion_protocol", None)
+        if _dispersion and _dispersion != DISPERSION_PROTOCOL_LEGACY_UNIFORM_LRC:
+            payload["dispersion_protocol"] = str(_dispersion)
+        return _protocol_fingerprint(payload)
 
     def _preopt_protocol_key(
         self,

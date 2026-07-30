@@ -244,7 +244,10 @@ def _load_validated_window_data_triplet(
     )
 
 
-def ibs_lj_tail_lrc_is_applicable(potential_type: Optional[str]) -> bool:
+def ibs_lj_tail_lrc_is_applicable(
+    potential_type: Optional[str],
+    dispersion_protocol: Optional[str] = None,
+) -> bool:
     """🔑 [P2-14] `build_ibs_dual_system` 是否会给该势函数附加解析 LJ 长程尾项修正。
 
     这是**唯一真相**，生产者和报告者共用同一个谓词：
@@ -263,16 +266,53 @@ def ibs_lj_tail_lrc_is_applicable(potential_type: Optional[str]) -> bool:
     公式一旦被验证/替换，只需要改这一处，行为和报告会一起动，不会再分叉。
     同一份纪律仓库里已经用在系数数组本身上（三个消费者共读
     `ibs_wrapper.lj_tail_lrc_coeff_kj_mol`）。
+
+    ---
+    🔑 [B6 / memtodolist §1.3 / §6.4] 第二个否决维度：`dispersion_protocol`。
+
+    这里的 `lj_tail_lrc_coeff[k] / V(t)` 假设配体周围是**均匀体相密度**。配体埋在
+    脂双层口袋里时这个假设直接不成立——局域密度既不是水也不是体相脂质。所以
+    §1.3 明文要求膜体系"关闭当前 `lrc_coeff/V`，metadata 写
+    `disabled_by_membrane_forcefield_protocol`，**不能写成遗漏**"。
+
+    注意这**不是**"膜体系一律禁用长程色散修正"。环境–环境那部分色散仍然按所选
+    脂质力场的原始参数化条件走（Amber Lipid21 就是开着各向同性 LRC 拟合的，
+    关掉才是错的）——那是基础 `NonbondedForce` 的事。被关掉的只有**炼金
+    ligand–environment** 这一项，因为只有它的均匀密度假设在膜里失效。
+
+    扩展这个谓词而不是在别处加第二道门，正是它 docstring 一直强调的纪律：
+    生产者与报告者必须共用同一个真相，否则 `final_results.json` 会声称
+    "已应用"而实际没有（或反之）。
+
+    `dispersion_protocol=None` 或 `legacy_uniform_density_lrc` 时行为与本改动前
+    **逐位一致**，当前可溶体系生产路径不受影响。
     """
-    return str(potential_type or "").strip().lower() != "dexp"
+    if str(potential_type or "").strip().lower() == "dexp":
+        return False
+    protocol = str(dispersion_protocol or "").strip().lower()
+    if protocol and protocol != "legacy_uniform_density_lrc":
+        return False
+    return True
 
 
-def ibs_lj_tail_lrc_inapplicable_reason(potential_type: Optional[str]) -> str:
+def ibs_lj_tail_lrc_inapplicable_reason(
+    potential_type: Optional[str],
+    dispersion_protocol: Optional[str] = None,
+) -> str:
     """不附加修正时的机器可读理由；适用时返回空串。"""
-    if ibs_lj_tail_lrc_is_applicable(potential_type):
+    if ibs_lj_tail_lrc_is_applicable(potential_type, dispersion_protocol):
         return ""
+    if str(potential_type or "").strip().lower() == "dexp":
+        return (
+            "potential_type='dexp' 尚未验证解析尾项公式是否适用于该势函数"
+        )
+    # §1.3 指定的机器可读理由字符串，不要改写成别的措辞——它会进 final_results.json。
     return (
-        "potential_type='dexp' 尚未验证解析尾项公式是否适用于该势函数"
+        "disabled_by_membrane_forcefield_protocol: "
+        f"dispersion_protocol={str(dispersion_protocol).strip().lower()!r} 时，"
+        "炼金 ligand–environment 的均匀体相密度 LRC 不适用"
+        "（配体所在口袋的局域密度既不是水也不是体相脂质）；"
+        "环境–环境色散仍按所选力场的原始参数化条件由基础 NonbondedForce 处理"
     )
 
 
@@ -2854,6 +2894,7 @@ def build_ibs_dual_system(
     prefix: str = "abfe_dual",
     box_vectors=None,
     reference_positions=None,
+    dispersion_protocol: Optional[str] = None,
 ) -> Tuple[openmm.System, 'IBSBiasForce']:
     """
     构建双λ IBS 采样系统 (终极修复版：彻底剥离 Group 0 的 λ 依赖)
@@ -3069,9 +3110,9 @@ def build_ibs_dual_system(
     # softcore-aware 径向积分（_lj_tail_lrc_coefficients_kj_mol），同时补上
     # 排斥项 r^-12 的尾贡献（之前只有吸引项 r^-6）。每帧修正 = coeff[k] / V(t)。
     ibs_wrapper.lj_tail_lrc_coeff_kj_mol = None
-    if not ibs_lj_tail_lrc_is_applicable(potential_type):
+    if not ibs_lj_tail_lrc_is_applicable(potential_type, dispersion_protocol):
         print(
-            f"  ⚠️ [LJ LRC] {ibs_lj_tail_lrc_inapplicable_reason(potential_type)}"
+            f"  ⚠️ [LJ LRC] {ibs_lj_tail_lrc_inapplicable_reason(potential_type, dispersion_protocol)}"
             "，本次不附加修正。"
         )
     else:
@@ -7889,6 +7930,7 @@ class IBSWindowManagerDualLambda:
         window_ranges: List[Tuple[int, int]],
         alchemical_params,
         potential_type: str = "softcore",
+        dispersion_protocol: Optional[str] = None,
         restraint_params: Optional[Dict] = None,
         prefix: str = "abfe_dual",
         platform_name: str = "CUDA",
@@ -7906,6 +7948,9 @@ class IBSWindowManagerDualLambda:
         self.ranges = window_ranges
         self.alchemical_params = alchemical_params
         self.potential_type = potential_type
+        # [B6] 膜体系用非 legacy 色散路线时，炼金 ligand–environment 的均匀密度
+        # LRC 必须关闭（memtodolist §1.3）。None → 与改动前逐位一致。
+        self.dispersion_protocol = dispersion_protocol
         self.boresch = restraint_params
         self.prefix = prefix
         self.platform_name = platform_name
@@ -7949,6 +7994,7 @@ class IBSWindowManagerDualLambda:
             self.prefix,
             box_vectors=resolved_box,
             reference_positions=positions,
+            dispersion_protocol=self.dispersion_protocol,
         )
 
     def _enqueue_window_snapshot(self, window_idx: int, stage_type: str, sampler) -> None:

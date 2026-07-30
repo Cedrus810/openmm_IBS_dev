@@ -43,6 +43,14 @@ from abfe_core import (
     resolve_dispersion_protocol,  # LJ/色散路线唯一校验实现（B6）
     resolve_forcefield_family,  # 力场族识别唯一实现（§1.1）
     acceptance_thresholds_payload,  # §13 阈值快照，进 provenance
+    validate_membrane_input,  # §3.3 膜输入核对唯一实现
+    MEMBRANE_MIN_EQUILIBRATION_NS,  # §9/§15 膜预平衡时长下限
+    resolve_gromacs_include,  # include 解析唯一实现
+    parse_gromacs_topology,  # `.top` 解析（[ defaults ] / [ moleculetype ] / [ molecules ]）
+    classify_system_composition,  # 组成驱动的身份判定，替代残基名硬编码
+    gromacs_topology_has_funct2_pairs,  # OpenMM 不支持 [ pairs ] funct 2
+    convert_gromacs_pairs_funct2,  # 带逐对等价校验的兼容性转换
+    GROMACS_PAIRS_FUNCT2_CONVERSION_VERSION,
 )
 from abfe_pipeline import (
     ABFEPipeline, TraditionalABFEPipeline, _collect_pipeline_provenance, _pme_u_kn_meta_payload,
@@ -122,15 +130,12 @@ def _resolve_gromacs_include_path(
     including_file: str,
     gmx_include_dir: Optional[str],
 ) -> str:
-    candidates = [os.path.join(os.path.dirname(including_file), include_name)]
-    if gmx_include_dir:
-        candidates.append(os.path.join(gmx_include_dir, include_name))
-    for candidate in candidates:
-        if os.path.isfile(candidate):
-            return os.path.realpath(candidate)
-    raise FileNotFoundError(
-        f"GROMACS include 无法解析: {include_name!r}（来自 {including_file}）"
-    )
+    """薄包装：解析顺序的**唯一实现**在 `abfe_core.resolve_gromacs_include`。
+
+    保留这个名字是因为 `_gromacs_dependency_hashes` 与主缓存指纹都在用它；
+    实现收敛到一处，避免两份解析顺序日后各改一半。
+    """
+    return resolve_gromacs_include(include_name, including_file, gmx_include_dir)
 
 
 def _gromacs_dependency_hashes(
@@ -185,6 +190,13 @@ def _main_cache_identity(
         ),
         "ligand_resname": str(ligand_resname),
         "system_build_parameters": {
+            # OpenMM 不支持 `[ pairs ]` funct 2，含它的拓扑会先经等价转换再交给
+            # GromacsTopFile。指纹按**原始**输入算（topology_dependencies 上面那项），
+            # 但转换逻辑本身也决定最终 System，所以它的版本号必须进指纹——
+            # 否则改了转换而复用旧 System 缓存就是静默串协议。
+            "gromacs_pairs_funct2_conversion_version": (
+                GROMACS_PAIRS_FUNCT2_CONVERSION_VERSION
+            ),
             "nonbonded_method": "PME",
             "nonbonded_cutoff_nm": 1.0,
             "constraints": "HBonds",
@@ -1207,6 +1219,28 @@ def center_system_rigidly(
 # ---------------------------------------------------------------------------
 # 配置管理
 # ---------------------------------------------------------------------------
+# membrane.* 的 CLI 子键 → argparse 属性名。RunConfig 与 run_prepare_command 共用，
+# 不各写一份（`--membrane-*` 的 argparse 默认值全是 None，所以 "is not None"
+# 等价于"用户显式给了"，不需要再去翻 argv）。
+_MEMBRANE_CLI_ARG_NAMES = {
+    "normal_axis": "membrane_normal_axis",
+    "surface_tension_bar_nm": "membrane_surface_tension_bar_nm",
+    "xy_mode": "membrane_xy_mode",
+    "z_mode": "membrane_z_mode",
+    "barostat_frequency": "membrane_barostat_frequency",
+}
+
+
+def _membrane_overrides_from_args(args) -> Dict:
+    """从 argparse 命名空间取出显式给出的 membrane.* 子键。"""
+    overrides = {}
+    for key, attr in _MEMBRANE_CLI_ARG_NAMES.items():
+        value = getattr(args, attr, None)
+        if value is not None:
+            overrides[key] = value
+    return overrides
+
+
 def _load_config(config_path: str) -> dict:
     """加载配置文件，支持 .json / .yaml / .yml 格式"""
     if not os.path.isfile(config_path):
@@ -1411,6 +1445,8 @@ class RunConfig:
             preset["dispersion_protocol"] = args.dispersion_protocol
         if _flag_present("--forcefield-family"):
             preset["forcefield_family"] = args.forcefield_family
+        if _flag_present("--membrane-input-declaration"):
+            preset["membrane_input_declaration"] = args.membrane_input_declaration
         if _flag_present("--force-switch-deviation-evidence"):
             preset["force_switch_deviation_evidence"] = (
                 args.force_switch_deviation_evidence
@@ -1419,24 +1455,7 @@ class RunConfig:
             preset["confirm_soluble_with_lipids"] = bool(
                 args.confirm_soluble_with_lipids
             )
-        _membrane_cli = {
-            "normal_axis": ("--membrane-normal-axis", "membrane_normal_axis"),
-            "surface_tension_bar_nm": (
-                "--membrane-surface-tension-bar-nm",
-                "membrane_surface_tension_bar_nm",
-            ),
-            "xy_mode": ("--membrane-xy-mode", "membrane_xy_mode"),
-            "z_mode": ("--membrane-z-mode", "membrane_z_mode"),
-            "barostat_frequency": (
-                "--membrane-barostat-frequency",
-                "membrane_barostat_frequency",
-            ),
-        }
-        _membrane_overrides = {
-            key: getattr(args, attr)
-            for key, (flag, attr) in _membrane_cli.items()
-            if _flag_present(flag)
-        }
+        _membrane_overrides = _membrane_overrides_from_args(args)
         if _membrane_overrides:
             # 命令行只覆盖显式给出的子键，不清空配置文件里的其余 membrane.* 设置。
             merged_membrane = dict(preset.get("membrane") or {})
@@ -1489,6 +1508,7 @@ class RunConfig:
             "dispersion_protocol": None,
             "forcefield_family": None,
             "force_switch_deviation_evidence": None,
+            "membrane_input_declaration": None,
         }
         for key, value in defaults.items():
             preset.setdefault(key, value)
@@ -1531,6 +1551,8 @@ def _write_run_provenance(
     charge_protocol: Optional[Dict] = None,
     dispersion_protocol: Optional[Dict] = None,
     forcefield_family: Optional[Dict] = None,
+    membrane_input: Optional[Dict] = None,
+    pairs_conversion: Optional[Dict] = None,
 ) -> Dict:
     provenance = _collect_pipeline_provenance(
         config=config.as_dict(),
@@ -1551,6 +1573,14 @@ def _write_run_provenance(
         provenance["dispersion_protocol"] = dispersion_protocol
     if forcefield_family is not None:
         provenance["forcefield_family"] = forcefield_family
+    if pairs_conversion is not None:
+        provenance["gromacs_pairs_funct2_conversion"] = pairs_conversion
+    # §3.3 / §10：膜输入核对结果（含实测叶片数/水/离子计数与声明来源）落盘。
+    if membrane_input is not None:
+        provenance["membrane_input"] = membrane_input
+        provenance["membrane_composition"] = (membrane_input.get("declared") or {}).get(
+            "membrane_composition"
+        )
     # §13：阈值必须进 provenance，否则"当时用的哪套阈值"无从追溯。
     provenance["acceptance_thresholds"] = acceptance_thresholds_payload()
     if charge_protocol is not None:
@@ -2188,6 +2218,17 @@ def parse_arguments():
         help="显式覆盖从 .top 自动识别的力场族；覆盖会留记录，不静默",
     )
     parser.add_argument(
+        "--membrane-input-declaration",
+        default=None,
+        help=(
+            "膜输入声明 JSON（§3.3）：build_tool / build_parameters / "
+            "final_equilibration_job / source_structure_id / conformational_state / "
+            "membrane_composition / binding_site_solvent_exposure / "
+            "leaflet_assignment_basis，可选 n_atoms / n_upper / n_lower / n_water / ion_counts。"
+            "system_type=membrane 时必填"
+        ),
+    )
+    parser.add_argument(
         "--force-switch-deviation-evidence",
         default=None,
         help=(
@@ -2640,6 +2681,8 @@ def run_prepare_command(args):
     positions, box_vectors = center_system_rigidly(positions, box_vectors, ligand_indices)
 
     # 4. 初始化 Pipeline（只做预平衡估算用）
+    # 这里也走膜协议：prepare 会调 pre_equilibrate()，膜体系必须用膜 barostat，
+    # 否则 prepare 产出的预平衡轨迹是各向同性缩放下的，APL 已经跑掉了。
     pipeline = ABFEPipeline(
         system=system,
         topology=topology,
@@ -2649,6 +2692,13 @@ def run_prepare_command(args):
         temperature=args.temperature,
         output_dir=output_dir,
         platform_name=args.platform,
+        environment_type=getattr(args, "system_type", None),
+        membrane=(_membrane_overrides_from_args(args) or None),
+        confirm_soluble_with_lipids=bool(
+            getattr(args, "confirm_soluble_with_lipids", False)
+        ),
+        dispersion_protocol=getattr(args, "dispersion_protocol", None),
+        forcefield_family=getattr(args, "forcefield_family", None),
     )
 
     # 5. 预平衡生成轨迹
@@ -2743,6 +2793,14 @@ def run_traditional_mode(config: RunConfig):
             output_dir=output_dir,
             checkpoint_dir=os.path.join(output_dir, "checkpoints"),
             platform_name=config.platform,
+            # 复合物腿 → 走膜协议（Boresch 估算会触发预平衡）。
+            environment_type=config.get("system_type"),
+            membrane=config.get("membrane"),
+            confirm_soluble_with_lipids=bool(
+                config.get("confirm_soluble_with_lipids", False)
+            ),
+            dispersion_protocol=config.get("dispersion_protocol"),
+            forcefield_family=config.get("forcefield_family"),
         )
         boresch_restraint = resolve_boresch_restraint(config, boresch_pipeline)
         if boresch_restraint:
@@ -3113,6 +3171,18 @@ def _run_boresch_attachment_only(
         output_dir=rerun_dir,
         checkpoint_dir=os.path.join(rerun_dir, "checkpoints"),
         platform_name=config.platform,
+        # 🔑 rerun **继承 source pipeline 已解析的协议**，不重读 config——
+        # 增量重跑必须与被复用的那次用同一个恒压器集合，而 config 可能已经改过。
+        environment_type=source_pipeline.environment_type,
+        membrane=source_pipeline.barostat_protocol.get("membrane"),
+        confirm_soluble_with_lipids=bool(
+            source_pipeline.barostat_protocol.get("soluble_with_lipids_confirmed", False)
+        ),
+        # 色散路线同样继承：换了它 u_kn 口径就变，增量段与被复用段不可比。
+        dispersion_protocol=source_pipeline.dispersion_protocol,
+        forcefield_family=source_pipeline.dispersion_protocol_info.get(
+            "forcefield_family"
+        ),
     )
     run_provenance = _write_run_provenance(
         rerun_dir,
@@ -3265,6 +3335,18 @@ def _run_complex_charging_only(
         output_dir=rerun_dir,
         checkpoint_dir=os.path.join(rerun_dir, "checkpoints"),
         platform_name=config.platform,
+        # 🔑 rerun **继承 source pipeline 已解析的协议**，不重读 config——
+        # 增量重跑必须与被复用的那次用同一个恒压器集合，而 config 可能已经改过。
+        environment_type=source_pipeline.environment_type,
+        membrane=source_pipeline.barostat_protocol.get("membrane"),
+        confirm_soluble_with_lipids=bool(
+            source_pipeline.barostat_protocol.get("soluble_with_lipids_confirmed", False)
+        ),
+        # 色散路线同样继承：换了它 u_kn 口径就变，增量段与被复用段不可比。
+        dispersion_protocol=source_pipeline.dispersion_protocol,
+        forcefield_family=source_pipeline.dispersion_protocol_info.get(
+            "forcefield_family"
+        ),
     )
     run_provenance = _write_run_provenance(
         rerun_dir,
@@ -3573,13 +3655,37 @@ def main():
             gmx_include_dir=include_dir
         )
         log.info("♻️ 从缓存加载 System 完成")
+        # 缓存命中时不需要再转换（缓存里存的是转换后构建出来的 System）。
+        # 转换版本已进主缓存指纹，所以指纹一致就代表转换口径一致。
+        _pairs_conversion = None
     else:
         if not config.gro or not config.top:
             log.error("未提供 --gro/--top 且无缓存，无法构建系统")
             sys.exit(1)
+        # OpenMM 的 GromacsTopFile 只接受 `[ pairs ]` funct 1；CHARMM-GUI 的
+        # AMBER FF-Converter 会对部分对写 funct 2（多出 fudgeQQ/q1/q2 三列）。
+        # 那三列经**逐对校验**若与全局 fudgeQQ 和 `[ atoms ]` 电荷一致，就是冗余重述，
+        # 可等价转成 funct 1；不一致则 fail closed（硬转会静默改变哈密顿量）。
+        # 转换写到 output_dir 下的独立目录，**原始输入一个字节都不动**。
+        _top_for_openmm = config.top
+        _pairs_conversion = None
+        if gromacs_topology_has_funct2_pairs(config.top, include_dir):
+            _compat_dir = os.path.join(output_dir, "gromacs_openmm_compat")
+            log.info("🔧 检测到 [ pairs ] funct 2（OpenMM 不支持），执行等价转换 → %s", _compat_dir)
+            _pairs_conversion = convert_gromacs_pairs_funct2(
+                config.top, _compat_dir, include_dir
+            )
+            _top_for_openmm = _pairs_conversion["converted_top_path"]
+            log.info(
+                "   ✓ 转换 %d 条 pairs（%d 个文件拷贝，改写 %s）；原始输入未修改",
+                _pairs_conversion["n_pairs_converted"],
+                _pairs_conversion["n_files_copied"],
+                [os.path.basename(f["source"]) for f in _pairs_conversion["patched_files"]],
+            )
+
         # 从 GROMACS 构建
         system, topology, positions, box_vectors, ligand_indices = build_system_from_gromacs(
-            config.gro, config.top, config.ligand,
+            config.gro, _top_for_openmm, config.ligand,
             include_dir
         )
         diagnose_14_scaling(system)
@@ -3716,6 +3822,108 @@ def main():
             "生效" if _dispersion_protocol["uniform_density_lrc_active"] else "关闭",
         )
 
+    # ---- §3.3 膜输入核对 + §9/§15 预平衡时长门（只在膜体系生效）----
+    _membrane_input_report = None
+    if _barostat_protocol["system_type"] == "membrane":
+        _declaration_path = config.get("membrane_input_declaration")
+        if not _declaration_path:
+            raise SystemExit(
+                "system_type=membrane 需要 --membrane-input-declaration：§3.3 要求输入是"
+                "已完成膜构建和主要平衡的体系，且构建工具/参数/最终平衡作业/来源结构"
+                "可追溯。缺这份声明就无法核对，拒绝继续。"
+            )
+        _membrane_declared = _load_json_object_file(_declaration_path, "膜输入声明")
+
+        # 身份一律以 `.top` 的 [ molecules ] + [ moleculetype ] 为准，不靠残基名猜。
+        # 实测理由：CHARMM-GUI 的 AMBER 体系里一个 POPC 是三个残基（PA+PC+OL）、
+        # 水叫 TP3、离子叫 Na+/Cl-，靠残基名会把脂质数数成 3 倍、水和离子数成 0。
+        _system_composition = classify_system_composition(
+            parse_gromacs_topology(
+                config.get("top"), find_gmx_include_dir(config.get("gmx_path"))
+            ),
+            ligand_molecule_name=_membrane_declared.get("ligand_molecule_name"),
+            declared_roles=_membrane_declared.get("molecule_roles"),
+        )
+        log.info(
+            "🧾 体系组成（来自 .top）：%s",
+            {
+                name: f"{role}×{_system_composition['molecule_counts'][name]}"
+                for name, role in _system_composition["roles"].items()
+            },
+        )
+        if _system_composition["n_atoms_total"] != topology.getNumAtoms():
+            raise SystemExit(
+                f".top 展开得到 {_system_composition['n_atoms_total']} 个原子，"
+                f"但拓扑有 {topology.getNumAtoms()} 个。两者必须一致，否则原子索引"
+                "对不上，后续所有按索引的选择都会静默错位。"
+            )
+
+        _membrane_input_report = validate_membrane_input(
+            topology,
+            positions,
+            box_vectors,
+            declared=_membrane_declared,
+            normal_axis=(_barostat_protocol["membrane"] or {}).get("normal_axis", "z"),
+            composition=_system_composition,
+        )
+        log.info(
+            "🧫 膜输入核对通过：%d 原子，上叶 %d / 下叶 %d 脂质（不平衡 %.1f%%），"
+            "水 %d，离子 %s",
+            _membrane_input_report["n_atoms"],
+            _membrane_input_report["leaflets"]["n_upper"],
+            _membrane_input_report["leaflets"]["n_lower"],
+            100.0 * _membrane_input_report["leaflets"]["imbalance_fraction"],
+            _membrane_input_report["n_water"],
+            _membrane_input_report["ion_counts"],
+        )
+
+        # §9/§15：把"拿可溶体系的 10 ns 默认值去跑膜"挡在配置阶段，而不是等质量门
+        # 事后否掉——后者要先烧掉整轮采样才知道。
+        _equil_steps = int(config.get("n_equil_steps", 5_000_000))
+        _timestep_ps = float(config.get("timestep_ps", 0.002))
+        _equil_ns = _equil_steps * _timestep_ps / 1000.0
+        # 上游平衡的两条合法表述已由 validate_membrane_input 裁决过，这里只用结论。
+        _upstream_ns = _membrane_input_report["upstream_equilibration_ns"]
+        _nominal_precheck = _membrane_input_report[
+            "nominal_equilibration_precheck_applicable"
+        ]
+        _shortfall_note = _membrane_declared.get("equilibration_shortfall_justification")
+        if not _nominal_precheck:
+            # 上游生产已完成但时长不可考 → 标称时长预检不适用。
+            # §9 的实测质量门（末段漂移 + 脂质横向弛豫时间尺度）仍会独立判定。
+            _total_equil_ns = None
+            log.info(
+                "🧫 上游平衡：%s（证据 %s）→ 标称时长预检不适用；"
+                "本流程再平衡 %.1f ns。§9 实测质量门仍为硬门。",
+                _membrane_input_report["upstream_equilibration_status"],
+                _membrane_declared.get("final_equilibration_job"),
+                _equil_ns,
+            )
+        else:
+            _total_equil_ns = float(_upstream_ns) + _equil_ns
+            log.info(
+                "🧫 平衡时长：上游 %.1f ns + 本流程 %.1f ns = %.1f ns（下限 %.0f ns）",
+                _upstream_ns, _equil_ns, _total_equil_ns, MEMBRANE_MIN_EQUILIBRATION_NS,
+            )
+        if _total_equil_ns is not None and _total_equil_ns < MEMBRANE_MIN_EQUILIBRATION_NS:
+            if not _shortfall_note:
+                raise SystemExit(
+                    f"膜体系总平衡时长 {_total_equil_ns:.1f} ns"
+                    f"（上游声明 {_upstream_ns:.1f} + 本流程 {_equil_ns:.1f}）"
+                    f"低于下限 {MEMBRANE_MIN_EQUILIBRATION_NS:.0f} ns。"
+                    "§9：通用 10 ns 不是膜平衡充分性的证明；§15：膜体系预平衡 ≥ 100 ns。"
+                    "正解是调大 n_equil_steps 或延长上游平衡。"
+                    "确有理由放行时，在膜输入声明里填 "
+                    "equilibration_shortfall_justification 写明依据（会进 provenance）——"
+                    "但注意这**只**放开这道标称时长预检，"
+                    "§9 基于实测漂移与脂质横向弛豫时间的质量门仍然是硬门，不受影响。"
+                )
+            log.warning(
+                "⚠️ 膜平衡标称时长不足（%.1f < %.0f ns），已按声明的理由放行：%s。"
+                "§9 的实测质量门仍会独立判定。",
+                _total_equil_ns, MEMBRANE_MIN_EQUILIBRATION_NS, _shortfall_note,
+            )
+
     run_provenance = None
     if not config.only_complex_charging:
         run_provenance = _write_run_provenance(
@@ -3724,6 +3932,8 @@ def main():
             charge_protocol=_charge_protocol,
             dispersion_protocol=_dispersion_protocol,
             forcefield_family=_forcefield_family_info,
+            membrane_input=_membrane_input_report,
+            pairs_conversion=_pairs_conversion,
         )
         log.info(
             "🧾 运行 provenance 已保存: %s",
@@ -3787,6 +3997,30 @@ def main():
         membrane=config.get("membrane"),
         confirm_soluble_with_lipids=bool(
             config.get("confirm_soluble_with_lipids", False)
+        ),
+        dispersion_protocol=_dispersion_protocol["dispersion_protocol"],
+        forcefield_family=_dispersion_protocol["forcefield_family"],
+        # §9 质量门需要的显式输入，从膜输入声明里取（可溶体系为空 dict，不进该分支）。
+        membrane_quality_inputs=(
+            {
+                key: (_membrane_input_report["declared"] or {}).get(key)
+                for key in (
+                    "pocket_atom_indices",
+                    "coion_atom_index",
+                    "literature_apl_nm2",
+                    "equilibration_length_ns",
+                    "ligand_resname",
+                )
+            }
+            | {
+                "composition": _system_composition,
+                # §9 的判据吃的是**总**平衡时长（上游 + 本流程），不是只看本流程。
+                # 上游时长不可考时传 None，提取器会退回用轨迹自身跨度——那是我们
+                # 唯一能实测到的时长，比塞一个编出来的数诚实。
+                "equilibration_length_ns": _total_equil_ns,
+            }
+            if _membrane_input_report is not None
+            else None
         ),
     )
 
@@ -3952,15 +4186,23 @@ def main():
     pos_solv, box_solv = center_system_rigidly(pos_solv, box_solv, lig_idx_solv)
     
     solvent_out_dir = os.path.join(output_dir, "solvent_leg")
-    # 🔑 溶剂腿**刻意不接** environment_type / membrane：memtodolist §3.2
-    # "溶剂腿继续使用普通 MonteCarloBarostat"。溶剂腿是配体在体相水里，与膜无关，
-    # 即使复合物腿跑 membrane，这里也必须保持各向同性恒压器。
-    # 不要"为了一致"把 config 的 system_type 传进来——那会给纯水盒装上膜 barostat。
+    # 🔑 溶剂腿有两条**方向相反**的规矩，别搞混：
+    #
+    #   - **恒压器**：刻意不接 environment_type / membrane。memtodolist §3.2
+    #     "溶剂腿继续使用普通 MonteCarloBarostat"——溶剂腿是配体在体相水里，与膜无关，
+    #     即使复合物腿跑 membrane，这里也必须保持各向同性恒压器。不要"为了一致"
+    #     把 config 的 system_type 传进来，那会给纯水盒装上膜 barostat。
+    #   - **色散路线**：必须与复合物腿**完全相同**。§1.3 路线 A 与 §7.5 要求
+    #     "复合物腿和溶剂腿使用同一套 ligand–environment 非键定义"。若复合物腿
+    #     关掉了炼金均匀密度 LRC 而溶剂腿还留着，两腿的 ligand–environment 口径
+    #     就不一致，ΔG_bind = ΔG_solv − ΔG_cplx 的差值里会混进一个协议差。
     pipeline_solv = ABFEPipeline(
         system=sys_solv, topology=top_solv, positions=pos_solv, box_vectors=box_solv,
         ligand_indices=lig_idx_solv, temperature=config.temperature,
         output_dir=solvent_out_dir, checkpoint_dir=os.path.join(solvent_out_dir, "checkpoints"),
         platform_name=config.platform,
+        dispersion_protocol=_dispersion_protocol["dispersion_protocol"],
+        forcefield_family=_dispersion_protocol["forcefield_family"],
     )
     
     # 运行溶剂腿 (🔑 强制关闭 Boresch)
