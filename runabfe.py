@@ -39,6 +39,10 @@ from abfe_core import (
     solvent_box_edge_nm, SOLVENT_NONBONDED_CUTOFF_NM,  # 溶剂盒唯一实现，勿在此重复
     resolve_water_model_xml,  # 溶剂腿水模型必须从复合物 .top 反推
     resolve_membrane_protocol,  # 膜体系协议唯一解析实现（B1）
+    resolve_charge_treatment,  # 净电荷处理协议唯一校验实现（B2）
+    resolve_dispersion_protocol,  # LJ/色散路线唯一校验实现（B6）
+    resolve_forcefield_family,  # 力场族识别唯一实现（§1.1）
+    acceptance_thresholds_payload,  # §13 阈值快照，进 provenance
 )
 from abfe_pipeline import (
     ABFEPipeline, TraditionalABFEPipeline, _collect_pipeline_provenance, _pme_u_kn_meta_payload,
@@ -52,6 +56,9 @@ from ibs_engine import (
     lambda_endpoint_diagnostics,
     synthetic_mbar_u_kn,
     TraditionalMBARAnalyzer,
+    # 配体净电荷的**唯一**实现。B2 的校验层刻意只吃一个 float，不自己再数一遍
+    # 电荷，避免出现第二套净电荷判据（abfe_core 在 ibs_engine 下层，不能反向 import）。
+    _compute_ligand_net_charge,
 ) # ✅ 保持从 ibs_engine 导入
 from abfe_preoptimizer import DualLambdaPreOptimizer, build_aces_probe_system_dual_lambda
 
@@ -1394,6 +1401,20 @@ class RunConfig:
         # ---- 膜体系（B1）。配置键按 memtodolist §3.1：顶层 system_type + 嵌套 membrane.* ----
         if _flag_present("--system-type"):
             preset["system_type"] = args.system_type
+        if _flag_present("--charge-treatment"):
+            preset["charge_treatment"] = args.charge_treatment
+        if _flag_present("--co-alchemical-ion"):
+            preset["co_alchemical_ion"] = args.co_alchemical_ion
+        if _flag_present("--apbs-evidence"):
+            preset["apbs_evidence"] = args.apbs_evidence
+        if _flag_present("--dispersion-protocol"):
+            preset["dispersion_protocol"] = args.dispersion_protocol
+        if _flag_present("--forcefield-family"):
+            preset["forcefield_family"] = args.forcefield_family
+        if _flag_present("--force-switch-deviation-evidence"):
+            preset["force_switch_deviation_evidence"] = (
+                args.force_switch_deviation_evidence
+            )
         if _flag_present("--confirm-soluble-with-lipids"):
             preset["confirm_soluble_with_lipids"] = bool(
                 args.confirm_soluble_with_lipids
@@ -1460,6 +1481,14 @@ class RunConfig:
             "system_type": None,
             "membrane": None,
             "confirm_soluble_with_lipids": False,
+            # 净电荷协议默认由配体净电荷推导（§1.2 生产默认值）。
+            "charge_treatment": None,
+            "co_alchemical_ion": None,
+            "apbs_evidence": None,
+            # LJ/色散：soluble 不声明 = legacy_uniform_density_lrc（行为不变）。
+            "dispersion_protocol": None,
+            "forcefield_family": None,
+            "force_switch_deviation_evidence": None,
         }
         for key, value in defaults.items():
             preset.setdefault(key, value)
@@ -1499,6 +1528,9 @@ def _write_run_provenance(
     topology: Optional[app.Topology] = None,
     positions=None,
     barostat_protocol: Optional[Dict] = None,
+    charge_protocol: Optional[Dict] = None,
+    dispersion_protocol: Optional[Dict] = None,
+    forcefield_family: Optional[Dict] = None,
 ) -> Dict:
     provenance = _collect_pipeline_provenance(
         config=config.as_dict(),
@@ -1513,6 +1545,23 @@ def _write_run_provenance(
     if barostat_protocol is not None:
         provenance["barostat_protocol"] = barostat_protocol
         provenance["system_type"] = barostat_protocol.get("system_type")
+    # memtodolist §10：charge_treatment / ligand_net_charge / coion_identity /
+    # apbs_applicable-applied 必须落盘；§1.2 要求"最终说明"能直接回答电荷怎么处理。
+    if dispersion_protocol is not None:
+        provenance["dispersion_protocol"] = dispersion_protocol
+    if forcefield_family is not None:
+        provenance["forcefield_family"] = forcefield_family
+    # §13：阈值必须进 provenance，否则"当时用的哪套阈值"无从追溯。
+    provenance["acceptance_thresholds"] = acceptance_thresholds_payload()
+    if charge_protocol is not None:
+        provenance["charge_protocol"] = charge_protocol
+        provenance["charge_treatment"] = charge_protocol.get("charge_treatment")
+        provenance["ligand_net_charge"] = charge_protocol.get("ligand_net_charge_e")
+        provenance["coion_identity"] = charge_protocol.get("co_alchemical_ion")
+        provenance["apbs_applicable"] = charge_protocol.get("apbs_applicable")
+        provenance["apbs_applied"] = charge_protocol.get("apbs_applied")
+        if charge_protocol.get("experimental_not_for_production"):
+            provenance["experimental_not_for_production"] = True
     provenance["input_files"] = {
         "gro": config.get("gro"),
         "top": config.get("top"),
@@ -2087,6 +2136,64 @@ def parse_arguments():
         "--confirm-soluble-with-lipids",
         action="store_true",
         help="确认 system_type=soluble 但拓扑含大量脂质残基（留记录，不静默放行）",
+    )
+
+    # ---- 净电荷处理协议（memtodolist §1.2，B2）----
+    # 不传时按配体净电荷推导：中性 → neutral（当前生产路径），带电 → charge-transfer。
+    parser.add_argument(
+        "--charge-treatment",
+        default=None,
+        choices=[
+            "neutral",
+            "co_alchemical_charge_transfer",
+            "rocklin_apbs_neutralizing_plasma",
+            "co_annihilation_experimental",
+        ],
+        help=(
+            "净电荷处理路线。co-ion 路线与 Rocklin/APBS 是二选一，同时用即重复修正、"
+            "会 fail closed。co_annihilation_experimental 仅供方法对照，膜体系禁用"
+        ),
+    )
+    parser.add_argument(
+        "--co-alchemical-ion",
+        default=None,
+        help="co-alchemical ion 身份/参数/restraint 的 JSON 文件路径（§3.4 字段）",
+    )
+    parser.add_argument(
+        "--apbs-evidence",
+        default=None,
+        help="rocklin_apbs_neutralizing_plasma 路线的 APBS 证据 JSON（manifest/result/介电图/脂质电荷图）",
+    )
+
+    # ---- LJ/色散路线与力场族（memtodolist §1.1 / §1.3，B6）----
+    parser.add_argument(
+        "--dispersion-protocol",
+        default=None,
+        choices=[
+            "legacy_uniform_density_lrc",
+            "ff_native_isotropic_lrc",
+            "ff_native_force_switch_no_lrc",
+            "lj_pme",
+            "membrane_inhomogeneous",
+        ],
+        help=(
+            "LJ/色散路线。soluble 不传 = legacy_uniform_density_lrc（行为不变）；"
+            "membrane 不传即 fail closed。lj_pme / membrane_inhomogeneous 是路线 B/C，未实现"
+        ),
+    )
+    parser.add_argument(
+        "--forcefield-family",
+        default=None,
+        choices=["amber", "charmm"],
+        help="显式覆盖从 .top 自动识别的力场族；覆盖会留记录，不静默",
+    )
+    parser.add_argument(
+        "--force-switch-deviation-evidence",
+        default=None,
+        help=(
+            "charmm 分支放行所需的定量偏差论证 JSON（APL / 膜厚 / 单点能对照）。"
+            "OpenMM 没有 force-switch，无此证据一律 fail closed"
+        ),
     )
 
     # 高级选项
@@ -3535,11 +3642,88 @@ def main():
             _barostat_protocol["barostat_class"],
         )
 
+    # 净电荷处理协议（memtodolist §1.2，B2）。同样在建任何 Context 之前判死，
+    # 且**自动计算配体净电荷并与配置交叉核对**（§6.1）。
+    # 净电荷用 ibs_engine 里既有的唯一实现算，不另造一套判据。
+    _ligand_net_charge_e = _compute_ligand_net_charge(system, ligand_indices)
+    _charge_protocol = resolve_charge_treatment(
+        config.get("charge_treatment"),
+        ligand_net_charge_e=_ligand_net_charge_e,
+        apbs_correction_kJ_mol=config.get("apbs_correction_kJ_mol", 0.0),
+        co_alchemical_ion=(
+            _load_json_object_file(config.get("co_alchemical_ion"), "co-alchemical ion 规格")
+            if config.get("co_alchemical_ion")
+            else None
+        ),
+        environment_type=config.get("system_type"),
+        apbs_evidence=(
+            _load_json_object_file(config.get("apbs_evidence"), "APBS 证据")
+            if config.get("apbs_evidence")
+            else None
+        ),
+    )
+    if _charge_protocol["charge_treatment"] != "neutral":
+        log.info(
+            "⚡ 净电荷协议=%s（配体净电荷 %+d e，APBS %s）",
+            _charge_protocol["charge_treatment"],
+            _charge_protocol["ligand_net_charge_e"],
+            "适用" if _charge_protocol["apbs_applicable"] else "不适用",
+        )
+        if _charge_protocol["experimental_not_for_production"]:
+            log.warning(
+                "⚠️ charge_treatment=co_annihilation_experimental 是**实验对照专用**，"
+                "其数值不得进入任何 ΔG_bind 汇总（memtodolist MEM-00a-2）。"
+            )
+
+    # 力场族与 LJ/色散路线（memtodolist §1.1 / §1.3，B6）。同样在建 Context 之前判死。
+    # 力场族识别只在**膜体系或用户显式声明了色散路线/力场族**时才强制——可溶体系
+    # 走 legacy_uniform_density_lrc，与识别结果无关，不能因为识别不出就挡住现有运行。
+    _forcefield_family_info = None
+    _needs_forcefield_family = (
+        _barostat_protocol["system_type"] != "soluble"
+        or config.get("dispersion_protocol")
+        or config.get("forcefield_family")
+    )
+    if _needs_forcefield_family:
+        _forcefield_family_info = resolve_forcefield_family(
+            top_path=config.get("top"),
+            explicit_family=config.get("forcefield_family"),
+        )
+        log.info(
+            "🧬 力场族=%s（来源 %s）",
+            _forcefield_family_info["family"],
+            _forcefield_family_info["source"],
+        )
+    _dispersion_protocol = resolve_dispersion_protocol(
+        config.get("dispersion_protocol"),
+        environment_type=config.get("system_type"),
+        forcefield_family=(
+            _forcefield_family_info["family"] if _forcefield_family_info else None
+        ),
+        force_switch_deviation_evidence=(
+            _load_json_object_file(
+                config.get("force_switch_deviation_evidence"),
+                "force-switch 偏差论证",
+            )
+            if config.get("force_switch_deviation_evidence")
+            else None
+        ),
+    )
+    if not _dispersion_protocol["was_defaulted"]:
+        log.info(
+            "🧪 色散路线=%s（均匀密度 LRC %s）",
+            _dispersion_protocol["dispersion_protocol"],
+            "生效" if _dispersion_protocol["uniform_density_lrc_active"] else "关闭",
+        )
+
     run_provenance = None
     if not config.only_complex_charging:
         run_provenance = _write_run_provenance(
             output_dir, config, system, topology, positions,
             barostat_protocol=_barostat_protocol,
+            charge_protocol=_charge_protocol,
+            dispersion_protocol=_dispersion_protocol,
+            forcefield_family=_forcefield_family_info,
         )
         log.info(
             "🧾 运行 provenance 已保存: %s",

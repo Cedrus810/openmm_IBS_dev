@@ -494,6 +494,767 @@ def barostat_fingerprint_payload(protocol: Optional[Dict[str, Any]]) -> Optional
     return payload
 
 
+# ============================================================================
+# 净电荷处理协议：charge_treatment（memtodolist.md §1.2 / §2 / §7.1；B2）
+#
+# 这一节是**纯校验层**：把"配体净电荷 / co-ion / APBS / 环境类型"这四个量的合法
+# 组合一次性判死，在创建任何 Context 之前（§6.1）。它不构建任何 Hamiltonian——
+# charge-transfer 的 charging System 构建是 B3，溶剂腿 co-ion 身份是 B4。
+#
+# 关键设计约束逐条对应清单：
+#   §1.2 必须是**显式配置**；禁止根据"有没有 APBS 数值"猜协议。
+#   §1.2 co-ion 路线与 Rocklin/APBS 是二选一，禁止重复修正（双计数）。
+#   §0.5.1 MEM-00a-1 `CHARGE_TRANSFER_PROTOCOL_VERSION` 必须**独立**，
+#          不复用 SOLVENT_CACHE_PROTOCOL_VERSION / IBS_BIAS_PROTOCOL_VERSION。
+#   §0.5.1 MEM-00a-2 co-annihilation 降级为实验对照：membrane 一律 fail closed，
+#          输出必须带 `experimental_not_for_production: true`，
+#          其数值不得进入任何 ΔG_bind 汇总。
+#   §7.7 中性配体路径行为不变——这是当前生产体系（Atenolol 中性）走的那条。
+# ============================================================================
+
+# MEM-00a-1：与其它协议版本并列的独立版本号。charge-transfer 协议本身变化时递增，
+# 不要因为溶剂缓存或 IBS bias 协议变了就动它，反之亦然。
+CHARGE_TRANSFER_PROTOCOL_VERSION = 1
+
+CHARGE_TREATMENT_NEUTRAL = "neutral"
+CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER = "co_alchemical_charge_transfer"
+CHARGE_TREATMENT_ROCKLIN_APBS = "rocklin_apbs_neutralizing_plasma"
+CHARGE_TREATMENT_CO_ANNIHILATION_EXPERIMENTAL = "co_annihilation_experimental"
+
+CHARGE_TREATMENTS = (
+    CHARGE_TREATMENT_NEUTRAL,
+    CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER,
+    CHARGE_TREATMENT_ROCKLIN_APBS,
+    CHARGE_TREATMENT_CO_ANNIHILATION_EXPERIMENTAL,
+)
+
+# 🚧 B3 未落地。charge-transfer 的 charging Hamiltonian（ligand q→0 与
+# co-ion 0→q 由同一个 lambda_q 反向驱动、co-ion 电荷走 PME particle offset）
+# 还没有实现，`ibs_engine.py` 里现存的是 co-annihilation。
+# 所以本校验层即使收到一份格式完全合法的 co-ion 规格，也必须 fail closed——
+# 放行只会让用户拿到一个"声明了 charge-transfer、实际跑的是别的东西"的结果。
+# B3 落地时把它改成 True，并同时打开对应的端点测试（§7.2 / §7.3）。
+CHARGE_TRANSFER_HAMILTONIAN_IMPLEMENTED = False
+
+# §13.2 数值自洽的两个容差。放在这里是因为本层就要用；§13 的完整阈值表另立。
+LIGAND_NET_CHARGE_INTEGER_TOLERANCE_E = 1.0e-3
+TOTAL_CHARGE_CONSERVATION_TOLERANCE_E = 1.0e-6
+
+# §3.4 要求写入 manifest 的 co-ion 身份字段。B2 只校验"齐不齐、算不算得平"，
+# 真正的选择与落盘是 B4。
+CO_ALCHEMICAL_ION_REQUIRED_FIELDS = (
+    "atom_index",
+    "residue_index",
+    "residue_name",
+    "element",
+    "charge_at_lambda1_e",
+    "charge_at_lambda0_e",
+    "sigma_nm",
+    "epsilon_kj_mol",
+    "mass_amu",
+    "restraint",
+)
+
+# §5 / §1.2：选 Rocklin 路线时必须真的有 APBS 证据，不能只填一个数。
+APBS_REQUIRED_EVIDENCE_FIELDS = (
+    "manifest_path",
+    "result_path",
+    "dielectric_map_paths",
+    "lipid_charge_map_path",
+    "net_charge_e",
+)
+
+
+def resolve_charge_treatment(
+    charge_treatment: Optional[str],
+    ligand_net_charge_e: float,
+    apbs_correction_kJ_mol: float = 0.0,
+    co_alchemical_ion: Optional[Any] = None,
+    environment_type: Optional[str] = None,
+    apbs_evidence: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """校验净电荷处理协议，返回可直接进 fingerprint/provenance 的解析结果。
+
+    `charge_treatment=None` 时按 §1.2 的生产默认推导：中性配体 → `neutral`，
+    带电配体 → `co_alchemical_charge_transfer`。**这不是"猜协议"**——它只看配体
+    净电荷这一个客观量，与清单禁止的"根据有没有 APBS 数值猜"是两回事。
+
+    `ligand_net_charge_e` 由调用方用现有实现算出并传入（复合物腿走
+    `ibs_engine._compute_ligand_net_charge`），本函数不自己再数一遍电荷，
+    避免出现第二套净电荷判据。
+    """
+    raw_q = float(ligand_net_charge_e)
+    if not math.isfinite(raw_q):
+        raise ValueError(f"配体净电荷不是有限数：{ligand_net_charge_e!r}")
+    q_int = int(round(raw_q))
+    if abs(raw_q - q_int) > LIGAND_NET_CHARGE_INTEGER_TOLERANCE_E:
+        raise ValueError(
+            f"配体净电荷 {raw_q:+.6f} e 不接近整数"
+            f"（容差 {LIGAND_NET_CHARGE_INTEGER_TOLERANCE_E:g} e）。"
+            "§2.2：非整数净电荷必须先作为输入错误调查，"
+            "不要静默塞给一个分数价 co-ion。"
+        )
+
+    try:
+        apbs_value = float(apbs_correction_kJ_mol or 0.0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"apbs_correction_kJ_mol={apbs_correction_kJ_mol!r} 不是数值"
+        ) from exc
+    if not math.isfinite(apbs_value):
+        raise ValueError("apbs_correction_kJ_mol 必须有限")
+
+    # ---- 解析协议名 ----
+    if charge_treatment is None or str(charge_treatment).strip() == "":
+        resolved = (
+            CHARGE_TREATMENT_NEUTRAL
+            if q_int == 0
+            else CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER
+        )
+        was_defaulted = True
+    else:
+        resolved = str(charge_treatment).strip().lower()
+        was_defaulted = False
+    if resolved not in CHARGE_TREATMENTS:
+        raise ValueError(
+            f"charge_treatment={charge_treatment!r} 不是合法值；"
+            f"允许 {list(CHARGE_TREATMENTS)}。"
+        )
+
+    resolved_environment = resolve_environment_type(environment_type)
+    is_experimental = resolved == CHARGE_TREATMENT_CO_ANNIHILATION_EXPERIMENTAL
+
+    # ---- 逐协议规则（§1.2 的 fail-closed 清单）----
+    if resolved == CHARGE_TREATMENT_NEUTRAL:
+        # fail-closed #2：neutral 但检测到配体净电荷不为 0。
+        if q_int != 0:
+            raise ValueError(
+                f"charge_treatment=neutral 但配体净电荷为 {q_int:+d} e。"
+                "带电配体必须显式选择净电荷处理路线："
+                f"生产用 {CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER}，"
+                f"方法对照用 {CHARGE_TREATMENT_CO_ANNIHILATION_EXPERIMENTAL}，"
+                f"neutralizing plasma 用 {CHARGE_TREATMENT_ROCKLIN_APBS}。"
+            )
+        if co_alchemical_ion:
+            raise ValueError("charge_treatment=neutral 不得创建 co-alchemical ion。")
+        if apbs_value != 0.0:
+            raise ValueError(
+                f"charge_treatment=neutral 但 apbs_correction_kJ_mol={apbs_value:+.6f}。"
+                "中性配体既不需要 co-ion，也不需要 Rocklin 净电荷修正（§0 第 3 条）。"
+            )
+
+    elif resolved in (
+        CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER,
+        CHARGE_TREATMENT_CO_ANNIHILATION_EXPERIMENTAL,
+    ):
+        if q_int == 0:
+            raise ValueError(
+                f"charge_treatment={resolved} 但配体净电荷为 0。"
+                "中性配体不需要共炼金离子，请用 neutral。"
+            )
+        # fail-closed #1：co-ion 路线与 APBS 是二选一，禁止双计数。
+        if apbs_value != 0.0:
+            raise ValueError(
+                f"charge_treatment={resolved} 且 "
+                f"apbs_correction_kJ_mol={apbs_value:+.6f} —— 这是**重复修正**。"
+                "共炼金路线全程保持体系总电荷不变，Rocklin/APBS 净电荷修正必须为 0，"
+                "并记录 not_applicable_co_alchemical_charge_transfer（§0 第 3 条）。"
+            )
+
+        if is_experimental:
+            # MEM-00a-2：膜生产一律 fail closed。
+            if resolved_environment == ENVIRONMENT_TYPE_MEMBRANE:
+                raise ValueError(
+                    "charge_treatment=co_annihilation_experimental 不允许出现在膜体系中。"
+                    "co-annihilation 同时执行 ligand: q→0 与 counterion: −q→0，"
+                    "两个异号离子在膜/水非均匀环境中的消失自由能不能可靠抵消"
+                    "（一个在结合位点、一个在体相水，介电环境完全不同）。"
+                    "膜生产请用 co_alchemical_charge_transfer；"
+                    "本路线只允许用于水盒 / lipid slab 的方法对照（§8.1/§8.2 末条）。"
+                )
+        else:
+            # fail-closed #3：charge-transfer 缺 co-ion 身份/参数/restraint。
+            if not co_alchemical_ion:
+                raise ValueError(
+                    "charge_treatment=co_alchemical_charge_transfer 但没有提供 "
+                    "co_alchemical_ion 身份、参数与 restraint（§1.2 fail-closed 第 3 条、§3.4）。"
+                )
+            _validate_co_alchemical_ion_spec(co_alchemical_ion, q_int)
+            if not CHARGE_TRANSFER_HAMILTONIAN_IMPLEMENTED:
+                raise NotImplementedError(
+                    "charge_treatment=co_alchemical_charge_transfer 的 charging "
+                    "Hamiltonian 尚未实现（memtodolist Phase B3）。"
+                    "`ibs_engine.py` 里现存的共炼金实现是 co-annihilation，"
+                    "不是 ligand q→0 / co-ion 0→q 的 charge-transfer（MEM-00a）。"
+                    "在 B3 落地前拒绝放行：否则结果会声明 charge-transfer 而实际跑的是别的哈密顿量。"
+                    "方法对照请显式选 co_annihilation_experimental。"
+                )
+
+    elif resolved == CHARGE_TREATMENT_ROCKLIN_APBS:
+        if co_alchemical_ion:
+            raise ValueError(
+                "charge_treatment=rocklin_apbs_neutralizing_plasma 禁止创建 "
+                "co-alchemical ion —— 两条路线是二选一，同时用就是重复修正。"
+            )
+        # fail-closed #4：缺 APBS 来源说明/结果文件。
+        missing = [
+            field
+            for field in APBS_REQUIRED_EVIDENCE_FIELDS
+            if not (apbs_evidence or {}).get(field)
+        ]
+        if missing:
+            raise ValueError(
+                f"charge_treatment=rocklin_apbs_neutralizing_plasma 缺少 APBS 证据字段 "
+                f"{missing}（§1.2 fail-closed 第 4 条、§5）。"
+                "必须提供真实 APBS manifest/result、介电图与脂质电荷图；"
+                "只填一个 apbs_correction_kJ_mol 数值不算。"
+            )
+
+    payload: Dict[str, Any] = {
+        "protocol_version": CHARGE_TRANSFER_PROTOCOL_VERSION,
+        "charge_treatment": resolved,
+        "was_defaulted_from_net_charge": bool(was_defaulted),
+        "ligand_net_charge_e": q_int,
+        "ligand_net_charge_raw_e": raw_q,
+        "environment_type": resolved_environment,
+        "apbs_correction_kJ_mol": apbs_value,
+        "apbs_applicable": resolved == CHARGE_TREATMENT_ROCKLIN_APBS,
+        "apbs_applied": resolved == CHARGE_TREATMENT_ROCKLIN_APBS and apbs_value != 0.0,
+        "co_alchemical_ion": co_alchemical_ion or None,
+        "experimental_not_for_production": bool(is_experimental),
+    }
+
+    if resolved in (
+        CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER,
+        CHARGE_TREATMENT_CO_ANNIHILATION_EXPERIMENTAL,
+    ):
+        payload["apbs_not_applicable_reason"] = (
+            "not_applicable_co_alchemical_charge_transfer"
+            if not is_experimental
+            else "not_applicable_co_annihilation_conserves_total_charge"
+        )
+        payload["total_charge_conserved_at_every_lambda"] = True
+    elif resolved == CHARGE_TREATMENT_ROCKLIN_APBS:
+        payload["total_charge_conserved_at_every_lambda"] = False
+        payload["apbs_evidence"] = dict(apbs_evidence or {})
+    else:
+        payload["total_charge_conserved_at_every_lambda"] = True
+        payload["apbs_not_applicable_reason"] = "not_applicable_neutral_ligand"
+
+    return payload
+
+
+def _validate_co_alchemical_ion_spec(spec: Any, ligand_net_charge: int) -> None:
+    """校验 co-ion 规格：字段齐全、每粒子不超过一个单位电荷、总变化抵消（§2.2/§3.4）。
+
+    接受单个 dict 或 dict 列表——`|q_L| > 1` 时按 §2.2 必须用多个单价 co-ion 分担，
+    不允许把多个单位电荷集中到一个非物理多价粒子上。
+    """
+    ions = spec if isinstance(spec, (list, tuple)) else [spec]
+    if not ions:
+        raise ValueError("co_alchemical_ion 为空")
+
+    seen_indices = set()
+    total_transferred = 0.0
+    for position, ion in enumerate(ions):
+        if not isinstance(ion, dict):
+            raise ValueError(
+                f"co_alchemical_ion[{position}] 必须是 dict，收到 {type(ion).__name__}"
+            )
+        missing = [f for f in CO_ALCHEMICAL_ION_REQUIRED_FIELDS if f not in ion]
+        if missing:
+            raise ValueError(
+                f"co_alchemical_ion[{position}] 缺少 §3.4 要求的字段 {missing}"
+            )
+        index = int(ion["atom_index"])
+        if index in seen_indices:
+            raise ValueError(
+                f"co_alchemical_ion 出现重复 atom_index={index}；"
+                "同一个粒子不能被当成两个 co-ion。"
+            )
+        seen_indices.add(index)
+
+        q1 = float(ion["charge_at_lambda1_e"])
+        q0 = float(ion["charge_at_lambda0_e"])
+        # §2.2：λ=1 时它是"中性但保留 LJ 的 ion-shaped dummy"。
+        if abs(q1) > TOTAL_CHARGE_CONSERVATION_TOLERANCE_E:
+            raise ValueError(
+                f"co_alchemical_ion[{position}] 在 λ=1 的电荷应为 0（中性 dummy），"
+                f"实际 {q1:+.6f} e。"
+            )
+        transferred = q0 - q1
+        if abs(transferred) - 1.0 > TOTAL_CHARGE_CONSERVATION_TOLERANCE_E:
+            raise ValueError(
+                f"co_alchemical_ion[{position}] 转移了 {transferred:+.6f} e。"
+                "§2.2：每个 co-ion 最多转移一个单位电荷；"
+                f"|q_L| > 1 请用 {abs(ligand_net_charge)} 个单价 co-ion 分担，"
+                "不要构造非物理多价粒子。"
+            )
+        if ligand_net_charge > 0 and transferred <= 0:
+            raise ValueError(
+                f"配体净电荷 {ligand_net_charge:+d} e 为正，co-ion 必须是同号（阳离子型，"
+                f"0 → +1），实际转移 {transferred:+.6f} e。"
+                "注意 charge-transfer 不是 co-annihilation：不是去掉一个异号反离子。"
+            )
+        if ligand_net_charge < 0 and transferred >= 0:
+            raise ValueError(
+                f"配体净电荷 {ligand_net_charge:+d} e 为负，co-ion 必须是同号（阴离子型，"
+                f"0 → −1），实际转移 {transferred:+.6f} e。"
+            )
+        if not ion.get("restraint"):
+            raise ValueError(
+                f"co_alchemical_ion[{position}] 缺少 restraint（§2.3 要求可审计的 "
+                "flat-bottom restraint，参考位置随盒缩放）。"
+            )
+        total_transferred += transferred
+
+    # fail-closed #5：配体电荷变化与 co-ion 电荷变化之和不为 0。
+    ligand_change = 0.0 - float(ligand_net_charge)
+    residual = ligand_change + total_transferred
+    if abs(residual) > TOTAL_CHARGE_CONSERVATION_TOLERANCE_E:
+        raise ValueError(
+            f"配体电荷变化 ({ligand_change:+.6f} e) 与 co-ion 电荷变化之和 "
+            f"({total_transferred:+.6f} e) 不为 0，残差 {residual:+.6e} e "
+            f"> {TOTAL_CHARGE_CONSERVATION_TOLERANCE_E:g} e"
+            "（§1.2 fail-closed 第 5 条）。总电荷必须在每个 λ 严格守恒。"
+        )
+
+
+# ============================================================================
+# §13 验收阈值：全部落成命名常量并进 provenance
+#
+# 清单原文通篇写"预设阈值"但没给数——没有数就写不了 fail-closed 检查，也没法判
+# 验收。§13 要求"必须在 Phase A 结束前落成常量并进 provenance，不许运行时凭感觉判"。
+# 这里就是那份常量表；数值取 §13 的提案值，可改，但改必须改这里、且会进 provenance。
+# ============================================================================
+
+ACCEPTANCE_THRESHOLDS_VERSION = 1
+
+# ---- §13.1 co-ion 几何 ----
+COION_LIGAND_MIN_IMAGE_INITIAL_NM = 1.6
+# 全程下限取 softcore cutoff。⚠️ 这个值必须与 `ibs_engine.SOFTCORE_CUTOFF_NM` 一致；
+# abfe_core 在 ibs_engine 的下层不能反向 import，所以由
+# tests/test_acceptance_thresholds.py 的交叉检查测试钉住，防止两处各改一半。
+COION_LIGAND_MIN_IMAGE_RUNTIME_NM = 1.2
+COION_PROTEIN_HEAVY_ATOM_MIN_NM = 1.2
+COION_MEMBRANE_MIDPLANE_MIN_ABS_Z_NM = 3.0
+COION_NEAREST_PHOSPHORUS_MIN_NM = 1.0
+COION_FIRST_SHELL_WATER_CUTOFF_NM = 0.32
+# 按离子类型给首层水配位数下限（§13.1）。键为残基名/元素的大写形式。
+COION_FIRST_SHELL_MIN_WATER_COUNT = {
+    "NA": 5, "SOD": 5, "K": 5, "POT": 5,
+    "CL": 6, "CLA": 6,
+}
+COION_FLAT_BOTTOM_RADIUS_NM = 0.5
+COION_FLAT_BOTTOM_K_KJ_PER_MOL_NM2 = 100.0
+
+# ---- §13.2 数值自洽 ----
+# 总电荷守恒容差 TOTAL_CHARGE_CONSERVATION_TOLERANCE_E 已在 B2 一节定义，此处不重复。
+LIGAND_CHARGE_LAMBDA_TOLERANCE_E = 1.0e-6
+ENDPOINT_ENERGY_RELATIVE_TOLERANCE = 1.0e-5
+ENDPOINT_FORCE_MAX_ABS_TOLERANCE_KJ_PER_MOL_NM = 1.0e-3
+# λ=0 端 ligand–environment 静电与 LJ 必须是**严格零**，不是"很小"。
+DECOUPLED_ENDPOINT_ENERGY_ABS_TOLERANCE_KJ_PER_MOL = 1.0e-6
+GROMACS_OPENMM_COMPONENT_RELATIVE_TOLERANCE = 1.0e-4
+GROMACS_OPENMM_TOTAL_ABS_TOLERANCE_KJ_PER_MOL = 0.1
+
+# ---- §13.3 膜质量门（判据统一为"末段窗口内线性漂移小于阈值"）----
+MEMBRANE_QUALITY_GATE_TAIL_WINDOW_NS = 20.0
+APL_MAX_DRIFT_PERCENT_PER_NS = 0.2
+APL_MAX_DEVIATION_FROM_LITERATURE_PERCENT = 3.0
+BILAYER_THICKNESS_MAX_DRIFT_NM_PER_TAIL_WINDOW = 0.05
+PROTEIN_BACKBONE_MAX_RMSD_NM = 0.30
+TRANSMEMBRANE_TILT_MAX_DRIFT_DEG = 5.0
+POCKET_MAX_RMSD_NM = 0.20
+LIGAND_HEAVY_ATOM_MAX_RMSD_NM = 0.25
+
+# ---- §13.4 结果验收 ----
+CROSS_REPEAT_MAX_STDDEV_KCAL_PER_MOL = 1.0
+MIN_INDEPENDENT_REPEATS = 3
+BENCHMARK_MIN_LIGANDS = 5
+BENCHMARK_MAX_MAE_KCAL_PER_MOL = 1.5
+BENCHMARK_MAX_ABS_OUTLIER_KCAL_PER_MOL = 3.0
+# §3.0 空腔填充迟滞：正反向 / 双起点 stage 2 的 ΔF 差 ≤ 2σ。
+STAGE2_HYSTERESIS_MAX_SIGMA = 2.0
+
+
+def acceptance_thresholds_payload() -> Dict[str, Any]:
+    """§13 全部阈值的可序列化快照，供 provenance 落盘。
+
+    目的是让每一份结果都能回答"当时用的是哪套阈值"——阈值改了而结果没重跑，
+    对照 provenance 就能看出来。
+    """
+    return {
+        "version": ACCEPTANCE_THRESHOLDS_VERSION,
+        "coion_geometry": {
+            "ligand_min_image_initial_nm": COION_LIGAND_MIN_IMAGE_INITIAL_NM,
+            "ligand_min_image_runtime_nm": COION_LIGAND_MIN_IMAGE_RUNTIME_NM,
+            "protein_heavy_atom_min_nm": COION_PROTEIN_HEAVY_ATOM_MIN_NM,
+            "membrane_midplane_min_abs_z_nm": COION_MEMBRANE_MIDPLANE_MIN_ABS_Z_NM,
+            "nearest_phosphorus_min_nm": COION_NEAREST_PHOSPHORUS_MIN_NM,
+            "first_shell_water_cutoff_nm": COION_FIRST_SHELL_WATER_CUTOFF_NM,
+            "first_shell_min_water_count": dict(COION_FIRST_SHELL_MIN_WATER_COUNT),
+            "flat_bottom_radius_nm": COION_FLAT_BOTTOM_RADIUS_NM,
+            "flat_bottom_k_kj_per_mol_nm2": COION_FLAT_BOTTOM_K_KJ_PER_MOL_NM2,
+        },
+        "numerical_selfconsistency": {
+            "total_charge_conservation_e": TOTAL_CHARGE_CONSERVATION_TOLERANCE_E,
+            "ligand_charge_lambda_e": LIGAND_CHARGE_LAMBDA_TOLERANCE_E,
+            "endpoint_energy_relative": ENDPOINT_ENERGY_RELATIVE_TOLERANCE,
+            "endpoint_force_max_abs_kj_per_mol_nm": (
+                ENDPOINT_FORCE_MAX_ABS_TOLERANCE_KJ_PER_MOL_NM
+            ),
+            "decoupled_endpoint_energy_abs_kj_per_mol": (
+                DECOUPLED_ENDPOINT_ENERGY_ABS_TOLERANCE_KJ_PER_MOL
+            ),
+            "gromacs_openmm_component_relative": (
+                GROMACS_OPENMM_COMPONENT_RELATIVE_TOLERANCE
+            ),
+            "gromacs_openmm_total_abs_kj_per_mol": (
+                GROMACS_OPENMM_TOTAL_ABS_TOLERANCE_KJ_PER_MOL
+            ),
+        },
+        "membrane_quality_gate": {
+            "tail_window_ns": MEMBRANE_QUALITY_GATE_TAIL_WINDOW_NS,
+            "apl_max_drift_percent_per_ns": APL_MAX_DRIFT_PERCENT_PER_NS,
+            "apl_max_deviation_from_literature_percent": (
+                APL_MAX_DEVIATION_FROM_LITERATURE_PERCENT
+            ),
+            "bilayer_thickness_max_drift_nm_per_tail_window": (
+                BILAYER_THICKNESS_MAX_DRIFT_NM_PER_TAIL_WINDOW
+            ),
+            "protein_backbone_max_rmsd_nm": PROTEIN_BACKBONE_MAX_RMSD_NM,
+            "transmembrane_tilt_max_drift_deg": TRANSMEMBRANE_TILT_MAX_DRIFT_DEG,
+            "pocket_max_rmsd_nm": POCKET_MAX_RMSD_NM,
+            "ligand_heavy_atom_max_rmsd_nm": LIGAND_HEAVY_ATOM_MAX_RMSD_NM,
+        },
+        "result_acceptance": {
+            "cross_repeat_max_stddev_kcal_per_mol": (
+                CROSS_REPEAT_MAX_STDDEV_KCAL_PER_MOL
+            ),
+            "min_independent_repeats": MIN_INDEPENDENT_REPEATS,
+            "benchmark_min_ligands": BENCHMARK_MIN_LIGANDS,
+            "benchmark_max_mae_kcal_per_mol": BENCHMARK_MAX_MAE_KCAL_PER_MOL,
+            "benchmark_max_abs_outlier_kcal_per_mol": (
+                BENCHMARK_MAX_ABS_OUTLIER_KCAL_PER_MOL
+            ),
+            "stage2_hysteresis_max_sigma": STAGE2_HYSTERESIS_MAX_SIGMA,
+        },
+    }
+
+
+# ============================================================================
+# §1.1 力场族自动识别 + §1.3 dispersion_protocol（B6）
+#
+# 两者绑在一起，因为 §1.1 的裁决直接决定 §1.3 走哪条路线：
+#   amber 系  → Amber 脂质（Lipid21/Lipid17）+ ff_native_isotropic_lrc
+#   charmm 系 → CHARMM36 脂质 + ff_native_force_switch_no_lrc
+#
+# ⚠️ §1.3 的修正框：原稿"膜体系一律禁用 LRC"是错的。判据是**跟随所选脂质力场的
+# 原始参数化条件**——Amber Lipid21 就是在开着各向同性 vdW 长程修正下拟合的，
+# 对它关掉 LRC 才是错的；CHARMM36 是 force-switch 且不加 LRC，对它开 LRC 才是错的。
+#
+# ⚠️ OpenMM 的 `NonbondedForce` 只有 potential-switch（`setUseSwitchingFunction`），
+# **没有 force-switch**。所以 charmm 分支无法复现原始 Hamiltonian，默认 fail closed，
+# 只有给出定量偏差论证（APL / 膜厚 / 单点能对照）后才允许放行。amber 是首选路径。
+# ============================================================================
+
+FORCEFIELD_FAMILY_AMBER = "amber"
+FORCEFIELD_FAMILY_CHARMM = "charmm"
+FORCEFIELD_FAMILIES = (FORCEFIELD_FAMILY_AMBER, FORCEFIELD_FAMILY_CHARMM)
+
+# 识别得出但本轮不支持的族：明确报错好过"识别不出"这种含糊结论。
+FORCEFIELD_FAMILIES_UNSUPPORTED = ("opls", "gromos")
+
+# `#include` 路径里出现这些 token 即判定为对应族。按最长匹配优先，避免
+# "charmm36" 被 "charm" 之类的前缀误伤。
+_FORCEFIELD_FAMILY_TOKENS = (
+    ("charmm", FORCEFIELD_FAMILY_CHARMM),
+    ("amber", FORCEFIELD_FAMILY_AMBER),
+    ("opls", "opls"),
+    ("oplsaa", "opls"),
+    ("gromos", "gromos"),
+)
+
+DISPERSION_PROTOCOL_LEGACY_UNIFORM_LRC = "legacy_uniform_density_lrc"
+DISPERSION_PROTOCOL_FF_NATIVE_ISOTROPIC_LRC = "ff_native_isotropic_lrc"
+DISPERSION_PROTOCOL_FF_NATIVE_FORCE_SWITCH_NO_LRC = "ff_native_force_switch_no_lrc"
+DISPERSION_PROTOCOL_LJ_PME = "lj_pme"
+DISPERSION_PROTOCOL_MEMBRANE_INHOMOGENEOUS = "membrane_inhomogeneous"
+
+DISPERSION_PROTOCOLS = (
+    DISPERSION_PROTOCOL_LEGACY_UNIFORM_LRC,
+    DISPERSION_PROTOCOL_FF_NATIVE_ISOTROPIC_LRC,
+    DISPERSION_PROTOCOL_FF_NATIVE_FORCE_SWITCH_NO_LRC,
+    DISPERSION_PROTOCOL_LJ_PME,
+    DISPERSION_PROTOCOL_MEMBRANE_INHOMOGENEOUS,
+)
+
+# 已实现（有代码支撑）的路线。LJ-PME 是 §1.3 路线 B、非均匀色散修正是路线 C，
+# 两者都只有验收条件、没有实现——声明它们必须 NotImplementedError，
+# 而不是被当成拼错的未知值。
+DISPERSION_PROTOCOLS_IMPLEMENTED = (
+    DISPERSION_PROTOCOL_LEGACY_UNIFORM_LRC,
+    DISPERSION_PROTOCOL_FF_NATIVE_ISOTROPIC_LRC,
+)
+
+# §1.3：`system_type=membrane` 且未选择**已验证**的 dispersion_protocol → fail closed。
+# 目前只有 amber 分支这一条算已验证路径。
+MEMBRANE_VALIDATED_DISPERSION_PROTOCOLS = (
+    DISPERSION_PROTOCOL_FF_NATIVE_ISOTROPIC_LRC,
+)
+
+FORCEFIELD_FAMILY_DISPERSION_PROTOCOL = {
+    FORCEFIELD_FAMILY_AMBER: DISPERSION_PROTOCOL_FF_NATIVE_ISOTROPIC_LRC,
+    FORCEFIELD_FAMILY_CHARMM: DISPERSION_PROTOCOL_FF_NATIVE_FORCE_SWITCH_NO_LRC,
+}
+
+# charmm 分支放行所需的定量论证字段（§1.1 最后一条）。
+FORCE_SWITCH_DEVIATION_EVIDENCE_FIELDS = (
+    "apl_comparison",
+    "bilayer_thickness_comparison",
+    "single_point_energy_comparison",
+)
+
+
+def detect_forcefield_family_from_top(top_path: str) -> Dict[str, Any]:
+    """从 GROMACS `.top` 的 `#include` 判定力场族（§1.1）。
+
+    实测本仓库的 `topol.top` **没有 `[ defaults ]` 段**（它在
+    `amber14sb_OL15_fs1.ff/forcefield.itp` 里面），所以主判据只能是 include 路径；
+    `[ defaults ]` 若存在则作为可选交叉检查一并记录，不作为唯一判据。
+
+    识别不出（混合 include / 自定义 ff 目录）时**返回 family=None**，由
+    `resolve_forcefield_family()` 决定是否 fail closed——本函数只负责观测。
+    """
+    with open(top_path, encoding="utf-8", errors="replace") as handle:
+        lines = handle.readlines()
+
+    includes: List[str] = []
+    defaults_row: Optional[str] = None
+    in_defaults = False
+    for raw in lines:
+        line = raw.split(";", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("#include"):
+            # #include "path/to/forcefield.itp"
+            parts = line.split('"')
+            if len(parts) >= 2:
+                includes.append(parts[1])
+            continue
+        if line.startswith("["):
+            in_defaults = line.replace(" ", "").lower().startswith("[defaults]")
+            continue
+        if in_defaults and defaults_row is None:
+            defaults_row = line
+
+    families: Dict[str, List[str]] = {}
+    for include in includes:
+        lowered = include.lower()
+        # 本地 include（./x.itp、posre.itp）不带 ff 目录，跳过。
+        matched = None
+        for token, family in sorted(
+            _FORCEFIELD_FAMILY_TOKENS, key=lambda kv: -len(kv[0])
+        ):
+            if token in lowered:
+                matched = family
+                break
+        if matched:
+            families.setdefault(matched, []).append(include)
+
+    distinct = sorted(families)
+    if len(distinct) == 1:
+        detected = distinct[0]
+        reason = "single_family_include"
+    elif len(distinct) > 1:
+        detected = None
+        reason = f"mixed_family_includes:{distinct}"
+    else:
+        detected = None
+        reason = "no_recognized_forcefield_include"
+
+    return {
+        "family": detected,
+        "reason": reason,
+        "includes": includes,
+        "family_evidence": {k: sorted(v) for k, v in families.items()},
+        "defaults_row": defaults_row,
+        "top_path": str(top_path),
+    }
+
+
+def resolve_forcefield_family(
+    top_path: Optional[str] = None,
+    explicit_family: Optional[str] = None,
+) -> Dict[str, Any]:
+    """确定力场族；识别不出即 fail closed，允许显式覆盖但必须留记录（§1.1）。"""
+    detection: Dict[str, Any] = {"family": None, "reason": "not_attempted"}
+    if top_path:
+        detection = detect_forcefield_family_from_top(top_path)
+
+    if explicit_family is not None and str(explicit_family).strip():
+        override = str(explicit_family).strip().lower()
+        if override in FORCEFIELD_FAMILIES_UNSUPPORTED:
+            raise ValueError(
+                f"forcefield_family={override!r} 本轮不支持（只支持 "
+                f"{list(FORCEFIELD_FAMILIES)}）。"
+            )
+        if override not in FORCEFIELD_FAMILIES:
+            raise ValueError(
+                f"forcefield_family={override!r} 非法；允许 {list(FORCEFIELD_FAMILIES)}。"
+            )
+        # §1.1：覆盖必须留记录，不能静默。
+        if detection.get("family") and detection["family"] != override:
+            logger.warning(
+                "⚠️ forcefield_family 被显式覆盖：自动识别为 %r（依据 %s），"
+                "但用户指定 %r。覆盖已记入 provenance。",
+                detection["family"], detection["reason"], override,
+            )
+        return {
+            "family": override,
+            "source": "explicit_override",
+            "overrode_detection": detection.get("family"),
+            "detection": detection,
+        }
+
+    family = detection.get("family")
+    if family in FORCEFIELD_FAMILIES_UNSUPPORTED:
+        raise ValueError(
+            f"从 {top_path} 识别出力场族 {family!r}，本轮不支持"
+            f"（只支持 {list(FORCEFIELD_FAMILIES)}）。"
+        )
+    if family is None:
+        raise ValueError(
+            f"无法从 {top_path!r} 识别力场族（原因：{detection.get('reason')}；"
+            f"include 列表 {detection.get('includes')}）。"
+            "按 memtodolist §1.1 这里 fail closed：**不许猜、不许默认回落到 amber**。"
+            "请用 --forcefield-family 显式指定（会记入 provenance）。"
+        )
+    return {
+        "family": family,
+        "source": "auto_detected",
+        "overrode_detection": None,
+        "detection": detection,
+    }
+
+
+def resolve_dispersion_protocol(
+    dispersion_protocol: Optional[str],
+    environment_type: Optional[str] = None,
+    forcefield_family: Optional[str] = None,
+    force_switch_deviation_evidence: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """校验 LJ/色散路线（§1.3 / B6）。
+
+    默认值刻意**按环境类型分叉**，以保证 §7.7：
+      - soluble 未声明 → `legacy_uniform_density_lrc`，即改动前的
+        `lrc_coeff[k]/V(t)` 行为，可溶路径逐位不变；
+      - membrane 未声明 → **fail closed**（§1.3 明文要求）。
+    """
+    resolved_environment = resolve_environment_type(environment_type)
+    is_membrane = resolved_environment == ENVIRONMENT_TYPE_MEMBRANE
+
+    if dispersion_protocol is None or str(dispersion_protocol).strip() == "":
+        if is_membrane:
+            expected = (
+                FORCEFIELD_FAMILY_DISPERSION_PROTOCOL.get(forcefield_family)
+                if forcefield_family
+                else None
+            )
+            raise ValueError(
+                "system_type=membrane 但没有选择 dispersion_protocol —— fail closed（§1.3）。"
+                f"已验证可用的只有 {list(MEMBRANE_VALIDATED_DISPERSION_PROTOCOLS)}"
+                + (f"；按识别到的力场族 {forcefield_family!r} 应选 {expected!r}。" if expected else "。")
+            )
+        resolved = DISPERSION_PROTOCOL_LEGACY_UNIFORM_LRC
+        was_defaulted = True
+    else:
+        resolved = str(dispersion_protocol).strip().lower()
+        was_defaulted = False
+
+    if resolved not in DISPERSION_PROTOCOLS:
+        raise ValueError(
+            f"dispersion_protocol={dispersion_protocol!r} 非法；"
+            f"允许 {list(DISPERSION_PROTOCOLS)}。"
+        )
+
+    if resolved in (
+        DISPERSION_PROTOCOL_LJ_PME,
+        DISPERSION_PROTOCOL_MEMBRANE_INHOMOGENEOUS,
+    ):
+        route = "B（LJ-PME）" if resolved == DISPERSION_PROTOCOL_LJ_PME else "C（膜非均匀色散修正）"
+        raise NotImplementedError(
+            f"dispersion_protocol={resolved} 属 §1.3 路线 {route}，尚未实现。"
+            "该路线的四项/三项验收条件清单里已写明，但代码不存在；"
+            "在完成之前不能只把基础 NonbondedForce 切过去就宣称支持。"
+        )
+
+    # §6.4 / §1.3：membrane + legacy uniform-density LRC 必须 fail closed。
+    if is_membrane and resolved == DISPERSION_PROTOCOL_LEGACY_UNIFORM_LRC:
+        raise ValueError(
+            "system_type=membrane 不得使用 legacy_uniform_density_lrc。"
+            "现有 `lj_tail_lrc_coeff[k]/V(t)` 假设配体周围是**均匀体相密度**；"
+            "配体埋在脂双层口袋里时这个假设直接不成立——局域密度既不是水也不是体相脂质。"
+            "这是膜体系下的真实缺陷，不是保守选项（§1.3 修正框第 1 条、§6.4）。"
+        )
+
+    if is_membrane and resolved not in MEMBRANE_VALIDATED_DISPERSION_PROTOCOLS:
+        raise ValueError(
+            f"system_type=membrane + dispersion_protocol={resolved} 尚未验证。"
+            f"已验证的只有 {list(MEMBRANE_VALIDATED_DISPERSION_PROTOCOLS)}（§1.3）。"
+        )
+
+    # charmm 的 force-switch 无法在 OpenMM 复现，默认卡住（§1.1 / §1.3 路线 A 末条）。
+    if resolved == DISPERSION_PROTOCOL_FF_NATIVE_FORCE_SWITCH_NO_LRC:
+        missing = [
+            field
+            for field in FORCE_SWITCH_DEVIATION_EVIDENCE_FIELDS
+            if not (force_switch_deviation_evidence or {}).get(field)
+        ]
+        if missing:
+            raise ValueError(
+                "dispersion_protocol=ff_native_force_switch_no_lrc 默认 fail closed："
+                "OpenMM 的 NonbondedForce 只有 potential-switch"
+                "（setUseSwitchingFunction），**没有 force-switch**，"
+                "无法复现 CHARMM36 脂质的原始 Hamiltonian；用 potential-switch 顶替会"
+                "移动 APL 与膜厚，且不会报错。"
+                f"放行需要定量偏差论证，当前缺少 {missing}（§1.1 / §1.3）。"
+                "首选路径是改用 Amber 系脂质力场（与现有 amber14sb 同族）。"
+            )
+
+    # 与力场族交叉核对：族与路线不匹配就是用错了参数化条件。
+    if forcefield_family:
+        family = str(forcefield_family).strip().lower()
+        if family not in FORCEFIELD_FAMILIES:
+            raise ValueError(
+                f"forcefield_family={forcefield_family!r} 非法；允许 {list(FORCEFIELD_FAMILIES)}。"
+            )
+        expected = FORCEFIELD_FAMILY_DISPERSION_PROTOCOL[family]
+        if resolved not in (expected, DISPERSION_PROTOCOL_LEGACY_UNIFORM_LRC):
+            raise ValueError(
+                f"力场族 {family!r} 的原始参数化条件对应 dispersion_protocol={expected!r}，"
+                f"但声明的是 {resolved!r}。§1.3 的判据是**跟随所选力场的原始参数化条件**："
+                "Amber Lipid21 是在开着各向同性 LRC 下拟合的，关掉 LRC 才是错的；"
+                "CHARMM36 是 force-switch 且不加 LRC，开 LRC 才是错的。"
+            )
+
+    return {
+        "dispersion_protocol": resolved,
+        "was_defaulted": bool(was_defaulted),
+        "environment_type": resolved_environment,
+        "forcefield_family": (
+            str(forcefield_family).strip().lower() if forcefield_family else None
+        ),
+        "implemented": resolved in DISPERSION_PROTOCOLS_IMPLEMENTED,
+        "uniform_density_lrc_active": (
+            resolved == DISPERSION_PROTOCOL_LEGACY_UNIFORM_LRC
+        ),
+        # §5 最后一条 / §6.5：APBS 与 LJ 色散正交，不得互相顶替。
+        "apbs_is_orthogonal_to_dispersion": True,
+    }
+
+
 def _validate_minimum_image(box_vectors, cutoff_nm: float) -> None:
     """Validate the triclinic minimum-image condition using plane spacings."""
     vectors = box_vectors

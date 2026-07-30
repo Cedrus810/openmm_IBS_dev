@@ -76,9 +76,9 @@ charge-transfer。** 下面每条都带 `file:line`，Phase A 必须逐条裁决
 
   落地动作：
 
-  - [ ] **MEM-00a-1**：新增正式协议标识 `charge_treatment = co_alchemical_charge_transfer`，
-    并引入独立的 `CHARGE_TRANSFER_PROTOCOL_VERSION = 1`（与
-    `SOLVENT_CACHE_PROTOCOL_VERSION`、`IBS_BIAS_PROTOCOL_VERSION` 并列，不复用）。
+  - [x] **MEM-00a-1** ✅ 2026-07-30（B2）：`charge_treatment` 枚举与
+    `CHARGE_TRANSFER_PROTOCOL_VERSION = 1` 已落在 `abfe_core.py`，与
+    `SOLVENT_CACHE_PROTOCOL_VERSION`、`IBS_BIAS_PROTOCOL_VERSION` 并列、未复用。
   - [ ] **MEM-00a-2**：现有 `configure_coalchemical_neutral_decharging` 改名为
     `configure_co_annihilation_experimental`，对应 `charge_treatment` 值为
     `co_annihilation_experimental`。
@@ -202,7 +202,14 @@ SERT 特有的坑，**必须在 Phase A 就处理，否则会静默选错 co-ion
   - [ ] 表观结合（可能混入膜分配）；
   - [ ] 膜相二维/面密度标准态结合。
 - [ ] 第一套实现优先选 `q = 0` 或 `|q| = 1` 的配体；不要用多价配体作为首个验证体系。
-- [ ] **✅ 已定（2026-07-29）：脂质力场按输入自动识别力场族**（`forcefield_family`）。
+- [x] **✅ 已定（2026-07-29）；实现完成 2026-07-30：脂质力场按输入自动识别力场族**（`forcefield_family`）。
+  `abfe_core.detect_forcefield_family_from_top()` / `resolve_forcefield_family()`。
+  **实测补记**：本仓库 `topol.top` **没有 `[ defaults ]` 段**（它在
+  `amber14sb_OL15_fs1.ff/forcefield.itp` 里），所以主判据只能是 `#include` 路径，
+  `[ defaults ]` 若存在则一并记录作交叉检查、不作唯一判据。
+  实测该文件判定为 amber（依据 3 条 `amber14sb_OL15_fs1.ff/*` include，
+  `./Atenolol-rank1.itp` / `posre.itp` 等本地 include 正确忽略）。
+  混合 include、自定义 ff 目录、opls/gromos 全部 fail closed。
   从 `.top` 的 `#include` 与 `[ defaults ]` 判定：
   - 识别到 amber 系（如现有 `amber14sb_OL15_fs1.ff`，`topol.top:21`）→ 走 Amber 脂质
     （Lipid21 / Lipid17）+ `dispersion_protocol = ff_native_isotropic_lrc`；
@@ -246,7 +253,7 @@ SERT 特有的坑，**必须在 Phase A 就处理，否则会静默选错 co-ion
 
 允许值：
 
-- [ ] `neutral`
+- [x] `neutral` ✅ 2026-07-30（B2）
   - 配体净电荷为 0；
   - 不创建 co-ion；
   - APBS/Rocklin 净电荷修正必须为 0。
@@ -274,7 +281,12 @@ SERT 特有的坑，**必须在 Phase A 就处理，否则会静默选错 co-ion
 - [ ] `neutral` 但检测到配体净电荷不为 0。
 - [ ] `co_alchemical_charge_transfer` 但缺 co-ion 身份、参数或 restraint。
 - [ ] `rocklin_apbs_neutralizing_plasma` 但缺 APBS 来源说明/结果文件。
-- [ ] 配体电荷变化与 co-ion 电荷变化之和不为 0。
+- [x] 配体电荷变化与 co-ion 电荷变化之和不为 0。✅ 2026-07-30（B2）
+
+以上 5 条 fail-closed 组合与 4 个允许值全部落在
+`abfe_core.resolve_charge_treatment()`，测试见 `tests/test_charge_treatment_protocol.py`。
+**检查顺序有意义且有测试钉住**：APBS 双计数在"缺 co-ion"之前拦，"缺 co-ion"在
+"B3 未实现"之前拦——协议错误不该被"反正还没实现"掩盖。
 
 ### 1.3 LJ/色散路线
 
@@ -303,9 +315,10 @@ SERT 特有的坑，**必须在 Phase A 就处理，否则会静默选错 co-ion
 
 膜体系禁止继续默认使用当前均匀密度 `lrc_coeff[k] / V(t)`：
 
-- [ ] 新增 `dispersion_protocol` 显式配置。
-- [ ] `system_type = membrane` 且未选择已验证的 `dispersion_protocol` 时 fail closed。
-- [ ] 禁止把 APBS 当成 LJ 修正。
+- [x] 新增 `dispersion_protocol` 显式配置。✅ 2026-07-30（B6）
+- [x] `system_type = membrane` 且未选择已验证的 `dispersion_protocol` 时 fail closed。✅
+- [x] 禁止把 APBS 当成 LJ 修正。✅ 解析结果带 `apbs_is_orthogonal_to_dispersion: true`
+  并落 provenance。
 
 候选路线只能选择一条：
 
@@ -757,10 +770,11 @@ manifest
 
 ### 7.1 配置与 fail-closed
 
-- [ ] 中性配体 + `neutral`：通过。
-- [ ] 带电配体 + `neutral`：失败。
-- [ ] 带电配体 + co-ion：通过。
-- [ ] co-ion + 非零 APBS：失败。
+- [x] 中性配体 + `neutral`：通过。✅ 2026-07-30（B2）
+- [x] 带电配体 + `neutral`：失败。✅
+- [x] 带电配体 + co-ion：**规格校验通过，但 B3 未落地故 fail closed**（`NotImplementedError`）。✅
+  测试分两步断言，把"规格合法"与"哈密顿量还没有"分开，B3 落地后能看出当初是哪一环在挡。
+- [x] co-ion + 非零 APBS：失败。✅
 - [ ] membrane + 未指定 dispersion protocol：失败。
 - [ ] membrane + 普通各向同性 barostat：失败或明确替换，不能静默继续。
 
@@ -969,11 +983,38 @@ independent_repeat_id
     一律叫 `environment_type`，只在配置键/provenance 里叫 `system_type`；
     把腿身份传进膜协议解析会报错。
   - 证据：`tests/test_membrane_barostat_protocol.py`。
-- [ ] B2. 加 charge-treatment 配置与双计数 fail-closed。
+- [x] B2. 加 charge-treatment 配置与双计数 fail-closed。✅ 2026-07-30
+  - `abfe_core.resolve_charge_treatment()` 是唯一校验实现，四值枚举 +
+    §1.2 全部 5 条 fail-closed + MEM-00a-2 的膜禁用 + `_validate_co_alchemical_ion_spec()`
+    （§3.4 字段齐全、每粒子 ≤1 单位电荷、同号而非异号、总电荷配平）。
+  - `CHARGE_TRANSFER_PROTOCOL_VERSION = 1`（MEM-00a-1，独立版本号，不复用其它协议版本）。
+  - `runabfe.py`：`--charge-treatment` / `--co-alchemical-ion` / `--apbs-evidence`
+    + 配置键 + 在建任何 Context 前校验（§6.1）+ **自动算配体净电荷并交叉核对**
+    （复用 `ibs_engine._compute_ligand_net_charge`，不另造判据）+ provenance 落
+    `charge_protocol` / `charge_treatment` / `ligand_net_charge` / `coion_identity` /
+    `apbs_applicable` / `apbs_applied`。
+  - 🚧 `CHARGE_TRANSFER_HAMILTONIAN_IMPLEMENTED = False`：B3 未落地前，
+    即使给出格式完全合法的 co-ion 规格也 fail closed（`NotImplementedError`），
+    避免产出"声明 charge-transfer、实际跑 co-annihilation"的结果。
+  - ⚠️ **带电配体行为已变更**：改动前会静默走
+    `configure_coalchemical_neutral_decharging`（co-annihilation）跑完；
+    现在必须显式声明 `co_annihilation_experimental`。这是 §1.2 与 MEM-00a-2/00a-4
+    要求的门。中性配体（当前生产体系）路径不变，基线不受影响。
+  - 证据：`tests/test_charge_treatment_protocol.py`。
 - [ ] B3. 实现 PME co-alchemical ion charging Hamiltonian。
 - [ ] B4. 重写溶剂腿 builder，显式返回 co-ion identity。
 - [ ] B5. complex/solvent cache 加 co-ion 指纹。
-- [ ] B6. membrane 模式禁用 legacy uniform-density LRC。
+- [x] B6. membrane 模式禁用 legacy uniform-density LRC。✅ 2026-07-30
+  `abfe_core.resolve_dispersion_protocol()` 是唯一校验实现，5 值枚举。
+  soluble 不声明 → `legacy_uniform_density_lrc`（行为逐位不变）；
+  membrane 不声明 → fail closed；membrane + legacy → fail closed。
+  路线 B（`lj_pme`）与路线 C（`membrane_inhomogeneous`）作为**已识别但未实现**收进
+  枚举并抛 `NotImplementedError`，好过被当成拼错的未知值。
+  charmm 的 `ff_native_force_switch_no_lrc` 默认 fail closed（OpenMM 无 force-switch），
+  需 `--force-switch-deviation-evidence` 给出 APL/膜厚/单点能定量论证才放行；
+  即便放行，membrane 已验证集合仍只含 amber 路线。
+  另有力场族 × 色散路线的交叉核对（amber 配 force-switch、charmm 配 isotropic LRC 都报错）。
+  证据：`tests/test_dispersion_and_forcefield_protocol.py`。
 
 ### Phase C：物理与数值验证
 
@@ -1015,10 +1056,17 @@ independent_repeat_id
 
 ---
 
-## 13. 阈值默认值（**提案，Phase A 定稿；原稿全篇写"预设阈值"但没给数**）
+## 13. 阈值默认值（✅ 2026-07-30 已全部落成常量并进 provenance）
 
 没有数就没法写 fail-closed 检查，也没法判验收。以下是起始提案，可以改，
 但**必须在 Phase A 结束前落成常量并进 provenance**，不许运行时凭感觉判。
+
+**已完成**：全部数值落在 `abfe_core.py`（`ACCEPTANCE_THRESHOLDS_VERSION = 1`），
+`acceptance_thresholds_payload()` 的快照无条件写入 `run_provenance.json`
+的 `acceptance_thresholds`，所以每份结果都能回答"当时用的哪套阈值"。
+测试：`tests/test_dispersion_and_forcefield_protocol.py`。
+⚠️ `COION_LIGAND_MIN_IMAGE_RUNTIME_NM = 1.2` 与 `ibs_engine.SOFTCORE_CUTOFF_NM`
+是两处各一份（`abfe_core` 在下层不能反向 import），已有交叉检查测试防止各改一半。
 
 ### 13.1 co-ion 几何
 
