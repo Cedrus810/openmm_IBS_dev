@@ -16,6 +16,7 @@ import 该模块才能取到 target，删掉那行不改变任何事。真正的
 """
 
 import ast
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -118,3 +119,67 @@ def test_lazy_device_accessors_exist_and_are_memoized():
         assert first is not None
         abfe_core.supports_tf32()
         assert abfe_core._DEVICE_SETTINGS_CACHE is first, "结果必须缓存，不能反复探测"
+
+
+# ---------------------------------------------------------------------------
+# [P0-REMD-CUDA] pymbar 4 的后端是 JAX，JAX 默认预分配整卡 75% 显存
+# ---------------------------------------------------------------------------
+
+
+def test_jax_preallocation_is_disabled_before_pymbar_is_imported():
+    """`XLA_PYTHON_CLIENT_PREALLOCATE=false` 必须在 import pymbar **之前**设好。
+
+    实测（2026-08-04，`memtest/output_membrane_100ns`）：attachment 腿末尾用 pymbar
+    解 BAR/MBAR，日志里 `JAX 64-bit mode is now on!` 之后紧跟着
+        📊 [显存] Stage 0 attachment 结束: used=12197 free=3646 total=16303 MiB
+    **12197 / 16303 = 74.8%**，正是 JAX 的默认 `XLA_PYTHON_CLIENT_MEM_FRACTION=0.75`。
+    于是 Stage 1 只剩 3646 MiB，而 12 个 replica Context 需要 12 × 317 = 3804 MiB，
+    建满 11 个后第 12 个抛 `No compatible CUDA device is available`，
+    整个 decharging 阶段静默退 CPU（慢约两个数量级）。
+
+    环境变量必须在 JAX 被 import 之前生效——JAX 只在初始化时读一次。
+    """
+    source = (REPO_ROOT / "abfe_core.py").read_text(encoding="utf-8")
+
+    setter = source.find('os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE"')
+    assert setter >= 0, (
+        "abfe_core.py 里不再设置 XLA_PYTHON_CLIENT_PREALLOCATE=false。"
+        "去掉它 = JAX 会在解 MBAR 时预分配整卡 75% 显存，REMD 随后建不出 Context "
+        "并静默退 CPU（P0-REMD-CUDA）。"
+    )
+    pymbar_import = source.find("import pymbar")
+    assert pymbar_import >= 0
+    assert setter < pymbar_import, (
+        "XLA_PYTHON_CLIENT_PREALLOCATE 的设置跑到 import pymbar 之后了——"
+        "JAX 只在初始化时读一次环境变量，设晚了等于没设。"
+    )
+
+    # 用 setdefault 而不是直接赋值：外部显式指定的值必须优先。
+    assert 'os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] =' not in source, (
+        "必须用 setdefault，让外部（例如显式导出 JAX_PLATFORMS=cpu 的人）能覆盖"
+    )
+
+
+def test_importing_abfe_core_sets_the_jax_preallocation_flag():
+    """在干净子进程里 import abfe_core，标志必须已就位。"""
+    script = (
+        "import sys; sys.path.insert(0, %r)\n"
+        "import os\n"
+        "assert 'XLA_PYTHON_CLIENT_PREALLOCATE' not in os.environ, '外部已设，测不了默认行为'\n"
+        "import abfe_core\n"
+        "print(os.environ.get('XLA_PYTHON_CLIENT_PREALLOCATE'))\n"
+    ) % str(REPO_ROOT)
+
+    env = dict(os.environ)
+    env.pop("XLA_PYTHON_CLIENT_PREALLOCATE", None)
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        cwd=str(REPO_ROOT),
+        env=env,
+    )
+    if proc.returncode != 0:
+        pytest.skip(f"子进程 import 失败（缺依赖）: {proc.stderr.strip()[-400:]}")
+    assert proc.stdout.strip().splitlines()[-1] == "false"

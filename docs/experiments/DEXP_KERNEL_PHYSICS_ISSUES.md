@@ -1340,6 +1340,10 @@ Atenolol 单体系试点（§10.3-§10.5）用的方法论——扰动云生成�
 
 - `abfe_core.py::DEXPSurrogatePotential` — pair-specific 解析核（当前默认 `alpha_vdw=14,beta_vdw=5`）
 - `abfe_core.py::SurrogateSystemBuilder.build_surrogate_system` — 把 sigma/epsilon 喂给 DEXP CustomNonbondedForce
+- `abfe_core.py::DEXP_VDW_CUTOFF_NM` / `DEXP_VDW_SWITCH_WIDTH_NM` — DEXP vdW 软化力壳（当前 0.70/0.20 nm）
+- `abfe_core.py::GAUSS_COUL_SIGMA_NM` / `GAUSS_COUL_CUTOFF_NM` — 与 DEXP 配置解耦的 Gaussian-Coulomb 参数（当前 0.10/0.70 nm）
+- `abfe_core.py::_validate_minimum_image` — 使用三斜晶胞 plane spacing 的生产 minimum-image 校验
+- `dexp_退役.py` — 已退役的 Orb 全局拟合类与入口；仅供研究 harness 追溯，生产代码不得 import
 - `dexp_experiment.py::run_perturbation_scan`（`--perturb-scan`）— anchor-relative 局部扰动云生成
 - `dexp_experiment.py::run_perturbation_fit`（`--perturb-fit`）— 分档等权 + LOAO + 2D score surface + PCA 对角谷检测 + 奇偶分解
 - `dexp_experiment.py::_build_perturbation_distance_tensors` — 从 `run_perturbation_fit` 重构出的共享几何张量构建（距离/r0_ij/eps_ij/cutoff mask），供 `run_perturbation_fit`/`_contact_type_build_context` 共用

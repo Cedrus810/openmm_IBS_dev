@@ -50,6 +50,23 @@ from abfe_core import (
     # （手写第 5 份二面角副本正是 BOR-01 反号事故的成因）。
     assert_starting_state_is_sane,
     calc_boresch_from_last_frame,
+    # MEM-00c：co-ion 身份冻结。选择只允许发生一次，之后所有入口只核对不重选。
+    build_co_alchemical_ion_identity,
+    verify_co_alchemical_ion_identity,
+    CHARGE_TREATMENT_CO_ANNIHILATION_EXPERIMENTAL,
+    # MEM-00d + B3：co-ion restraint 形式与 charging λ 电荷映射的**唯一**实现。
+    # 这一层只负责把它们写进 OpenMM 对象，不重新定义任何形式或映射。
+    CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER,
+    CO_ALCHEMICAL_ION_RESTRAINT_EXPRESSION,
+    CO_ALCHEMICAL_ION_RESTRAINT_FORCE_GROUP,
+    CO_ALCHEMICAL_ION_RESTRAINT_FORM_FLAT_BOTTOM,
+    COION_FLAT_BOTTOM_K_KJ_PER_MOL_NM2,
+    COION_FLAT_BOTTOM_RADIUS_NM,
+    LIGAND_CHARGE_LAMBDA_TOLERANCE_E,
+    TOTAL_CHARGE_CONSERVATION_TOLERANCE_E,
+    charge_at_lambda,
+    co_alchemical_charge_offset_plan,
+    minimum_image_displacement_nm,
 )
 
 try:
@@ -488,31 +505,59 @@ def _minimum_image_displacement_nm(
     displacement,
     box_vectors,
 ) -> np.ndarray:
-    """Triclinic minimum-image displacement for row-vector box matrices."""
-    delta = np.asarray(displacement, dtype=np.float64)
+    """Triclinic minimum-image displacement for row-vector box matrices.
+
+    薄包装：本层只负责把 OpenMM Quantity / list-of-Vec3 归一成 (3,3) 数组，
+    minimum-image 的数学只有一份，在 `abfe_core.minimum_image_displacement_nm`
+    （co-ion 的 §13.1 几何判据在那一层就要用，而 abfe_core 不能反向 import 本模块）。
+    """
     box = _box_vectors_to_nm_array(box_vectors)
-    if box is None or box.shape != (3, 3) or not np.all(np.isfinite(box)):
+    if box is None:
         raise ValueError("minimum-image 计算需要有限的 (3,3) 周期盒向量")
-    det = float(np.linalg.det(box))
-    if not np.isfinite(det) or abs(det) <= 1.0e-12:
-        raise ValueError("周期盒向量奇异，无法计算 minimum-image 位移")
-    fractional = delta @ np.linalg.inv(box)
-    fractional -= np.round(fractional)
-    return fractional @ box
+    return minimum_image_displacement_nm(displacement, box)
 
 
-def _create_bulk_water_ion_restraint(
+def _create_co_alchemical_ion_restraint(
     ion_index: int,
-    reference_position_nm: np.ndarray,
-    force_constant_kj_per_mol_nm2: float = 25.0,
-) -> openmm.CustomExternalForce:
-    """将共炼金反离子锚定在初始 bulk 水位点，使用 periodicdistance 保持 PBC 一致性。"""
-    expr = "0.5*k_ion*periodicdistance(x,y,z,x0,y0,z0)^2"
-    force = openmm.CustomExternalForce(expr)
+    anchor_atom_index: int,
+    reference_displacement_nm: Sequence[float],
+    force_constant_kj_per_mol_nm2: float = COION_FLAT_BOTTOM_K_KJ_PER_MOL_NM2,
+    flat_bottom_radius_nm: float = COION_FLAT_BOTTOM_RADIUS_NM,
+) -> openmm.CustomCompoundBondForce:
+    """[MEM-00d] flat-bottom + 锚点相对的 co-ion 位置限制。
+
+    井心 = 锚点原子的**当前**位置 + 冻结位移 d0，所以它随体系一起被 barostat 缩放；
+    平坦区内无力，出了平坦区才有 `0.5·k·(r−r₀)²` 的软墙。
+
+    为什么是 `CustomCompoundBondForce` + `pointdistance`（而不是
+    `CustomExternalForce` + `periodicdistance`）：
+      * `periodicdistance` **只在 CustomExternalForce 里存在**（实测
+        CustomCompoundBondForce / CustomCentroidBondForce 都报 unknown function），
+        而 CustomExternalForce 只能吃绝对参考点 —— 那正是 MEM-00d 要退役的形式；
+      * CustomCompoundBondForce 打开 PBC 后会把 bond 内的粒子平移到与第一个粒子
+        相同的周期镜像，所以其中的 `pointdistance` **就是** minimum-image 距离
+        （实测：离子 z=0.2、锚点 z=9.4、盒 z=12 → 0.2 nm，不是 9.2 nm）。
+
+    表达式与力常数/半径都来自 `abfe_core` 的常量，与落进身份指纹的那份 restraint
+    描述同源；两者若分叉，`verify_co_alchemical_ion_identity` 会当场拦下。
+    """
+    force = openmm.CustomCompoundBondForce(2, CO_ALCHEMICAL_ION_RESTRAINT_EXPRESSION)
     force.addGlobalParameter("k_ion", float(force_constant_kj_per_mol_nm2))
-    for name in ("x0", "y0", "z0"):
-        force.addPerParticleParameter(name)
-    force.addParticle(int(ion_index), [float(reference_position_nm[0]), float(reference_position_nm[1]), float(reference_position_nm[2])])
+    force.addGlobalParameter("r0_ion", float(flat_bottom_radius_nm))
+    for name in ("dx0", "dy0", "dz0"):
+        force.addPerBondParameter(name)
+    displacement = [float(v) for v in list(reference_displacement_nm)[:3]]
+    if len(displacement) != 3:
+        raise ValueError(
+            f"reference_displacement_nm 需要 3 个分量，收到 {reference_displacement_nm!r}"
+        )
+    if int(ion_index) == int(anchor_atom_index):
+        raise ValueError(
+            f"co-ion 与 restraint 锚点是同一个粒子（index={ion_index}）——"
+            "那样这个 restraint 恒等于常数，什么也限制不住。"
+        )
+    force.addBond([int(ion_index), int(anchor_atom_index)], displacement)
+    force.setUsesPeriodicBoundaryConditions(True)
     return force
 
 
@@ -808,6 +853,19 @@ def synthetic_mbar_u_kn(delta_f_kT: float = 1.25, n_per_state: int = 200, seed: 
     return np.vstack([u0, u1]), np.array([int(n_per_state), int(n_per_state)], dtype=int)
 
 
+# 离子残基名的**唯一**一份表（`_select_bulk_water_counterion` 与
+# `_identify_reserved_neutral_co_ions` 共用）。两处都还要按电荷交叉核对，
+# 所以名字表只是"候选集"，判身份不靠它单独说话。
+#
+# ⚠️ §0.5.4 的教训在这儿仍然成立：**靠残基名判身份，换一套体系就错**
+# （CHARMM-GUI 的 AMBER 转换器把离子写成 `Na+` / `Cl-`，所以带符号的形式也在表里）。
+# 真正的修法是走 `abfe_core.classify_system_composition()` 的组成驱动判定；
+# 这里先把两处收敛为一份，避免"补一个漏一片"，彻底收口单独立项。
+CO_ALCHEMICAL_ION_RESIDUE_NAMES = frozenset(
+    {"CL", "CLA", "CL-", "NA", "NA+", "SOD", "K", "K+", "POT", "MG", "CA"}
+)
+
+
 def _select_bulk_water_counterion(
     nb_force: openmm.NonbondedForce,
     ligand_indices: List[int],
@@ -815,7 +873,15 @@ def _select_bulk_water_counterion(
     positions,
     box_vectors,
 ) -> Tuple[List[int], List[np.ndarray], Dict[str, Any]]:
-    """Select enough monovalent counterions using PBC-aware bulk-water metrics."""
+    """Select enough monovalent counterions using PBC-aware bulk-water metrics.
+
+    ⚠️ **[MEM-00c] 只允许 `select_co_alchemical_ion_once()` 调用本函数。**
+    它按传入坐标当场排序挑离子（主键是"到最近溶质的 minimum-image 距离"这个连续量），
+    所以**坐标变了结果就可能变**——实测 0.05 nm 位移即可翻转（见
+    `tests/test_coalchemical_ion_identity.py`）。任何"动力学 / REMD 副本 / u_kn
+    各自调一次"的用法都会造成 u_kn 与动力学 Hamiltonian 用了不同粒子的静默错误。
+    下游一律走 `abfe_core.verify_co_alchemical_ion_identity()` 只读核对。
+    """
     pos_nm = _positions_to_nm_array(positions)
     ligand_set = set(int(i) for i in ligand_indices)
     raw_lig_net_charge = 0.0
@@ -833,7 +899,7 @@ def _select_bulk_water_counterion(
     target_ion_charge = -1.0 if lig_net_charge > 0 else 1.0
     required_count = abs(lig_net_charge)
     water_names = {"HOH", "WAT", "SOL", "TIP3", "TIP3P"}
-    ion_names = {"CL", "CLA", "NA", "SOD", "K", "POT", "MG", "CA"}
+    ion_names = set(CO_ALCHEMICAL_ION_RESIDUE_NAMES)
     heavy_solute_indices = [
         a.index for a in topology.atoms()
         if a.index not in ligand_set
@@ -917,6 +983,135 @@ def _select_bulk_water_counterion(
     }
 
 
+def _identify_reserved_neutral_co_ions(
+    nb_force: openmm.NonbondedForce,
+    topology,
+    required_count: int,
+) -> Tuple[List[int], Dict[str, Any]]:
+    """[B3] 找出建系时预留的 **中性 ion-shaped dummy** 粒子（charge-transfer 路线）。
+
+    判据只有两条，**都与坐标无关**：残基名在离子名集合里，且电荷严格为 0。
+    这不是"挑一个"，而是"认出来"——真实体系里的离子都带电，所以一个**电荷为 0 的
+    离子残基**只可能是建系时专门留出来的 co-ion。于是 MEM-00c 那个"坐标一动选择就翻转"
+    的失效模式在 charge-transfer 路线上**结构上不存在**（没有排序、没有连续量主键）。
+
+    数量必须恰好等于 |q_L|（§2.2：每个 co-ion 最多接过一个单位电荷），
+    不足或多余都 fail closed —— 多余尤其危险：那说明建系时留了不止一个 dummy，
+    随便挑一个就又回到"按坐标选"的老路上了。
+    """
+    ion_names = set(CO_ALCHEMICAL_ION_RESIDUE_NAMES)
+    candidates: List[Dict[str, Any]] = []
+    for atom in topology.atoms():
+        if atom.residue.name.upper() not in ion_names:
+            continue
+        q, sigma, epsilon = nb_force.getParticleParameters(atom.index)
+        q_val = q.value_in_unit(unit.elementary_charge)
+        if abs(q_val) > TOTAL_CHARGE_CONSERVATION_TOLERANCE_E:
+            continue
+        candidates.append(
+            {
+                "ion_index": int(atom.index),
+                "residue_name": str(atom.residue.name),
+                "element": str(getattr(atom.element, "symbol", "") or ""),
+                "charge_e": float(q_val),
+                "sigma_nm": float(sigma.value_in_unit(unit.nanometer)),
+                "epsilon_kj_mol": float(epsilon.value_in_unit(unit.kilojoule_per_mole)),
+            }
+        )
+    if len(candidates) != int(required_count):
+        raise RuntimeError(
+            f"charge-transfer 需要建系时预留 {int(required_count)} 个**电荷为 0 的**"
+            f"ion-shaped dummy 粒子（§2.2 / §4.3），实测找到 {len(candidates)} 个"
+            f"：{[c['ion_index'] for c in candidates]}\n"
+            "    · 少了：输入体系里没有 reserved co-ion。复合物腿的输入拓扑必须自带；"
+            "溶剂腿由 B4 的 builder 生成。**不要**拿一个已经带电的物理离子顶上——"
+            "那会让 λ=1 端的总电荷不再等于物理体系的总电荷。\n"
+            "    · 多了：预留了不止一个，那就得靠坐标去挑，MEM-00c 的漂移风险原地复活。\n"
+            f"    离子残基名判据：{sorted(ion_names)}；"
+            f"电荷零判据容差 {TOTAL_CHARGE_CONSERVATION_TOLERANCE_E:g} e。"
+        )
+    indices = sorted(int(c["ion_index"]) for c in candidates)
+    return indices, {
+        "selection": "reserved_neutral_ion_shaped_dummy_identified_by_zero_charge",
+        "coordinate_independent": True,
+        "required_count": int(required_count),
+        "candidates": candidates,
+    }
+
+
+def select_co_alchemical_ion_once(
+    system: openmm.System,
+    ligand_indices: List[int],
+    topology,
+    positions,
+    box_vectors,
+    charge_treatment: str = CHARGE_TREATMENT_CO_ANNIHILATION_EXPERIMENTAL,
+    ion_restraint_k: Optional[float] = None,
+    flat_bottom_radius_nm: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """[MEM-00c] **唯一**允许发生 co-ion 选择的入口；返回可落盘的身份 spec。
+
+    调用它**一次**（首跑、拿到最终预平衡坐标之后），把返回的 spec 落盘；
+    此后动力学 System 构建、REMD 副本、`compute_u_kn`、resume 全部只读消费这份 spec，
+    不再有第二次选择。中性配体返回 `None`（那条路径根本不需要 co-ion）。
+
+    为什么这条边界必须由代码强制、而不是靠约定：co-annihilation 选择器的排序主键是
+    坐标的连续函数，而首跑与 resume 喂进来的坐标本来就不同（首跑在预平衡输出上又叠了
+    2000 步最小化，resume 直接读 DCD 末帧）。靠"记得只选一次"是守不住的。
+
+    两条路线的身份来源不同，这是**有意的**：
+
+    * `co_annihilation_experimental`：从既有盐里按 bulk-water 判据挑一个**异号**物理
+      反离子（`_select_bulk_water_counterion`，坐标相关 ⟹ 必须冻结）；
+    * `co_alchemical_charge_transfer`：认出建系时预留的**中性** ion-shaped dummy
+      （`_identify_reserved_neutral_co_ions`，坐标无关）。
+    """
+    nb_force = next(
+        (f for f in system.getForces() if isinstance(f, openmm.NonbondedForce)), None
+    )
+    if nb_force is None:
+        raise RuntimeError("选择 co-ion 需要 NonbondedForce，但 System 里没有。")
+
+    raw_lig_net_charge = 0.0
+    for idx in {int(i) for i in ligand_indices}:
+        q, _, _ = nb_force.getParticleParameters(idx)
+        raw_lig_net_charge += q.value_in_unit(unit.elementary_charge)
+    lig_net_charge = int(round(raw_lig_net_charge))
+    if abs(raw_lig_net_charge - lig_net_charge) > 1.0e-3:
+        raise RuntimeError(
+            f"配体净电荷 {raw_lig_net_charge:+.6f} e 不接近整数（容差 1e-3 e）"
+        )
+    if lig_net_charge == 0:
+        return None
+
+    if charge_treatment == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
+        ion_indices, ion_meta = _identify_reserved_neutral_co_ions(
+            nb_force, topology, abs(lig_net_charge)
+        )
+    else:
+        ion_indices, _ion_ref_positions_nm, ion_meta = _select_bulk_water_counterion(
+            nb_force, ligand_indices, topology, positions, box_vectors
+        )
+    if not ion_indices:
+        raise RuntimeError(
+            "配体带净电荷但没能确定 co-ion 身份 —— 无法保持 PME 去电荷腿逐 λ 电荷守恒。"
+        )
+
+    return build_co_alchemical_ion_identity(
+        system=system,
+        topology=topology,
+        ion_atom_indices=ion_indices,
+        ligand_indices=list(ligand_indices),
+        positions_nm=_positions_to_nm_array(positions),
+        box_vectors=_box_vectors_to_nm_array(box_vectors),
+        ligand_net_charge_e=lig_net_charge,
+        charge_treatment=charge_treatment,
+        selection_provenance=ion_meta,
+        k_kj_per_mol_nm2=ion_restraint_k,
+        flat_bottom_radius_nm=flat_bottom_radius_nm,
+    )
+
+
 def _prepare_pme_coulomb_leg_system(
     system_template: openmm.System,
     ligand_indices: List[int],
@@ -925,6 +1120,7 @@ def _prepare_pme_coulomb_leg_system(
     topology=None,
     positions=None,
     box_vectors=None,
+    co_alchemical_ion_spec: Optional[Dict[str, Any]] = None,
 ) -> openmm.System:
     prepared = openmm.XmlSerializer.deserialize(openmm.XmlSerializer.serialize(system_template))
     prepared.thisown = 1
@@ -936,6 +1132,8 @@ def _prepare_pme_coulomb_leg_system(
         topology=topology,
         positions=positions,
         box_vectors=box_vectors,
+        # [MEM-00c] 每个 replica / 每次 u_kn 重算都拿同一份冻结身份。
+        co_alchemical_ion_spec=co_alchemical_ion_spec,
     )
     return prepared
 
@@ -1034,10 +1232,14 @@ BORESCH_ATTACHMENT_LAMBDA_NAME = "lambda_boresch_scale"
 # attachment 腿的监控落盘间隔（步）。2 fs × 500 = 1 ps 一行，一条腿约 2400 行，
 # 写盘开销可忽略。这条腿此前**一帧都不写**，2026-08-03 的 NaN 因此没有任何现场证据。
 ATTACHMENT_MONITOR_INTERVAL = 500
-# 头 1000 步（2 ps）用 25 步（50 fs）的细粒度：2026-08-03 的 NaN 就发生在第一个
-# 500 步分块内，粗粒度只留下 step 0 一行 —— 夹不住死亡时刻等于没有证据。
-ATTACHMENT_MONITOR_FINE_INTERVAL = 25
-ATTACHMENT_MONITOR_FINE_STEPS = 1000
+# 头若干步用细粒度：2026-08-03 定位 MEM-15 时，NaN 发生在第一个 500 步分块内，
+# 粗粒度只留下 step 0 一行、夹不住死亡时刻。根因修掉之后细粒度就只剩成本了 ——
+# 每行要两次 `getState`（一次 `getForces` = GPU 同步 + 45354×3 个 float 下载，
+# 一次取 Boresch 力组能量），25 步一行相当于每 50 fs 打断一次 GPU。
+# 放宽到 250 步（0.5 ps）、只覆盖头 2500 步：既留住"起跑阶段出事能夹住"的能力，
+# 又不再按 50 fs 停。要重新细化时把这两个数调小即可，逻辑不用动。
+ATTACHMENT_MONITOR_FINE_INTERVAL = 250
+ATTACHMENT_MONITOR_FINE_STEPS = 2500
 BORESCH_ATTACHMENT_FORCE_GROUP = 3
 
 # 升序排列——MBAR 的 delta_G = f[K-1] − f[0]，升序时它直接就是 ΔG(A′→A)，
@@ -1860,6 +2062,34 @@ def run_boresch_attachment_leg(
         np.save(os.path.join(output_dir, "attachment_u_kn.npy.n_k.npy"), n_k)
         with open(os.path.join(output_dir, "attachment_meta.json"), "w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2, ensure_ascii=False, cls=NumpyEncoder)
+
+    # [P0-REMD-CUDA] 显式释放 attachment 腿的 CUDA Context。
+    #
+    # 本函数整段原来**没有任何 teardown**：`simulation` 是局部变量，只靠函数返回时的
+    # 引用计数回收。这在"下一步立刻要建 12 个 replica Context"的场景下太脆——
+    # 引用一旦被 payload / 闭包 / 异常 traceback 之一勾住，显存就一直挂着，而
+    # Stage 1 实测开跑前卡上已被占 12197/16303 MiB（只剩 3646，12 个 Context 需 3804）。
+    # 与预平衡那段同一口径：显式断链 + gc，并把释放前后的显存打出来，对不上账就看得见。
+    #
+    # ⚠️ 量级要诚实：这里只有**一个** Context ≈ 317 MiB，所以它**不足以**解释那
+    # 12.2 GB 里对不上账的约 10 GB。修它是因为它本来就该修，不是因为它是元凶。
+    _vram_before_release = _gpu_memory_mib()
+    try:
+        del simulation.context
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        del simulation, integrator
+    except Exception:  # noqa: BLE001
+        pass
+    gc.collect()
+    _vram_after_release = _gpu_memory_mib()
+    if _vram_before_release and _vram_after_release:
+        log(
+            f"  🧹 attachment 腿 Context 已释放 | 显存 used "
+            f"{_vram_before_release[0]} → {_vram_after_release[0]} MiB "
+            f"(free {_vram_before_release[1]} → {_vram_after_release[1]} MiB)"
+        )
     return payload
 
 
@@ -1873,6 +2103,7 @@ def _prepare_pme_mixed_alchemical_system(
     lambda_coul_name: str = "lambda_coul",
     lambda_vdw_name: str = "lambda_vdw",
     restraint_params: Optional[Dict] = None,
+    co_alchemical_ion_spec: Optional[Dict[str, Any]] = None,
 ) -> openmm.System:
     """构建同时支持 PME 去电荷与软核去 VDW 的联合炼金体系。"""
     mixed_sys = _prepare_pme_coulomb_leg_system(
@@ -1883,6 +2114,7 @@ def _prepare_pme_mixed_alchemical_system(
         topology=topology,
         positions=positions,
         box_vectors=box_vectors,
+        co_alchemical_ion_spec=co_alchemical_ion_spec,
     )
     mixed_sys.thisown = 1
 
@@ -2063,6 +2295,41 @@ def _split_platform_spec(platform_name: str) -> Tuple[str, Optional[str]]:
     return base, device
 
 
+# [P0-REMD-CUDA] 判 OOM 的下限：一个 45354 原子 PME Context 实测约 315–338 MiB
+# （`memtest/probe_remd_context_capacity.py`）。留一倍余量当"还装得下一个"的门槛。
+_REMD_CONTEXT_VRAM_FLOOR_MIB = 700.0
+
+
+def _gpu_memory_mib() -> Optional[Tuple[int, int, int]]:
+    """(used, free, total) MiB；拿不到就返回 None。
+
+    刻意用 `nvidia-smi` 子进程而不是 torch/pynvml：这条路径**不能**为了打个日志就
+    在本进程里初始化 CUDA（ATT-04 的教训——`abfe_core` 模块级那行 torch 调用曾让
+    每个 spawn 子进程在 import 期各抓一个 CUDA context）。诊断绝不能改变被诊断的状态。
+    """
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used,memory.free,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        ).stdout.strip().splitlines()
+        if not out:
+            return None
+        used, free, total = (int(v.strip()) for v in out[0].split(","))
+        return used, free, total
+    except Exception:
+        # 拿不到显存读数不是错误——诊断失败不该让生产跑挂。
+        return None
+
+
 def _build_platform_properties(platform_name: str) -> Tuple[str, Dict[str, str]]:
     base, device = _split_platform_spec(platform_name)
     upper = base.upper()
@@ -2086,6 +2353,333 @@ import openmm
 from openmm import app, unit
 import numpy as np
 
+def charging_charge_conservation_report(
+    nb_force: openmm.NonbondedForce,
+    lambda_name: str,
+    *,
+    ligand_indices: Optional[Sequence[int]] = None,
+    co_ion_indices: Optional[Sequence[int]] = None,
+    ligand_net_charge_e: Optional[float] = None,
+    lambdas: Sequence[float] = (0.0, 0.25, 0.5, 0.75, 1.0),
+) -> Dict[str, Any]:
+    """[§7.2] 逐 λ 电荷账目：总电荷是否恒定、配体/co-ion 是否走在该走的路上。
+
+    直接读**已经配置好的** `NonbondedForce`（粒子基电荷 + 该 λ 名下的 ParameterOffset），
+    所以它核对的是"实际会跑的那个哈密顿量"，不是我们打算写进去的那个。
+
+    总电荷守恒是一次代数证明而不是抽查：`Σq(λ) = Σq_base + λ·Σq_scale`，
+    所以只要 `Σq_scale = 0`，**所有** λ（含中间态）的总电荷都相同。逐 λ 的数值仍然
+    一并算出来落盘，因为它是最容易被人读懂的证据。
+    """
+    n = nb_force.getNumParticles()
+    base = np.zeros(n, dtype=np.float64)
+    for i in range(n):
+        q, _, _ = nb_force.getParticleParameters(i)
+        base[i] = q.value_in_unit(unit.elementary_charge)
+    scale = np.zeros(n, dtype=np.float64)
+    n_offsets = 0
+    for offset_idx in range(nb_force.getNumParticleParameterOffsets()):
+        param, particle_idx, charge_scale, _s, _e = nb_force.getParticleParameterOffset(
+            offset_idx
+        )
+        if str(param) != str(lambda_name):
+            continue
+        scale[int(particle_idx)] += _value_in_elementary_charge(charge_scale)
+        n_offsets += 1
+
+    base_sum = float(base.sum())
+    scale_sum = float(scale.sum())
+    totals = {
+        f"{float(lam):.6g}": float(charge_at_lambda(base_sum, scale_sum, float(lam)))
+        for lam in lambdas
+    }
+    report: Dict[str, Any] = {
+        "lambda_name": str(lambda_name),
+        "n_particle_offsets": int(n_offsets),
+        "base_sum_e": base_sum,
+        "scale_sum_e": scale_sum,
+        "total_charge_by_lambda_e": totals,
+        "total_charge_is_lambda_independent": bool(
+            abs(scale_sum) <= TOTAL_CHARGE_CONSERVATION_TOLERANCE_E
+        ),
+        "tolerance_e": float(TOTAL_CHARGE_CONSERVATION_TOLERANCE_E),
+    }
+    if ligand_indices is not None:
+        lig = np.asarray(sorted({int(i) for i in ligand_indices}), dtype=int)
+        report["ligand_charge_by_lambda_e"] = {
+            f"{float(lam):.6g}": float(
+                charge_at_lambda(base[lig].sum(), scale[lig].sum(), float(lam))
+            )
+            for lam in lambdas
+        }
+        if ligand_net_charge_e is not None:
+            report["ligand_charge_matches_lambda_times_qL"] = all(
+                abs(
+                    charge_at_lambda(base[lig].sum(), scale[lig].sum(), float(lam))
+                    - float(lam) * float(ligand_net_charge_e)
+                )
+                <= LIGAND_CHARGE_LAMBDA_TOLERANCE_E
+                for lam in lambdas
+            )
+    if co_ion_indices is not None and len(list(co_ion_indices)):
+        ions = np.asarray(sorted({int(i) for i in co_ion_indices}), dtype=int)
+        report["co_ion_charge_by_lambda_e"] = {
+            f"{float(lam):.6g}": float(
+                charge_at_lambda(base[ions].sum(), scale[ions].sum(), float(lam))
+            )
+            for lam in lambdas
+        }
+    if not report["total_charge_is_lambda_independent"]:
+        raise RuntimeError(
+            "charging 腿的总电荷随 λ 变化："
+            f"Σq_scale = {scale_sum:+.6e} e（容差 {TOTAL_CHARGE_CONSERVATION_TOLERANCE_E:g} e）。\n"
+            f"    逐 λ 总电荷：{totals}\n"
+            "    PME 会用一个逐 λ 变化的中和背景电荷把这件事掩盖掉，ΔG 静默出错（§7.2）。"
+        )
+    return report
+
+
+def _inject_co_alchemical_ion_restraints(
+    system: openmm.System,
+    co_alchemical_ion_spec: Dict[str, Any],
+    log_prefix: str = "  🪢",
+) -> List[Dict[str, Any]]:
+    """[MEM-00d] 按冻结 spec 注入每个 co-ion 的 flat-bottom 锚点相对位置限制。
+
+    两条路线共用这一处（§4.4 要求复合物腿与溶剂腿"同一函数形式和力常数"，
+    co-annihilation 与 charge-transfer 同理没有理由各写一份）。
+    所有参数都来自 spec，**不看当前坐标** —— 参考量属于身份的一部分。
+    """
+    injected: List[Dict[str, Any]] = []
+    for ion in co_alchemical_ion_spec["ions"]:
+        restraint_spec = ion["restraint"]
+        if restraint_spec.get("form") != CO_ALCHEMICAL_ION_RESTRAINT_FORM_FLAT_BOTTOM:
+            raise RuntimeError(
+                f"co-ion restraint 形式 {restraint_spec.get('form')!r} 不是当前实现的 "
+                f"{CO_ALCHEMICAL_ION_RESTRAINT_FORM_FLAT_BOTTOM!r}（MEM-00d）。"
+                "旧 spec 不可复用，请重新选择 co-ion 并落盘。"
+            )
+        force = _create_co_alchemical_ion_restraint(
+            ion_index=int(ion["atom_index"]),
+            anchor_atom_index=int(restraint_spec["anchor_atom_index"]),
+            reference_displacement_nm=restraint_spec["reference_displacement_nm"],
+            force_constant_kj_per_mol_nm2=float(restraint_spec["k_kj_per_mol_nm2"]),
+            flat_bottom_radius_nm=float(restraint_spec["flat_bottom_radius_nm"]),
+        )
+        # §6.4 末条：restraint 逐 λ 相同，且必须待在自己的 force group 里，
+        # 不许混进任何 λ 相关的能量分解或 u_kn 差值。
+        force.setForceGroup(int(restraint_spec.get(
+            "force_group", CO_ALCHEMICAL_ION_RESTRAINT_FORCE_GROUP
+        )))
+        system.addForce(force)
+        d0 = [float(v) for v in restraint_spec["reference_displacement_nm"]]
+        injected.append(
+            {
+                "ion_index": int(ion["atom_index"]),
+                "anchor_atom_index": int(restraint_spec["anchor_atom_index"]),
+                "reference_displacement_nm": d0,
+                "k_kj_per_mol_nm2": float(restraint_spec["k_kj_per_mol_nm2"]),
+                "flat_bottom_radius_nm": float(restraint_spec["flat_bottom_radius_nm"]),
+                "force_group": int(force.getForceGroup()),
+            }
+        )
+        print(
+            f"{log_prefix} co-ion flat-bottom 位置限制已注入: 粒子 {ion['atom_index']} "
+            f"↔ 锚点 {restraint_spec['anchor_atom_index']}, "
+            f"k={float(restraint_spec['k_kj_per_mol_nm2']):.1f} kJ/mol/nm², "
+            f"r₀={float(restraint_spec['flat_bottom_radius_nm']):.2f} nm, "
+            f"d0=({d0[0]:.3f}, {d0[1]:.3f}, {d0[2]:.3f}) nm"
+        )
+    return injected
+
+
+def configure_charge_transfer_decharging(
+    system: openmm.System,
+    ligand_indices: List[int],
+    topology,
+    lambda_name: str = "lam_coul",
+    co_alchemical_ion_spec: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict, List[int]]:
+    """[B3] charge-transfer 的 charging Hamiltonian：ligand q→0 与 co-ion 0→q。
+
+    §2.1 的 λ 定义（`lam_coul` 1 → 0，即 `lambda_q`）：
+
+        q_lig_i(λ) = λ · q_i                    base 0,       scale  q_i
+        q_coion(λ) = (1 − λ) · share            base share,   scale −share
+
+    于是 `Σq_lig(λ) + Σq_coion(λ) = q_L` 对**所有** λ 恒成立，全盒总电荷与 λ=1
+    的物理体系逐 λ 严格相同（§2.1 末句）。这一点由
+    `charging_charge_conservation_report` 在配置完成后**读回真实 Force** 证明，
+    而不是靠这段注释。
+
+    与 co-annihilation（`configure_coalchemical_neutral_decharging`）的区别只在
+    co-ion 那两行 base/scale，但物理含义相反：那条是"同时湮灭一对异号电荷"，
+    这条是"把电荷从结合位点搬到体相水"。两者不可混用，spec 里记着
+    `charge_treatment` 并在此处强制核对。
+
+    电荷映射本身来自 `abfe_core.co_alchemical_charge_offset_plan()`——这一层只负责
+    把它写进 OpenMM，不重新推导一遍（写歪了会自己对上自己）。
+    """
+    nb_force = next(
+        (f for f in system.getForces() if isinstance(f, openmm.NonbondedForce)), None
+    )
+    if nb_force is None:
+        raise RuntimeError("系统中未找到 NonbondedForce")
+
+    ligand_set = {int(i) for i in ligand_indices}
+    raw_lig_net_charge = 0.0
+    ligand_params: Dict[int, Any] = {}
+    for idx in sorted(ligand_set):
+        q, sig, eps = nb_force.getParticleParameters(idx)
+        ligand_params[idx] = (q, sig, eps)
+        raw_lig_net_charge += q.value_in_unit(unit.elementary_charge)
+    lig_net_charge = int(round(raw_lig_net_charge))
+    if abs(raw_lig_net_charge - lig_net_charge) > 1.0e-3:
+        raise RuntimeError(
+            f"配体净电荷 {raw_lig_net_charge:+.6f} e 不接近整数（容差 1e-3 e）"
+        )
+    if lig_net_charge == 0:
+        raise RuntimeError(
+            "charge-transfer 被调用，但配体净电荷为 0。中性配体应当走 "
+            "`charge_treatment=neutral` 的普通 ligand-only offset 路径 —— "
+            "给中性配体造 co-ion 只会凭空加一个不必要的炼金粒子。"
+        )
+    if co_alchemical_ion_spec is None:
+        raise RuntimeError(
+            f"检测到带电配体 (Net Charge: {lig_net_charge:+d}) 且路线为 charge-transfer，"
+            "但没有传入 `co_alchemical_ion_spec`。\n"
+            "    [MEM-00c] co-ion 身份必须由 `select_co_alchemical_ion_once()` 选一次并"
+            "落盘，动力学 / REMD 副本 / compute_u_kn / resume 全部只读消费。\n"
+            "    **不要**在这里恢复自动选择。"
+        )
+
+    pinned = verify_co_alchemical_ion_identity(
+        co_alchemical_ion_spec,
+        system=system,
+        topology=topology,
+        charge_treatment=CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER,
+        ligand_net_charge_e=lig_net_charge,
+        context="configure_charge_transfer_decharging",
+    )
+    ion_indices = [int(i) for i in pinned]
+    if ligand_set & set(ion_indices):
+        raise RuntimeError(
+            f"co-ion 与配体原子重叠：{sorted(ligand_set & set(ion_indices))}。"
+            "co-ion 必须是体相水里另一个粒子。"
+        )
+
+    plan = co_alchemical_charge_offset_plan(
+        charge_treatment=CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER,
+        ligand_net_charge_e=lig_net_charge,
+        ligand_charges_e={
+            idx: ligand_params[idx][0].value_in_unit(unit.elementary_charge)
+            for idx in sorted(ligand_set)
+        },
+        co_ion_physical_charges_e={
+            idx: nb_force.getParticleParameters(idx)[0].value_in_unit(
+                unit.elementary_charge
+            )
+            for idx in ion_indices
+        },
+    )
+
+    existing_params = [
+        nb_force.getGlobalParameterName(i)
+        for i in range(nb_force.getNumGlobalParameters())
+    ]
+    if lambda_name not in existing_params:
+        nb_force.addGlobalParameter(lambda_name, 1.0)
+
+    original_charges: Dict[int, Any] = {}
+    alchemical_set = set(ligand_set) | set(ion_indices)
+    for idx, (base_e, scale_e) in sorted(plan["offsets"].items()):
+        q, sig, eps = nb_force.getParticleParameters(idx)
+        original_charges[idx] = q
+        nb_force.setParticleParameters(idx, base_e * unit.elementary_charge, sig, eps)
+        nb_force.addParticleParameterOffset(
+            lambda_name,
+            idx,
+            scale_e * unit.elementary_charge,
+            0.0 * unit.nanometer,
+            0.0 * unit.kilojoule_per_mole,
+        )
+
+    # co-ion 的 exception：单原子离子在 GROMACS/OpenMM 拓扑里**不该有**任何
+    # 1-2/1-3/1-4 exception。真有的话说明它不是单原子离子，而"base 非 0 的粒子
+    # 走 exception offset"需要 (base·q_other, −base·q_other) 那一对系数，
+    # 与下面配体那段的 (0, chargeProd) 不是同一个式子 —— 所以这里 fail closed
+    # 而不是套用配体的写法。
+    for exc_idx in range(nb_force.getNumExceptions()):
+        p1, p2, _cp, _s, _e = nb_force.getExceptionParameters(exc_idx)
+        if int(p1) in ion_indices or int(p2) in ion_indices:
+            raise RuntimeError(
+                f"co-ion（粒子 {int(p1)} / {int(p2)} 之一）带有 NonbondedForce exception。"
+                "charge-transfer 的第一版只支持**单原子** co-ion（§2.2：只改 charge，"
+                "mass/sigma/epsilon 逐 λ 不变）；多原子 co-ion 的 exception offset 系数"
+                "与配体那套不同，必须单独实现并验证，不许套用。"
+            )
+
+    # 配体内部静电必须逐 λ 恒定（否则去电荷腿会把配体自身的 self-energy 也带着变），
+    # 与既有 PME 路径同一套写法：L-L 冻结成显式 exception，只对"单端炼金"的对加 offset。
+    frozen_ll_pairs = set()
+    for exc_idx in range(nb_force.getNumExceptions()):
+        p1, p2, charge_prod, sig, eps = nb_force.getExceptionParameters(exc_idx)
+        p1, p2 = int(p1), int(p2)
+        if p1 in ligand_set and p2 in ligand_set:
+            frozen_ll_pairs.add((min(p1, p2), max(p1, p2)))
+            continue
+        if (p1 in alchemical_set) ^ (p2 in alchemical_set):
+            nb_force.setExceptionParameters(
+                exc_idx, p1, p2, 0.0 * unit.elementary_charge**2, sig, eps
+            )
+            nb_force.addExceptionParameterOffset(
+                lambda_name,
+                exc_idx,
+                charge_prod,
+                0.0 * unit.nanometer,
+                0.0 * unit.kilojoule_per_mole,
+            )
+
+    lig_list = sorted(ligand_set)
+    for offset_i, p1 in enumerate(lig_list):
+        q1, sig1, eps1 = ligand_params[p1]
+        q1_val = q1.value_in_unit(unit.elementary_charge)
+        sig1_val = sig1.value_in_unit(unit.nanometer)
+        eps1_val = eps1.value_in_unit(unit.kilojoule_per_mole)
+        for p2 in lig_list[offset_i + 1:]:
+            if (p1, p2) in frozen_ll_pairs:
+                continue
+            q2, sig2, eps2 = ligand_params[p2]
+            q2_val = q2.value_in_unit(unit.elementary_charge)
+            sig2_val = sig2.value_in_unit(unit.nanometer)
+            eps2_val = eps2.value_in_unit(unit.kilojoule_per_mole)
+            nb_force.addException(
+                p1,
+                p2,
+                (q1_val * q2_val) * unit.elementary_charge**2,
+                0.5 * (sig1_val + sig2_val) * unit.nanometer,
+                math.sqrt(max(eps1_val * eps2_val, 0.0)) * unit.kilojoule_per_mole,
+                True,
+            )
+
+    _inject_co_alchemical_ion_restraints(system, co_alchemical_ion_spec)
+
+    report = charging_charge_conservation_report(
+        nb_force,
+        lambda_name,
+        ligand_indices=sorted(ligand_set),
+        co_ion_indices=ion_indices,
+        ligand_net_charge_e=lig_net_charge,
+    )
+    print(
+        f"  ⚡ [B3] charge-transfer charging 已配置: 配体 {lig_net_charge:+d} e → 0，"
+        f"co-ion {ion_indices} 0 → {lig_net_charge:+d} e（每粒子 ≤ 1 单位电荷）；"
+        f"逐 λ 总电荷恒为 {report['base_sum_e']:+.6f} e "
+        f"(Σscale={report['scale_sum_e']:+.2e} e)"
+    )
+    return original_charges, ion_indices
+
+
 # ================= ibs_engine.py 顶部新增 =================
 def configure_coalchemical_neutral_decharging(
     system: openmm.System,
@@ -2094,11 +2688,20 @@ def configure_coalchemical_neutral_decharging(
     positions,
     box_vectors=None,
     lambda_name: str = "lam_coul",
-    ion_restraint_k: float = 25.0,
+    co_alchemical_ion_spec: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict, List[int]]:
-    """
-    🔥 终极防御：共炼金反离子策略
-    寻找体系中最远的反离子，使其与配体同步消电，保持全局严格电中性。
+    """共炼金反离子策略：反离子与配体同步消电，保持全局严格电中性。
+
+    ⚠️ 这是 **co-annihilation**（异号反离子跟着一起消电），**不是** §0 选定的
+    charge-transfer（ligand q→0 / co-ion 0→q）。生产路线见 MEM-00a / B3
+    （`configure_charge_transfer_decharging`）。本函数按 MEM-00a-2 降级为
+    **实验对照专用**，只允许用于水盒 / lipid slab 的方法对照。
+
+    ⚠️ **[MEM-00c] 配体带净电荷时必须传 `co_alchemical_ion_spec`。**
+    本函数**不再自己选离子**：身份由 `select_co_alchemical_ion_once()` 选一次、
+    落盘，这里只做 `verify_co_alchemical_ion_identity()` 只读核对。
+    没有 spec 就 fail closed —— 因为"每个入口自己选一次"在跨进程 resume 下
+    会静默选中不同粒子，让 u_kn 与动力学用上不同的 Hamiltonian。
     """
     nb_force = next((f for f in system.getForces() if isinstance(f, openmm.NonbondedForce)), None)
     if nb_force is None:
@@ -2117,22 +2720,47 @@ def configure_coalchemical_neutral_decharging(
 
     if lig_net_charge == 0:
         print("  ℹ️ 配体为电中性，无需共消电反离子。使用标准 PME Offset。")
-        target_ion_charge = 0.0
         best_ion_indices: List[int] = []
-        ion_ref_positions_nm: List[np.ndarray] = []
-        ion_meta = {}
+        ion_meta: Dict[str, Any] = {}
     else:
-        print(f"  ⚡ 检测到带电配体 (Net Charge: {lig_net_charge:+d})，启动共炼金反离子搜索...")
-        target_ion_charge = -1.0 if lig_net_charge > 0 else 1.0
-        best_ion_indices, ion_ref_positions_nm, ion_meta = _select_bulk_water_counterion(
-            nb_force, ligand_indices, topology, positions, box_vectors
-        )
-        if best_ion_indices:
-            print(
-                f"  🎯 锁定共消电反离子: Indices {best_ion_indices}"
+        # [MEM-00c] 只核对，不重选。没有 spec 就停 —— 见本函数 docstring。
+        if co_alchemical_ion_spec is None:
+            raise RuntimeError(
+                f"检测到带电配体 (Net Charge: {lig_net_charge:+d})，但没有传入 "
+                "`co_alchemical_ion_spec`。\n"
+                "    [MEM-00c] co-ion 身份必须由 `select_co_alchemical_ion_once()` "
+                "**选一次并落盘**，动力学 / REMD 副本 / compute_u_kn / resume 全部只读消费。\n"
+                "    本函数以前会在这里自己调一次选择器；因为选择结果是坐标的连续函数，"
+                "而首跑（预平衡输出 + 2000 步最小化）与 resume（直接读 DCD 末帧）"
+                "喂进来的坐标不同，于是同一条腿的动力学与 u_kn 可能选中**不同粒子** —— "
+                "ΔG 会错且没有任何异常现象。\n"
+                "    修法是在上游选一次、把 spec 传下来；**不要**在这里恢复自动选择。"
             )
-        else:
-            raise RuntimeError("未找到可用于共炼金的匹配反离子，无法保持 PME 去电荷腿的电中性。")
+        pinned = verify_co_alchemical_ion_identity(
+            co_alchemical_ion_spec,
+            system=system,
+            topology=topology,
+            ligand_net_charge_e=lig_net_charge,
+            context="configure_coalchemical_neutral_decharging",
+        )
+        if (
+            co_alchemical_ion_spec.get("charge_treatment")
+            == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER
+        ):
+            raise RuntimeError(
+                "传进来的是 charge-transfer 的 co-ion 身份 spec，但调用的是 "
+                "co-annihilation 的 charging builder。两者的哈密顿量相反"
+                "（q_phys→0 vs 0→q_L），请改调 `configure_charge_transfer_decharging`。"
+            )
+        best_ion_indices = list(pinned)
+        # restraint 参数全部取自 spec，不取当前坐标（MEM-00c/00d：参考量属于身份的
+        # 一部分）。注入由 `_inject_co_alchemical_ion_restraints` 统一负责，
+        # 与 charge-transfer 共用同一份形式（§4.4）。
+        ion_meta = dict(co_alchemical_ion_spec.get("selection_provenance") or {})
+        print(
+            f"  🔒 [MEM-00c] 复用已冻结的共炼金反离子身份: Indices {best_ion_indices} "
+            f"(fingerprint {str(co_alchemical_ion_spec.get('fingerprint'))[:12]}…)"
+        )
 
     # 3. 注入全局 Lambda 与 ParameterOffset
     existing_params = [nb_force.getGlobalParameterName(i) for i in range(nb_force.getNumGlobalParameters())]
@@ -2195,20 +2823,16 @@ def configure_coalchemical_neutral_decharging(
                 True,
             )
 
-    for best_ion_idx, ion_ref_pos_nm in zip(
-        best_ion_indices,
-        ion_ref_positions_nm,
-    ):
-        restraint = _create_bulk_water_ion_restraint(
-            ion_index=best_ion_idx,
-            reference_position_nm=ion_ref_pos_nm,
-            force_constant_kj_per_mol_nm2=ion_restraint_k,
-        )
-        restraint.setForceGroup(6)
-        system.addForce(restraint)
-        print(
-            f"  🪢 共炼金反离子 bulk 水锚定已注入: "
-            f"k={ion_restraint_k:.1f} kJ/mol/nm^2, ref=({ion_ref_pos_nm[0]:.3f}, {ion_ref_pos_nm[1]:.3f}, {ion_ref_pos_nm[2]:.3f}) nm"
+    if best_ion_indices:
+        _inject_co_alchemical_ion_restraints(system, co_alchemical_ion_spec)
+        # §7.2：逐 λ 电荷账目由同一个函数核对（与 charge-transfer 共用），
+        # 不靠"异号反离子应该会抵消"这句话。
+        charging_charge_conservation_report(
+            nb_force,
+            lambda_name,
+            ligand_indices=sorted(ligand_set),
+            co_ion_indices=best_ion_indices,
+            ligand_net_charge_e=lig_net_charge,
         )
 
     print("  ✅ 共炼金反离子防御阵列部署完毕。PME 倒空间计算全程严格电中性！")
@@ -2223,6 +2847,7 @@ def configure_pme_ligand_charge_offsets(
     topology=None,
     positions=None,
     box_vectors=None,
+    co_alchemical_ion_spec: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Configure a PME-preserving Coulomb leg on the native NonbondedForce.
@@ -2254,20 +2879,48 @@ def configure_pme_ligand_charge_offsets(
         )
 
     if rounded_charge != 0:
-        if topology is None or positions is None:
-            raise RuntimeError("带电配体的 PME 去电荷路径需要 topology 和初始 positions 以构建共炼金反离子 bulk 水锚定。")
-        original_charges, ion_indices = configure_coalchemical_neutral_decharging(
-            system,
-            ligand_indices,
-            topology,
-            positions,
-            box_vectors=box_vectors,
-            lambda_name=lambda_name,
-        )
+        if topology is None:
+            raise RuntimeError(
+                "带电配体的 PME 去电荷路径需要 topology 才能核对冻结的 co-ion 身份。"
+            )
+        # 走哪条共炼金路线由**冻结 spec 里记录的 charge_treatment** 决定，不是由这里
+        # 再猜一次。理由：spec 的端点电荷已经按某一条路线算好了（q_phys→0 还是 0→q_L），
+        # 用另一条路线的 builder 消费它就是"声明一种哈密顿量、实际跑另一种"。
+        # spec 缺失时保持既有 co-annihilation 分支的 fail-closed 报错口径（MEM-00c）。
+        treatment = (co_alchemical_ion_spec or {}).get("charge_treatment")
+        if treatment == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
+            original_charges, ion_indices = configure_charge_transfer_decharging(
+                system,
+                ligand_indices,
+                topology,
+                lambda_name=lambda_name,
+                co_alchemical_ion_spec=co_alchemical_ion_spec,
+            )
+            mode = "co_alchemical_charge_transfer"
+        else:
+            if positions is None:
+                raise RuntimeError(
+                    "co-annihilation 的 PME 去电荷路径需要初始 positions。"
+                )
+            original_charges, ion_indices = configure_coalchemical_neutral_decharging(
+                system,
+                ligand_indices,
+                topology,
+                positions,
+                box_vectors=box_vectors,
+                lambda_name=lambda_name,
+                # [MEM-00c] 身份只读透传；为 None 时下游 fail closed，不再自动选。
+                co_alchemical_ion_spec=co_alchemical_ion_spec,
+            )
+            mode = "coalchemical_counterion"
         return {
-            "mode": "coalchemical_counterion",
+            "mode": mode,
+            "charge_treatment": treatment,
             "ion_indices": [int(i) for i in ion_indices],
             "n_offsets": len(original_charges),
+            "co_alchemical_ion_fingerprint": (
+                (co_alchemical_ion_spec or {}).get("fingerprint")
+            ),
         }
 
     existing_params = [nb_force.getGlobalParameterName(i) for i in range(nb_force.getNumGlobalParameters())]
@@ -13126,6 +13779,44 @@ def solve_stage_integrated(
                 if row:
                     seg["uncertainty_mbar_kJ_mol"] = seg["uncertainty_kJ_mol"]
                     seg["uncertainty_kJ_mol"] = row["sigma_effective_kJ_mol"]
+            # ---- [P1-23] 抬高了 σ，端点 σ 门与 converged 必须一起重算 ----
+            #
+            # 原先只替换 `total_error` 与逐段 `uncertainty_kJ_mol`，却**不动**
+            # `max_endpoint_uncertainty_kJ_mol`、也不重判 `converged` ——
+            # 等于"σ 抬上去了，而门还在读抬高前的小 σ"。σ 抬高的**全部意义**就是
+            # 让门看见真实的不确定度；门读旧值就是 fail-open：一个本该被端点 σ 门
+            # 拦下的 stage 会带着 `converged=True` 通过。
+            #
+            # 这里只重算「端点 σ」这一项并据此重判，不碰 overlap / 独立样本数
+            # 那两项（它们与 σ 口径正交，值没变）。原始值保留成
+            # `*_mbar_only_*`，两套口径都在报告里可查。
+            _seg_unc = [
+                float(seg["uncertainty_kJ_mol"])
+                for seg in (res.get("covariance_chain_segments") or [])
+                if seg.get("uncertainty_kJ_mol") is not None
+            ]
+            if _seg_unc:
+                _old_max = res.get("max_endpoint_uncertainty_kJ_mol")
+                _new_max = float(np.max(_seg_unc))
+                _thr = res.get("max_endpoint_uncertainty_kJ_mol_threshold")
+                res["max_endpoint_uncertainty_kJ_mol_mbar_only"] = _old_max
+                res["max_endpoint_uncertainty_kJ_mol"] = _new_max
+                if _thr is not None and np.isfinite(_new_max):
+                    _endpoint_ok = _meets_maximum_with_roundoff(_new_max, float(_thr))
+                    res["max_endpoint_uncertainty_gate_passed"] = bool(_endpoint_ok)
+                    if not _endpoint_ok and res.get("converged"):
+                        res["converged"] = False
+                        res["converged_revoked_by_sigma_inflation"] = True
+                        print(
+                            f"  ⛔ [P1-23] σ 抬高后端点 σ = {_new_max:.4f} kJ/mol "
+                            f"超过门限 {float(_thr):.4f}，`converged` 由 True 改判为 "
+                            "False（此前这里是 fail-open：σ 抬上去了而门还在读旧的小 σ）"
+                        )
+                if _old_max is not None:
+                    print(
+                        f"  ℹ️ [P1-23] 端点 σ 随之更新：{float(_old_max):.4f} → "
+                        f"{_new_max:.4f} kJ/mol"
+                    )
             res["sigma_inflation_applied"] = True
             print(
                 f"  ✅ [P1-19] 已采用 σ 下界：总 σ = "
@@ -13502,11 +14193,16 @@ class REMDManager:
         boresch_params: Optional[Dict] = None,
         random_seed: Optional[int] = None,
         max_resident_contexts: Optional[int] = None,
+        co_alchemical_ion_spec: Optional[Dict[str, Any]] = None,
     ):
         self.topology = topology
         self.positions = positions
         self.box_vectors = box_vectors
         self.ligand_indices = ligand_indices
+        # [MEM-00c] 冻结的 co-ion 身份。带电配体时必须由调用方传入
+        # （`ibs_engine.select_co_alchemical_ion_once()` 选一次的产物）；
+        # 中性配体为 None。所有 replica 共用它，不各自重选。
+        self.co_alchemical_ion_spec = co_alchemical_ion_spec
         self.lambdas_coul = np.array(lambdas_coul)
         self.lambdas_vdw = np.array(lambdas_vdw)
         self.n_replicas = len(lambdas_coul)
@@ -13640,6 +14336,24 @@ class REMDManager:
         resolved_platform, props = _build_platform_properties(self.platform_name)
         platform = openmm.Platform.getPlatformByName(resolved_platform)
 
+        # [P0-REMD-CUDA] 建 Context 前后记显存。
+        #
+        # 为什么必须记：`No compatible CUDA device is available` 是 OpenMM 在**所有**
+        # 设备都初始化失败时给的**通用文案**，真 OOM 也长这样。没有"第几个 replica
+        # 断的 / 断时剩多少显存"这两个数，"显存不够"和"其它初始化失败"就区分不了，
+        # 只能反复猜。离线探针（`memtest/probe_remd_context_capacity.py`）已证明
+        # 12 × 45354 原子的 Context 单进程能建满、每个 ≈ 338 MiB，
+        # 连"先跑一遍 λ 预优化"都复现不了失败 —— 所以差异只可能在生产路径上，
+        # 必须就地打点。
+        _vram_baseline = _gpu_memory_mib()
+        if _vram_baseline and str(resolved_platform).upper() == "CUDA":
+            logger.info(
+                "[REMD] 建 %d 个 %s Context 之前显存: used=%d free=%d total=%d MiB "
+                "(props=%s)",
+                self.n_replicas, resolved_platform,
+                _vram_baseline[0], _vram_baseline[1], _vram_baseline[2], props,
+            )
+
         try:
             if (
                 str(resolved_platform).upper() in {"CUDA", "OPENCL"}
@@ -13659,6 +14373,8 @@ class REMDManager:
                         topology=self.topology,
                         positions=self.positions,
                         box_vectors=self.box_vectors,
+                        # [MEM-00c] 所有 replica 共用同一份冻结身份，不各自重选。
+                        co_alchemical_ion_spec=self.co_alchemical_ion_spec,
                     )
                     _add_physical_boresch_restraint(replica_sys, self.boresch_params, force_group=3)
                 elif self.is_mixed_pme_alchemical:
@@ -13671,6 +14387,7 @@ class REMDManager:
                         lambda_coul_name="lambda_coul",
                         lambda_vdw_name="lambda_vdw",
                         restraint_params=self.boresch_params,
+                        co_alchemical_ion_spec=self.co_alchemical_ion_spec,
                     )
                 else:
                     sys_xml = openmm.XmlSerializer.serialize(system_template)
@@ -13704,7 +14421,25 @@ class REMDManager:
                 self.contexts.append(ctx)
                 self.integrators.append(integ)
                 self.replica_systems.append(replica_sys)
+
+                # [P0-REMD-CUDA] 逐个记，断在第几个一看就知道。
+                _vram = _gpu_memory_mib()
+                if _vram and str(resolved_platform).upper() == "CUDA":
+                    _per_ctx = (
+                        (_vram[0] - _vram_baseline[0]) / len(self.contexts)
+                        if _vram_baseline else float("nan")
+                    )
+                    logger.info(
+                        "[REMD] Context %d/%d 建成: used=%d free=%d MiB "
+                        "(平均每 Context ≈ %.0f MiB)",
+                        len(self.contexts), self.n_replicas,
+                        _vram[0], _vram[1], _per_ctx,
+                    )
         except Exception as exc:
+            # ⚠️ 显存必须在 `_clear_replica_contexts()` **之前**读——释放之后再读就
+            # 只剩一个"失败后已回收"的数，判不了当时到底是不是不够用。
+            _vram_at_failure = _gpu_memory_mib()
+            _n_built = len(self.contexts)
             self._clear_replica_contexts()
             if (
                 allow_platform_fallback
@@ -13712,10 +14447,122 @@ class REMDManager:
                 and self._is_gpu_context_failure(exc)
             ):
                 self.platform_fallback_reason = str(exc)
-                print(
-                    "  ⚠️ REMD GPU Context 构建失败，已释放已创建的 replica contexts；"
-                    f"回退 CPU 重建。原始错误: {exc}"
+                # 判 OOM / 非 OOM：断点还剩得下一个 Context 的量 ⟹ **不是**显存不够，
+                # 别按 OOM 修（把 λ 数减小只是掩盖）。阈值取实测的每 Context 量级。
+                _diagnosis = "显存读数不可用（无 nvidia-smi？）"
+                if _vram_at_failure:
+                    _per_ctx = (
+                        (_vram_at_failure[0] - _vram_baseline[0]) / max(1, _n_built)
+                        if _vram_baseline and _n_built else float("nan")
+                    )
+                    _looks_like_oom = _vram_at_failure[1] < max(
+                        _REMD_CONTEXT_VRAM_FLOOR_MIB, _per_ctx if _per_ctx == _per_ctx else 0.0
+                    )
+                    _diagnosis = (
+                        f"失败瞬间 used={_vram_at_failure[0]} free={_vram_at_failure[1]} "
+                        f"total={_vram_at_failure[2]} MiB，已建成 {_n_built} 个"
+                        + (f"（平均每 Context ≈ {_per_ctx:.0f} MiB）" if _per_ctx == _per_ctx else "")
+                        + "。判定: "
+                    )
+                    if not _looks_like_oom:
+                        _diagnosis += (
+                            "**不像 OOM** —— 剩余显存仍足够再建一个 Context，"
+                            "所以这是别的初始化失败；减 λ 数只会掩盖它，别按 OOM 修。"
+                        )
+                    else:
+                        # 🔑 显存不够有**两种**完全不同的原因，别混成一句"减 λ 就行"：
+                        #   (a) REMD 自己的 N 个 Context 就把卡吃满了 ⟹ 减 λ 是对的；
+                        #   (b) **开跑前**卡上已经被占掉一大块 ⟹ 真问题是那个占用者
+                        #       （同卡上的别的作业 / 上一次没杀干净的进程 / 本进程前面
+                        #       某个 CUDA 阶段没释放）。这时减 λ 只是把症状盖住，
+                        #       下次窗口一多又会撞上。
+                        # 实测教训（2026-08-04）：`vram_before=[12197, 3646, 16303]`，
+                        # 12 个 Context 只需 3804 MiB 却只剩 3646 MiB —— 差 158 MiB。
+                        # 本条腿之前的 CUDA 阶段（预平衡 1 + attachment 4 + λ 预优化 1）
+                        # 约 2 GB，剩下约 10 GB 来源不明。若当时只报"减 λ"，
+                        # 那 10 GB 就永远不会被查。
+                        _need_all = _per_ctx * self.n_replicas if _per_ctx == _per_ctx else float("nan")
+                        _diagnosis += "**像 OOM**（剩余显存已不足一个 Context）。"
+                        if _vram_baseline:
+                            _baseline_used, _baseline_free, _baseline_total = _vram_baseline
+                            _diagnosis += (
+                                f" 但注意开跑**之前**就已 used={_baseline_used} "
+                                f"free={_baseline_free} MiB"
+                            )
+                            if _need_all == _need_all:
+                                _diagnosis += (
+                                    f"；{self.n_replicas} 个 Context 共需 ≈ {_need_all:.0f} MiB"
+                                )
+                            if _baseline_used > 0.25 * _baseline_total:
+                                _diagnosis += (
+                                    f"。⚠️ 开跑前的占用已达全卡 "
+                                    f"{100.0 * _baseline_used / _baseline_total:.0f}% —— "
+                                    "**先查是谁占的**（`nvidia-smi` 看 PID：同卡上的别的作业？"
+                                    "上一次没杀干净的进程？本进程前面某个 CUDA 阶段没释放？）。"
+                                    "只减 λ 数能让这次跑起来，但会把这块占用永久掩盖，"
+                                    "窗口一多又会撞上。"
+                                )
+                            else:
+                                _diagnosis += (
+                                    "。开跑前占用不大 ⟹ 确实是 REMD 自己的 Context 数"
+                                    "超过了这张卡，减少 λ 状态数"
+                                    "（= replica 数 = 常驻 Context 数）是对的修法。"
+                                )
+                        else:
+                            _diagnosis += (
+                                " 拿不到开跑前的显存基线，无法区分"
+                                "'REMD 自己吃满'与'开跑前已被占'——先补这个数再决定要不要减 λ。"
+                            )
+                _message = (
+                    "⚠️ REMD GPU Context 构建失败，已释放已创建的 replica contexts；"
+                    f"回退 CPU 重建。\n"
+                    f"     原始错误 [{type(exc).__name__}]: {exc}\n"
+                    f"     {_diagnosis}\n"
+                    "     ⛔ CPU 回退会让本阶段慢约两个数量级（实测 45354 原子 × 12 副本："
+                    "第 0 轮交换用了 29 分钟，500 轮约 10 天），表现得像卡死。"
                 )
+                logger.warning(_message)
+
+                # 🔑 当场落盘，不等阶段跑完。
+                #
+                # 这条告警此前只到终端：`logger` 没有 FileHandler，而 `pipeline.log`
+                # 是 `ABFEPipeline._log` 自己写的另一条通路，所以归档日志里**一行都没有**
+                # （2026-08-03/04 因此绕了很多轮：只能靠 `nvidia-smi` 看到卡是空的，
+                # 才推断出它退了 CPU）。而 `platform_fallback_reason` 只在阶段**跑完**时
+                # 进 `*_exchange_diagnostics.json` —— 一旦像这次那样在 CPU 上磨到被杀，
+                # 那份文件永远不会出现，证据就彻底没了。
+                try:
+                    os.makedirs(self.output_dir, exist_ok=True)
+                    _fallback_path = os.path.join(
+                        self.output_dir, "remd_platform_fallback.json"
+                    )
+                    with open(_fallback_path, "w", encoding="utf-8") as _handle:
+                        json.dump(
+                            {
+                                "requested_platform": str(resolved_platform),
+                                "platform_properties": dict(props),
+                                "n_replicas": int(self.n_replicas),
+                                "max_resident_contexts": int(self.max_resident_contexts),
+                                "n_contexts_built_before_failure": int(_n_built),
+                                "exception_type": type(exc).__name__,
+                                "exception": str(exc),
+                                "vram_before_mib": (
+                                    list(_vram_baseline) if _vram_baseline else None
+                                ),
+                                "vram_at_failure_mib": (
+                                    list(_vram_at_failure) if _vram_at_failure else None
+                                ),
+                                "diagnosis": _diagnosis,
+                            },
+                            _handle,
+                            indent=2,
+                            ensure_ascii=False,
+                        )
+                    print(f"  🧾 平台回退证据已落盘: {_fallback_path}")
+                except Exception as _write_exc:  # noqa: BLE001
+                    logger.warning("平台回退证据落盘失败: %s", _write_exc)
+
+                print(f"  {_message}")
                 self.platform_name = "CPU"
                 self._build_replicas(system_template, allow_platform_fallback=False)
                 return
@@ -14896,6 +15743,7 @@ class TraditionalMBARAnalyzer:
         reference_positions=None,
         reference_box_vectors=None,
         boresch_params: Optional[Dict] = None,
+        co_alchemical_ion_spec: Optional[Dict[str, Any]] = None,
     ) -> np.ndarray:
         import mdtraj as md
         if topology is None:
@@ -15075,6 +15923,8 @@ class TraditionalMBARAnalyzer:
                 topology=topology,
                 positions=reference_positions,
                 box_vectors=reference_box_vectors,
+                # [MEM-00c] 同上：只读消费冻结身份，不按 reference_positions 重选。
+                co_alchemical_ion_spec=co_alchemical_ion_spec,
             )
             nb_prepared = next((f for f in prepared_system.getForces() if isinstance(f, openmm.NonbondedForce)), None)
             if nb_prepared is None:
@@ -15124,6 +15974,10 @@ class TraditionalMBARAnalyzer:
                 lambda_coul_name="lambda_coul",
                 lambda_vdw_name="lambda_vdw",
                 restraint_params=boresch_params,
+                # [MEM-00c] 重算必须用**动力学当时冻结的那个粒子**。
+                # `reference_positions` 在 resume 进程里与首跑不同，
+                # 以前这里会据此重新选一个离子 —— 那正是静默不一致的来源。
+                co_alchemical_ion_spec=co_alchemical_ion_spec,
             )
             nb_prepared = next((f for f in prepared_system.getForces() if isinstance(f, openmm.NonbondedForce)), None)
             if nb_prepared is None:

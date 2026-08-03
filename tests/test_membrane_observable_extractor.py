@@ -1011,3 +1011,34 @@ def test_pure_lipid_apl_reference_is_a_diagnostic_not_a_gate():
         c["criterion"].startswith("deviation_from_literature_percent")
         for c in report["checks"]
     ), "诊断参考值不得变成 checks 里的门（那是 literature_apl_nm2 的职责）"
+
+
+def test_frame_count_reconciliation_is_gone_and_must_not_come_back():
+    """MEM-17 已删除（2026-08-03，用户决定）：质量门里不再有帧数对账。
+
+    背景与理由（免得下一个人"顺手补回来"）：
+    * resume 的重复帧是**真的** —— 实测那条 100 ns 是 5001 帧而非 5000，
+      两次 resume（38,500,000 / 40,500,000 续跑）在 `(40500000,40515000]`
+      区间重写了第 40,510,000 步那一帧，重复帧在 DCD 索引 4050/4051。
+    * 但对账拦住的是**主线**，代价是重跑 8 h 的预平衡；而根因在
+      `abfe_pipeline.pre_equilibrate` 的 `DCDReporter(append=resume_from_chk)`
+      没有先把 DCD 截断到 checkpoint 对应的帧边界。要修就修那里。
+    * "第 0 帧也算所以 5001 是对的"这个说法不成立：DCD 头 `ISTART=10000`、
+      `NSAVC=10000`，monitor 首行是 5000 而不是 0 —— OpenMM 的 reporter 从第
+      `interval` 步开始写，不写初始帧。整除不 +1 本来是对的。
+    """
+    import inspect
+
+    src = inspect.getsource(core.run_membrane_quality_gate)
+    assert "预平衡轨迹有" not in src, (
+        "帧数对账被加回来了：resume 的重复帧会让它 fail closed 拦住主线，"
+        "而根因在 abfe_pipeline.pre_equilibrate 的 DCDReporter(append=True) 不截断。"
+    )
+    assert "MEM-17 已移除" in src, "删除的缘由注释别一起删掉，否则下个人会再加一遍"
+    # 帧数已不再是判据 ⇒ 上游也不该再算这个数喂进来。
+    from pathlib import Path
+
+    runabfe_src = (Path(__file__).absolute().parents[1] / "runabfe.py").read_text(
+        encoding="utf-8"
+    )
+    assert '"expected_pre_equilibration_frames":' not in runabfe_src

@@ -15,6 +15,7 @@ OpenMM ABFE 计算核心流程管理器 (v4.0 - 生产级重构)
 
 import openmm
 from openmm import app, unit, XmlSerializer
+import gc
 import numpy as np
 import os
 import glob
@@ -29,7 +30,7 @@ import platform
 import sys
 import math
 from datetime import datetime
-from typing import Dict, List, Sequence, Tuple, Optional
+from typing import Any, Dict, List, Sequence, Tuple, Optional
 
 # 项目内部模块依赖
 from abfe_preoptimizer import ABFEPreOptimizer, DualLambdaPreOptimizer
@@ -86,6 +87,10 @@ from ibs_engine import (
     IBSIncompleteStageCoverageError,
     ibs_lj_tail_lrc_is_applicable,
     ibs_lj_tail_lrc_inapplicable_reason,
+    # [MEM-00c] co-ion 身份：唯一的选择入口（此外任何地方都不许再选）。
+    select_co_alchemical_ion_once,
+    # [P0-REMD-CUDA] 显存读数唯一实现（走 nvidia-smi 子进程，绝不在本进程初始化 CUDA）。
+    _gpu_memory_mib,
 )
 from abfe_core import (
     calculate_boresch_analytical_correction,
@@ -118,6 +123,8 @@ from abfe_core import (
     barostat_fingerprint_payload,
     ensure_barostat_for_protocol,
     resolve_membrane_protocol,
+    # [MEM-00c] 只读核对冻结的 co-ion 身份（唯一实现，不在 pipeline 里另写一份）。
+    verify_co_alchemical_ion_identity,
 )
 import warnings
 
@@ -1146,6 +1153,7 @@ class ABFEPipeline:
         forcefield_family: Optional[str] = None,
         membrane_quality_inputs: Optional[Dict] = None,
         membrane_quality_gate_mode: Optional[str] = None,
+        charge_treatment: Optional[str] = None,
     ):
 
         # 统一温度/压力单位
@@ -1192,6 +1200,18 @@ class ABFEPipeline:
             forcefield_family=forcefield_family,
         )
         self.dispersion_protocol = self.dispersion_protocol_info["dispersion_protocol"]
+
+        # [B2/B3] 净电荷路线。这里**只存**已经由 `abfe_core.resolve_charge_treatment()`
+        # 在 runabfe 侧判死的那个值（§6.1 要求在建任何 Context 之前判完），
+        # 本层不再解析一遍、也不猜：它唯一的用途是告诉
+        # 唯一那个选择入口该按哪条路线冻结 co-ion 身份。
+        # ⚠️ 这段注释故意不写出那个函数名加左括号的形式：
+        # `tests/test_coalchemical_ion_identity.py` 用"出现次数"来钉住"只有一处调用"，
+        # 注释里多一个带括号的提及就会让那条契约测试失效。
+        # 不传时按 None 处理 —— 只在配体带净电荷时才会走到 co-ion 分支，
+        # 那时 `select_co_alchemical_ion_once` 的默认值（co-annihilation 实验对照）
+        # 与本改动前的行为一致，中性配体（当前生产体系）完全不经过这条路。
+        self.charge_treatment = charge_treatment
 
         # [§9] 膜质量门需要的、无法从轨迹自动可靠推断的输入：口袋原子、co-ion 索引、
         # 该脂质力场的文献 APL、声明的预平衡时长。膜体系必填，可溶体系不用。
@@ -1300,6 +1320,90 @@ class ABFEPipeline:
 
     def _get_state_lock_file(self) -> str:
         return self._get_state_file() + ".lock"
+
+    # =========================================================================
+    # 0.6 [MEM-00c] co-ion 身份：选一次、落盘、之后只读核对
+    # =========================================================================
+    def _log_vram(self, label: str) -> None:
+        """[P0-REMD-CUDA] 在阶段边界打一次显存点。
+
+        为什么按阶段打：实测 Stage 1 建 replica 前卡上已被占 **12197/16303 MiB**，
+        而按每 Context ≈ 317 MiB 折算，本条腿之前那些 CUDA 阶段（预平衡 1 个 +
+        Stage 0 attachment 4 个 + 两次 λ 预优化各 1 个）只该占 ≈ 2 GB ——
+        **约 10 GB 对不上账**。用户独占节点，所以不是别的作业占的，是本进程漏的。
+        只有在每个阶段前后各记一次，才能指出漏在哪一段；否则只能猜。
+        """
+        vram = _gpu_memory_mib()
+        if vram:
+            self._log(
+                f"  📊 [显存] {label}: used={vram[0]} free={vram[1]} total={vram[2]} MiB"
+            )
+
+    def _co_alchemical_ion_spec_path(self) -> str:
+        return os.path.join(self.checkpoint_dir, "coalchemical_ion_spec.json")
+
+    def resolve_co_alchemical_ion_spec(self) -> Optional[Dict[str, Any]]:
+        """返回本条腿冻结的 co-ion 身份；中性配体返回 None。
+
+        [MEM-00c] 这是**唯一**会触发选择的地方，而且只在磁盘上还没有 spec 时触发：
+
+        * 首次调用且无落盘 spec ⟹ 用当前 `self.positions` 选一次，立刻落盘；
+        * 已有落盘 spec（含跨进程 resume）⟹ 读盘 + `verify_...` 只读核对，
+          **绝不**因为坐标变了就重新选。
+
+        为什么必须落盘而不是只放在内存里：同一条腿的动力学与 `compute_u_kn`
+        经常发生在**不同进程**（resume）。首跑的 `self.positions` 是预平衡输出再叠
+        2000 步最小化，resume 的是 DCD 末帧 —— 两者差 0.01–0.1 nm，足以让选择器
+        换一个粒子（实测 0.05 nm 即翻转）。落盘是把身份跨进程钉住的唯一办法。
+        """
+        if getattr(self, "_co_alchemical_ion_spec_cached", None) is not None:
+            return self._co_alchemical_ion_spec_cached
+
+        path = self._co_alchemical_ion_spec_path()
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as handle:
+                spec = json.load(handle)
+            pinned = verify_co_alchemical_ion_identity(
+                spec,
+                system=self.system,
+                topology=self.topology,
+                context=f"resume 读取 {os.path.basename(path)}",
+            )
+            self._log(
+                f"  🔒 [MEM-00c] 复用已冻结的 co-ion 身份 {pinned} "
+                f"(fingerprint {str(spec.get('fingerprint'))[:12]}…)"
+            )
+            self._co_alchemical_ion_spec_cached = spec
+            return spec
+
+        kwargs: Dict[str, Any] = {}
+        if self.charge_treatment:
+            # 路线决定身份来源：charge-transfer 认建系预留的中性 dummy（坐标无关），
+            # co-annihilation 按 bulk-water 判据挑物理反离子（坐标相关，必须冻结）。
+            kwargs["charge_treatment"] = str(self.charge_treatment)
+        spec = select_co_alchemical_ion_once(
+            self.system,
+            self.ligand_indices,
+            self.topology,
+            self.positions,
+            self.box_vectors,
+            **kwargs,
+        )
+        if spec is None:
+            # 中性配体：这条路径整个不需要 co-ion。不落盘空文件——落了反而会让
+            # 将来换成带电配体时误判"已经选过了"。
+            self._co_alchemical_ion_spec_cached = None
+            return None
+
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(spec, handle, indent=2, ensure_ascii=False, cls=NumpyEncoder)
+        self._log(
+            "  🔒 [MEM-00c] co-ion 身份已选定并冻结: "
+            f"{[ion['atom_index'] for ion in spec['ions']]} "
+            f"(fingerprint {spec['fingerprint'][:12]}…) → {path}"
+        )
+        self._co_alchemical_ion_spec_cached = spec
+        return spec
 
     def _load_pipeline_state(self) -> Dict:
         """加载 Pipeline 状态"""
@@ -1819,6 +1923,7 @@ class ABFEPipeline:
                 self._log(f"  ⚠️ 上下文清理警告: {e}（通常不影响后续运行）")
         
         self._log(f"  ✓ 预平衡完成 | 最终势能: {final_energy:.2f} kJ/mol")
+        self._log_vram("预平衡结束（Context 已清理）")
 
         self._update_stage_status(
             "equilibration",
@@ -2557,7 +2662,25 @@ class ABFEPipeline:
                 overlap=2,
             )
 
-        del context, integrator, probe_sys
+        # [P0-REMD-CUDA] 显式、彻底地释放 λ 预优化的 CUDA Context。
+        #
+        # 原来只有 `del context, integrator, probe_sys`：那只解掉三个**局部名字**，
+        # 而 `optimizer` 仍然持有 `context`（`DualLambdaPreOptimizer.__init__(system,
+        # context, ...)`），所以显存要等到函数返回、`optimizer` 被回收才可能释放；
+        # 若 optimizer 与 context 之间存在引用环，还要等一次 gc 周期。
+        # 而 Stage 1 在本函数返回后**17 秒**就开始建 12 个 replica Context —— 实测
+        # 那时卡上已被占 12197/16303 MiB，12 个 Context 需要 3804 MiB 却只剩 3646 MiB。
+        # 所以这里必须显式断链 + 立刻 gc，并把释放前后的显存打出来（对不上账就能看见）。
+        _vram_before_release = _gpu_memory_mib()
+        del optimizer, context, integrator, probe_sys
+        gc.collect()
+        _vram_after_release = _gpu_memory_mib()
+        if _vram_before_release and _vram_after_release:
+            self._log(
+                f"  🧹 λ 预优化 Context 已释放 | 显存 used "
+                f"{_vram_before_release[0]} → {_vram_after_release[0]} MiB "
+                f"(free {_vram_before_release[1]} → {_vram_after_release[1]} MiB)"
+            )
         return {
             "lambdas_var": opt_res["lambdas_coul"] if stage_name=="decharging" else opt_res["lambdas_vdw"],
             "n_states": opt_res["n_states"],
@@ -2770,6 +2893,8 @@ class ABFEPipeline:
                     output_dir=stage_output_dir,
                     boresch_params=boresch_params,
                     max_resident_contexts=remd_max_resident_contexts,
+                    # [MEM-00c] 所有 replica 共用同一份冻结身份。
+                    co_alchemical_ion_spec=self.resolve_co_alchemical_ion_spec(),
                 )
                 traj_files = remd.run(
                     n_steps=n_steps_per_window,
@@ -2789,6 +2914,8 @@ class ABFEPipeline:
                 reference_positions=self.positions,
                 reference_box_vectors=self.box_vectors,
                 boresch_params=boresch_params,
+                # [MEM-00c] 重算用动力学当时冻结的粒子，不按 reference_positions 重选。
+                co_alchemical_ion_spec=self.resolve_co_alchemical_ion_spec(),
             )
             np.save(u_kn_path, u_kn)
             np.save(n_k_path, analyzer._last_n_k)
@@ -3355,6 +3482,7 @@ class ABFEPipeline:
                     platform_name=self.platform_name,
                     output_dir=stage_output_dir,
                     boresch_params=boresch_params,
+                    co_alchemical_ion_spec=self.resolve_co_alchemical_ion_spec(),
                 )
                 traj_files = remd.run(
                     n_steps=n_steps_per_window,
@@ -3376,6 +3504,8 @@ class ABFEPipeline:
                 reference_positions=self.positions,
                 reference_box_vectors=self.box_vectors,
                 boresch_params=boresch_params,
+                # [MEM-00c] 重算用动力学当时冻结的粒子，不按 reference_positions 重选。
+                co_alchemical_ion_spec=self.resolve_co_alchemical_ion_spec(),
             )
             np.save(u_kn_path, u_kn)
             np.save(n_k_path, analyzer._last_n_k)
@@ -3683,9 +3813,56 @@ class ABFEPipeline:
                 self._log(f"     保留原始平衡值，体系可能未充分弛豫")
                 return boresch_params
                 
+            # 🔑 强校验 3（BOR-02）：**逐自由度**的 σ 偏差，含三个二面角。
+            #
+            # 上面两道门只看 θ 与 r0，所以 2026-07-29 那次二面角**整体反号**
+            # 畅通无阻地覆盖了正确的参考几何（ΔG(A′→A) 5.5 → 98.8 kJ/mol）。
+            # 这里复用同文件已有的 `boresch_committed_deviation_sigma()`——它按
+            # kT/k 把每个自由度的偏差折成 σ，二面角先过 `_wrap_to_pi`，
+            # 所以反号（Δφ ≈ 2φ）会立刻表现为巨大的 σ。
+            #
+            # ⚠️ **超限的行为是"告警 + 保留 orig_eq"，不是 raise**，三条理由：
+            #   1. 与本函数已有两道门风格一致（都是 return 原值）；
+            #   2. `orig_eq` 来自 `boresch_simple.json` 的 500 帧系综均值，本来就比
+            #      单帧重锚可靠，退回它是**严格更优**，不是妥协；
+            #   3. 4σ 在 6 个自由度上误报率约 2.8%，硬门会以约 1/36 的概率无故杀掉
+            #      一次 9 小时的生产跑。真正的守门人是
+            #      `tests/test_boresch_dihedral_convention.py`（符号约定）。
+            _dev = boresch_committed_deviation_sigma(
+                committed_eq=orig_eq,
+                current_eq=new_eq,
+                force_constants=boresch_params.get("force_constants") or {},
+                temperature_k=float(self.temperature.value_in_unit(unit.kelvin)),
+            )
+            # ⚠️ 取 `deviation_sigma`（偏离几个 σ），**不是** `sigma`（分布宽度本身）。
+            # 与本文件 3603 行那个既有调用点同一口径。
+            _worst_name, _worst = None, 0.0
+            for _name, _row in (_dev or {}).items():
+                _sig = float(_row.get("deviation_sigma", 0.0) or 0.0)
+                if np.isfinite(_sig) and _sig > _worst:
+                    _worst_name, _worst = _name, _sig
+            if _worst > float(BORESCH_COMMITTED_MAX_DEVIATION_SIGMA):
+                self._log(
+                    f"  ⚠️ 自动更新拦截（BOR-02）：{_worst_name} 偏离 {_worst:.2f}σ "
+                    f"> {float(BORESCH_COMMITTED_MAX_DEVIATION_SIGMA):.1f}σ"
+                )
+                self._log(
+                    "     保留原始平衡值（来自系综均值，比单帧重锚可靠）。"
+                    "二面角出现这种量级的偏差通常意味着**反号**或采到了反转构象 —— "
+                    "参见 handoffs/BORESCH_DIHEDRAL_SIGN_HANDOFF.md。"
+                )
+                return boresch_params
+            if _worst > float(BORESCH_COMMITTED_WARN_DEVIATION_SIGMA):
+                self._log(
+                    f"  ⚠️ Boresch 平衡值 {_worst_name} 偏离 {_worst:.2f}σ"
+                    f"（告警阈值 {float(BORESCH_COMMITTED_WARN_DEVIATION_SIGMA):.1f}σ），"
+                    "仍在容许范围内，已采用"
+                )
+
             # ✅ 校验通过，安全覆盖
             boresch_params["equilibrium_values"] = new_eq
             self._log(f"  ✅ 已用最后一帧安全更新 Boresch 平衡值: r0={new_r0*10:.2f}Å, θA={thA_deg:.1f}°, θB={thB_deg:.1f}°")
+            self._log(f"     逐自由度最大偏差 {_worst:.2f}σ（{_worst_name}），含三个二面角")
         except Exception as e:
             self._log(f"  ⚠️ Boresch 平衡值更新失败: {e}，使用原始值")
         return boresch_params
@@ -6330,6 +6507,9 @@ class ABFEPipeline:
                         "completed",
                         {"total_delta_G": attachment_dg},
                     )
+            # [P0-REMD-CUDA] attachment 腿建过 len(attachment_lambdas) 个 Context；
+            # 若它们没释放，这里就会比"预平衡结束"高出若干个 317 MiB。
+            self._log_vram("Stage 0 attachment 结束")
             preopt1_file = os.path.join(
                 self.checkpoint_dir, "preopt_dual_decharging.json"
             )
@@ -6771,6 +6951,7 @@ class ABFEPipeline:
             # === Sequential execution ===
             if should_run_stage1:
                 self._log("\n[双λ] Stage 1: 去电荷 (λ_coul: 1→0, λ_vdw=1)")
+                self._log_vram("Stage 1 建 replica 之前")
 
                 def _run_stage1_once(_n_states, _lambdas, _ranges, _production_step_overrides=None,
                                       _frozen_validation_step_overrides=None,
@@ -7681,6 +7862,8 @@ class TraditionalABFEPipeline:
                 platform_name=self.platform_name,
                 output_dir=stage_output_dir,
                 boresch_params=boresch_params,
+                # [MEM-00c] 所有 replica 共用同一份冻结身份。
+                co_alchemical_ion_spec=self.resolve_co_alchemical_ion_spec(),
             )
             traj_files = remd.run(
                 n_steps=n_steps,
@@ -7707,6 +7890,8 @@ class TraditionalABFEPipeline:
             reference_positions=self.positions,
             reference_box_vectors=self.box_vectors,
             boresch_params=boresch_params,
+            # [MEM-00c] 重算用动力学当时冻结的粒子，不按 reference_positions 重选。
+            co_alchemical_ion_spec=self.resolve_co_alchemical_ion_spec(),
         )
         np.save(u_kn_path, u_kn)
         np.save(n_k_path, analyzer._last_n_k)

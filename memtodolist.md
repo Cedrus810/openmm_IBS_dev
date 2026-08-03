@@ -102,17 +102,48 @@ charge-transfer。** 下面每条都带 `file:line`，Phase A 必须逐条裁决
   `_prepare_pme_mixed_alchemical_system`（`ibs_engine.py:1576`）、
   `_build_replicas`（`ibs_engine.py:13347`）、`compute_u_kn`（`ibs_engine.py:14763`）。
   即：**动力学、REMD 副本、能量重算三处各自独立地走了一次共炼金配置。**
-- [ ] **MEM-00c：反离子身份是运行时重选的，违反 §3.4。**
-  `_select_bulk_water_counterion`（`ibs_engine.py:766`）按"到最近溶质的
-  minimum-image 距离 + 水配位数"当场排序挑离子。因为 MEM-00b 的三个调用点各调一次，
-  **必须实测确认：动力学用的离子与 `compute_u_kn` 重算用的离子是否同一个粒子。**
-  若三处传入的 `positions` 不同（很可能），选出的离子就可能不同 →
-  u_kn 与动力学 Hamiltonian 不一致的静默错误。这条优先级最高，先写一个断言测试。
-- [ ] **MEM-00d：反离子 restraint 形式不满足 §2.3。**
-  `_create_bulk_water_ion_restraint`（`ibs_engine.py:459`）是
-  `0.5*k*periodicdistance(...)^2`，k = 25 kJ/mol/nm²，参考点是**初始帧的绝对笛卡尔
-  坐标**。§2.3 要求 flat-bottom + 随盒缩放的参考定义。在膜半各向异性 NPT 下，
-  Z 方向盒长会变而参考点不动，离子可能被拖向膜。必须改。
+- [x] **MEM-00c：反离子身份运行时重选 —— 已修（2026-08-04）：选一次 + 冻结 + 只读核对。**
+  `_select_bulk_water_counterion`（现 `ibs_engine.py:811`）按"到最近溶质的
+  minimum-image 距离 + 水配位数"当场排序挑离子。
+
+  ⚠️ 原文这句判断**是错的**，B3 复核时别沿用：*"因为 MEM-00b 的三个调用点各调一次，
+  若三处传入的 `positions` 不同（很可能）…"* —— 同一进程内三处拿的是**同一个**
+  `self.positions`，不会漂。真正的漂移入口是**跨进程 resume**：首跑的
+  `self.positions` 是预平衡输出**再叠 2000 步快速最小化**，resume（`skip_equil`）
+  直接读 `pre_equilibration.dcd` **末帧**、不做最小化。两者差 0.01–0.1 nm，
+  实测 **0.05 nm 即足以翻转选择结果**。
+
+  修法与证据见 `docs/TODO.md` 的 MEM-00c 条目（选择唯一入口
+  `select_co_alchemical_ion_once`、带指纹的 spec 落 `checkpoints/coalchemical_ion_spec.json`、
+  6 个消费点全走 `resolve_co_alchemical_ion_spec()`、无 spec 即 fail closed；
+  `tests/test_coalchemical_ion_identity.py` 20 条契约测试，全套 977 passed）。
+  spec 里记 `charge_treatment`，所以它同时服务本条 co-annihilation 与 B3 的
+  charge-transfer，两者不可互相复用。
+  ⚠️ 尚未在带电体系上真机验证 —— 当前 Atenolol 净电荷 = 0，这条路径不被触发。
+- [x] **MEM-00d：反离子 restraint 形式 —— 已修（2026-08-04，与 B3 同一改动）。**
+  旧形式（`0.5*k*periodicdistance(x,y,z,x0,y0,z0)^2`，k = 25，参考点是**选中那一刻的
+  绝对笛卡尔坐标**）有两个毛病：没有平坦区；参考点在膜半各向异性 NPT 下不随盒缩放，
+  Z 方向盒长变而参考点不动 ⟹ 离子被系统性拖向膜。
+
+  新形式 `flat_bottom_anchor_relative`：
+  `0.5*k_ion*max(0, pointdistance(x1,y1,z1, x2+dx0,y2+dy0,z2+dz0) - r0_ion)^2`，
+  k = 100 kJ/mol/nm²、r₀ = 0.5 nm（§13.1），force group 6，逐 λ 相同。
+  井心 = **锚点原子当前位置 + 冻结位移 d0** ⟹ 随体系一起被 barostat 缩放。
+  锚点 = 配体重原子中离配体质心最近的那一个，两条腿同一条规则。
+
+  ⚠️ **实测 API 事实（别再猜）**：`periodicdistance` **只存在于 CustomExternalForce**；
+  `CustomCentroidBondForce` / `CustomCompoundBondForce` 都报 `unknown function`。
+  而 CustomExternalForce 只能吃绝对参考点，正是要退役的形式。可行组合是
+  `CustomCompoundBondForce` + `pointdistance` + `setUsesPeriodicBoundaryConditions(True)`
+  —— 打开 PBC 后 bond 内粒子被平移到与第一个粒子同一镜像，于是 `pointdistance`
+  **就是** minimum-image 距离（实测：离子 z=0.2、锚点 z=9.4、盒 z=12 → 0.2 nm）。
+
+  如设计所愿：`form` 变了 ⟹ 指纹变 ⟹ 旧 spec 与旧缓存自动作废；
+  `CO_ALCHEMICAL_ION_IDENTITY_PROTOCOL_VERSION` 1 → 2。退役的绝对参考点保留为审计字段
+  但**改了键名**（`reference_position_nm` → `selection_time_absolute_position_nm`），
+  还在读旧键的消费者会 KeyError 而不是静默拿到已退役的参考点。
+  证据见 `docs/TODO.md` 的 B3 + MEM-00d 条目与
+  `tests/test_charge_transfer_hamiltonian.py`。
 - [ ] **MEM-00e：restraint 自由能账目没有写进热力学循环。**
   该力加在 force group 6 且**逐 λ 相同**，所以腿内抵消；但复合物腿与溶剂腿的可用
   体积不同，§2.3 要求的"两腿是否抵消"说明目前在代码和文档里都不存在。
@@ -714,10 +745,134 @@ test_torn_rigid_water_is_caught_before_dynamics`（合成两个刚性水，
 与 `test_pbc_repair_promotes_constraints_to_bonds_for_grouping`
 （源码契约：约束补键必须在 `traj.image_molecules(` 之前）。
 
+#### ✅ 真机端到端确认（2026-08-03 23:38–23:43，`memtest/output_membrane_100ns`）
+
+MEM-15 不再只有合成测试兜着 —— **真实 100 ns 膜体系的 attachment 腿整条跑通、无 NaN**：
+
+* `pipeline.log`：23:38:40 PBC 修复报 `🔗 已把 28626 个约束补成键用于分子归组`
+  （= 9542 水 × 3，与上面因果链第 1 步的实测数字逐位一致）；
+  23:38:44 起点 `PE = −508657 kJ/mol`、`max|F| = 5292 kJ/mol/nm (idx=3353 GLU208/C)`；
+  `✓ 镜像一致性: 排除对 120895 个（最远 0.433 nm）、约束对 38349 个（最远 0.151 nm）`。
+* `attachment/stage0_attachment_monitor.csv`：1409 行覆盖 4 个 λ 态，
+  **`nan`/`inf` 出现 0 次**；温度 304–310 K，势能 −508657 → −509385 kJ/mol，
+  `max_force` 全程 ~5.2×10³ kJ/mol/nm 无发散。旧 bug 是「**不到 1 ps** 就 NaN」，
+  这次 4 态 × 300000 步全过。
+* 结果：`ΔG(A′→A) = 6.0880 ± 0.1062 kJ/mol = 1.4551 ± 0.0254 kcal/mol`
+  （BAR 主口径；TI 6.2551、MBAR 诊断 5.8793；前后半程漂移 −0.0171 kJ/mol，容差 0.6371）。
+  产物：`attachment/attachment_meta.json`、`attachment_u_kn.npy`。
+* 23:48:20 已进入 Stage 1 去电荷（12 状态线性 λ 路径）。
+
 ⚠️ **这是 §0.5.7 那个根因的第二次**：§0.5.7 是 mmCIF 往返丢掉**非标准残基的键**，
 导致 PBC 修复撕开脂质；这次是刚性水的键**从来就不在 topology 里**（只在约束里），
 导致 PBC 修复撕开水。共同教训：**"按 topology 的键归组分子"这个前提本身要验证**，
 而不是假定拓扑里有全部连通性。
+
+---
+
+### 0.5.11 pymbar 4 的 JAX 后端预分配整卡 75% 显存 → REMD 静默退 CPU（2026-08-04 已修）
+
+**这条挡住了膜体系的 Stage 1，而且伪装成"显存不够/体系太大"。**
+
+pymbar 4 的后端是 JAX；JAX 默认 `XLA_PYTHON_CLIENT_PREALLOCATE=true` +
+`XLA_PYTHON_CLIENT_MEM_FRACTION=0.75`，**一碰 GPU 就预分配整卡的 75%**。
+attachment 腿末尾要用 pymbar 解 BAR/MBAR —— 于是它把卡吃掉 75%，
+紧接着 Stage 1 要建 12 个 replica Context 就建不出来，静默回退 CPU
+（慢约两个数量级：第 0 轮交换 29 分钟，500 轮约 10 天，表现得像卡死）。
+
+日志逐行对上（`memtest/output_membrane_100ns/pipeline.log`）：
+
+```
+06:09:09  📊 [显存] 预平衡结束（Context 已清理）: used=  269 free=15574 total=16303 MiB
+06:15:21  WARNING | ******* JAX 64-bit mode is now on! *******     ← pymbar 解 MBAR
+06:15:22  📊 [显存] Stage 0 attachment 结束:        used=12197 free= 3646
+06:15:22  📊 [显存] Stage 1 建 replica 之前:        used=12197 free= 3646
+          → 建满 11 个、第 12 个 OpenMMException: No compatible CUDA device is available
+```
+
+**12197 / 16303 = 74.8%**，就是那个 0.75。12 个 Context 需要 12 × 317 = 3804 MiB，
+只剩 3646 MiB —— **差 158 MiB**。
+
+**修法**：`abfe_core.py` 顶部、**在任何 `import pymbar` 之前**
+`os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")`
+（JAX 只在初始化时读一次环境变量，设晚了等于没设）。只关预分配、**不**把 MBAR
+挪到 CPU：JAX 仍在 GPU 上按需申请，数值路径不变，不动已落盘基线。
+用 `setdefault` 所以外部可覆盖（更彻底可外部 `export JAX_PLATFORMS=cpu`，
+但那会改变 MBAR 的执行设备，属于需单独验证的改动）。
+
+**真机前后对比**（同一台机、同一体系）：
+
+| 时间点 | 修之前 | 修之后 |
+| --- | --- | --- |
+| 预平衡结束 | used=269 | used=269 |
+| **Stage 0 attachment 结束** | **used=12197** | **used=445** |
+| Stage 1 建 replica 之前 | used=12197, free=3646 → **退 CPU** | used=445, **free=15398** |
+| Stage 1 | 建到第 11 个死 | **06:34:12 → 06:53:26 跑完，全程 CUDA** |
+
+**为什么绕了很多轮（四个假设全被否掉，别再猜一遍）**：
+1. 进程内 Context 泄漏 —— 全新进程 resume 照样失败（每个进程都会重新预分配）；
+2. 体系太大 / PME 网格 —— 更**大**的可溶体系（73536 原子）12 个 Context 成功过，
+   膜只有 45354；
+3. OOM（12 个 Context 太多）—— 离线探针
+   `memtest/probe_remd_context_capacity.py` **12/12 全建成**、每个 ≈ 317 MiB、
+   共 3.8 GB，`--replay-preoptimizer` 也一样。探针成功的原因正是**它不调 pymbar**，
+   JAX 从未初始化；
+4. fork / 并行 stage —— `--parallel-stages` 2026-07-27 已整体移除，主进程串行。
+
+**教训**：**GPU 显存不是只有 OpenMM 在用。** 分析层（pymbar/JAX）、ML 势
+（torch/MACE）都会抓 VRAM，而 JAX 是**按整卡比例预分配**、不是按需。
+查这类问题第一件事是打点"开跑前 used 是多少" —— `vram_before` 这一个数
+比任何体系大小的推理都值钱。定位工具已留在仓库里：
+`REMDManager._build_replicas` 逐 Context 记显存并把失败证据**当场**落盘
+`<stage_dir>/remd_platform_fallback.json`（不能靠日志：`logger` 没有 FileHandler，
+`pipeline.log` 是 `ABFEPipeline._log` 另一条通路写的，所以回退告警在归档日志里一行都没有）；
+`ABFEPipeline._log_vram()` 在预平衡结束 / attachment 结束 / Stage 1 建 replica 之前三处打点。
+
+顺带修掉两个**真实但非元凶**的泄漏（各约一个 Context 的量）：
+* `ibs_engine.run_boresch_attachment_leg` 整段原来**没有任何 teardown**
+  （唯一的 `app.Simulation` 在 `ibs_engine.py:1494`）→ 已加显式释放。
+  ⚠️ 实测是**空操作**（`used 445 → 445`）：引用计数本来就回收了。写显式仍然对，
+  但它不是元凶，别把它当成本条的解释。
+* λ 预优化原来只 `del context, integrator, probe_sys`，而 `optimizer`
+  （`DualLambdaPreOptimizer(probe_sys, context, ...)`）仍持有 `context`
+  → 改为 `del optimizer, ...` + `gc.collect()`。实测**确实是漏**：`used 806 → 445`，
+  释放了 361 MiB。
+
+证据：`tests/test_import_time_side_effects.py` 两条新测试（源码顺序必须早于
+`import pymbar`；干净子进程 import 后标志为 `false`）。全套 979 passed / 2 skipped / 0 failed。
+
+---
+
+### 0.5.12 单次 σ 不代表 attachment 腿的跨运行散布（2026-08-04 观测；已知统计限制，不阻塞开发）
+
+同一体系、同一协议下 attachment 腿（`ΔG(A′→A)`）五次独立运行（kJ/mol）：
+
+```
+5.7726 ± 0.0969
+5.8623 ± 0.0971
+6.0786 ± 0.0976
+6.0880 ± 0.1062
+7.5216 ± 0.1141   ← 显著离群
+```
+
+| 口径 | 数值 | 相对单次 σ ≈ 0.10 |
+| --- | --- | --- |
+| 五次样本标准差 | **0.716** | ≈ 7× |
+| 五次极差 | 1.749 | (17× —— **极差不是标准差，这个比值没有校准意义**) |
+| 去掉 7.5216 后四次样本标准差 | **0.158** | ≈ **1.6×** |
+
+⚠️ **本节早前写成"跑间散布比 σ 大约 17 倍"是错的**，那是拿**极差**除以 σ 得到的。
+正确的表述只有一句：**单次 σ 不能代表跨运行散布**。
+不能据此宣称"σ 系统性低估 17 倍"——去掉离群点后只有 1.6×，属正常范围；
+`7.5216` 是**一次显著离群运行**，应当先当异常个案查清，而不是当作 σ 口径的证据。
+
+**定位到正确的优先级**：这属于 P1-19 那类"已知统计限制"，
+按 §17 的排序依赖，P1-19 阻止的是**进生产**，**并没有**规定它阻止
+B3/B4/B5 的方法开发。所以：
+* **现在不处理**，不要让它把工程闭环拽住；
+* 真正做**三重复 / benchmark / 生产验收**时再按 §13.4 的口径收口；
+* 届时先查清那次离群（λ 路径不同？起点坐标不同？前后半程漂移超容差？）。
+
+**不要**用"多跑几次取平均"当作 σ 口径的修复 —— 那是两件不同的事。
 
 ---
 
@@ -861,11 +1016,12 @@ SERT 特有的坑，**必须在 Phase A 就处理，否则会静默选错 co-ion
   - 配体净电荷为 0；
   - 不创建 co-ion；
   - APBS/Rocklin 净电荷修正必须为 0。
-- [ ] `co_alchemical_charge_transfer`
+- [x] `co_alchemical_charge_transfer` ✅ 复合物腿 2026-08-04（B3）；**溶剂腿仍待 B4**
   - 配体净电荷不为 0；
-  - 两腿都必须存在、选择并约束 co-ion；
-  - 所有 charging λ 上总电荷必须恒定；
-  - APBS/Rocklin 必须为 0。
+  - 两腿都必须存在、选择并约束 co-ion —— ⚠️ 复合物腿已实现并冻结身份，
+    **溶剂腿 builder 是 B4**，未落地，`build_and_cache_solvent_leg` fail closed；
+  - 所有 charging λ 上总电荷必须恒定 ✅ 由 `Σscale = 0` 代数保证 + 读回真实 Force 核对；
+  - APBS/Rocklin 必须为 0 ✅（B2 起就在拦双计数）。
 - [ ] `rocklin_apbs_neutralizing_plasma`
   - 允许总电荷随 λ 改变；
   - 禁止创建 co-alchemical ion；
@@ -1011,14 +1167,21 @@ sum(q_lig(lambda_q)) + q_coion(lambda_q) = q_L
 
 ### 2.2 co-ion 粒子模型
 
-- [ ] co-ion 是 System 中真实存在的粒子，必须进入 PME `NonbondedForce`。
-- [ ] 第一版只改变 charge；mass、sigma、epsilon 在所有 λ 保持不变。
-- [ ] λ=1 时它是“中性但保留 LJ 的 ion-shaped dummy”。
-- [ ] λ=0 时它成为与 `q_L` 同号的物理单价离子。
-- [ ] `q_L = +1`：使用 `0 -> +1` 的阳离子型 co-ion。
-- [ ] `q_L = -1`：使用 `0 -> -1` 的阴离子型 co-ion。
-- [ ] `|q_L| > 1`：使用多个单价 co-ion，每个最多转移一个单位电荷。
-- [ ] 非整数净电荷必须先作为输入错误调查；不要静默把它塞给一个分数价 co-ion。
+✅ 全部实现 2026-08-04（B3）。⚠️ **它必须是建系时额外预留的粒子**：λ=1 端的总电荷
+必须等于物理体系的总电荷，而普通离子已按 §4.3 把配体的形式电荷配平掉了，
+所以拿一个**已经带电**的物理盐离子当 co-ion 会让 λ=1 端总电荷少一个单位电荷。
+代码在两处 fail closed（`co_alchemical_charge_offset_plan` 与
+`verify_co_alchemical_ion_identity`），报错里直接写明"建系时额外加 |q_L| 个电荷为 0 的
+ion-shaped 粒子"。
+
+- [x] co-ion 是 System 中真实存在的粒子，必须进入 PME `NonbondedForce`。
+- [x] 第一版只改变 charge；mass、sigma、epsilon 在所有 λ 保持不变。
+- [x] λ=1 时它是“中性但保留 LJ 的 ion-shaped dummy”。
+- [x] λ=0 时它成为与 `q_L` 同号的物理单价离子。
+- [x] `q_L = +1`：使用 `0 -> +1` 的阳离子型 co-ion。
+- [x] `q_L = -1`：使用 `0 -> -1` 的阴离子型 co-ion（share 取 `sign(q_L)`，同一段代码）。
+- [x] `|q_L| > 1`：使用多个单价 co-ion，每个最多转移一个单位电荷。
+- [x] 非整数净电荷必须先作为输入错误调查；不要静默把它塞给一个分数价 co-ion。
 
 注意：当前 `abfe_core.py::GhostIonHandler` 不是这里需要的方法。它使用固定空间点和
 自定义短程形式，不是一个进入 PME 粒子电荷表的 co-alchemical ion，不能用来证明
@@ -1036,27 +1199,43 @@ sum(q_lig(lambda_q)) + q_coion(lambda_q) = q_L
   - [ ] 与配体距离足够远；
   - [ ] 与盒边的 minimum-image 距离安全；
   - [ ] 与复合物腿 co-ion 尽量使用相同水模型、离子类型和局域溶剂条件。
-- [ ] 使用可审计的 restraint；优先选择平坦区足够大的 flat-bottom restraint，
-  避免把 co-ion 锁死在一个异常水构象。
-- [ ] restraint 参考位置使用盒分数坐标或可随盒缩放的定义，不能在膜 NPT 中固定一个
-  会漂入膜内的绝对笛卡尔坐标。
-- [ ] restraint 势在所有 λ 完全相同。
+- [x] 使用可审计的 restraint；优先选择平坦区足够大的 flat-bottom restraint，
+  避免把 co-ion 锁死在一个异常水构象。✅ 2026-08-04（MEM-00d）：r₀ = 0.5 nm、
+  k = 100 kJ/mol/nm²，全部参数进身份指纹。
+- [x] restraint 参考位置使用盒分数坐标或可随盒缩放的定义，不能在膜 NPT 中固定一个
+  会漂入膜内的绝对笛卡尔坐标。✅ 走**锚点相对**：井心 = 锚点原子当前位置 + 冻结位移，
+  所以它跟着 barostat 缩放；实现口径与被否掉的两个方案见 MEM-00d 条目。
+- [x] restraint 势在所有 λ 完全相同。✅ force group 6，表达式里没有 λ，有测试逐 λ 比能量。
 - [ ] restraint 的自由能是否在两腿抵消必须写进热力学循环说明；若几何/可用体积不同，
   需要显式修正或用数值对照证明差异可忽略。
+  🔗 **MEM-00e 仍未完成**，但论证材料已经有了：两条腿用**同一条锚点规则**
+  （配体重原子中离质心最近者）、同一个 k 与 r₀ ⟹ 可用体积在两腿相同，
+  restraint 的自由能因此对消。这段论证要落到 `THERMODYNAMIC_CYCLE_DOC` 里
+  （与 B4 一起做，那时溶剂腿的 co-ion 才真正存在，可同时给数值对照）。
 
 ### 2.4 charging Hamiltonian
 
-- [ ] 修改现有 charging builder，使 ligand 和 co-ion 的电荷由同一个 `lambda_q`
-  控制，变化方向相反。
-- [ ] co-ion 电荷必须通过 PME `NonbondedForce`/其合法 λ 参数化实现。
-- [ ] 禁止用 cutoff `CustomNonbondedForce` 模拟 co-ion 的长程静电。
-- [ ] 每个 charging state 的能量矩阵同时包含 ligand 与 co-ion 的变化。
+- [x] 修改现有 charging builder，使 ligand 和 co-ion 的电荷由同一个 `lambda_q`
+  控制，变化方向相反。✅ 2026-08-04：**新增** `configure_charge_transfer_decharging`，
+  没有改 co-annihilation 那个（它按 MEM-00a-3 保留作负对照）；两者共用 restraint
+  注入与电荷账目核对，分派由冻结 spec 的 `charge_treatment` 决定、只有一个分派点。
+- [x] co-ion 电荷必须通过 PME `NonbondedForce`/其合法 λ 参数化实现。✅ particle
+  parameter offset（`base + λ·scale`），与配体走同一条机制。
+- [x] 禁止用 cutoff `CustomNonbondedForce` 模拟 co-ion 的长程静电。✅ 有测试断言
+  co-ion 不出现在任何 `CustomNonbondedForce` 的相互作用组里。
+- [x] 每个 charging state 的能量矩阵同时包含 ligand 与 co-ion 的变化。✅ u_kn 重算与
+  动力学走同一个 prepared system 构造函数、消费同一份冻结 spec。
 - [ ] TI/BAR/MBAR 的 `u_kn`、checkpoint、manifest 和协议指纹都必须包含 co-ion 身份和参数。
-- [ ] stage 2 vanishing/vdW 阶段固定：
+  ⚠️ **这条是 B5**，未完成：`configure_pme_ligand_charge_offsets` 现在会把
+  `co_alchemical_ion_fingerprint` 放进返回的 info 里，但还没有写进窗口 manifest 与
+  `_stage_protocol_key`。
+- [x] stage 2 vanishing/vdW 阶段固定：✅ 机械保证，不需要额外记状态 ——
+  co-ion 电荷是 `(1−λ_coul)·q_L`，而 vanishing 阶段 λ_coul 恒为 0。
   - ligand 电荷为 0；
   - co-ion 电荷为 `q_L`；
-  - co-ion 不参与 ligand 的 vdW decoupling。
-- [ ] 不能让 co-ion 在 stage 1 后被错误恢复成中性。
+  - co-ion 不参与 ligand 的 vdW decoupling（它就是普通环境粒子，不进炼金 vdW 集合）。
+- [x] 不能让 co-ion 在 stage 1 后被错误恢复成中性。✅ 同上：λ_coul=0 ⟹ 满电，
+  有测试 `test_stage2_holds_the_ligand_at_zero_and_the_coion_fully_charged`。
 
 ---
 
@@ -1410,22 +1589,32 @@ manifest
 
 ### 7.2 电荷守恒
 
-对每个 charging λ：
+对每个 charging λ（✅ 2026-08-04，`tests/test_charge_transfer_hamiltonian.py`）：
 
-- [ ] `sum(all NonbondedForce particle charges)` 恒定到严格数值容差。
-- [ ] ligand charge 等于 `lambda_q * q_L`。
-- [ ] co-ion charge 等于 `(1-lambda_q) * q_L`。
-- [ ] λ=1 和 λ=0 均满足预期。
-- [ ] λ 中间态也满足，而不是只检查端点。
-- [ ] energy matrix 重算使用的 charge 与动力学 System 完全一致。
+- [x] `sum(all NonbondedForce particle charges)` 恒定到严格数值容差（1e-6 e）。
+  判据是代数的：`Σq(λ) = Σq_base + λ·Σq_scale`，`Σscale = 0` 覆盖所有 λ。
+- [x] ligand charge 等于 `lambda_q * q_L`（容差 `LIGAND_CHARGE_LAMBDA_TOLERANCE_E`）。
+- [x] co-ion charge 等于 `(1-lambda_q) * q_L`。
+- [x] λ=1 和 λ=0 均满足预期，且与**独立手写参照体系**的能量（rel ≤ 1e-5）与
+  逐原子力（max|Δ| ≤ 1e-3 kJ/mol/nm）逐项对照通过（§13.2）。λ=1 的参照就是物理体系。
+- [x] λ 中间态也满足（λ = 0.37 同样做了参照对照；电荷账目取 11 个 λ 点）。
+- [x] energy matrix 重算使用的 charge 与动力学 System 完全一致 —— 两者都走
+  `_prepare_pme_coulomb_leg_system` / `_prepare_pme_mixed_alchemical_system`，
+  消费同一份冻结 spec，分派点只有一个（MEM-00c + 本轮的源码契约测试）。
 
 ### 7.3 co-ion 物理测试
 
-- [ ] co-ion mass/LJ 在 λ 间不变。
-- [ ] co-ion charge 通过 PME，不通过 cutoff ghost force。
-- [ ] restraint 在三斜/各向异性盒中 minimum-image 正确。
-- [ ] NPT 盒变化后 co-ion 不漂入膜。
-- [ ] 多 co-ion 分摊电荷时，总变化正确、每粒子不超过一个单位电荷。
+- [x] co-ion mass/LJ 在 λ 间不变（✅ 2026-08-04：sigma/epsilon offset 必须为 0）。
+- [x] co-ion charge 通过 PME，不通过 cutoff ghost force（✅ 断言粒子在 PME 的
+  particle-parameter-offset 里、且不在任何 `CustomNonbondedForce` 相互作用组里；
+  `GhostIonHandler` 已从 `ibs_engine` 完全消失）。
+- [x] restraint 在三斜/各向异性盒中 minimum-image 正确（✅ 6.0×6.0×12.0 nm 盒，
+  含"离子被回卷到盒另一头"的构造）。
+- [x] NPT 盒变化后 co-ion 不漂入膜（✅ z 方向坐标+盒同乘 1.05 后 flat-bottom 能量仍为 0；
+  同一构造下退役的绝对参考点形式会产生 >1 kJ/mol 的伪能量与一个指向膜的力）。
+- [x] 多 co-ion 分摊电荷时，总变化正确、每粒子不超过一个单位电荷（✅ q_L=+2 用 2 个
+  单价 dummy；只预留 1 个即 fail closed）。
+- [ ] ⚠️ 仍待真机：以上全部是 CPU 合成体系测试。带电体系的第一次真机验证是 §17.0 的 C1。
 
 ### 7.4 barostat
 
@@ -1654,7 +1843,16 @@ independent_repeat_id
     现在必须显式声明 `co_annihilation_experimental`。这是 §1.2 与 MEM-00a-2/00a-4
     要求的门。中性配体（当前生产体系）路径不变，基线不受影响。
   - 证据：`tests/test_charge_treatment_protocol.py`。
-- [ ] B3. 实现 PME co-alchemical ion charging Hamiltonian。
+- [x] B3. 实现 PME co-alchemical ion charging Hamiltonian。✅ 2026-08-04（含 MEM-00d）
+  `ibs_engine.configure_charge_transfer_decharging`（ligand base 0/scale q_i，
+  co-ion base share/scale −share ⟹ 逐 λ `Σscale = 0`）、
+  `abfe_core.co_alchemical_charge_offset_plan`（λ 电荷映射唯一实现，纯数学）、
+  `ibs_engine.charging_charge_conservation_report`（读回真实 Force 核对，§7.2）、
+  `_create_co_alchemical_ion_restraint`（MEM-00d flat-bottom 锚点相对）、
+  `_identify_reserved_neutral_co_ions`（charge-transfer 的身份来源，**与坐标无关**）。
+  分派由冻结 spec 的 `charge_treatment` 决定，只有一个分派点。
+  🚧 `CHARGE_TRANSFER_SOLVENT_LEG_IMPLEMENTED = False` ⟹ 循环闭不上、不得报 ΔG_bind。
+  证据：`tests/test_charge_transfer_hamiltonian.py`。详见 `docs/TODO.md` 的 B3 条目。
 - [ ] B4. 重写溶剂腿 builder，显式返回 co-ion identity。
 - [ ] B5. complex/solvent cache 加 co-ion 指纹。
 - [x] B6. membrane 模式禁用 legacy uniform-density LRC。✅ 2026-07-30（校验层 + **接线**）
@@ -1843,16 +2041,49 @@ independent_repeat_id
 
 ## 17. 与现有工作的排序依赖（原稿只在 Phase D 提了一句）
 
-膜工作**不能**在下面这些没收口之前进生产：
+### 17.0 当前主线（2026-08-04 拍定，按此顺序推进）
 
-- [ ] `docs/TODO.md` P1-19（per-window σ 系统性低估 2–4 倍）——
-  不修的话，膜体系的跨重复散布会被同一个问题污染，§13.4 的验收无法判定。
-- [ ] `docs/TODO.md` P1-23（σ 采纳路径 fail-open，真 bug）。
+**进度（2026-08-04 晚）**：② B3 已完成（含 MEM-00d），下一步是 ③ B4。
+① 仍在跑（`memtest/output_membrane_100ns`，Stage 2 vanishing 进行中）。
+
+```
+① 让当前**中性 Atenolol** 跑完整个 Stage 2 + 溶剂腿
+       ↓  这是膜 ABFE 的**工程 smoke test**：看完整主链 / 缓存 / REMD / LJ / 溶剂腿
+       ↓  能不能全跑通。**不把它当统计学最终结果**（配体净电荷 = 0，见 §0.5.1 MEM-00c）
+② B3：真正的 PME charge-transfer 哈密顿量  ✅ **已完成 2026-08-04（含 MEM-00d）**
+       ↓  身份前置条件已就位（MEM-00c 已完成"选一次 / 冻结 / 六个消费点只读核对"）
+       ↓  MEM-00d 一并解决：restraint 换成 flat-bottom + **锚点相对**（随体系缩放）。
+       ↓  身份指纹协议版本 1 → 2，旧 spec/缓存自动作废（刻意）。
+       ↓  ⚠️ 只有复合物腿；溶剂腿 fail closed，所以现在**不得报出 ΔG_bind**。
+③ B4：溶剂腿 builder（三类离子分离：中和用普通 counterion / 维持盐浓度的普通盐 /
+       ↓  参与炼金的 reserved co-ion；不许事后按残基名再猜）
+④ B5：cache / resume / provenance（等 B3/B4 的对象定义稳定后再把 identity 写进指纹）
+⑤ C1：小水盒验证
+```
+
+**不属于当前主线、明确暂不投入**：新的 APL 指标、新的膜弛豫硬门、更多 Stage 0 λ、
+重调 Boresch 力常数、更多膜专用诊断、直接做三重复、直接做 benchmark。
+
+⚠️ **MEM-00h（cutoff 不一致）走旁线**：独立立项、独立 PR，与 B3 并行分析即可，
+不许和 charge-transfer 混在一个改动里（否则哈密顿量同时变两处，误差无法二分定位）。
+但在 Phase C endpoint 验收与生产运行前必须收口。
+
+### 17.1 进生产前必须收口的（⚠️ 这些**只**阻止"进生产"，不阻止 B3/B4/B5 方法开发）
+
+- [ ] `docs/TODO.md` P1-19 / P1-19b（σ 口径与跨运行散布）——
+  已知统计限制。膜体系上的实测见 §0.5.12：五次 attachment 的样本标准差 0.716
+  （≈7× 单次 σ），但**去掉那一次显著离群后只有 0.158（≈1.6×）**，属正常范围。
+  所以它能说明"单次 σ 不代表跨运行散布"，**不能**说明"σ 系统性低估十几倍"。
+  留到真正做三重复 / benchmark / 生产验收时按 §13.4 收口，
+  **现在不处理，也不让它拽住工程闭环。**
+- [x] `docs/TODO.md` P1-23（σ 采纳路径 fail-open，真 bug）—— **已于 2026-08-03 修**：
+  采纳 σ 后重算端点 σ 门并重判 `converged`。该标志仍默认关闭，故落盘基线不变。
 - [ ] P1-22（vdW/stage2 帧选择与 σ 口径）——至少要有结论，即使结论是"维持现状"。
 - [ ] MEM-00h（cutoff 不一致）——存量问题，**必须单独立项、单独 PR**，
   不许和膜改造混在一起改，否则出问题无法二分定位。
-- [ ] MEM-00c（co-ion 身份可能在动力学与 u_kn 之间漂移）——
-  这是唯一可以、也应该**现在就查**的一条，与膜无关，只需要一个断言测试。
+- [x] MEM-00c（co-ion 身份可能在动力学与 u_kn 之间漂移）—— **已于 2026-08-04 修**：
+  身份选一次并冻结落盘，dynamics / replicas / u_kn / resume 全部只读核对，
+  无 spec 即 fail closed。B3 的前置条件已就位。详见 §0.5.1 MEM-00c 与 `docs/TODO.md`。
 
 允许并行推进的：§1.1 协议冻结、§3.3 膜输入准备、§9 膜平衡（这些是 CPU/建系工作，
 不依赖上面的估计量修复）。

@@ -7,6 +7,33 @@ ABFE 核心物理模块 (v6.0 - 完整收敛版)
 依赖：openmm, numpy, scipy, mdtraj, torch, openmmml (部分功能)
 """
 
+import os
+
+# ============================================================================
+# [P0-REMD-CUDA] 必须在**任何** pymbar/JAX import 之前执行。
+#
+# pymbar 4 的后端是 JAX，而 JAX 的默认行为是一碰 GPU 就**预分配整卡的 75%**
+# (`XLA_PYTHON_CLIENT_PREALLOCATE=true` + `XLA_PYTHON_CLIENT_MEM_FRACTION=0.75`)。
+#
+# 实测后果（2026-08-04，`memtest/output_membrane_100ns`）：attachment 腿末尾用
+# pymbar 解 BAR/MBAR，日志里 `JAX 64-bit mode is now on!` 之后紧跟着
+#     📊 [显存] Stage 0 attachment 结束: used=12197 free=3646 total=16303 MiB
+# 12197 / 16303 = **74.8%**，就是那个 0.75。于是 Stage 1 只剩 3646 MiB，
+# 而 12 个 replica Context 需要 12 × 317 = 3804 MiB —— 建满 11 个后第 12 个抛
+# `No compatible CUDA device is available`，整个 decharging 阶段静默退 CPU
+# （慢约两个数量级：第 0 轮交换 29 分钟，500 轮约 10 天）。
+#
+# 这解释了此前所有反直觉现象：离线探针能建满 12 个（它不调 pymbar，JAX 从未初始化）、
+# 更大的可溶体系反而成功、换全新进程照样失败（每个进程都会重新预分配）、
+# 以及"约 10 GB 对不上账"——那 10 GB 就是 JAX 的预分配，不是 Context 泄漏。
+#
+# 只关预分配、**不**把 MBAR 挪到 CPU：JAX 仍在 GPU 上按需申请，数值路径不变
+# （避免动已落盘的基线）。想更彻底地把显存全留给 OpenMM，可在外部导出
+# `JAX_PLATFORMS=cpu` —— 那会改变 MBAR 的执行设备，属于需要单独验证的改动。
+# 用 `setdefault`，所以外部显式设置的值优先。
+# ============================================================================
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 import openmm
 from openmm import app, unit
 import numpy as np
@@ -14,14 +41,13 @@ import math
 import re
 import warnings
 import json
-import os
 import logging
 import gc
 import builtins
 import statistics
 from itertools import combinations
 from collections import deque
-from typing import Dict, List, Tuple, Optional, Any, Callable
+from typing import Dict, List, Tuple, Optional, Any, Callable, Sequence
 from typing import OrderedDict as OrderedDictType
 from scipy.optimize import differential_evolution, least_squares, minimize
 from scipy import constants
@@ -530,13 +556,23 @@ CHARGE_TREATMENTS = (
     CHARGE_TREATMENT_CO_ANNIHILATION_EXPERIMENTAL,
 )
 
-# 🚧 B3 未落地。charge-transfer 的 charging Hamiltonian（ligand q→0 与
-# co-ion 0→q 由同一个 lambda_q 反向驱动、co-ion 电荷走 PME particle offset）
-# 还没有实现，`ibs_engine.py` 里现存的是 co-annihilation。
-# 所以本校验层即使收到一份格式完全合法的 co-ion 规格，也必须 fail closed——
-# 放行只会让用户拿到一个"声明了 charge-transfer、实际跑的是别的东西"的结果。
-# B3 落地时把它改成 True，并同时打开对应的端点测试（§7.2 / §7.3）。
-CHARGE_TRANSFER_HAMILTONIAN_IMPLEMENTED = False
+# ✅ B3 已落地（2026-08-04）：charge-transfer 的 charging Hamiltonian
+# （ligand q→0 与 co-ion 0→q 由同一个 `lam_coul` 反向驱动、co-ion 电荷走 PME
+# particle offset）实现在 `ibs_engine.configure_charge_transfer_decharging`，
+# restraint 换成 MEM-00d 的 flat-bottom 锚点相对形式。
+# 证据：`tests/test_charge_transfer_hamiltonian.py`（§7.2 逐 λ 电荷守恒 / §7.3 co-ion 物理）。
+CHARGE_TRANSFER_HAMILTONIAN_IMPLEMENTED = True
+
+# 🚧 B4 未落地：溶剂腿 builder 还不会构造"ligand + water + 普通盐 + reserved co-ion"
+# 那个盒子（§4.1）。复合物腿的哈密顿量已经可以跑（pilot / λ 阶梯重估、§6.4 明确要求
+# 用 pilot 重新定窗口数），但**整条热力学循环闭不上**：溶剂腿里没有 reserved co-ion，
+# ΔG_solv 与 ΔG_cplx 的 co-ion 项就不对消。
+#
+# 所以这里**不**在 `resolve_charge_treatment` 里一刀切 fail closed（那会连 pilot 都做不了），
+# 而是：解析结果里如实带上 `solvent_leg_builder_implemented: False`，
+# 由真正构建溶剂腿的那一处 fail closed（唯一的门，不是两套判据），
+# 且 runabfe 在开跑前就大声警告"这条运行不得报出 ΔG_bind"。
+CHARGE_TRANSFER_SOLVENT_LEG_IMPLEMENTED = False
 
 # §13.2 数值自洽的两个容差。放在这里是因为本层就要用；§13 的完整阈值表另立。
 LIGAND_NET_CHARGE_INTEGER_TOLERANCE_E = 1.0e-3
@@ -736,6 +772,17 @@ def resolve_charge_treatment(
             else "not_applicable_co_annihilation_conserves_total_charge"
         )
         payload["total_charge_conserved_at_every_lambda"] = True
+        payload["charging_hamiltonian_implemented"] = bool(
+            CHARGE_TRANSFER_HAMILTONIAN_IMPLEMENTED
+        )
+        # B4 状态如实落 provenance：一条 charge-transfer 运行现在能跑复合物腿（pilot），
+        # 但溶剂腿 builder 没落地 ⟹ 循环闭不上 ⟹ 不得报出 ΔG_bind。
+        payload["solvent_leg_builder_implemented"] = bool(
+            CHARGE_TRANSFER_SOLVENT_LEG_IMPLEMENTED
+        )
+        payload["closes_thermodynamic_cycle"] = bool(
+            CHARGE_TRANSFER_SOLVENT_LEG_IMPLEMENTED
+        ) or is_experimental
     elif resolved == CHARGE_TREATMENT_ROCKLIN_APBS:
         payload["total_charge_conserved_at_every_lambda"] = False
         payload["apbs_evidence"] = dict(apbs_evidence or {})
@@ -820,6 +867,791 @@ def _validate_co_alchemical_ion_spec(spec: Any, ligand_net_charge: int) -> None:
             f"> {TOTAL_CHARGE_CONSERVATION_TOLERANCE_E:g} e"
             "（§1.2 fail-closed 第 5 条）。总电荷必须在每个 λ 严格守恒。"
         )
+
+
+# ============================================================================
+# MEM-00c：co-ion 身份冻结（B3 的前置条件，不是 B5 的缓存细节）
+#
+# 为什么必须冻结，而不是"每个入口自己选一次就行"：
+# `ibs_engine._select_bulk_water_counterion` 按**传入坐标**当场排序挑离子
+# （主键 = 到最近溶质的 minimum-image 距离，一个连续量），没有持久化身份、
+# 也没有只读模式。而喂给它的坐标在**跨进程 resume** 时会变：
+#   · 首跑：`pre_equilibrate()` 的输出**再叠 2000 步快速最小化**；
+#   · resume（`skip_equil`）：直接读 `pre_equilibration.dcd` **末帧**，不做最小化。
+# `tests/test_coalchemical_ion_identity.py` 实测 **0.05 nm 位移就足以翻转选择结果**，
+# 而 2000 步最小化的原子位移正是 0.01–0.1 nm 量级。于是首跑用粒子 A 跑动力学、
+# resume 进程用粒子 B 重算 u_kn —— u_kn 与动力学 Hamiltonian 静默不一致，
+# ΔG 会错而没有任何异常现象。
+#
+# 落地形态（顺序不可颠倒）：
+#     选一次 → 落成 spec（含指纹） → dynamics / replicas / u_kn / resume 全部只读消费
+#     → 任何下游重选路径都不可达
+#
+# 字段直接复用 §3.4 的 `CO_ALCHEMICAL_ION_REQUIRED_FIELDS`，不另造 schema。
+# ============================================================================
+
+# v1 → v2（2026-08-04，MEM-00d + B3）：restraint 形式从"绝对笛卡尔参考点的纯谐振子"
+# 换成"锚点相对的 flat-bottom"（见下方 §2.3/MEM-00d 一节），restraint 字典的键因此
+# 整体改变。v1 的 spec 一律拒绝复用——它记的 `reference_frame` 是
+# `absolute_cartesian_at_selection_time`，那个参考点在膜半各向异性 NPT 下会把离子拖向膜。
+CO_ALCHEMICAL_ION_IDENTITY_PROTOCOL_VERSION = 2
+
+# 指纹覆盖的字段 = "任一项变化都必须拒绝旧缓存"的那张表。少一项就等于允许
+# 一个静默不一致的 resume：例如只钉 atom_index 而不钉 sigma/epsilon，
+# 换了离子类型（Cl⁻→Br⁻）却仍复用旧 u_kn。
+CO_ALCHEMICAL_ION_IDENTITY_FINGERPRINT_FIELDS = (
+    "atom_index",       # 粒子 index
+    "residue_index",    # 残基 index（index 相同但残基变了 = 拓扑换了）
+    "residue_name",     # 离子类型
+    "element",          # 离子类型
+    "mass_amu",
+    "sigma_nm",
+    "epsilon_kj_mol",
+    "charge_at_lambda1_e",  # 端点电荷
+    "charge_at_lambda0_e",
+    "restraint",        # restraint 形式 + 参考位置
+)
+
+
+# ============================================================================
+# MEM-00d：co-ion restraint 的形式（§2.3 / §13.1）
+#
+# 旧形式（v1，已退役）：`0.5*k*periodicdistance(x,y,z,x0,y0,z0)^2`，k = 25，
+# 参考点是**选中那一刻的绝对笛卡尔坐标**。它有两个毛病：
+#   1. 没有平坦区 —— §2.3 要求"平坦区足够大的 flat-bottom，避免把 co-ion 锁死在
+#      一个异常水构象"；
+#   2. 参考点在膜半各向异性 NPT 下不随盒缩放 —— Z 方向盒长变而参考点不动，
+#      离子会被系统性地拖向膜。
+#
+# 新形式：**锚点相对**的 flat-bottom。参考点 = 锚点原子当前位置 + 冻结的位移向量 d0，
+# 所以它跟着体系一起被 barostat 缩放（§2.3"可随盒缩放的定义"），而不是钉在盒坐标系里。
+#
+# 为什么用 `CustomCompoundBondForce` + `pointdistance` 而不是别的：
+#   * `periodicdistance` **只存在于 CustomExternalForce**——实测
+#     `CustomCentroidBondForce` 与 `CustomCompoundBondForce` 都报
+#     `unknown function: periodicdistance`（2026-08-04 在 OpenMM 8.5.1 上逐个试过）。
+#     而 CustomExternalForce 只能吃**绝对**参考点，正是要退役的那个形式。
+#   * `CustomCompoundBondForce` 打开 PBC 后会把同一个 bond 里的粒子平移到与第一个
+#     粒子相同的周期镜像再求值，所以 `pointdistance` 在其中**就是** minimum-image
+#     距离。实测：离子 z=0.2、锚点 z=9.4、盒 z=12 → 得 0.2 nm（不是 9.2 nm）。
+#   * 三斜/各向异性盒都走同一条 minimum-image 逻辑，无需自己写盒矩阵运算。
+#
+# 锚点取**配体重原子中离配体质心最近的那一个**，两条腿用同一条规则：
+#   * 它随体系一起缩放，消掉 MEM-00d 的系统性拖拽；
+#   * 它让"co-ion ↔ 配体 minimum-image 距离"在结构上被 restraint 本身钉住
+#     （§13.1 的全程下限从"事后诊断"变成"构造时可证"）；
+#   * 两条腿同一个锚点规则、同一个 k/r₀ ⟹ 可用体积相同，restraint 的自由能在
+#     ΔG_solv − ΔG_cplx 里对消（§2.3 末条要求的说明，见 docs 的 MEM-00e 记录）；
+#   * 取"离质心最近"而不是随便一个重原子：配体转动时该原子位移最小，井心抖动最小。
+# ============================================================================
+
+CO_ALCHEMICAL_ION_RESTRAINT_FORM_FLAT_BOTTOM = "flat_bottom_anchor_relative"
+# ⚠️ 这个表达式与 `ibs_engine._create_co_alchemical_ion_restraint` 里实际注入的
+# 必须逐字符相同 —— 它进身份指纹，所以"记录的形式"与"跑的形式"分叉就等于
+# 让一份 spec 描述了另一个哈密顿量。有契约测试钉住两者相等。
+CO_ALCHEMICAL_ION_RESTRAINT_EXPRESSION = (
+    "0.5*k_ion*max(0, pointdistance(x1,y1,z1, x2+dx0, y2+dy0, z2+dz0) - r0_ion)^2"
+)
+CO_ALCHEMICAL_ION_RESTRAINT_REFERENCE_FRAME = "anchor_atom_relative_displacement"
+# restraint 与 Boresch（force group 3）分开，且**逐 λ 完全相同**（§2.3、§6.4）。
+CO_ALCHEMICAL_ION_RESTRAINT_FORCE_GROUP = 6
+# 判"是重原子"的质量下限：H 是 1.008，D 是 2.014，最轻的重原子 C 是 12。
+CO_ALCHEMICAL_ION_ANCHOR_MIN_MASS_AMU = 2.5
+
+# 走出平坦区之后墙很软（k=100 时 0.316 nm 才 2 kT），所以"全程 ≥ 1.2 nm"这条
+# 不能只按平坦区半径算，必须再留一段热涨落余量。取 2 kT 对应的位移：
+#     0.5 * k * d² = 2 kT(300 K) = 4.988 kJ/mol  ⟹  d = 0.316 nm
+CO_ALCHEMICAL_ION_RESTRAINT_THERMAL_MARGIN_KT = 2.0
+CO_ALCHEMICAL_ION_RESTRAINT_REFERENCE_TEMPERATURE_K = 300.0
+
+
+def co_alchemical_ion_restraint_wall_margin_nm(
+    k_kj_per_mol_nm2: Optional[float] = None,
+    margin_kt: float = CO_ALCHEMICAL_ION_RESTRAINT_THERMAL_MARGIN_KT,
+    temperature_k: float = CO_ALCHEMICAL_ION_RESTRAINT_REFERENCE_TEMPERATURE_K,
+) -> float:
+    """平坦区之外还能走多远才付得起 `margin_kt` 个 kT（nm）。
+
+    用途是把 §13.1 的"co-ion ↔ 配体全程 ≥ 1.2 nm"变成**构造时可证的几何条件**，
+    而不是只靠事后逐帧诊断去发现它已经被违反了。
+
+    `k_kj_per_mol_nm2=None` 时取 §13.1 的 `COION_FLAT_BOTTOM_K_KJ_PER_MOL_NM2`
+    ——不写成默认参数值是因为那个常量在本文件里定义得更晚（§13 一节），
+    默认参数在 def 执行时求值会直接 NameError。
+    """
+    k = (
+        COION_FLAT_BOTTOM_K_KJ_PER_MOL_NM2
+        if k_kj_per_mol_nm2 is None
+        else float(k_kj_per_mol_nm2)
+    )
+    if not math.isfinite(k) or k <= 0.0:
+        raise ValueError(f"restraint 力常数必须为正有限数，收到 {k_kj_per_mol_nm2!r}")
+    kt = 0.008314462618 * float(temperature_k)
+    return math.sqrt(2.0 * float(margin_kt) * kt / k)
+
+
+def minimum_image_displacement_nm(displacement, box_vectors) -> np.ndarray:
+    """三斜盒的 minimum-image 位移（行向量盒矩阵，nm）。
+
+    这是本仓库 minimum-image 数学的**唯一**实现；`ibs_engine._minimum_image_displacement_nm`
+    是它的薄包装（那一层负责把 OpenMM Quantity / list-of-Vec3 归一成 (3,3) 数组）。
+    放在 abfe_core 是因为 co-ion 的几何判据（§13.1）在这一层就要用，而 abfe_core
+    在 ibs_engine 下层、不能反向 import。
+    """
+    delta = np.asarray(displacement, dtype=np.float64)
+    box = np.asarray(box_vectors, dtype=np.float64)
+    if box.shape != (3, 3) or not np.all(np.isfinite(box)):
+        raise ValueError("minimum-image 计算需要有限的 (3,3) 周期盒向量")
+    det = float(np.linalg.det(box))
+    if not np.isfinite(det) or abs(det) <= 1.0e-12:
+        raise ValueError("周期盒向量奇异，无法计算 minimum-image 位移")
+    fractional = delta @ np.linalg.inv(box)
+    fractional -= np.round(fractional)
+    return fractional @ box
+
+
+def co_alchemical_ion_anchor_atom_index(
+    *,
+    system: Any,
+    ligand_indices: Sequence[int],
+    positions_nm: Sequence[Sequence[float]],
+    box_vectors,
+) -> Dict[str, Any]:
+    """选 restraint 锚点原子：**离配体质心最近的配体重原子**（MEM-00d）。
+
+    两条腿用同一条规则，规则本身与坐标无关（只有"哪一个最近"这一步看坐标），
+    结果连同 minimum-image 位移一起冻结进 spec，此后只读核对。
+
+    返回 dict：`anchor_atom_index` / `anchor_position_nm` / `ligand_extent_nm`
+    （配体任一原子到锚点的最大 minimum-image 距离，供 §13.1 的几何余量判据用）。
+    """
+    indices = [int(i) for i in ligand_indices]
+    if not indices:
+        raise ValueError("配体原子列表为空，无法确定 co-ion restraint 锚点。")
+    pos = np.asarray(positions_nm, dtype=np.float64)
+    if pos.ndim != 2 or pos.shape[1] != 3:
+        raise ValueError(f"positions_nm 形状非法：{pos.shape}")
+
+    heavy = [
+        i
+        for i in indices
+        if float(system.getParticleMass(i).value_in_unit(unit.dalton))
+        >= CO_ALCHEMICAL_ION_ANCHOR_MIN_MASS_AMU
+    ]
+    if not heavy:
+        raise ValueError(
+            "配体没有质量 ≥ "
+            f"{CO_ALCHEMICAL_ION_ANCHOR_MIN_MASS_AMU} amu 的重原子，无法选 restraint 锚点。"
+        )
+
+    # 质心用 minimum-image 相对第一个重原子累加，避免配体跨周期边界时质心跑到盒中间。
+    origin = pos[heavy[0]]
+    offsets = minimum_image_displacement_nm(pos[heavy] - origin, box_vectors)
+    masses = np.asarray(
+        [float(system.getParticleMass(i).value_in_unit(unit.dalton)) for i in heavy],
+        dtype=np.float64,
+    )
+    centroid = origin + (offsets * masses[:, None]).sum(axis=0) / masses.sum()
+    distances = np.linalg.norm(
+        minimum_image_displacement_nm(pos[heavy] - centroid, box_vectors), axis=1
+    )
+    anchor_index = int(heavy[int(np.argmin(distances))])
+    extent = float(
+        np.max(
+            np.linalg.norm(
+                minimum_image_displacement_nm(
+                    pos[indices] - pos[anchor_index], box_vectors
+                ),
+                axis=1,
+            )
+        )
+    )
+    return {
+        "anchor_atom_index": anchor_index,
+        "anchor_position_nm": [round(float(v), 6) for v in pos[anchor_index]],
+        "ligand_centroid_nm": [round(float(v), 6) for v in centroid],
+        "ligand_extent_from_anchor_nm": extent,
+        "anchor_selection_rule": "ligand_heavy_atom_nearest_ligand_center_of_mass",
+        "ligand_heavy_atom_count": int(len(heavy)),
+    }
+
+
+def co_alchemical_ion_restraint_spec(
+    *,
+    anchor: Dict[str, Any],
+    reference_displacement_nm: Sequence[float],
+    flat_bottom_radius_nm: Optional[float] = None,
+    k_kj_per_mol_nm2: Optional[float] = None,
+) -> Dict[str, Any]:
+    """MEM-00d 的 restraint 描述（进身份指纹 ⟹ 改形式即作废旧 spec/缓存）。
+
+    `reference_displacement_nm` 是"锚点 → co-ion"的 minimum-image 位移，在选择那一刻
+    冻结。井心 = 锚点当前位置 + 该位移，所以它随体系一起被 barostat 缩放。
+    """
+    radius = (
+        COION_FLAT_BOTTOM_RADIUS_NM
+        if flat_bottom_radius_nm is None
+        else float(flat_bottom_radius_nm)
+    )
+    k = (
+        COION_FLAT_BOTTOM_K_KJ_PER_MOL_NM2
+        if k_kj_per_mol_nm2 is None
+        else float(k_kj_per_mol_nm2)
+    )
+    if not math.isfinite(radius) or radius <= 0.0:
+        raise ValueError(f"flat-bottom 半径必须为正有限数，收到 {radius!r}")
+    displacement = [round(float(v), 6) for v in list(reference_displacement_nm)[:3]]
+    if len(displacement) != 3:
+        raise ValueError(
+            f"reference_displacement_nm 需要 3 个分量，收到 {reference_displacement_nm!r}"
+        )
+    return {
+        "form": CO_ALCHEMICAL_ION_RESTRAINT_FORM_FLAT_BOTTOM,
+        "expression": CO_ALCHEMICAL_ION_RESTRAINT_EXPRESSION,
+        "reference_frame": CO_ALCHEMICAL_ION_RESTRAINT_REFERENCE_FRAME,
+        "k_kj_per_mol_nm2": k,
+        "flat_bottom_radius_nm": radius,
+        "force_group": CO_ALCHEMICAL_ION_RESTRAINT_FORCE_GROUP,
+        "anchor_atom_index": int(anchor["anchor_atom_index"]),
+        "anchor_selection_rule": str(anchor["anchor_selection_rule"]),
+        "reference_displacement_nm": displacement,
+    }
+
+
+def validate_co_alchemical_ion_placement(
+    *,
+    restraint: Dict[str, Any],
+    ligand_extent_from_anchor_nm: float,
+    strict: bool,
+) -> Dict[str, Any]:
+    """§13.1：flat-bottom 井是否**构造性地**保证"co-ion ↔ 配体全程 ≥ 1.2 nm"。
+
+    判据（全部量都是 minimum-image）：
+
+        |d0| − r₀ − wall_margin − ligand_extent  ≥  COION_LIGAND_MIN_IMAGE_RUNTIME_NM
+
+    `|d0|` 是锚点到 co-ion 的冻结位移长度，`ligand_extent` 是配体任一原子到锚点的
+    最大距离（锚点不是配体最外缘，所以必须减掉它），`wall_margin` 是走出平坦区
+    2 kT 对应的位移（墙很软，只算平坦区会高估约束力）。
+
+    `strict=False` 时只返回报告不 raise —— 那是 co-annihilation 实验对照专用路径
+    （MEM-00a-2：只能用于水盒/lipid slab 方法对照，其数值不得进入任何 ΔG_bind 汇总），
+    它的反离子是从既有盐里挑的物理离子、不是我们摆的，几何余量由诊断如实记录。
+    ⚠️ charge-transfer 生产路线一律 `strict=True`。
+    """
+    d0 = np.asarray(restraint["reference_displacement_nm"], dtype=np.float64)
+    d0_norm = float(np.linalg.norm(d0))
+    radius = float(restraint["flat_bottom_radius_nm"])
+    margin = co_alchemical_ion_restraint_wall_margin_nm(
+        restraint.get("k_kj_per_mol_nm2")
+    )
+    extent = float(ligand_extent_from_anchor_nm)
+    guaranteed = d0_norm - radius - margin - extent
+    report = {
+        "anchor_to_coion_distance_nm": d0_norm,
+        "flat_bottom_radius_nm": radius,
+        "wall_margin_nm": margin,
+        "wall_margin_kt": CO_ALCHEMICAL_ION_RESTRAINT_THERMAL_MARGIN_KT,
+        "ligand_extent_from_anchor_nm": extent,
+        "guaranteed_min_ligand_distance_nm": guaranteed,
+        "required_min_ligand_distance_nm": COION_LIGAND_MIN_IMAGE_RUNTIME_NM,
+        "initial_threshold_nm": COION_LIGAND_MIN_IMAGE_INITIAL_NM,
+        "satisfies_runtime_threshold": bool(
+            guaranteed >= COION_LIGAND_MIN_IMAGE_RUNTIME_NM
+        ),
+        "satisfies_initial_threshold": bool(
+            d0_norm - extent >= COION_LIGAND_MIN_IMAGE_INITIAL_NM
+        ),
+        "enforced": bool(strict),
+    }
+    if strict and not (
+        report["satisfies_runtime_threshold"] and report["satisfies_initial_threshold"]
+    ):
+        raise ValueError(
+            "co-ion 摆放不满足 §13.1 的几何余量：\n"
+            f"    锚点↔co-ion 冻结距离 |d0| = {d0_norm:.3f} nm\n"
+            f"    配体最外缘到锚点     = {extent:.3f} nm\n"
+            f"    平坦区半径 r₀        = {radius:.3f} nm\n"
+            f"    2 kT 软墙余量        = {margin:.3f} nm\n"
+            f"    ⟹ 可保证的最小配体距离 = {guaranteed:.3f} nm"
+            f"（要求 ≥ {COION_LIGAND_MIN_IMAGE_RUNTIME_NM} nm 全程、"
+            f"初始 ≥ {COION_LIGAND_MIN_IMAGE_INITIAL_NM} nm）\n"
+            "    正解是把 reserved co-ion 摆得更远（并保证 minimum-image 安全，§4.2），"
+            "不是放宽本判据或缩小 flat-bottom 半径 —— 后者只是把违反藏进事后诊断。"
+        )
+    return report
+
+
+# ============================================================================
+# B3：charging λ 的逐粒子电荷映射（§2.1 / §2.4 / §7.2）
+#
+# OpenMM 的 `NonbondedForce.addParticleParameterOffset` 给出的是
+#     q(λ) = q_base + λ · q_scale
+# 而 `ibs_engine` 的 λ 约定是 `lam_coul` 从 1 → 0。于是两条共炼金路线只差
+# "base/scale 怎么填"：
+#
+#   co-annihilation（实验对照，MEM-00a-2）：配体与**异号**反离子同步消电
+#       ligand i : base 0,        scale q_i          ⟹ q(λ) = λ q_i
+#       counterion: base 0,       scale q_phys       ⟹ q(λ) = λ q_phys
+#
+#   charge-transfer（生产，§2.1）：电荷从配体**搬到**体相水里的同号 co-ion
+#       ligand i : base 0,        scale q_i          ⟹ q(λ) = λ q_i
+#       co-ion j : base share_j,  scale −share_j     ⟹ q(λ) = (1−λ) share_j
+#
+# 两者的总电荷守恒条件是同一句话：**Σ scale = 0**。因为
+#     Σq(λ) = Σq_base + λ · Σq_scale
+# 所以 Σscale = 0 ⟺ 总电荷与 λ 无关 —— 这不是在几个 λ 点上抽查，而是对**所有** λ
+# （含中间态，§7.2 要求）的一次代数证明。co-annihilation 满足它的方式是
+# Σscale = q_L + (−q_L) = 0（异号反离子）；charge-transfer 是 q_L + (−q_L) = 0
+# （配体升、co-ion 降）。
+# ============================================================================
+
+
+def co_alchemical_charge_offset_plan(
+    *,
+    charge_treatment: str,
+    ligand_net_charge_e: int,
+    ligand_charges_e: Dict[int, float],
+    co_ion_physical_charges_e: Dict[int, float],
+) -> Dict[str, Any]:
+    """把"哪个粒子在 λ 上怎么变"算成 `{index: (base, scale)}`，并证明总电荷守恒。
+
+    纯数学层：不碰 OpenMM 对象，所以可以在没有 GPU、没有真实体系的情况下逐 λ 验。
+    `ibs_engine` 负责把结果写进 `NonbondedForce`，并在写完之后用同一份 plan 核对
+    ——生产者与校验者共用同一份真相，不各写一套。
+    """
+    q_l = int(ligand_net_charge_e)
+    if charge_treatment not in (
+        CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER,
+        CHARGE_TREATMENT_CO_ANNIHILATION_EXPERIMENTAL,
+    ):
+        raise ValueError(
+            f"charge_treatment={charge_treatment!r} 不涉及共炼金离子，"
+            "不该为它构造 charging 电荷计划。"
+        )
+    if q_l == 0:
+        raise ValueError("配体净电荷为 0：中性路径不需要共炼金电荷计划。")
+
+    plan: Dict[int, Tuple[float, float]] = {}
+    for idx, q in ligand_charges_e.items():
+        plan[int(idx)] = (0.0, float(q))
+
+    ion_indices = sorted(int(i) for i in co_ion_physical_charges_e)
+    if charge_treatment == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
+        if len(ion_indices) != abs(q_l):
+            raise ValueError(
+                f"charge-transfer 需要 {abs(q_l)} 个单价 co-ion（配体净电荷 {q_l:+d} e，"
+                f"§2.2 禁止把多个单位电荷集中到一个非物理多价粒子上），"
+                f"实际拿到 {len(ion_indices)} 个：{ion_indices}"
+            )
+        share = 1.0 if q_l > 0 else -1.0
+        for idx in ion_indices:
+            physical = float(co_ion_physical_charges_e[idx])
+            if abs(physical) > TOTAL_CHARGE_CONSERVATION_TOLERANCE_E:
+                raise ValueError(
+                    f"reserved co-ion（粒子 {idx}）在输入体系里的电荷是 "
+                    f"{physical:+.6f} e，不是 0。\n"
+                    "    charge-transfer 要求 λ=1 端它是**中性但保留 LJ 的 "
+                    "ion-shaped dummy**（§2.2），配体的净电荷则由**普通离子**在建系时"
+                    "配平（§4.3）。\n"
+                    "    换句话说：不能把一个已经带电的物理离子拿来当 co-ion —— 那样"
+                    "λ=1 端的总电荷就不再是物理体系的总电荷了。\n"
+                    "    正解是在建系时额外加入 "
+                    f"{abs(q_l)} 个电荷为 0 的 ion-shaped 粒子（B4 的溶剂腿 builder "
+                    "会这么做；复合物腿的输入拓扑必须自带）。"
+                )
+            plan[idx] = (share, -share)
+    else:
+        for idx in ion_indices:
+            plan[idx] = (0.0, float(co_ion_physical_charges_e[idx]))
+
+    base_sum = float(sum(base for base, _ in plan.values()))
+    scale_sum = float(sum(scale for _, scale in plan.values()))
+    if abs(scale_sum) > TOTAL_CHARGE_CONSERVATION_TOLERANCE_E:
+        raise ValueError(
+            f"charging 电荷计划的 Σscale = {scale_sum:+.6e} e ≠ 0，"
+            f"容差 {TOTAL_CHARGE_CONSERVATION_TOLERANCE_E:g} e。\n"
+            "    Σq(λ) = Σq_base + λ·Σq_scale，所以 Σscale ≠ 0 就意味着总电荷随 λ 变 —— "
+            "PME 会用一个逐 λ 变化的中和背景电荷把它掩盖掉，ΔG 静默出错（§7.2）。"
+        )
+    return {
+        "charge_treatment": str(charge_treatment),
+        "ligand_net_charge_e": q_l,
+        "offsets": plan,
+        "base_sum_e": base_sum,
+        "scale_sum_e": scale_sum,
+        "co_ion_indices": ion_indices,
+        "total_charge_is_lambda_independent": True,
+    }
+
+
+def charge_at_lambda(base_e: float, scale_e: float, lam: float) -> float:
+    """OpenMM particle-parameter-offset 的电荷模型：`q(λ) = base + λ·scale`。
+
+    单独抽出来是为了让"期望值"只有一处定义 —— 测试、诊断与断言都调它，
+    不各自手写一遍 `base + lam*scale`（写歪了就会自己对上自己）。
+    """
+    return float(base_e) + float(lam) * float(scale_e)
+
+
+def _canonical_fingerprint(payload: Any) -> str:
+    """稳定的 canonical-JSON sha256。dict 顺序、浮点格式都不能影响结果。"""
+    import hashlib
+
+    blob = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        default=str,
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _co_alchemical_ion_endpoint_charges(
+    charge_treatment: str,
+    physical_charge_e: float,
+    ligand_net_charge_e: int,
+    share_e: Optional[float] = None,
+) -> Tuple[float, float]:
+    """按所选电荷路线给出 co-ion 在 λ=1 / λ=0 的电荷。
+
+    λ 约定与 `ibs_engine` 一致：`lam_coul` 从 **1 → 0**，粒子电荷走
+    `addParticleParameterOffset`，即 q(λ) = λ · q_offset。
+
+    * `co_annihilation_experimental`（`ibs_engine` 现存实现）：反离子是**异号**的，
+      与配体**同步**消电 ⟹ λ=1 时是它的物理电荷、λ=0 时为 0。
+    * `co_alchemical_charge_transfer`（B3 目标）：co-ion 是**同号**的中性 dummy，
+      电荷由配体**转移**过来 ⟹ λ=1 时为 0、λ=0 时为 +q_L。
+
+    两条路线的端点电荷不同，所以它进指纹：一份 co-annihilation 的 spec
+    绝不能被一次声明 charge-transfer 的运行拿去复用。
+    """
+    if charge_treatment == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
+        # 中性 dummy → 接过配体电荷中属于**这一个粒子**的那一份。
+        # `share_e` 由调用方按 §2.2 拆成 |q_L| 个单价份额；不传时退回单 co-ion 情形
+        # （此时份额就是整份净电荷）。⚠️ 不要在这里默默把 |q_L|>1 塞给一个粒子——
+        # 那正是 §2.2 禁止的非物理多价 co-ion。
+        if share_e is None:
+            return 0.0, float(ligand_net_charge_e)
+        return 0.0, float(share_e)
+    if charge_treatment == CHARGE_TREATMENT_CO_ANNIHILATION_EXPERIMENTAL:
+        return float(physical_charge_e), 0.0
+    raise ValueError(
+        f"charge_treatment={charge_treatment!r} 不涉及 co-alchemical ion，"
+        "不应该为它构造 co-ion 身份 spec。"
+    )
+
+
+def build_co_alchemical_ion_identity(
+    *,
+    system: Any,
+    topology: Any,
+    ion_atom_indices: Sequence[int],
+    ligand_indices: Sequence[int],
+    positions_nm: Sequence[Sequence[float]],
+    box_vectors: Any,
+    ligand_net_charge_e: int,
+    charge_treatment: str,
+    lambda_direction: str = "lam_coul_1_to_0",
+    selection_provenance: Optional[Dict[str, Any]] = None,
+    flat_bottom_radius_nm: Optional[float] = None,
+    k_kj_per_mol_nm2: Optional[float] = None,
+    enforce_placement_thresholds: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """把"这一次选出来的 co-ion"固化成可落盘、可跨进程核对的身份 spec。
+
+    只在**选择发生的那一次**调用。此后所有消费者（动力学 System 构建、REMD 副本、
+    `compute_u_kn`、resume）都只读这份 spec，不再调用选择器。
+
+    restraint 的**形式不接受调用方指定**：它由 `co_alchemical_ion_restraint_spec()`
+    唯一生成（MEM-00d 的 flat-bottom + 锚点相对），调用方只能覆盖 k 与平坦区半径。
+    这样就不可能出现"spec 里记着一种形式、实际注入另一种"的分叉。参考量（锚点
+    index + 冻结位移）属于身份的一部分，所以整份 restraint 进指纹。
+
+    `enforce_placement_thresholds` 默认按路线取：charge-transfer（生产）强制 §13.1
+    几何余量，co-annihilation（实验对照）只记录诊断。见
+    `validate_co_alchemical_ion_placement` 的 docstring。
+    """
+    import openmm
+
+    nb_force = next(
+        (f for f in system.getForces() if isinstance(f, openmm.NonbondedForce)), None
+    )
+    if nb_force is None:
+        raise RuntimeError("构造 co-ion 身份需要 NonbondedForce，但 System 里没有。")
+
+    indices = [int(i) for i in ion_atom_indices]
+    if not indices:
+        raise ValueError(
+            "ion_atom_indices 为空。中性配体不需要 co-ion —— 那种情况不该走到这里"
+            "（调用方应当在 ligand_net_charge_e == 0 时完全跳过身份构造）。"
+        )
+    if len(indices) != len(set(indices)):
+        raise ValueError(f"ion_atom_indices 有重复：{indices}")
+
+    q_l = int(ligand_net_charge_e)
+    if charge_treatment == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER and len(
+        indices
+    ) != abs(q_l):
+        raise ValueError(
+            f"charge-transfer 需要 {abs(q_l)} 个单价 co-ion（配体净电荷 {q_l:+d} e，"
+            f"§2.2），实际给了 {len(indices)} 个：{indices}"
+        )
+
+    pos_nm = np.asarray(positions_nm, dtype=np.float64)
+    anchor = co_alchemical_ion_anchor_atom_index(
+        system=system,
+        ligand_indices=ligand_indices,
+        positions_nm=pos_nm,
+        box_vectors=box_vectors,
+    )
+    strict = (
+        charge_treatment == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER
+        if enforce_placement_thresholds is None
+        else bool(enforce_placement_thresholds)
+    )
+    share = (1.0 if q_l > 0 else -1.0) if q_l else 0.0
+
+    atoms = list(topology.atoms())
+    ions: List[Dict[str, Any]] = []
+    for position, index in enumerate(indices):
+        if not 0 <= index < len(atoms):
+            raise ValueError(
+                f"co-ion atom_index={index} 越界（拓扑只有 {len(atoms)} 个原子）。"
+            )
+        atom = atoms[index]
+        q, sigma, epsilon = nb_force.getParticleParameters(index)
+        physical_charge = q.value_in_unit(unit.elementary_charge)
+        q1, q0 = _co_alchemical_ion_endpoint_charges(
+            charge_treatment, physical_charge, q_l, share_e=share
+        )
+        displacement = minimum_image_displacement_nm(
+            pos_nm[index] - np.asarray(anchor["anchor_position_nm"], dtype=np.float64),
+            box_vectors,
+        )
+        ion_restraint = co_alchemical_ion_restraint_spec(
+            anchor=anchor,
+            reference_displacement_nm=displacement,
+            flat_bottom_radius_nm=flat_bottom_radius_nm,
+            k_kj_per_mol_nm2=k_kj_per_mol_nm2,
+        )
+        # 选择那一刻的绝对坐标：**只作审计记录**，不再被任何 restraint 消费。
+        # 刻意不叫 `reference_position_nm`（v1 的键名）—— 那样一个还在读旧键的消费者
+        # 会静默拿到已退役的绝对参考点；改了名字它会 KeyError，这是有意的。
+        ion_restraint["selection_time_absolute_position_nm"] = [
+            round(float(v), 6) for v in pos_nm[index]
+        ]
+        placement = validate_co_alchemical_ion_placement(
+            restraint=ion_restraint,
+            ligand_extent_from_anchor_nm=anchor["ligand_extent_from_anchor_nm"],
+            strict=strict,
+        )
+        ions.append(
+            {
+                "atom_index": int(index),
+                "placement_diagnostics": placement,
+                "residue_index": int(atom.residue.index),
+                "residue_name": str(atom.residue.name),
+                "element": str(getattr(atom.element, "symbol", "") or ""),
+                "charge_at_lambda1_e": float(q1),
+                "charge_at_lambda0_e": float(q0),
+                "sigma_nm": float(sigma.value_in_unit(unit.nanometer)),
+                "epsilon_kj_mol": float(
+                    epsilon.value_in_unit(unit.kilojoule_per_mole)
+                ),
+                "mass_amu": float(
+                    system.getParticleMass(index).value_in_unit(unit.dalton)
+                ),
+                "restraint": ion_restraint,
+                # 诊断字段（不进指纹）：物理电荷用于事后核对端点推导是否合理。
+                "physical_charge_e": float(physical_charge),
+                "spec_position": int(position),
+            }
+        )
+
+    spec: Dict[str, Any] = {
+        "protocol_version": CO_ALCHEMICAL_ION_IDENTITY_PROTOCOL_VERSION,
+        "charge_treatment": str(charge_treatment),
+        "lambda_direction": str(lambda_direction),
+        "ligand_net_charge_e": int(ligand_net_charge_e),
+        "ions": ions,
+        "selection_provenance": dict(selection_provenance or {}),
+    }
+    spec["fingerprint"] = co_alchemical_ion_identity_fingerprint(spec)
+    return spec
+
+
+def co_alchemical_ion_identity_fingerprint(spec: Dict[str, Any]) -> str:
+    """身份指纹：只吃"变了就必须作废旧缓存"的那些字段。
+
+    刻意**不吃** `selection_provenance`（当时的排序距离、水配位数等诊断量）——
+    那些数每次读坐标都会变一点，进指纹会让每次 resume 都误判成身份漂移。
+    """
+    payload = {
+        "protocol_version": int(spec["protocol_version"]),
+        "charge_treatment": str(spec["charge_treatment"]),
+        "lambda_direction": str(spec["lambda_direction"]),
+        "ligand_net_charge_e": int(spec["ligand_net_charge_e"]),
+        "ions": [
+            {field: ion[field] for field in CO_ALCHEMICAL_ION_IDENTITY_FINGERPRINT_FIELDS}
+            for ion in spec["ions"]
+        ],
+    }
+    return _canonical_fingerprint(payload)
+
+
+def verify_co_alchemical_ion_identity(
+    spec: Dict[str, Any],
+    *,
+    system: Any,
+    topology: Any,
+    charge_treatment: Optional[str] = None,
+    ligand_net_charge_e: Optional[int] = None,
+    context: str = "",
+) -> List[int]:
+    """按 spec 核对当前 System/拓扑，通过则返回被钉住的 atom_index 列表。
+
+    **只读**：任何不符都 raise，绝不"重新选一个能对上的"。这就是 MEM-00c 的修法——
+    把"每个入口自己选"换成"选一次 + 处处核对"。
+
+    返回的 index 列表可直接交给 `ibs_engine` 的 offset 注入路径使用。
+    """
+    import openmm
+
+    where = f"（{context}）" if context else ""
+    if not isinstance(spec, dict) or "ions" not in spec:
+        raise ValueError(f"co-ion 身份 spec 结构非法{where}：{type(spec).__name__}")
+
+    version = int(spec.get("protocol_version", -1))
+    if version != CO_ALCHEMICAL_ION_IDENTITY_PROTOCOL_VERSION:
+        raise ValueError(
+            f"co-ion 身份 spec 的 protocol_version={version}{where}，"
+            f"当前实现是 {CO_ALCHEMICAL_ION_IDENTITY_PROTOCOL_VERSION}。"
+            "协议版本变了就意味着字段含义可能变了，拒绝复用旧 spec；请重新选择并落盘。"
+        )
+
+    recomputed = co_alchemical_ion_identity_fingerprint(spec)
+    if recomputed != spec.get("fingerprint"):
+        raise ValueError(
+            f"co-ion 身份 spec 自身指纹不符{where}："
+            f"记录 {spec.get('fingerprint')}，重算 {recomputed}。"
+            "spec 被手工改过或写坏了 —— 不接受，请重新选择并落盘。"
+            "（不要手改 spec 让它对上；那等于把不一致藏起来。）"
+        )
+
+    if charge_treatment is not None and str(charge_treatment) != spec["charge_treatment"]:
+        raise ValueError(
+            f"co-ion 身份 spec 记录的电荷路线是 {spec['charge_treatment']!r}，"
+            f"本次运行声明的是 {charge_treatment!r}{where}。"
+            "两条路线的端点电荷不同（co-annihilation 是 q_phys→0，"
+            "charge-transfer 是 0→q_L），spec 不可跨路线复用。"
+        )
+    if (
+        ligand_net_charge_e is not None
+        and int(ligand_net_charge_e) != int(spec["ligand_net_charge_e"])
+    ):
+        raise ValueError(
+            f"co-ion 身份 spec 是为配体净电荷 {spec['ligand_net_charge_e']:+d} e 选的，"
+            f"当前体系是 {int(ligand_net_charge_e):+d} e{where}。"
+        )
+
+    nb_force = next(
+        (f for f in system.getForces() if isinstance(f, openmm.NonbondedForce)), None
+    )
+    if nb_force is None:
+        raise RuntimeError(f"核对 co-ion 身份需要 NonbondedForce，但 System 里没有{where}。")
+
+    atoms = list(topology.atoms())
+    pinned: List[int] = []
+    for ion in spec["ions"]:
+        index = int(ion["atom_index"])
+        if not 0 <= index < len(atoms):
+            raise ValueError(
+                f"co-ion atom_index={index} 越界{where}（拓扑只有 {len(atoms)} 个原子）——"
+                "拓扑变了，旧身份不可用。"
+            )
+        atom = atoms[index]
+        q, sigma, epsilon = nb_force.getParticleParameters(index)
+
+        def _check(field: str, actual: Any, tolerance: Optional[float] = None) -> None:
+            expected = ion[field]
+            if tolerance is None:
+                same = str(expected) == str(actual)
+            else:
+                same = abs(float(expected) - float(actual)) <= tolerance
+            if not same:
+                raise ValueError(
+                    f"co-ion 身份漂移{where}：atom_index={index} 的 {field} "
+                    f"记录为 {expected!r}，当前 System/拓扑给的是 {actual!r}。\n"
+                    "    这正是 MEM-00c 要拦的那类静默不一致（u_kn 与动力学"
+                    "Hamiltonian 用了不同粒子/参数）。\n"
+                    "    正解是**重跑**这条腿并重新选择 co-ion；"
+                    "**不要**放宽本核对或改 spec 让它对上。"
+                )
+
+        _check("residue_index", int(atom.residue.index))
+        _check("residue_name", str(atom.residue.name))
+        _check("element", str(getattr(atom.element, "symbol", "") or ""))
+        _check("sigma_nm", sigma.value_in_unit(unit.nanometer), 1.0e-9)
+        _check(
+            "epsilon_kj_mol", epsilon.value_in_unit(unit.kilojoule_per_mole), 1.0e-9
+        )
+        _check(
+            "mass_amu",
+            system.getParticleMass(index).value_in_unit(unit.dalton),
+            1.0e-6,
+        )
+        # 端点电荷：核对的是"当前 System 里这个粒子的电荷仍然支持记录的端点"。
+        # 注意此处的 System 可能已经被 offset 改写过——那时粒子的**基**电荷是：
+        #   * co-annihilation：0（真实电荷整份挪进 ParameterOffset）；
+        #   * charge-transfer：share（= λ=0 端电荷，offset 里放 −share）。
+        # 所以合法读数是一个小集合，逐项列出来而不是"够小就放过"。
+        current_q = q.value_in_unit(unit.elementary_charge)
+        expected_physical = float(ion.get("physical_charge_e", current_q))
+        acceptable = [expected_physical, 0.0]
+        if spec["charge_treatment"] == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
+            acceptable.append(float(ion["charge_at_lambda0_e"]))
+            # charge-transfer 的 co-ion 必须是**中性 dummy**（§2.2）。这一项不在指纹里，
+            # 所以只有在这儿核对才能拦住手改过的 spec。
+            if abs(expected_physical) > TOTAL_CHARGE_CONSERVATION_TOLERANCE_E:
+                raise ValueError(
+                    f"co-ion 身份非法{where}：atom_index={index} 记录的物理电荷是 "
+                    f"{expected_physical:+.6f} e，而 charge-transfer 要求 λ=1 端它是"
+                    "中性但保留 LJ 的 ion-shaped dummy（§2.2）。"
+                    "带电的物理离子不能当 co-ion —— 那样 λ=1 端总电荷就不是物理体系的了。"
+                )
+        if all(abs(current_q - value) > 1.0e-6 for value in acceptable):
+            raise ValueError(
+                f"co-ion 身份漂移{where}：atom_index={index} 的物理电荷记录为 "
+                f"{expected_physical:+.6f} e，当前 System 给的是 {current_q:+.6f} e"
+                f"（本路线可接受的基电荷读数：{acceptable}）。"
+                "离子类型变了 —— 旧 u_kn 与旧动力学都不可复用。"
+            )
+
+        # restraint：spec 记录的形式必须就是当前实现会注入的那一个（MEM-00d）。
+        # 形式对不上意味着这份 spec 描述的是另一个哈密顿量。
+        restraint = ion.get("restraint") or {}
+        if restraint.get("form") != CO_ALCHEMICAL_ION_RESTRAINT_FORM_FLAT_BOTTOM:
+            raise ValueError(
+                f"co-ion restraint 形式不符{where}：spec 记的是 {restraint.get('form')!r}，"
+                f"当前实现是 {CO_ALCHEMICAL_ION_RESTRAINT_FORM_FLAT_BOTTOM!r}（MEM-00d："
+                "旧的『绝对笛卡尔参考点纯谐振子』已退役，它在膜半各向异性 NPT 下会把"
+                "离子系统性拖向膜）。请重新选择 co-ion 并落盘新 spec。"
+            )
+        if restraint.get("expression") != CO_ALCHEMICAL_ION_RESTRAINT_EXPRESSION:
+            raise ValueError(
+                f"co-ion restraint 表达式不符{where}：spec 记的是 "
+                f"{restraint.get('expression')!r}。它必须与实际注入的逐字符相同。"
+            )
+        anchor_index = int(restraint.get("anchor_atom_index", -1))
+        if not 0 <= anchor_index < len(atoms):
+            raise ValueError(
+                f"co-ion restraint 锚点 atom_index={anchor_index} 越界{where}"
+                f"（拓扑只有 {len(atoms)} 个原子）——拓扑变了，旧身份不可用。"
+            )
+        pinned.append(index)
+
+    if len(pinned) != len(set(pinned)):
+        raise ValueError(f"co-ion 身份 spec 出现重复 atom_index{where}：{pinned}")
+    return pinned
 
 
 # ============================================================================
@@ -2765,6 +3597,11 @@ def run_membrane_quality_gate(
     emit(f"\n[膜质量门 · {mode}] 读取预平衡轨迹并计算 §9 观测量...")
     try:
         traj = md.load(traj_path, top=md.Topology.from_openmm(openmm_topology))
+        # [MEM-17 已移除] 曾经在这里对账「帧数 == n_steps // reporter_interval」，
+        # resume 追加的重复帧会让它 fail closed。判据本身算得没错（重复帧是真的），
+        # 但它拦的是主线而不是根因：根因在 `abfe_pipeline.pre_equilibrate` 里
+        # `DCDReporter(append=True)` 不截断到 checkpoint 帧边界。
+        # 2026-08-03 用户决定删掉这道对账，**不要再加回来**；要修就修上游截断。
         observables, diagnostics = membrane_observables_from_trajectory(
             traj,
             ligand_resname=ligand_resname,

@@ -11,14 +11,18 @@
 以及 MEM-00a-2：`co_annihilation_experimental` 在膜体系一律 fail closed，
 输出必须带 `experimental_not_for_production: true`。
 
-## 一条刻意的 fail-closed：B3 未落地
+## B3 已落地、B4 还没有（2026-08-04 更新）
 
-`CHARGE_TRANSFER_HAMILTONIAN_IMPLEMENTED = False`。即使给出一份格式完全合法的
-co-ion 规格，`co_alchemical_charge_transfer` 也会抛 `NotImplementedError`——因为
-`ibs_engine.py` 里现存的共炼金实现是 **co-annihilation**，不是 charge-transfer
-（MEM-00a）。放行只会让用户拿到一个"声明了 charge-transfer、实际跑的是别的
-哈密顿量"的结果。B3 落地时把那个常量改成 True，本文件对应的两条测试会失败，
-那是提醒改写的钩子。
+`CHARGE_TRANSFER_HAMILTONIAN_IMPLEMENTED = True`：charging Hamiltonian 实现在
+`ibs_engine.configure_charge_transfer_decharging`（ligand q→0 / co-ion 0→q，
+restraint 换成 MEM-00d 的 flat-bottom 锚点相对形式），所以本层不再对合法的 co-ion
+规格抛 `NotImplementedError`。原先那条"提醒改写的钩子"已经按设计触发过了。
+
+`CHARGE_TRANSFER_SOLVENT_LEG_IMPLEMENTED = False`：溶剂腿 builder（§4.1）是 B4。
+这个状态**不**在本层 raise —— 那会连 §6.4 要求的 pilot / λ 阶梯重估都做不了；
+它作为 `solvent_leg_builder_implemented` / `closes_thermodynamic_cycle` 落进解析结果
+与 provenance，真正的门在 `runabfe.build_and_cache_solvent_leg`（唯一一处）。
+⚠️ 一条声明 charge-transfer 的运行在 B4 落地前**不得报出 ΔG_bind**。
 
 ## 对现有生产路径的影响
 
@@ -101,29 +105,49 @@ def test_charged_ligand_with_neutral_treatment_fails():
         core.resolve_charge_treatment("neutral", ligand_net_charge_e=1.0)
 
 
-def test_charged_ligand_with_coion_passes_validation_but_hamiltonian_is_not_implemented():
-    """§7.1 第 3 条：带电配体 + co-ion → 校验通过，但 B3 未落地故 fail closed。
+def test_charged_ligand_with_coion_passes_validation_and_reports_the_open_solvent_leg():
+    """§7.1 第 3 条：带电配体 + co-ion → 校验通过。
 
-    分两步断言，把"规格校验过了"与"哈密顿量还没有"区分开——否则一旦 B3 落地，
-    看不出当初是哪一环在挡。
+    ⚠️ 2026-08-04 起这条断言变了：**B3（charging Hamiltonian）已落地**，所以这里不再
+    抛 `NotImplementedError`。原先那个"分两步断言"的设计意图（把"规格校验过了"与
+    "哈密顿量还没有"分开，好让 B3 落地时看得出当初是哪一环在挡）就在这一刻兑现了 ——
+    挡住的那一环是哈密顿量，现在它有了。
+
+    还没有的是 **B4 溶剂腿 builder**，所以解析结果必须如实说"循环闭不上"。
+    这个状态**不**在这里 raise：那会连 §6.4 要求的 pilot / λ 阶梯重估都做不了。
+    真正的门在 `runabfe.build_and_cache_solvent_leg`（唯一一处，见
+    `tests/test_charge_transfer_hamiltonian.py::
+    test_solvent_leg_builder_is_still_fail_closed_for_charge_transfer`）。
     """
     spec = _coion(+1.0)
     # 规格本身合法：单独校验不抛错。
     core._validate_co_alchemical_ion_spec(spec, 1)
 
-    with pytest.raises(NotImplementedError, match="Phase B3"):
-        core.resolve_charge_treatment(
-            "co_alchemical_charge_transfer",
-            ligand_net_charge_e=1.0,
-            co_alchemical_ion=spec,
-        )
+    payload = core.resolve_charge_treatment(
+        "co_alchemical_charge_transfer",
+        ligand_net_charge_e=1.0,
+        co_alchemical_ion=spec,
+    )
+    assert payload["charge_treatment"] == "co_alchemical_charge_transfer"
+    assert payload["charging_hamiltonian_implemented"] is True
+    assert core.CHARGE_TRANSFER_HAMILTONIAN_IMPLEMENTED is True
+    # B4 未落地 ⟹ 不得报出 ΔG_bind，这一条必须能从解析结果直接读出来。
+    assert payload["solvent_leg_builder_implemented"] is False
+    assert payload["closes_thermodynamic_cycle"] is False
+    # APBS 仍然一律为 0（co-ion 路线与 Rocklin 二选一，禁止双计数）。
+    assert payload["apbs_applicable"] is False
+    assert payload["apbs_correction_kJ_mol"] == 0.0
+    assert (
+        payload["apbs_not_applicable_reason"]
+        == "not_applicable_co_alchemical_charge_transfer"
+    )
 
 
 def test_coion_with_nonzero_apbs_fails():
     """§7.1 第 4 条 / §1.2 fail-closed #1：co-ion + 非零 APBS → 失败（重复修正）。
 
-    必须在 B3 的 NotImplementedError 之前就拦下——双计数是协议错误，
-    不该被"反正还没实现"掩盖。
+    必须在"缺 co-ion"之前就拦下——双计数是协议错误，
+    不该被别的检查顺序掩盖（检查顺序有意义，本文件另有测试钉住）。
     """
     with pytest.raises(ValueError, match="重复修正"):
         core.resolve_charge_treatment(
@@ -330,8 +354,9 @@ def test_tiny_numerical_residue_in_net_charge_is_tolerated_as_neutral():
 def test_charged_ligand_defaults_to_charge_transfer_not_to_the_legacy_path():
     """不声明时带电配体默认 charge-transfer，而不是沿用现存的 co-annihilation。
 
-    §1.2 的生产默认值。因为 B3 未落地，这里表现为 NotImplementedError 而不是
-    静默走旧路径——这正是想要的行为（MEM-00a-4：旧带电配体数据一律作废）。
+    §1.2 的生产默认值。默认解析成 charge-transfer 之后，因"没有提供 co_alchemical_ion"
+    而失败 —— 而不是静默落回 neutral、也不是沿用旧的 co-annihilation
+    （MEM-00a-4：旧带电配体数据一律作废）。
     """
     # 默认解析成 charge-transfer，于是因"没有提供 co_alchemical_ion"而失败——
     # 而不是静默落回 neutral、也不是沿用旧的 co-annihilation。

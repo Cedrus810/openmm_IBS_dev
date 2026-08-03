@@ -70,7 +70,7 @@ Boresch 锚点或口袋力估计，尚未进入 ABFE production Hamiltonian。
 | 完整 MACE 生产路线 | 停止；PythonForce/CUDA MTS 在 EXP-009 后端资格失败 |
 | 当前路线 | EXP-012：CV-free 通用局部残差路径势；frozen-MACE latent 是主要候选表示，XED 仅作可选消融 |
 | EXP-011 冻结状态 | `FORMAL_RUN1_OVERLAP_FAILED`；AUG-001 后 mutual overlap `0.02353 < 0.03` 且 22 个去相关样本 `< 25`，不再补采、不拟合 PMF |
-| EXP-012 状态 | `PLANNED / PREREG_DRAFT_V2`；三条 run 的逐帧五态 CUDA ledger 已完成并通过 SHA/System/账本闭合及 CPU/CUDA 审计；主命名已迁移为 `local_residual` A/B/C/D，尚未冻结表示细节、(A_k)、训练预算和数值门，因此未 sealed、未训练模型 |
+| EXP-012 状态 | `PLANNED / PREREG_DRAFT_V2 / C1_REAL_FRAME_CPU_PASSED`；三条 run 的逐帧五态 ledger 与 backend audit 已通过；MACE-OMOL-0 extra-large-1024 在 Atenolol `run1/frame0` 的两层、6 Å 精确图闭包上完成 CPU float32 latent/autograd smoke：2135 节点、155624 条有向边、ligand latent `[41,1024]`，ligand/environment 梯度均有限且非零，MACE 参数梯度为零；CUDA 同帧尚未执行，未 sealed、未训练模型 |
 | EXP-010 教师局部选择 | ligand 41 + protein atoms 216；事后审计显示 26 个涉及残基全部是不完整截断，仅作失败证据 |
 | cheap-CV 候选 | EXP-010 的 1D order 2/4/6、2D order 2/3/4 全部不晋级；当前无 production 候选 |
 | production 接入 | 尚未进行；生产模块明确不导入独立研发模块 |
@@ -124,7 +124,10 @@ B_\theta^{\rm local}(\mathbf R)
 
 这里 MACE latent 是学习到的局部几何/化学表示，不能宣称为真实电子密度、孤对电子或
 Pauli/exchange 能量。它也不会自动解决局部图边界：必须冻结 ligand/environment 原子身份、
-cutoff、message-passing receptive-field buffer、PBC、元素/电荷支持域和 ligand-only readout。
+cutoff、message-passing 图闭包、PBC、元素/电荷支持域和 ligand-only readout。两层、6 Å
+cutoff 的节点支持域必须定义为图上的两跳闭包
+`S0=L, S1=N_6Å(S0), S2=N_6Å(S1)`；12 Å 仅是最远几何上界，禁止用 ligand-centered
+12 Å 球替代两跳闭包。
 不再复用 `E(complex)-E(ligand)-E(environment)` subtraction。
 
 必须区分两种执行路线：
@@ -133,6 +136,11 @@ cutoff、message-passing receptive-field buffer、PBC、元素/电荷支持域�
   每步通过 autograd 产生守恒力；表示最强，但仍承担 MACE forward/backward 成本。
 - **L2：MACE latent 离线 teacher + 轻量可导 student。** 用 latent/gap 诊断指导一个
   小型局部等变 encoder；production 不运行完整 MACE，优先争取 ESS/GPU-hour。
+
+  **现状（DEC-030，2026-08-04，见 EXPERIMENT_LOG）**：当前路线正式定性为 L2。
+  `original_6a`/`derived_5a` 是离线 teacher，`LocalResidualStudent`（尚不存在代码）
+  是唯一在线模型。L1 定义本身不删除，但降级为非当前下一步——原因见下方对
+  line 190 要求的回应，不是绕开它。
 
 `get_descriptors()` 式 NumPy 输出只能用于离线诊断。若在 production 中把 descriptor 当作
 预计算常数，就无法对新坐标产生正确的 \(-\nabla_{\mathbf R}B\)。在线路线必须直接包装
@@ -187,6 +195,14 @@ TYK2/CDK2 通常属于 RBFE benchmark，必须在 RBFE Hamiltonian/ledger 接口
 - 不因 MLP 很小就假定在线 MACE 足够便宜，必须实际比较 L1/L2 的 ESS/GPU-hour；
 - \(A_0=A_K=0\) 指全局物理 alchemical 端点，跨窗口共享 λ 的模型和系数必须一致；
 - XED 若保留，只能作为 Arm D 特征消融，不向 PME 增加第二套静电。
+
+DEC-030 对上面第四条的回应：本 session 已实测 teacher 侧单帧离线 latent 提取
+成本（`derived_5a` CUDA 19.8s、`original_6a` CPU 172.7s，仅一次 forward+backward），
+每 MD 步预算需要 O(ms) 级，两者差 3–4 个数量级。这不是"因为 MLP 很小就假定便宜"，
+而是 teacher 自己最便宜的离线成本就已经比每步预算慢几个数量级，与 student 本身
+的成本无关。因此 L1 在当前证据下降级为非当前下一步，不是未经比较就排除；完整
+逐 step ESS/GPU-hour 对照仍保留在 §WP-4C.3 待执行列表中，只是不再是优先级最高的
+下一步。
 ---
 
 ## 3. 数学定义

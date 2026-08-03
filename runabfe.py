@@ -41,6 +41,8 @@ from abfe_core import (
     resolve_membrane_protocol,  # 膜体系协议唯一解析实现（B1）
     resolve_environment_type,  # 只看 config 的环境类型规范化（不需要 topology）
     resolve_charge_treatment,  # 净电荷处理协议唯一校验实现（B2）
+    CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER,  # B3 生产路线；溶剂腿 builder 是 B4
+    CHARGE_TRANSFER_SOLVENT_LEG_IMPLEMENTED,  # B4 状态，进 provenance 与开跑前告警
     resolve_dispersion_protocol,  # LJ/色散路线唯一校验实现（B6）
     resolve_forcefield_family,  # 力场族识别唯一实现（§1.1）
     acceptance_thresholds_payload,  # §13 阈值快照，进 provenance
@@ -837,10 +839,31 @@ def build_and_cache_solvent_leg(
     ionic_strength_molar: float = DEFAULT_SOLVENT_IONIC_STRENGTH_MOLAR,
     cache_identity: Optional[Dict] = None,
     padding_nm: float = SOLVENT_PADDING_NM,
+    charge_treatment: Optional[str] = None,
 ):
     """
     🔑 终极纯净版：彻底抛弃 mmCIF，直接从原始 .top 提取配体并自动加水。
+
+    ⚠️ [B4 未落地] 本 builder 只产 `ligand + water + 普通盐` 的盒子。§4.1 要求
+    charge-transfer 的溶剂腿还必须显式产出 **reserved co-alchemical ion**，
+    并把三类电荷来源（配体形式电荷 / 中和+盐浓度的普通离子 / reserved co-ion）
+    分开登记（§4.3）。那是 B4，尚未实现，所以这里 fail closed。
     """
+    # 唯一的 B4 门：放在真正建溶剂盒的这一处，而不是再在上游写一遍判据。
+    if charge_treatment == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
+        raise NotImplementedError(
+            "charge_treatment=co_alchemical_charge_transfer 的**溶剂腿 builder 尚未实现**"
+            "（memtodolist Phase B4）。\n"
+            "    复合物腿的 charging Hamiltonian 已经可用（B3，2026-08-04），可以用它做"
+            "pilot / λ 阶梯重估（§6.4 明确要求用 pilot 重定 stage1 窗口数）；\n"
+            "    但溶剂腿里没有 reserved co-ion，ΔG_solv 与 ΔG_cplx 的 co-ion 项就不对消，"
+            "热力学循环闭不上 ⟹ **不得报出 ΔG_bind**。\n"
+            "    需要的是 §4.1 那个一次性产出 "
+            "`ligand + water + ordinary salt/counterions + reserved co-alchemical ion` "
+            "并返回 `coion_indices` / `ordinary_ion_indices` 的 builder。\n"
+            "    ⚠️ 不要为了跑通而在这里临时挑一个盐离子当 co-ion —— 那既不是"
+            "charge-transfer（λ=1 端必须是中性 dummy），也会让两腿离子强度口径分叉（§4.3）。"
+        )
     padding_nm = float(padding_nm)
     log.info("💧 正在构建溶剂相 (配体腿) 系统并生成缓存...")
     from openmm.app import Modeller, ForceField
@@ -1742,6 +1765,14 @@ def _write_run_provenance(
         provenance["apbs_applied"] = charge_protocol.get("apbs_applied")
         if charge_protocol.get("experimental_not_for_production"):
             provenance["experimental_not_for_production"] = True
+        # B3/B4 实现状态如实落盘：一条声明 charge-transfer 的运行到底闭不闭合循环，
+        # 事后必须能从 provenance 直接读出来，而不是靠回忆当时代码到哪一步了。
+        if charge_protocol.get("closes_thermodynamic_cycle") is False:
+            provenance["closes_thermodynamic_cycle"] = False
+            provenance["must_not_report_delta_g_bind"] = True
+            provenance["incomplete_cycle_reason"] = (
+                "charge_transfer_solvent_leg_builder_not_implemented_phase_b4"
+            )
     provenance["input_files"] = {
         "gro": config.get("gro"),
         "top": config.get("top"),
@@ -2859,6 +2890,9 @@ def run_prepare_command(args):
         ),
         dispersion_protocol=getattr(args, "dispersion_protocol", None),
         forcefield_family=getattr(args, "forcefield_family", None),
+        # [B3] 净电荷路线：两条腿必须传同一个（§6.1）。它只决定 co-ion 身份怎么冻结，
+        # 中性配体（当前生产体系）根本不进 co-ion 分支，行为逐位不变。
+        charge_treatment=getattr(args, "charge_treatment", None),
     )
 
     # 5. 预平衡生成轨迹
@@ -2937,6 +2971,7 @@ def run_traditional_mode(config: RunConfig):
             gmx_include_dir=find_gmx_include_dir(config.gmx_path),
             ionic_strength_molar=config.solvent_ionic_strength_molar,
             cache_identity=solvent_identity,
+            charge_treatment=config.get("charge_treatment"),
         ):
             raise RuntimeError("traditional 模式自动构建溶剂腿缓存失败。")
 
@@ -2961,6 +2996,7 @@ def run_traditional_mode(config: RunConfig):
             ),
             dispersion_protocol=config.get("dispersion_protocol"),
             forcefield_family=config.get("forcefield_family"),
+            charge_treatment=config.get("charge_treatment"),
         )
         boresch_restraint = resolve_boresch_restraint(config, boresch_pipeline)
         if boresch_restraint:
@@ -3346,6 +3382,8 @@ def _run_boresch_attachment_only(
         forcefield_family=source_pipeline.dispersion_protocol_info.get(
             "forcefield_family"
         ),
+        # 净电荷路线同样继承：换了它 co-ion 身份与 charging 哈密顿量就变。
+        charge_treatment=getattr(source_pipeline, "charge_treatment", None),
     )
     run_provenance = _write_run_provenance(
         rerun_dir,
@@ -3512,6 +3550,8 @@ def _run_complex_charging_only(
         forcefield_family=source_pipeline.dispersion_protocol_info.get(
             "forcefield_family"
         ),
+        # 净电荷路线同样继承：换了它 co-ion 身份与 charging 哈密顿量就变。
+        charge_treatment=getattr(source_pipeline, "charge_treatment", None),
     )
     run_provenance = _write_run_provenance(
         rerun_dir,
@@ -3971,6 +4011,18 @@ def main():
                 "⚠️ charge_treatment=co_annihilation_experimental 是**实验对照专用**，"
                 "其数值不得进入任何 ΔG_bind 汇总（memtodolist MEM-00a-2）。"
             )
+        if (
+            _charge_protocol["charge_treatment"]
+            == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER
+            and not CHARGE_TRANSFER_SOLVENT_LEG_IMPLEMENTED
+        ):
+            # 开跑前就说清楚，而不是让人烧几小时复合物腿再在溶剂腿撞墙。
+            # 真正的门在 `build_and_cache_solvent_leg`（唯一一处），这里只负责告知。
+            log.warning(
+                "⚠️ charge-transfer 的**溶剂腿 builder 尚未落地（B4）**：本次运行可以跑"
+                "复合物腿（B3 的 charging 哈密顿量已实现，适合做 pilot / λ 阶梯重估），"
+                "但热力学循环闭不上 —— **不得报出 ΔG_bind**。到溶剂腿会 fail closed。"
+            )
 
     # 力场族与 LJ/色散路线（memtodolist §1.1 / §1.3，B6）。同样在建 Context 之前判死。
     # 力场族识别只在**膜体系或用户显式声明了色散路线/力场族**时才强制——可溶体系
@@ -4170,6 +4222,7 @@ def main():
                 gmx_include_dir=include_dir,
                 ionic_strength_molar=config.solvent_ionic_strength_molar,
                 cache_identity=solvent_identity,
+                charge_treatment=_charge_protocol["charge_treatment"],
             ):
                 log.error("❌ 自动构建溶剂腿失败，无法继续一键 ABFE")
                 sys.exit(1)
@@ -4196,6 +4249,7 @@ def main():
         ),
         dispersion_protocol=_dispersion_protocol["dispersion_protocol"],
         forcefield_family=_dispersion_protocol["forcefield_family"],
+        charge_treatment=_charge_protocol["charge_treatment"],
         # §9 质量门需要的显式输入，从膜输入声明里取（可溶体系为空 dict，不进该分支）。
         membrane_quality_inputs=(
             {
@@ -4214,6 +4268,11 @@ def main():
             }
             | {
                 "composition": _system_composition,
+                # [MEM-17 已移除 2026-08-03] 这里曾传 `expected_pre_equilibration_frames`
+                # 给 §9 质量门做帧数对账。resume 追加的重复帧是真的（实测那条 100 ns
+                # 多 1 帧），但对账拦的是主线而不是根因 —— 根因在
+                # `abfe_pipeline.pre_equilibrate` 的 `DCDReporter(append=True)`
+                # 没有先把 DCD 截断到 checkpoint 帧边界。按用户决定删除，别再加回来。
                 # §9 的判据吃的是**总**平衡时长（上游 + 本流程），不是只看本流程。
                 # 上游时长不可考时传 None，提取器会退回用轨迹自身跨度——那是我们
                 # 唯一能实测到的时长，比塞一个编出来的数诚实。
@@ -4404,6 +4463,9 @@ def main():
         platform_name=config.platform,
         dispersion_protocol=_dispersion_protocol["dispersion_protocol"],
         forcefield_family=_dispersion_protocol["forcefield_family"],
+        # ⚠️ 与恒压器方向相反：色散路线与净电荷路线**必须**两腿相同（§1.3 路线 A / §6.1），
+        # 只有 environment_type/membrane 是溶剂腿刻意不接的。
+        charge_treatment=_charge_protocol["charge_treatment"],
     )
     
     # 运行溶剂腿 (🔑 强制关闭 Boresch)

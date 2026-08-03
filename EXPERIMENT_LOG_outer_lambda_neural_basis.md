@@ -45,12 +45,13 @@ EXP-002
 
 | 项目 | 当前值 |
 |---|---|
-| 总体阶段 | WP-0 完成；EXP-009/010/011 均已失败并冻结；EXP-012 已升级为 CV-free 通用局部残差路线，preregistration 仍为 draft |
+| 总体阶段 | WP-0 完成；EXP-009/010/011 均已失败并冻结；EXP-012 为 CV-free 通用局部残差路线，C1 合成图 MACE graph/latent 合约已通过，preregistration 仍为 draft |
 | 当前基础势 | `softcore` 原型；生产模块尚未接入神经路径 |
 | 当前目标窗口 | complex vanishing window 0，Stage 2 states `[0,5)` |
 | 历史慢变量 | primary ligand torsion `[4591,4592,4593,4585]` 仅保留为 EXP-010/011 诊断证据；EXP-012 不预设单一 torsion CV |
 | 当前训练目标 | 最小化完整 MM 相邻态双向 target-state gap variance；不预设慢 CV，frozen-MACE latent 为主要候选表示 |
-| 当前生产候选 | 无；EXP-012 三条逐帧五态 ledger 与 backend 审计已完成，但未冻结/执行 A/B/C/D 表示消融、模型、Force 或 NVT 资格 |
+| 当前路线定性 | L2（DEC-030）：`original_6a`/`derived_5a` 为离线 teacher，`LocalResidualStudent`（尚不存在代码）为唯一在线模型；L1 降级为非当前下一步 |
+| 当前生产候选 | 无；`original_6a`（6 Å，DEC-024）CPU C1 通过，CUDA float32 对照三次尝试均在同一算子 OOM（`BLOCKED_ON_VRAM`，非碎片化，见 DEC-026/11A.11），6 Å 的 gradient checkpointing 尚未实现；`derived_5a`（5 Å，DEC-027）frame0-only 固定 manifest 的 CPU/CUDA C1（DEC-028/029）已被 DEC-032 撤销固定图策略取代，不再作为 teacher 图构造方式；模型训练、Force 和 NVT 均未进行。DEC-031：跨 1500 帧闭包并集重建 manifest 使候选池膨胀到 4874 原子/4915 节点（比 `original_6a` 已 OOM 的 2135 节点图更大），该方向已被 DEC-032 撤销。DEC-032：teacher 是离线工具、不进 OpenMM，正式改为逐帧独立精确两跳闭包（无固定图、无整残基收口），`local_residual/teacher_graph.py` 与三个配套脚本（equivalence smoke、per-frame geometry 扫描、per-frame C1 smoke）已写好但均未在真实数据上执行 |
 | 神经路径协议版本 | 独立模块 v1 已实现；production 未接入且明确保持隔离 |
 | 已完成实验数 | 11；EXP-008 与 EXP-012 尚未执行 |
 | 已通过实验数 | 7；EXP-006、EXP-009、EXP-010、EXP-011 失败 |
@@ -81,6 +82,19 @@ EXP-002
 | 2026-08-02 | DEC-017 | 冻结 EXP-011 目标加权周期 PMF 协议；历史三 run 仅用于覆盖诊断，不用空 bin 产模 | 7/24 pooled bins 为空；三 run 周期有效样本数为 141.41/6.62/3.76；最低 pairwise Bhattacharyya overlap 为 0.328 | 状态为 `PREREGISTERED / SAMPLING_REQUIRED`；下一步受限/增强采样，WP-5 保持未开始 |
 | 2026-08-03 | DEC-018 | 冻结 EXP-011 失败并登记 EXP-012：完整 MM 基线 + XED-inspired 局部场 + ligand-only 短程路径残差 | AUG-001 后 mutual overlap 0.02353 < 0.03 且 22 个去相关样本 < 25；EXP-010 fragment-total MACE 边界不闭合 | 不再补采/拟合 EXP-011；EXP-012 先做 atom-centered / +XED / +overlap 三层消融，未证明增量前不训练完整 MACE、不进入 WP-5 |
 | 2026-08-03 | DEC-019 | 将 EXP-012 从 XED 专项升级为 CV-free 通用局部残差路径势；frozen-MACE latent 作为主要候选，XED 降为可选 Arm D | MACE 可提供中间层 node descriptors，但在线守恒力必须保留 encoder 对坐标的 autograd；单 CV PMF 已在 EXP-011 失败，gap variance 可直接针对 overlap 瓶颈 | 保留 `exp012_xed` 草案哈希与 schema 证据，sealed 前迁移为 local-residual A/B/C/D 协议；新增 L1 在线 MACE 与 L2 latent-teacher student 对照，WP-5 分体系内和跨 ABFE 通用性验收 |
+| 2026-08-03 | DEC-020 | 将真实 OFF24 合成三原子 graph/latent/autograd smoke 登记为 `C1_SYNTHETIC_PASSED`，但不视为 Atenolol 科学资格 | 严格 latent slice 为 `node_feats[:,512:640]`，shape `[1,128]`；ligand/environment gradient norm 为 `1.42825/7.93055`，MACE parameter grad count 为 `0`；联合回归 `107 passed, 2 skipped`。图/PBC 契约：`local_residual/mace_graph.py` 固定 `edge_cutoff_angstrom=6.0`（`smoke_exp012_mace_latent.py` 对此值硬校验，非 6.0 直接拒绝）、`interaction_layers=2`；12 Å 是两跳可能达到的几何上界，不定义径向候选集合（该语义由 DEC-024 明确修正）。triclinic PBC 用最小像约定检查。C0 架构核查报告已对真实（非合成）`MACE-OFF24_medium.model` 生成并通过，存于 `output/outer_lambda_exp012/mace_contract.json`（`status=PASSED_READ_ONLY_ARCHITECTURE_INSPECTION`，`policy` 全 `False`），可直接作为 `run1/frame0` smoke 的 `--c0-report` 输入 | 下一步限定为 Atenolol ligand/environment 身份冻结、两份 provisional 文件审计、`run1/frame0` CPU smoke 和 CUDA 同帧对照；在此之前禁止训练 |
+| 2026-08-03 | DEC-021 | 补齐生成 provisional 环境/mapping 文件缺失的工具（发现脚本+CLI），但不在本机对真实 Atenolol 数据执行；不単方面提议或冻结 preregistration 剩余 9 个 unresolved 字段的具体数值 | 此前只有校验器（`local_residual/environment.py`、`atom_mapping.py`）而没有生成器；EXP-010 的失败根因之一是单帧 0.5 nm 逐原子选择切碎残基，新工具按整条残基取舍以避免重犯 | 新增 `scripts/discover_exp012_environment_config.py`（完整残基环境发现+config 组装，标记 chain-terminal 供后续 capping 决策）与 `scripts/build_exp012_atom_mapping.py`（对已 sealed 环境 manifest 生成 canonical atom mapping）；仅用合成 mdtraj topology 做过 py_compile 和人工代码走查，未在 openmm_dev 环境实际执行（本机默认 Python 无 numpy/mdtraj）；真实 Atenolol provisional 文件生成、preregistration 9 个 unresolved 字段仍需用户在计算节点上执行并决定 |
+| 2026-08-03 | DEC-022 | 在真实 Atenolol 数据上生成并冻结两份 provisional 文件；`pocket_cutoff_nm=0.5` 与三条 scratch run 末帧并集为本轮采用值，不代表已对 cutoff/参考帧做过消融 | `openmm_dev` 环境 10/10 单元测试通过（一次修正：`load_atom_mapping` 需要文件路径而非已解析 dict，测试自身的 bug，非脚本 bug）；对 `output_lrc_fix/topology.cif` + `hard_window0_run1/2/3` 末帧执行发现，得到 21 个完整残基、339 个环境原子、0 个 chain-terminal，加 41 个 ligand 原子共 380 节点；元素集合 H/C/N/O/S 与 mapping config 的 `supported_atomic_numbers=[1,6,7,8,16]` 完全吻合 | `provisional_mace_environment_manifest.json`（sha `ffa52ebc...254f05`）与 `provisional_mace_atom_mapping.json`（sha `2c74e5e0...86597a`，`manifest_canonical` ordering）已生成，IMPLEMENTATION_PLAN §13 对应条目已勾选；下一门是 `run1/frame0` 真实 CPU MACE latent/autograd smoke（`scripts/smoke_exp012_mace_latent.py`），其 `--c0-report` 输入尚未核实，在此之前仍不得训练任何模型 |
+| 2026-08-03 | DEC-023（已撤销） | DEC-022 的 provisional 文件仍作废，但“应改成 ligand-centered 12 Å 球”的修复结论错误 | 当时把 `edge_cutoff × interaction_layers = 12 Å` 的几何上界误当成了必须完整纳入的径向支持球；这会额外装入没有两跳路径连接 ligand 的水/蛋白节点和大量无关 environment–environment edges | 由 DEC-024 取代；禁止执行原建议的 1.5 nm 径向发现命令。旧实现与错误结论仅作为失败证据存档 |
+| 2026-08-03 | DEC-024 | EXP-012 两层支持域冻结为 6 Å 邻接图的精确两跳闭包，而非 12 Å ligand-centered 球 | 真正依赖为 `S0=L`、`S1=N_6Å(S0)`、`S2=N_6Å(S1)`；8 Å 原子若没有中间 6 Å 邻居不会影响 ligand latent，而距 ligand 超过 6 Å 的原子若通过 S1 连通则必须纳入。12 Å 仅是最远几何上界 | `local_residual.mace_graph.topology_n_hop_closure` 成为 discovery/smoke 共用定义；每参考帧按 PBC 严格 `<6 Å` 做两层 frontier 扩展，多帧取并集，环境按完整残基收口。CLI 改为 `--edge-cutoff-angstrom 6.0 --interaction-layers 2`；旧 provisional 不覆盖，节点重生成并通过 CPU smoke 后再冻结新哈希 |
+| 2026-08-03 | DEC-025 | 冻结 OMOL 两层 latent 的执行层为 zero-based `product_layer_index=1`，并登记 `run1/frame0` CPU smoke 为 `C1_REAL_FRAME_CPU_PASSED` | OMOL contract 有 3 个 product layers；若取最终 layer 2，就需要三跳且会计算不需要的第三层。修正后在 layer 1 hook 处 early-stop，只取该层开头的 `1024x0e`。frame0 精确闭包为 1538 原子（hop 0/1/2=`41/343/1154`），整残基收口后固定图为 2135 节点、155624 有向边；float32 latent `[41,1024]` 有限，ligand/environment 梯度 norm `32.2197/22.2791`，参数梯度数 0，重复差 0 | C1 CPU 可导性通过；报告 SHA `ce8fd06c...58db5`。仍不得宣称性能或科学资格；下一门只做同图 CUDA float32 对照，之后才决定 readout/训练。此前一次 96 GB RAM OOM 无完成报告，归因边界仅限于旧实现同时存在全配对构边、完整三层 float64 OMOL 和两份可导 forward；未单独测量各分量，不能把 OOM 精确归给某一项 |
+| 2026-08-03 | DEC-026 | 修复 `MaceLatentBasisAdapter` 中不带 index 的 `--device cuda` 与实际张量具体设备（如 `cuda:0`）比较不相等的代码缺陷；同时排除显存碎片化作为 CUDA 对照 OOM 的原因，暂不采纳更大显存设备或 gradient checkpointing 中的任一个 | `torch.device("cuda")`（index=None）与创建后的张量 `.device`（具体 index）按 PyTorch 语义不相等，导致本门要求的确切命令形式必然先于 forward 被拒绝，已在 `mace_latent.py:223-225` 归一化修复；随后三次 CUDA 尝试（15.47/10.57/23.58 GiB 三张卡）在加与不加 `empty_cache`/`expandable_segments` 缓解措施下，OOM 处的已占用显存均为 14.57–14.59 GiB 且卡在同一算子，数字未因缓解措施变化 | EXP-012 CUDA float32 对照仍为 `BLOCKED_ON_VRAM`，未生成 CUDA 报告，不计入 `C1` 通过；下一步在“换更大显存设备”与“对已执行的两层 interaction/product block 做 gradient checkpointing”之间由用户选择，任一选项都不擅自执行；两跳支持域（DEC-024）和模型选择均不因显存不足而放宽 |
+| 2026-08-03 | DEC-027 | 新增 `derived_5a` 为与 `original_6a`（DEC-024，6 Å）并列的第二个显式预注册 EXP-012 表示候选臂：`--edge-cutoff-angstrom` 只接受 `{6.0, 5.0}` 两个值，5.0 对应两层 `geometric_upper_bound_angstrom>=10.0`；两臂各自独立生成 manifest/mapping 与 C1 smoke，互不覆盖，最终按 held-out gap variance、梯度稳定性与显存成本判决，不预设胜负 | 依据是用户在本项目之外的研究经验（“4.5 Å 外信号噪声明显增加”）叠加当前 VRAM 约束，明确记为外部先验，不是 EXP-012 内测得的证据；`MaceLatentBasisAdapter.forward` 对 ligand latent 的读出没有环境原子级别的可分解结构（只有 `ligand_latent = node_feats[ligand_mask, slice]`），因此“latent 后按距离衰减”不能等价于收窄编码器输入图，已放弃该方案；`MaceGraphConfig` 本身已支持任意有限正 cutoff（`geometric_upper_bound_angstrom >= edge_cutoff_angstrom*interaction_layers` 是唯一约束），真正的功能阻塞只在 smoke 脚本的硬编码 `!=6.0` 校验 | 修改 `scripts/smoke_exp012_mace_latent.py`：用 `ENCODER_VARIANTS={6.0:"original_6a",5.0:"derived_5a"}` 替换硬编码校验，报告新增 `encoder_variant`、`model_r_max_angstrom`（取自 C0 报告的 `expected.r_max_angstrom=6.0`，两臂相同，因为模型本身未变）、`graph_cutoff_angstrom`、`original_encoder_numerically_preserved` 四个字段；新增 `--output` 已存在即拒绝写入的防覆盖门；`local_residual/mace_graph.py` 中两处写死 “6-Angstrom”/“6 Angstrom” 的注释与报错信息已参数化为实际配置的 cutoff。尚未执行：按 5 Å 重新生成 provisional environment/atom-mapping 与 CPU C1 smoke；6 Å 分支的 gradient checkpointing 尚未实现 |
+| 2026-08-04 | DEC-028 | 登记 `derived_5a` 的 `run1/frame0` CPU float32 smoke 为 `C1_REAL_FRAME_CPU_PASSED`（第二个通过 C1 的候选臂）；两臂 C1 均已通过，进入各自下一门（5 Å 做 CUDA 对照，6 Å 等 checkpointing） | 同一 topology/ligand indices/base system/box/trajectory/frame0/C0 报告，仅 `--edge-cutoff-angstrom 5.0 --geometric-upper-bound-angstrom 10.0`；两跳精确闭包从 1538 原子（6 Å）降到 974 原子（5 Å，hop 0/1/2=`41/219/714`），整残基收口后节点数 2135→1444，边数 155624→60048（降至 38.6%，好于此前 42% 边数下降的估计）；float32 latent `[41,1024]` 有限，ligand/environment 梯度 norm `32.9454/19.9347`，repeat 最大差 `0`，参数梯度数 `0`，CPU 耗时 172.7s→34.5s | 报告 SHA `d28be435...9c7a0d`；`encoder_variant=derived_5a`、`model_r_max_angstrom=6.0`（模型未变）、`graph_cutoff_angstrom=5.0`、`original_encoder_numerically_preserved=false` 均按 DEC-027 schema 写入。仍不得宣称性能/科学资格；下一步是同图 CUDA float32 对照（预期显存需求随边数近似线性下降，但未实测，不得假设一定能进 24 GiB）。`scripts/discover_exp012_environment_config.py` 顺手修了一个真实 bug：`--report-output`/`--config-output` 写入前未 `mkdir -p` 父目录，已在 §该脚本 修复，与 5 Å/6 Å 的科学决策无关 |
+| 2026-08-04 | DEC-029 | 登记 `derived_5a` 的同帧 CUDA float32 对照为 `C1_REAL_FRAME_CUDA_PASSED`；`derived_5a` 是首个同时通过 CPU 和 CUDA C1 的候选臂，`original_6a` 仍 `BLOCKED_ON_VRAM` | 同一 frame0/manifest/mapping/C0 报告/product-layer-1，仅 `--device cuda`；无 OOM，整次运行 23.87s（单帧 19.76s）。CPU↔CUDA 相对差：latent norm `7.53e-7`、ligand 梯度 norm `1.16e-7`、environment 梯度 norm `-3.83e-7`，均是 float32 舍入量级，非真实分歧；CUDA 内 repeat 差 `1.64e-7`（CPU 内 repeat 差为精确 `0`，非 bug，是 GPU kernel 的正常非确定性量级）；参数梯度数 `0`，两类坐标梯度均有限非零 | 报告 SHA `ba7d053d...deb37bc8d59`；`derived_5a` 的 C1（CPU+CUDA）现已完整通过，`original_6a` 因 VRAM 仍卡在 CUDA 半门。仍不得宣称性能/科学资格、不得训练。下一步：(a) 6 Å 分支等 `inspect.getsource(ScaleShiftMACE.forward)` 以设计 checkpointing；(b) 两臂真正的判决（held-out gap variance、梯度稳定性、显存成本）要等 Arm A/B/C/D 表示消融和训练本身，不能仅凭 C1 通过就选 `derived_5a` |
+| 2026-08-04 | DEC-030 | 正式定性当前路线为 §11A.4 的 **L2**（离线 frozen-MACE teacher → 在线轻量可导 student），明确三个实体的边界，L1 从"当前下一步"降级（不删除）；修订下一步顺序为：多帧支持域审计（report-only）→ `derived_5a` 离线 latent cache → cached-latent 线性/ridge readout 的 held-out gap-variance 验证 → 有增益才蒸馏 `LocalResidualStudent` → student 在线力学与性能资格 | 三个实体：`original_6a`（离线参考 teacher，CPU 可跑，CUDA 24 GiB OOM，DEC-026，不进 MD 每步）；`derived_5a`（当前主要离线 teacher，CPU+CUDA C1 均通过，DEC-028/029，产出 latent/标量残差目标/必要时坐标梯度，同样不进 MD 每步）；`LocalResidualStudent`（唯一计划中的在线模型，尚不存在代码——三个并行只读探索确认 `local_residual/`、`scripts/`、`tests/` 内均无该模型/Arm A/B 的任何实现，仅 `IMPLEMENTATION_PLAN` 里标注"计划 | 尚不存在"）。teacher 的 CUDA smoke 是离线计算资格，不是 MD 部署资格，teacher 不需要过 OpenMM/NVT/ns-day 门。`PLAN_outer_lambda_neural_basis.md:190` 明确要求"不因 MLP 很小就假定在线 MACE 足够便宜，必须实际比较 L1/L2 的 ESS/GPU-hour"——本决策不是绕开这条要求，而是用本 session 已实测的 teacher 侧单帧数字（`derived_5a` CUDA 19.8s、`original_6a` CPU 172.7s 每帧，仅做一次 latent 提取）说明：真正的每 MD 步预算需要 O(ms)级，而 teacher 自己最便宜的离线单帧成本已是 O(10s)级，L1（同一 frozen encoder 直接进在线路径）在当前证据下已不可行，不依赖对 student 成本的任何假设。探索还确认：`local_residual/loss.py::bidirectional_gap_variance_loss` 已实现 §11A.2 的 \(\mathcal L_{\rm gap}\)（MBAR 式重要性加权双向 gap 方差+能量/力正则），三条真实 run 的五态逐帧 ledger（`adjacent_gap_reduced`、`log_importance_unnormalized`）已存在，但没有任何代码把 MACE latent 和 ledger 接起来，也没有多帧 latent cache——这正是本决策新排的下一步顺序里第 2/3 步要填的空 | 本决策不删除 §11A.4 的 L1 定义，只标注降级依据；不构成 production 批准；`original_6a` 的 gradient checkpointing 是独立、并行的另一条线（等 `inspect.getsource(ScaleShiftMACE.forward)`），与本决策的教师/学生分工无关 |
+| 2026-08-04 | DEC-031 | 完成 DEC-030(a) 多帧支持域审计（`scripts/audit_exp012_multiframe_support_domain.py`，report-only，不设硬门），针对三条真实 run（`hard_window0_run1/2/3`，共 1500 帧）跑通：1499/1500 帧违规，`derived_5a` 的 frame0-only manifest 不足以支撑 (b) 的离线多帧 latent cache；修复方向定为改用这 1500 帧闭包的并集重建 manifest（精确覆盖，而非代表帧外推） | report_sha256 `a74ea2352263ea9b25e324c9d0930a0199b0fb826d453ab2715b54cd82cf9b69`，`num_workers=32`。三条 run 违规帧数分别为 499/500/500，单帧最坏遗漏原子数 122/134/141（占 1444 个固定原子的 8.5–9.8%）。遗漏原子中约 86–88% 是水（`HOH`），这是正常物理（水在两跳壳层内持续扩散进出），不是缺陷；但约 24 个非水残基 （ALA50/63/131/168、ARG167、ASN166、ASP246、CYS154/160/227、ILE233、 LEU57/142/182/229/256、PHE77、PRO230、TRP4/130、TYR155、VAL129/245）与一个钠离子 在三条独立 run 中都被遗漏——同一批真实残基而非逐 run 随机噪声，说明它们结构上正好卡在 5 Å/两跳边界。由于该 teacher 按 DEC-030 定性为离线、只需要嵌入这 1500 个已采集帧（不需要 泛化到未来帧），可以用这 1500 帧闭包的并集做到精确覆盖，而不是像 frame0-only 那样赌一个 代表帧 | 为此扩展了 `scripts/discover_exp012_environment_config.py`：新增 `--frame-stride-all N`（对每个 `--trajectory` 取第 0,N,2N,... 帧为参考帧，与 `--frame-index` 互斥，报告新增 `reference_frame_mode`/`reference_frame_provenance`/ `reference_frame_count` 字段）；`discover_complete_residue_environment()` 新增 `num_workers` 参数，逐参考帧闭包按 `ProcessPoolExecutor` 并行、跨进程按元素级 minimum 归约（顺序无关，新增测试 `test_parallel_and_serial_reference_frame_reduction_agree` 锁定并行/串行结果一致），默认仅在 `frame_count>=8` 时才自动并行。审计脚本本身也从串行 改为按 `ProcessPoolExecutor` 并行（`--num-workers` 默认取 `os.sched_getaffinity` 核数而非整机 `cpu_count`，避免在 SLURM/cgroup 限额节点上超订； 两处均不使用 GPU，因为本审计和本发现都不跑 MACE 模型）。顺手修了两个动态加载脚本的 测试文件（`test_exp012_environment_discovery.py`、 `test_exp012_multiframe_support_domain_audit.py`）里遗漏的 `sys.modules[spec.name]=module`——没有这行，动态加载模块里定义的函数无法被跨进程 pickle 找到，`num_workers>1` 会在测试环境下崩溃。尚未执行：用 `--frame-stride-all` 重建 `derived_5a` 的 config/manifest/mapping，重新过一遍 CPU/CUDA C1 smoke（新 manifest SHA 必然与 DEC-028/029 记录的不同，需要重新生成两份 smoke report，成本各自 ~35s/~24s，不是要作废的大计算），再对新 manifest 重跑本审计确认违规数降到 0（或给出 有记录的残留量）后才能进入 DEC-030(b) 的 latent cache |
+| 2026-08-04 | DEC-032 | 撤销 DEC-031 的"跨 1500 帧闭包并集固定 environment manifest"策略，改为逐帧独立精确两跳闭包（无固定图、无整残基收口）作为离线 teacher 的正式图构造策略 | 为此撤销（不删除，作废使用）：`derived_5a` 的 discovery config/report 已实际用 `--frame-stride-all 1` 重建，结果候选池从 1444 膨胀到 4874 个环境原子（1136 个残基，chain-terminal 3 个），固定图节点数变为 4915——比 `original_6a` 已在 CUDA 上 OOM 的 2135 节点图还大一倍以上，若继续这条路会重新引入 DEC-027 选 5 Å 就是为了避开的显存问题。正确认识：teacher 是离线工具，从不进 OpenMM/MD，没有任何理由为一张跨帧共用的固定图付出代价；正确做法是逐帧独立构造精确两跳闭包 S_a=S0∪S1∪S2（ligand、5 Å 邻居、邻居的 5 Å 邻居），这样零支持域遗漏是构造性保证（不是审计结果），不需要把 1500 帧见过的残基同时塞进每张图，也不会为了控制固定图大小而排除环境交换最强、恰恰最有训练价值的困难帧。 新增 `local_residual/teacher_graph.py::build_teacher_graph_for_frame`：不接受也不需要 environment manifest/atom mapping，直接对当前帧的 `topology_n_hop_closure` 结果按 topology index 升序取节点（无整残基收口），复用 `mace_graph.py` 的 `_build_cutoff_edges_chunked`/`_face_heights`/`_floating_tensor`/`_torch` 构边；ligand 41 个原子在排序后相对顺序帧帧不变（拓扑索引固定），因此缓存的 `[41,1024]` latent 可以跨帧直接比较或喂线性 probe。整残基收口被移除的依据是 EXP-010 的 fragment energy subtraction 需要完整残基，而当前 ligand latent 读出从不计算 fragment energy——收口是否改变数值是可验证问题，不是可以直接假定的前提，因此新增 `scripts/smoke_exp012_teacher_graph_equivalence.py` 在 frame0 上比较 974-node 精确闭包（graph A）与 1444-node 整残基收口图（graph B，复用 DEC-028/029 已冻结的 manifest/mapping），比较完整 ligand latent 张量（不仅 norm）、scalar probe 和 ligand 坐标梯度，只报告差异不设门（`status=COMPARISON_ONLY_NOT_A_GATE`）。另新增 `scripts/audit_exp012_per_frame_teacher_graph_geometry.py`：对三条 run 1500 帧只做几何构图（不跑 MACE），报告每帧 node/edge count、hop 0/1/2 计数、water/ion/other 环境原子组成与 max/mean/P95/P99 汇总，显式给出 `overall_max_edge_count_frame`/`overall_max_node_count_frame`，替代"假设 frame0 是最坏情况"。再新增 `scripts/smoke_exp012_teacher_graph_latent.py`（`smoke_exp012_mace_latent.py` 的对应版本，改用 `build_teacher_graph_for_frame`），供在 geometry 扫描选出的最大图帧上跑 CPU/CUDA C1。新增测试 `tests/test_exp012_teacher_graph.py`：闭包即节点集（无收口）、ligand 相对顺序在环境原子数变化时不变、不支持元素 fail-closed、坐标自动求导可用。三个新脚本均未在真实数据上执行——需要 openmm_dev 环境和真实 MACE 模型/GPU。 | DEC-031 的 4874-atom union discovery 报告（`output/outer_lambda_exp012/two_hop_allframes_derived_5a/`）保留存档但标记 `FIXED_UNION_POLICY_REJECTED_FOR_OFFLINE_TEACHER`，不晋升为任何运行时 manifest，也不再重建 config/manifest/mapping 或对其执行 C1 smoke。DEC-030(a) 的审计脚本（`audit_exp012_multiframe_support_domain.py`）以及 `discover_exp012_environment_config.py` 的`--frame-stride-all`/并行扩展保留在库中，作为"发现某条路线不可行"过程的正当代码产出，不因方向撤销而删除。下一步顺序：① 跑 equivalence smoke 决定是否正式删除整残基收口；② 跑 1500 帧 geometry-only 扫描拿到真实 node/edge count 分布与最大图所在帧；③ 对该帧跑 CPU 再跑 CUDA C1；④ 通过后才进入 DEC-030(b) 的逐帧 latent cache 生成（不使用固定 manifest）。仍不得训练。 |
 
 ## 4. 基础路径登记
 
@@ -125,7 +139,7 @@ EXP-002
 | EXP-009 | 2026-07-30 | WP-3A/WP-4 | 冻结系数 0.09 的 MTS 调度资格 | FAILED | \(N=1\) 即出现 PythonForce/CUDA MTS 后端错误；没有可用于物理分布比较的 arm |
 | EXP-010 | 2026-07-31 | WP-4A | MACE 教师到目标慢变量 cheap-CV bias 的蒸馏 | FAILED | GPU 教师数据集通过支持域门，但六个预注册 Fourier 候选均未通过跨 run 能量/广义力验证 |
 | EXP-011 | 2026-08-02 | WP-4B | 完整 MM Hamiltonian 条件平均力/PMF 到周期 torsion bias | FAILED | AUG-001 后 mutual overlap 与去相关样本数仍未过冻结门；`FORMAL_RUN1_OVERLAP_FAILED`，不拟合 PMF |
-| EXP-012 | 2026-08-03 | WP-4C | CV-free 通用局部残差路径势：A/B/C/D 表示 + 双向 gap-variance loss | PLANNED | 五态 CUDA ledger、权重账本和 CPU/CUDA audit 已通过，draft 已迁移为 local-residual v2；尚未 seal A/B/C/D、训练模型、建立 Force 或运行 NVT |
+| EXP-012 | 2026-08-03 | WP-4C | CV-free 通用局部残差路径势：A/B/C/D 表示 + 双向 gap-variance loss | PLANNED / C1_REAL_FRAME_CPU_PASSED | ledger/backend audit、OFF24 合成图合约及 Atenolol frame0 OMOL CPU latent/autograd smoke 已通过；下一门是同图 CUDA float32 对照，仍未训练 |
 
 ---
 
@@ -964,7 +978,7 @@ pooling、环境图 cutoff/receptive-field buffer、PBC 和支持域。
 
 1. 补齐三条 scratch run 逐帧五态 target ledger，并核对坐标、状态顺序和 energy hash；
 2. 将现有 `exp012_xed` draft 迁移/别名为通用 `local_residual` schema，保留旧哈希；
-3. 冻结 A/B/C/D、MACE layer、图边界、readout、\(A_k\)、训练预算和数值门后 seal；
+3. 冻结 A/B/C/D、MACE layer、图边界、readout、(A_k)、训练预算和数值门后 seal；
 4. 完成 whole-run holdout 与至少 3 个训练 seed；
 5. 对 ligand/environment 坐标分别做 autograd/finite-difference force check；
 6. TorchScript/OpenMM Reference、XML round-trip、端点和 CPU/CUDA 一致；
@@ -1015,6 +1029,160 @@ draft 已升级为 `exp012-local-residual-prereg-v2`，主导入命名空间为 
 不证明 feature、模型或 Force。当前唯一允许的下一步是冻结 A/B/C/D 表示、MACE layer、
 图边界、readout、全局 (A_k)、训练预算和数值门并 seal；在此之前不得训练正式模型、
 跑 production NVT、启动 WP-5 或修改 production 模块。
+
+### 11A.9 DEC-021：provisional 环境/mapping 生成工具（尚未在真实数据执行）
+
+此前 `local_residual/environment.py`、`local_residual/atom_mapping.py` 只有校验器，没有
+生成器；真实 Atenolol 的 `provisional_mace_environment_manifest.json` 和
+`provisional_mace_atom_mapping.json` 因此连输入草稿都不存在。新增两个脚本：
+
+- `scripts/discover_exp012_environment_config.py`：给定 topology、一个或多个参考帧
+  （每条 `--trajectory` 一帧，默认取最后一帧）、ligand 索引和口袋 cutoff，发现完整
+  残基环境候选并组装 `exp012-environment-config-v1` config。核心函数
+  `discover_complete_residue_environment` 对每个候选残基始终返回整条残基的全部原子，
+  绝不像 EXP-010 的教师选择那样只取半径内的原子子集；同时对每个候选标记
+  `is_chain_terminal`，供后续判断是否需要 capping/receptive-field buffer。支持多帧
+  取并集（任一帧命中即入选），比单帧更保守，避免因单帧巧合漏掉真正邻近的残基。
+- `scripts/build_exp012_atom_mapping.py`：对已 sealed 的环境 manifest 生成
+  canonical topology/local-graph/MACE-node 三重映射，是
+  `local_residual.atom_mapping.build_atom_mapping` 缺失的 CLI 入口。
+
+新增单元测试 `tests/test_exp012_environment_discovery.py`（合成 mdtraj topology，专门
+验证"部分重叠残基必须整条返回"这一 EXP-010 修正点、水/配体排除、chain-terminal 标记、
+多帧并集、以及组装结果能通过 `build_environment_manifest` 校验）和
+`tests/test_exp012_atom_mapping_cli.py`（CLI 子进程测试，覆盖成功路径与 manifest SHA
+不匹配的 fail-closed 路径）。本机默认 Python 环境没有 numpy/mdtraj（`local_residual`
+包 `__init__` 会经由 `ledger_audit` 传递依赖 numpy），因此这批代码在本机只做过
+`py_compile` 和人工审阅。
+
+用户已在 `openmm_dev` conda 环境实际验证：两个测试文件 10/10 passed（修正一处测试自身
+的 bug，`load_atom_mapping` 需要文件路径而非已解析的 dict；脚本本身无需改动）。随后对
+真实 Atenolol 数据执行发现流程（`output_lrc_fix/topology.cif`、`hard_window0_run1/2/3`
+末帧、`pocket_cutoff_nm=0.5`），得到 21 个完整残基、339 个环境原子、0 个 chain-terminal，
+加 41 个 ligand 原子共 380 节点，元素集合 H/C/N/O/S。两份 provisional 文件已生成并冻结：
+`output/outer_lambda_exp012/provisional_mace_environment_manifest.json`（sha
+`ffa52ebc38508fac929e3989252ec518f873ea3404431154744d1dd94b254f05`）与
+`output/outer_lambda_exp012/provisional_mace_atom_mapping.json`（sha
+`2c74e5e087c472ef07a3d964a3cdc515652a52aa58eb8c22d287fa623f86597a`，`manifest_canonical`
+ordering）。见 DEC-022。IMPLEMENTATION_PLAN §13 对应条目已勾选。
+
+这两个脚本只是生成/组装工具，不做任何科学决策；`pocket_cutoff_nm=0.5` 和三条 run 末帧
+并集是本轮**采用值**，不是消融后的最优值——尚未比较过其它 cutoff 或参考帧选择。
+Arm A/B/C/D 精确 schema、MACE layer/图边界/readout、训练预算与随机种子、数值判决门这
+9 个 preregistration `unresolved` 字段仍然没有值——它们是有后果的设计选择（错误的
+cutoff 或图边界会浪费 GPU-hour，过早 seal 等于让预注册失去意义），仍需要用户决定后
+再写入 preregistration 并重新哈希、seal。
+
+上述 DEC-022 径向选择及两份 SHA 随后已由 DEC-023 作废；DEC-023 提出的 1.5 nm 径向球
+修复又由 DEC-024 撤销。它们保留在本节仅用于记录失败链，不代表当前执行协议。
+
+### 11A.10 DEC-024/025：精确两跳闭包与 Atenolol CPU 真帧通过
+
+当前协议不再用 ligand-centered 12 Å 球。discovery 与 runtime validator 共用
+`local_residual.mace_graph.topology_n_hop_closure`，对 6 Å PBC 邻接图逐层扩展：
+
+```text
+S0 = ligand
+S1 = N_6A(S0)
+S2 = N_6A(S1)
+S  = S0 union S1 union S2
+```
+
+`run1/frame0` 的原子级闭包为 1538 个原子，其中 hop 0/1/2 分别为 `41/343/1154`；触及的
+环境按完整残基收口后，固定图包含 41 个 ligand 原子和 2094 个 environment 原子，共
+2135 节点、155624 条 6 Å 有向边。12 Å 仅记录为两层最远几何上界。
+
+OMOL C0 报告显示模型有 3 个 product layers。两层候选因此固定为 zero-based
+`product_layer_index=1`，在第二个 product hook 后 early-stop，不执行第三层；从该层
+`1024x0e+1024x1o+1024x2e` 输出中只取开头 `1024x0e` 标量块。构边改为
+`chunked_no_n_by_n_allocation`，每批最多 100000 对；repeat reference 不保留 autograd graph，
+正式 smoke 只保留一份可导 forward，并使用 float32。
+
+第一次旧实现运行导致 96 GB RAM OOM，未生成完成报告。旧实现同时存在全配对构边、完整
+三层 float64 OMOL 和两份可导 forward，因此只登记为组合工程失败，不能在没有分项测量时
+断言某一个分量单独耗尽全部内存。
+
+修正后的 CPU smoke 已完成：
+
+| 项目 | 结果 |
+|---|---:|
+| 状态 | `COMPLETED_AUTOGRAD_SMOKE_ONLY` |
+| 模型 | `MACE-omol-0-extra-large-1024.model` |
+| 模型 SHA-256 | `9b64b4fd5153ca578c694abc57806d8111050de6ff652e695c9b525bc4d36469` |
+| dtype / device | `torch.float32` / CPU |
+| latent shape | `[41,1024]` |
+| latent min / max / norm | `-0.837964 / 0.864419 / 16.308716` |
+| ligand gradient norm | `32.219711` |
+| environment gradient norm | `22.279121` |
+| repeat max absolute difference | `0.0` |
+| MACE parameter gradient count | `0` |
+| 总耗时 | `172.713 s` |
+
+身份与报告：
+
+| 产物 | canonical/report SHA | 文件 SHA-256 |
+|---|---|---|
+| environment manifest | `0e399a9ec03c0c8c397bacdbf1c53032be8fb65fd3248c3747a577e88e223935` | `9c9cd4a062f6b6787ea4a86b1be556ffb23ee6e0a92277182bbe5254f764b95b` |
+| atom mapping | `d84a65f9165bc89980e7564850eb48b7e8d42326f1edd707edccdbdc3e88d00f` | `355b48e16037157d44df57c9f28afd350c4c2b9e3e9bd50aca46f2f2e21a824c` |
+| OMOL C0 report | `83ee5ab57057fb2559c8593804680e551e9dd72bd1d50d617bd238f18b8d5f1a` | `ca0352fcc5255a546cdf613b97d519a7763f37b7f3edb22f005f45f8049482c5` |
+| CPU smoke | `ce8fd06cad0e4bdb8b65589c8d5eece5e7718c8174932d9d465817348ed58db5` | `2a27c24fae50ea7d09d3328cd00d8a43c8c326e4d1a1026da0822bae2e4bd8fe` |
+
+报告路径为
+`output/outer_lambda_exp012/two_hop_frame0/cpu_omol_latent_smoke.json`。policy 明确记录
+`training_executed=false`、`full_dataset_scanned=false`、`scientific_qualification=false`、
+`fragment_subtraction_used=false` 和 `latent_detached=false`。因此结论只到
+`C1_REAL_FRAME_CPU_PASSED`；下一门是相同 frame、manifest、mapping、product layer 与 dtype
+的 CUDA 对照，不允许据此开始训练或宣称 production 可用。
+
+### 11A.11 CUDA 对照尝试与显存瓶颈（尚未通过）
+
+当前状态：`BLOCKED_ON_VRAM`。DEC-025 的 CUDA float32 对照门尚未通过；没有生成
+`cuda_omol_latent_smoke.json`，不构成失败判定，只是被显存容量卡住。
+
+运行前发现并修复了两处代码问题（均在本轮对照准备中发现，不是 CPU smoke 遗留缺陷）：
+
+1. `local_residual/mace_latent.py` 的 `--model` 身份校验对 `~` 路径不做展开比较修正——
+   实为调用命令用了 `~/.cache/mace/...` 而 C0 报告冻结的是绝对路径
+   `/home/ruigengji/.cache/mace/...`，属于命令用法问题，已改用绝对路径，非代码缺陷；
+2. `MaceLatentBasisAdapter.forward`（`mace_latent.py:222-225`）用
+   `torch.device(self.device_name)` 构造 `expected_device`；当 `--device cuda`
+   不带显式 index 时，该对象的 `index=None`，而实际张量在 CUDA 上创建后
+   `.device` 总是解析出具体 index（如 `cuda:0`），两者按 PyTorch 语义不相等，
+   导致每次不带 index 的 `--device cuda`（即本门要求的形式）都会在真正跑到
+   forward 之前被 `"graph dtype/device differs from the explicit adapter contract"`
+   拒绝。修正为：当 `expected_device.type=="cuda"` 且 `index is None` 时，归一化为
+   `torch.device("cuda", torch.cuda.current_device())` 后再比较（真实代码缺陷，已修复）。
+
+代码修正后连续三次 CUDA 尝试，均在 product-layer-1 张量积内部的同一个
+`cat`/`reshape` 操作处 OOM：
+
+| 尝试 | GPU / 总容量 | 已修正的分配器改动 | 触发分配 | 已占用 | 结果 |
+|---|---|---|---:|---:|---|
+| 1 | 15.47 GiB（GPU 0，另有进程 96% 占用） | 无 | 9.50 GiB | 14.59 GiB | OOM |
+| 2 | 10.57 GiB | 无 | 2.97 GiB | 7.89 GiB | OOM（更早的更小算子，未到达尝试 1/3 的算子） |
+| 3 | 23.58 GiB（空闲 RTX 3090，物理 24576 MiB） | `torch.cuda.empty_cache()`（no-grad 参考 forward 后）+ `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | 9.50 GiB | 14.57 GiB | OOM |
+
+尝试 1 与尝试 3 的已占用显存几乎相同（14.59 对 14.57 GiB），且尝试 3 已经加上
+`empty_cache()` 与 `expandable_segments` 缓解措施后数字仍未变化。据此排除
+"显存碎片化"作为原因；这是该图（2135 节点、155624 有向边，其中两跳精确闭包
+1538 个原子、另 597 个原子来自整残基收口）在 `MACE-omol-0-extra-large-1024`
+product-layer-index=1、float32 下的真实显存需求，且需求 `>= 14.57+9.50≈24.07 GiB`，
+超过尝试 3 这张 23.58 GiB 卡约 0.5 GiB；这只是遇到的第一个大算子，不能排除
+之后还有更大的峰值。
+
+未采纳/未执行的选项（等待用户决定，不擅自选择）：
+
+- 使用更大显存的设备（32/48/80 GiB 级别）；
+- 对已执行的两层 interaction/product block 做 gradient checkpointing，用重算换显存；
+- 缩小两跳图（原子数）或更换更小的 OMOL 模型——均会改动已冻结的 DEC-024 支持域定义
+  或模型选择，不在本次对照的授权范围内。
+
+| 项目 | 路径/说明 |
+|---|---|
+| 代码修正 1 | `local_residual/mace_latent.py:223-225`（cuda 设备等价性归一化） |
+| 代码修正 2 | `scripts/smoke_exp012_mace_latent.py:191-193`（no-grad 参考 forward 后 `torch.cuda.synchronize`+`empty_cache`） |
+| CUDA 报告 | 未生成；三次尝试均以 `RuntimeError: CUDA out of memory` 终止，未落盘 JSON |
+
 ---
 
 ## 12. 单次实验模板

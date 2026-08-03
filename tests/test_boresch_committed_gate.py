@@ -273,3 +273,98 @@ def test_legacy_bare_payload_is_recognisable():
     legacy = {"equilibrium_values": BAD_COMMITTED}
     assert legacy.get("schema_version") is None
     assert "receptor_indices" not in legacy
+
+
+# ---------------------------------------------------------------------------
+# BOR-02：`update_boresch_from_last_frame` 的校验门必须看二面角
+#
+# 原先那两道强校验只看 θA/θB（40–140°）与 r0 漂移（≤ 0.25 nm），所以
+# 2026-07-29 那次二面角**整体反号**畅通无阻地覆盖了正确的参考几何
+# （ΔG(A′→A) 5.5 → 98.8 kJ/mol）。现在复用 `boresch_committed_deviation_sigma()`
+# 逐自由度算偏差，二面角先过 `_wrap_to_pi`，反号 ⟹ 巨大 σ ⟹ 拦下。
+# ---------------------------------------------------------------------------
+
+
+def _boresch_params(eq=None):
+    return {
+        "receptor_indices": [0, 1, 2],
+        "ligand_indices": [3, 4, 5],
+        "equilibrium_values": dict(eq or {
+            "r0": 0.50, "thetaA0": 1.60, "thetaB0": 1.55,
+            "phiA0": 1.20, "phiB0": -0.80, "phiC0": 0.40,
+        }),
+        "force_constants": {
+            "kr": 2000.0, "kthetaA": 400.0, "kthetaB": 100.0,
+            "kphiA": 240.0, "kphiB": 130.0, "kphiC": 150.0,
+        },
+    }
+
+
+def test_dihedral_sign_flip_is_rejected_by_the_update_gate(monkeypatch):
+    """二面角反号必须被拦住，且**保留原值**（不是 raise）。"""
+    from abfe_pipeline import ABFEPipeline
+
+    params = _boresch_params()
+    orig = dict(params["equilibrium_values"])
+    flipped = dict(orig)
+    for key in ("phiA0", "phiB0", "phiC0"):
+        flipped[key] = -orig[key]          # 整体反号：正是 BOR-01 那次事故的形状
+
+    logs = []
+    pipeline = ABFEPipeline.__new__(ABFEPipeline)
+    pipeline._log = logs.append
+    pipeline.positions = None
+    from openmm import unit as _u
+    pipeline.temperature = 303.15 * _u.kelvin
+    monkeypatch.setattr(
+        "abfe_core.calc_boresch_from_last_frame",
+        lambda *a, **k: dict(flipped),
+    )
+
+    out = ABFEPipeline.update_boresch_from_last_frame(pipeline, params)
+    assert out["equilibrium_values"] == orig, "反号值不得覆盖原始平衡值"
+    joined = "\n".join(logs)
+    assert "BOR-02" in joined and "σ" in joined
+    assert "保留原始平衡值" in joined
+    # 必须是告警式拦截，不是异常 —— 4σ 在 6 个自由度上误报率约 2.8%，
+    # 硬门会以约 1/36 的概率无故杀掉一次 9 小时生产跑。
+    assert out is params
+
+
+def test_small_dihedral_drift_is_still_accepted(monkeypatch):
+    """正常热漂移（远小于阈值）照样更新，否则这道门会挡住合法运行。"""
+    from abfe_pipeline import ABFEPipeline
+
+    params = _boresch_params()
+    orig = dict(params["equilibrium_values"])
+    nudged = dict(orig)
+    nudged["phiA0"] = orig["phiA0"] + 0.01   # 约 0.6°，远在 1σ 内
+    nudged["r0"] = orig["r0"] + 0.002
+
+    logs = []
+    pipeline = ABFEPipeline.__new__(ABFEPipeline)
+    pipeline._log = logs.append
+    pipeline.positions = None
+    from openmm import unit as _u
+    pipeline.temperature = 303.15 * _u.kelvin
+    monkeypatch.setattr(
+        "abfe_core.calc_boresch_from_last_frame", lambda *a, **k: dict(nudged)
+    )
+
+    out = ABFEPipeline.update_boresch_from_last_frame(pipeline, params)
+    assert out["equilibrium_values"]["phiA0"] == pytest.approx(nudged["phiA0"])
+    assert "逐自由度最大偏差" in "\n".join(logs)
+
+
+def test_update_gate_uses_deviation_sigma_not_the_sigma_width():
+    """契约：门读的是 `deviation_sigma`（偏离几个 σ），不是 `sigma`（分布宽度）。
+
+    读错键这道门就形同虚设 —— `sigma` 是常数量级的宽度，永远不会超 4。
+    """
+    import inspect
+    from abfe_pipeline import ABFEPipeline
+
+    src = inspect.getsource(ABFEPipeline.update_boresch_from_last_frame)
+    assert 'boresch_committed_deviation_sigma(' in src
+    assert '_row.get("deviation_sigma"' in src
+    assert '_row.get("sigma"' not in src
