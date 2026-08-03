@@ -756,7 +756,8 @@ class SourceContractTests(unittest.TestCase):
         # N_decorrelated=114 时等价于要求 ratio>=0.44，而日志里报的门是 0.05），而且
         # 样本越少门越严——与"延长采样"的修复方向相反。
         # 现在换成三份真正正交的证据，本测试钉住这个结构，防止 absolute-ESS 门被
-        # "顺手加回来"，也防止 min_ess_ratio 被换回 raw 单参考 ESS。
+        # "顺手加回来"，也防止 min_ess_ratio 被换回 raw 单参考 ESS。occupancy 与
+        # warmup 协议一致，只作诊断：不能等全部 GPU 采样完成后再用同一指标反向否决。
         conv_idx = self.engine.index("converged = bool(\n            len(local_results) == len(valid_windows)")
         conv_block = self.engine[conv_idx:conv_idx + 700]
         # (1) 权重质量：扣掉共模因子后的混合覆盖度比例
@@ -764,14 +765,12 @@ class SourceContractTests(unittest.TestCase):
             "_meets_minimum_with_roundoff(min_overlap, min_overlap_threshold)",
             conv_block,
         )
-        # (2) 权重质量的一阶矩伴随项：ESS 是逐态尺度不变的，抓不到"均匀被饿死"的
-        # 态（实测 f_k 未补偿、高出 80 kT 的态 ESS/N 仍报 0.34）。必须配 K*<p_k>。
-        self.assertIn(
-            "_meets_minimum_with_roundoff(\n"
-            "                min_occupancy_normalized, min_occupancy_normalized_threshold",
-            conv_block,
-        )
-        # (3) 样本量：与比例正交的那份证据
+        # occupancy 保留为一阶矩伴随诊断，但不得进入最终 converged 门。
+        self.assertNotIn("min_occupancy_normalized", conv_block)
+        self.assertIn('"min_occupancy_normalized_threshold": None,', self.engine)
+        self.assertIn('"min_occupancy_is_gate": False,', self.engine)
+        self.assertIn('"min_occupancy_gate_retired_reason": (', self.engine)
+        # (2) 样本量：与比例正交的那份证据
         self.assertIn(
             "min_decorrelated_samples >= int(final_min_decorrelated_samples)",
             conv_block,

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # CPU-only pre-flight：改完代码、在节点上烧 GPU 之前跑这一条。
 #
+# pytest 配置在**仓库根目录**的 pytest.ini（不在 tests/ 下）。本脚本 cd 到仓库根
+# 之后不带路径参数跑 pytest，而 pytest 只从 cwd 向上找配置文件——配置放在 tests/ 里
+# 会对这条命令整体静默失效（2026-07-30 修，详见 pytest.ini 顶部注释）。
+#
 # 只跑不需要 CUDA 的测试（-m "not needs_gpu"）。当前所有测试都是 CPU 可跑的，
 # 所以这条命令等于跑全套；将来若加了真需要 GPU 的测试，给它打 needs_gpu 标记
 # 就会被这里自动排除，不必再改这个脚本。

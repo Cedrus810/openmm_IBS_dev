@@ -39,17 +39,21 @@ from abfe_core import (
     solvent_box_edge_nm, SOLVENT_NONBONDED_CUTOFF_NM,  # 溶剂盒唯一实现，勿在此重复
     resolve_water_model_xml,  # 溶剂腿水模型必须从复合物 .top 反推
     resolve_membrane_protocol,  # 膜体系协议唯一解析实现（B1）
+    resolve_environment_type,  # 只看 config 的环境类型规范化（不需要 topology）
     resolve_charge_treatment,  # 净电荷处理协议唯一校验实现（B2）
     resolve_dispersion_protocol,  # LJ/色散路线唯一校验实现（B6）
     resolve_forcefield_family,  # 力场族识别唯一实现（§1.1）
     acceptance_thresholds_payload,  # §13 阈值快照，进 provenance
     validate_membrane_input,  # §3.3 膜输入核对唯一实现
+    resolve_membrane_quality_gate_mode,  # §9 质量门 enforce / advisory
     MEMBRANE_MIN_EQUILIBRATION_NS,  # §9/§15 膜预平衡时长下限
     resolve_gromacs_include,  # include 解析唯一实现
     parse_gromacs_topology,  # `.top` 解析（[ defaults ] / [ moleculetype ] / [ molecules ]）
     classify_system_composition,  # 组成驱动的身份判定，替代残基名硬编码
     gromacs_topology_has_funct2_pairs,  # OpenMM 不支持 [ pairs ] funct 2
     convert_gromacs_pairs_funct2,  # 带逐对等价校验的兼容性转换
+    openmm_compatible_gromacs_top,  # 需要时转换，返回可交给 OpenMM 的 .top
+    load_gromacs_topology_for_openmm,  # **唯一**的拓扑加载入口
     GROMACS_PAIRS_FUNCT2_CONVERSION_VERSION,
 )
 from abfe_pipeline import (
@@ -437,6 +441,56 @@ def equilibrium_is_done(output_dir: str, expected_fingerprint: Optional[str] = N
             "温度或目标步数但复用了同一个 --output 目录），拒绝复用，将重新执行预平衡。"
         )
         return False
+
+    # ---- 真的跑完了吗（MEM-09，2026-08-02）----
+    #
+    # ⚠️ 到这里为止的判据全部是 **fail-open** 的：轨迹与 checkpoint 只要存在就算数，
+    # 而 `pre_equilibration_fingerprint.json` 是 `pre_equilibrate()` 在**第一步之前**
+    # 就写下的（`abfe_pipeline.py`，为的是让被中断的运行下次能认出自己的身份），
+    # 它记的 `n_steps` 是**目标**步数，不是已完成步数。
+    #
+    # 于是一次被中断的运行（例如 100 ns 只跑到 40 ns）在下一次调用里会被判成
+    # "已完成"，`pre_equilibrate()` 整段跳过 —— 连同它内部的 §9 膜质量门一起跳过，
+    # 而 provenance 与 fingerprint 都写着 100 ns。这是"短平衡冒充长平衡"，
+    # 且 `enforce` 模式根本没机会拦。
+    #
+    # 唯一可信的完成标记是 `pipeline_state.json` 里 equilibration 的
+    # `status=completed` —— 它只在步进真正结束之后才写。
+    state_file = os.path.join(output_dir, "checkpoints", "pipeline_state.json")
+    if not os.path.isfile(state_file):
+        log.warning(
+            "⚠️ 预平衡轨迹/Checkpoint/指纹都在，但缺少 checkpoints/pipeline_state.json，"
+            "无法确认预平衡**真的跑完了**（指纹是第一步之前就写的，只代表目标）。"
+            "保守视为未完成。加 --resume 可从 Checkpoint 续跑，不会白烧已完成的部分。"
+        )
+        return False
+    try:
+        with open(state_file, encoding="utf-8") as f:
+            equil_state = (json.load(f).get("stages") or {}).get("equilibration") or {}
+    except Exception as e:
+        log.warning("⚠️ 读取 pipeline_state.json 失败 (%s)，保守视为预平衡未完成", e)
+        return False
+    if equil_state.get("status") != "completed":
+        log.warning(
+            "⚠️ 上一次预平衡**没有跑完**（pipeline_state.json 里 equilibration.status=%r）。"
+            "拒绝把它当成已完成的平衡复用 —— 那会让一段短平衡冒充目标时长，"
+            "并连带跳过 §9 膜质量门。加 --resume 可从 Checkpoint 续跑。",
+            equil_state.get("status"),
+        )
+        return False
+    try:
+        with open(fp_file, encoding="utf-8") as handle:
+            recorded_target = int(json.load(handle).get("n_steps", 0))
+    except Exception:
+        recorded_target = 0
+    achieved = int(equil_state.get("total_steps") or 0)
+    if recorded_target and achieved < recorded_target:
+        log.warning(
+            "⚠️ 已完成的预平衡只有 %d 步，而当前目标是 %d 步。拒绝复用，"
+            "加 --resume 可从 Checkpoint 续跑剩下的部分。",
+            achieved, recorded_target,
+        )
+        return False
     return True
 
 
@@ -532,7 +586,8 @@ def generate_ligand_xml_from_top(
 ) -> str:
     """从 GROMACS .top 中抽取配体参数，生成可被 OpenMM ForceField 加载的 ligand_only.xml。"""
     log.info("🔹 从 GROMACS 拓扑抽取配体参数: 生成 ligand_only.xml")
-    top = app.GromacsTopFile(top_file, includeDir=gmx_include_dir)
+    # 走唯一入口（见 abfe_core.load_gromacs_topology_for_openmm）。
+    top = load_gromacs_topology_for_openmm(top_file, includeDir=gmx_include_dir)
     lig_res = next((r for r in top.topology.residues() if r.name == ligand_resname), None)
     if lig_res is None:
         raise ValueError(f"未在拓扑中找到配体残基: {ligand_resname}")
@@ -819,7 +874,9 @@ def build_and_cache_solvent_leg(
         return False
         
     log.info("  🧬 彻底抛弃 mmCIF，从原始 .top 重建 100% 纯净配体拓扑...")
-    gmx_top = app.GromacsTopFile(top_file, includeDir=gmx_include_dir)
+    # 走唯一入口：溶剂腿也会读复合物 .top，同样可能撞上 `[ pairs ]` funct 2。
+    # （首次修 funct-2 时只接了 build_system_from_gromacs，这里就漏了。）
+    gmx_top = load_gromacs_topology_for_openmm(top_file, includeDir=gmx_include_dir)
     stable_names = _build_stable_ligand_atom_names(gmx_top, ligand_resname)
     
     # 获取 .top 中的配体原子索引
@@ -998,8 +1055,32 @@ def load_native_system(
     phase="complex",
     prefer_equilibrated: bool = True,
     expected_pre_equilibration_fingerprint: Optional[str] = None,
+    require_bonded_topology: bool = False,
 ):
-    """从 output_dir 的缓存文件加载系统（跳过 GROMACS 解析）"""
+    """从 output_dir 的缓存文件加载系统（跳过 GROMACS 解析）
+
+    ## ⚠️ `topology.cif` 会丢掉非标准残基的键
+
+    `app.PDBxFile.writeFile` **不写任何键记录**（写入端没有 `struct_conn` /
+    `chem_comp_bond`），而读取端只能靠 `createStandardBonds()` 补**标准残基**
+    （氨基酸/核酸/水）的键。于是 mmCIF 往返之后：
+
+      * 脂质（`POPC` = `PA`+`PC`+`OL`）、配体（`MOL`）、离子的键**全部丢失**；
+      * 而这里原本只校验**原子数**，键数不符照样通过。
+
+    后果是实测出来的：`pre_equilibrate` 之前的「PBC 分子完整性修复」靠 topology 的
+    键判断"什么算一个分子"，键丢了就把跨周期边界的脂质**逐段撕开** ——
+    最小化后 PE = 4.1e13 kJ/mol、max|F| = 3.7e9（落在脂质尾链氢 `PA334/H8S`），
+    几千步后变成一个没有上下文的 `Particle coordinate is NaN`。
+    从 `.top` 重建拓扑（有键）时同一体系完全正常（PE ≈ −6.5e5）。
+
+    `require_bonded_topology=True`（膜体系必须传）会：
+      1. **优先从 `.top` 重建**拓扑，mmCIF 只在没有 `.top` 时兜底；
+      2. 校验键数，覆盖不足即 fail closed。
+
+    可溶路径默认仍走原逻辑（mmCIF 优先）——它的配体 `MOL` 同样丢键，属存量隐患，
+    但改动会移动现有生产基线的预平衡起点（§7.7 / R7），单独立项评估。
+    """
     paths = _cache_paths(output_dir, phase=phase)
     xml_path = paths["xml"]
     if not os.path.exists(xml_path):
@@ -1031,21 +1112,67 @@ def load_native_system(
         except Exception as e:
             log.warning("  ⚠️ 设置默认盒子失败: %s", e)
 
-    # 4. Topology 恢复 (🔑 优先 mmCIF 缓存，降级至原始 TOP 文件)
+    # 4. Topology 恢复
+    #
+    # 膜体系（require_bonded_topology）**优先从 .top 重建**：mmCIF 不保存非标准残基
+    # 的键，而 PBC 分子完整性修复依赖键。详见本函数 docstring。
     top_path = paths["top"]
     topology = None
     cif = None
-    if os.path.exists(top_path):
+
+    if require_bonded_topology and top_file and os.path.exists(top_file):
+        try:
+            inc_dir = gmx_include_dir or find_gmx_include_dir()
+            _rebuilt = load_gromacs_topology_for_openmm(
+                top_file, includeDir=inc_dir, periodicBoxVectors=box_vectors
+            )
+            topology = _rebuilt.topology
+            log.info(
+                "  ✓ 拓扑从原始 TOP 重建（%d 原子, %d 键）—— 膜体系不用 mmCIF，"
+                "因为它不保存非标准残基的键",
+                topology.getNumAtoms(), topology.getNumBonds(),
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"膜体系要求从 .top 重建带键拓扑，但失败了：{e}\n"
+                "   不能退回 mmCIF —— 它丢掉脂质/配体的键，会让 PBC 分子完整性修复"
+                "把跨边界的分子撕开（实测最小化后 PE 到 1e13、随后 NaN）。"
+            ) from e
+
+    if topology is None and os.path.exists(top_path):
         try:
             cif = app.PDBxFile(top_path)
             topology = cif.topology
             n_cif = topology.getNumAtoms()
             n_sys = system.getNumParticles()
-            if n_cif == n_sys:
-                log.info("  ✓ 拓扑从 mmCIF 缓存恢复 (原子数校验通过: %d)", n_cif)
-            else:
+            if n_cif != n_sys:
                 log.warning("  ⚠️ mmCIF 拓扑原子数 (%d) 与 System (%d) 不匹配，已丢弃缓存", n_cif, n_sys)
                 topology = None
+            else:
+                # 🔑 键数校验：只校验原子数是不够的。mmCIF 不保存非标准残基的键，
+                # 读回时只有 createStandardBonds() 能补标准残基，脂质/配体/离子的键
+                # 会静默丢失，而 PBC 分子完整性修复正是靠键判断分子边界。
+                n_cif_bonds = topology.getNumBonds()
+                n_sys_bonds = 0
+                for _f in system.getForces():
+                    if isinstance(_f, openmm.HarmonicBondForce):
+                        n_sys_bonds = max(n_sys_bonds, _f.getNumBonds())
+                # System 的键数 = HarmonicBondForce 键数 + 被 constraints 吸收的 X–H 键，
+                # 所以 topology 键数应当 ≥ HarmonicBondForce 键数。明显更少就是丢了。
+                if n_sys_bonds > 0 and n_cif_bonds < n_sys_bonds:
+                    log.warning(
+                        "  ⚠️ mmCIF 拓扑只有 %d 个键，而 System 的 HarmonicBondForce 有 %d 个"
+                        " —— mmCIF 不保存非标准残基（脂质/配体/离子）的键。"
+                        "PBC 分子完整性修复依赖键，键丢了会把跨边界分子撕开。"
+                        "已丢弃 mmCIF 拓扑，改从 .top 重建。",
+                        n_cif_bonds, n_sys_bonds,
+                    )
+                    topology = None
+                else:
+                    log.info(
+                        "  ✓ 拓扑从 mmCIF 缓存恢复 (原子数 %d, 键数 %d)",
+                        n_cif, n_cif_bonds,
+                    )
         except Exception as e:
             log.warning("  ⚠️ mmCIF 拓扑加载失败: %s", e)
 
@@ -1053,7 +1180,7 @@ def load_native_system(
     if topology is None and phase == "complex" and top_file and os.path.exists(top_file):
         try:
             inc_dir = gmx_include_dir or find_gmx_include_dir()
-            top = app.GromacsTopFile(top_file, includeDir=inc_dir)
+            top = load_gromacs_topology_for_openmm(top_file, includeDir=inc_dir)
             topology = top.topology
             log.info("  ✓ 拓扑从原始 TOP 文件重建")
         except Exception as e:
@@ -1064,6 +1191,20 @@ def load_native_system(
             "无法恢复拓扑：mmCIF 缓存损坏且无有效 TOP 文件。\n"
             "   💡 解决方案：请确保命令中包含 --top 参数，或删除 output 目录后重新运行。"
         )
+
+    # 🔑 无论拓扑从哪条路径恢复，都必须带上周期盒矢量。
+    #
+    # `app.DCDFile` 写每帧的 unitcell 时读的是 **topology** 的盒矢量
+    # （`dcdfile.py:155`：`boxVectors = self._topology.getPeriodicBoxVectors()`；
+    # 为 None 就整段不写，header 的 boxFlag 也是 0）。拓扑没盒矢量 → DCD 没 unitcell
+    # → 下游任何要算 APL / 盒序列的分析（§9 膜质量门）直接失效。
+    #
+    # mmCIF 恢复的拓扑自带 `_cell`，所以历史上没暴露；但从 `.top` 重建时
+    # `GromacsTopFile` 只在显式传 `periodicBoxVectors` 时才设盒——这是一处
+    # **fail-open**：少传一个参数，产出的轨迹静默缺少盒信息。
+    if box_vectors is not None and topology.getPeriodicBoxVectors() is None:
+        topology.setPeriodicBoxVectors(box_vectors)
+        log.info("  ✓ 已把盒矢量写入拓扑（DCD 的 unitcell 依赖它）")
 
     # 5. Positions (保持不变)
     positions = None
@@ -1143,7 +1284,7 @@ def build_system_from_gromacs(
         log.warning("  ⚠️ 未找到 include 目录，若拓扑含 #include 可能失败")
 
     try:
-        top = app.GromacsTopFile(
+        top = load_gromacs_topology_for_openmm(
             top_file,
             periodicBoxVectors=box_vectors,
             includeDir=include_dir,
@@ -1451,6 +1592,8 @@ class RunConfig:
             preset["force_switch_deviation_evidence"] = (
                 args.force_switch_deviation_evidence
             )
+        if _flag_present("--membrane-quality-gate"):
+            preset["membrane_quality_gate"] = args.membrane_quality_gate
         if _flag_present("--confirm-soluble-with-lipids"):
             preset["confirm_soluble_with_lipids"] = bool(
                 args.confirm_soluble_with_lipids
@@ -1500,6 +1643,8 @@ class RunConfig:
             "system_type": None,
             "membrane": None,
             "confirm_soluble_with_lipids": False,
+            # §9 质量门默认 enforce（严格）。
+            "membrane_quality_gate": None,
             # 净电荷协议默认由配体净电荷推导（§1.2 生产默认值）。
             "charge_treatment": None,
             "co_alchemical_ion": None,
@@ -1553,6 +1698,7 @@ def _write_run_provenance(
     forcefield_family: Optional[Dict] = None,
     membrane_input: Optional[Dict] = None,
     pairs_conversion: Optional[Dict] = None,
+    membrane_quality_gate_mode: Optional[str] = None,
 ) -> Dict:
     provenance = _collect_pipeline_provenance(
         config=config.as_dict(),
@@ -1576,6 +1722,10 @@ def _write_run_provenance(
     if pairs_conversion is not None:
         provenance["gromacs_pairs_funct2_conversion"] = pairs_conversion
     # §3.3 / §10：膜输入核对结果（含实测叶片数/水/离子计数与声明来源）落盘。
+    if membrane_quality_gate_mode is not None:
+        # advisory 放行过的运行必须在 provenance 里认得出来——否则事后无从判断
+        # 那个 ΔG_bind 有没有生产资格。
+        provenance["membrane_quality_gate_mode"] = membrane_quality_gate_mode
     if membrane_input is not None:
         provenance["membrane_input"] = membrane_input
         provenance["membrane_composition"] = (membrane_input.get("declared") or {}).get(
@@ -2161,6 +2311,16 @@ def parse_arguments():
         type=int,
         default=None,
         help="膜 barostat 体积移动频率，默认 25",
+    )
+    parser.add_argument(
+        "--membrane-quality-gate",
+        default=None,
+        choices=["enforce", "advisory"],
+        help=(
+            "§9 膜质量门模式。enforce（默认）门未过即阻断；"
+            "advisory 照样计算并落盘报告、失败大声 warning 但不阻断"
+            "（用于先把管路跑通；**不是生产资格**）"
+        ),
     )
     parser.add_argument(
         "--confirm-soluble-with-lipids",
@@ -3080,6 +3240,9 @@ def _run_boresch_attachment_only(
         )
     if config.decoupling != "dual_lambda":
         raise RuntimeError("--only-boresch-attachment 只支持 --decoupling dual_lambda")
+    # [§9 / MEM-14] 增量重跑同样是在**消费**那次预平衡，所以门必须先过。
+    # 否则"门失败 → 用 --only-* 重跑"就成了另一条绕过路径。可溶体系直接短路。
+    source_pipeline.ensure_membrane_quality_gate_passed()
     # 运行时解析出的这组只是个参考——真正要用的是冻结腿 payload 里那组（见下）。
     # 所以这里不拦，解析不出来也能继续。
     if not _has_valid_boresch_anchors(boresch_restraint):
@@ -3296,6 +3459,8 @@ def _run_complex_charging_only(
         raise RuntimeError("--only-complex-charging 只支持生产级 PME charging 路径")
     if not isinstance(boresch_restraint, dict):
         raise RuntimeError("charging-only 需要现有 complex Boresch 参数")
+    # [§9 / MEM-14] 同上：增量重跑也在消费那次预平衡，门必须先过。
+    source_pipeline.ensure_membrane_quality_gate_passed()
 
     source_dir = os.path.abspath(config.output)
     stage2_path = os.path.join(source_dir, "checkpoints", "stage2_vanishing.json")
@@ -3637,6 +3802,14 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
 
     # ----- 1. 系统加载：优先从缓存，否则 GROMACS 构建并立即落盘 -----
+    #
+    # 环境类型必须在**加载 System 之前**就知道：膜体系要求 `load_native_system`
+    # 返回**带键**的拓扑（mmCIF 不保存脂质/配体的键，而 PBC 分子完整性修复靠键）。
+    # 这里只用 config 判环境类型——完整的膜协议解析（要 topology 做脂质交叉检查）
+    # 仍在下面 `resolve_membrane_protocol` 那一处，两者取值一致由下方断言保证。
+    _environment_type = resolve_environment_type(config.get("system_type"))
+    _require_bonded_topology = _environment_type == "membrane"
+
     include_dir = find_gmx_include_dir(config.gmx_path)
     main_cache_identity = _main_cache_identity(
         config.gro, config.top, config.ligand, include_dir
@@ -3652,7 +3825,10 @@ def main():
             output_dir, 
             gro_file=config.gro, 
             top_file=config.top, 
-            gmx_include_dir=include_dir
+            gmx_include_dir=include_dir,
+            # 膜体系必须拿**带键**的拓扑：mmCIF 不保存脂质/配体的键，而
+            # PBC 分子完整性修复靠键判断分子边界，键丢了会把跨边界脂质撕开。
+            require_bonded_topology=_require_bonded_topology,
         )
         log.info("♻️ 从缓存加载 System 完成")
         # 缓存命中时不需要再转换（缓存里存的是转换后构建出来的 System）。
@@ -3667,23 +3843,23 @@ def main():
         # 那三列经**逐对校验**若与全局 fudgeQQ 和 `[ atoms ]` 电荷一致，就是冗余重述，
         # 可等价转成 funct 1；不一致则 fail closed（硬转会静默改变哈密顿量）。
         # 转换写到 output_dir 下的独立目录，**原始输入一个字节都不动**。
-        _top_for_openmm = config.top
-        _pairs_conversion = None
-        if gromacs_topology_has_funct2_pairs(config.top, include_dir):
-            _compat_dir = os.path.join(output_dir, "gromacs_openmm_compat")
-            log.info("🔧 检测到 [ pairs ] funct 2（OpenMM 不支持），执行等价转换 → %s", _compat_dir)
-            _pairs_conversion = convert_gromacs_pairs_funct2(
-                config.top, _compat_dir, include_dir
-            )
-            _top_for_openmm = _pairs_conversion["converted_top_path"]
+        # 主路径显式指定转换目录，让产物落在 output_dir 里便于审计；
+        # 下游各加载点即使自己再调一次，也会命中同一份（幂等 + 内容寻址）。
+        _top_for_openmm, _pairs_conversion = openmm_compatible_gromacs_top(
+            config.top,
+            include_dir,
+            compat_dir=os.path.join(output_dir, "gromacs_openmm_compat"),
+        )
+        if _pairs_conversion:
             log.info(
-                "   ✓ 转换 %d 条 pairs（%d 个文件拷贝，改写 %s）；原始输入未修改",
-                _pairs_conversion["n_pairs_converted"],
-                _pairs_conversion["n_files_copied"],
-                [os.path.basename(f["source"]) for f in _pairs_conversion["patched_files"]],
+                "🔧 [ pairs ] funct 2（OpenMM 不支持）已等价转换 → %s"
+                "（%s 条；原始输入未修改）",
+                _top_for_openmm,
+                _pairs_conversion.get("n_pairs_converted", "复用已有"),
             )
 
-        # 从 GROMACS 构建
+        # 从 GROMACS 构建（build_system_from_gromacs 内部也走唯一入口，这里传
+        # 转换后的路径只是为了让 provenance 记录的就是实际用的那份）。
         system, topology, positions, box_vectors, ligand_indices = build_system_from_gromacs(
             config.gro, _top_for_openmm, config.ligand,
             include_dir
@@ -3702,12 +3878,17 @@ def main():
         log.info("✅ 原生缓存已生成")
         # 重新从缓存加载，确保后续所有对象都来自落盘文件
         # 替换原有的 load_native_system 调用为：
+        # ⚠️ 注意这一步：即使是**全新构建**，这里也会立刻从落盘文件重新读回，
+        # 所以生产的每一次运行（首跑或缓存命中）都会拿到 `load_native_system` 的
+        # 拓扑。膜体系必须要求带键拓扑，否则首跑同样会被 mmCIF 丢键坑到——
+        # 这正是"直接用 build_system_from_gromacs 复现不出 NaN"的原因。
         system, topology, positions, box_vectors, ligand_indices = load_native_system(
             output_dir, 
             gro_file=config.gro, 
             top_file=config.top, 
             gmx_include_dir=include_dir,
             prefer_equilibrated=False,
+            require_bonded_topology=_require_bonded_topology,
         )
         log.info("🔄 已从缓存重新加载 System (使用落盘后对象)")
 
@@ -3741,6 +3922,16 @@ def main():
             config.get("confirm_soluble_with_lipids", False)
         ),
     )
+    # 两处环境类型解析必须一致（前者只看 config，后者还做脂质交叉检查）。
+    # 不一致意味着有人给其中一条加了额外来源，那会让"要不要带键拓扑"与
+    # "用哪种 barostat"基于不同的判断，属静默不一致。
+    if _barostat_protocol["system_type"] != _environment_type:
+        raise SystemExit(
+            f"环境类型解析不一致：加载 System 前判为 {_environment_type!r}，"
+            f"完整协议解析判为 {_barostat_protocol['system_type']!r}。"
+            "两者必须同源（都来自 config 的 system_type）。"
+        )
+
     if _barostat_protocol["system_type"] != "soluble":
         log.info(
             "🧫 环境类型=%s，复合物腿将使用 %s",
@@ -3934,6 +4125,11 @@ def main():
             forcefield_family=_forcefield_family_info,
             membrane_input=_membrane_input_report,
             pairs_conversion=_pairs_conversion,
+            membrane_quality_gate_mode=(
+                resolve_membrane_quality_gate_mode(config.get("membrane_quality_gate"))
+                if _barostat_protocol["system_type"] == "membrane"
+                else None
+            ),
         )
         log.info(
             "🧾 运行 provenance 已保存: %s",
@@ -4008,6 +4204,10 @@ def main():
                     "pocket_atom_indices",
                     "coion_atom_index",
                     "literature_apl_nm2",
+                    # 诊断专用参考值：只落盘偏差，不判门（MEM-12）。与
+                    # `literature_apl_nm2` 刻意分成两个字段，见
+                    # `abfe_core.evaluate_membrane_quality_gate` 里的说明。
+                    "pure_lipid_reference_apl_nm2",
                     "equilibration_length_ns",
                     "ligand_resname",
                 )
@@ -4022,6 +4222,7 @@ def main():
             if _membrane_input_report is not None
             else None
         ),
+        membrane_quality_gate_mode=config.get("membrane_quality_gate"),
     )
 
     # ----- 3. 加载可选参数 -----

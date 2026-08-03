@@ -102,8 +102,19 @@ from abfe_core import (
     ENVIRONMENT_TYPE_MEMBRANE,
     DISPERSION_PROTOCOL_LEGACY_UNIFORM_LRC,
     resolve_dispersion_protocol,
-    membrane_observables_from_trajectory,
-    evaluate_membrane_quality_gate,
+    # §9 质量门：提取 + 判定 + 落盘的接线只有 `run_membrane_quality_gate` 一份，
+    # 本文件不再直接调 `membrane_observables_from_trajectory` /
+    # `evaluate_membrane_quality_gate`（那会变成第二套判据，见 §0.5.7 的教训）。
+    run_membrane_quality_gate,
+    MEMBRANE_QUALITY_GATE_MODE_ADVISORY,
+    resolve_membrane_quality_gate_mode,
+    # 预平衡轨迹时间轴：写轨迹的 reporter/integrator 与判 §9 的一侧共用这两个数。
+    PRE_EQUILIBRATION_TRAJ_INTERVAL_STEPS,
+    PRE_EQUILIBRATION_TIMESTEP_PS,
+    pre_equilibration_frame_interval_ps,
+    # 起始态体检（PE / max|F|）唯一实现；attachment 腿共用它。
+    assert_starting_state_is_sane,
+    load_gromacs_topology_for_openmm,
     barostat_fingerprint_payload,
     ensure_barostat_for_protocol,
     resolve_membrane_protocol,
@@ -111,6 +122,30 @@ from abfe_core import (
 import warnings
 
 PME_DECHARGE_MODEL_VERSION = "pme_decharge_v2_llfreeze_pmeself_20260523"
+
+# 膜体系预平衡的速度初始化种子。固定值使同一输入可复现；只影响膜路径
+# （可溶路径不初始化速度，以保持既有生产基线逐位一致）。
+MEMBRANE_EQUILIBRATION_VELOCITY_SEED = 20260730
+
+# 膜预平衡的监控落盘间隔（步）。5000 步 = 10 ps，10 ns 会得到 1000 行，
+# 足够看清体积/温度/能量往哪走，写盘开销可忽略。
+MEMBRANE_EQUILIBRATION_MONITOR_INTERVAL = 5000
+
+# 最小化后允许的最大单原子受力（kJ/mol/nm）。超过即判定"起始态坏了"并 fail closed。
+#
+# 定这个数的依据是实测：memtest 体系（45354 原子）**正常**时最小化后
+# max|F| ≈ 2.5e3 且落在水上；而一个坏掉的 System（缓存里的 system_native.xml）
+# 给出 max|F| = 3.7e9、PE = 4.1e13 —— 相差 6 个数量级。
+# 1e6 留了 400 倍余量，正常体系不可能触发，坏体系必定触发。
+#
+# 为什么必须拦：坏的起始态会在几千步后变成一个**没有上下文的** `Particle
+# coordinate is NaN`，然后要花好几轮去猜。拦在这里，报的是"起点就坏"，
+# 并且能指出是哪个原子。
+#
+# 判门与报数的实现在 `abfe_core.assert_starting_state_is_sane()`（唯一一份，
+# Boresch attachment 腿的起点体检共用它）。这里只是这个调用点的阈值别名 ——
+# 值等于 `abfe_core.STARTING_STATE_MAX_FORCE_KJ_PER_MOL_NM`，改要一起改。
+MEMBRANE_POST_MINIMIZATION_MAX_FORCE_KJ_PER_MOL_NM = 1.0e6
 
 logger = logging.getLogger(__name__)
 
@@ -1110,6 +1145,7 @@ class ABFEPipeline:
         dispersion_protocol: Optional[str] = None,
         forcefield_family: Optional[str] = None,
         membrane_quality_inputs: Optional[Dict] = None,
+        membrane_quality_gate_mode: Optional[str] = None,
     ):
 
         # 统一温度/压力单位
@@ -1160,6 +1196,11 @@ class ABFEPipeline:
         # [§9] 膜质量门需要的、无法从轨迹自动可靠推断的输入：口袋原子、co-ion 索引、
         # 该脂质力场的文献 APL、声明的预平衡时长。膜体系必填，可溶体系不用。
         self.membrane_quality_inputs = dict(membrane_quality_inputs or {})
+        # §9 质量门模式：未声明即 enforce（严格）。advisory 只放行、不隐藏——
+        # 报告仍完整落盘，模式进 provenance。
+        self.membrane_quality_gate_mode = resolve_membrane_quality_gate_mode(
+            membrane_quality_gate_mode
+        )
 
         # 路径配置
         self.output_dir = os.path.abspath(output_dir)
@@ -1330,6 +1371,44 @@ class ABFEPipeline:
         try:
             import mdtraj as md
             md_top = md.Topology.from_openmm(self.topology)
+            # 🔑 [MEM-15] 把 System 的**约束**补成键，再交给 image_molecules()。
+            #
+            # `image_molecules()` 按 **topology 的键**判断"什么算一个分子"。而刚性水
+            # （`constraints=HBonds` + `rigidWater`）的 O–H / H–H 只以**约束**存在：
+            # 实测 memtest 体系 `topology.bonds()` 里涉及水的键数 = **0**，
+            # 而约束里涉及水的有 28626 个（= 9542 水 × 3）。
+            # 于是 mdtraj 把每个水原子当成独立分子、逐原子回卷，把跨边界的水**撕开**。
+            #
+            # 实测后果（2026-08-03 Stage 0 的 NaN，全链条都量过）：
+            #   * 243 个水的 O/H 落到不同镜像 → 729 个 PME 排除对跨盒（最远 13.76 nm），
+            #     而 OpenMM 的 PME 要求排除对必须比 cutoff 近 → 虚假的 −30.9 MJ/mol；
+            #   * 约束求解器要在相距 5.9–12.4 nm 的 O/H 间满足 0.0957 nm → 不收敛
+            #     → `Particle coordinate is NaN`，**不到 1 ps**。
+            #
+            # ⚠️ 这个损坏对所有既有诊断都是隐形的：水没有键力项，所以键能
+            # （9525.72，两边逐位相同）与最大键长（0.19 nm）完全正常；
+            # 最小化后 max|F| 也正常（5292）。只有查排除对距离才看得见。
+            #
+            # 用约束而不是"从 .top 的 [ molecules ] 取区间"：约束就在 System 里，
+            # 任何输入来源都有，不依赖 `.top` 是否可得；而它补上的正好是缺的那些边。
+            _constraint_bonds = 0
+            _md_atoms = list(md_top.atoms)
+            _existing = {
+                tuple(sorted((a.index, b.index))) for a, b in md_top.bonds
+            }
+            for _ci in range(self.system.getNumConstraints()):
+                _p1, _p2, _ = self.system.getConstraintParameters(_ci)
+                _key = tuple(sorted((int(_p1), int(_p2))))
+                if _key in _existing:
+                    continue
+                md_top.add_bond(_md_atoms[_key[0]], _md_atoms[_key[1]])
+                _existing.add(_key)
+                _constraint_bonds += 1
+            if _constraint_bonds:
+                self._log(
+                    f"  🔗 已把 {_constraint_bonds} 个约束补成键用于分子归组"
+                    "（刚性水的 O–H 只以约束存在，否则会被逐原子回卷撕开）"
+                )
             # ⚠️ Quantity.value_in_unit() 在底层是 list-of-Vec3（而非 numpy 数组）时
             # 返回的仍是 Python list，没有 .reshape；必须显式再包一层 np.asarray。
             # 🚨 mdtraj 的 Cython 扩展（含 image_molecules 内部用到的 geometry 例程）
@@ -1371,72 +1450,72 @@ class ABFEPipeline:
                 "  常见原因：拓扑与坐标原子数不一致、盒矢量非法、mdtraj 未安装。"
             ) from exc
 
+    def ensure_membrane_quality_gate_passed(self) -> Optional[Dict]:
+        """消费预平衡之前，确保 §9 膜质量门已经判过（MEM-14）。幂等。
+
+        ## 为什么需要它：门原先能被"再跑一次"绕过
+
+        门此前只在 `pre_equilibrate()` **内部**调用，而
+        `_update_stage_status("equilibration", "completed")` 与预平衡指纹是在门
+        **之前**写的。于是：
+
+            门失败 → 原样重跑 → `equilibrium_is_done()` 为真
+            → `pre_equilibrate()` 整段跳过 → **门也一起被跳过** → 直接进 Stage 0
+
+        也就是说 `enforce` 的语义被控制流击穿了 —— 而 `enforce` 存在的全部意义就是
+        "门没过不许继续烧 λ 窗口"。实测触发过：memtest 100 ns 那轮门失败后，
+        任何一次重跑都会静默通过。
+
+        所以现在**每个消费预平衡的入口**都要先过这里：`run_full_pipeline()` 与
+        `runabfe` 的两个增量重跑入口。`pre_equilibrate()` 里那次调用**保留**——
+        刚产出就 fail fast，省得白跑 Stage 0。
+
+        幂等：本进程内判过一次就复用结果（重算一次 5000 帧要一两分钟，
+        没必要在同一进程里做两遍）。可溶体系直接短路返回 None。
+        """
+        if self.environment_type != ENVIRONMENT_TYPE_MEMBRANE:
+            return None
+        cached = getattr(self, "_membrane_quality_gate_report", None)
+        if cached is not None:
+            return cached
+        traj_path = os.path.join(self.output_dir, "pre_equilibration.dcd")
+        if not os.path.exists(traj_path):
+            raise RuntimeError(
+                f"膜体系要判 §9 质量门，但找不到预平衡轨迹：{traj_path}。"
+                "门不能因为轨迹缺失就跳过——那正是 MEM-14 修掉的绕过路径。"
+            )
+        report = self._evaluate_membrane_quality_gate_after_equilibration(traj_path)
+        self._membrane_quality_gate_report = report
+        return report
+
     def _evaluate_membrane_quality_gate_after_equilibration(self, traj_path: str) -> Dict:
         """预平衡结束后判膜质量门并落盘摘要（§9 / §6.2）。
 
-        门没过就 raise —— §9 末句："质量门失败时回到膜体系平衡，不允许靠增加
-        ABFE 窗口掩盖。"所以这里必须阻断，而不是打个 warning 继续烧 λ 窗口。
+        ⚠️ **接线只有一份**，在 `abfe_core.run_membrane_quality_gate()`。
+        这里只负责把 pipeline 的状态喂进去。离线复算工具
+        （`tools/diagnostics/evaluate_membrane_quality_gate.py`）调的是同一个函数，
+        所以"离线判的门"与"生产判的门"构造性同源 —— §0.5.7 已经因为
+        "离线重建与生产路径不一致"白花过好几轮，不能再有第二份判据。
 
-        需要的口袋定义 / co-ion 索引由 `membrane_quality_inputs` 显式给出，
-        不做运行时推断——同一体系两次跑必须用同一个口袋定义（MEM-00c 那类漂移的教训）。
+        模式语义（`enforce` / `advisory`）与 fail-closed 行为见该函数的 docstring。
+
+        ⚠️ 入口不止这一个：`ensure_membrane_quality_gate_passed()` 会在每个**消费**
+        预平衡的地方再判一次（MEM-14），因为门失败后重跑会跳过 `pre_equilibrate()`。
         """
-        import mdtraj as md
-
-        inputs = self.membrane_quality_inputs
-        pocket = inputs.get("pocket_atom_indices")
-        if not pocket:
-            raise RuntimeError(
-                "膜体系必须在 membrane_quality_inputs 里给出 pocket_atom_indices："
-                "口袋定义直接决定 §9 的 pocket_rmsd 这一道门，不接受运行时推断。"
-            )
-        ligand_resname = inputs.get("ligand_resname")
-        if not ligand_resname:
-            ligand_resname = self.topology.atom(self.ligand_indices[0]).residue.name
-
-        self._log("\n[膜质量门] 读取预平衡轨迹并计算 §9 观测量...")
-        traj = md.load(traj_path, top=md.Topology.from_openmm(self.topology))
-        observables, diagnostics = membrane_observables_from_trajectory(
-            traj,
-            ligand_resname=ligand_resname,
-            normal_axis=(self.barostat_protocol["membrane"] or {}).get("normal_axis", "z"),
-            pocket_atom_indices=[int(i) for i in pocket],
-            coion_atom_index=inputs.get("coion_atom_index"),
-            equilibration_length_ns=inputs.get("equilibration_length_ns"),
-            # 身份以 `.top` 组成为准：脂质按分子分叶、水/离子/蛋白用权威原子集合，
-            # 不靠残基名（TP3 / Na+ / Cl- / HID / NTRP 都会被残基名判据漏掉）。
-            composition=inputs.get("composition"),
+        self._membrane_quality_gate_report = report = run_membrane_quality_gate(
+            traj_path,
+            self.topology,
+            self.membrane_quality_inputs,
+            mode=self.membrane_quality_gate_mode,
+            normal_axis=(self.barostat_protocol["membrane"] or {}).get(
+                "normal_axis", "z"
+            ),
+            ligand_indices=self.ligand_indices,
+            output_dir=self.output_dir,
+            # 与上面那条 DCDReporter / Integrator 同源（见常量定义处的说明）。
+            frame_interval_ps=pre_equilibration_frame_interval_ps(),
+            log=self._log,
         )
-        report = evaluate_membrane_quality_gate(
-            observables,
-            diagnostics,
-            literature_apl_nm2=inputs.get("literature_apl_nm2"),
-            require_coion=inputs.get("coion_atom_index") is not None,
-        )
-
-        summary_path = os.path.join(self.output_dir, "membrane_quality_gate.json")
-        with open(summary_path, "w", encoding="utf-8") as handle:
-            json.dump(
-                {"report": report, "observables": observables},
-                handle,
-                indent=2,
-                ensure_ascii=False,
-                cls=NumpyEncoder,
-            )
-        self._log(f"  ✓ 膜质量门摘要已保存: {summary_path}")
-
-        for check in report["checks"]:
-            flag = "✓" if check["passed"] else "✗"
-            self._log(
-                f"    {flag} {check['observable']} [{check['criterion']}] "
-                f"{check['measured']:.6g} vs 阈值 {check['threshold']:.6g}"
-            )
-
-        if not report["passed"]:
-            raise RuntimeError(
-                f"膜质量门未通过，失败项：{report['failed_checks']}。"
-                f"{report['remediation']} 详情见 {summary_path}。"
-            )
-        self._log("  ✅ 膜质量门通过")
         return report
 
     def pre_equilibrate(
@@ -1540,8 +1619,13 @@ class ABFEPipeline:
             )
 
         # 创建 Integrator
+        # 步长走 `abfe_core.PRE_EQUILIBRATION_TIMESTEP_PS`（值仍是 0.002，逐位不变）：
+        # §9 质量门的时间轴只能由"reporter 间隔 × 这个步长"重建（mdtraj 读 DCD 给的是
+        # 整数帧号），所以写轨迹的一侧与判门的一侧必须引用同一个常量。
         integrator = openmm.LangevinMiddleIntegrator(
-            self.temperature, 1.0 / unit.picosecond, 0.002 * unit.picosecond
+            self.temperature,
+            1.0 / unit.picosecond,
+            PRE_EQUILIBRATION_TIMESTEP_PS * unit.picosecond,
         )
         
         # ✅ 修复：正确初始化 Platform，支持 CUDA
@@ -1577,14 +1661,136 @@ class ABFEPipeline:
                 simulation.context.setPeriodicBoxVectors(*self.box_vectors)
             self._log("  → 能量最小化...")
             openmm.LocalEnergyMinimizer.minimize(simulation.context, maxIterations=1000)
+
+            # 🔑 膜体系：最小化后必须把速度初始化到目标温度，**再**开始 NPT。
+            #
+            # 这个函数原来从不调 `setVelocitiesToTemperature`（`ibs_engine` 里有 10 处
+            # 都调，唯独这里没有），于是体系从 **0 K** 起跑，而 barostat 从第 0 步就
+            # 以频率 25 做体积移动。冷体系下 |ΔE| 很小、`P·ΔV` 项主导，barostat 会
+            # 倾向接受大幅压缩；纯水盒通常扛得住（可溶路径一直如此），但膜在法向上
+            # 没有横向支撑，Z 自由的那一维可能被压塌。
+            # ⚠️ 证据口径：这条改动的**依据是通行做法**（0 K 起跑直接开 NPT 是错的），
+            # **不是**"已证明它修掉了 NaN"。实测（`memtest/diagnose_nan.py` 的 [F]/[G]，
+            # CUDA 200k 步 = 0.4 ns）：不初始化速度与初始化速度**都没炸**，且盒子都在
+            # 近似定容下 XY 收 / Z 涨（零表面张力膜 barostat 的正常弛豫），
+            # 所以"冷启动压塌盒子"这个假设并未被证实。NaN 在 0.4 ns 之后。
+            #
+            # ⚠️ **只对膜体系生效**：给可溶路径加速度初始化会改变现有生产基线的轨迹
+            # （§7.7 / R7 要求 `system_type` 默认时逐位一致），那属于单独的课题。
+            # 膜体系：最小化后立刻报**势能与最大受力**。
+            #
+            # 这一步是为了能一眼看出"起始态本身是否异常"。首跑 NaN 时这里什么都不报，
+            # 只能靠离线脚本重建同一状态去对比——而离线重建与生产路径未必一致
+            # （生产可能命中缓存、坐标来自 CIF 而非 .gro），于是白花了几轮。
+            # 有了这两个数，下一次崩的时候立刻能判断是"起点就坏"还是"跑着坏"。
+            # 参考量级（memtest，45354 原子）：最小化后 PE ≈ −6.5e5 kJ/mol，
+            # max|F| ≈ 2.5e3 kJ/mol/nm 且落在水上。
+            if self.environment_type == ENVIRONMENT_TYPE_MEMBRANE:
+                # 门只有一份实现（`abfe_core.assert_starting_state_is_sane`），
+                # Boresch attachment 腿的起点体检调的是同一个函数。
+                assert_starting_state_is_sane(
+                    simulation.context,
+                    self.topology,
+                    label="最小化后",
+                    max_force_kj_per_mol_nm=(
+                        MEMBRANE_POST_MINIMIZATION_MAX_FORCE_KJ_PER_MOL_NM
+                    ),
+                    remediation=(
+                        "    最常见的原因是**缓存里的 System 与当前输入不一致**"
+                        "（`system_native.xml` 往返坏掉 / 串了别的体系）。\n"
+                        "    验证方法：`python memtest/compare_systems.py` 会把缓存 System 与"
+                        "从 .top 现场重建的 System 逐力对比；\n"
+                        "    临时绕过：删掉 output 目录里的 system_native.xml（或加 --reset）"
+                        "强制从 .top 重建。"
+                    ),
+                    log=self._log,
+                )
+
+            if self.environment_type == ENVIRONMENT_TYPE_MEMBRANE:
+                simulation.context.setVelocitiesToTemperature(
+                    self.temperature, MEMBRANE_EQUILIBRATION_VELOCITY_SEED
+                )
+                self._log(
+                    f"  🌡️ 膜体系：速度已初始化到 {self.temperature}"
+                    f"（seed={MEMBRANE_EQUILIBRATION_VELOCITY_SEED}）——"
+                    "避免 0 K 冷启动下 barostat 压塌盒子"
+                )
             steps_remaining = n_steps
         
         # 添加 Reporter
         if save_traj and steps_remaining > 0:
             simulation.reporters.append(
-                app.DCDReporter(traj_file, 10000, append=resume_from_chk, enforcePeriodicBox=False)
+                app.DCDReporter(
+                    traj_file,
+                    PRE_EQUILIBRATION_TRAJ_INTERVAL_STEPS,  # 值仍是 10000，逐位不变
+                    append=resume_from_chk,
+                    enforcePeriodicBox=False,
+                )
             )
             simulation.reporters.append(app.CheckpointReporter(chk_file, 100000))
+
+        # 🔑 膜体系：DCD 的 unitcell 依赖 **topology** 的盒矢量，必须在开跑前查。
+        #
+        # `app.DCDFile` 写每帧 unitcell 时读的是 `self._topology.getPeriodicBoxVectors()`
+        # （`dcdfile.py:155`），为 None 就整段不写。而 §9 膜质量门要从这条轨迹算
+        # APL / 盒序列——拿到一条没有 unitcell 的 DCD 时它只能报错，
+        # 那时 10 ns 已经烧完了。所以拦在这里，而不是拦在质量门。
+        if (
+            self.environment_type == ENVIRONMENT_TYPE_MEMBRANE
+            and save_traj
+            and steps_remaining > 0
+            and self.topology.getPeriodicBoxVectors() is None
+        ):
+            _box_message = (
+                "膜体系的 topology 没有周期盒矢量 —— DCD 将不带 unitcell，"
+                "§9 膜质量门无法计算 APL 与盒序列，而那时预平衡已经跑完。\n"
+                "    `app.DCDFile` 的 unitcell 取自 topology（dcdfile.py:155），"
+                "不是取自 Context。\n"
+                "    最常见原因：从 `.top` 重建拓扑时没传 `periodicBoxVectors`"
+                "（`GromacsTopFile` 只在显式传参时才设盒）。\n"
+                "    修法：加载/重建拓扑后调用 `topology.setPeriodicBoxVectors(box)`。"
+            )
+            if self.membrane_quality_gate_mode == MEMBRANE_QUALITY_GATE_MODE_ADVISORY:
+                self._log(f"  ⚠️ [膜质量门 advisory] {_box_message}")
+            else:
+                raise RuntimeError(_box_message)
+
+        # 🔑 膜体系：把盒体积/势能/温度按步落盘。
+        #
+        # 首跑在预平衡动力学里出 `Particle coordinate is NaN`，而离线诊断
+        # （`memtest/diagnose_nan.py`）证明：输入无坏点、刚性平移保能量、分力项正常、
+        # 无原子重叠、**CUDA 上带膜 barostat 跑 0.4 ns 也不炸**（盒子在近似定容下
+        # XY 收 0.85% / Z 涨 1.61%，是零表面张力膜 barostat 的正常弛豫，不是压塌）。
+        # 也就是说 NaN 在 0.4 ns 之后，离线再猜性价比很低——必须**在跑中**留下轨迹，
+        # 崩的时候才能知道是体积失控、温度失控还是能量先发散。
+        #
+        # 只给膜体系加：可溶路径的 reporter 组合不变（多一个 reporter 会改日志与
+        # I/O 时序，虽不改数值，但 §7.7 要求默认路径行为一致，不必要就不动）。
+        if (
+            self.environment_type == ENVIRONMENT_TYPE_MEMBRANE
+            and save_traj
+            and steps_remaining > 0
+        ):
+            monitor_path = os.path.join(self.output_dir, "pre_equilibration_monitor.csv")
+            simulation.reporters.append(
+                app.StateDataReporter(
+                    monitor_path,
+                    MEMBRANE_EQUILIBRATION_MONITOR_INTERVAL,
+                    step=True,
+                    time=True,
+                    potentialEnergy=True,
+                    kineticEnergy=True,
+                    temperature=True,
+                    volume=True,
+                    density=True,
+                    speed=True,
+                    append=resume_from_chk,
+                )
+            )
+            self._log(
+                f"  📈 膜体系监控已启用（每 {MEMBRANE_EQUILIBRATION_MONITOR_INTERVAL} 步）: "
+                f"{monitor_path}"
+            )
         
         # 运行模拟
         if steps_remaining > 0:
@@ -5646,6 +5852,9 @@ class ABFEPipeline:
                 "评估项见 docs/TODO.md 的 R-03。"
             )
 
+        # [§9 / MEM-14] 消费预平衡之前必须判过膜质量门。
+        self.ensure_membrane_quality_gate_passed()
+
         self._last_run_config = {
             "decoupling_scheme": decoupling_scheme,
             "potential_type": potential_type,
@@ -7332,7 +7541,8 @@ class TraditionalABFEPipeline:
         gmx_include_dir: str = None,
     ):
         gro = app.GromacsGroFile(gro_file)
-        top = app.GromacsTopFile(
+        # 走唯一入口（见 abfe_core.load_gromacs_topology_for_openmm 的说明）。
+        top = load_gromacs_topology_for_openmm(
             top_file,
             periodicBoxVectors=gro.getPeriodicBoxVectors(),
             includeDir=gmx_include_dir,

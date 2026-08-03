@@ -166,6 +166,561 @@ charge-transfer。** 下面每条都带 `file:line`，Phase A 必须逐条裁决
 
 ---
 
+### 0.5.5 OpenMM 不支持 `[ pairs ]` funct 2（2026-07-30 已修）
+
+`memtest/` 首跑第一个硬错误：
+
+    ValueError: Unsupported function type in [ pairs ] line:
+        1  11  2 0.833333  -0.125447  -0.033096  3.39966950842e-01  7.62882666667e-02
+
+OpenMM 的 `app.GromacsTopFile` 只接受 funct 1
+（`gromacstopfile.py::_processPair` 里 `if fields[2] != '1': raise`）。
+CHARMM-GUI 的 AMBER FF-Converter 对**部分**对写 funct 2，多出 `fudgeQQ q1 q2` 三列。
+实测 `toppar/POPC.itp` 有 **21 条**（共 356 条 pairs），其余 7 个文件一条没有。
+
+**为什么 OpenMM 报错是对的**：它读 `fields[3:5]`。对 funct 1 那正好是 `sigma eps`；
+对 funct 2 会读成 `fudgeQQ q1`。所以这不是它太严，是那三列真的会让它读错列。
+
+**为什么可以等价转换**：OpenMM 算 1-4 exception 的电荷用的是「粒子电荷 × 全局
+fudgeQQ」（`atom1params[0]*atom2params[0]*fudgeQQ`）。所以只要两条成立，那三列就是
+冗余重述：
+
+1. 逐对 `fudgeQQ` == `[ defaults ]` 的全局值 —— 实测 21 条全是 `0.833333` ✅
+2. `q1`/`q2` == 该 moleculetype `[ atoms ]` 的真实电荷 —— 实测 21 条全相等 ✅
+
+`abfe_core.convert_gromacs_pairs_funct2()` **逐对校验这两条**，任一不成立即
+fail closed（不成立意味着该对真的覆盖了静电缩放或电荷，硬转会静默改变哈密顿量）。
+
+实现要点：
+- **逐文件拷贝改写**，不做 include 展开：只有含 funct-2 的文件里那几行被改，
+  其余文件逐字节拷贝。实测 `POPC.itp` 行数不变、仅 21 行不同，另 7 个文件
+  `filecmp` 逐字节相同。
+- `#ifdef POSRES` / `#ifdef DIHRES` 原样保留（位置限制就藏在里面，
+  丢掉等于悄悄改变了"能不能做位置限制阶梯"）。
+- **原始输入一个字节不动**；转换产物写到 `output_dir/gromacs_openmm_compat/`。
+- 主 System 缓存指纹仍按**原始**输入算，但加入
+  `GROMACS_PAIRS_FUNCT2_CONVERSION_VERSION` —— 改了转换逻辑会正确让缓存失效，
+  否则是静默串协议。
+- 转换结果（含两侧 SHA256、改写条数）进 `run_provenance.json`。
+
+顺带确认：位置限制材料**在拓扑里就有**（`POPC.itp:1273`、`PROA.itp:42805` 的
+`#ifdef POSRES`），不是缺 `posre.itp`；默认不激活。§3.2 的分级释放若要自己做，
+走 `GromacsTopFile` 的 `defines` 即可。
+
+**⚠️ 首次修这个问题时犯了和 B1 同样的错：只接了一个入口。**
+第一版只在 `build_system_from_gromacs` 处做转换，结果溶剂腿的
+`build_and_cache_solvent_leg`（另一个直接调 `app.GromacsTopFile` 的地方）照样炸。
+全仓一共有 **6 处**加载点（`runabfe.py` 4 处 + `abfe_core.py` 1 处 +
+`abfe_pipeline.py` 1 处）。这与 B1 当初只接了 1 个 `ABFEPipeline` 构造点
+（实际 5 个复合物腿）是**同一个毛病：同一件事有多个入口，补一个漏一片**。
+
+现在收敛为**唯一入口** `abfe_core.load_gromacs_topology_for_openmm()`：
+- `openmm_compatible_gromacs_top()` 幂等、**内容寻址缓存**
+  （key = 整棵树各文件 sha256 + 转换版本号），同一份输入只转一次，
+  输入变了 key 就变，且不往用户输入目录里写东西；
+- 主路径显式传 `output_dir/gromacs_openmm_compat` 让产物落在输出目录便于审计；
+- 6 处加载点全部改走它，并有**契约测试禁止任何生产文件裸调
+  `app.GromacsTopFile(`**（唯一豁免是入口函数自己那一行）——新加加载点会在测试里失败。
+
+证据：`tests/test_gromacs_pairs_funct2_conversion.py`（20 条，直接对真实
+`memtest/toppar/POPC.itp` 断言 + 合成拓扑验证两条 fail-closed + 唯一入口契约）。
+
+---
+
+### 0.5.6 水模型靠文件名识别（2026-07-30 已修）—— 同一类根因的第三次
+
+`memtest/` 首跑第二个硬错误（过了 `GromacsTopFile` 之后）：
+
+    ValueError: 在 topol.top 的 #include 里没认出任何水模型；
+                已知的有 ['opc','opc3','spce','tip3p','tip3pfb','tip4pew','tip4pfb']
+
+`resolve_water_model_xml()` 只看 `#include` 的**文件名词干**。对
+`amber14sb_OL15_fs1.ff/tip3p.itp` 有效；但 CHARMM-GUI 的 AMBER 转换器把 TIP3P
+命名为 **`TP3`**（`toppar/TP3.itp`），词干匹配必然落空。
+
+**这是同一个根因的第三次出现**（前两次见 §0.5.4）：脂质按残基名计数、
+水/离子按残基名计数、水模型按文件名识别——**靠名字判身份，换一套体系就错**。
+
+修法：文件名词干优先（保证现有可溶体系行为不变），认不出时按**实际参数**判——
+O/H 电荷 + O 的 σ/ε + 位点数。实测 `TP3` 是
+
+    3 位点, q_O = −0.834, q_H = +0.417,
+    σ_O = 0.315075240658 nm, ε_O = 0.635968 kJ/mol
+
+在 7 个候选里**唯一**匹配 `amber14/tip3p.xml`（σ 逐位吻合）。最接近的竞争者
+SPC/E 的 σ 差 1.5e-3 nm ≈ 容差(1e-6) 的 1500 倍，不存在误判空间。
+
+关键设计：**候选参数直接从 OpenMM 自带的 XML 读出**
+（`openmm/app/data/amber14/*.xml`），不硬编码参数表——"最终选出的 XML"与
+"用于比对的参数"构造性来自同一处，不会抄错、不会随 OpenMM 升级漂移。
+匹配必须**唯一**，多个候选落在容差内即拒绝（说明容差太松）。
+认不出时报错信息里带上实测的四个数字，否则用户只知道"认不出"、
+不知道自己的水到底是什么参数。
+
+顺带扩展了 `parse_gromacs_topology()`：新增 `[ atomtypes ]`（σ/ε/质量/电荷）与
+每个 moleculetype 的 `atoms`（含 atomtype、原子名、电荷、质量）——σ/ε 在
+`forcefield.itp` 里，必须递归拿到。
+
+证据：`tests/test_water_model_identification.py`（15 条，含"起怪名字的 SPC/E
+也能按参数认出"、"唯一性余量 > 100× 容差"、"认不出时报错带实测数字"、
+以及现有可溶体系仍走文件名的回归）。
+
+---
+
+### 0.5.7 mmCIF 拓扑缓存丢键 → PBC 修复撕开脂质 → NaN（2026-07-30 已修）
+
+`memtest/` 首跑第三个硬错误，也是最难定位的一个：预平衡动力学出
+`Particle coordinate is NaN`，而最小化"通过"了。
+
+**根因**：`app.PDBxFile.writeFile` **不写任何键记录**（写入端没有 `struct_conn` /
+`chem_comp_bond`），读取端只能靠 `createStandardBonds()` 补**标准残基**
+（氨基酸/核酸/水）的键。于是 `topology.cif` 往返之后，
+`POPC`（=PA+PC+OL）、配体 `MOL`、离子的键**全部静默丢失**，
+而 `load_native_system` 当时只校验**原子数**、不校验键数。
+
+`pre_equilibrate` 之前的「PBC 分子完整性修复」靠 topology 的键判断"什么算一个
+分子" —— 键丢了就把跨周期边界的脂质**逐段撕开**。实测对比：
+
+| 拓扑来源 | 最小化后 PE | max\|F\| |
+| --- | --- | --- |
+| `topology.cif`（丢键） | **4.109e+13** kJ/mol | **3.72e+09** @ `PA334/H8S`（脂质尾链氢） |
+| `.top` 重建（有键） | −648536 kJ/mol | 2501 @ `HOH3812/O`（水，正常） |
+
+**为什么绕了好几轮**：`runabfe` 在**全新构建**之后也会立刻
+`load_native_system` 重新读回（"确保后续所有对象都来自落盘文件"，
+`runabfe.py:3791` 附近），所以**首跑与缓存命中都会中招**；
+而我的离线诊断直接用 `build_system_from_gromacs`（`.top` 拓扑，有键）+ 不调 PBC 修复，
+所以怎么跑都不炸。**离线重建与生产路径不一致，是白花几轮的直接原因。**
+
+定位靠的是 `memtest/reproduce_production_preequil.py` 的三段 bisect
+（原样 / `--from-gro` / `--no-cache`）——它**只调生产函数**，不自己搭东西。
+
+修复：
+- `load_native_system(require_bonded_topology=True)`（膜体系必传）**优先从 `.top`
+  重建**拓扑，mmCIF 只在没有 `.top` 时兜底；重建失败即 fail closed，不许退回 mmCIF。
+- mmCIF 分支加**键数校验**：`topology.getNumBonds() < HarmonicBondForce.getNumBonds()`
+  即判定丢键、丢弃该拓扑。
+- 环境类型改为在**加载 System 之前**解析（`resolve_environment_type`，只看 config），
+  并对两处解析加一致性断言——否则"要不要带键拓扑"与"用哪种 barostat"会基于不同判断。
+  （首版把它写在使用点之后，自检直接抓出 `NameError`。）
+- `pre_equilibrate` 新增**最小化后受力合理性门**：`max|F| > 1e6 kJ/mol/nm` 当场 raise，
+  列出受力最大的 10 个原子、给出参考量级、指出最可能原因与验证方法。
+  这条把"跑 10 ps 后一个没有上下文的 NaN"变成"起点就坏，且告诉你坏在哪"。
+- `openmm_compatible_gromacs_top` 的复用改为按 `conversion_manifest.json` 逐文件
+  核对 sha256（原先只查"顶层 top 存在 && 树里没 funct-2"，是 fail-open：
+  半成品/被改过的转换目录会被静默复用）。
+
+⚠️ **可溶路径的同类隐患未动**：溶剂腿与可溶复合物腿的 `MOL` 配体键在 mmCIF 往返里
+同样会丢。改动会移动现有生产基线的预平衡起点（§7.7 / R7），所以单独立项评估，
+已记入 `docs/TODO.md`。
+
+**⚠️ 这个修复自己引入了下一个坑（同日修）**：`require_bonded_topology` 分支里
+调 `load_gromacs_topology_for_openmm(top_file, includeDir=...)` 时**没传
+`periodicBoxVectors`**，于是重建的拓扑没有盒矢量。而 `app.DCDFile` 写每帧 unitcell
+时读的是 **topology** 的盒矢量（`dcdfile.py:155`，为 None 就整段不写、header 的
+`boxFlag` 也是 0）——mmCIF 拓扑自带 `_cell` 所以历史上没暴露。
+结果：10 ns 预平衡跑完（DCD 272 MB / 500 帧），却在 §9 质量门读轨迹时才报
+「轨迹没有 unitcell 信息」。**烧完才发现**。
+
+修法三处：
+- `load_native_system` 的三条拓扑恢复路径**统一补盒矢量**
+  （`topology.setPeriodicBoxVectors(box_vectors)`），重建时也直接传参；
+- `pre_equilibrate` 在**开跑前**拦住"膜体系 + 拓扑无盒矢量"，不让它跑完才失败；
+- 提取器的报错指明根因位置（`dcdfile.py:155`）与修法，避免下次再从头查。
+
+证据：`tests/test_membrane_barostat_protocol.py` 的
+`test_membrane_requires_a_bonded_topology_not_the_mmcif_cache` /
+`test_topology_must_carry_box_vectors_before_a_membrane_run` /
+`test_bad_starting_state_fails_closed_after_minimization`。
+
+---
+
+### 0.5.8 §9 质量门的 enforce / advisory 双模式（2026-07-30）
+
+`memtest/` 的 10 ns 预平衡跑通后卡在质量门：那条 DCD 是在「拓扑缺盒矢量」那一版
+写出来的，没有 unitcell，算不了 APL 与盒序列。而轨迹本身很健康
+（末段 T 303.6–305.8 K、PE −508k~−510k、体积 438.97–440.37 nm³、密度 1.034 g/mL，
+监控 1001 行），不值得为一道门重烧 10 ns。
+
+所以给 §9 质量门加了 `membrane_quality_gate` 模式：
+
+| 模式 | 行为 |
+| --- | --- |
+| `enforce`（默认） | 门未过即阻断。这是 §9 末句的原意 |
+| `advisory` | 照样计算、照样落盘报告、失败大声 WARNING，但**不阻断** |
+
+**为什么是 advisory 而不是让人注释掉调用**：门被注释掉就**没有记录**，
+事后无从知道当时到底过没过。advisory 下：
+
+- 报告仍完整落盘（`membrane_quality_gate.json`）；**连"算不出来"也落盘**
+  （`{"evaluated": false, "blocked_reason": ...}`）；
+- `membrane_quality_gate_mode` 进 `run_provenance.json` —— "这次是放行跑的"赖不掉；
+- 模式值拼错直接报错，不静默回落成 enforce（反之亦然，两个方向都会让人误判资格）；
+- 开跑前那道「拓扑无盒矢量」守卫也跟着分模式，否则等于用另一条路把门变硬。
+
+⚠️ **advisory 不是生产资格。** 任何要报出的 ΔG_bind 必须在 `enforce` 下通过。
+这句话同时写在代码常量注释、`memtest/abfe_config.json` 注释与放行时的 WARNING 里。
+
+`memtest/abfe_config.json` 曾设 `advisory`，理由写在配置注释里。
+**2026-08-02 已改回 `enforce`**（见 §0.5.9）：带 unitcell 的 DCD 已拿到，
+且门本身的两个缺陷（MEM-01 / MEM-08）已修。
+
+---
+
+### 0.5.9 质量门自己坏了两处，而且一直没人知道（2026-08-02 已修）
+
+08-02 又跑了一轮 10 ns 预平衡（5e6 步 30.2 min → **实测 476 ns/day**），
+DCD 这次带 unitcell 了（§0.5.8 挂着的那一项由此完成）。但它把 §9 质量门自身的
+两个缺陷顶到了台面上 —— **这道门从来没有在真实膜体系上评估成功过一次**。
+
+#### MEM-01：分子路径下 `head_by_residue` 未绑定（同一根因的第四次）
+
+`abfe_core.membrane_observables_from_trajectory` 里，§0.5.4 把叶片划分从"按残基"
+改成"按分子"时分成了两条分支，但下面 `leaflet_composition` 那段仍然只读**残基分支的
+局部变量** `head_by_residue`。memtest 有 `.top` 组成 → 走分子分支 → 该变量从未绑定：
+
+    UnboundLocalError: cannot access local variable 'head_by_residue'
+
+07-31 14:51 与 08-02 16:53 两次运行**逐字相同**，`membrane_quality_gate.json`
+一直是 `{"evaluated": false}`。advisory 模式把它记成 WARNING 就过去了；
+⚠️ 同样的崩溃在 `enforce` 下是 `raise`，所以"直接改成 enforce"当时会死在这里。
+
+**这是 §0.5.4–§0.5.6 那个根因的第四次**，但换了个形态：前三次是"靠名字判身份"，
+这次是"**身份口径改了，但有个消费点没跟着改**" —— 与 §0.5.5
+"同一件事有多个入口，补一个漏一片"同源。
+
+修法是**改生成器不改产物**：两条分支统一产出
+`head_units: List[(单元标签, 头基原子 index)]`，`head_indices` 与
+`leaflet_composition` 都只从它派生，分支专属变量整个消失。
+分子路径的标签取 moleculetype 名（`POPC`），**不是**构成残基名（PA/PC/OL）——
+用残基名会让 leaflet_composition 又数出 3 倍脂质数。
+
+**为什么能漏出来**：`tests/test_membrane_observable_extractor.py` 原有 22 条测试
+**没有一条**传 `composition=`，分子分支覆盖率是零。已补 5 条，其中一条构造
+Amber Lipid21 式的模块化残基命名（一个 POPC 分子 = `PC` 头基残基 + `PA` 尾链残基），
+断言"按残基必须 fail closed、按分子才对"。
+
+#### MEM-08：§9 的时间轴错 20 倍
+
+修掉 MEM-01 之后门跑通了，报出来的是：
+
+    ValueError: 序列总跨度 0.499 ns 覆盖不了要求的末段窗口 20.000 ns
+
+但那条轨迹是 **10 ns**（5e6 步 × 2 fs），500 帧、每帧 10000 步 = **20 ps**。
+`0.499` 从哪来？实测：
+
+    >>> DCDTrajectoryFile(...).read_as_traj(top, n_frames=6).time
+    array([0, 1, 2, 3, 4, 5])          # 整数 dtype，间隔 1
+
+**mdtraj 读 DCD 不传播真实步长，`traj.time` 是整数帧号。**
+提取器原先只校验"时间数组存在且单调递增"——帧号完全满足，
+所以那条 docstring 里写着"不允许用帧号冒充 ns"的守卫，对 DCD（管线唯一写的格式）
+是 fail-open。
+
+**时间轴错一个倍数，两道门往相反方向坏**，这也是它难被发觉的原因：
+
+| 判据 | 时间轴小 20 倍时 |
+| --- | --- |
+| 末段 ≥ 20 ns 窗口 | **过严** —— 要 400 ns 真实时间才够 |
+| 预平衡 ≥ 一个脂质横向弛豫时间 | **过松** —— MSD 拟合的 D 被放大 20 倍，弛豫时间缩小 20 倍 |
+| 各量的 per-ns 漂移斜率 | **大 20 倍** —— APL 0.2 %/ns 阈值会被虚假违反 |
+
+修法：时间轴由「reporter 保存间隔 × integrator 步长」显式重建。
+两个常量 `PRE_EQUILIBRATION_TRAJ_INTERVAL_STEPS = 10000` /
+`PRE_EQUILIBRATION_TIMESTEP_PS = 0.002` 落在 `abfe_core`，
+**写轨迹的 reporter/integrator 与判门的一侧共用它们**（值不变，故行为逐位兼容；
+有 AST 契约测试禁止 `DCDReporter` 再写字面量间隔）。
+不传 `frame_interval_ps` 时，遇到**整数 dtype** 的时间数组一律拒绝并说明原因。
+实际用了哪一条写进 `diagnostics.time_axis_source`。
+
+修好后同一条 DCD 报 **9.980 ns**（499 × 20 ps），与手算一致。
+
+#### 顺带：质量门收敛为唯一实现 + 离线复判工具（MEM-02）
+
+上面这两个 bug 各花了一次 30 min GPU 才被看到，因为质量门的接线只存在于
+`ABFEPipeline._evaluate_membrane_quality_gate_after_equilibration` 里 ——
+唯一的验证办法就是**重烧一遍预平衡**。§0.5.7 已经因为
+"离线重建与生产路径不一致"白花过好几轮，所以这次不允许再有第二份接线：
+
+- 提取 → 判定 → 落盘收敛到 `abfe_core.run_membrane_quality_gate()`；
+- `tools/diagnostics/evaluate_membrane_quality_gate.py` 调**同一个**函数，
+  拓扑走 `runabfe.load_native_system(require_bonded_topology=True)`、
+  组成走 `classify_system_composition()`，与生产逐项对齐；纯 CPU、不建 Context；
+- advisory 下"判不了门"时**观测量也一起落盘**：那些数字是烧了 GPU 才有的，
+  判不了门不等于没价值（"跨度不够"时 APL/膜厚的实测值正是延长平衡的唯一依据）。
+
+#### 那条 10 ns 轨迹修好后算出来的 §9 观测量
+
+| 观测量 | 均值 | 末段 5 ns | 斜率 /ns | §13.3 阈值 |
+| --- | --- | --- | --- | --- |
+| `apl_nm2`（raw） | 0.8074 | 0.8058 | −0.0018 | 漂移 ≤ 0.2 %/ns |
+| `bilayer_thickness_nm` | 3.9301 | 3.9321 | +0.0051 | ≤ 0.05 nm / 20 ns |
+| `lipid_tail_order_parameter` | 0.1507 | 0.1534 | +0.0015 | （无绝对阈值）|
+| `protein_backbone_rmsd_nm` | 0.1047 | 0.1101 | +0.0004 | ≤ 0.30 nm |
+| `transmembrane_tilt_deg` | 3.4348 | 3.2355 | −0.1505 | 漂移 ≤ 5° |
+| `pocket_rmsd_nm` | 0.0643 | 0.0688 | +0.0009 | ≤ 0.20 nm |
+| `ligand_heavy_atom_rmsd_nm` | 0.0362 | 0.0370 | −0.0007 | ≤ 0.25 nm |
+| `box_volume_nm3` | 440.30 | 440.25 | −0.0414 | — |
+
+RMSD 三项与倾角都远在阈值内。唯一判不了的是"末段 20 ns" —— 轨迹只有 10 ns，
+所以 `n_equil_steps` 改成 **5e7（100 ns，≈5.0 h @ 476 ns/day）**。
+⚠️ 配置期那道 `MEMBRANE_MIN_EQUILIBRATION_NS = 100.0` 预检**没挡住** 10 ns 那次，
+因为本体系声明 `upstream_equilibration_status = completed_length_unrecorded`
+→ 标称时长预检不适用 → 整条跳过（`runabfe.py:4030`）。设计本身没错
+（上游时长确实不可考），但代价是 §9 实测门成了唯一的门。
+
+#### Stage 0 attachment 腿的 NaN：只加了体检，没有宣布根因
+
+08-02 17:03，`ibs_engine.py:1425` 出 `Particle coordinate is NaN`。
+
+⚠️ **第一个实际跑的态是 λ=1.0（全强度限制力），不是 λ 列表里的第一个 0.0** ——
+`order = list(range(K-1, -1, -1))`，从全强度端往下扫。日志此前只打印 λ 列表
+`[0.0, 0.1, 0.35, 1.0]`，很容易被误读成"限制力为零时就炸了"。已补一行明说。
+
+本轮只做了**让下次失败带上下文**（MEM-06）：§0.5.7 给 `pre_equilibrate` 加的
+"最小化后 max|F| 门"抽成 `abfe_core.assert_starting_state_is_sane()`（唯一一份），
+attachment 腿在第一次 `step` 之前调同一个函数，并额外落盘六个力常数、
+**起点实测六个几何量 vs 已提交平衡值**（走 BOR-01 之后唯一正确的
+`calc_boresch_from_last_frame`，不写第五份二面角副本）、逐 force group 能量。
+报错按"g0 已异常 → 起点坐标坏"和"只有 Boresch 力组异常 → 查几何/力常数"分两条路。
+这段**只读**，对既有可溶生产路径数值逐位无影响。
+
+同时按用户指示把 `boresch_source` 从 `auto` 换成 **`simple`**（纯几何涨落估算，
+不加载 MACE/e3nn；`auto` 的 `OrbBoreschEstimator` 会加载 MACE 并按 kr 大小给候选加分）。
+⚠️ 注意 `boresch_source="traditional"` 是另一回事：那个值只从 `--boresch-anchors`
+读外部 JSON、不做估算。
+
+#### MEM-09：被中断的预平衡会被当成"已完成"复用
+
+顺着"5 h 的跑中断了能不能续"这个问题查出来的第三个 fail-open。
+
+`runabfe.equilibrium_is_done()`（`runabfe.py:405`）原先只查
+「轨迹存在（>10 KB）+ checkpoint 存在 + 指纹相符」。而
+`pre_equilibration_fingerprint.json` 是 `pre_equilibrate()` 在**第一步之前**就写的
+（`abfe_pipeline.py:1488`，为的是让被中断的运行下次能认出自己的身份），
+它记的 `n_steps` 是**目标**步数，不是已完成步数。
+
+于是：**100 ns 跑到 40 ns 被杀掉 → 下次判成"已完成"→ `pre_equilibrate()` 整段跳过
+→ 连它内部的 §9 膜质量门一起跳过**，而 provenance 与指纹都写着 100 ns。
+短平衡冒充长平衡，且 `enforce` 根本没机会拦（门在被跳过的那段里面）。
+
+修法：追加**完成判定** —— `checkpoints/pipeline_state.json` 的
+`equilibration.status` 必须是 `completed`（该字段只在步进真正结束后才写），
+且 `total_steps` ≥ 指纹文件记录的目标步数；缺该状态文件时保守视为未完成。
+⚠️ 对既有目录零影响：`output_lrc_fix` 与 `memtest/output_membrane` 实测都有
+`status=completed` + `total_steps=5000000`，仍判为已完成（§7.7）。
+
+各阶段的续跑粒度（写进 `memtest/README_MEMTEST.md`）：预平衡每 200 ps
+一个 checkpoint；Stage 0 attachment 无窗口级 checkpoint（整段重跑约 7 min）；
+Stage 1/2 每个 λ 窗口一份 `openmm.chk` + manifest，manifest 任一项不符整份拒绝。
+`memtest/abfe_config.json` 的 `resume` 已设为 `true` —— 不设时
+`DCDReporter` 用 `append=False`，已跑的部分直接作废。
+
+#### MEM-10：`superpose` 原地改坐标，污染 6 个观测量（100 ns 那轮的直接肇因）
+
+100 ns 预平衡跑完后 `enforce` 门卡在
+
+    ✗ equilibration_length_ns [at_least_one_lipid_lateral_relaxation_time]
+      100.04 vs 阈值 139.362
+
+**那个 139.362 本身是错的。** 根因：`abfe_core.py:3607`
+
+    aligned = traj.superpose(traj, 0, atom_indices=protein_backbone)
+
+`mdtraj.Trajectory.superpose()` **原地修改 `traj.xyz` 并返回 self**。于是这一行之后
+所有读 `traj.xyz` 的量都在用"对齐到蛋白骨架"的坐标，而 `midplane` / `upper_z` /
+`lower_z` 是在 3502–3503 行、对齐**之前**算的 —— 两者不在同一坐标系。
+
+| 观测量 | 污染后 | 修好后 |
+| --- | --- | --- |
+| 脂质横向弛豫 τ | **139.36 ns** | 11.57 ns（单参考帧口径）|
+| 跨膜倾角漂移 | 0.477 °/window（被压掉） | **1.274** °/window |
+| 蛋白横截面 / 校正后 APL、疏水核内水、水层间隙、密度分布 | 坐标系错配 | 一致 |
+
+τ 的 12 倍放大**逐位复现**了门里那个 139.362，所以因果链没有猜测成分。
+
+**而那行 superpose 对它本来要服务的三个 RMSD 毫无作用**：
+`md.rmsd(..., atom_indices=X)` 内部会自己在 X 上重新做最优拟合，先对齐不改变返回值
+（实测 pocket 0.069400 / 0.069400、ligand 0.050201 / 0.050201）。**它是纯有害的一行。**
+
+修法：主 `traj` 一个字节不动；只为三个 RMSD 建 backbone ∪ pocket ∪ ligand 的
+**子集副本**（`atom_slice`，内存约为全轨迹 1/20），在副本上对齐。
+契约测试直接钉根因：跑完提取器后 `assert_array_equal(traj.xyz, before)`。
+
+#### MEM-11：弛豫时间尺度不该当硬门（用户质疑"是不是比正常 MD 严"是对的）
+
+估计器原先是**单一参考帧**（每个 lag 只有一个样本）+ 过原点最小二乘拟合**全部** lag
+（权重 ∝ lag²，长 lag 主导）。而实测 MSD ~ t^**0.80**（亚扩散），这样拟合必然偏：
+
+| 用到的轨迹长度 | 10 | 20 | 40 | 60 | 80 | 100 ns |
+| --- | --- | --- | --- | --- | --- | --- |
+| τ | 30.1 | 38.0 | 24.1 | 13.2 | 10.8 | 11.6 ns |
+
+**非单调乱跳** —— 这种量当硬门只会制造假阴性。改成**时间平均 MSD**（多时间原点）+
+声明 lag 窗口（5–30 ns）带截距拟合后：D = **0.008664** nm²/ns → τ = **18.467 ns**，
+与 POPC 文献 D ≈ 0.008 nm²/ns 给出的 20 ns 吻合。
+
+**判据本身也降级**（硬门 → 诊断），三条依据：
+
+1. §9 原文只要求「**记录**弛豫尺度、**用它论证**预平衡时长」，
+   `MEMBRANE_EQUILIBRATION_MIN_RELAXATION_MULTIPLE = 1.0` 这个倍数是本实现自加的
+   （旧注释里就写着「§13 未给此倍数」）；
+2. 常规膜蛋白平衡的判据是 APL / 膜厚 / 序参量 / RMSD 走平 —— 那些仍是硬门，
+   本体系实测余量 2–6 倍；不是要求脂质完成一次横向扩散位移；
+3. τ 是方法依赖量（拟合窗口、拥挤度、盒尺寸）。
+
+与本仓库把 ESS `min_occupancy_normalized` 退役为 diagnostics-only 同一先例。
+⚠️ **降级不等于不记录**：τ、比值、与文献 D 的对照全部落
+`statistics.equilibration_vs_relaxation`；"永不弛豫的膜"会以极大 τ、比值 < 1 被如实
+报出（有专门测试）。⚠️ **不得为让某次运行通过而塞回 `checks`**。
+
+顺带：合成 fixture 从"沿固定方向确定性位移"改成**真正的二维随机行走** ——
+旧构造只让单参考帧 MSD 等于 4Dt，本身不是扩散运动，只是恰好配合了旧估计器
+（所以旧那条 `rel=1e-3` 的"高精度"是 fixture 与估计器互相配合出来的假精度）。
+
+#### MEM-12：APL 的 3% 绝对值门，含蛋白膜不启用
+
+**先认账**：§0.5.9 上一版写"§13.3 的绝对值门可以开了"，但**没有**把
+`literature_apl_nm2` 写进 `memtest/membrane_input.json`，那道门一直没跑。
+现在实测（100 ns）校正后 APL = 0.5907 vs POPC 0.645，差 **8.42%** —— 真设了也不过。
+
+含蛋白膜差百分之几**不构成"体系有问题"的证据**：annular lipid 被跨膜蛋白减速重排、
+蛋白占本体系约 **24%** 横向面积（8.47 / 9.22 nm² vs 盒面 36.3 nm²）、
+90 脂小膜片还有有限尺寸效应。改为新增**诊断专用**字段
+`pure_lipid_reference_apl_nm2`（名字与"要判"的 `literature_apl_nm2` 刻意不同），
+判定层落 `statistics.apl_vs_pure_lipid_literature`（含 `is_gate: false` 与不判的理由）。
+这道门应在**无蛋白 POPC slab**（§8.2）上启用 —— 不是删掉，是放到能判的地方。
+
+#### MEM-13：口袋/配体 RMSD 测的是内部构象，不是 pose 漂移
+
+`md.rmsd(aligned, aligned, 0, atom_indices=pocket)` 会在口袋/配体**自身**上再做一次
+最优拟合，所以它测的是内部构象变化，而 §9 要的是"配体 pose"。改成"对齐蛋白骨架后
+**不重拟合**的位移"：实测 0.0857 / 0.0833 nm（重拟合口径 0.0760 / **0.0493**，
+配体差 1.7 倍）。阈值 0.20 / 0.25 **不变**，修正后仍有 2.3× / 3.0× 余量。
+
+#### MEM-14：门写在 `pre_equilibrate()` 内部，重跑即绕过
+
+`_update_stage_status("equilibration","completed")` 与预平衡指纹写在门**之前**
+（`abfe_pipeline.py:1745-1763`），门在 `pre_equilibrate()` **内部**。于是
+**门失败 → 原样重跑 → `equilibrium_is_done()` 为真 → `pre_equilibrate()` 跳过 →
+门也一起被跳过 → 直接进 Stage 0**。`enforce` 的语义被控制流击穿，
+而它存在的全部意义就是"门没过不许继续烧 λ 窗口"。
+
+修法：幂等的 `ensure_membrane_quality_gate_passed()` 接在**每个消费预平衡的入口**
+（`run_full_pipeline` + 两个 `--only-*` 增量重跑入口），`pre_equilibrate()` 里那次保留
+（刚产出就 fail fast）。有源码契约测试覆盖三个入口。
+
+#### 修完之后：同一条 100 ns 轨迹在 `enforce` 下通过
+
+    ✓ apl_nm2 [tail_drift_percent_per_ns]        0.0515 vs 0.2
+    ✓ bilayer_thickness_nm [tail_drift/window]   0.0144 vs 0.05
+    ✓ transmembrane_tilt_deg [tail_drift/window] 1.274  vs 5
+    ✓ protein_backbone_rmsd_nm [tail_mean]       0.1331 vs 0.30
+    ✓ pocket_rmsd_nm [tail_mean]                 0.0857 vs 0.20
+    ✓ ligand_heavy_atom_rmsd_nm [tail_mean]      0.0833 vs 0.25
+    ✓ membrane_periodic_image_contacts           0      vs 0
+    ✅ 膜质量门通过（模式 enforce）
+
+**没有重烧 GPU** —— 全部修复都在分析层，用现成轨迹离线复判
+（`tools/diagnostics/evaluate_membrane_quality_gate.py`，纯 CPU）。
+`MEMBRANE_QUALITY_GATE_PROTOCOL_VERSION` 2 → **3**：v2 的倾角/横截面/弛豫/pose
+数字全部作废。
+
+证据：`tests/test_membrane_observable_extractor.py`（分子路径 5 条 + 时间轴 6 条 +
+APL 校正 8 条）、`tests/test_membrane_barostat_protocol.py` 的
+`test_bad_starting_state_fails_closed_after_minimization`（现同时钉住共用实现与
+attachment 腿调用点）、
+`test_extractor_does_not_mutate_the_caller_trajectory`（MEM-10 根因契约）、
+`test_quality_gate_cannot_be_bypassed_by_rerunning`（MEM-14 三个入口）、
+`test_interrupted_pre_equilibration_is_not_mistaken_for_a_finished_one`（4 种情形）、
+`test_pre_equilibration_checkpoint_interval_bounds_the_work_lost_on_resume`。
+
+---
+
+### 0.5.10 Stage 0 的 NaN：刚性水被 PBC 修复撕开（2026-08-03 已修，MEM-15）
+
+`memtest` 100 ns 那轮在 attachment 腿第一个 λ 态出 `Particle coordinate is NaN`。
+**根因与 Boresch 无关**，而且它对当时所有诊断都是隐形的。
+
+#### 因果链（每一步都有实测数字）
+
+1. `.top` 的 TIP3P 用 settles 定义 ⟹ OpenMM 把 O–H / H–H 变成**约束**。
+   实测：`topology.bonds()` 里**涉及水的键数 = 0**（非水键 16635），
+   而约束里涉及水的 **28626** 个（= 9542 水 × 3）；
+   `HarmonicBondForce` 里涉及水的项 = **0**。
+2. `ABFEPipeline.repair_pbc_molecule_integrity` 用 `mdtraj.image_molecules()`，
+   它**按 topology 的键**判断"什么算一个分子" ⟹ 每个水原子被当成独立分子 ⟹
+   跨边界的 **243 个水**被逐原子回卷，O 与 H 落到**不同周期镜像**。
+3. **PME 排除修正失效**：729 个 exception 对跨盒，最远 **13.76 nm**
+   （OpenMM 要求排除对比 cutoff 近，本体系 cutoff = 1.0 nm）⟹
+   虚假的 **−30.9 MJ/mol** 非键能（−612757.78 vs 健康的 −581848.01）。
+4. **约束求解器崩掉**：要在相距 5.9–12.4 nm 的 O/H 之间满足 0.0957 nm 的刚性约束
+   ⟹ 不收敛 ⟹ **不到 1 ps** 就 NaN。
+
+#### 为什么绕了很多轮：这个损坏对既有诊断全部隐形
+
+| 诊断 | 坏坐标下的读数 | 为什么看不见 |
+| --- | --- | --- |
+| `HarmonicBondForce` 能量 | 9525.72（与健康坐标**逐位相同**） | 水根本没有键力项 |
+| 最大键长 | 0.1905 nm（正常） | 同上 |
+| 角 / 二面角能量 | 逐位相同 | 同上 |
+| 最小化后 `max|F|` | 5292 kJ/mol/nm（正常量级） | PME 的排除误差是**平滑长程项** |
+| MEM-06 的起点体检 | **通过** | 它只看 PE 与受力 |
+
+也正因为如此，离线**忠实重放**（同起点、同种子、同步数，走完整条 λ 序列 2.4 ns）
+**不复现** —— 因为它用的是 rebalance 末帧，那份坐标还没经过这步修复，
+729 个排除对最远只有 **0.4331 nm**。两份坐标的差别是"整体平移 + 逐原子回卷"，
+键合能因此完全一致，只有非键差了 30909.77 kJ/mol。
+
+#### 沿途被逐一排除的假设（都有实测，记下来免得再走一遍）
+
+| 假设 | 判定依据 |
+| --- | --- |
+| Boresch 参数是旧的 / MACE 出来的 | `boresch_simple.json` 当天新生成，来自 `GeometricRestraintEstimator`（纯几何涨落，不加载力场/ML） |
+| 盒矢量不匹配 | rebalance 末帧 5.9417×5.9417×12.4657 nm，与平衡末帧逐位一致（这条我一度判错过，实测推翻） |
+| 锚点共线奇点 | 六锚点全重原子，四个角度 103–128° |
+| 限制力太硬 / 几何不对 | λ=1 时 `E_Boresch = 0`（起点正在最小点）；λ=0（力乘 0）也活 100 ps |
+| 体系被改动 | Force 清单、粒子数 45354、约束数 38349 与 fresh 加载逐项相同 |
+
+#### 修法
+
+1. **改根因**：`repair_pbc_molecule_integrity` 先把 System 的**约束补成键**，
+   再交给 `image_molecules()`。实测补 **28626** 个（正好水的约束数；另 9723 个
+   约束对本来就是键）。
+   ⚠️ 用约束而不是"从 `.top` 的 `[ molecules ]` 取区间"：约束就在 System 里，
+   任何输入来源都有、不依赖 `.top` 是否可得，而它补上的正好是缺的那些边。
+2. **加守卫**：`abfe_core.assert_starting_state_is_sane` 新增**镜像一致性**检查
+   （排除对与约束对是否都在同一镜像内，上限取 cutoff 或半个最短盒边）。
+   这不是冗余：上表说明力检查**构造性地**看不见这类损坏。
+3. **补现场证据**（这条腿此前一帧轨迹、一行监控都不写）：
+   * `attachment/stage0_attachment_start.npz` —— 起点坐标 + 盒矢量，
+     **可离线确定性复现**（只存 SHA256 时每查一步都得重跑一次生产）；
+   * `attachment/stage0_attachment_inputs.json` —— Force 清单 / 粒子数 / 约束数 /
+     盒矢量 / 锚点 raw vs minimum-image 距离 / λ 序列 / 种子 / 各段步数 / 限制力全参数；
+   * `attachment/stage0_attachment_monitor.csv` —— 头 1000 步 **50 fs** 一行、
+     之后 1 ps 一行的 `PE / T / max|F| / 受力最大原子 / E_Boresch`。
+
+#### 验证（两个方向都实测过）
+
+* 拿生产那份坏坐标喂守卫：力检查照常打印正常的 `max|F| = 5292`，
+  **紧接着** raise「729 个 nonbonded_exceptions 对跨了周期镜像（最远 13.760 nm，
+  上限 1.000 nm）」；
+* 约束补键后重修同一份坐标：排除对最远 **0.433 nm**、约束对 **0.151 nm**，
+  守卫放行，且 `PE = −508657` 回到 rebalance 的健康值 —— 那 31 MJ/mol 虚假能量消失。
+
+证据：`tests/test_membrane_barostat_protocol.py::
+test_torn_rigid_water_is_caught_before_dynamics`（合成两个刚性水，
+`topology.getNumBonds() == 0` 与真实拓扑同构；把一个水的 H2 逐原子回卷 → 守卫 raise）
+与 `test_pbc_repair_promotes_constraints_to_bonds_for_grouping`
+（源码契约：约束补键必须在 `traj.image_molecules(` 之前）。
+
+⚠️ **这是 §0.5.7 那个根因的第二次**：§0.5.7 是 mmCIF 往返丢掉**非标准残基的键**，
+导致 PBC 修复撕开脂质；这次是刚性水的键**从来就不在 topology 里**（只在约束里），
+导致 PBC 修复撕开水。共同教训：**"按 topology 的键归组分子"这个前提本身要验证**，
+而不是假定拓扑里有全部连通性。
+
+---
+
 ### 0.5.2 已存在的、进膜之前必须先收口的非键协议不一致
 
 - [ ] **MEM-00h：ligand–environment 与 environment–environment 的 LJ cutoff 目前就不一致。**
@@ -191,6 +746,13 @@ charge-transfer。** 下面每条都带 `file:line`，Phase A 必须逐条裁决
   现改为按类名检测三种（`abfe_core.detect_barostats`）+
   `ensure_barostat_for_protocol` 三分支（复用 / 添加 / fail closed）。
   证据：`tests/test_membrane_barostat_protocol.py`。
+- [ ] **MEM-00m：`pre_equilibrate` 的 integrator 步长与 DCD 保存间隔是
+  §9 时间轴的唯一来源，已收敛为共用常量（2026-08-02，MEM-08）。**
+  `PRE_EQUILIBRATION_TIMESTEP_PS = 0.002` 与
+  `PRE_EQUILIBRATION_TRAJ_INTERVAL_STEPS = 10000` 落在 `abfe_core`，
+  写轨迹的 reporter/integrator 与判门的一侧引用同一份（值不变，逐位兼容）。
+  ⚠️ 若 MEM-00j 决定给膜体系上 HMR + 4 fs，**必须同时**确认这两个常量与
+  §9 时间轴的关系（帧间隔会从 20 ps 变成 40 ps），否则所有 per-ns 判据会静默错 2 倍。
 - [ ] **MEM-00j：没有 HMR，生产 dt = 2 fs + `constraints=HBonds`**
   （`ibs_engine.py:8388`，`abfe_core.py:3564` 的 `timestep_ps` 默认 0.002）。
   膜体系是否用 HMR 上到 4 fs 是 Phase A 的显式决策，不是默认继承。
@@ -1003,6 +1565,14 @@ manifest
   弛豫 30 ns 时通用 10 ns 预平衡必然不过。
 - [x] 报告里带 `remediation`：质量门失败时回到膜体系平衡，
   **不允许靠增加 ABFE 窗口、放宽阈值或缩短末段窗口掩盖**（§9 末句，有测试钉住）。
+- [x] **APL 与文献值的对照口径已落地（MEM-03，2026-08-02）**：含蛋白膜必须比
+  **蛋白横截面校正后**的 APL（新观测量 `apl_protein_corrected_nm2`），
+  raw APL 把蛋白占掉的横向面积也摊给了脂质（实测 0.807 vs POPC 文献 0.645）。
+  校正用**最近参考原子归属**（Voronoi 式），**没有探针半径** ——
+  外扩法实测沿蛋白周长多算约 1.7 nm²、把校正后 APL 压到 0.564（低 12.6%），
+  那样的门会因方法偏差而不过。栅格边长是唯一方法参数，2× 粗栅格复算随报告落盘。
+  漂移判据仍判 raw APL（那测的是盒面积有没有平衡）。
+  `MEMBRANE_QUALITY_GATE_PROTOCOL_VERSION` 1 → 2。
 - [ ] 上下叶脂质数如何确定必须有依据（按每叶面积匹配，不是随手对半分），
   并记录膜是否出现整体起伏（undulation）或残余张力。
 - [ ] 记录 co-ion 的 z 分布直方图，而不只是瞬时距离；它必须整段留在体相水层。
@@ -1195,7 +1765,9 @@ independent_repeat_id
 
 ### 13.3 膜质量门（末段 ≥ 20 ns）
 
-- APL 漂移 ≤ 0.2 %/ns，且与该脂质力场文献值差 ≤ 3%。
+- APL 漂移 ≤ 0.2 %/ns（判 raw APL），且与该脂质力场文献值差 ≤ 3%
+  （判**蛋白横截面校正后**的 `apl_protein_corrected_nm2`，见 §9 与 §0.5.9；
+  含蛋白膜拿 raw APL 比纯脂文献值必然偏大）。
 - 双层厚度（P–P）漂移 ≤ 0.05 nm / 20 ns。
 - 蛋白骨架 RMSD ≤ 0.30 nm，跨膜倾角漂移 ≤ 5°。
 - 口袋 RMSD ≤ 0.20 nm；配体重原子 RMSD ≤ 0.25 nm。

@@ -45,6 +45,11 @@ from abfe_core import (
     _extract_free_energy_arrays,
     subsample_series_by_autocorrelation,
     NumpyEncoder,
+    # attachment 腿起点体检（MEM-06）。两个都**复用**已有实现：
+    # 受力门与预平衡共用一份；六个几何量走 BOR-01 之后唯一正确的那份计算
+    # （手写第 5 份二面角副本正是 BOR-01 反号事故的成因）。
+    assert_starting_state_is_sane,
+    calc_boresch_from_last_frame,
 )
 
 try:
@@ -1026,6 +1031,13 @@ def _add_physical_boresch_restraint(
 #     里那些硬编码的 "lambda_coul"。
 BORESCH_ATTACHMENT_PROTOCOL_VERSION = 1
 BORESCH_ATTACHMENT_LAMBDA_NAME = "lambda_boresch_scale"
+# attachment 腿的监控落盘间隔（步）。2 fs × 500 = 1 ps 一行，一条腿约 2400 行，
+# 写盘开销可忽略。这条腿此前**一帧都不写**，2026-08-03 的 NaN 因此没有任何现场证据。
+ATTACHMENT_MONITOR_INTERVAL = 500
+# 头 1000 步（2 ps）用 25 步（50 fs）的细粒度：2026-08-03 的 NaN 就发生在第一个
+# 500 步分块内，粗粒度只留下 step 0 一行 —— 夹不住死亡时刻等于没有证据。
+ATTACHMENT_MONITOR_FINE_INTERVAL = 25
+ATTACHMENT_MONITOR_FINE_STEPS = 1000
 BORESCH_ATTACHMENT_FORCE_GROUP = 3
 
 # 升序排列——MBAR 的 delta_G = f[K-1] − f[0]，升序时它直接就是 ΔG(A′→A)，
@@ -1414,17 +1426,265 @@ def run_boresch_attachment_leg(
 
     order = list(range(K - 1, -1, -1))   # 从全强度端往下走
     log(f"  attachment 腿：{K} 个 λ 态 {np.round(lam, 4).tolist()}")
+    log(
+        f"  ⚠️ 扫描顺序是**从全强度端往下**：第一个实际跑的态是 "
+        f"λ={float(lam[order[0]]):.4f}，不是列表里的第一个 λ。"
+    )
     log(f"  每态 平衡 {equil_steps_per_state} 步 + 生产 {n_steps_per_state} 步 → {n_samples} 帧")
 
+    # ---- 起点体检（MEM-06）：把"跑了几步的无上下文 NaN"变成"起点就坏，坏在哪" ----
+    #
+    # 实测背景：memtest 膜体系 2026-08-02 在这里出 `Particle coordinate is NaN`。
+    # 那次第一个跑的态是 λ=1.0（**全强度** Boresch 限制力，kr=946.7 kJ/mol/nm²），
+    # 起点坐标刚经过两次 PBC 修复 + 两次锚点重推导（r0 0.705 → 0.767 nm、
+    # θA 61.3° → 63.3°）。所以"限制力参数"与"起点坐标"都是嫌疑，
+    # 而当时的日志两样都没留下 —— 下面把它们全部量出来再落盘。
+    #
+    # ⚠️ 这段**只读**：不最小化、不改坐标/速度、不改任何 global parameter
+    # （λ 会在下面的循环里由 order[0] 重新设成同一个值）。所以对既有可溶生产路径
+    # 的数值逐位无影响（§7.7）。
+    simulation.context.setParameter(
+        BORESCH_ATTACHMENT_LAMBDA_NAME, float(lam[order[0]])
+    )
+    log(
+        "  🔎 Boresch 力常数: "
+        + ", ".join(
+            f"{name}={float(restraint_params['force_constants'][name]):.4g}"
+            for name in ("kr", "kthetaA", "kthetaB", "kphiA", "kphiB", "kphiC")
+            if name in (restraint_params.get("force_constants") or {})
+        )
+    )
+    try:
+        _measured = calc_boresch_from_last_frame(
+            simulation.context.getState(getPositions=True).getPositions(asNumpy=True),
+            restraint_params["receptor_indices"],
+            restraint_params["ligand_indices"],
+        )
+        _eq = restraint_params.get("equilibrium_values") or {}
+        log(
+            "  🔎 起点实测几何 vs 已提交平衡值: "
+            + ", ".join(
+                f"{key}: {float(_measured[key]):.4f} / {float(_eq[key]):.4f}"
+                for key in ("r0", "thetaA0", "thetaB0", "phiA0", "phiB0", "phiC0")
+                if key in _measured and key in _eq
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        # 诊断失败不该顶替真正的失败，但也不许静默 —— 说出来，然后继续体检受力。
+        log(f"  ⚠️ 起点几何诊断未能完成（不阻断）：{type(exc).__name__}: {exc}")
+    _group_energies = {}
+    for _group in (0, BORESCH_ATTACHMENT_FORCE_GROUP):
+        try:
+            _group_energies[_group] = float(
+                simulation.context.getState(getEnergy=True, groups={_group})
+                .getPotentialEnergy()
+                .value_in_unit(unit.kilojoule_per_mole)
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    if _group_energies:
+        log(
+            "  🔎 逐 force group 能量 (kJ/mol): "
+            + ", ".join(f"g{g}={e:.6g}" for g, e in sorted(_group_energies.items()))
+        )
+    # ---- 入口快照 + 在跑中监控（2026-08-03）----
+    #
+    # 为什么必须有：这条腿此前**一帧轨迹、一行监控都不写**，所以 2026-08-03 的
+    # `Particle coordinate is NaN` 除了一个 traceback 什么证据都没留下。
+    # 而离线忠实重放（同起点、同种子、同步数，走完整条 λ 序列 2.4 ns）
+    # **不复现** —— 也就是说生产与重放之间有差异，但没有任何落盘的东西能拿来 diff。
+    # §0.5.7 的教训原话是"离线再猜性价比很低，必须在跑中留下轨迹"。
+    _diag_dir = output_dir or "."
+    try:
+        os.makedirs(_diag_dir, exist_ok=True)
+        _forces = []
+        for _i, _f in enumerate(work.getForces()):
+            _entry = {
+                "index": _i,
+                "class": _f.__class__.__name__,
+                "force_group": int(_f.getForceGroup()),
+            }
+            if hasattr(_f, "usesPeriodicBoundaryConditions"):
+                try:
+                    _entry["uses_pbc"] = bool(_f.usesPeriodicBoundaryConditions())
+                except Exception:  # noqa: BLE001
+                    pass
+            for _attr in ("getNonbondedMethod", "getCutoffDistance", "getNumParticles"):
+                if hasattr(_f, _attr):
+                    try:
+                        _v = getattr(_f, _attr)()
+                        _entry[_attr[3:]] = (
+                            float(_v.value_in_unit(unit.nanometer))
+                            if hasattr(_v, "value_in_unit") else int(_v)
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+            _forces.append(_entry)
+        _pos_nm = np.asarray(
+            simulation.context.getState(getPositions=True)
+            .getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+            dtype=np.float64,
+        )
+        _box_nm = np.asarray(
+            [v.value_in_unit(unit.nanometer)
+             for v in simulation.context.getState().getPeriodicBoxVectors()],
+            dtype=np.float64,
+        )
+        # 锚点的 raw 距离 vs minimum-image 距离：两者不等就说明锚点分处不同周期镜像，
+        # 而 `CustomCompoundBondForce` 的 angle()/dihedral() 不做 minimum-image。
+        _rec = [int(i) for i in restraint_params["receptor_indices"]]
+        _lig = [int(i) for i in restraint_params["ligand_indices"]]
+        _anchor_pairs = {}
+        for _tag, _a, _b in (
+            ("R0-L0", _rec[0], _lig[0]), ("R1-R0", _rec[1], _rec[0]),
+            ("R2-R1", _rec[2], _rec[1]), ("L1-L0", _lig[1], _lig[0]),
+            ("L2-L1", _lig[2], _lig[1]),
+        ):
+            _d = _pos_nm[_a] - _pos_nm[_b]
+            _mi = _d - np.diag(_box_nm) * np.round(_d / np.diag(_box_nm))
+            _anchor_pairs[_tag] = {
+                "raw_nm": float(np.linalg.norm(_d)),
+                "minimum_image_nm": float(np.linalg.norm(_mi)),
+                "differs": bool(
+                    abs(np.linalg.norm(_d) - np.linalg.norm(_mi)) > 1.0e-6
+                ),
+            }
+        _snapshot = {
+            "n_particles": int(work.getNumParticles()),
+            "n_constraints": int(work.getNumConstraints()),
+            "forces": _forces,
+            "box_vectors_nm": _box_nm.tolist(),
+            "positions_sha256": hashlib.sha256(
+                np.ascontiguousarray(_pos_nm, dtype=np.float64).tobytes()
+            ).hexdigest(),
+            "positions_min_nm": _pos_nm.min(axis=0).tolist(),
+            "positions_max_nm": _pos_nm.max(axis=0).tolist(),
+            "anchor_pair_distances": _anchor_pairs,
+            "lambdas": [float(v) for v in lam],
+            "scan_order_k": [int(k) for k in order],
+            "seed": int(seed),
+            "equil_steps_per_state": int(equil_steps_per_state),
+            "n_steps_per_state": int(n_steps_per_state),
+            "steps_per_sample": int(steps_per_sample),
+            "restraint": {
+                "equilibrium_values": restraint_params.get("equilibrium_values"),
+                "force_constants": restraint_params.get("force_constants"),
+                "receptor_indices": _rec,
+                "ligand_indices": _lig,
+            },
+        }
+        _snap_path = os.path.join(_diag_dir, "stage0_attachment_inputs.json")
+        with open(_snap_path, "w", encoding="utf-8") as _h:
+            json.dump(_snapshot, _h, indent=2, ensure_ascii=False, cls=NumpyEncoder)
+        log(f"  🧾 attachment 腿入口快照已落盘: {_snap_path}")
+        # ⚠️ **坐标本身**也要存，不能只存 SHA256。
+        # 2026-08-03 的教训：只有哈希时，离线既无法复现也无法逐力分解 ——
+        # 那次 NaN 发生在第一个 500 步分块内（< 1 ps），而用 rebalance 末帧做的
+        # 离线重放（同种子、同步数）走完 2.4 ns 都不崩，两者 PE 差 31 MJ/mol。
+        # 差异只能来自坐标，而坐标没落盘，于是每查一步都要重跑一次生产。
+        # 1.1 MB 换"能离线确定性复现"，永远值。
+        _start_path = os.path.join(_diag_dir, "stage0_attachment_start.npz")
+        np.savez_compressed(
+            _start_path, positions_nm=_pos_nm, box_vectors_nm=_box_nm
+        )
+        log(f"  🧾 attachment 腿起点坐标已落盘（可离线复现）: {_start_path}")
+        _torn = [t for t, v in _anchor_pairs.items() if v["differs"]]
+        if _torn:
+            log(
+                f"  ⚠️ 锚点对 {_torn} 的 raw 距离与 minimum-image 距离不同 —— "
+                "说明锚点分处不同周期镜像。`CustomCompoundBondForce` 的 "
+                "angle()/dihedral() **不做** minimum-image，这会让被约束的几何量"
+                "不是你以为的那个。"
+            )
+    except Exception as _exc:  # noqa: BLE001
+        log(f"  ⚠️ 入口快照落盘失败（不阻断）: {type(_exc).__name__}: {_exc}")
+
+    _monitor_path = os.path.join(_diag_dir, "stage0_attachment_monitor.csv")
+    _monitor = None
+    try:
+        _monitor = open(_monitor_path, "w", encoding="utf-8", buffering=1)
+        _monitor.write("cumulative_step,lambda_index_k,lambda,phase,"
+                       "potential_kJ_mol,temperature_K,max_force_kJ_mol_nm,"
+                       "max_force_atom_index,boresch_energy_kJ_mol\n")
+        log(f"  📈 attachment 腿监控已启用（每 {ATTACHMENT_MONITOR_INTERVAL} 步）: "
+            f"{_monitor_path}")
+    except Exception as _exc:  # noqa: BLE001
+        log(f"  ⚠️ 监控无法写入（不阻断）: {_exc}")
+        _monitor = None
+
+    _n_dof = 3 * work.getNumParticles() - work.getNumConstraints()
+
+    def _monitor_row(cumulative_step, k_index, lam_value, phase):
+        """写一行监控。**崩之前的最后几行就是唯一的现场证据。**"""
+        if _monitor is None:
+            return
+        try:
+            st = simulation.context.getState(getEnergy=True, getForces=True)
+            pe = st.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+            ke = st.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole)
+            temp = 2.0 * ke / (_n_dof * 0.008314462618) if _n_dof > 0 else float("nan")
+            fmag = np.linalg.norm(
+                np.asarray(st.getForces(asNumpy=True).value_in_unit(
+                    unit.kilojoule_per_mole / unit.nanometer), dtype=float),
+                axis=1,
+            )
+            worst = int(np.argmax(fmag)) if fmag.size else -1
+            ub = simulation.context.getState(
+                getEnergy=True, groups={BORESCH_ATTACHMENT_FORCE_GROUP}
+            ).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+            _monitor.write(
+                f"{int(cumulative_step)},{int(k_index)},{float(lam_value):.6f},"
+                f"{phase},{pe:.6f},{temp:.4f},{float(fmag.max()):.6f},{worst},"
+                f"{ub:.6f}\n"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    assert_starting_state_is_sane(
+        simulation.context,
+        topology,
+        label=f"attachment 腿起点 λ={float(lam[order[0]]):.4f}",
+        remediation=(
+            "    这一步**没有**做最小化：起点坐标是上游交给本腿的（预平衡 → 带 Boresch\n"
+            "    的 rebalance → PBC 修复 → 锚点重推导）。所以要分两种情况看：\n"
+            "      * 上面 g0（基础力）已经异常 → 坏的是起点坐标本身，与 Boresch 无关，\n"
+            "        查 PBC 修复是否撕开了分子（§0.5.7）以及拓扑有没有键；\n"
+            "      * 只有 Boresch 力组异常 → 查上面那行「实测几何 vs 已提交平衡值」，\n"
+            "        以及力常数是否过硬。`--boresch-source simple` 是纯几何涨落估算，\n"
+            "        可与 `auto`（MACE 打分、偏好大 kr）对照。"
+        ),
+        log=log,
+    )
+
     linearity_checked = False
+    _cumulative = 0
     for k in order:
         simulation.context.setParameter(BORESCH_ATTACHMENT_LAMBDA_NAME, float(lam[k]))
         simulation.context.setVelocitiesToTemperature(
             temperature_k * unit.kelvin, int(seed) + 7919 * k + 1
         )
-        simulation.step(int(equil_steps_per_state))
+        _monitor_row(_cumulative, k, lam[k], "state_start")
+        # 平衡段分块步进，只为了能在崩之前留下监控行；总步数与分块前完全相同。
+        #
+        # 头 `ATTACHMENT_MONITOR_FINE_STEPS` 步用**细**粒度：2026-08-03 那次 NaN
+        # 就发生在第一个 500 步分块内，粗粒度只留下了 step 0 一行，等于没夹住。
+        _remaining = int(equil_steps_per_state)
+        while _remaining > 0:
+            _interval = (
+                ATTACHMENT_MONITOR_FINE_INTERVAL
+                if _cumulative < ATTACHMENT_MONITOR_FINE_STEPS
+                else ATTACHMENT_MONITOR_INTERVAL
+            )
+            _chunk = min(_interval, _remaining)
+            simulation.step(_chunk)
+            _remaining -= _chunk
+            _cumulative += _chunk
+            _monitor_row(_cumulative, k, lam[k], "equil")
         for s in range(n_samples):
             simulation.step(int(steps_per_sample))
+            _cumulative += int(steps_per_sample)
+            if s % max(1, ATTACHMENT_MONITOR_INTERVAL // int(steps_per_sample)) == 0:
+                _monitor_row(_cumulative, k, lam[k], "sample")
             total = simulation.context.getState(getEnergy=True).getPotentialEnergy()
             total = total.value_in_unit(unit.kilojoule_per_mole)
             # U_B 一律在 λ=1 下直接量，不用「力组能量 / λ_k」反推：
@@ -1455,6 +1715,12 @@ def run_boresch_attachment_leg(
 
         log(f"    λ={lam[k]:.4f}  ⟨U_Boresch⟩={float(np.mean(u_boresch[k])):9.3f} "
             f"± {float(np.std(u_boresch[k])):7.3f}  max={float(np.max(u_boresch[k])):9.3f} kJ/mol")
+
+    if _monitor is not None:
+        try:
+            _monitor.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     del simulation, integrator
 

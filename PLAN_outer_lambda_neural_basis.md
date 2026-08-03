@@ -3,7 +3,8 @@
 ## 1. 文档定位
 
 本文定义“外层 λ 神经基势”（Outer-λ Neural Basis Hamiltonian）的研究与验证计划。
-它是一份方法开发路线图，不代表相关模型、OpenMM 接口或 IBS 生产集成已经实现。
+它是一份方法开发路线图。文中原则与验收门是规范性要求；实际完成状态以第 2.3 节和
+实验日志为准，不能仅凭本文中的设计描述宣称 production 已实现。
 
 核心原则：
 
@@ -53,6 +54,139 @@ Boresch 锚点或口袋力估计，尚未进入 ABFE production Hamiltonian。
 推荐顺序：先用路线 A 完成方法学可证伪验证；若研究主题必须是 DEXP，再把通过验证的
 神经路径框架迁移到路线 B。
 
+### 2.3 截至 2026-08-03 的冻结状态
+
+当前采用路线 A，且保持 production 隔离：
+
+| 项目 | 已冻结事实 |
+|---|---|
+| 基础路径 | `softcore + dual_lambda + IBS` |
+| 困难窗口 | complex vanishing Stage 2 window 0，states `[0,5)` |
+| primary slow variable | ligand periodic torsion `[4591,4592,4593,4585]` |
+| secondary candidate | 相邻 torsion `[4593,4585,4594,4595]` |
+| 诊断变量 | `VAL251 chi1` 与 ligand hydration coordination |
+| 端点包络 | \(w(\lambda)=\sin^2(\pi\lambda)\) |
+| 已通过完整 MACE 幅度 | `coefficient=0.09`；EXP-007 NVT qualification 通过 |
+| 完整 MACE 生产路线 | 停止；PythonForce/CUDA MTS 在 EXP-009 后端资格失败 |
+| 当前路线 | EXP-012：CV-free 通用局部残差路径势；frozen-MACE latent 是主要候选表示，XED 仅作可选消融 |
+| EXP-011 冻结状态 | `FORMAL_RUN1_OVERLAP_FAILED`；AUG-001 后 mutual overlap `0.02353 < 0.03` 且 22 个去相关样本 `< 25`，不再补采、不拟合 PMF |
+| EXP-012 状态 | `PLANNED / PREREG_DRAFT_V2`；三条 run 的逐帧五态 CUDA ledger 已完成并通过 SHA/System/账本闭合及 CPU/CUDA 审计；主命名已迁移为 `local_residual` A/B/C/D，尚未冻结表示细节、(A_k)、训练预算和数值门，因此未 sealed、未训练模型 |
+| EXP-010 教师局部选择 | ligand 41 + protein atoms 216；事后审计显示 26 个涉及残基全部是不完整截断，仅作失败证据 |
+| cheap-CV 候选 | EXP-010 的 1D order 2/4/6、2D order 2/3/4 全部不晋级；当前无 production 候选 |
+| production 接入 | 尚未进行；生产模块明确不导入独立研发模块 |
+
+WP-0、WP-1、WP-2、WP-3 通用部署骨架和 EXP-007 已完成。EXP-010 的正式 GPU
+教师数据集保留 290/300 帧并通过支持域门，但六个预注册 Fourier 候选的
+leave-one-run-out 能量 RMSE 均未优于 intercept-only，广义力验证也失败。因此
+EXP-010 记为 `FAILED`，不选择最终模型，WP-5 三臂 IBS 不启动。
+该失败不能归因于 torsion bias 本身：EXP-010 的固定 environment 由单帧
+0.5 nm 逐原子半径选择构建，存在普遍的残基和共价边界截断；同时它要求
+低维 torsion 势逐帧重现高维瞬时 interaction energy。两者都会破坏跨 run 可迁移性。
+
+对“冻结”的限定：
+
+- primary torsion 已冻结为 EXP-010/EXP-011 的候选慢坐标，但仍无 production approval；
+- `coefficient=0.09` 是完整 MACE EXP-007 的合格幅度，不因蒸馏自动成为 cheap-CV
+  的 production approval；
+- 所有 slow-variable manifest 均明确 `production_approval=false`；
+- EXP-010 的 cheap-CV 未通过能量/广义力验证，因此不能进入 OpenMM 力学资格或
+  WP-5 三臂实验。
+
+### 2.4 2026-08-03 路线收敛：CV-free 通用局部残差路径势
+
+EXP-012 的研究对象不再是 XED 特征本身，而是一个不依赖人工慢变量的通用路径残差：
+
+\[
+\boxed{
+H_k^*(\mathbf R)=H_k^{\rm MM}(\mathbf R)+A_kB_\theta^{\rm local}(\mathbf R),
+\qquad A_0=A_K=0
+}
+\]
+
+完整 MM/softcore/PME 始终负责基础势、长程作用和物理端点；\(B_\theta^{\rm local}\)
+只学习对相邻态 reduced-energy gap 方差贡献最大的局部坐标相关残差。模型不接收连续 λ，
+不要求事先指定 torsion、hydration 或其它慢 CV，也不计算 fragment total energy。
+
+第一候选表示是 frozen-MACE 中间层原子描述符：
+
+\[
+\mathbf z_i^{\rm MACE}(\mathbf R)
+=\operatorname{FrozenMACEEncoder}(\mathbf R)_i,
+\]
+
+\[
+B_\theta^{\rm local}(\mathbf R)
+=B_{\max}\tanh\!\left[
+\frac{\sum_{i\in L}g_i^{\rm contact}
+\operatorname{MLP}_\theta(\mathbf z_i^{\rm MACE})-b_0}{B_{\max}}
+\right].
+\]
+
+这里 MACE latent 是学习到的局部几何/化学表示，不能宣称为真实电子密度、孤对电子或
+Pauli/exchange 能量。它也不会自动解决局部图边界：必须冻结 ligand/environment 原子身份、
+cutoff、message-passing receptive-field buffer、PBC、元素/电荷支持域和 ligand-only readout。
+不再复用 `E(complex)-E(ligand)-E(environment)` subtraction。
+
+必须区分两种执行路线：
+
+- **L1：在线 frozen-MACE encoder + MLP readout。** encoder 保留在坐标计算图内，
+  每步通过 autograd 产生守恒力；表示最强，但仍承担 MACE forward/backward 成本。
+- **L2：MACE latent 离线 teacher + 轻量可导 student。** 用 latent/gap 诊断指导一个
+  小型局部等变 encoder；production 不运行完整 MACE，优先争取 ESS/GPU-hour。
+
+`get_descriptors()` 式 NumPy 输出只能用于离线诊断。若在 production 中把 descriptor 当作
+预计算常数，就无法对新坐标产生正确的 \(-\nabla_{\mathbf R}B\)。在线路线必须直接包装
+Torch MACE forward，并保留 ligand、environment 和图构造所涉及坐标的梯度。
+
+EXP-012 的表示消融固定为：
+
+1. A：typed atom-centered RBF/contact baseline；
+2. B：轻量等变 ligand-environment cross encoder；
+3. C：frozen-MACE latent + 小型 invariant scalar readout；
+4. D：XED-inspired field，仅作为可选物理启发消融，不作为主路线。
+
+训练目标不再拟合 PMF，而是最小化相邻态双向 gap variance。若
+\(\Delta u^0_{ak}=\beta(H_{k+1}^{\rm MM}-H_k^{\rm MM})\)，定义：
+
+\[
+\delta_{ak}(\theta)=\Delta u^0_{ak}
++\beta(A_{k+1}-A_k)B_\theta^{\rm local}(\mathbf R_a),
+\]
+
+\[
+\mathcal L_{\rm gap}
+=\sum_k\frac12\left[
+\operatorname{Var}_{p_k}(\delta_k)
++\operatorname{Var}_{p_{k+1}}(\delta_k)
+\right]
++\lambda_E\langle B_\theta^2\rangle
++\lambda_F\langle\|\nabla B_\theta\|^2\rangle.
+\]
+
+第一轮冻结全局 \(A_k\)，只训练表示和 readout；禁止同时学习 \(A_k\) 造成尺度简并。
+数据按整条独立 run 切分，ESS、BAR mutual overlap 和 ESS/GPU-hour 只在 held-out 数据及
+独立生产重复上判决。模型、中心化常数、图协议和全部超参数在 production 前冻结并哈希。
+
+“通用”分成两个不同层级：
+
+- **通用训练管线：** 架构、超参数、训练预算和验收门不变，但允许每个体系用自己的
+  pilot ledger 重新训练权重；
+- **通用冻结模型：** 同一权重跨体系不微调直接使用；这是更强的后续目标，不与第一层混写。
+
+跨体系主验收首先使用至少两个额外 ABFE benchmark/困难窗口，不人工指定 CV、不改变
+超参数。路径项端点归零，因此主正确性门是与 converged-MM 自由能在联合不确定度内一致，
+而不是要求神经路径修复 MM 对实验的系统误差。实验误差 `<1.0 kcal/mol` 只作为次级报告；
+TYK2/CDK2 通常属于 RBFE benchmark，必须在 RBFE Hamiltonian/ledger 接口另行资格通过后
+再进入迁移验证。
+
+第一版硬边界：
+
+- 不使用 fragment-total subtraction 或未经处理的 pretrained MACE 总能量；
+- 不把 frozen latent 解释为电子密度或真实 Pauli 势；
+- 不用离线 NumPy descriptor 冒充可导 production Force；
+- 不因 MLP 很小就假定在线 MACE 足够便宜，必须实际比较 L1/L2 的 ESS/GPU-hour；
+- \(A_0=A_K=0\) 指全局物理 alchemical 端点，跨窗口共享 λ 的模型和系数必须一致；
+- XED 若保留，只能作为 Arm D 特征消融，不向 PME 增加第二套静电。
 ---
 
 ## 3. 数学定义
@@ -192,6 +326,33 @@ Hamiltonian，必须继续按现有协议记录并重加权。
 
 第一版不应同时解决动态水交换、离子交换和全蛋白多体重组。
 
+### 5.4 MACE 教师势与生产 bias 的角色分离
+
+外层 λ 方法并不要求生产阶段永久使用完整 MACE。应区分：
+
+- **教师/诊断势**：完整 MACE 局部分解，用于离线标注、识别瓶颈、验证能量和力；
+- **直接生产势候选**：经过支持域、力学和成本门后，以多时间步方式参与 MD；
+- **廉价生产 bias**：把教师势与慢变量的关系蒸馏为
+  \(V_\phi(s(\mathbf R))\)，其中 \(s\) 是少量平滑慢变量。
+
+推荐的最终生产形式为：
+
+\[
+\widetilde H_\lambda(\mathbf R)
+=
+H_\lambda^0(\mathbf R)
++
+w(\lambda)c(\lambda)V_\phi(s(\mathbf R))
+\]
+
+其中 \(V_\phi\) 可采用 1D/2D spline、tabulated function、低阶多项式或小型
+MLP。完整 MACE 负责回答“应当沿哪个慢自由度推、势能形状是什么”，廉价模型负责
+每步生产动力学。
+
+不能因为外层系数较小，就把完整原子级 MACE 自动视为慢力。局部 MACE 仍包含氢振动、
+短程接触、水取向和侧链局部运动等高频分量。若未经验证地每隔几十步更新一次并冻结旧
+力，会改变实际采样 Hamiltonian；端点归零不能修复这种积分误差。
+
 ---
 
 ## 6. 外层 λ 控制器
@@ -298,12 +459,21 @@ M=2\sim4
 - 不应为每个 λ 复制同一个神经基势计算。
 - 必须记录每个基势的推理时间和总 MD 性能损失。
 - 必须检查 OpenMM CustomCVForce 的 CV 数量上限。
+- 若直接使用完整 MACE，应通过独立 force group 和 MTS/r-RESPA 调度，而不是在普通
+  积分器外手工冻结旧力。
+- MTS 间隔必须同时记录“步数”和物理时间；同一个 \(N\) 在 0.5 fs 与 2 fs 内步长下
+  不是同一实验。
+- 直接 MACE 路线与蒸馏后的 cheap-CV 路线都必须以 ESS/GPU-hour 判决；不能只比较
+  每步墙钟或表面交换率。
 
 ---
 
 ## 8. 分阶段研发路线
 
 ## 阶段 0：冻结基线与问题定位
+
+当前状态：已完成 WP-0。困难窗口和 primary torsion 已由三个独立 scratch run
+冻结；这不是 production 采样收益证明。
 
 目标：确认神经路径要解决的具体瓶颈。
 
@@ -326,6 +496,9 @@ M=2\sim4
 - 现有结果不足以区分采样不足和路径设计问题。
 
 ## 阶段 1：单基势接口与端点验证
+
+当前状态：独立模块中的数学、mock 账本、TorchForce/OpenMM 部署骨架和真实 MACE
+EXP-007 qualification 已完成；生产模块仍保持隔离。
 
 目标：只验证 Hamiltonian 结构，不宣称统计效率提升。
 
@@ -350,16 +523,81 @@ H_\lambda^0+w(\lambda)\overline U_1
 
 ## 阶段 2：单个任务化重组基势
 
-目标：证明神经项能改善一个明确瓶颈。
+当前状态：EXP-010、EXP-011 均已失败并冻结；EXP-012 已登记为新的可证伪路线。
+完整 MACE 直接 MTS、atom-cut fragment teacher 和 torsion-PMF 三条路线均不再推进。
+当前没有模型可以进入本阶段的生产对照；target-state ledger 与 backend 审计已补齐，下一门是
+冻结并 seal local-residual A/B/C/D 表示、(A_k)、训练预算和数值门，再执行通用表示消融和
+gap-variance 诊断。
+
+2026-08-02 已实现 `exp011-umbrella-sample` 和 `exp011-reweight-umbrella`。前者在
+完整 window-0 MM expanded-mixture System 上施加最短周期角差 torsion restraint，
+逐帧记录角度与 umbrella energy；后者按 source window 去相关，用 MBAR 生成显式
+`log_target_weight` 并检查 overlap 图连通性。纯数值、周期边界和相关 CLI 回归已通过。
+
+完整体系 smoke 已晋级：Reference 跳过最小化的诊断运行在第一步出现 NaN，证明不得
+省略原协议最小化；在可用 GPU 环境执行的 200 次最小化、单中心一帧正式 smoke 报告
+`ok=true`，angle `-173.5426°`、umbrella energy `0.01656 kJ/mol`、temperature
+`278.03 K`，checkpoint 与 DCD 完整。下一步先做同一中心短时稳定性 pilot，再扩展到少量
+相邻中心检查 overlap；不得用普通 `sample-hard-window-scratch` 代替。
+
+同一中心 10 ps 稳定性 pilot 已通过：10/10 帧有限，temperature `298.12–302.11 K`，
+angle `-173.12°` 至 `-158.97°`，最大 umbrella energy `2.79 kJ/mol`。该短 pilot 仅用于
+执行资格，不当作正式 PMF 数据。下一步运行相邻 `-157.5°` 中心，并以两窗 MBAR 检查
+局部 overlap 后再决定是否扩展中心。
+
+`-157.5°` pilot 与两窗 MBAR 已通过，邻窗 overlap 为 `0.3584`，明显高于 `0.03` 门；
+两窗各保留 10 个样本。该结论只验证局部邻窗连通，不验证全周期覆盖或正式 PMF。
+下一步增加第三个 `-142.5°` 中心并检查三窗 overlap，仍不直接批量启动 24 centers。
+
+第三窗和三窗 MBAR 已通过；两个邻接界面的 overlap 分别为 `0.3105` 和
+`0.1864/0.3728`，均高于 `0.03`。第三窗去相关后只余 5/10 帧，因此 10 ps 仍只作
+pilot。下一步不继续顺着同一势阱取点，而是在历史空白区 `75°–165°` 的中部运行
+`112.5°` 哨兵窗；通过后再冻结正式 24-center 的采样长度和 replicate 协议。
+
+`112.5°` 哨兵窗已通过可达性检查：angle `93.22°–112.21°`，最后一帧到达
+`112.21°`，10/10 帧有限。由于短轨迹分布偏向中心低侧，下一步增加高侧邻窗 `127.5°`
+并检查 `112.5°/127.5°` overlap；该界面通过后再冻结正式批量协议。
+
+空白区界面正反向 overlap 为 `0.0759/0.0949`，通过 `0.03` 门，但短 pilot 去相关后只余
+5 与 4 帧，因此不进入 PMF。正式采样计划已在任何正式结果产生前冻结：24 个 15° 中心 ×
+3 replicates，每窗 50 ps burn-in + 100 ps sampling，每 1 ps 一帧；三个 replicate 使用
+三条不同历史困难窗口轨迹末帧和独立 seed。机器协议为
+`protocols/EXP-011_umbrella_sampling_plan.json`，断点续跑入口为
+`scripts/run_exp011_umbrella_grid.py`。下一步只跑 formal_run1 的单窗正式 smoke，验收后再
+放开该 replicate 的剩余 23 窗。
+
+formal_run1 的 `-172.5°` 正式单窗已通过：100/100 帧有限，temperature
+`297.74–302.74 K`，周期中心偏差 `-8.82°` 至 `+21.92°`，初态轨迹哈希与断点续跑校验
+一致。现在只放开 formal_run1 剩余 23 窗；该 run 的完整环形 overlap 验收前不启动
+formal_run2/3。
+
+formal_run1 已完成 24/24 窗和 2400 个有限帧，但严格环形 MBAR 未通过。审计发现旧实现只
+检查有向 overlap 图可达，现已修正为 mutual overlap `min(O_ij,O_ji)` 并逐个检查周期邻接
+接口，schema 升至 v2。唯一失败接口是 `112.5°↔127.5°`，值 `0.0110 < 0.03`；
+`127.5°` 仅有 7 个去相关样本。因此不启动 formal_run2/3，也不查看 PMF。冻结的
+EXP-011-AUG-001 只允许从该窗末帧补采 500 ps，合并后重新执行同一严格门。
+
+EXP-011-AUG-001 已完成但未通过：补采轨迹 500/500 帧有限，角度覆盖
+`77.50°–169.78°`；补采去相关后仅 15 帧，与原窗合计 22 帧，低于 25。严格 v2 MBAR
+中唯一失败接口仍为 `112.5°↔127.5°`，mutual overlap 从 `0.0110` 改善到 `0.02353`，
+但仍低于 `0.03`，故 `qualified_for_pmf_input=false`。状态冻结为
+`FORMAL_RUN1_OVERLAP_FAILED` 并停止：不再补采，不启动 formal_run2/3，不拟合 PMF，
+不进入 NVT、WP-5 或 production；所有现有数据保留供未来重新预注册。
+
+目标：证明一个不使用人工慢 CV 的局部残差势能以可承受成本降低相邻态 energy-gap 方差，
+并判定 frozen-MACE latent、轻量等变 encoder 或更简单接触基线中哪一种值得进入 production。
 
 工作：
 
-- 只选择一种目标，例如 ligand torsion 或 cavity hydration。
-- 构建与该目标对应的局部训练数据。
-- 冻结训练后的 \(U_1\)。
-- 扫描少量外层幅度，不在线更新模型。
-- 比较基础路径、仅 λ 重排、单基势路径。
-
+- 使用已经补齐并通过 CPU/CUDA 审计的三条逐帧五态 target-state ledger；
+- 按整条 run 切分，禁止随机拆帧造成轨迹泄漏；
+- 比较 A（RBF/contact）、B（轻量等变 cross encoder）、C（frozen-MACE latent）和
+  D（可选 XED-inspired field）；
+- C 路线只读取 ligand node latent 并使用 invariant scalar readout，不输出环境总能量；
+- 分别评估在线 frozen encoder（L1）与 latent-teacher 蒸馏 student（L2）；
+- 使用双向 gap variance 与能量/力安全正则训练，ESS/BAR overlap 为 held-out 硬门；
+- 冻结模型、中心化常数、幅度、图选择、cutoff、单位和协议哈希后再进入 TorchForce；
+- 比较基础路径、仅 λ 重排、解析接触基线和最优单局部残差基势。
 通过条件：
 
 - 相同或可比计算成本下，至少一个主指标显著改善。
@@ -498,17 +736,25 @@ production 轨迹不得用于继续在线更新当前 production Hamiltonian。
 - 中间态出现基础路径中没有的非物理深井。
 - 收益可以被简单 λ 重排完全替代。
 - 神经推理成本抵消了 ESS 增益。
+- 只有把完整 MACE 的外层力更新间隔提高到不稳定或有积分偏差的范围，才能获得可接受
+  性能。
+- 蒸馏后的 cheap-CV bias 不能重现教师势与目标慢变量之间的稳定关系。
 - 多基势相互高度相关，增加基势数量没有可测收益。
 - 不同独立重复给出不一致的自由能或重组分布。
 - 端点、公共 λ 状态或离线能量账本无法严格闭合。
 
 “该体系不需要神经路径”是允许且有价值的研究结论。
 
+EXP-010 已触发“当前教师–cheap-CV 协议不能跨 run 稳定重现”的失败判据。
+该结果不能区分 atom-cut 教师边界伪影、未显式 CV 与 torsion 表达误差，因此不能据此
+宣称 torsion bias 无效。EXP-011 必须以完整 MM 条件平均力/PMF 为新目标量；不得把
+提高 Fourier order、改变正则或随机拆帧当作 EXP-010 的事后重试。
+
 ---
 
 ## 12. 配置、缓存与可追溯性要求
 
-未来若进入实现，每次运行至少记录：
+从独立研发阶段开始，每次运行至少记录：
 
 - 基础势类型及参数；
 - DEXP/softcore 路径协议版本；
@@ -561,6 +807,10 @@ production 轨迹不得用于继续在线更新当前 production Hamiltonian。
 \rightarrow
 \text{单基势端点验证}
 \rightarrow
+\text{完整 MACE 教师诊断}
+\rightarrow
+\text{cheap-CV 蒸馏}
+\rightarrow
 \text{单个重组问题验证}
 \rightarrow
 \text{2--4 个共享神经基势}
@@ -570,6 +820,10 @@ production 轨迹不得用于继续在线更新当前 production Hamiltonian。
 
 只有当低秩神经基势无法表达所需的 λ 依赖势能面变化时，才考虑连续
 λ-conditioned GNN。
+
+当前项目不再把“更换 CUDA 节点后重跑相同 PythonForce MTS 后端”列为推进步骤。
+只有出现新的、经单独资格验证的原生 OpenMM/TorchForce MACE 后端时，才可作为新实验
+重新打开直接 MTS 分支；该变化不得覆盖 EXP-009 的失败结论。
 
 方法的成功标准不是“使用了 MACE”，而是：
 

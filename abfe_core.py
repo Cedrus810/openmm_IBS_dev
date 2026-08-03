@@ -860,10 +860,68 @@ DECOUPLED_ENDPOINT_ENERGY_ABS_TOLERANCE_KJ_PER_MOL = 1.0e-6
 GROMACS_OPENMM_COMPONENT_RELATIVE_TOLERANCE = 1.0e-4
 GROMACS_OPENMM_TOTAL_ABS_TOLERANCE_KJ_PER_MOL = 0.1
 
+# ---- 预平衡轨迹的时间轴（生产者与消费者共用同一组数）----
+#
+# 为什么必须共用：mdtraj 读 DCD 时**不传播真实步长**，`traj.time` 是整数帧号，
+# 所以 §9 的时间轴只能由"reporter 保存间隔 × integrator 步长"重建。这两个数
+# 一个写在 `pre_equilibrate()` 的 DCDReporter 里、一个写在它的 Integrator 里，
+# 各自散着就必然错开（实测 memtest 那条 10 ns 轨迹被当成 0.499 ns，差 20 倍）。
+PRE_EQUILIBRATION_TRAJ_INTERVAL_STEPS = 10000
+PRE_EQUILIBRATION_TIMESTEP_PS = 0.002
+
+
+def pre_equilibration_frame_interval_ps(
+    timestep_ps: Optional[float] = None,
+    interval_steps: Optional[int] = None,
+) -> float:
+    """预平衡 DCD 每帧对应多少 ps。默认值即生产设置（10000 × 2 fs = 20 ps）。"""
+    dt = PRE_EQUILIBRATION_TIMESTEP_PS if timestep_ps is None else float(timestep_ps)
+    steps = (
+        PRE_EQUILIBRATION_TRAJ_INTERVAL_STEPS
+        if interval_steps is None
+        else int(interval_steps)
+    )
+    if not np.isfinite(dt) or dt <= 0.0 or steps <= 0:
+        raise ValueError(
+            f"预平衡帧间隔参数非法：timestep_ps={dt!r}, interval_steps={steps!r}"
+        )
+    return dt * steps
+
+
 # ---- §13.3 膜质量门（判据统一为"末段窗口内线性漂移小于阈值"）----
 MEMBRANE_QUALITY_GATE_TAIL_WINDOW_NS = 20.0
 APL_MAX_DRIFT_PERCENT_PER_NS = 0.2
 APL_MAX_DEVIATION_FROM_LITERATURE_PERCENT = 3.0
+
+# ---- 含蛋白膜的 APL：必须先扣掉蛋白横截面才能与纯脂文献值比 ----
+#
+# 实测 memtest（PROA 1 + POPC 90，08-02 那条 10 ns 轨迹）：
+# raw APL = 横向面积 / 每叶脂质数 = 0.807 nm²，而 POPC 纯脂文献值 ≈ 0.645。
+# 差值来自跨膜蛋白占掉的横向面积，**不是**体系有问题。所以 §13.3 那条
+# 「与文献值差 ≤ 3%」若拿 raw APL 去比，会把物理上正常的含蛋白膜判失败；
+# 先前的应对是干脆不设 literature_apl_nm2，代价是这道门整条缺席。
+#
+# ## 为什么是"最近原子归属"而不是"蛋白外扩一个探针半径"
+#
+# 第一版用的是"每个蛋白重原子外扩 0.17 nm 求并集"。实测它**系统性高估蛋白面积**：
+# 外扩会沿蛋白周长加一圈宽 0.17 nm 的边（周长约 10 nm → 约 1.7 nm²），
+# 于是校正后 APL = 0.564，比文献值低 12.6% —— 门会因为**方法偏差**而不过，
+# 而不是因为体系有问题。那种门迟早会被"调参调绿"，正是本仓库反复吃亏的模式。
+#
+# 现在改为**无探针半径**的定义（Voronoi 式，APL@Voro 的同一思路）：把该叶片
+# slab 内的脂质重原子与蛋白重原子放在一起，横向栅格的每个格子归给**最近的**那个
+# 原子，蛋白面积 = 归给蛋白原子的格子面积之和。边界自动落在两者中间，没有可调的
+# 半径；唯一的方法参数是栅格边长，而它只带来无偏的离散化误差。
+PROTEIN_CROSS_SECTION_GRID_NM = 0.05
+# 栅格边长的敏感性检查（用 2× 粗栅格复算若干帧，确认离散化误差可忽略）。
+PROTEIN_CROSS_SECTION_GRID_SENSITIVITY_FACTOR = 2.0
+# 敏感性只在若干等间隔帧上算（主序列仍逐帧），避免为一个诊断量把成本翻倍。
+PROTEIN_CROSS_SECTION_SENSITIVITY_MAX_FRAMES = 25
+# 校正后 APL 的观测量名。**不进** REQUIRED_MEMBRANE_QUALITY_OBSERVABLES：
+# 判定层要能吃老报告和手工构造的观测量；缺它时绝对值门会退回未校正值，
+# 但会把 criterion 写成 `..._uncorrected`，事后分得清当时比的是什么。
+APL_PROTEIN_CORRECTED_OBSERVABLE = "apl_protein_corrected_nm2"
+
 BILAYER_THICKNESS_MAX_DRIFT_NM_PER_TAIL_WINDOW = 0.05
 PROTEIN_BACKBONE_MAX_RMSD_NM = 0.30
 TRANSMEMBRANE_TILT_MAX_DRIFT_DEG = 5.0
@@ -921,6 +979,12 @@ def acceptance_thresholds_payload() -> Dict[str, Any]:
             "apl_max_drift_percent_per_ns": APL_MAX_DRIFT_PERCENT_PER_NS,
             "apl_max_deviation_from_literature_percent": (
                 APL_MAX_DEVIATION_FROM_LITERATURE_PERCENT
+            ),
+            # 蛋白横截面校正的方法参数：绝对值门比的是校正后的 APL，
+            # 而校正结果依赖这三个数，所以它们必须与阈值一起进 provenance。
+            "protein_cross_section_grid_nm": PROTEIN_CROSS_SECTION_GRID_NM,
+            "protein_cross_section_grid_sensitivity_factor": (
+                PROTEIN_CROSS_SECTION_GRID_SENSITIVITY_FACTOR
             ),
             "bilayer_thickness_max_drift_nm_per_tail_window": (
                 BILAYER_THICKNESS_MAX_DRIFT_NM_PER_TAIL_WINDOW
@@ -1115,6 +1179,7 @@ def parse_gromacs_topology(
     defaults: Optional[Dict[str, Any]] = None
     moleculetypes: "OrderedDictType[str, Dict[str, Any]]" = {}
     molecules: List[Tuple[str, int]] = []
+    atomtypes: Dict[str, Dict[str, Any]] = {}
     unresolved_includes: List[str] = []
     files: List[str] = []
 
@@ -1146,11 +1211,32 @@ def parse_gromacs_topology(
                 "fudge_qq": float(fields[4]) if len(fields) > 4 else None,
                 "source": source,
             }
+        elif section == "atomtypes" and len(fields) >= 7:
+            # name at.num mass charge ptype sigma epsilon
+            # （CHARMM-GUI 还会在注释里附 sigma_14/epsilon_14，注释已被剥掉。）
+            try:
+                atomtypes[fields[0]] = {
+                    "atomic_number": int(float(fields[1])),
+                    "mass": float(fields[2]),
+                    "charge": float(fields[3]),
+                    "ptype": fields[4],
+                    "sigma_nm": float(fields[5]),
+                    "epsilon_kj_mol": float(fields[6]),
+                }
+            except ValueError:
+                # 少数力场的 [ atomtypes ] 列序不同（例如省略 at.num）。跳过而不是猜，
+                # 由用它的地方 fail closed。
+                pass
         elif section == "moleculetype" and current_moltype is None:
             current_moltype = fields[0]
             moleculetypes.setdefault(
                 current_moltype,
-                {"name": current_moltype, "n_atoms": 0, "residue_names": []},
+                {
+                    "name": current_moltype,
+                    "n_atoms": 0,
+                    "residue_names": [],
+                    "atoms": [],
+                },
             )
         elif section == "atoms" and current_moltype:
             # nr type resnr residue atom cgnr charge mass
@@ -1160,6 +1246,16 @@ def parse_gromacs_topology(
                 resname = fields[3]
                 if resname not in entry["residue_names"]:
                     entry["residue_names"].append(resname)
+                entry.setdefault("atoms", []).append(
+                    {
+                        "nr": int(fields[0]),
+                        "type": fields[1],
+                        "residue_name": resname,
+                        "atom_name": fields[4],
+                        "charge": float(fields[6]) if len(fields) >= 7 else None,
+                        "mass": float(fields[7]) if len(fields) >= 8 else None,
+                    }
+                )
         elif section == "molecules":
             if len(fields) >= 2:
                 try:
@@ -1173,6 +1269,7 @@ def parse_gromacs_topology(
         "defaults": defaults,
         "moleculetypes": moleculetypes,
         "molecules": molecules,
+        "atomtypes": atomtypes,
         "unresolved_includes": unresolved_includes,
     }
 
@@ -1588,26 +1685,218 @@ def convert_gromacs_pairs_funct2(
     }
 
 
+def gromacs_file_has_funct2_pairs(path: str) -> bool:
+    """**单个文件**自身是否含 `[ pairs ]` funct 2（不跟随 include）。
+
+    与 `gromacs_topology_has_funct2_pairs`（整棵树）分开：定位"哪个 .itp 带"要用
+    这个，判断"要不要走兼容性转换"要用那个。两者共用同一份扫描逻辑，只是作用域
+    不同——不要各写一份，否则口径会分叉。
+    """
+    section = None
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        for raw in handle:
+            line = raw.split(";", 1)[0].strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("["):
+                section = line.strip("[] ").strip().lower()
+                continue
+            if section == "pairs":
+                fields = line.split()
+                if len(fields) >= 3 and fields[2] == "2":
+                    return True
+    return False
+
+
 def gromacs_topology_has_funct2_pairs(
     top_path: str,
     gmx_include_dir: Optional[str] = None,
 ) -> bool:
-    """拓扑树里是否存在 `[ pairs ]` funct 2（决定要不要走兼容性转换）。"""
-    for path in gromacs_topology_files(top_path, gmx_include_dir):
-        section = None
-        with open(path, encoding="utf-8", errors="replace") as handle:
-            for raw in handle:
-                line = raw.split(";", 1)[0].strip()
-                if not line or line.startswith("#"):
-                    continue
-                if line.startswith("["):
-                    section = line.strip("[] ").strip().lower()
-                    continue
-                if section == "pairs":
-                    fields = line.split()
-                    if len(fields) >= 3 and fields[2] == "2":
-                        return True
-    return False
+    """**整棵**拓扑树里是否存在 `[ pairs ]` funct 2（决定要不要走兼容性转换）。
+
+    ⚠️ 递归语义：对顶层 `.top` 调用它会因为 include 了带 funct-2 的 `.itp` 而返回
+    True。想知道"哪个文件自己带"请用 `gromacs_file_has_funct2_pairs`。
+    """
+    return any(
+        gromacs_file_has_funct2_pairs(path)
+        for path in gromacs_topology_files(top_path, gmx_include_dir)
+    )
+
+
+def openmm_compatible_gromacs_top(
+    top_file: str,
+    gmx_include_dir: Optional[str] = None,
+    compat_dir: Optional[str] = None,
+) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """返回 `(可直接交给 OpenMM 的 .top 路径, 转换信息或 None)`。**幂等、按内容缓存。**
+
+    没有 funct-2 pairs 时原路返回，`None` 表示"未做任何转换"。
+
+    `compat_dir` 不给时用系统临时目录下的**内容寻址**缓存
+    （key = 整棵拓扑树各文件 sha256 + 转换版本号），所以：
+      - 同一份输入多次调用只转换一次；
+      - 输入变了 key 就变，不会复用过期的转换产物；
+      - 不往用户的输入目录里写任何东西。
+
+    `runabfe` 主路径会显式传 `output_dir/gromacs_openmm_compat` 以便审计。
+    """
+    import hashlib
+    import tempfile
+
+    if not gromacs_topology_has_funct2_pairs(top_file, gmx_include_dir):
+        return top_file, None
+
+    if compat_dir is None:
+        digest = hashlib.sha256()
+        digest.update(f"v{GROMACS_PAIRS_FUNCT2_CONVERSION_VERSION}\n".encode())
+        top_dir = os.path.dirname(os.path.realpath(top_file))
+        for path in gromacs_topology_files(top_file, gmx_include_dir):
+            with open(path, "rb") as handle:
+                file_digest = hashlib.sha256(handle.read()).hexdigest()
+            relative = os.path.relpath(os.path.realpath(path), top_dir)
+            digest.update(f"{relative}:{file_digest}\n".encode())
+        compat_dir = os.path.join(
+            tempfile.gettempdir(),
+            "abfe_gromacs_openmm_compat",
+            digest.hexdigest()[:16],
+        )
+
+    candidate = os.path.join(
+        compat_dir, os.path.basename(os.path.realpath(top_file))
+    )
+    manifest_path = os.path.join(compat_dir, "conversion_manifest.json")
+
+    # 复用之前必须核对**整棵树**是否完整且与当前输入一致。
+    #
+    # ⚠️ 早先这里只检查"顶层 top 存在 && 树里没有 funct-2"就直接复用——那是
+    # fail-open：一次被中断的转换会留下半成品（部分文件已拷、部分没拷，或某个
+    # `.itp` 被截断），而这两个条件仍可能成立。于是 OpenMM 读到一棵**不自洽**的
+    # 拓扑，建出一个参数错乱的 System，最小化后 PE 到 1e13、几千步后变成一个
+    # 没有上下文的 `Particle coordinate is NaN`。
+    # 所以改成按 manifest 逐文件核对 sha256，任何不符就重转。
+    if os.path.isfile(candidate) and os.path.isfile(manifest_path):
+        try:
+            with open(manifest_path, encoding="utf-8") as handle:
+                manifest = json.load(handle)
+        except Exception:
+            manifest = None
+        if manifest and _conversion_manifest_matches(
+            manifest, top_file, gmx_include_dir, compat_dir
+        ):
+            return candidate, {
+                "reused_existing_conversion": True,
+                "converted_top_path": candidate,
+                "conversion_version": GROMACS_PAIRS_FUNCT2_CONVERSION_VERSION,
+                "manifest_path": manifest_path,
+            }
+        logger.warning(
+            "⚠️ %s 里已有的 funct-2 转换与当前输入不符（或不完整），重新转换。",
+            compat_dir,
+        )
+
+    result = convert_gromacs_pairs_funct2(top_file, compat_dir, gmx_include_dir)
+    _write_conversion_manifest(
+        manifest_path, top_file, gmx_include_dir, compat_dir, result
+    )
+    result["manifest_path"] = manifest_path
+    return result["converted_top_path"], result
+
+
+def _conversion_tree_fingerprint(
+    top_file: str,
+    gmx_include_dir: Optional[str],
+    compat_dir: str,
+) -> Dict[str, Any]:
+    """源树与转换产物的逐文件 sha256，用于核对复用是否安全。"""
+    import hashlib
+
+    def _sha256(path: str) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    top_dir = os.path.dirname(os.path.realpath(top_file))
+    source: Dict[str, str] = {}
+    converted: Dict[str, Optional[str]] = {}
+    for path in gromacs_topology_files(top_file, gmx_include_dir):
+        real = os.path.realpath(path)
+        relative = (
+            os.path.basename(real)
+            if real == os.path.realpath(top_file)
+            else os.path.relpath(real, top_dir)
+        )
+        source[relative] = _sha256(real)
+        destination = os.path.join(compat_dir, relative)
+        converted[relative] = (
+            _sha256(destination) if os.path.isfile(destination) else None
+        )
+    return {
+        "conversion_version": GROMACS_PAIRS_FUNCT2_CONVERSION_VERSION,
+        "source": source,
+        "converted": converted,
+    }
+
+
+def _write_conversion_manifest(
+    manifest_path: str,
+    top_file: str,
+    gmx_include_dir: Optional[str],
+    compat_dir: str,
+    result: Dict[str, Any],
+) -> None:
+    fingerprint = _conversion_tree_fingerprint(top_file, gmx_include_dir, compat_dir)
+    fingerprint["n_pairs_converted"] = int(result.get("n_pairs_converted", 0))
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(fingerprint, handle, indent=2, ensure_ascii=False)
+
+
+def _conversion_manifest_matches(
+    manifest: Dict[str, Any],
+    top_file: str,
+    gmx_include_dir: Optional[str],
+    compat_dir: str,
+) -> bool:
+    if int(manifest.get("conversion_version", -1)) != (
+        GROMACS_PAIRS_FUNCT2_CONVERSION_VERSION
+    ):
+        return False
+    current = _conversion_tree_fingerprint(top_file, gmx_include_dir, compat_dir)
+    # 源文件必须逐一相同（输入变了就不能复用旧转换）。
+    if manifest.get("source") != current["source"]:
+        return False
+    # 转换产物必须**全部存在**且与当初写下的一致（挡住半成品 / 被改过的产物）。
+    recorded = manifest.get("converted") or {}
+    if set(recorded) != set(current["converted"]):
+        return False
+    for relative, digest in recorded.items():
+        if digest is None or current["converted"].get(relative) != digest:
+            return False
+    return True
+
+
+def load_gromacs_topology_for_openmm(
+    top_file: str,
+    includeDir: Optional[str] = None,
+    compat_dir: Optional[str] = None,
+    **kwargs,
+):
+    """**唯一**的 GROMACS 拓扑加载入口：需要时先做 funct-2 等价转换，再交给 OpenMM。
+
+    ## 为什么必须只有一个入口
+
+    OpenMM 的 `GromacsTopFile` 不支持 `[ pairs ]` funct 2。首次修这个问题时只在
+    `build_system_from_gromacs` 一处接了转换，结果溶剂腿的
+    `build_and_cache_solvent_leg`（另一个直接调 `app.GromacsTopFile` 的地方）
+    照样炸——**这与 B1 当初只接了 1 个 `ABFEPipeline` 构造点是同一个毛病**：
+    同一件事有多个入口，补一个漏一片。
+
+    现在全仓所有加载点都走这里，并有契约测试禁止裸调 `app.GromacsTopFile`
+    （见 `tests/test_gromacs_pairs_funct2_conversion.py`）。
+    """
+    resolved, _ = openmm_compatible_gromacs_top(top_file, includeDir, compat_dir)
+    return app.GromacsTopFile(resolved, includeDir=includeDir, **kwargs)
 
 
 def _family_from_defaults(defaults: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -1887,7 +2176,55 @@ def resolve_dispersion_protocol(
 # ============================================================================
 
 MEMBRANE_INPUT_PROTOCOL_VERSION = 1
-MEMBRANE_QUALITY_GATE_PROTOCOL_VERSION = 1
+# v2（2026-08-02）：
+#   * 新增 `apl_protein_corrected_nm2` 观测量，§13.3 的 APL 绝对值门改为比校正后的值
+#     （含蛋白膜拿 raw APL 比纯脂文献值必然偏大，实测 0.826 vs 0.645）；
+#   * 时间轴改为由 `frame_interval_ps` 显式重建，不再吃 mdtraj 给 DCD 的整数帧号
+#     （v1 下那条 10 ns 轨迹被当成 0.499 ns，所有 per-ns 判据都错 20 倍）。
+# v1 的报告与 v2 的**不可直接比较**：per-ns 斜率与 APL 绝对值口径都变了。
+# v3（2026-08-02，同日）：
+#   * MEM-10：`superpose` 原地污染修掉。此前倾角、蛋白横截面/校正后 APL、疏水核内水、
+#     水层间隙、密度分布、脂质横向弛豫都在"对齐到蛋白骨架"的坐标上算，而 slab 边界
+#     取自对齐前坐标。实测 τ 因此被放大 12 倍（11.57 → 139.36 ns）、倾角漂移被压掉
+#     （0.477 → 1.274 °/window）。**v2 的这些数字全部作废。**
+#   * MEM-11：弛豫时间尺度改时间平均 MSD + 声明 lag 窗口；该判据从 `checks`
+#     降级为 `statistics.equilibration_vs_relaxation` 诊断。
+#   * MEM-13：口袋/配体 RMSD 改成"对齐骨架后不重拟合"的 pose 漂移
+#     （0.0760 → 0.0857、0.0493 → 0.0833 nm）。
+#   * MEM-12：新增 `statistics.apl_vs_pure_lipid_literature` 诊断（不判门）。
+MEMBRANE_QUALITY_GATE_PROTOCOL_VERSION = 3
+
+# §9 质量门的执行模式。
+#
+#   "enforce"（默认）—— 门未过即阻断。这是 §9 的原意：
+#       "质量门失败时回到膜体系平衡，不允许靠增加 ABFE 窗口掩盖。"
+#   "advisory"        —— 照样计算、照样落盘报告、失败照样大声 WARNING 并写进
+#       provenance，但**不阻断**。用于"先把管路跑通"的探索阶段。
+#
+# 为什么提供 advisory 而不是让人注释掉调用：门被注释掉就**没有记录**，
+# 事后无从知道当时到底过没过。advisory 下报告仍然完整落盘、
+# `membrane_quality_gate_mode` 进 provenance，所以"当时是放行跑的"这件事赖不掉。
+#
+# ⚠️ advisory **不是**生产资格。任何要报出的 ΔG_bind 都必须在 enforce 下通过。
+MEMBRANE_QUALITY_GATE_MODE_ENFORCE = "enforce"
+MEMBRANE_QUALITY_GATE_MODE_ADVISORY = "advisory"
+MEMBRANE_QUALITY_GATE_MODES = (
+    MEMBRANE_QUALITY_GATE_MODE_ENFORCE,
+    MEMBRANE_QUALITY_GATE_MODE_ADVISORY,
+)
+
+
+def resolve_membrane_quality_gate_mode(value: Optional[str]) -> str:
+    """规范化 §9 质量门模式；未声明即 `enforce`（默认严格）。"""
+    if value is None or str(value).strip() == "":
+        return MEMBRANE_QUALITY_GATE_MODE_ENFORCE
+    normalized = str(value).strip().lower()
+    if normalized not in MEMBRANE_QUALITY_GATE_MODES:
+        raise ValueError(
+            f"membrane_quality_gate={value!r} 非法；允许 {list(MEMBRANE_QUALITY_GATE_MODES)}。"
+            "不会静默回落——拼错的值被当成 enforce（或反之）都会让人误判结果的资格。"
+        )
+    return normalized
 
 # §3.3：这些是"记录"类要求，缺一项就说明输入来源不可追溯 → fail closed。
 # §9/§15 的预平衡时长门是对**总平衡时长**的要求，不是"本流程必须自己再跑 100 ns"。
@@ -2002,6 +2339,22 @@ MEMBRANE_HYDROPHOBIC_CORE_HEADGROUP_MARGIN_NM = 0.5
 # 估计脂质横向弛豫时间尺度时使用的特征位移（约一个脂质直径）。
 LIPID_LATERAL_RELAXATION_REFERENCE_DISPLACEMENT_NM = 0.8
 
+# 时间平均 MSD 的线性拟合 lag 窗口（ns）。
+#
+# 依据是实测（memtest 100 ns 膜蛋白体系）：1–30 ns 区间 MSD ~ t^0.80，
+# 也就是短 lag 仍处在亚扩散/笼振区，从 5 ns 起才接近线性；上限 30 ns 是为了
+# 保留足够多的独立时间原点（100 ns 轨迹在 30 ns lag 上还有约 70 ns 的原点可用）。
+# 换窗口会改变 D 与 τ，所以实际用的窗口**必须**随报告落盘（见 details 里的
+# `fit_lag_window_ns` / `fit_lag_window_source`）——"换窗口把数调好看"藏不住。
+LIPID_LATERAL_MSD_FIT_LAG_MIN_NS = 5.0
+LIPID_LATERAL_MSD_FIT_LAG_MAX_NS = 30.0
+
+# 纯 POPC 双层的横向扩散系数参考值（nm²/ns），用于判读上面那个 τ 的量级：
+# 文献量级 D ≈ 0.008 nm²/ns（≈ 0.8e-7 cm²/s）→ 位移 0.8 nm 需 τ ≈ 20 ns。
+# ⚠️ 仅作**诊断锚点**，不是阈值：含蛋白膜的脂质会被蛋白减速（annular lipid），
+# 小膜片还有有限尺寸效应，所以偏离它不构成"体系有问题"的证据。
+PURE_POPC_REFERENCE_LATERAL_DIFFUSION_NM2_PER_NS = 0.008
+
 
 def linear_drift_per_ns(times_ns, values) -> Dict[str, Any]:
     """对时间序列做一次线性拟合，返回每 ns 漂移斜率。
@@ -2075,6 +2428,7 @@ def evaluate_membrane_quality_gate(
     literature_apl_nm2: Optional[float] = None,
     require_coion: bool = False,
     tail_window_ns: float = MEMBRANE_QUALITY_GATE_TAIL_WINDOW_NS,
+    pure_lipid_reference_apl_nm2: Optional[float] = None,
 ) -> Dict[str, Any]:
     """按 §9 + §13.3 判膜质量门。
 
@@ -2099,7 +2453,12 @@ def evaluate_membrane_quality_gate(
     # 阈值判据表：名字 → (判什么, 阈值, 说明)
     checks: List[Dict[str, Any]] = []
     stats: Dict[str, Any] = {}
-    for name in required_obs:
+    optional_obs = [
+        name
+        for name in (APL_PROTEIN_CORRECTED_OBSERVABLE,)
+        if name in (observables or {})
+    ]
+    for name in required_obs + optional_obs:
         times, values = _series_pair(name, observables[name])
         full = linear_drift_per_ns(times, values)
         tail_t, tail_y = _tail_window(times, values, tail_window_ns)
@@ -2127,17 +2486,70 @@ def evaluate_membrane_quality_gate(
         APL_MAX_DRIFT_PERCENT_PER_NS,
         "tail_drift_percent_per_ns",
     )
+    # 与文献值比**必须用蛋白横截面校正后的 APL**（见
+    # `PROTEIN_CROSS_SECTION_GRID_NM` 的注释）：raw APL 把蛋白占掉的横向
+    # 面积也摊给了脂质，含蛋白膜拿它比纯脂文献值必然偏大。
+    # 漂移判据仍留在 raw APL 上——那测的是盒面积有没有平衡，掺进蛋白面积的逐帧
+    # 噪声只会让它变糊。
     if literature_apl_nm2 is not None:
-        deviation = abs(apl["mean"] - float(literature_apl_nm2)) / abs(
+        corrected = stats.get(APL_PROTEIN_CORRECTED_OBSERVABLE)
+        if corrected is not None:
+            reference_name = APL_PROTEIN_CORRECTED_OBSERVABLE
+            criterion = "deviation_from_literature_percent"
+            measured_mean = corrected["tail"]["mean"]
+        else:
+            # 提取器没给校正序列（老报告 / 手工构造的观测量）——照样判，但把
+            # "用的是未校正值"写进 criterion，否则事后分不清这道门当时比的是什么。
+            reference_name = "apl_nm2"
+            criterion = "deviation_from_literature_percent_uncorrected"
+            measured_mean = apl["mean"]
+        deviation = abs(measured_mean - float(literature_apl_nm2)) / abs(
             float(literature_apl_nm2)
         ) * 100.0
         _add(
-            "apl_nm2",
+            reference_name,
             deviation <= APL_MAX_DEVIATION_FROM_LITERATURE_PERCENT,
             deviation,
             APL_MAX_DEVIATION_FROM_LITERATURE_PERCENT,
-            "deviation_from_literature_percent",
+            criterion,
         )
+
+    # ---- 与纯脂文献 APL 的对照：**诊断，不判**（MEM-12，2026-08-02）----
+    #
+    # `pure_lipid_reference_apl_nm2` 与 `literature_apl_nm2` **刻意是两个不同的字段**：
+    # 后者是"要判这道门"的开关，前者只是"记下参考值"。名字分开是为了避免有人
+    # 顺手把诊断值填进开关里，从而给含蛋白膜套上一道物理上站不住的门。
+    #
+    # 为什么含蛋白膜不判与纯脂文献值的 3% 偏差（实测 memtest：校正后 APL 0.5907
+    # vs POPC 0.645，低 8.4%）：
+    #   * annular lipid 被跨膜蛋白减速并重排，其面积本就不等于体相脂质；
+    #   * 蛋白在本体系占约 24% 的横向面积（8.5–9.2 nm² / 36.3 nm²），
+    #     "扣掉蛋白面积再除以脂质数"无论怎么定义都残留方法依赖；
+    #   * 90 脂小膜片还有有限尺寸效应。
+    # 也就是说差百分之几**不构成"体系有问题"的证据**，拿它当门只会制造假阴性。
+    #
+    # 这道 3% 门应当在**无蛋白 POPC slab** 上启用（memtodolist §8.2 的 lipid slab
+    # 工作），那里它才有定义 —— 这不是把门删掉，是把它放到能判的地方。
+    if pure_lipid_reference_apl_nm2 is not None:
+        corrected = stats.get(APL_PROTEIN_CORRECTED_OBSERVABLE)
+        measured_apl = (corrected or {}).get("tail", apl)["mean"]
+        reference = float(pure_lipid_reference_apl_nm2)
+        stats["apl_vs_pure_lipid_literature"] = {
+            "measured_apl_nm2": float(measured_apl),
+            "apl_caliber": (
+                APL_PROTEIN_CORRECTED_OBSERVABLE if corrected else "apl_nm2"
+            ),
+            "pure_lipid_reference_apl_nm2": reference,
+            "deviation_percent": float(
+                abs(measured_apl - reference) / abs(reference) * 100.0
+            ),
+            "is_gate": False,
+            "not_judged_reason": (
+                "含蛋白膜与纯脂文献 APL 的偏差不构成体系缺陷证据："
+                "annular lipid 被蛋白减速重排、蛋白占本体系约 24% 横向面积、"
+                "小膜片有限尺寸效应。这道 3% 门留给无蛋白 POPC slab（§8.2）。"
+            ),
+        }
 
     # ---- 双层厚度：漂移 ≤ 0.05 nm / 末段窗口 ----
     thick = stats["bilayer_thickness_nm"]["tail"]
@@ -2184,19 +2596,44 @@ def evaluate_membrane_quality_gate(
             worst = float(np.min(np.asarray(values, dtype=float)))
             _add(name, worst >= limit, worst, limit, "full_series_min_nm_lower_bound")
 
-    # ---- §9：用脂质横向弛豫时间尺度论证预平衡时长够 ----
+    # ---- §9：用脂质横向弛豫时间尺度**论证**预平衡时长（诊断，不是门）----
+    #
+    # ⚠️ **这一项刻意不进 `checks`**（MEM-11，2026-08-02）。理由，按重要性排序：
+    #
+    # 1. **§9 原文只要求"记录…并用它论证"**，没有要求"≥ 1 倍"。那个倍数
+    #    （`MEMBRANE_EQUILIBRATION_MIN_RELAXATION_MULTIPLE`）是本实现自己加的，
+    #    当时的注释里就写着"§13 未给此倍数"。
+    # 2. **常规膜蛋白平衡的判据不是这个**：看的是 APL / 膜厚 / 序参量 / RMSD 走平
+    #    （上面那些 check 就是干这个的，本体系实测余量 2–6 倍），
+    #    而不是要求脂质完成一次横向扩散位移。
+    # 3. **它是方法依赖量**：τ 由 MSD 拟合窗口、体系拥挤度、盒尺寸共同决定
+    #    （见 `_lipid_lateral_relaxation_timescale_ns` 的 docstring：同一条 100 ns
+    #    轨迹在旧估计器下 τ 从 30 跳到 11 ns）。用一个方法依赖量当硬门，
+    #    会出现"体系没问题、方法波动把它挡住"的假阴性。
+    #
+    # 与本仓库把 ESS `min_occupancy_normalized` 退役为 diagnostics-only 是同一先例
+    # （`docs/TODO.md` TEST-GATE-01）。
+    #
+    # 🚫 **降级不等于不记录**：下面照样把 τ、比值、与纯 POPC 文献 D 的对照全部落盘，
+    #    "永不弛豫的膜"会在这里以极大的 τ 与 < 1 的比值被如实报出（有专门测试钉住）。
+    # 🚫 **不得为了让某次运行通过而把它重新塞回 `checks`。** 要重新当门，必须先给出
+    #    "这个 τ 估计在跨体系/跨轨迹长度上稳定"的证据，并在 §13 里写下倍数的依据。
     relax_ns = float(diagnostics["lipid_lateral_relaxation_timescale_ns"])
     equil_ns = float(diagnostics["equilibration_length_ns"])
-    needed = relax_ns * MEMBRANE_EQUILIBRATION_MIN_RELAXATION_MULTIPLE
-    checks.append(
-        {
-            "observable": "equilibration_length_ns",
-            "criterion": "at_least_one_lipid_lateral_relaxation_time",
-            "measured": equil_ns,
-            "threshold": needed,
-            "passed": bool(equil_ns >= needed),
-        }
-    )
+    stats["equilibration_vs_relaxation"] = {
+        "equilibration_length_ns": equil_ns,
+        "lipid_lateral_relaxation_timescale_ns": relax_ns,
+        "ratio_equilibration_over_relaxation": (
+            float(equil_ns / relax_ns) if relax_ns > 0 else float("inf")
+        ),
+        "is_gate": False,
+        "retired_reason": (
+            "§9 只要求记录并论证，未给倍数；常规膜平衡判据是观测量走平；"
+            "τ 是方法依赖量（拟合窗口/拥挤度/盒尺寸），当硬门会产生假阴性。"
+            "退役为 diagnostics-only，不得为让运行变绿而塞回 checks。"
+        ),
+        "lipid_lateral_diffusion": diagnostics.get("lipid_lateral_diffusion"),
+    }
 
     # ---- §9：膜与周期镜像的异常接触必须为 0 ----
     contacts = int(diagnostics["membrane_periodic_image_contacts"])
@@ -2225,6 +2662,393 @@ def evaluate_membrane_quality_gate(
             "质量门失败时回到膜体系平衡（延长预平衡 / 检查建系组成与叶片数），"
             "不允许靠增加 ABFE 窗口、放宽阈值或缩短末段窗口掩盖（§9 末句）。"
         ),
+    }
+
+
+MEMBRANE_QUALITY_GATE_REPORT_FILENAME = "membrane_quality_gate.json"
+
+
+def run_membrane_quality_gate(
+    traj_path: str,
+    openmm_topology,
+    membrane_quality_inputs: Dict[str, Any],
+    *,
+    mode: str,
+    normal_axis: str = "z",
+    ligand_indices=None,
+    output_dir: Optional[str] = None,
+    frame_interval_ps: Optional[float] = None,
+    log=None,
+) -> Dict[str, Any]:
+    """轨迹 → §9 观测量 → 判定 → 落盘，**唯一实现**（§9 / §6.2）。
+
+    ## 为什么是模块级函数而不是 `ABFEPipeline` 的方法
+
+    原先这段接线只存在于 `ABFEPipeline._evaluate_membrane_quality_gate_after_equilibration`
+    里，于是"验证质量门"唯一的办法是**重烧一遍预平衡**（膜体系 10–100 ns，
+    5 h 起）。§0.5.7 已经因为"离线重建与生产路径不一致"白花过好几轮，
+    所以这里不允许再出现第二份接线：`ABFEPipeline` 与
+    `tools/diagnostics/evaluate_membrane_quality_gate.py` 都调这一个函数。
+
+    ## 两种模式（`mode`）
+
+    * `enforce`（默认）——门没过就 raise。这是 §9 末句的原意：
+      "质量门失败时回到膜体系平衡，不允许靠增加 ABFE 窗口掩盖。"
+    * `advisory`——照样计算、照样落盘报告、失败照样大声 WARNING，但**不阻断**。
+      用于"先把管路跑通"的探索阶段。
+
+    为什么提供 advisory 而不是让人注释掉调用：门被注释掉就**没有记录**，
+    事后无从知道当时到底过没过。advisory 下报告仍完整落盘、模式进 provenance。
+    ⚠️ advisory **不是**生产资格；要报出的 ΔG_bind 必须在 `enforce` 下通过。
+
+    需要的口袋定义 / co-ion 索引由 `membrane_quality_inputs` 显式给出，
+    不做运行时推断——同一体系两次跑必须用同一个口袋定义（MEM-00c 那类漂移的教训）。
+
+    `frame_interval_ps` 默认取 `pre_equilibration_frame_interval_ps()`（= 生产设置
+    10000 步 × 2 fs = 20 ps/帧）。**必须显式重建时间轴**：mdtraj 读 DCD 给的
+    `traj.time` 是整数帧号，直接用会让 §9 的时间轴错 20 倍（详见提取器的 docstring）。
+    """
+    import mdtraj as md
+
+    emit = log if callable(log) else (lambda message: None)
+    mode = resolve_membrane_quality_gate_mode(mode)
+    advisory = mode == MEMBRANE_QUALITY_GATE_MODE_ADVISORY
+
+    def _write(report: Dict[str, Any], observables) -> Optional[str]:
+        if not output_dir:
+            return None
+        summary_path = os.path.join(output_dir, MEMBRANE_QUALITY_GATE_REPORT_FILENAME)
+        payload: Dict[str, Any] = {"report": report}
+        if observables is not None:
+            payload["observables"] = observables
+        with open(summary_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False, cls=NumpyEncoder)
+        emit(f"  ✓ 膜质量门摘要已保存: {summary_path}")
+        return summary_path
+
+    def _blocked(message: str, observables=None) -> Dict[str, Any]:
+        """enforce 下 raise；advisory 下大声记录并落一个"未评估"的报告。
+
+        `observables` 已经算出来时**一定要一起落盘**：观测量是烧了几小时 GPU 才有的，
+        判不了门不等于这些数字没价值（例如"跨度覆盖不了末段窗口"时，APL / 膜厚
+        的实测值仍然是判断要不要延长平衡的唯一依据）。
+        """
+        if not advisory:
+            raise RuntimeError(message)
+        emit(f"  ⚠️ [膜质量门 advisory] 未能完成评估：{message}")
+        report = {
+            "protocol_version": MEMBRANE_QUALITY_GATE_PROTOCOL_VERSION,
+            "mode": MEMBRANE_QUALITY_GATE_MODE_ADVISORY,
+            "evaluated": False,
+            "passed": None,
+            "blocked_reason": message,
+        }
+        _write(report, observables=observables)
+        return report
+
+    inputs = dict(membrane_quality_inputs or {})
+    pocket = inputs.get("pocket_atom_indices")
+    if not pocket:
+        return _blocked(
+            "膜体系必须在 membrane_quality_inputs 里给出 pocket_atom_indices："
+            "口袋定义直接决定 §9 的 pocket_rmsd 这一道门，不接受运行时推断。"
+        )
+    ligand_resname = inputs.get("ligand_resname")
+    if not ligand_resname:
+        if not ligand_indices:
+            return _blocked(
+                "既没有 ligand_resname，也没有 ligand_indices，无法定位配体。"
+                "请在膜输入声明里填 ligand_resname。"
+            )
+        ligand_resname = openmm_topology.atom(int(ligand_indices[0])).residue.name
+
+    emit(f"\n[膜质量门 · {mode}] 读取预平衡轨迹并计算 §9 观测量...")
+    try:
+        traj = md.load(traj_path, top=md.Topology.from_openmm(openmm_topology))
+        observables, diagnostics = membrane_observables_from_trajectory(
+            traj,
+            ligand_resname=ligand_resname,
+            normal_axis=normal_axis,
+            pocket_atom_indices=[int(i) for i in pocket],
+            coion_atom_index=inputs.get("coion_atom_index"),
+            equilibration_length_ns=inputs.get("equilibration_length_ns"),
+            # 身份以 `.top` 组成为准：脂质按分子分叶、水/离子/蛋白用权威原子集合，
+            # 不靠残基名（TP3 / Na+ / Cl- / HID / NTRP 都会被残基名判据漏掉）。
+            composition=inputs.get("composition"),
+            # 时间轴显式重建，不吃 mdtraj 给 DCD 的整数帧号。
+            frame_interval_ps=(
+                pre_equilibration_frame_interval_ps()
+                if frame_interval_ps is None
+                else frame_interval_ps
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _blocked(f"{type(exc).__name__}: {exc}")
+
+    try:
+        report = evaluate_membrane_quality_gate(
+            observables,
+            diagnostics,
+            literature_apl_nm2=inputs.get("literature_apl_nm2"),
+            require_coion=inputs.get("coion_atom_index") is not None,
+            # 诊断专用参考值（不判门），见 evaluate_membrane_quality_gate 里的说明。
+            pure_lipid_reference_apl_nm2=inputs.get("pure_lipid_reference_apl_nm2"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        # 判定层报错（最典型：轨迹跨度覆盖不了 20 ns 末段窗口）。观测量已经算出来了，
+        # 连同"为什么判不了"一起落盘 —— 那些数字是决定要不要延长平衡的依据。
+        return _blocked(f"{type(exc).__name__}: {exc}", observables=observables)
+    report["mode"] = mode
+    report["evaluated"] = True
+    summary_path = _write(report, observables)
+
+    for check in report["checks"]:
+        flag = "✓" if check["passed"] else "✗"
+        emit(
+            f"    {flag} {check['observable']} [{check['criterion']}] "
+            f"{check['measured']:.6g} vs 阈值 {check['threshold']:.6g}"
+        )
+
+    if not report["passed"]:
+        message = (
+            f"膜质量门未通过，失败项：{report['failed_checks']}。"
+            f"{report['remediation']}"
+            + (f" 详情见 {summary_path}。" if summary_path else "")
+        )
+        if not advisory:
+            raise RuntimeError(message)
+        emit(
+            f"  ⚠️ [膜质量门 advisory] {message}\n"
+            "     以 advisory 模式放行继续 —— **这不是生产资格**，"
+            "要报出的 ΔG_bind 必须在 enforce 下通过。"
+        )
+        return report
+    emit(f"  ✅ 膜质量门通过（模式 {mode}）")
+    return report
+
+
+# ============================================================================
+# 起始态体检：把"跑了几千步的无上下文 NaN"变成"起点就坏，且坏在哪个原子"
+#
+# 实测教训（§0.5.7）：一个坏掉的 System 最小化后 PE = 4.1e13 kJ/mol、
+# max|F| = 3.7e9（落在脂质尾链氢 PA334/H8S），但代码什么都不报，几千步后只给出
+# `Particle coordinate is NaN`，于是花了好几轮去猜。正常时 PE ≈ −6.5e5、
+# max|F| ≈ 2.5e3 且落在水上 —— 相差 6 个数量级。
+#
+# ⚠️ **只有一份实现**：预平衡与 Boresch attachment 腿都调这个函数。
+# 同一道门写两遍，迟早会有一处漏改（本仓库的 §0.5.5 就是这个毛病）。
+# ============================================================================
+
+# 起始态允许的最大单原子受力（kJ/mol/nm）。1e6 相对正常量级留了约 400 倍余量：
+# 正常体系不可能触发，坏体系必定触发。
+STARTING_STATE_MAX_FORCE_KJ_PER_MOL_NM = 1.0e6
+
+
+def _assert_periodic_images_are_consistent(context, *, label: str, log=None):
+    """排除对与约束对是否都在**同一周期镜像**内。不是就 raise（MEM-15）。
+
+    ## 为什么必须单独查
+
+    OpenMM 的 PME **要求排除/exception 对比 cutoff 近** —— 排除修正是按两原子的
+    实际位移去减倒空间贡献的，一旦这对原子跨了盒，修正就完全算错。
+    刚性水的 O–H 又只以**约束**存在（实测 memtest：`topology.bonds()` 里涉及水的
+    键数 = 0，而约束 28626 个），所以靠 topology 键归组的 PBC 修复会把跨边界的水
+    逐原子回卷、撕开 —— 而这件事对**所有**常规诊断都是隐形的：
+
+      * 水没有键力项 ⟹ 键能与最大键长完全正常；
+      * PME 的误差是平滑长程项 ⟹ 势能只是偏移，`max|F|` 也正常（实测 5292）；
+      * 崩的是**约束求解器**（要在 5.9–12.4 nm 的 O/H 间满足 0.0957 nm）
+        ⟹ 不到 1 ps 就 `Particle coordinate is NaN`，且没有任何上下文。
+
+    所以这道检查不是冗余的：它是唯一能在起点看见这类损坏的量。
+    """
+    import openmm as _mm
+
+    emit = log if callable(log) else (lambda message: None)
+    system = context.getSystem()
+    state = context.getState(getPositions=True)
+    pos = np.asarray(
+        state.getPositions(asNumpy=True).value_in_unit(_unit_nanometer()),
+        dtype=np.float64,
+    )
+    box = np.asarray(
+        [v.value_in_unit(_unit_nanometer())
+         for v in state.getPeriodicBoxVectors()],
+        dtype=np.float64,
+    )
+    lengths = np.diag(box)
+    if not np.all(lengths > 0):
+        return {"checked": False, "reason": "box_vectors_degenerate"}
+
+    # 允许的上界：cutoff（有 PME 时）否则半个最短盒边。超了就说明跨镜像。
+    cutoff = None
+    for force in system.getForces():
+        if isinstance(force, _mm.NonbondedForce):
+            try:
+                cutoff = float(
+                    force.getCutoffDistance().value_in_unit(_unit_nanometer())
+                )
+            except Exception:  # noqa: BLE001
+                cutoff = None
+            break
+    limit = float(cutoff) if cutoff else 0.5 * float(lengths.min())
+
+    findings = {}
+    for kind, pairs in (
+        ("nonbonded_exceptions", _nonbonded_exception_pairs(system)),
+        ("constraints", _constraint_pairs(system)),
+    ):
+        if pairs.size == 0:
+            findings[kind] = {"n_pairs": 0, "n_over_limit": 0, "max_nm": 0.0}
+            continue
+        d = np.linalg.norm(pos[pairs[:, 0]] - pos[pairs[:, 1]], axis=1)
+        over = int(np.count_nonzero(d > limit))
+        findings[kind] = {
+            "n_pairs": int(pairs.shape[0]),
+            "n_over_limit": over,
+            "max_nm": float(d.max()),
+            "limit_nm": limit,
+        }
+        if over:
+            worst = pairs[int(np.argmax(d))]
+            raise RuntimeError(
+                f"[{label}] {over} 个 {kind} 对跨了周期镜像"
+                f"（最远 {d.max():.3f} nm，上限 {limit:.3f} nm，"
+                f"最坏的一对是原子 {int(worst[0])}–{int(worst[1])}）。\n"
+                "    OpenMM 的 PME 要求排除对比 cutoff 近；约束对更是必须在同一镜像内，"
+                "否则约束求解器无法收敛，几百步内就会给出一个**没有上下文的** "
+                "`Particle coordinate is NaN`。\n"
+                "    最常见原因：PBC 分子完整性修复按 topology 的**键**归组分子，"
+                "而刚性水的 O–H 只以**约束**存在（`topology.bonds()` 里 0 个水键），"
+                "于是跨边界的水被逐原子回卷、撕开。\n"
+                "    修法见 `ABFEPipeline.repair_pbc_molecule_integrity`（MEM-15）："
+                "把 System 的约束补成键再交给 `image_molecules()`。\n"
+                "    ⚠️ 这类损坏对键能 / 最大键长 / max|F| 全部隐形，只有本检查看得见。"
+            )
+    emit(
+        f"  ✓ 镜像一致性: 排除对 {findings['nonbonded_exceptions']['n_pairs']} 个"
+        f"（最远 {findings['nonbonded_exceptions']['max_nm']:.3f} nm）、"
+        f"约束对 {findings['constraints']['n_pairs']} 个"
+        f"（最远 {findings['constraints']['max_nm']:.3f} nm），上限 {limit:.3f} nm"
+    )
+    findings["checked"] = True
+    return findings
+
+
+def _unit_nanometer():
+    from openmm import unit as _u
+
+    return _u.nanometer
+
+
+def _nonbonded_exception_pairs(system):
+    import openmm as _mm
+
+    for force in system.getForces():
+        if isinstance(force, _mm.NonbondedForce):
+            n = force.getNumExceptions()
+            if n == 0:
+                return np.empty((0, 2), dtype=int)
+            return np.asarray(
+                [force.getExceptionParameters(i)[:2] for i in range(n)], dtype=int
+            )
+    return np.empty((0, 2), dtype=int)
+
+
+def _constraint_pairs(system):
+    n = system.getNumConstraints()
+    if n == 0:
+        return np.empty((0, 2), dtype=int)
+    return np.asarray(
+        [system.getConstraintParameters(i)[:2] for i in range(n)], dtype=int
+    )
+
+
+def assert_starting_state_is_sane(
+    context,
+    topology,
+    *,
+    label: str,
+    max_force_kj_per_mol_nm: float = STARTING_STATE_MAX_FORCE_KJ_PER_MOL_NM,
+    remediation: str = "",
+    log=None,
+) -> Dict[str, Any]:
+    """量一次势能与最大受力，异常即 raise。**只读**，不改坐标/速度/参数。
+
+    `label` 进日志（例如 "最小化后" / "attachment 腿起点 λ=1"）。
+    `remediation` 是调用点专属的排查提示，会附在超限报错里。
+
+    返回实测数字，供调用方落盘。
+    """
+    from openmm import unit as _unit
+
+    emit = log if callable(log) else (lambda message: None)
+    state = context.getState(getEnergy=True, getForces=True)
+    potential = state.getPotentialEnergy().value_in_unit(_unit.kilojoule_per_mole)
+    forces = np.asarray(
+        state.getForces(asNumpy=True).value_in_unit(
+            _unit.kilojoule_per_mole / _unit.nanometer
+        ),
+        dtype=float,
+    )
+    magnitudes = np.linalg.norm(forces, axis=1)
+    atoms = _topology_atoms(topology)
+
+    def _atom_label(index: int) -> str:
+        atom = atoms[int(index)]
+        return f"{atom.residue.name}{atom.residue.index}/{atom.name}"
+
+    finite = np.isfinite(magnitudes)
+    if not finite.all():
+        raise RuntimeError(
+            f"[{label}] 已有 {int((~finite).sum())} 个原子受力为 NaN/Inf —— "
+            "起始态就是坏的，继续跑动力学没有意义。"
+            "请检查输入坐标与拓扑是否对应（原子顺序、缓存是否串了体系）。"
+            + (f"\n{remediation}" if remediation else "")
+        )
+    worst = int(np.argmax(magnitudes))
+    max_force = float(magnitudes.max())
+    emit(
+        f"  📐 {label}: PE = {potential:.6g} kJ/mol, "
+        f"max|F| = {max_force:.4g} kJ/mol/nm "
+        f"(idx={worst} {_atom_label(worst)}), "
+        f"中位数 {np.median(magnitudes):.4g}"
+    )
+    if max_force > float(max_force_kj_per_mol_nm):
+        order = np.argsort(magnitudes)[::-1][:10]
+        worst_list = "\n".join(
+            f"      idx={int(i)} {_atom_label(i)}  |F| = {magnitudes[int(i)]:.4g}"
+            for i in order
+        )
+        raise RuntimeError(
+            f"[{label}] max|F| = {max_force:.4g} kJ/mol/nm 超过上限 "
+            f"{float(max_force_kj_per_mol_nm):.4g}（PE = {potential:.6g} kJ/mol）"
+            "——**起始态就是坏的**，继续跑动力学只会得到一个没有上下文的 "
+            "`Particle coordinate is NaN`。\n"
+            f"    受力最大的 10 个原子：\n{worst_list}\n"
+            "    实测参考量级：正常时 PE ≈ −6.5e5 kJ/mol、max|F| ≈ 2.5e3 且落在水上。\n"
+            + (f"{remediation}\n" if remediation else "")
+        )
+    # ---- 镜像一致性（MEM-15）：受力检查看不见的那一类损坏 ----
+    #
+    # 2026-08-03 实测：243 个刚性水的 O/H 被 PBC 修复放进了不同周期镜像，于是
+    # 729 个 PME 排除对跨盒（最远 13.76 nm）。而 **上面那些量全部正常**：
+    # PE 只是多了个平滑的长程误差、max|F| = 5292（水没有键力项，所以键能与最大
+    # 键长也完全正常）。跑起来后是**约束求解器**先崩 → 不到 1 ps 就 NaN。
+    # 也就是说"力看起来正常"根本不能证明起点没坏，必须单独查这一项。
+    image_report = _assert_periodic_images_are_consistent(
+        context, label=label, log=emit
+    )
+
+    return {
+        "label": label,
+        "potential_energy_kj_per_mol": potential,
+        "max_force_kj_per_mol_nm": max_force,
+        "periodic_image_consistency": image_report,
+        "median_force_kj_per_mol_nm": float(np.median(magnitudes)),
+        "max_force_atom_index": worst,
+        "max_force_atom": _atom_label(worst),
+        "max_force_threshold_kj_per_mol_nm": float(max_force_kj_per_mol_nm),
     }
 
 
@@ -2346,6 +3170,118 @@ def assign_lipid_leaflets(
     }
 
 
+def verify_membrane_normal_axis(
+    topology,
+    positions,
+    declared_axis: str = "z",
+    lipid_molecules: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """从坐标**实测**膜法向，并核对与声明的轴一致（§3.3「蛋白跨膜方向」）。
+
+    为什么必须实测：`MonteCarloMembraneBarostat` 把膜法向**硬编码为 z**——它按
+    XY 等比例、Z 独立地缩放。若坐标里的双层其实垂直于 x 或 y，barostat 会沿着膜
+    平面内的一个方向单独缩放、同时把法向和一个面内方向绑在一起，膜会被压坏，
+    而且**不会报任何错**。只看盒子形状（哪条边最长）是不够的：盒子长边与膜法向
+    未必一致。
+
+    判据：沿真正的法向，头基参考原子应当分成**两个清晰的簇**（上下叶），
+    两簇计数接近相等且簇心间距 ≈ P–P 膜厚（2–5 nm）；面内两个方向上头基是
+    弥散分布。所以取"二分后两簇计数最平衡且簇心间距最大"的轴为法向。
+    """
+    axis_names = ("x", "y", "z")
+    declared = str(declared_axis).strip().lower()
+    if declared not in axis_names:
+        raise ValueError(f"declared_axis={declared_axis!r} 非法；允许 {list(axis_names)}")
+
+    pos_nm = np.asarray(
+        positions.value_in_unit(unit.nanometer)
+        if hasattr(positions, "value_in_unit")
+        else positions,
+        dtype=float,
+    )
+    head_candidates = LIPID_HEAD_REFERENCE_ATOM_NAMES + LIPID_HEAD_FALLBACK_ATOM_NAMES
+    heads: List[int] = []
+    if lipid_molecules:
+        all_atoms = _topology_atoms(topology)
+        for entry in lipid_molecules:
+            by_name = {}
+            for atom in all_atoms[int(entry["start"]):int(entry["stop"])]:
+                by_name.setdefault(str(atom.name).strip().upper(), int(atom.index))
+            reference = next((by_name[c] for c in head_candidates if c in by_name), None)
+            if reference is not None:
+                heads.append(reference)
+    else:
+        for residue in _topology_residues(topology):
+            if str(residue.name).strip().upper() not in KNOWN_LIPID_RESIDUE_NAMES:
+                continue
+            residue_atoms = residue.atoms
+            residue_atoms = list(
+                residue_atoms() if callable(residue_atoms) else residue_atoms
+            )
+            by_name = {
+                str(a.name).strip().upper(): int(a.index) for a in residue_atoms
+            }
+            reference = next((by_name[c] for c in head_candidates if c in by_name), None)
+            if reference is not None:
+                heads.append(reference)
+    if len(heads) < 4:
+        raise ValueError(
+            f"只找到 {len(heads)} 个脂质头基参考原子，无法实测膜法向。"
+        )
+
+    head_array = np.asarray(heads, dtype=int)
+    per_axis: Dict[str, Dict[str, float]] = {}
+    for index, name in enumerate(axis_names):
+        values = pos_nm[head_array][:, index]
+        split = 0.5 * (float(values.min()) + float(values.max()))
+        lower = values[values < split]
+        upper = values[values >= split]
+        if lower.size == 0 or upper.size == 0:
+            per_axis[name] = {
+                "n_lower": int(lower.size),
+                "n_upper": int(upper.size),
+                "separation_nm": 0.0,
+                "balance": 0.0,
+            }
+            continue
+        total = float(lower.size + upper.size)
+        per_axis[name] = {
+            "n_lower": int(lower.size),
+            "n_upper": int(upper.size),
+            # 1.0 = 完美对半；越小越不像双层。
+            "balance": 1.0 - abs(lower.size - upper.size) / total,
+            "separation_nm": float(np.mean(upper) - np.mean(lower)),
+        }
+
+    # 双层的法向：两簇最平衡；平衡度相同时取簇心间距更大的。
+    measured = max(
+        axis_names,
+        key=lambda name: (per_axis[name]["balance"], per_axis[name]["separation_nm"]),
+    )
+    report = {
+        "declared_axis": declared,
+        "measured_axis": measured,
+        "n_head_atoms": int(head_array.size),
+        "per_axis": per_axis,
+        "agrees": measured == declared,
+    }
+    if measured != declared:
+        raise ValueError(
+            f"声明膜法向为 {declared!r}，但从坐标实测最像双层法向的是 {measured!r}。"
+            f"逐轴证据（二分后两簇计数 / 平衡度 / 簇心间距）：{per_axis}。"
+            "OpenMM 的 MonteCarloMembraneBarostat 把法向硬编码为 z——轴错了它会沿"
+            "膜平面内单独缩放、把法向与一个面内方向绑死，膜会被压坏且不报错。"
+            "请在建系时把膜法向对齐 z。"
+        )
+    logger.info(
+        "🧫 膜法向实测确认为 %s（%d 个头基原子；上下叶 %d/%d，簇心间距 %.3f nm）",
+        measured, report["n_head_atoms"],
+        per_axis[measured]["n_upper"], per_axis[measured]["n_lower"],
+        per_axis[measured]["separation_nm"],
+    )
+    return report
+
+
 def validate_membrane_input(
     topology,
     positions,
@@ -2457,6 +3393,10 @@ def validate_membrane_input(
         )
 
     # ---- 上下叶脂质数：实测 + 与声明交叉核对，不假设对半分 ----
+    # ⚠️ 顺序有意义：**先**叶片划分再核对法向。
+    # 叶片划分会报出"哪些脂质找不到头基参考原子"这条**更具体、更可操作**的错；
+    # 而法向实测在头基不足时只会报"无法实测膜法向"——那是前者的下游后果，
+    # 先报下游会把人引到错误的地方去查。
     leaflets = assign_lipid_leaflets(
         topology,
         positions,
@@ -2470,6 +3410,16 @@ def validate_membrane_input(
             f"有 {len(leaflets['unassignable_lipid_residues'])} 个脂质单位找不到头基参考原子，"
             "无法判定所属叶片。请补充原子命名映射，不要让它们静默不计入。"
         )
+    # §3.3：膜法向必须**实测**核对，不能只信盒子形状（长边未必是法向）。
+    # 轴错了 MonteCarloMembraneBarostat 会沿膜平面内单独缩放、把法向与一个面内
+    # 方向绑死，膜被压坏且不报错。
+    normal_axis_report = verify_membrane_normal_axis(
+        topology,
+        positions,
+        declared_axis=normal_axis,
+        lipid_molecules=(composition or {}).get("molecules_by_role", {}).get("lipid"),
+    )
+
     for key, measured in (("n_upper", leaflets["n_upper"]), ("n_lower", leaflets["n_lower"])):
         if declared.get(key) is not None and int(declared[key]) != measured:
             raise ValueError(
@@ -2513,6 +3463,7 @@ def validate_membrane_input(
         "n_atoms": n_topology_atoms,
         "box_lengths_nm": [float(np.linalg.norm(row)) for row in box_nm],
         "box_is_rectangular": True,
+        "membrane_normal_axis": normal_axis_report,
         "leaflets": leaflets,
         "n_water": n_water,
         "ion_counts": dict(sorted(ion_counts.items())),
@@ -2626,14 +3577,31 @@ def membrane_observables_from_trajectory(
     coion_atom_index: Optional[int] = None,
     equilibration_length_ns: Optional[float] = None,
     composition: Optional[Dict[str, Any]] = None,
+    frame_interval_ps: Optional[float] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """把一条膜轨迹算成 `evaluate_membrane_quality_gate()` 需要的观测量与诊断量。
 
     `traj` 是一个已载入的 mdtraj Trajectory（带 unitcell 与键信息）。
     返回 `(observables, diagnostics)`，可直接喂给判定层。
 
-    时间轴取 `traj.time`（ps → ns）。轨迹没有时间信息时报错，因为 §9 的判据全部
-    定义在"末段 ≥ 20 ns"上——没有真实时间轴就无从判定，不允许用帧号假装 ns。
+    ## 时间轴：DCD 必须显式给 `frame_interval_ps`
+
+    §9 的判据全部定义在真实时间轴上（"末段 ≥ 20 ns"、"漂移 ≤ x/ns"），所以时间轴
+    错一个倍数，两道门会往**相反**方向坏掉：末段窗口变得过严，而"预平衡 ≥ 一个脂质
+    横向弛豫时间"变得过松（MSD 拟合出的 D 被同一个倍数放大）。
+
+    ⚠️ **mdtraj 读 DCD 时不传播真实步长**：`DCDTrajectoryFile.read_as_traj` 给出的
+    `traj.time` 是**整数帧号** `[0, 1, 2, …]`。实测 memtest 那条 10 ns / 500 帧
+    （10000 步 × 2 fs = 20 ps/帧）的轨迹，`traj.time` 就是 `[0…499]`，
+    于是时间轴被当成 0.499 ns —— 比真实值小 20 倍。
+    原先这里只校验"存在且单调递增"，帧号完全满足，所以这条守卫对 DCD 是 fail-open。
+
+    因此：
+      * 传了 `frame_interval_ps` → 时间轴由它构造（`i × interval`），忽略 `traj.time`。
+        这是生产路径的做法，数值来自 `pre_equilibration_frame_interval_ps()`，
+        与写轨迹的 reporter/integrator 共用同一组常量。
+      * 没传 → 用 `traj.time`，但**整数 dtype 一律拒绝**（那就是上面那个帧号签名）。
+    实际采用了哪一条会写进 `diagnostics["time_axis_source"]`，事后查得出来。
     """
     md = _require_mdtraj("膜质量门观测量提取")
     axis = {"x": 0, "y": 1, "z": 2}[str(normal_axis).strip().lower()]
@@ -2641,8 +3609,37 @@ def membrane_observables_from_trajectory(
     top = traj.topology
 
     if traj.unitcell_lengths is None:
-        raise ValueError("轨迹没有 unitcell 信息，无法计算 APL / 盒序列。")
-    times = np.asarray(traj.time, dtype=float)
+        raise ValueError(
+            "轨迹没有 unitcell 信息，无法计算 APL / 盒序列。\n"
+            "    `app.DCDFile` 写每帧 unitcell 时读的是**topology**的盒矢量"
+            "（`dcdfile.py:155`：`boxVectors = self._topology.getPeriodicBoxVectors()`），"
+            "为 None 就整段不写、header 的 boxFlag 也是 0。\n"
+            "    所以这不是轨迹格式问题，而是**写轨迹时那个 topology 没有盒矢量**。"
+            "最常见原因：从 `.top` 重建拓扑时没传 `periodicBoxVectors`"
+            "（`GromacsTopFile` 只在显式传参时才设盒）。\n"
+            "    修法：加载/重建拓扑后 `topology.setPeriodicBoxVectors(box)`，然后重跑预平衡。"
+        )
+    if frame_interval_ps is not None:
+        interval_ps = float(frame_interval_ps)
+        if not np.isfinite(interval_ps) or interval_ps <= 0.0:
+            raise ValueError(f"frame_interval_ps 必须是正有限值，收到 {frame_interval_ps!r}")
+        times = np.arange(traj.n_frames, dtype=float) * interval_ps
+        time_axis_source = "declared_frame_interval"
+    else:
+        raw_time = np.asarray(traj.time)
+        if np.issubdtype(raw_time.dtype, np.integer):
+            raise ValueError(
+                "轨迹的 time 数组是**整数**，这正是 mdtraj 读 DCD 时给出的**帧号**"
+                f"（实测形如 [0, 1, 2, …]，本条 {raw_time.size} 帧）。"
+                "§9 的判据定义在真实时间轴上（末段 ≥ 20 ns、漂移 ≤ x/ns），"
+                "用帧号冒充 ps 会让末段窗口过严、同时让"
+                "「预平衡 ≥ 一个脂质横向弛豫时间」过松（D 被同一倍数放大）。\n"
+                "    修法：传 `frame_interval_ps`（= reporter 保存间隔 × integrator 步长，"
+                "生产路径用 `pre_equilibration_frame_interval_ps()`），不要改判据窗口。"
+            )
+        times = raw_time.astype(float)
+        time_axis_source = "trajectory_time_field"
+        interval_ps = None
     if times.size != traj.n_frames or not np.all(np.diff(times) > 0):
         raise ValueError(
             "轨迹的 time 数组缺失或非单调递增。§9 的判据定义在真实时间轴上"
@@ -2659,11 +3656,19 @@ def membrane_observables_from_trajectory(
     # 有 `.top` 组成时**按分子**分叶。Amber Lipid21 把一个 POPC 拆成
     # PA + PC + OL 三个残基，按残基会数出 3 倍脂质数、APL 错 3 倍，且尾链残基
     # 没有磷原子会直接报"找不到头基参考原子"（实测 memtest 体系正是如此）。
+    #
+    # ⚠️ 两条分支**必须**收敛到同一个 `head_units`：`(单元标签, 头基原子 index)`。
+    # 下游（`head_indices`、`leaflet_composition`）只许从它派生，不许再有分支专属变量。
+    # 原先分子分支产 `head_list`、残基分支产 `head_by_residue`，而下面的
+    # `leaflet_composition` 只读后者 —— 分子分支下它从未绑定，于是真实膜体系上
+    # 整个 §9 质量门崩在 `UnboundLocalError`（memtest 2026-07-31 与 08-02 各一次，
+    # 报告落成 `{"evaluated": false}`）。根因是"身份口径改成按分子了，但有个消费点
+    # 没跟着改"，与 §0.5.5 记的"同一件事多个入口，补一个漏一片"同源。
     lipid_molecules = (composition or {}).get("molecules_by_role", {}).get("lipid")
     head_candidates = LIPID_HEAD_REFERENCE_ATOM_NAMES + LIPID_HEAD_FALLBACK_ATOM_NAMES
+    head_units: List[Tuple[str, int]] = []
     if lipid_molecules:
         all_atoms = _topology_atoms(top)
-        head_list: List[int] = []
         missing_units: List[Dict[str, Any]] = []
         for entry in lipid_molecules:
             start, stop = int(entry["start"]), int(entry["stop"])
@@ -2674,13 +3679,16 @@ def membrane_observables_from_trajectory(
             if ref is None:
                 missing_units.append({"atom_range": [start, stop]})
             else:
-                head_list.append(ref)
+                # 标签取 moleculetype 名（`POPC`），**不是**构成残基名（PA/PC/OL）——
+                # 用残基名会让 leaflet_composition 又数出 3 倍脂质数（§0.5.4 那个坑）。
+                head_units.append(
+                    (str(entry["molecule_name"]).strip().upper(), ref)
+                )
         if missing_units:
             raise ValueError(
                 f"{len(missing_units)} 个脂质分子找不到头基参考原子"
                 f"（示例原子区间 {missing_units[:3]}）。请补充原子命名，不要静默不计入。"
             )
-        head_indices = np.asarray(head_list, dtype=int)
         lipid_unit_label = "molecule"
     else:
         head_by_residue = _lipid_head_atom_indices_by_residue(top)
@@ -2693,10 +3701,12 @@ def membrane_observables_from_trajectory(
                 f"{len(missing_heads)} 个脂质残基找不到头基参考原子"
                 f"（残基 index 示例 {missing_heads[:5]}）。请补充原子命名，不要让它们静默不计入。"
             )
-        head_indices = np.asarray(
-            [head_by_residue[r] for r in sorted(head_by_residue)], dtype=int
-        )
+        head_units = [
+            (str(top.residue(r).name).strip().upper(), head_by_residue[r])
+            for r in sorted(head_by_residue)
+        ]
         lipid_unit_label = "residue"
+    head_indices = np.asarray([idx for _, idx in head_units], dtype=int)
     if head_indices.size == 0:
         raise ValueError("找不到任何脂质头基参考原子，这不是膜体系。")
     head_coords_frame0 = traj.xyz[0][head_indices][:, axis]
@@ -2767,6 +3777,7 @@ def membrane_observables_from_trajectory(
     protein_atoms_from_composition = (
         (composition or {}).get("atom_indices_by_role", {}).get("protein")
     )
+    protein_heavy = np.asarray([], dtype=int)
     if protein_atoms_from_composition:
         protein_set = set(int(i) for i in protein_atoms_from_composition)
         backbone_names = {"N", "CA", "C", "O"}
@@ -2776,6 +3787,16 @@ def membrane_observables_from_trajectory(
                 for atom in _topology_atoms(top)
                 if int(atom.index) in protein_set
                 and str(atom.name).strip().upper() in backbone_names
+            ),
+            dtype=int,
+        )
+        # 蛋白横截面用**全部重原子**（不只骨架）：占掉脂质面积的是侧链外表面。
+        protein_heavy = np.asarray(
+            sorted(
+                int(atom.index)
+                for atom in _topology_atoms(top)
+                if int(atom.index) in protein_set
+                and (getattr(atom.element, "symbol", "") or "").upper() != "H"
             ),
             dtype=int,
         )
@@ -2801,13 +3822,11 @@ def membrane_observables_from_trajectory(
                 "直接用它会静默少选骨架原子。请传入 composition"
                 "（`classify_system_composition()` 的产出）以使用权威的蛋白原子集合。"
             )
+        protein_heavy = np.asarray(
+            sorted(int(i) for i in top.select("protein and not element H")), dtype=int
+        )
     if protein_backbone.size == 0:
         raise ValueError("找不到蛋白骨架原子，无法计算骨架 RMSD 与跨膜倾角。")
-    aligned = traj.superpose(traj, 0, atom_indices=protein_backbone)
-    backbone_rmsd = md.rmsd(aligned, aligned, 0, atom_indices=protein_backbone)
-
-    ligand_rmsd = md.rmsd(aligned, aligned, 0, atom_indices=ligand_heavy)
-
     if pocket_atom_indices is None:
         raise ValueError(
             "必须显式提供 pocket_atom_indices。口袋定义直接决定 pocket_rmsd 这一道门，"
@@ -2817,7 +3836,56 @@ def membrane_observables_from_trajectory(
     pocket_indices = np.asarray(sorted(int(i) for i in pocket_atom_indices), dtype=int)
     if pocket_indices.size == 0:
         raise ValueError("pocket_atom_indices 为空。")
-    pocket_rmsd = md.rmsd(aligned, aligned, 0, atom_indices=pocket_indices)
+
+    # ---- RMSD 三项：在**子集副本**上做骨架对齐，绝不动传入的 traj（MEM-10）----
+    #
+    # ⚠️ `mdtraj.Trajectory.superpose()` **原地修改 `traj.xyz` 并返回 self**。
+    # 原先这里写的是 `aligned = traj.superpose(traj, 0, atom_indices=protein_backbone)`，
+    # 于是这一行之后所有读 `traj.xyz` 的量都在用"对齐到蛋白骨架"的坐标，而
+    # `midplane` / `upper_z` / `lower_z` 是在上面、对齐**之前**算的 —— 两者不在同一
+    # 坐标系。实测后果（memtest 100 ns，2026-08-02）：
+    #   * 脂质横向弛豫时间尺度 τ 从 11.57 ns 被放大到 **139.36 ns**（12 倍），
+    #     直接把 §9 质量门判失败（门里报的正是 139.362）；
+    #   * 跨膜倾角在对齐帧里测 → 漂移被系统性压掉；
+    #   * 蛋白横截面 / 校正后 APL、疏水核内水、水层间隙、密度分布全部口径错配。
+    #
+    # 而那次 superpose 对它本来要服务的三个 RMSD **毫无作用**：
+    # `md.rmsd(..., atom_indices=X)` 内部会自己在 X 上重新做最优拟合，所以先对齐
+    # 不改变返回值（实测 pocket 0.069400 / 0.069400、ligand 0.050201 / 0.050201）。
+    # 也就是说它是**纯有害**的一行。
+    #
+    # 现在只对 backbone ∪ pocket ∪ ligand 这个子集建副本（`atom_slice` 返回新对象），
+    # 旋转矩阵只由骨架坐标决定，所以骨架 RMSD 与改前数值等价；内存约为全轨迹的
+    # 1/20（实测 1128 + 148 + 41 vs 45354 原子）。
+    rmsd_subset = np.unique(
+        np.concatenate([protein_backbone, pocket_indices, ligand_heavy])
+    )
+    _subset_position = {int(g): i for i, g in enumerate(rmsd_subset)}
+    _backbone_in_subset = np.asarray(
+        [_subset_position[int(i)] for i in protein_backbone], dtype=int
+    )
+    _pocket_in_subset = np.asarray(
+        [_subset_position[int(i)] for i in pocket_indices], dtype=int
+    )
+    _ligand_in_subset = np.asarray(
+        [_subset_position[int(i)] for i in ligand_heavy], dtype=int
+    )
+    ref = traj.atom_slice(rmsd_subset)
+    backbone_rmsd = md.rmsd(ref, ref, 0, atom_indices=_backbone_in_subset)
+    ref.superpose(ref, 0, atom_indices=_backbone_in_subset)  # 只改副本
+
+    # 口袋 / 配体是 **pose 漂移**（§9："口袋 RMSD、配体 RMSD/关键相互作用"），
+    # 所以对齐蛋白骨架之后**不再重新拟合**，直接量位移（MEM-13）。
+    # 原先用 `md.rmsd(..., atom_indices=pocket)`，它会在口袋/配体自身上再做一次
+    # 最优拟合 —— 测到的是内部构象变化，而不是相对受体的 pose 漂移。
+    # 实测差别（memtest 100 ns 末段 20 ns）：不重拟合 0.0857 / 0.0833 nm，
+    # 重拟合 0.0760 / 0.0493 nm（配体差 1.7 倍）。阈值 0.20 / 0.25 不变。
+    def _pose_drift_nm(subset_indices):
+        delta = ref.xyz[:, subset_indices, :] - ref.xyz[0, subset_indices, :][None]
+        return np.sqrt(np.mean(np.sum(delta**2, axis=2), axis=1))
+
+    pocket_rmsd = _pose_drift_nm(_pocket_in_subset)
+    ligand_rmsd = _pose_drift_nm(_ligand_in_subset)
 
     # 跨膜倾角：蛋白骨架坐标的第一主轴与膜法向的夹角（0–90°）。
     tilt_deg = np.empty(traj.n_frames, dtype=float)
@@ -2832,8 +3900,96 @@ def membrane_observables_from_trajectory(
         cosine = abs(float(np.dot(principal, normal_vector)))
         tilt_deg[frame] = math.degrees(math.acos(min(1.0, max(0.0, cosine))))
 
+    # ---- APL 的蛋白横截面校正（§13.3 的绝对值门只有校正后才有意义）----
+    # raw APL 把蛋白占掉的横向面积也摊到脂质头上，含蛋白膜因此系统性偏大
+    # （实测 memtest 0.826 vs POPC 纯脂文献 0.645）。校正 = 先从横向面积里扣掉
+    # 该叶片 slab 内的蛋白占据面积，再除以该叶脂质数。
+    # 脂质原子集合：组成优先，名字兜底。下面的"膜与周期镜像水层间隙"复用同一集合。
+    lipid_from_composition = (
+        (composition or {}).get("atom_indices_by_role", {}).get("lipid")
+    )
+    if lipid_from_composition:
+        lipid_atoms = np.asarray(sorted(int(i) for i in lipid_from_composition), dtype=int)
+    else:
+        lipid_atoms = np.asarray(
+            [
+                int(atom.index)
+                for atom in _topology_atoms(top)
+                if str(atom.residue.name).strip().upper() in KNOWN_LIPID_RESIDUE_NAMES
+            ],
+            dtype=int,
+        )
+    if lipid_atoms.size == 0:
+        raise ValueError("找不到任何脂质原子，无法判断膜与周期镜像的水层间隙。")
+    _lipid_atom_set = set(int(i) for i in lipid_atoms.tolist())
+    lipid_heavy = np.asarray(
+        [
+            int(atom.index)
+            for atom in _topology_atoms(top)
+            if int(atom.index) in _lipid_atom_set
+            and (getattr(atom.element, "symbol", "") or "").upper() != "H"
+        ],
+        dtype=int,
+    )
+    cross_upper, cross_lower = _protein_leaflet_cross_sections_nm2(
+        traj, protein_heavy, lipid_heavy, axis, lateral_axes, midplane, upper_z, lower_z
+    )
+    apl_corrected = 0.5 * (
+        (lateral_area - cross_upper) / n_upper
+        + (lateral_area - cross_lower) / n_lower
+    )
+    # 栅格边长是**唯一**的方法参数（最近原子归属没有探针半径），所以敏感性检查
+    # 就是"换成 2× 粗栅格复算若干帧"。判读绝对值门必须连它一起看。
+    sens_frames = np.unique(
+        np.linspace(
+            0,
+            traj.n_frames - 1,
+            min(traj.n_frames, PROTEIN_CROSS_SECTION_SENSITIVITY_MAX_FRAMES),
+        ).astype(int)
+    )
+    apl_sensitivity: Dict[str, Any] = {
+        "method": "nearest_reference_atom_partition",
+        "grid_nm": PROTEIN_CROSS_SECTION_GRID_NM,
+        "coarse_grid_nm": (
+            PROTEIN_CROSS_SECTION_GRID_NM
+            * PROTEIN_CROSS_SECTION_GRID_SENSITIVITY_FACTOR
+        ),
+        "n_frames_sampled": int(sens_frames.size),
+        "n_protein_reference_atoms": int(protein_heavy.size),
+        "n_lipid_reference_atoms": int(lipid_heavy.size),
+    }
+    up_s, lo_s = _protein_leaflet_cross_sections_nm2(
+        traj,
+        protein_heavy,
+        lipid_heavy,
+        axis,
+        lateral_axes,
+        midplane,
+        upper_z,
+        lower_z,
+        grid_nm=(
+            PROTEIN_CROSS_SECTION_GRID_NM
+            * PROTEIN_CROSS_SECTION_GRID_SENSITIVITY_FACTOR
+        ),
+        frames=sens_frames,
+    )
+    area_s = lateral_area[sens_frames]
+    apl_sensitivity["apl_nm2_fine_grid"] = float(
+        np.mean(apl_corrected[sens_frames])
+    )
+    apl_sensitivity["apl_nm2_coarse_grid"] = float(
+        np.mean(0.5 * ((area_s - up_s) / n_upper + (area_s - lo_s) / n_lower))
+    )
+    apl_sensitivity["protein_cross_section_nm2_fine_grid"] = float(
+        np.mean(0.5 * (cross_upper[sens_frames] + cross_lower[sens_frames]))
+    )
+    apl_sensitivity["protein_cross_section_nm2_coarse_grid"] = float(
+        np.mean(0.5 * (up_s + lo_s))
+    )
+
     observables: Dict[str, Any] = {
         "apl_nm2": _series(times_ns, apl),
+        "apl_protein_corrected_nm2": _series(times_ns, apl_corrected),
         "bilayer_thickness_nm": _series(times_ns, thickness),
         "lipid_tail_order_parameter": _series(times_ns, order_parameter),
         "protein_backbone_rmsd_nm": _series(times_ns, backbone_rmsd),
@@ -2855,22 +4011,7 @@ def membrane_observables_from_trajectory(
     core_water = inside.sum(axis=1)
 
     # ---- 膜与周期镜像的水层间隙 ----
-    lipid_from_composition = (
-        (composition or {}).get("atom_indices_by_role", {}).get("lipid")
-    )
-    if lipid_from_composition:
-        lipid_atoms = np.asarray(sorted(int(i) for i in lipid_from_composition), dtype=int)
-    else:
-        lipid_atoms = np.asarray(
-            [
-                int(atom.index)
-                for atom in _topology_atoms(top)
-                if str(atom.residue.name).strip().upper() in KNOWN_LIPID_RESIDUE_NAMES
-            ],
-            dtype=int,
-        )
-    if lipid_atoms.size == 0:
-        raise ValueError("找不到任何脂质原子，无法判断膜与周期镜像的水层间隙。")
+    # `lipid_atoms` 在上面（APL 蛋白横截面校正处）已经解析过，两处共用同一集合。
     lipid_z = traj.xyz[:, lipid_atoms, axis]
     water_gap = normal_length - (lipid_z.max(axis=1) - lipid_z.min(axis=1))
     image_contact_frames = int(np.count_nonzero(water_gap < MEMBRANE_MIN_WATER_SLAB_NM))
@@ -2879,20 +4020,21 @@ def membrane_observables_from_trajectory(
     density_profile = _density_profile_along_normal(traj, axis, midplane)
 
     # ---- 脂质横向弛豫时间尺度（由头基横向 MSD 估计）----
-    relaxation_ns = _lipid_lateral_relaxation_timescale_ns(
+    relaxation_ns, relaxation_details = _lipid_lateral_relaxation_timescale_ns(
         traj, head_indices, lateral_axes, times_ns
     )
 
+    # 从 `head_units` 派生，与 `head_indices` / 叶片 mask 同源。
+    # 不要在这里重新按残基名找头基——那正是本函数崩过两次的地方。
     leaflet_composition = {"upper": {}, "lower": {}}
-    for residue_index, atom_index in head_by_residue.items():
-        name = str(top.residue(residue_index).name).strip().upper()
+    for label, atom_index in head_units:
         bucket = (
             "upper"
             if traj.xyz[0][atom_index][axis] > midplane0
             else "lower"
         )
-        leaflet_composition[bucket][name] = (
-            leaflet_composition[bucket].get(name, 0) + 1
+        leaflet_composition[bucket][label] = (
+            leaflet_composition[bucket].get(label, 0) + 1
         )
 
     diagnostics: Dict[str, Any] = {
@@ -2906,6 +4048,7 @@ def membrane_observables_from_trajectory(
             "water_slab_threshold_nm": MEMBRANE_MIN_WATER_SLAB_NM,
         },
         "lipid_lateral_relaxation_timescale_ns": relaxation_ns,
+        "lipid_lateral_diffusion": relaxation_details,
         "equilibration_length_ns": (
             float(equilibration_length_ns)
             if equilibration_length_ns is not None
@@ -2915,6 +4058,30 @@ def membrane_observables_from_trajectory(
         "n_lower": n_lower,
         "core_water_per_frame_mean": float(np.mean(core_water)),
         "lipid_unit": lipid_unit_label,
+        # 时间轴来自哪里必须可追溯：mdtraj 读 DCD 给的是帧号，用错了两道门会往
+        # 相反方向坏（末段窗口过严 / 弛豫时间过松），事后只看数字分辨不出来。
+        "time_axis_source": time_axis_source,
+        "frame_interval_ps": interval_ps,
+        "trajectory_span_ns": float(times_ns[-1] - times_ns[0]),
+        "protein_cross_section_upper_nm2_mean": float(np.mean(cross_upper)),
+        "protein_cross_section_lower_nm2_mean": float(np.mean(cross_lower)),
+        "n_protein_heavy_atoms": int(protein_heavy.size),
+        "apl_protein_cross_section_sensitivity": apl_sensitivity,
+        "apl_correction_definition": (
+            "apl_protein_corrected_nm2 = mean over leaflets of "
+            "(lateral box area - protein-owned lateral area in that leaflet slab) "
+            "/ (number of lipid units in that leaflet). The protein-owned area is a "
+            "Voronoi-style nearest-reference-atom partition of the lateral plane on a "
+            f"{PROTEIN_CROSS_SECTION_GRID_NM} nm periodic grid: every grid cell is "
+            "assigned to the closest heavy atom among the protein and lipid heavy "
+            "atoms whose normal-axis coordinate lies inside that leaflet slab. There "
+            "is NO probe radius - an outward-dilation definition adds a rim along the "
+            "protein perimeter and measurably overestimates the protein area. The grid "
+            "spacing is the only method parameter; see "
+            "apl_protein_cross_section_sensitivity for the coarse-grid cross-check. "
+            "Never compare a corrected APL against an uncorrected one, nor values "
+            "produced by different partition definitions."
+        ),
         "order_parameter_definition": (
             "intra-lipid C–C bond-vector order parameter relative to the membrane "
             "normal; an §9-permitted equivalent structural indicator, NOT S_CD "
@@ -2974,6 +4141,109 @@ def _resolve_water_oxygen_indices(topology, composition: Optional[Dict[str, Any]
     return np.asarray(sorted(indices), dtype=int)
 
 
+def _nearest_owner_area_nm2(
+    protein_xy,
+    lipid_xy,
+    lateral_lengths,
+    grid_nm: float = PROTEIN_CROSS_SECTION_GRID_NM,
+) -> float:
+    """横向平面上"离蛋白原子比离任何脂质原子都近"的面积，nm²（周期性）。
+
+    Voronoi 式划分：把横向平面打成边长 `grid_nm` 的栅格，每个格心归给最近的那个
+    参考原子（蛋白重原子 ∪ 脂质重原子），返回归给蛋白的面积。
+    **没有探针半径**——边界自动落在两类原子中间，所以不存在"外扩多少"这个可调量
+    （见 `PROTEIN_CROSS_SECTION_GRID_NM` 的注释：外扩法会沿周长多算一圈）。
+
+    周期性靠把参考原子在横向 3×3 复制一遍实现（格心只取主胞），
+    这样贴边的蛋白/脂质在最近邻判断里不会被盒边截断。
+    """
+    from scipy.spatial import cKDTree
+
+    protein_xy = np.asarray(protein_xy, dtype=float).reshape(-1, 2)
+    lipid_xy = np.asarray(lipid_xy, dtype=float).reshape(-1, 2)
+    if protein_xy.shape[0] == 0:
+        return 0.0
+    lx = float(lateral_lengths[0])
+    ly = float(lateral_lengths[1])
+    nx = max(1, int(round(lx / grid_nm)))
+    ny = max(1, int(round(ly / grid_nm)))
+    cell_x, cell_y = lx / nx, ly / ny
+    if lipid_xy.shape[0] == 0:
+        # 该 slab 里没有脂质原子 → 整个横向面积都不归脂质。这不是正常膜体系，
+        # 但也不该在这里猜；调用方会因为 APL 明显异常而察觉。
+        return lx * ly
+
+    refs = np.vstack([protein_xy, lipid_xy])
+    is_protein = np.zeros(refs.shape[0], dtype=bool)
+    is_protein[: protein_xy.shape[0]] = True
+    # 横向 3×3 周期镜像
+    shifts = np.array(
+        [(i * lx, j * ly) for i in (-1, 0, 1) for j in (-1, 0, 1)], dtype=float
+    )
+    refs_periodic = (refs[None, :, :] + shifts[:, None, :]).reshape(-1, 2)
+    owner_periodic = np.tile(is_protein, shifts.shape[0])
+
+    centers_x = (np.arange(nx) + 0.5) * cell_x
+    centers_y = (np.arange(ny) + 0.5) * cell_y
+    grid = np.stack(
+        np.meshgrid(centers_x, centers_y, indexing="ij"), axis=-1
+    ).reshape(-1, 2)
+    _, nearest = cKDTree(refs_periodic).query(grid, k=1)
+    return float(owner_periodic[nearest].sum()) * cell_x * cell_y
+
+
+def _protein_leaflet_cross_sections_nm2(
+    traj,
+    protein_heavy,
+    lipid_heavy,
+    axis: int,
+    lateral_axes,
+    midplane,
+    upper_z,
+    lower_z,
+    grid_nm: float = PROTEIN_CROSS_SECTION_GRID_NM,
+    frames=None,
+):
+    """逐帧、逐叶给出蛋白在该叶片 slab 内占掉的横向面积（nm²）。
+
+    上叶 slab = [中面, 上叶头基平面]，下叶 slab = [下叶头基平面, 中面]。
+    只取落在该 slab 内的原子——蛋白在膜外的胞内/胞外结构域不占脂质面积，
+    把它们算进来会高估蛋白横截面。
+    """
+    protein_heavy = np.asarray(protein_heavy, dtype=int)
+    lipid_heavy = np.asarray(lipid_heavy, dtype=int)
+    lengths = np.asarray(traj.unitcell_lengths, dtype=float)
+    frame_list = (
+        list(range(traj.n_frames)) if frames is None else [int(f) for f in frames]
+    )
+    upper = np.zeros(len(frame_list), dtype=float)
+    lower = np.zeros(len(frame_list), dtype=float)
+    if protein_heavy.size == 0:
+        return upper, lower
+    for out_i, frame in enumerate(frame_list):
+        cell = lengths[frame][lateral_axes]
+        p_coords = traj.xyz[frame][protein_heavy]
+        l_coords = (
+            traj.xyz[frame][lipid_heavy]
+            if lipid_heavy.size
+            else np.empty((0, 3), dtype=float)
+        )
+        p_z, l_z = p_coords[:, axis], l_coords[:, axis]
+        for out, lo, hi in (
+            (upper, midplane[frame], upper_z[frame]),
+            (lower, lower_z[frame], midplane[frame]),
+        ):
+            out[out_i] = _nearest_owner_area_nm2(
+                p_coords[(p_z >= lo) & (p_z <= hi)][:, lateral_axes],
+                l_coords[(l_z >= lo) & (l_z <= hi)][:, lateral_axes]
+                if l_coords.size
+                else np.empty((0, 2), dtype=float),
+                cell,
+                grid_nm=grid_nm,
+            )
+    return upper, lower
+
+
 def _density_profile_along_normal(traj, axis: int, midplane) -> Dict[str, Any]:
     """按组分给出沿膜法向的质量密度分布（相对膜中面）。"""
     top = traj.topology
@@ -3016,28 +4286,103 @@ def _density_profile_along_normal(traj, axis: int, midplane) -> Dict[str, Any]:
 
 def _lipid_lateral_relaxation_timescale_ns(
     traj, head_indices, lateral_axes, times_ns
-) -> float:
-    """由头基横向 MSD 估计脂质横向弛豫时间尺度（§9）。
+) -> Tuple[float, Dict[str, Any]]:
+    """由头基横向 MSD 估计脂质横向弛豫时间尺度（§9）。返回 `(tau_ns, details)`。
 
-    做法：对头基在膜平面内的位移求 MSD(Δt)，线性拟合得横向扩散系数
-    （2D：MSD = 4·D·Δt），再换算成"位移一个脂质直径所需时间"。
+    做法：**时间平均** MSD —— 对每个 lag `L` 用**所有时间原点**
+    `msd[L] = mean_t |x(t+L) − x(t)|²`，再在一个**声明的 lag 窗口**内做带截距的
+    线性拟合得 2D 扩散系数（MSD = 4·D·Δt），最后换算成"位移一个脂质直径所需时间"。
     这是一个**量级估计**，用于论证预平衡时长，不是精确扩散系数测量。
+
+    ## 为什么不能用单一参考帧 + 过原点拟合全部 lag（MEM-11）
+
+    原实现取 `reference = lateral[0]`（每个 lag 只有**一个**样本）并用过原点最小
+    二乘拟合**全部** lag（权重 ∝ lag²，长 lag 主导）。两个问题：
+
+    * 脂质横向 MSD 在短 lag 是**亚扩散**的（实测 memtest 100 ns，1–30 ns 区间
+      MSD ~ t^0.80），过原点拟合把这段一起吃进去必然偏；
+    * 长 lag 只有极少数独立样本，却被 lag² 权重放大。
+
+    实测后果：同一条 100 ns 轨迹，只改"用到前多少 ns"，τ 就是
+    30.1 → 38.0 → 24.1 → 13.2 → 10.8 → 11.6 ns（10/20/40/60/80/100 ns），
+    **非单调乱跳** —— 这样的量不该当硬门（见 `evaluate_membrane_quality_gate`
+    里 `equilibration_vs_relaxation` 那段说明）。
+    改成时间平均 + 5–30 ns 窗口后同一条轨迹给 D = 0.008664 nm²/ns → τ = 18.467 ns，
+    与 POPC 文献 D ≈ 0.008 nm²/ns 给出的 τ ≈ 20 ns 吻合。
     """
     if times_ns.size < 3:
         raise ValueError("估计脂质横向弛豫时间尺度至少需要 3 帧")
-    lateral = traj.xyz[:, head_indices, :][:, :, lateral_axes]
-    reference = lateral[0]
-    displacement = lateral - reference[None, :, :]
-    msd = np.mean(np.sum(displacement**2, axis=2), axis=1)  # nm^2, 逐帧
-    lag_ns = times_ns - times_ns[0]
-    # 跳过 lag=0，用最小二乘过原点拟合 MSD = 4 D t。
-    mask = lag_ns > 0
-    if not np.any(mask):
-        raise ValueError("时间轴退化，无法估计横向弛豫")
-    slope = float(np.sum(lag_ns[mask] * msd[mask]) / np.sum(lag_ns[mask] ** 2))
-    d_lateral = max(slope / 4.0, 1.0e-12)  # nm^2/ns
+    diffs = np.diff(times_ns)
+    if not np.allclose(diffs, diffs[0], rtol=1e-6, atol=1e-12):
+        raise ValueError(
+            "时间轴不是等间隔的，时间平均 MSD 需要等间隔帧。"
+            "请提供等间隔轨迹或显式给出 frame_interval_ps。"
+        )
+    dt_ns = float(diffs[0])
+    span_ns = float(times_ns[-1] - times_ns[0])
+
+    lag_lo, lag_hi = (
+        LIPID_LATERAL_MSD_FIT_LAG_MIN_NS,
+        LIPID_LATERAL_MSD_FIT_LAG_MAX_NS,
+    )
+    window_source = "declared"
+    if span_ns < 2.0 * lag_lo:
+        # 轨迹太短装不下声明窗口：按跨度缩放，并**如实记录**用了哪个窗口。
+        # 不静默套用声明窗口（那会拟合到根本没有的 lag），也不报错（短轨迹在
+        # 合成测试与早期诊断里是合法用法）。
+        lag_lo, lag_hi = 0.1 * span_ns, 0.6 * span_ns
+        window_source = "scaled_to_trajectory_span"
+
+    lag_min_frames = max(1, int(round(lag_lo / dt_ns)))
+    lag_max_frames = min(traj.n_frames - 1, int(round(lag_hi / dt_ns)))
+    if lag_max_frames <= lag_min_frames:
+        lag_min_frames = 1
+        lag_max_frames = max(2, traj.n_frames - 1)
+        window_source = "degenerate_span_used_all_lags"
+    # 拟合点数上限：MSD 是 O(n_frames × n_heads) 一个 lag，30 个点足够定斜率。
+    lag_frames = np.unique(
+        np.linspace(lag_min_frames, lag_max_frames, 30).astype(int)
+    )
+
+    lateral = traj.xyz[:, head_indices, :][:, :, lateral_axes].astype(np.float64)
+    msd = np.empty(lag_frames.size, dtype=float)
+    for i, lag in enumerate(lag_frames):
+        delta = lateral[int(lag):] - lateral[: -int(lag)]
+        msd[i] = float(np.mean(np.sum(delta**2, axis=2)))
+    lag_ns = lag_frames * dt_ns
+
+    if lag_frames.size >= 2:
+        slope, intercept = np.polyfit(lag_ns, msd, 1)
+    else:
+        slope, intercept = msd[0] / lag_ns[0], 0.0
+    # 亚扩散指数（诊断用）：MSD ~ t^alpha，纯扩散 alpha = 1。
+    positive = msd > 0
+    if int(np.count_nonzero(positive)) >= 2:
+        alpha = float(
+            np.polyfit(np.log(lag_ns[positive]), np.log(msd[positive]), 1)[0]
+        )
+    else:
+        alpha = float("nan")
+
+    d_lateral = max(float(slope) / 4.0, 1.0e-12)  # nm²/ns
     reference_displacement = LIPID_LATERAL_RELAXATION_REFERENCE_DISPLACEMENT_NM
-    return float(reference_displacement**2 / (4.0 * d_lateral))
+    tau_ns = float(reference_displacement**2 / (4.0 * d_lateral))
+    details = {
+        "method": "time_averaged_msd_multiple_origins",
+        "lateral_diffusion_nm2_per_ns": float(d_lateral),
+        "msd_power_law_exponent": alpha,
+        "fit_lag_window_ns": [float(lag_ns[0]), float(lag_ns[-1])],
+        "fit_lag_window_source": window_source,
+        "n_fit_points": int(lag_frames.size),
+        "fit_intercept_nm2": float(intercept),
+        "reference_displacement_nm": float(reference_displacement),
+        "trajectory_span_ns": span_ns,
+        # 判读锚点：POPC 纯脂文献 D ≈ 0.008 nm²/ns → τ ≈ 20 ns。
+        "pure_popc_reference_diffusion_nm2_per_ns": (
+            PURE_POPC_REFERENCE_LATERAL_DIFFUSION_NM2_PER_NS
+        ),
+    }
+    return tau_ns, details
 
 
 def _coion_observables_from_trajectory(
@@ -6288,6 +7633,182 @@ GMX_TO_OPENMM_WATER_XML = {
 }
 
 
+# 参数匹配水模型时的容差。O 的 σ/ε 与电荷在各模型间的差别远大于此
+# （例如 TIP3P σ=0.315075 vs SPC/E σ=0.316572），所以这个容差既能吸收
+# 力场文件与 XML 的有效位差异，又不会把两个模型混为一谈。
+WATER_MODEL_MATCH_CHARGE_TOLERANCE_E = 1.0e-4
+WATER_MODEL_MATCH_SIGMA_TOLERANCE_NM = 1.0e-6
+WATER_MODEL_MATCH_EPSILON_TOLERANCE_KJ_MOL = 1.0e-4
+
+
+def water_model_parameters_from_topology(
+    parsed: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """从已解析的 GROMACS 拓扑里取出水的 O/H 电荷与 O 的 σ/ε。
+
+    找不到水 moleculetype 或缺 atomtype 参数时返回 None（由调用方 fail closed）。
+    """
+    water_name = next(
+        (
+            name
+            for name in parsed["moleculetypes"]
+            if str(name).strip().upper() in WATER_MOLECULE_NAMES
+        ),
+        None,
+    )
+    if water_name is None:
+        return None
+    atoms = parsed["moleculetypes"][water_name].get("atoms") or []
+    atomtypes = parsed.get("atomtypes") or {}
+
+    oxygen = next(
+        (a for a in atoms if str(a.get("atom_name", "")).strip().upper().startswith("O")),
+        None,
+    )
+    hydrogens = [
+        a for a in atoms if str(a.get("atom_name", "")).strip().upper().startswith("H")
+    ]
+    if oxygen is None or not hydrogens:
+        return None
+    o_type = atomtypes.get(oxygen["type"])
+    if o_type is None:
+        return None
+    return {
+        "moleculetype": water_name,
+        "n_sites": len(atoms),
+        "charge_o_e": float(oxygen["charge"]),
+        "charge_h_e": float(hydrogens[0]["charge"]),
+        "sigma_o_nm": float(o_type["sigma_nm"]),
+        "epsilon_o_kj_mol": float(o_type["epsilon_kj_mol"]),
+    }
+
+
+def openmm_water_model_parameters(xml_relative_path: str) -> Optional[Dict[str, Any]]:
+    """从 OpenMM 自带的水模型 XML 里取同一组参数，用于与拓扑比对。
+
+    刻意**读 XML 而不是硬编码一张参数表**：这样"选出的 XML"与"比对用的参数"
+    构造性地来自同一处，不会出现表抄错或版本漂移。
+    """
+    import xml.etree.ElementTree as ET
+
+    data_dir = os.path.join(os.path.dirname(app.__file__), "data")
+    path = os.path.join(data_dir, xml_relative_path)
+    if not os.path.isfile(path):
+        return None
+    root = ET.parse(path).getroot()
+
+    residue = next(
+        (r for r in root.iter("Residue") if r.get("name") in ("HOH", "WAT")), None
+    )
+    if residue is None:
+        return None
+    site_types: Dict[str, str] = {}
+    charges: Dict[str, float] = {}
+    for atom in residue:
+        name, atom_type, charge = atom.get("name"), atom.get("type"), atom.get("charge")
+        if name is None or atom_type is None or charge is None:
+            continue
+        site_types[name] = atom_type
+        charges[name] = float(charge)
+    if not site_types:
+        return None
+
+    sigma_epsilon: Dict[str, Tuple[float, float]] = {}
+    for atom in root.iter("Atom"):
+        atom_type = atom.get("type")
+        sigma, epsilon = atom.get("sigma"), atom.get("epsilon")
+        if atom_type in set(site_types.values()) and sigma is not None and epsilon is not None:
+            sigma_epsilon[atom_type] = (float(sigma), float(epsilon))
+
+    oxygen_name = next((n for n in site_types if n.upper().startswith("O")), None)
+    hydrogen_name = next((n for n in site_types if n.upper().startswith("H")), None)
+    if oxygen_name is None or hydrogen_name is None:
+        return None
+    o_params = sigma_epsilon.get(site_types[oxygen_name])
+    if o_params is None:
+        return None
+    return {
+        "xml": xml_relative_path,
+        "n_sites": len(site_types),
+        "charge_o_e": charges[oxygen_name],
+        "charge_h_e": charges[hydrogen_name],
+        "sigma_o_nm": o_params[0],
+        "epsilon_o_kj_mol": o_params[1],
+    }
+
+
+def _water_models_match(topology_params, xml_params) -> bool:
+    return (
+        int(topology_params["n_sites"]) == int(xml_params["n_sites"])
+        and abs(topology_params["charge_o_e"] - xml_params["charge_o_e"])
+        <= WATER_MODEL_MATCH_CHARGE_TOLERANCE_E
+        and abs(topology_params["charge_h_e"] - xml_params["charge_h_e"])
+        <= WATER_MODEL_MATCH_CHARGE_TOLERANCE_E
+        and abs(topology_params["sigma_o_nm"] - xml_params["sigma_o_nm"])
+        <= WATER_MODEL_MATCH_SIGMA_TOLERANCE_NM
+        and abs(topology_params["epsilon_o_kj_mol"] - xml_params["epsilon_o_kj_mol"])
+        <= WATER_MODEL_MATCH_EPSILON_TOLERANCE_KJ_MOL
+    )
+
+
+def identify_water_model_by_parameters(
+    top_file: str,
+    gmx_include_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """按**实际参数**（O/H 电荷 + O 的 σ/ε + 位点数）识别水模型。
+
+    为什么需要：原实现只看 `#include` 的文件名词干。那对
+    `amber14sb_OL15_fs1.ff/tip3p.itp` 有效，但 CHARMM-GUI 的 AMBER 转换器把
+    TIP3P 的水叫 **`TP3`**（`toppar/TP3.itp`），文件名匹配直接 fail closed。
+
+    这是同一类根因的第三次出现（前两次是脂质按残基计数、水/离子计数静默为 0）：
+    **靠名字判身份在换一套体系时就会错**。参数是权威的，且比对用的候选参数直接
+    从 OpenMM 自带 XML 读出，不硬编码。
+
+    返回 `{"xml", "matched", "topology_params", "candidates"}`；
+    `matched=False` 时由调用方决定报错措辞。
+    """
+    parsed = parse_gromacs_topology(top_file, gmx_include_dir)
+    topology_params = water_model_parameters_from_topology(parsed)
+    if topology_params is None:
+        return {
+            "xml": None,
+            "matched": False,
+            "reason": "topology_water_parameters_unavailable",
+            "topology_params": None,
+            "candidates": {},
+        }
+
+    candidates: Dict[str, Any] = {}
+    matches: List[str] = []
+    for key, xml_relative_path in GMX_TO_OPENMM_WATER_XML.items():
+        xml_params = openmm_water_model_parameters(xml_relative_path)
+        candidates[key] = xml_params
+        if xml_params and _water_models_match(topology_params, xml_params):
+            matches.append(key)
+
+    if len(matches) == 1:
+        return {
+            "xml": GMX_TO_OPENMM_WATER_XML[matches[0]],
+            "matched": True,
+            "reason": "parameter_fingerprint",
+            "model_key": matches[0],
+            "topology_params": topology_params,
+            "candidates": candidates,
+        }
+    return {
+        "xml": None,
+        "matched": False,
+        "reason": (
+            f"ambiguous_parameter_match:{sorted(matches)}"
+            if matches
+            else "no_parameter_match"
+        ),
+        "topology_params": topology_params,
+        "candidates": candidates,
+    }
+
+
 def resolve_water_model_xml(top_file: str) -> Tuple[str, str]:
     """从复合物 ``.top`` 的 ``#include`` 里解出水模型，返回 ``(OpenMM XML, 命中的 itp)``。
 
@@ -6321,9 +7842,35 @@ def resolve_water_model_xml(top_file: str) -> Tuple[str, str]:
             hits[key] = include_path
 
     if not hits:
+        # 文件名词干认不出来时，按**实际参数**识别（O/H 电荷 + O 的 σ/ε + 位点数）。
+        # 实测理由：CHARMM-GUI 的 AMBER 转换器把 TIP3P 的水命名为 `TP3`
+        # （`toppar/TP3.itp`），文件名匹配必然落空，但它的参数
+        # （q_O=-0.834, q_H=+0.417, σ_O=0.315075240658 nm, ε_O=0.635968 kJ/mol）
+        # 与 `amber14/tip3p.xml` 逐位吻合。参数是权威的，名字不是。
+        identification = identify_water_model_by_parameters(top_file)
+        if identification["matched"]:
+            params = identification["topology_params"]
+            logger.info(
+                "💧 水模型按参数识别为 %s（moleculetype=%s, %d 位点, "
+                "q_O=%+.6f, q_H=%+.6f, σ_O=%.9f nm, ε_O=%.6f kJ/mol）——"
+                "`#include` 文件名词干认不出，故用参数判定。",
+                identification["xml"], params["moleculetype"], params["n_sites"],
+                params["charge_o_e"], params["charge_h_e"],
+                params["sigma_o_nm"], params["epsilon_o_kj_mol"],
+            )
+            return identification["xml"], f"parameter_match:{params['moleculetype']}"
+        detail = ""
+        if identification["topology_params"]:
+            p = identification["topology_params"]
+            detail = (
+                f" 拓扑里的水是 moleculetype={p['moleculetype']!r}、{p['n_sites']} 位点、"
+                f"q_O={p['charge_o_e']:+.6f}, q_H={p['charge_h_e']:+.6f}, "
+                f"σ_O={p['sigma_o_nm']:.9f} nm, ε_O={p['epsilon_o_kj_mol']:.6f} kJ/mol，"
+                f"与已知模型都不匹配（{identification['reason']}）。"
+            )
         raise ValueError(
-            f"在 {top_file} 的 #include 里没认出任何水模型；"
-            f"已知的有 {sorted(GMX_TO_OPENMM_WATER_XML)}。"
+            f"在 {top_file} 的 #include 里没认出任何水模型，按参数也没匹配上；"
+            f"已知的有 {sorted(GMX_TO_OPENMM_WATER_XML)}。{detail}"
             "拒绝为溶剂腿猜一个水模型——它必须和复合物腿一致。"
         )
     if len(hits) > 1:
@@ -6397,7 +7944,8 @@ class SolventLegRunner:
         """从 GROMACS 文件提取配体并水盒化"""
         from openmm.app import Modeller, ForceField
         gro = app.GromacsGroFile(gro_file)
-        top = app.GromacsTopFile(top_file, includeDir=gmx_include_dir)
+        # 走唯一入口：拓扑若含 `[ pairs ]` funct 2（OpenMM 不支持）会先做等价转换。
+        top = load_gromacs_topology_for_openmm(top_file, includeDir=gmx_include_dir)
         modeller = Modeller(top.topology, gro.positions)
         
         lig_indices = [atom.index for atom in gro.topology.atoms() if atom.residue.name == self.ligand_resname]
