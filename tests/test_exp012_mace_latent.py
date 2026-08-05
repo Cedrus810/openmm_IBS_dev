@@ -95,6 +95,14 @@ def _graph():
     }
 
 
+def _graph_no_grad():
+    graph = _graph()
+    detached_positions = graph["data"]["positions"].detach().clone()
+    assert not detached_positions.requires_grad
+    graph["data"] = {**graph["data"], "positions": detached_positions}
+    return graph
+
+
 def _adapter(model):
     return MaceLatentBasisAdapter(
         c0_report=_report(), model_path=Path("/test/mock.model"),
@@ -190,6 +198,26 @@ def test_early_stop_uses_second_product_scalar_block_and_skips_third_product():
     with torch.no_grad():
         no_grad = adapter.forward(graph, require_coordinate_grad=False)
     assert no_grad["ligand_latent"].grad_fn is None
+
+
+def test_require_coordinate_grad_false_accepts_non_grad_positions():
+    # A bulk offline cache that never needs coordinate gradients (DEC-032)
+    # should not have to fabricate a requires_grad=True leaf just to satisfy
+    # this check -- require_coordinate_grad=False must mean exactly that,
+    # for the input as well as the output.
+    graph = _graph_no_grad()
+    adapter = _adapter(_MockMACE())
+    with torch.no_grad():
+        result = adapter.forward(graph, require_coordinate_grad=False)
+    assert result["ligand_latent"].grad_fn is None
+    assert torch.isfinite(result["ligand_latent"]).all()
+
+
+def test_require_coordinate_grad_true_still_rejects_non_grad_positions():
+    graph = _graph_no_grad()
+    adapter = _adapter(_MockMACE())
+    with pytest.raises(MaceLatentError, match="requires_grad Torch tensor"):
+        adapter.forward(graph, require_coordinate_grad=True)
 
 
 def test_invalid_contract_slice_and_wrong_runtime_width_are_rejected():

@@ -385,7 +385,8 @@ def _matching_conv(**overrides):
 
 
 def _gate(conv, shape=GOOD_SHAPE, enable_early_stop=False, target_steps=TARGET_STEPS,
-          early_stop_config=None, lse_tolerance=LSE_TOL):
+          early_stop_config=None, lse_tolerance=LSE_TOL,
+          current_coion_identity=None):
     return ie._resume_cached_window_gate_status(
         conv,
         shape,
@@ -396,6 +397,7 @@ def _gate(conv, shape=GOOD_SHAPE, enable_early_stop=False, target_steps=TARGET_S
         enable_early_stop,
         dict(EARLY_STOP_CONFIG if early_stop_config is None else early_stop_config),
         target_steps,
+        current_coion_identity=current_coion_identity,
     )
 
 
@@ -499,6 +501,61 @@ def test_resume_accepts_cache_produced_under_higher_step_budget():
         _matching_conv(n_steps_per_window_effective=900_000), target_steps=500_000
     )
     assert status["usable"] is True
+
+
+COION_IDENTITY = {
+    "schema_version": 1,
+    "leg": "complex",
+    "charge_treatment": "co_alchemical_charge_transfer",
+    "identity_protocol_version": 1,
+    "fingerprint": "fp-original",
+    "ligand_net_charge_e": 1,
+    "lambda_direction": "lam_coul_1_to_0",
+    "ion_atom_indices": [123],
+    "spec_relative_path": "checkpoints/coalchemical_ion_spec.json",
+}
+
+
+def test_resume_coion_identity_gate_accepts_exact_match():
+    status = _gate(
+        _matching_conv(coion_identity=COION_IDENTITY),
+        current_coion_identity=COION_IDENTITY,
+    )
+    assert status["usable"] is True
+    assert status["coion_identity_match"] is True
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"fingerprint": "fp-changed"},
+        {"ion_atom_indices": [999]},
+        {"spec_relative_path": "checkpoints/other-restraint-spec.json"},
+    ],
+)
+def test_resume_rejects_changed_coion_identity(mutation):
+    cached = dict(COION_IDENTITY)
+    current = dict(COION_IDENTITY)
+    current.update(mutation)
+    status = _gate(
+        _matching_conv(coion_identity=cached),
+        current_coion_identity=current,
+    )
+    assert status["usable"] is False
+    assert status["coion_identity_match"] is False
+    assert "co-ion runtime identity" in status["reason"]
+
+
+def test_resume_rejects_old_charge_transfer_cache_without_coion_identity():
+    status = _gate(_matching_conv(), current_coion_identity=COION_IDENTITY)
+    assert status["usable"] is False
+    assert status["coion_identity_match"] is False
+
+
+def test_resume_keeps_neutral_legacy_cache_compatible():
+    status = _gate(_matching_conv())
+    assert status["usable"] is True
+    assert status["coion_identity_match"] is True
 
 
 def test_resume_rejects_early_stopped_cache_when_early_stop_now_disabled():

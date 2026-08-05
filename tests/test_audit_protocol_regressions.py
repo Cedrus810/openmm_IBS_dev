@@ -458,15 +458,21 @@ class SourceContractTests(unittest.TestCase):
         self.assertIn("Stage 2 自适应优化失败，拒绝静默回退线性路径", self.pipeline)
 
     def test_solvent_leg_has_explicit_salt_and_invalidates_pure_water_cache(self):
-        self.assertIn("SOLVENT_CACHE_PROTOCOL_VERSION = 4", self.runabfe)
+        # 4 → 5（2026-08-04，P0-12b）：身份里加入配体**起始构象**指纹。实测同一分子
+        # 换一个起始构象，溶剂腿去电荷 62.80 → 191.05 kJ/mol，而旧口径两次都判
+        # "缓存有效"（P0-12）。升版本号让所有旧盒缓存重建，这是刻意的。
+        # 5 → 6（2026-08-05，B4）：manifest 加入 reserved co-ion 字段，旧缓存不含
+        # dummy 粒子，必须重建。
+        self.assertIn("SOLVENT_CACHE_PROTOCOL_VERSION = 7", self.runabfe)
+        self.assertIn('"ligand_start_conformer"', self.runabfe)
         self.assertIn("DEFAULT_SOLVENT_IONIC_STRENGTH_MOLAR = 0.15", self.runabfe)
         self.assertIn('positiveIon="Na+"', self.runabfe)
         self.assertIn('negativeIon="Cl-"', self.runabfe)
         self.assertIn("ionicStrength=ionic_strength_molar * unit.molar", self.runabfe)
         self.assertIn("neutralize=True", self.runabfe)
         self.assertIn('"solvent_cache_manifest.json"', self.runabfe)
-        self.assertIn('manifest.get("na_count", 0)', self.runabfe)
-        self.assertIn('manifest.get("cl_count", 0)', self.runabfe)
+        self.assertIn('manifest["ordinary_na_count"]', self.runabfe)
+        self.assertIn('manifest["ordinary_cl_count"]', self.runabfe)
 
     def test_vanishing_uses_thermodynamic_few_state_subdomains_without_overlap_two(self):
         self.assertIn("THERMODYNAMIC_PATH_PROTOCOL_VERSION = 21", self.preoptimizer)

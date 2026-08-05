@@ -799,23 +799,24 @@ def test_dispatch_is_driven_by_the_frozen_spec_not_by_a_second_guess():
     )
 
 
-def test_solvent_leg_builder_is_still_fail_closed_for_charge_transfer():
-    """B4 未落地：溶剂腿必须 fail closed，而不是悄悄产一个没有 co-ion 的盒子。"""
+def test_solvent_leg_builder_inserts_reserved_dummy_for_charge_transfer():
+    """B4 已落地（2026-08-05）：溶剂腿不再对 charge-transfer 无条件 fail closed。
+
+    真正的插入逻辑（摘最远水、造 dummy、清零电荷、多 dummy 不错位、水不够时仍
+    fail closed）由 `tests/test_solvent_leg_coion_builder.py` 逐项覆盖——那些测试
+    直接调用新增的 `runabfe._insert_reserved_coalchemical_ion_dummies`，不需要
+    真实 GROMACS 输入。这里只钉住"入口不再无条件拒绝"这个契约，防止有人把 B4 的
+    `NotImplementedError` 悄悄加回去。
+    """
     runabfe = pytest.importorskip("runabfe")
-    assert core.CHARGE_TRANSFER_SOLVENT_LEG_IMPLEMENTED is False
-    with pytest.raises(NotImplementedError, match="B4"):
-        runabfe.build_and_cache_solvent_leg(
-            output_dir=None,
-            topology=None,
-            positions=None,
-            ligand_indices=None,
-            ligand_resname=None,
-            charge_treatment=core.CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER,
-        )
+    assert core.CHARGE_TRANSFER_SOLVENT_LEG_IMPLEMENTED is True
+    src = (ROOT / "runabfe.py").read_text(encoding="utf-8")
+    assert "_insert_reserved_coalchemical_ion_dummies" in src
+    assert "溶剂腿 builder 尚未实现" not in src
 
 
-def test_charge_treatment_payload_reports_the_incomplete_cycle():
-    """声明 charge-transfer 时，解析结果必须如实说"循环还闭不上"。"""
+def test_charge_treatment_payload_reports_the_closed_cycle():
+    """声明 charge-transfer 时，解析结果必须如实说"循环闭得上"（B4 已落地）。"""
     ion = {
         "atom_index": 3,
         "residue_index": 1,
@@ -834,6 +835,6 @@ def test_charge_treatment_payload_reports_the_incomplete_cycle():
         co_alchemical_ion=ion,
     )
     assert payload["charging_hamiltonian_implemented"] is True
-    assert payload["solvent_leg_builder_implemented"] is False
-    assert payload["closes_thermodynamic_cycle"] is False
+    assert payload["solvent_leg_builder_implemented"] is True
+    assert payload["closes_thermodynamic_cycle"] is True
     assert payload["apbs_applicable"] is False

@@ -54,12 +54,15 @@ from abfe_core import (
     build_co_alchemical_ion_identity,
     verify_co_alchemical_ion_identity,
     CHARGE_TREATMENT_CO_ANNIHILATION_EXPERIMENTAL,
+    # [B6-FIX] 目标色散路线 × 该腿环境 → 加不加炼金解析尾项，唯一实现在 abfe_core。
+    resolve_leg_dispersion_implementation,
     # MEM-00d + B3：co-ion restraint 形式与 charging λ 电荷映射的**唯一**实现。
     # 这一层只负责把它们写进 OpenMM 对象，不重新定义任何形式或映射。
     CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER,
     CO_ALCHEMICAL_ION_RESTRAINT_EXPRESSION,
     CO_ALCHEMICAL_ION_RESTRAINT_FORCE_GROUP,
     CO_ALCHEMICAL_ION_RESTRAINT_FORM_FLAT_BOTTOM,
+    CO_ALCHEMICAL_ION_RESIDUE_NAMES,
     COION_FLAT_BOTTOM_K_KJ_PER_MOL_NM2,
     COION_FLAT_BOTTOM_RADIUS_NM,
     LIGAND_CHARGE_LAMBDA_TOLERANCE_E,
@@ -269,6 +272,7 @@ def _load_validated_window_data_triplet(
 def ibs_lj_tail_lrc_is_applicable(
     potential_type: Optional[str],
     dispersion_protocol: Optional[str] = None,
+    environment_type: Optional[str] = None,
 ) -> bool:
     """🔑 [P2-14] `build_ibs_dual_system` 是否会给该势函数附加解析 LJ 长程尾项修正。
 
@@ -308,33 +312,48 @@ def ibs_lj_tail_lrc_is_applicable(
 
     `dispersion_protocol=None` 或 `legacy_uniform_density_lrc` 时行为与本改动前
     **逐位一致**，当前可溶体系生产路径不受影响。
+
+    ---
+    ⚠️ [B6-FIX 2026-08-04] 第三个维度：`environment_type`，**这条腿**的环境。
+
+    此前这里是一个全局布尔（`protocol != legacy → False`），没有环境维度，于是
+    "膜口袋里局域密度不均匀"这个**对复合物腿正确**的理由，被原样套到了同一次运行的
+    **纯水溶剂腿**上——那条腿里配体周围恰恰就是均匀体相水，尾项修正完全成立。
+    实测代价：同一个配体的溶剂腿 vanishing 96.96 → 83.83 kJ/mol（−13.1），
+    而 `final_results.json` 里还写着 `disabled_by_membrane_forcefield_protocol`。
+
+    分层判据挪到 `abfe_core.resolve_leg_dispersion_implementation()`（唯一实现）：
+    目标（力场原始参数化条件）× 该腿环境 → 加不加解析尾项。本谓词只是它的
+    "potential_type 一票否决 + 布尔投影"，保持生产者/报告者共用同一真相的纪律。
     """
     if str(potential_type or "").strip().lower() == "dexp":
         return False
-    protocol = str(dispersion_protocol or "").strip().lower()
-    if protocol and protocol != "legacy_uniform_density_lrc":
-        return False
-    return True
+    return bool(
+        resolve_leg_dispersion_implementation(
+            dispersion_protocol, environment_type
+        )["alchemical_uniform_density_lrc"]
+    )
 
 
 def ibs_lj_tail_lrc_inapplicable_reason(
     potential_type: Optional[str],
     dispersion_protocol: Optional[str] = None,
+    environment_type: Optional[str] = None,
 ) -> str:
     """不附加修正时的机器可读理由；适用时返回空串。"""
-    if ibs_lj_tail_lrc_is_applicable(potential_type, dispersion_protocol):
+    if ibs_lj_tail_lrc_is_applicable(
+        potential_type, dispersion_protocol, environment_type
+    ):
         return ""
     if str(potential_type or "").strip().lower() == "dexp":
         return (
             "potential_type='dexp' 尚未验证解析尾项公式是否适用于该势函数"
         )
-    # §1.3 指定的机器可读理由字符串，不要改写成别的措辞——它会进 final_results.json。
-    return (
-        "disabled_by_membrane_forcefield_protocol: "
-        f"dispersion_protocol={str(dispersion_protocol).strip().lower()!r} 时，"
-        "炼金 ligand–environment 的均匀体相密度 LRC 不适用"
-        "（配体所在口袋的局域密度既不是水也不是体相脂质）；"
-        "环境–环境色散仍按所选力场的原始参数化条件由基础 NonbondedForce 处理"
+    # 理由字符串同样来自唯一实现（§1.3 指定的机器可读措辞在那里，不要在这里改写）。
+    return str(
+        resolve_leg_dispersion_implementation(
+            dispersion_protocol, environment_type
+        )["reason"]
     )
 
 
@@ -861,9 +880,9 @@ def synthetic_mbar_u_kn(delta_f_kT: float = 1.25, n_per_state: int = 200, seed: 
 # （CHARMM-GUI 的 AMBER 转换器把离子写成 `Na+` / `Cl-`，所以带符号的形式也在表里）。
 # 真正的修法是走 `abfe_core.classify_system_composition()` 的组成驱动判定；
 # 这里先把两处收敛为一份，避免"补一个漏一片"，彻底收口单独立项。
-CO_ALCHEMICAL_ION_RESIDUE_NAMES = frozenset(
-    {"CL", "CLA", "CL-", "NA", "NA+", "SOD", "K", "K+", "POT", "MG", "CA"}
-)
+# Candidate residue names live in abfe_core so the builder-identity helper and
+# the runtime selector share one table.  The actual identity check still also
+# requires a zero charge; residue names alone are never sufficient.
 
 
 def _select_bulk_water_counterion(
@@ -3814,6 +3833,9 @@ def build_ibs_dual_system(
     box_vectors=None,
     reference_positions=None,
     dispersion_protocol: Optional[str] = None,
+    # [B6-FIX] 这条腿的环境（soluble/membrane）。非 legacy 色散路线必须给，
+    # 否则 `resolve_leg_dispersion_implementation` 会 raise —— 刻意不设可猜的默认值。
+    environment_type: Optional[str] = None,
 ) -> Tuple[openmm.System, 'IBSBiasForce']:
     """
     构建双λ IBS 采样系统 (终极修复版：彻底剥离 Group 0 的 λ 依赖)
@@ -4029,9 +4051,12 @@ def build_ibs_dual_system(
     # softcore-aware 径向积分（_lj_tail_lrc_coefficients_kj_mol），同时补上
     # 排斥项 r^-12 的尾贡献（之前只有吸引项 r^-6）。每帧修正 = coeff[k] / V(t)。
     ibs_wrapper.lj_tail_lrc_coeff_kj_mol = None
-    if not ibs_lj_tail_lrc_is_applicable(potential_type, dispersion_protocol):
+    if not ibs_lj_tail_lrc_is_applicable(
+        potential_type, dispersion_protocol, environment_type
+    ):
         print(
-            f"  ⚠️ [LJ LRC] {ibs_lj_tail_lrc_inapplicable_reason(potential_type, dispersion_protocol)}"
+            "  ⚠️ [LJ LRC] "
+            f"{ibs_lj_tail_lrc_inapplicable_reason(potential_type, dispersion_protocol, environment_type)}"
             "，本次不附加修正。"
         )
     else:
@@ -5213,6 +5238,7 @@ def _resume_cached_window_gate_status(
     enable_early_stop: bool,
     current_early_stop_config: Dict[str, Any],
     effective_target_steps: int,
+    current_coion_identity: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """一份磁盘窗口缓存在 resume 时能不能直接复用：8 个门的纯函数求值。
 
@@ -5232,8 +5258,10 @@ def _resume_cached_window_gate_status(
     文案和一个 legacy_mutating 分支）需要读到**单个门**的布尔值，返回聚合结果会
     迫使那些打印重写。这里把逐门布尔一并返回，调用侧的 elif 阶梯得以一字不动。
 
-    ``usable`` 的与链顺序与原内联判断完全一致：
-        shape -> lambdas -> wca -> ibs_bias -> lse -> lrc -> repair_policy -> early_stop
+    ``usable`` 的与链顺序与原内联判断完全一致，并额外绑定本窗口实际采样的
+    co-ion runtime identity：
+        shape -> lambdas -> wca -> ibs_bias -> lse -> lrc -> repair_policy
+        -> coion_identity -> early_stop
     任何字段缺失（旧格式缓存读不到该 key）一律保守判"不可复用"，绝不"大概率
     没变"就放过。
     """
@@ -5300,6 +5328,13 @@ def _resume_cached_window_gate_status(
     # 旧缓存没有这个字段（None），与 "non_mutating_v1" 不相等，因此自动判无效。
     repair_policy_match = cached_conv.get("sampling_repair_policy") == repair_policy
 
+    # 能量/偏置/base 三件套来自具体 co-ion Hamiltonian 的采样分布；仅检查
+    # checkpoint manifest 太晚，因为完整能量文件会在建 Context 前被提前复用。
+    # neutral 的旧缓存没有该字段，None == None 保持兼容；任何当前 identity
+    # 非 None 的运行都要求 convergence.json 有完全相等的 payload。
+    cached_coion_identity = cached_conv.get("coion_identity")
+    coion_identity_match = cached_coion_identity == current_coion_identity
+
     # 🔑 [early_stop / 步数预算] 两条独立检查，不管这份缓存是否触发过 early stop
     # 都要过第一条：
     #  (1) 缓存产出时的目标步数不能低于当前调用的目标步数——否则即使从来没有触发
@@ -5350,6 +5385,7 @@ def _resume_cached_window_gate_status(
         and lse_tolerance_match
         and lrc_version_match
         and repair_policy_match
+        and coion_identity_match
         and early_stop_ok
     )
 
@@ -5389,6 +5425,11 @@ def _resume_cached_window_gate_status(
             f"sampling_repair_policy="
             f"{cached_conv.get('sampling_repair_policy')!r}（期望 {repair_policy!r}）"
         )
+    elif not coion_identity_match:
+        reason = (
+            "co-ion runtime identity 不匹配或缺失："
+            f"缓存={cached_coion_identity!r}，当前={current_coion_identity!r}"
+        )
     elif not early_stop_ok:
         reason = early_stop_reject_reason
     else:
@@ -5405,6 +5446,8 @@ def _resume_cached_window_gate_status(
         "cached_lse_tolerance": cached_lse_tolerance,
         "lrc_version_match": lrc_version_match,
         "repair_policy_match": repair_policy_match,
+        "coion_identity_match": coion_identity_match,
+        "cached_coion_identity": cached_coion_identity,
         "early_stop_ok": early_stop_ok,
         "early_stop_reject_reason": early_stop_reject_reason,
     }
@@ -7595,6 +7638,7 @@ def _build_fixed_h_probe_bank_manifest(
     temperature_K: float,
     sample_interval: int,
     platform_name: str,
+    coion_identity: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Content-based fingerprint for one window's fixed-H probe trajectory
     bank. Any change to the physical Hamiltonian (system/CV XML content,
@@ -7604,7 +7648,7 @@ def _build_fixed_h_probe_bank_manifest(
     ``probe_adjacent_path_overlap_bank``/``probe_adjacent_bias_calibration_bank``.
     XML blobs are hashed (not stored verbatim) to keep manifest.json small.
     """
-    return {
+    manifest = {
         "fixed_h_probe_cache_protocol_version": FIXED_H_PROBE_CACHE_PROTOCOL_VERSION,
         "ibs_bias_protocol_version": IBS_BIAS_PROTOCOL_VERSION,
         "probe_type": str(probe_type),
@@ -7621,6 +7665,9 @@ def _build_fixed_h_probe_bank_manifest(
         "sample_interval": int(sample_interval),
         "platform_name": str(platform_name),
     }
+    if coion_identity is not None:
+        manifest["coion_identity"] = coion_identity
+    return manifest
 
 
 def _fixed_h_probe_bank_manifest_matches(bank_dir: str, expected_manifest: Dict[str, Any]) -> bool:
@@ -7821,12 +7868,13 @@ def _build_main_window_checkpoint_manifest(
     temperature_K: float,
     platform_name: str,
     repair_policy: str = "non_mutating_v1",
+    coion_identity: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """主窗口 checkpoint 的内容指纹——任何一项不匹配都必须整体拒绝这份
     checkpoint（λ 网格被自动加密/重新划分窗口、协议版本变化、平台不同等），
     直接沿用探针轨迹库 `_build_fixed_h_probe_bank_manifest` 的字段/哈希写法。
     """
-    return {
+    manifest = {
         "main_window_checkpoint_protocol_version": MAIN_WINDOW_CHECKPOINT_PROTOCOL_VERSION,
         "ibs_bias_protocol_version": IBS_BIAS_PROTOCOL_VERSION,
         # 🔑 [non_mutating_v1] 采样修复策略进入 checkpoint 指纹：旧变异策略下的
@@ -7844,6 +7892,9 @@ def _build_main_window_checkpoint_manifest(
         "friction_per_ps": 2.0,
         "platform_name": str(platform_name),
     }
+    if coion_identity is not None:
+        manifest["coion_identity"] = coion_identity
+    return manifest
 
 
 def _main_window_checkpoint_is_usable(
@@ -7939,6 +7990,7 @@ def _build_production_window_checkpoint_manifest(
     temperature_K: float,
     platform_name: str,
     repair_policy: str = "non_mutating_v1",
+    coion_identity: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """生产采样 checkpoint 的内容指纹——直接沿用
     `_build_main_window_checkpoint_manifest` 的字段/哈希写法（win_sys_xml/
@@ -7956,7 +8008,7 @@ def _build_production_window_checkpoint_manifest(
       "验证 f_k 是否可信"这件事本身，f_k 在那个阶段还不该被信任为"已经在用
       它采生产样本"。
     """
-    return {
+    manifest = {
         "production_window_checkpoint_protocol_version": PRODUCTION_WINDOW_CHECKPOINT_PROTOCOL_VERSION,
         "ibs_bias_protocol_version": IBS_BIAS_PROTOCOL_VERSION,
         # 🔑 [non_mutating_v1] 采样修复策略进入生产 checkpoint 指纹。
@@ -7979,6 +8031,9 @@ def _build_production_window_checkpoint_manifest(
         "friction_per_ps": 2.0,
         "platform_name": str(platform_name),
     }
+    if coion_identity is not None:
+        manifest["coion_identity"] = coion_identity
+    return manifest
 
 
 def _production_window_checkpoint_is_usable(
@@ -8489,6 +8544,7 @@ def probe_adjacent_path_overlap_bank(
     sample_targets: Tuple[int, ...] = (20_000,),
     sample_interval: int = 500,
     threshold: float = 0.03,
+    coion_identity: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Per-state, resumable replacement for calling ``probe_bidirectional_overlap``
     once per edge.
@@ -8562,6 +8618,7 @@ def probe_adjacent_path_overlap_bank(
         temperature_K=temperature_q.value_in_unit(unit.kelvin),
         sample_interval=sample_interval,
         platform_name=platform_name,
+        coion_identity=coion_identity,
     )
     # 🔑 先查指纹、指纹对了才续采：任何一项不匹配就整个目录判定不可信，
     # 必须在决定"续采 vs 重新分段"之前完成，不能只是隐含意图。
@@ -8684,6 +8741,7 @@ def probe_adjacent_bias_calibration_bank(
     min_decorrelated_samples: int = 20,
     max_delta_f_uncertainty_kJ_mol: float = 1.0,
     overlap_threshold: float = 0.03,
+    coion_identity: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Per-state, resumable replacement for the old retry loop around
     ``probe_bidirectional_overlap_for_bias_calibration`` (rebuild two fresh
@@ -8725,6 +8783,7 @@ def probe_adjacent_bias_calibration_bank(
         temperature_K=temperature_q.value_in_unit(unit.kelvin),
         sample_interval=sample_interval,
         platform_name=platform_name,
+        coion_identity=coion_identity,
     )
     if not _fixed_h_probe_bank_manifest_matches(bank_dir, expected_manifest):
         _invalidate_fixed_h_probe_bank(bank_dir)
@@ -8850,6 +8909,10 @@ class IBSWindowManagerDualLambda:
         alchemical_params,
         potential_type: str = "softcore",
         dispersion_protocol: Optional[str] = None,
+        # [B6-FIX] 这条腿的环境类型。溶剂腿构造时天然是 soluble（runabfe 刻意不给
+        # 溶剂腿传 environment_type/membrane，B1 的接线契约测试钉着），所以纯水盒
+        # 里那条**合法**的均匀体相尾项修正会被正确保留。
+        environment_type: Optional[str] = None,
         restraint_params: Optional[Dict] = None,
         prefix: str = "abfe_dual",
         platform_name: str = "CUDA",
@@ -8857,6 +8920,7 @@ class IBSWindowManagerDualLambda:
         checkpoint_dir: str = "./checkpoints",
         pilot_lambdas: Optional[List[float]] = None,
         pilot_mean_dU_dlambda: Optional[List[float]] = None,
+        coion_identity: Optional[Dict[str, Any]] = None,
     ):
         self.system_template = system_template
         self.topology = topology
@@ -8870,11 +8934,15 @@ class IBSWindowManagerDualLambda:
         # [B6] 膜体系用非 legacy 色散路线时，炼金 ligand–environment 的均匀密度
         # LRC 必须关闭（memtodolist §1.3）。None → 与改动前逐位一致。
         self.dispersion_protocol = dispersion_protocol
+        self.environment_type = environment_type
         self.boresch = restraint_params
         self.prefix = prefix
         self.platform_name = platform_name
         self.output_dir = output_dir
         self.checkpoint_dir = checkpoint_dir
+        # B5: the caller resolves/freeze-checks this once; manifests only
+        # record the payload and never read the spec or select an ion.
+        self.coion_identity = coion_identity
         # [IBS_BIAS_PROTOCOL_VERSION warm-start] Stage 2's pilot probe already
         # measures the mean gradient (mean_dU_dlambda_kJ_mol), not just the
         # variance proxy used for lambda spacing -- kept here so
@@ -8914,6 +8982,7 @@ class IBSWindowManagerDualLambda:
             box_vectors=resolved_box,
             reference_positions=positions,
             dispersion_protocol=self.dispersion_protocol,
+            environment_type=self.environment_type,
         )
 
     def _enqueue_window_snapshot(self, window_idx: int, stage_type: str, sampler) -> None:
@@ -9215,6 +9284,7 @@ class IBSWindowManagerDualLambda:
                                 if production_step_overrides and window_idx in production_step_overrides
                                 else int(n_steps_per_window)
                             ),
+                            current_coion_identity=self.coion_identity,
                         )
                         # 🔑 这 8 个门原先内联在这里（~110 行），现已抽成模块级纯函数
                         # _resume_cached_window_gate_status，逐门语义与阈值一字未改，
@@ -9228,6 +9298,7 @@ class IBSWindowManagerDualLambda:
                         lse_tolerance_match = _gate["lse_tolerance_match"]
                         lrc_version_match = _gate["lrc_version_match"]
                         repair_policy_match = _gate["repair_policy_match"]
+                        coion_identity_match = _gate["coion_identity_match"]
                         early_stop_ok = _gate["early_stop_ok"]
                         early_stop_reject_reason = _gate["early_stop_reject_reason"]
                         if _gate["usable"]:
@@ -9286,6 +9357,13 @@ class IBSWindowManagerDualLambda:
                                 f"{cached_conv.get('sampling_repair_policy')!r}（期望 {repair_policy!r}）——"
                                 "该缓存产自旧的变异修复策略（legacy_mutating 下按无效缓存重采）。"
                             )
+                        elif cached_e.ndim == 2 and cached_e.shape[0] == len(lc_win) and cached_e.shape[1] > 0 and not coion_identity_match:
+                            print(
+                                f"  ⚠️ 窗口 {window_idx} convergence.json 的 co-ion runtime identity="
+                                f"{cached_conv.get('coion_identity')!r} 与当前"
+                                f" {self.coion_identity!r} 不一致或缺失，拒绝复用能量缓存，"
+                                "将重新采样该窗口。"
+                            )
                         elif cached_e.ndim == 2 and cached_e.shape[0] == len(lc_win) and cached_e.shape[1] > 0 and not early_stop_ok:
                             print(
                                 f"  ⚠️ 窗口 {window_idx} 缓存是 early stop 提前停止产出的短样本，"
@@ -9340,6 +9418,7 @@ class IBSWindowManagerDualLambda:
                 self.temperature.value_in_unit(unit.kelvin),
                 self.platform_name,
                 repair_policy=repair_policy,
+                coion_identity=self.coion_identity,
             )
             attempt_checkpoint_restore = bool(
                 resume
@@ -9365,6 +9444,13 @@ class IBSWindowManagerDualLambda:
                 lam_vdw_center = float(np.mean(lv_win))
                 sim.context.setParameter("lambda_shield", lam_vdw_center)
                 print(f"  🛡️ λ-WCA 防护壳已同步: lambda_shield={lam_vdw_center:.4f}")
+
+            # 🔑 [2026-08-05 修，排序 bug] Boresch 必须在最小化**之前**就已经在
+            # scale=1.0（生产强度），不能先无限制力自由最小化、再事后爬坡拽回来
+            # ——旧顺序正是下面"阶段3"（已注释掉）存在的唯一理由，也是它仍会在
+            # 某些窗口爬坡中途发散（Particle coordinate is NaN）的根因。
+            if _has_valid_boresch_restraint(self.boresch):
+                sim.context.setParameter("lambda_boresch_scale", 1.0)
 
             # 🔑 [MAIN_WINDOW_CHECKPOINT_PROTOCOL_VERSION] 续验冻结校准 f_k 时，
             # 若存在指纹匹配的主窗口 checkpoint，直接续算这个 Context 的坐标/
@@ -9416,7 +9502,7 @@ class IBSWindowManagerDualLambda:
 
             if not restored_from_window_checkpoint:
                 # ---------- 测试步进 ----------
-                print(f"\n[阶段2] 测试性步进 (Boresch 缩放至 1%)...")
+                print(f"\n[阶段2] 测试性步进（Boresch 全程 scale=1.0）...")
                 if _has_valid_boresch_restraint(self.boresch):
                     # 只做 minimum-image 诊断，绝不通过改坐标“修复”锚点距离。
                     # 旧逻辑把整个配体平移 H0-L0，必然令 L0'=H0，制造零距离。
@@ -9439,9 +9525,12 @@ class IBSWindowManagerDualLambda:
                         f"  ✅ Boresch minimum-image 锚点距离: {image_dist*10:.2f}Å "
                         "（未修改坐标）"
                     )
-                    sim.context.setParameter("lambda_boresch_scale", 0.01)  # 1%
-                    print(f"  🔧 Boresch 力常数缩放至 1%")
-    
+                    # 🔑 [2026-08-05 注释掉，排序 bug 修复的一部分] 不再把 scale
+                    # 缩到 1%——它现在已经在 setPositions 之后、最小化之前被设成
+                    # 1.0（生产强度），全程保持，不需要在这里往下调。
+                    # sim.context.setParameter("lambda_boresch_scale", 0.01)  # 1%
+                    # print(f"  🔧 Boresch 力常数缩放至 1%")
+
                 original_dt = sim.integrator.getStepSize()
                 test_schedule = [
                     (0.00001, 200, "0.01fs"),
@@ -9508,81 +9597,95 @@ class IBSWindowManagerDualLambda:
                     if debug_mode:
                         diagnose_force_breakdown(sim.context, win_sys, prefix=f"窗口{window_idx}_死锁缓解后")
     
+                # 🔑 [2026-08-05 整段注释掉，排序 bug 修复] 原"阶段3 Boresch 安全
+                # 爬坡"存在的唯一理由是补偿上面已经修掉的排序 bug：旧代码先在
+                # scale=0 下自由最小化（配体漂离 committed r0 达 ~0.2nm），再靠
+                # 这段 16 级自定义阶梯把它硬拽回限制力平衡点——拽的过程本身在
+                # 某些窗口（如这次的窗口 5）会在 sim.minimizeEnergy() 内部就已经
+                # 发散，抛出 Particle coordinate is NaN，而这段爬坡自己的能量/力
+                # 检查全部是"minimizeEnergy 返回之后"才做，根本挡不住这一种失败
+                # 模式。现在 Boresch 从最小化第一步起就已经在 scale=1.0，最小化
+                # 收敛点本身就满足限制力平衡，不再有"漂开再拽回"这回事，这整段
+                # 机制随之失去存在理由。整段注释掉而不是删除，留作历史参考；
+                # 不要因为将来某个窗口在满强度最小化下不稳定，就把这段爬坡重新
+                # 启用——那只是把同一个问题从"爬坡中途"挪回"最小化中途"，该查
+                # 的是那个窗口本身的起始构象/λ 组合，不是重新引入分级 ramp。
                 # ---------- Boresch 安全爬坡 ----------
                 # ================================================================
                 # Boresch 安全爬坡：自定义阶梯，逐个恢复力强度
                 # ================================================================
-                if _has_valid_boresch_restraint(self.boresch):
-                    print(f"\n[阶段3] Boresch 安全爬坡（自定义阶梯）...")
-                    
-                    # 自定义阶梯序列：低强度区采用更细分辨率，避免在高内应力底座上一步踩空。
-                    custom_scales = [0.01, 0.02, 0.03, 0.05, 0.08, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.0]
-                    dt_ramp = 0.001                  # 爬坡期间极小步长 (ps)
-                    
-                    # 保存原始步长，并设置为爬坡步长
-                    original_dt = sim.integrator.getStepSize()
-                    sim.integrator.setStepSize(dt_ramp * unit.picoseconds)
-                    print(f"  → 爬坡使用步长 {dt_ramp} ps，低强度区采用更细台阶")
-                    
-                    # 确保从当前 scale 开始（例如之前测试步进时设置的 0.01）
-                    try:
-                        current_scale = sim.context.getParameter("lambda_boresch_scale")
-                    except Exception:
-                        current_scale = 0.01
-                    print(f"  → 起始 Boresch scale = {current_scale:.3f}")
-                    prev_energy = sim.context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-                    
-                    ramp_success = True
-                    for target_scale in custom_scales:
-                        # 只在目标大于当前值时才爬升（避免回退）
-                        if target_scale <= current_scale:
-                            continue
-                        
-                        sim.context.setParameter("lambda_boresch_scale", float(target_scale))
-                        n_steps_per_level = 1500 if target_scale <= 0.10 else (1000 if target_scale <= 0.30 else 500)
-                        print(f"  🔹 设置 Boresch scale = {target_scale:.2f}，松弛 {n_steps_per_level} 步...", end="", flush=True)
-                        sim.minimizeEnergy(maxIterations=200, tolerance=20.0)
-                        for _ in range(max(1, n_steps_per_level // 100)):
-                            sim.step(100)
-                        
-                        # 检查能量与受力
-                        state = sim.context.getState(getEnergy=True, getForces=True)
-                        e = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-                        forces = state.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole/unit.nanometer)
-                        max_f = np.max(np.linalg.norm(forces, axis=1))
-                        delta_e = e - prev_energy
-                        
-                        if (not np.isfinite(e)) or max_f > 50000 or (abs(delta_e) > 5e5 and max_f > 15000):
-                            print(f"\n  🚨 Boresch 爬坡在 scale={target_scale:.2f} 处失败！")
-                            print(f"    当前势能 = {e:.1f} kJ/mol，ΔE = {delta_e:.1f} kJ/mol，最大力 = {max_f:.1f} kJ/(mol·nm)")
-                            if debug_mode:
-                                diagnose_force_breakdown(sim.context, win_sys, prefix=f"窗口{window_idx}_Boresch爬坡失败_scale{target_scale:.2f}")
-                            ramp_success = False
-                            break
-                        else:
-                            print(f" 势能 = {e:.2f} kJ/mol，ΔE = {delta_e:.2f} kJ/mol，最大力 = {max_f:.2f} kJ/(mol·nm)")
-                            # 记录新的当前 scale
-                            current_scale = target_scale
-                            prev_energy = e
-                    
-                    # 恢复原始步长
-                    sim.integrator.setStepSize(original_dt)
-                    
-                    if not ramp_success:
-                        raise RuntimeError(
-                            f"窗口 {window_idx} Boresch 爬坡失败（scale={target_scale:.2f}），系统可能已崩溃。"
-                            "请检查锚点几何、力常数或初始结构。"
-                        )
-                    
-                    print(f"  ✅ Boresch 爬坡成功完成 (scale 已恢复至 1.0)")
-                else:
-                    print(f"\n[阶段3] 无 Boresch 限制力，跳过爬坡。")
+                # if _has_valid_boresch_restraint(self.boresch):
+                #     print(f"\n[阶段3] Boresch 安全爬坡（自定义阶梯）...")
+                #
+                #     # 自定义阶梯序列：低强度区采用更细分辨率，避免在高内应力底座上一步踩空。
+                #     custom_scales = [0.01, 0.02, 0.03, 0.05, 0.08, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.0]
+                #     dt_ramp = 0.001                  # 爬坡期间极小步长 (ps)
+                #
+                #     # 保存原始步长，并设置为爬坡步长
+                #     original_dt = sim.integrator.getStepSize()
+                #     sim.integrator.setStepSize(dt_ramp * unit.picoseconds)
+                #     print(f"  → 爬坡使用步长 {dt_ramp} ps，低强度区采用更细台阶")
+                #
+                #     # 确保从当前 scale 开始（例如之前测试步进时设置的 0.01）
+                #     try:
+                #         current_scale = sim.context.getParameter("lambda_boresch_scale")
+                #     except Exception:
+                #         current_scale = 0.01
+                #     print(f"  → 起始 Boresch scale = {current_scale:.3f}")
+                #     prev_energy = sim.context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+                #
+                #     ramp_success = True
+                #     for target_scale in custom_scales:
+                #         # 只在目标大于当前值时才爬升（避免回退）
+                #         if target_scale <= current_scale:
+                #             continue
+                #
+                #         sim.context.setParameter("lambda_boresch_scale", float(target_scale))
+                #         n_steps_per_level = 1500 if target_scale <= 0.10 else (1000 if target_scale <= 0.30 else 500)
+                #         print(f"  🔹 设置 Boresch scale = {target_scale:.2f}，松弛 {n_steps_per_level} 步...", end="", flush=True)
+                #         sim.minimizeEnergy(maxIterations=200, tolerance=20.0)
+                #         for _ in range(max(1, n_steps_per_level // 100)):
+                #             sim.step(100)
+                #
+                #         # 检查能量与受力
+                #         state = sim.context.getState(getEnergy=True, getForces=True)
+                #         e = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+                #         forces = state.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole/unit.nanometer)
+                #         max_f = np.max(np.linalg.norm(forces, axis=1))
+                #         delta_e = e - prev_energy
+                #
+                #         if (not np.isfinite(e)) or max_f > 50000 or (abs(delta_e) > 5e5 and max_f > 15000):
+                #             print(f"\n  🚨 Boresch 爬坡在 scale={target_scale:.2f} 处失败！")
+                #             print(f"    当前势能 = {e:.1f} kJ/mol，ΔE = {delta_e:.1f} kJ/mol，最大力 = {max_f:.1f} kJ/(mol·nm)")
+                #             if debug_mode:
+                #                 diagnose_force_breakdown(sim.context, win_sys, prefix=f"窗口{window_idx}_Boresch爬坡失败_scale{target_scale:.2f}")
+                #             ramp_success = False
+                #             break
+                #         else:
+                #             print(f" 势能 = {e:.2f} kJ/mol，ΔE = {delta_e:.2f} kJ/mol，最大力 = {max_f:.2f} kJ/(mol·nm)")
+                #             # 记录新的当前 scale
+                #             current_scale = target_scale
+                #             prev_energy = e
+                #
+                #     # 恢复原始步长
+                #     sim.integrator.setStepSize(original_dt)
+                #
+                #     if not ramp_success:
+                #         raise RuntimeError(
+                #             f"窗口 {window_idx} Boresch 爬坡失败（scale={target_scale:.2f}），系统可能已崩溃。"
+                #             "请检查锚点几何、力常数或初始结构。"
+                #         )
+                #
+                #     print(f"  ✅ Boresch 爬坡成功完成 (scale 已恢复至 1.0)")
+                # else:
+                #     print(f"\n[阶段3] 无 Boresch 限制力，跳过爬坡。")
 
             # ================================================================
-            # 爬坡后：立刻进行一次非侵入式力分解，供对比分析
+            # 热化完成（Boresch 全程 scale=1.0，阶段3 爬坡已注释掉不再需要）：
+            # 立刻进行一次非侵入式力分解，供对比分析
             # ================================================================
             if debug_mode and self.boresch:
-                diagnose_force_breakdown(sim.context, win_sys, prefix=f"窗口{window_idx}_Boresch爬坡完成")
+                diagnose_force_breakdown(sim.context, win_sys, prefix=f"窗口{window_idx}_热化完成")
 
             # ---------- 初始化采样器 ----------
             # ibs_state_file 已经在窗口开头（checkpoint restore 判断之前）提前
@@ -10709,6 +10812,7 @@ class IBSWindowManagerDualLambda:
                         stage_type=stage_type,
                         window_idx=window_idx,
                         global_state_start=int(start),
+                        coion_identity=self.coion_identity,
                     )
                     bias_warmup_diag["bidirectional_overlap_probe"] = {
                         "pairs": bank_result["pairs"],
@@ -10780,6 +10884,7 @@ class IBSWindowManagerDualLambda:
                     window_idx=window_idx,
                     global_state_start=int(start),
                     lambda_shield=lam_vdw_center_for_calibration,
+                    coion_identity=self.coion_identity,
                 )
                 calibration_pairs = calib_bank_result["pairs"]
                 calibration_sufficient = bool(calib_bank_result["all_sufficient"])
@@ -11275,6 +11380,7 @@ class IBSWindowManagerDualLambda:
                 self.temperature.value_in_unit(unit.kelvin),
                 self.platform_name,
                 repair_policy=repair_policy,
+                coion_identity=self.coion_identity,
             )
             production_energies_path = os.path.join(
                 self.output_dir, f"dual_window_{window_idx}_{stage_type}_energies.npy"
@@ -11919,6 +12025,10 @@ class IBSWindowManagerDualLambda:
                 # 累计 ΔF 就地覆盖过 f_k（不同参考系）；resume / 窗口产物复用必须校
                 # 验这个字段，绝不能把旧策略缓存当成非变异策略的有效数据复用。
                 "sampling_repair_policy": repair_policy,
+                # [B5] Completed-window energy reuse happens before checkpoint
+                # manifests are consulted, so bind the energy triplet itself to
+                # the frozen runtime co-ion identity.
+                "coion_identity": self.coion_identity,
                 "n_steps_per_window_default": int(n_steps_per_window),
                 "n_steps_per_window_effective": int(effective_n_steps_per_window),
                 "n_updates": int(len(sampler.f_history)),
@@ -12242,6 +12352,7 @@ class IBSWindowManagerShadowCoul(IBSWindowManagerDualLambda):
         platform_name: str = "CUDA",
         output_dir: str = "./output",
         checkpoint_dir: str = "./checkpoints",
+        coion_identity: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             system_template=system_template,
@@ -12258,6 +12369,7 @@ class IBSWindowManagerShadowCoul(IBSWindowManagerDualLambda):
             platform_name=platform_name,
             output_dir=output_dir,
             checkpoint_dir=checkpoint_dir,
+            coion_identity=coion_identity,
         )
         self.lambdas_shadow_coul = self.lambdas_coul
 

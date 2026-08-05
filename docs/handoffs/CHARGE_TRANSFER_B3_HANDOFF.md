@@ -1,8 +1,10 @@
 # B3：PME co-alchemical charge-transfer charging Hamiltonian（含 MEM-00d）
 
 日期：2026-08-04
-状态：**代码已落地，CPU 全套回归通过（1014 passed / 2 skipped / 0 failed）；
-尚未在真机带电体系上跑过。**
+状态：**代码已落地，尚未在真机带电体系上跑过。**
+⚠️ 全套计数当时是 1014 passed；**同日之后又落了 B6-FIX / P0-12a/b / P0-13**，
+现在是 **1036 passed / 2 skipped / 0 failed**。那批工作见
+[`MEMBRANE_SOLVENT_LEG_P013_HANDOFF.md`](MEMBRANE_SOLVENT_LEG_P013_HANDOFF.md)。
 主线位置：`memtodolist.md` §17.0 的第 ② 步完成，下一步是 ③ **B4 溶剂腿 builder**。
 
 ⚠️ **本次改动不闭合热力学循环。** 复合物腿的 charging 哈密顿量有了，溶剂腿没有
@@ -54,7 +56,7 @@ co-ion j : base share_j  scale −share_j  ⟹ q(λ) = (1−λ)·share_j     sha
     两条路线 spec 互换、缺 spec、溶剂腿（B4）。
 * `tests/test_coalchemical_ion_identity.py`（20 条，已按新形式更新）。
 * `tests/test_charge_treatment_protocol.py`：那条"B3 未落地"的钩子已按设计改写。
-* 全套：`./tests/run_offline_tests.sh -q` → **1014 passed / 2 skipped / 0 failed**。
+* 全套：`./tests/run_offline_tests.sh -q` → 当时 **1014 passed**；同日后续工作后为 **1036 passed**。
 
 ---
 
@@ -145,7 +147,8 @@ mamba activate openmm_dev
 python -m pytest tests/test_charge_transfer_hamiltonian.py -v   # 只看 B3 这一组
 ```
 
-预期：`1014 passed, 2 skipped, 1 deselected`（本文档写作时的实测值）。
+预期：**`1036 passed, 2 skipped, 1 deselected`**（1014 是本文档写作时的值，同日后续
+工作又加了 22 条；见 `MEMBRANE_SOLVENT_LEG_P013_HANDOFF.md`）。
 
 ⚠️ **跑这一条的时候不要同时改生产 `.py` 文件。** 本仓库有大量源码/AST 契约测试走
 `inspect.getsource`，而它经 `linecache` 读的是 import 时的行号；跑到一半重写

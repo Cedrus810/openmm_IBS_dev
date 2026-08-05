@@ -107,6 +107,13 @@ from abfe_core import (
     ENVIRONMENT_TYPE_MEMBRANE,
     DISPERSION_PROTOCOL_LEGACY_UNIFORM_LRC,
     resolve_dispersion_protocol,
+    # [P0-12a] 配体构象诊断（§3.0 末条）：度量与汇总的唯一实现在 abfe_core，
+    # 本层只负责把 replica 轨迹切出来喂给它。
+    ligand_conformer_metrics,
+    ligand_conformer_summary,
+    LIGAND_INTERNAL_POLAR_MIN_BOND_SEPARATION,
+    CO_ALCHEMICAL_ION_ANCHOR_MIN_MASS_AMU,
+    CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER,
     # §9 质量门：提取 + 判定 + 落盘的接线只有 `run_membrane_quality_gate` 一份，
     # 本文件不再直接调 `membrane_observables_from_trajectory` /
     # `evaluate_membrane_quality_gate`（那会变成第二套判据，见 §0.5.7 的教训）。
@@ -125,6 +132,7 @@ from abfe_core import (
     resolve_membrane_protocol,
     # [MEM-00c] 只读核对冻结的 co-ion 身份（唯一实现，不在 pipeline 里另写一份）。
     verify_co_alchemical_ion_identity,
+    co_alchemical_ion_cache_identity_payload,
 )
 import warnings
 
@@ -163,13 +171,19 @@ def _stage_lambda_endpoint_diagnostics(
     lambdas_vdw,
 ) -> Dict:
     """Apply the endpoint contract for one half of the dual-lambda path."""
+    # ``vanishing_rescue`` is an internal sampling label for a partial
+    # replacement of failed vanishing windows.  Thermodynamically it is still
+    # the vanishing leg, so it must use the same endpoint contract.
+    diagnostic_stage_name = (
+        "vanishing" if stage_name == "vanishing_rescue" else stage_name
+    )
     expected = {
         "decharging": ((1.0, 1.0), (0.0, 1.0)),
         "vanishing": ((0.0, 1.0), (0.0, 0.0)),
     }
-    if stage_name not in expected:
+    if diagnostic_stage_name not in expected:
         raise ValueError(f"未知 dual-lambda stage: {stage_name!r}")
-    expected_start, expected_end = expected[stage_name]
+    expected_start, expected_end = expected[diagnostic_stage_name]
     return lambda_endpoint_diagnostics(
         lambdas_coul,
         lambdas_vdw,
@@ -763,6 +777,7 @@ def _pme_u_kn_meta_payload(
     topology: Optional[app.Topology],
     ligand_indices: Optional[List[int]],
     boresch_params: Optional[Dict],
+    coion_identity: Optional[Dict] = None,
 ) -> Dict:
     boresch_sig = None
     if boresch_params:
@@ -778,7 +793,7 @@ def _pme_u_kn_meta_payload(
                 for k, v in (boresch_params.get("force_constants") or {}).items()
             },
         }
-    return {
+    payload = {
         "model_version": PME_DECHARGE_MODEL_VERSION,
         "n_states": int(n_states),
         "temperature_k": round(float(temperature_k), 6),
@@ -798,6 +813,9 @@ def _pme_u_kn_meta_payload(
         "ligand_indices": [int(i) for i in (ligand_indices or [])],
         "boresch": boresch_sig,
     }
+    if coion_identity is not None:
+        payload["coion_identity"] = coion_identity
+    return payload
 
 
 # 🔑 [ESTIMATOR_ANALYSIS_PROTOCOL_VERSION=2, 2026-07-28] charging（decharging 腿）
@@ -847,6 +865,7 @@ def _is_pme_u_kn_cache_compatible(
     topology: Optional[app.Topology],
     ligand_indices: Optional[List[int]],
     boresch_params: Optional[Dict],
+    coion_identity: Optional[Dict] = None,
 ) -> bool:
     meta_path = _pme_u_kn_meta_path(stage_output_dir, stage_name)
     if not os.path.exists(meta_path):
@@ -854,7 +873,7 @@ def _is_pme_u_kn_cache_compatible(
     try:
         with open(meta_path, "r", encoding="utf-8") as f:
             meta = json.load(f)
-        return meta == _pme_u_kn_meta_payload(
+        expected = _pme_u_kn_meta_payload(
             n_states=n_states,
             lambdas_coul=lambdas_coul,
             lambdas_vdw=lambdas_vdw,
@@ -863,7 +882,20 @@ def _is_pme_u_kn_cache_compatible(
             topology=topology,
             ligand_indices=ligand_indices,
             boresch_params=boresch_params,
+            coion_identity=coion_identity,
         )
+        # The explicit PME model version is the cache invalidation contract.
+        # Do not invalidate expensive offline energy caches merely because an
+        # unrelated Python file changed (the old global code hash caused every
+        # resume after any pipeline fix to recompute u_kn from all DCD frames).
+        # Keep accepting legacy metadata that still contains the old hash.
+        meta.pop("code_sha256", None)
+        expected.pop("code_sha256", None)
+        if coion_identity is not None and not isinstance(
+            meta.get("coion_identity"), dict
+        ):
+            return False
+        return meta == expected
     except Exception:
         return False
 
@@ -879,6 +911,7 @@ def _write_pme_u_kn_meta(
     topology: Optional[app.Topology],
     ligand_indices: Optional[List[int]],
     boresch_params: Optional[Dict],
+    coion_identity: Optional[Dict] = None,
 ) -> None:
     meta_path = _pme_u_kn_meta_path(stage_output_dir, stage_name)
     with open(meta_path, "w", encoding="utf-8") as f:
@@ -892,6 +925,7 @@ def _write_pme_u_kn_meta(
                 topology=topology,
                 ligand_indices=ligand_indices,
                 boresch_params=boresch_params,
+                coion_identity=coion_identity,
             ),
             f,
             indent=2,
@@ -1054,6 +1088,84 @@ def _expected_remd_frame_count(n_steps: int, save_interval: int = 5000) -> int:
 def _all_remd_trajs_valid(stage_output_dir: str, stage_name: str, n_replicas: int, min_frames: int = 1) -> bool:
     traj_files = _expected_remd_traj_files(stage_output_dir, stage_name, n_replicas)
     return all(_is_traj_valid(path, min_frames=min_frames) for path in traj_files)
+
+
+def _remd_sampling_meta_path(stage_output_dir: str, stage_name: str) -> str:
+    """Metadata binding a REMD DCD set to the sampling Hamiltonian/protocol."""
+    return os.path.join(stage_output_dir, f"{stage_name}_sampling.meta.json")
+
+
+def _remd_sampling_fingerprint(
+    *,
+    stage_name: str,
+    system: openmm.System,
+    topology: app.Topology,
+    ligand_indices: List[int],
+    lambdas_coul: List[float],
+    lambdas_vdw: List[float],
+    temperature_K: float,
+    n_steps: int,
+    exchange_interval: int,
+    boresch_params: Optional[Dict],
+    potential_type: str,
+    platform_name: str,
+    coion_identity: Optional[Dict] = None,
+    max_resident_contexts: Optional[int] = None,
+) -> Dict:
+    """Fingerprint the distribution that produced a REMD trajectory set.
+
+    A complete DCD is not sufficient for resume: if the co-ion identity or any
+    sampling Hamiltonian input changed, reusing those frames for a new u_kn is
+    an invalid change of ensemble.  Keep this separate from the u_kn analysis
+    fingerprint so an analysis-only change can still reuse valid trajectories.
+    """
+    payload = {
+        "kind": "remd_sampling",
+        "stage_name": str(stage_name),
+        "system_xml_sha256": _system_xml_hash(system),
+        "topology_sha256": _topology_hash(topology),
+        "ligand_indices": [int(i) for i in ligand_indices],
+        "lambdas_coul": _lambda_signature(lambdas_coul),
+        "lambdas_vdw": _lambda_signature(lambdas_vdw),
+        "temperature_K": round(float(temperature_K), 8),
+        "n_steps": int(n_steps),
+        "exchange_interval": int(exchange_interval),
+        "boresch_params": boresch_params,
+        "potential_type": str(potential_type),
+        "platform_name": str(platform_name),
+        "max_resident_contexts": (
+            int(max_resident_contexts)
+            if max_resident_contexts is not None
+            else None
+        ),
+        "coion_identity": coion_identity,
+    }
+    return _protocol_fingerprint(payload)
+
+
+def _remd_sampling_metadata_matches(
+    stage_output_dir: str,
+    stage_name: str,
+    expected_fingerprint: Dict,
+) -> bool:
+    path = _remd_sampling_meta_path(stage_output_dir, stage_name)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            metadata = json.load(handle)
+    except (OSError, ValueError):
+        return False
+    return metadata.get("sampling_fingerprint") == expected_fingerprint
+
+
+def _write_remd_sampling_metadata(
+    stage_output_dir: str,
+    stage_name: str,
+    sampling_fingerprint: Dict,
+) -> None:
+    _atomic_write_json(
+        _remd_sampling_meta_path(stage_output_dir, stage_name),
+        {"sampling_fingerprint": sampling_fingerprint},
+    )
 
 def cleanup_temp_files(checkpoint_dir: str):
     """清理损坏的临时文件 (.tmp)"""
@@ -1342,6 +1454,40 @@ class ABFEPipeline:
     def _co_alchemical_ion_spec_path(self) -> str:
         return os.path.join(self.checkpoint_dir, "coalchemical_ion_spec.json")
 
+    def co_alchemical_ion_runtime_identity(
+        self,
+        leg: str,
+        *,
+        spec_relative_path: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve and cache this leg's minimal B5 runtime identity once."""
+        if hasattr(self, "_coion_runtime_identity_cache"):
+            return self._coion_runtime_identity_cache
+        # The leg marker is diagnostic metadata (excluded from the canonical
+        # fingerprint) but is required to prevent a complex spec being copied
+        # into the solvent checkpoint directory and silently accepted.
+        self._coion_expected_leg = str(leg)
+        spec = self.resolve_co_alchemical_ion_spec()
+        if spec is None:
+            self._coion_runtime_identity_cache = None
+            return None
+        if spec_relative_path is None:
+            spec_relative_path = getattr(self, "_coion_spec_relative_path", None)
+            if spec_relative_path is None:
+                spec_relative_path = os.path.relpath(
+                    self._co_alchemical_ion_spec_path(), self.output_dir
+                )
+        identity = co_alchemical_ion_cache_identity_payload(
+            spec,
+            system=self.system,
+            topology=self.topology,
+            leg=leg,
+            spec_relative_path=spec_relative_path,
+            charge_treatment=getattr(self, "charge_treatment", None),
+        )
+        self._coion_runtime_identity_cache = identity
+        return identity
+
     def resolve_co_alchemical_ion_spec(self) -> Optional[Dict[str, Any]]:
         """返回本条腿冻结的 co-ion 身份；中性配体返回 None。
 
@@ -1357,16 +1503,49 @@ class ABFEPipeline:
         换一个粒子（实测 0.05 nm 即翻转）。落盘是把身份跨进程钉住的唯一办法。
         """
         if getattr(self, "_co_alchemical_ion_spec_cached", None) is not None:
-            return self._co_alchemical_ion_spec_cached
+            cached = self._co_alchemical_ion_spec_cached
+            expected_leg = getattr(self, "_coion_expected_leg", None)
+            if expected_leg is not None and cached.get("leg") != expected_leg:
+                raise ValueError(
+                    "co-ion spec 腿身份不符："
+                    f"expected={expected_leg!r}, recorded={cached.get('leg')!r}, "
+                    f"path={self._co_alchemical_ion_spec_path()}"
+                )
+            requested_treatment = getattr(self, "charge_treatment", None)
+            if requested_treatment is not None and str(
+                cached.get("charge_treatment")
+            ) != str(requested_treatment):
+                raise ValueError(
+                    "co-ion spec charge_treatment 不符："
+                    f"当前运行={requested_treatment!r}，"
+                    f"记录={cached.get('charge_treatment')!r}，"
+                    f"path={self._co_alchemical_ion_spec_path()}"
+                )
+            verify_co_alchemical_ion_identity(
+                cached,
+                system=self.system,
+                topology=self.topology,
+                charge_treatment=requested_treatment,
+                context=f"内存缓存 {self._co_alchemical_ion_spec_path()}",
+            )
+            return cached
 
         path = self._co_alchemical_ion_spec_path()
         if os.path.isfile(path):
             with open(path, "r", encoding="utf-8") as handle:
                 spec = json.load(handle)
+            expected_leg = getattr(self, "_coion_expected_leg", None)
+            if expected_leg is not None and spec.get("leg") != expected_leg:
+                raise ValueError(
+                    "co-ion spec 腿身份不符："
+                    f"expected={expected_leg!r}, recorded={spec.get('leg')!r}, "
+                    f"path={path}"
+                )
             pinned = verify_co_alchemical_ion_identity(
                 spec,
                 system=self.system,
                 topology=self.topology,
+                charge_treatment=getattr(self, "charge_treatment", None),
                 context=f"resume 读取 {os.path.basename(path)}",
             )
             self._log(
@@ -1392,11 +1571,29 @@ class ABFEPipeline:
         if spec is None:
             # 中性配体：这条路径整个不需要 co-ion。不落盘空文件——落了反而会让
             # 将来换成带电配体时误判"已经选过了"。
+            if str(getattr(self, "charge_treatment", None)) == (
+                CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER
+            ):
+                raise ValueError(
+                    "charge-transfer 运行缺少 co-ion spec："
+                    f"leg={getattr(self, '_coion_expected_leg', None)!r}, "
+                    f"path={path}"
+                )
             self._co_alchemical_ion_spec_cached = None
             return None
 
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(spec, handle, indent=2, ensure_ascii=False, cls=NumpyEncoder)
+        expected_leg = getattr(self, "_coion_expected_leg", None)
+        if expected_leg is not None:
+            # ``leg`` is intentionally outside the canonical fingerprint: it
+            # identifies the file's owner, while the spec fingerprint remains
+            # the single physics identity algorithm shared with B3.
+            spec = dict(spec)
+            spec["leg"] = expected_leg
+
+        _atomic_write_json(
+            path,
+            _json_safe(spec),
+        )
         self._log(
             "  🔒 [MEM-00c] co-ion 身份已选定并冻结: "
             f"{[ion['atom_index'] for ion in spec['ions']]} "
@@ -2818,6 +3015,22 @@ class ABFEPipeline:
             traj_files = _expected_remd_traj_files(stage_output_dir, stage_name, len(lambdas_coul))
             u_kn_path = os.path.join(stage_output_dir, f"{stage_name}_pme_u_kn.npy")
             n_k_path = u_kn_path + ".n_k.npy"
+            sampling_fingerprint = _remd_sampling_fingerprint(
+                stage_name=stage_name,
+                system=self.system,
+                topology=self.topology,
+                ligand_indices=self.ligand_indices,
+                lambdas_coul=lambdas_coul,
+                lambdas_vdw=lambdas_vdw,
+                temperature_K=temp_k,
+                n_steps=n_steps_per_window,
+                exchange_interval=max(1, int(steps_per_update)),
+                boresch_params=boresch_params,
+                potential_type=potential_type,
+                platform_name=self.platform_name,
+                coion_identity=getattr(self, "_coion_runtime_identity", None),
+                max_resident_contexts=remd_max_resident_contexts,
+            )
             if resume and os.path.exists(u_kn_path) and _is_pme_u_kn_cache_compatible(
                 stage_output_dir,
                 stage_name,
@@ -2829,6 +3042,7 @@ class ABFEPipeline:
                 self.topology,
                 self.ligand_indices,
                 boresch_params,
+                coion_identity=getattr(self, "_coion_runtime_identity", None),
             ):
                 self._log("  ♻️ 检测到已有 PME u_kn，跳过 REMD 采样与重算，直接求解 MBAR")
                 u_kn = np.load(u_kn_path)
@@ -2872,14 +3086,30 @@ class ABFEPipeline:
                 self._log("  ♻️ 检测到旧版 PME u_kn 缓存，但模型版本不兼容；保留轨迹并重新执行离线 MBAR 重算。")
 
             expected_frames = max(1, _expected_remd_frame_count(n_steps_per_window))
-            if resume and _all_remd_trajs_valid(
-                stage_output_dir,
-                stage_name,
-                len(lambdas_coul),
-                min_frames=expected_frames,
+            if (
+                resume
+                and _remd_sampling_metadata_matches(
+                    stage_output_dir, stage_name, sampling_fingerprint
+                )
+                and _all_remd_trajs_valid(
+                    stage_output_dir,
+                    stage_name,
+                    len(lambdas_coul),
+                    min_frames=expected_frames,
+                )
             ):
                 self._log("  ♻️ 检测到完整 REMD DCD，视为采样已完成，跳过 REMD 继续离线 MBAR")
             else:
+                if resume and _all_remd_trajs_valid(
+                    stage_output_dir,
+                    stage_name,
+                    len(lambdas_coul),
+                    min_frames=expected_frames,
+                ):
+                    self._log(
+                        "  ⚠️ REMD DCD 虽完整，但 sampling fingerprint 缺失或不匹配；"
+                        "拒绝用新 Hamiltonian 重算旧采样分布，重新执行 REMD"
+                    )
                 remd = REMDManager(
                     system_template=self.system,
                     topology=self.topology,
@@ -2900,6 +3130,9 @@ class ABFEPipeline:
                     n_steps=n_steps_per_window,
                     exchange_interval=max(1, int(steps_per_update)),
                     stage_name=stage_name,
+                )
+                _write_remd_sampling_metadata(
+                    stage_output_dir, stage_name, sampling_fingerprint
                 )
 
             analyzer = TraditionalMBARAnalyzer(temperature=temp_k)
@@ -2930,6 +3163,7 @@ class ABFEPipeline:
                 self.topology,
                 self.ligand_indices,
                 boresch_params,
+                coion_identity=getattr(self, "_coion_runtime_identity", None),
             )
             res = analyzer.solve(u_kn, **_CHARGING_ESTIMATOR_KWARGS(lambdas_coul))
             return {
@@ -3042,6 +3276,9 @@ class ABFEPipeline:
             alchemical_params=alchemical_params,
             potential_type=potential_type,
             dispersion_protocol=self.dispersion_protocol,
+            # [B6-FIX] 这条腿的环境：溶剂腿是 soluble ⟹ 纯水盒里那条**合法**的
+            # 均匀体相尾项修正保留；膜复合物腿是 membrane ⟹ 关掉（口袋不均匀）。
+            environment_type=self.environment_type,
             restraint_params=boresch_params,
             prefix=("abfe_dual_rescue" if allow_partial_vanishing_rescue else "abfe_dual"),
             platform_name=self.platform_name,
@@ -3053,6 +3290,7 @@ class ABFEPipeline:
             ),
             pilot_lambdas=pilot_lambdas,
             pilot_mean_dU_dlambda=pilot_mean_dU_dlambda,
+            coion_identity=getattr(self, "_coion_runtime_identity", None),
         )
 
         # 🔑 关键：设置输出目录，确保 combine_results 能找到文件
@@ -3310,6 +3548,7 @@ class ABFEPipeline:
             platform_name=self.platform_name,
             output_dir=stage_output_dir,
             checkpoint_dir=self.checkpoint_dir,
+            coion_identity=getattr(self, "_coion_runtime_identity", None),
         )
         manager.output_dir = stage_output_dir
 
@@ -3441,6 +3680,21 @@ class ABFEPipeline:
         u_kn_path = os.path.join(stage_output_dir, f"{label}_pme_u_kn.npy")
         n_k_path = u_kn_path + ".n_k.npy"
         temp_k = self.temperature.value_in_unit(unit.kelvin)
+        sampling_fingerprint = _remd_sampling_fingerprint(
+            stage_name=label,
+            system=self.system,
+            topology=self.topology,
+            ligand_indices=self.ligand_indices,
+            lambdas_coul=lambdas_coul,
+            lambdas_vdw=lambdas_vdw,
+            temperature_K=temp_k,
+            n_steps=n_steps_per_window,
+            exchange_interval=max(1, int(steps_per_update)),
+            boresch_params=boresch_params,
+            potential_type=potential_type,
+            platform_name=self.platform_name,
+            coion_identity=getattr(self, "_coion_runtime_identity", None),
+        )
         if resume and os.path.exists(u_kn_path) and _is_pme_u_kn_cache_compatible(
             stage_output_dir,
             label,
@@ -3452,6 +3706,7 @@ class ABFEPipeline:
             self.topology,
             self.ligand_indices,
             boresch_params,
+            coion_identity=getattr(self, "_coion_runtime_identity", None),
         ):
             self._log("  ♻️ 检测到兼容的 PME u_kn 缓存，直接求解 MBAR")
             u_kn = np.load(u_kn_path)
@@ -3464,11 +3719,24 @@ class ABFEPipeline:
             res = analyzer.solve(u_kn)
         else:
             expected_frames = max(1, _expected_remd_frame_count(n_steps_per_window))
-            if resume and _all_remd_trajs_valid(
-                stage_output_dir, label, n_states, min_frames=expected_frames
+            if (
+                resume
+                and _remd_sampling_metadata_matches(
+                    stage_output_dir, label, sampling_fingerprint
+                )
+                and _all_remd_trajs_valid(
+                    stage_output_dir, label, n_states, min_frames=expected_frames
+                )
             ):
                 self._log("  ♻️ 检测到完整 REMD 轨迹，跳过采样直接重算 u_kn")
             else:
+                if resume and _all_remd_trajs_valid(
+                    stage_output_dir, label, n_states, min_frames=expected_frames
+                ):
+                    self._log(
+                        "  ⚠️ 2D REMD DCD 虽完整，但 sampling fingerprint 缺失或不匹配；"
+                        "拒绝重用旧采样分布，重新执行 REMD"
+                    )
                 self._log("  ⚡ 2D/单λ 路径改走 PME-preserving REMD+MBAR 通路")
                 remd = REMDManager(
                     system_template=self.system,
@@ -3488,6 +3756,9 @@ class ABFEPipeline:
                     n_steps=n_steps_per_window,
                     exchange_interval=max(1, int(steps_per_update)),
                     stage_name=label,
+                )
+                _write_remd_sampling_metadata(
+                    stage_output_dir, label, sampling_fingerprint
                 )
 
             analyzer = TraditionalMBARAnalyzer(
@@ -3520,6 +3791,7 @@ class ABFEPipeline:
                 self.topology,
                 self.ligand_indices,
                 boresch_params,
+                coion_identity=getattr(self, "_coion_runtime_identity", None),
             )
             res = analyzer.solve(u_kn)
 
@@ -3963,10 +4235,11 @@ class ABFEPipeline:
                 ibs_lj_tail_lrc_is_applicable(
                     _lj_lrc_potential_type,
                     getattr(self, "dispersion_protocol", None),
+                    getattr(self, "environment_type", None),
                 )
             )
             _lj_lrc_truth_source = (
-                "ibs_lj_tail_lrc_is_applicable(potential_type, dispersion_protocol)"
+                "ibs_lj_tail_lrc_is_applicable(potential_type, dispersion_protocol, environment_type)"
             )
 
         # ✅ 显式加入 Boresch 修正与约束修正
@@ -4007,6 +4280,12 @@ class ABFEPipeline:
                 "uses_analytical_release_formula": bool(correction_results.get("uses_analytical_release_formula", False)),
                 "analytical_release_assumption": correction_results.get("analytical_release_assumption", ""),
             },
+            # [P0-12a / §3.0] 配体构象诊断。§3.0 早就要求"记录溶剂腿配体回转半径与
+            # 内部氢键随 λ 的变化"，但一直没实现 —— 2026-08-04 那轮膜运行的溶剂腿
+            # 配体塌缩（0.66 nm）而复合物腿是伸展（1.28 nm），两条腿在给不同构象族
+            # 做热力学循环，全程无人看见。现在每条腿都自报，跨腿门在
+            # `abfe_core.combine_binding_free_energy` 里判（唯一一处）。
+            "ligand_conformer_diagnostics": self._ligand_conformer_diagnostics(),
             "lj_long_range_dispersion_correction": {
                 # 🔑 [P2-14] 这里原来是裸字面量 True，对 DEXP 运行无条件说谎。
                 # 现在与生产者 build_ibs_dual_system 共用同一个谓词
@@ -4021,6 +4300,7 @@ class ABFEPipeline:
                     else ibs_lj_tail_lrc_inapplicable_reason(
                         _lj_lrc_potential_type,
                         getattr(self, "dispersion_protocol", None),
+                        getattr(self, "environment_type", None),
                     )
                 ),
                 # [B6] 膜协议这一维必须一并落盘：否则看到 applied=False 只会以为
@@ -4037,7 +4317,7 @@ class ABFEPipeline:
                 "note": ("" if _lj_lrc_applicable else (
                     f"NOT APPLIED for potential_type={_lj_lrc_potential_type!r}, "
                     f"dispersion_protocol={getattr(self, 'dispersion_protocol', None)!r}: "
-                    f"{ibs_lj_tail_lrc_inapplicable_reason(_lj_lrc_potential_type, getattr(self, 'dispersion_protocol', None))}. "
+                    f"{ibs_lj_tail_lrc_inapplicable_reason(_lj_lrc_potential_type, getattr(self, 'dispersion_protocol', None), getattr(self, 'environment_type', None))}. "
                     "ibs_engine.py::build_ibs_dual_system leaves "
                     "ibs_wrapper.lj_tail_lrc_coeff_kj_mol = None, and every consumer "
                     "short-circuits to zeros, so the reported free energy contains NO "
@@ -4091,6 +4371,17 @@ class ABFEPipeline:
                 command_line=getattr(self, "_command_line", None),
             ),
         }
+        # [B5] Keep the per-leg runtime identity directly beside the result as
+        # well as in the protocol key.  This is deliberately the minimal cache
+        # identity (fingerprint + protocol/leg/path), never coordinates or the
+        # selector's selection_provenance.
+        if getattr(self, "_coion_runtime_identity", None) is not None:
+            final["co_alchemical_ion_runtime_identity"] = (
+                self._coion_runtime_identity
+            )
+            final["provenance"]["co_alchemical_ion_runtime_identity"] = (
+                self._coion_runtime_identity
+            )
         
         out_path = os.path.join(self.output_dir, "final_results.json")
         with open(out_path, "w") as f: json.dump(final, f, indent=2, cls=NumpyEncoder)
@@ -5460,11 +5751,15 @@ class ABFEPipeline:
             alchemical_params=alchemical_params,
             potential_type=potential_type,
             dispersion_protocol=self.dispersion_protocol,
+            # [B6-FIX] 这条腿的环境：溶剂腿是 soluble ⟹ 纯水盒里那条**合法**的
+            # 均匀体相尾项修正保留；膜复合物腿是 membrane ⟹ 关掉（口袋不均匀）。
+            environment_type=self.environment_type,
             restraint_params=boresch_params,
             prefix="abfe_dual",
             platform_name=self.platform_name,
             output_dir=stage_output_dir,
             checkpoint_dir=self.checkpoint_dir,
+            coion_identity=getattr(self, "_coion_runtime_identity", None),
         )
         resolved_box = _resolve_periodic_box_vectors(
             self.box_vectors, topology=self.topology, system=self.system
@@ -5727,6 +6022,122 @@ class ABFEPipeline:
         # 那套循环曾烧掉约一周 GPU 而没产出任何 ΔG。守护见
         # test_att27_dead_code_removed.py。
 
+    def _ligand_conformer_diagnostics(self) -> Optional[Dict[str, Any]]:
+        """[P0-12a] 从**去电荷 replica 轨迹**算这条腿的配体构象系综。
+
+        为什么取 decharging 而不是 vanishing：只有去电荷阶段落了 replica 轨迹
+        （`decharging/decharging_rep*.dcd`），而且那正是配体全强度 vdW、构象自由
+        演化的阶段 —— 塌缩就是在这里被发现的。vanishing 阶段配体的 vdW 在逐步关掉，
+        构象本身已不再有物理意义。
+
+        只读、失败不阻断：算不出来就返回 `None` 并让跨腿门记 `not_evaluated`
+        ——"判不了门"必须与"门过了"区分开（与 §9 质量门同一条纪律）。
+        """
+        try:
+            import glob
+
+            import mdtraj as md
+
+            pattern = os.path.join(self.output_dir, "decharging", "decharging_rep*.dcd")
+            files = sorted(glob.glob(pattern))
+            if not files:
+                return None
+            ligand = sorted(int(i) for i in (self.ligand_indices or []))
+            if len(ligand) < 2:
+                return None
+            mdtop = md.Topology.from_openmm(self.topology)
+            # 只读配体那几十个原子：整条轨迹搬进内存对膜体系是几百 MB。
+            local = {g: i for i, g in enumerate(ligand)}
+            heavy_local = [
+                local[g]
+                for g in ligand
+                if (mdtop.atom(g).element is not None
+                    and mdtop.atom(g).element.mass >= CO_ALCHEMICAL_ION_ANCHOR_MIN_MASS_AMU)
+            ]
+            if len(heavy_local) < 2:
+                return None
+            masses = [
+                float(mdtop.atom(g).element.mass) if mdtop.atom(g).element else 0.0
+                for g in ligand
+            ]
+            # §3.0 的"内部氢键"代理量：N/O 重原子对，键路径隔 ≥ 4 键。
+            polar_pairs = self._ligand_internal_polar_pairs(mdtop, ligand, local)
+
+            chunks = []
+            per_replica = []
+            for path in files:
+                traj = md.load(path, top=mdtop, atom_indices=ligand)
+                arr = np.asarray(traj.xyz, dtype=np.float64)
+                chunks.append(arr)
+                # 逐 replica 均值单独记：整体分布看不出"12 个 replica 全挤在同一个
+                # 窄basin 里"这件事，而那正是 2026-08-04 那次一眼就能认出塌缩的证据
+                # （实测 0.657–0.672 nm，σ=0.005）。诊断量，不进门。
+                rep = ligand_conformer_metrics(
+                    arr, heavy_local, masses_amu=masses, polar_pairs=polar_pairs
+                )
+                per_replica.append(
+                    float(np.mean(rep["max_internal_heavy_distance_nm"]))
+                )
+            xyz = np.concatenate(chunks, axis=0)
+            metrics = ligand_conformer_metrics(
+                xyz, heavy_local, masses_amu=masses, polar_pairs=polar_pairs
+            )
+            summary = ligand_conformer_summary(
+                metrics,
+                leg=str(getattr(self, "environment_type", "") or "unknown"),
+                source=f"decharging_replicas:{len(files)}_files:{xyz.shape[0]}_frames",
+            )
+            summary["n_replica_files"] = len(files)
+            summary["per_replica_mean_max_internal_heavy_distance_nm"] = per_replica
+            summary["per_replica_spread_nm"] = (
+                float(max(per_replica) - min(per_replica)) if per_replica else None
+            )
+            return summary
+        except Exception as exc:  # noqa: BLE001
+            self._log(
+                f"  ⚠️ [P0-12a] 配体构象诊断未能计算（{type(exc).__name__}: {exc}）；"
+                "跨腿构象门将记为 not_evaluated（不会伪装成通过）。"
+            )
+            return None
+
+    @staticmethod
+    def _ligand_internal_polar_pairs(mdtop, ligand, local) -> List[Tuple[int, int]]:
+        """配体内 N/O 重原子对（局部索引），且键路径隔 ≥ 4 键。
+
+        用键图算隔离度而不是"隔 3 个原子"：环状体系里序号相邻不等于键路径相邻。
+        """
+        import collections
+
+        ligand_set = set(ligand)
+        adj = collections.defaultdict(set)
+        for a, b in mdtop.bonds:
+            if a.index in ligand_set and b.index in ligand_set:
+                adj[a.index].add(b.index)
+                adj[b.index].add(a.index)
+        polar = [
+            g
+            for g in ligand
+            if mdtop.atom(g).element is not None
+            and mdtop.atom(g).element.symbol in ("N", "O")
+        ]
+        pairs: List[Tuple[int, int]] = []
+        for i, gi in enumerate(polar):
+            # BFS 求键路径距离（只在配体内部走）
+            dist = {gi: 0}
+            queue = collections.deque([gi])
+            while queue:
+                cur = queue.popleft()
+                if dist[cur] >= LIGAND_INTERNAL_POLAR_MIN_BOND_SEPARATION:
+                    continue
+                for nxt in adj[cur]:
+                    if nxt not in dist:
+                        dist[nxt] = dist[cur] + 1
+                        queue.append(nxt)
+            for gj in polar[i + 1:]:
+                if dist.get(gj, 99) >= LIGAND_INTERNAL_POLAR_MIN_BOND_SEPARATION:
+                    pairs.append((local[gi], local[gj]))
+        return pairs
+
     def _stage_protocol_key(
         self,
         stage_name: str,
@@ -5765,7 +6176,17 @@ class ABFEPipeline:
             "ligand_indices": [int(i) for i in self.ligand_indices],
             "system_xml_sha256": _system_xml_hash(self.system),
             "topology_sha256": _topology_hash(self.topology),
-            "coordinates_nm_sha256": _positions_hash(self.positions),
+            # 🔑 [2026-08-05 修] 曾经这里还有 `coordinates_nm_sha256`。删掉理由与
+            # `stage0_protocol_key`（同文件，稍后定义）完全一样：`self.positions`
+            # 在"本次调用刚做完预平衡/Boresch 再平衡"与"resume 时读 DCD/rebalance
+            # 轨迹末帧"两条路径下，即使描述同一段已完成的物理轨迹也会产生不同的
+            # 坐标数组（前者在 run_full_pipeline 第 1 节额外叠了 2000 步最小化，
+            # 后者没有），导致这份"stage 是否已完成"的聚合缓存在每次跨进程 resume
+            # 都被判失效——实测曾让本该复用的 decharging 预优化缓存在 resume 时
+            # 被无谓地整段重算。坐标/构型是否还对得上，已经由
+            # `boresch_equilibrium_committed.json` 的 σ 偏差核对和预平衡自己的
+            # completed 门守住，不需要在这里再叠一份对实现细节（有没有跑那额外
+            # 2000 步）比坐标数组的强判据。
             "code_sha256": _code_hash(),
             "aces_softcore_params": ACESoftcorePotential.optimize_alpha(
                 len(self.ligand_indices)
@@ -5811,6 +6232,26 @@ class ABFEPipeline:
         _dispersion = getattr(self, "dispersion_protocol", None)
         if _dispersion and _dispersion != DISPERSION_PROTOCOL_LEGACY_UNIFORM_LRC:
             payload["dispersion_protocol"] = str(_dispersion)
+            # 🔑 [B6-FIX 2026-08-04] 光有协议名不够：同一个 `ff_native_isotropic_lrc`
+            # 在**溶剂腿**（均匀体相水，加解析尾项）与**膜复合物腿**（口袋不均匀，
+            # 不加）下是两个不同的 u_kn 口径。所以把**实际生效的决定**也写进指纹。
+            #
+            # 只在决定为 True 时写：本改动之前，任何非 legacy 协议的实际行为都是
+            # "不加"，所以对 False 保持沉默 ⟹ 那些已产出的 stage 缓存（行为未变）
+            # 继续有效；而行为**真的变了**的那一类（膜运行的溶剂腿，从"不加"变成
+            # "加"）指纹必然改变、旧缓存被正确拒绝。legacy 路径一个键都不写，
+            # 可溶生产基线的缓存不受影响（§7.7）。
+            _leg_lrc = ibs_lj_tail_lrc_is_applicable(
+                potential_type,
+                _dispersion,
+                getattr(self, "environment_type", None),
+            )
+            if _leg_lrc:
+                payload["alchemical_uniform_density_lrc"] = True
+        if getattr(self, "_coion_runtime_identity", None) is not None:
+            payload["co_alchemical_ion_runtime_identity"] = (
+                self._coion_runtime_identity
+            )
         return _protocol_fingerprint(payload)
 
     def _preopt_protocol_key(
@@ -5843,7 +6284,7 @@ class ABFEPipeline:
         run_config = dict(getattr(self, "_last_run_config", {}) or {})
         run_config.pop("resume", None)
         run_config.pop("run_equilibration", None)
-        return _protocol_fingerprint({
+        payload = {
             "kind": "dual_lambda_preopt",
             "stage_name": stage_name,
             "potential_type": str(potential_type),
@@ -5856,7 +6297,14 @@ class ABFEPipeline:
             "ligand_indices": [int(i) for i in self.ligand_indices],
             "system_xml_sha256": _system_xml_hash(self.system),
             "topology_sha256": _topology_hash(self.topology),
-            "coordinates_nm_sha256": _positions_hash(self.positions),
+            # 🔑 [2026-08-05 修] 同 `_stage_protocol_key`/`stage0_protocol_key`：
+            # 不放 `coordinates_nm_sha256`。这份指纹本来就是刻意收窄过的
+            # （见上面的 docstring："这样修 ibs_engine.py/abfe_pipeline.py 里跟
+            # 预优化无关的 bug 不会连带让这份要跑好几个小时的预优化缓存失效"）——
+            # 但收窄时漏看了这一项：`self.positions` 在"刚做完预平衡/Boresch 再
+            # 平衡"与"resume 时读轨迹末帧"两条路径下产生不同坐标数组（前者多叠了
+            # 一次 2000 步最小化），恰恰是 docstring 想避免的那种"跟预优化本身无关
+            # 的实现细节波动却让这份小时级缓存失效"。
             "preopt_code_sha256": _preopt_code_hash(),
             "aces_softcore_params": ACESoftcorePotential.optimize_alpha(
                 len(self.ligand_indices)
@@ -5866,7 +6314,12 @@ class ABFEPipeline:
                 if stage_name == "vanishing"
                 else "n/a"
             ),
-        })
+        }
+        if getattr(self, "_coion_runtime_identity", None) is not None:
+            payload["co_alchemical_ion_runtime_identity"] = (
+                self._coion_runtime_identity
+            )
+        return _protocol_fingerprint(payload)
 
     @staticmethod
     def _preopt_cache_matches_ignoring_code_hash(
@@ -6264,6 +6717,14 @@ class ABFEPipeline:
         # =========================================================================
         # 2. 路由采样 (支持阶段级 Resume)
         # =========================================================================
+        # [B5] Freeze/read the leg identity once before any top-level, stage, or
+        # pre-optimization protocol key is built.  Downstream consumers use this
+        # payload; none of them is allowed to select an ion again.
+        if system_type in {"complex", "solvent"}:
+            self._coion_runtime_identity = self.co_alchemical_ion_runtime_identity(
+                system_type
+            )
+
         # 🔑 [P0] 这是整条 resume 链路里最先被检查的一环——status=="completed" 就
         # 直接把整份 final_results.json 读回来当最终结果 return，连下面 stage1/2
         # 的 protocol_key 校验都不会走到。之前只判断 status，不比对协议指纹，导致
@@ -6275,7 +6736,7 @@ class ABFEPipeline:
             config = dict(self._last_run_config)
             config.pop("resume", None)
             config.pop("run_equilibration", None)
-            return _protocol_fingerprint({
+            payload = {
                 "kind": "abfe_final_result",
                 "run_config": config,
                 "potential_type": potential_type,
@@ -6285,7 +6746,13 @@ class ABFEPipeline:
                 "decharge_method": kwargs.get("decharge_method", "pme"),
                 "system_xml_sha256": _system_xml_hash(self.system),
                 "topology_sha256": _topology_hash(self.topology),
-                "coordinates_nm_sha256": _positions_hash(self.positions),
+                # 🔑 [2026-08-05 修] 同 `_stage_protocol_key` 等三处：不放
+                # `coordinates_nm_sha256`。这是这条 resume 短路里**实测真的触发过**
+                # 的那一处——用户的运行日志里出现过
+                # "⚠️ 已有 final_results.json 协议指纹不匹配"，根因就是
+                # `self.positions` 在"本次调用刚完成预平衡/Boresch 再平衡"
+                # （多叠了一次 2000 步最小化）与"resume 时读轨迹末帧"（没有）之间
+                # 天然不同，跟这条腿的物理内容是否真的变了完全无关。
                 "code_sha256": _code_hash(),
                 "ligand_indices": [int(i) for i in self.ligand_indices],
                 "temperature_K": self.temperature.value_in_unit(unit.kelvin),
@@ -6312,7 +6779,12 @@ class ABFEPipeline:
                         self.checkpoint_dir, "preopt_dual_vanishing.json"
                     )),
                 },
-            })
+            }
+            if getattr(self, "_coion_runtime_identity", None) is not None:
+                payload["co_alchemical_ion_runtime_identity"] = (
+                    self._coion_runtime_identity
+                )
+            return _protocol_fingerprint(payload)
 
         _top_level_protocol_key = _build_top_level_protocol_key()
 
@@ -6410,18 +6882,29 @@ class ABFEPipeline:
                     "seed": int(kwargs.get("attachment_seed", 20260728)),
                     "n_seeds": int(kwargs.get("attachment_n_seeds", 1)),
                 }
+                # 🔑 [2026-08-05 修] 这里**故意不放** `coordinates_nm_sha256`。
+                # `self.positions` 在"本次调用刚跑完预平衡"（额外叠了 2000 步最小化，
+                # 见 run_full_pipeline 第 1 节）与"resume 时直接读 DCD 末帧"
+                # （不叠最小化）这两条路径下，即便描述的是同一段已完成、内容完全
+                # 相同的物理轨迹，也会产生不同的坐标数组、从而不同的哈希——
+                # 实测这会让 Stage 0 attachment 缓存在**每一次**跨进程 resume 都
+                # 判"不匹配"而整段重跑（~7 min），即使协议、System、Boresch 参数
+                # 全部没变。真正该守护的"坐标/构型是否还对得上"已经由
+                # `boresch_equilibrium_committed.json` +
+                # `_assert_committed_boresch_still_matches_pose()`（σ 偏差核对）
+                # 与预平衡自己的 `pre_equilibration_fingerprint.json` +
+                # `status=completed` 门分别把住了，不需要在这里再叠一份对实现细节
+                # （有没有跑那额外 2000 步）比坐标数组的强判据。
                 stage0_protocol_key = _protocol_fingerprint({
                     "kind": "boresch_attachment_stage0",
                     "boresch_params": boresch_params,
                     "attachment_config": attachment_config,
                     "system_xml_sha256": _system_xml_hash(self.system),
                     "topology_sha256": _topology_hash(self.topology),
-                    "coordinates_nm_sha256": _positions_hash(self.positions),
                     "box_vectors_sha256": _box_vectors_hash(self.box_vectors),
                     "ligand_indices": [int(i) for i in self.ligand_indices],
                     "temperature_K": self.temperature.value_in_unit(unit.kelvin),
                     "platform_name": self.platform_name,
-                    "code_sha256": _code_hash(),
                 })
                 stage0_file = os.path.join(
                     self.checkpoint_dir, "stage0_attachment.json"
@@ -6435,8 +6918,30 @@ class ABFEPipeline:
                             cached_stage0.get("attachment_delta_G_kJ_mol"),
                             cached_stage0.get("attachment_error_kJ_mol"),
                         )
+                        cached_protocol_key = stage0_doc.get("protocol_key")
+                        # Legacy Stage 0 caches included the global four-file
+                        # code hash.  It is deliberately excluded from the
+                        # attachment contract now: unrelated pipeline edits
+                        # must not force another attachment simulation.
+                        if isinstance(cached_protocol_key, dict):
+                            cached_protocol_key = dict(cached_protocol_key)
+                            cached_payload = cached_protocol_key.get("payload")
+                            if isinstance(cached_payload, dict):
+                                cached_protocol_key["payload"] = dict(cached_payload)
+                                cached_protocol_key["payload"].pop("code_sha256", None)
+                                cached_protocol_key["sha256"] = _sha256_text(
+                                    json.dumps(
+                                        _canonical_protocol_value(
+                                            cached_protocol_key["payload"]
+                                        ),
+                                        sort_keys=True,
+                                        separators=(",", ":"),
+                                        ensure_ascii=False,
+                                        allow_nan=False,
+                                    )
+                                )
                         if (
-                            stage0_doc.get("protocol_key") == stage0_protocol_key
+                            cached_protocol_key == stage0_protocol_key
                             and all(
                                 isinstance(v, (int, float)) and np.isfinite(float(v))
                                 for v in cached_values

@@ -203,6 +203,107 @@ DEC-030 对上面第四条的回应：本 session 已实测 teacher 侧单帧离
 的成本无关。因此 L1 在当前证据下降级为非当前下一步，不是未经比较就排除；完整
 逐 step ESS/GPU-hour 对照仍保留在 §WP-4C.3 待执行列表中，只是不再是优先级最高的
 下一步。
+
+**2026-08-04 状态更新（DEC-031→035，详见 EXPERIMENT_LOG）**：DEC-030(a) 多帧支持域审计发现
+frame0-only 固定 manifest 不足以覆盖 1500 帧；DEC-031 尝试的"跨帧闭包并集"修复本身被
+DEC-032 撤销——离线 teacher 不需要固定图，正确做法是逐帧独立精确两跳闭包（graph
+membership 固定在 CPU float64 决定一次，MACE forward 在 CUDA float32 执行，Option C）；
+DEC-033 用这套策略完成了 `derived_5a` 的三条 run 完整 latent cache（各 500 帧，
+`[41,1024]` float32，latent-only 不拼 ledger）。DEC-034/035 把这份 latent cache 与 MM
+ledger 的 `adjacent_gap_reduced`/`log_importance_unnormalized` 拼接，在**冻结** `A_k`
+（本节 sin² 包络，值直接取自 `protocols/EXP-012_preregistration.json` 的
+`target.global_schedule.A_k`，不重新拟合，避免 line 174 warns 的尺度简并）的前提下只
+训练线性/ridge readout，并以 leave-one-run-out 方式在真正 held-out 的那条 run 上比较
+相邻态 gap variance 相对 `B=0`（无残差项）基线的变化：**三个 fold 全部改善**
+（39.9%/29.1%/64.8%，均值 44.6%），比"至少一个 fold 有增益"的最低门槛更强。
+
+**DEC-030(c) 冻结（2026-08-04）**：以上结果记为最终登记结果，不因"2/3 fold 选中了 ridge
+网格最小候选值 `1e-3`"而重跑更宽的网格来替换它——那样做是看到边界结果后才决定加宽网格，
+是事后调整（post-hoc），可能改善数值探针但不能改变已经很强的 go/no-go 结论。之后如果要
+跑更宽的 ridge 网格（如 `1e-6/1e-5/1e-4`），必须显式标注为 `sensitivity-only`，不得替换
+已登记的 DEC-034/035 结果。
+
+**DEC-030(d0) `LocalResidualStudent` 设计契约（2026-08-04，编码开始前必须先冻结）**：
+(c) 通过只说明"frozen-MACE 局部残差表示对这个系统有用"，不等于已经知道如何把它变成一个
+可以在 OpenMM 每步内运行的在线可导模型。写学生代码之前必须先冻结以下设计，而不是直接
+从一个 MACE 类张量-equivariant 网络开始：
+
+1. **在线动态环境表示（最优先未决问题）**。Teacher 用的是逐帧动态水分子身份和逐帧图
+   （DEC-032 Option C），student 必须给出：瞬态水分子身份如何处理、ligand–environment
+   近邻发现如何进行、triclinic PBC 如何处理、cutoff 归属如何判定、如何在 TorchScript 里
+   表达一个逐步都可能变化的动态近邻结构、以及如何避免每步扫描一个巨大的固定环境。
+   这必须先于网络结构选择解决——网络设计依赖于这个答案，不是反过来。
+2. **最小架构**：第一个候选不是完整张量-equivariant MACE 式 student，而是最便宜的
+   标量、旋转不变局部模型：typed atom embedding + 平滑 ligand–environment
+   radial/contact 特征 + 至多 1–2 个轻量 interaction block + ligand-only 不变
+   pooling + 有界标量 `B_student`。旋转不变的标量能量对坐标求导本身就给出正确的
+   等变力，不需要为了"等变"而引入不变量以外的 irreps 机器；只有这个最简单候选
+   失败，才升级到更复杂的表示。
+3. **Teacher-target 协议**：每个 outer fold 内——在两条 run 上拟合 ridge teacher、
+   在同样两条 run 上训练 student、只在第三条 run 上评估——与 (c) 完全同构，可直接
+   比较。Student loss 应同时包含直接 gap 优化项和蒸馏项；teacher 不能被当成无条件
+   的 ground truth。
+4. **必需的对照实验**：同一 student 架构训练两种版本——(a) direct-gap student（无
+   teacher target，只优化 gap variance）；(b) distilled student（相同架构 + teacher
+   loss）。否则任何增益都无法归因于 MACE teacher 本身，而可能只是"任意同等容量的
+   可训练局部模型直接优化 gap 也能做到"。
+5. **计算与部署预算**：编码前必须冻结——最大参数量、最大 neighbor/edge 数（可参考
+   DEC-033/034 已实测的 teacher 精确闭包规模，1500 帧范围约 940–1066 节点/
+   37834–45656 边，作为同系统近邻规模的经验参考，不直接决定 student cutoff）、
+   目标每 MD 步毫秒数、GPU 显存上限、允许的 cutoff、训练 seed 与 epoch 数、早停
+   规则、held-out 改善判据。
+6. **分阶段条件式实现**（每阶段失败即停，不得跳阶段）：
+   - D1 离线 student 拟合 → held-out gap variance 与 teacher fidelity（用真实
+     每帧坐标计算 student 自己的特征，不是只读 teacher 的 cached pooled_latent——
+     student 的意义就是不在推理时跑 MACE）；
+   - D2 坐标/autograd 资格 → 有限差分、cutoff 平滑性、力尾部行为；
+   - D3 部署资格 → TorchScript、OpenMM Reference、CUDA 一致性、耗时；
+   - D4 动力学资格 → 短 NVT、稳定性，再做独立重复。
+   只有 D1 离线 student 仍保留有意义的 held-out 改善，才允许启动 D3/D4 的
+   OpenMM/NVT 工作。
+
+本轮只冻结上述契约，不写任何 student 代码；下一步是把第 1 条（在线动态环境表示）
+单独作为一次设计讨论解决，其余各项在该讨论之后才能细化为可执行任务。
+
+**2026-08-05 状态更新（DEC-038，详见 EXPERIMENT_LOG）**：第 1 条已解决，且用真实数据验证而非
+只靠代码阅读——`scripts/smoke_exp012_student_environment_funnel.py` 在 `openmm_dev` 环境对
+run1/frame0 与 teacher 已知最坏图帧 run3/frame343 两条真实帧实测：不追踪瞬态水分子持久身份，
+每步用 `local_residual.geometry.ligand_environment_cross_edges`（独立于 teacher 代码路径的
+minimum-image cutoff 实现）动态重算 ligand–environment cutoff funnel，与
+`local_residual/teacher_graph.py` 的已审计 canonical membership 在两帧上逐对（含周期 unit
+shift）完全一致；能量权重改用 `local_residual.geometry.quintic_c2_cutoff` 的 quintic C2
+平滑包络，边界扫描证实离散候选成员翻转（在 5.0 Å 处精确单次翻转）不会造成能量跳变，且存在
+真实的非 0/1 中间权重值。离散候选成员与能量平滑性由此明确为两个独立层次。本决策只证明设计
+可实现，不代表 student 有统计增益或生产资格；下一步是 (d0-5) 计算/部署预算冻结。
+
+**(d0-5) 进度（2026-08-05，详见 IMPLEMENTATION_PLAN §7 WP-4C.3 d0-5，已写为 DEC-039）**：
+图规模已用 1500 帧真实几何审计冻结（S1 原子 ≤256/320、边 1536/2048、单原子 neighbor
+64/80）；funnel 的 CUDA float32 一致性已验证（与 CPU float64 完全一致）；训练 epoch/seed/
+早停预算已冻结——改用训练 run 内部末尾 20% 连续时间块做早停验证（不复用被隔离的第三条
+run 兼职早停+最终评估，避免乐观偏差），`max_epoch=500`、`early_stop_patience=30`、
+`seeds_per_variant_per_fold=3`。**继续深挖后**，`win_sys_xml_sha256_matches_manifest=false`
+的根因已定位：`output_lrc_fix/box_vectors.npy` 只在初次建系统缓存时写一次，真正建窗口 0
+用的盒子取自内存里的 `pipeline.box_vectors`，会在预平衡 NPT 弛豫和 Boresch rebalance 后
+被重新赋值但从不写回磁盘；窗口 0 生产 System 无 barostat，故盒子建窗口后即冻结，可直接
+从 `openmm.chk` 读回真实盒子。诊断脚本已按此修复（两阶段构造，schema 升 v2），但修复后的
+重新测量尚未执行，ms/step 数字仍暂不计入 DEC-039 的已冻结生产基线。Arm A/B/D 已正式退役为
+`not_pursued`（非数值失败——从未实现；预注册偏离已显式记录，`C_vs_A`/`C_vs_B` 增量比较
+从未执行，结论收窄为"MACE latent 信号可泛化、值得蒸馏"而非"Arm C 优于 A/B"），
+`protocols/EXP-012_preregistration.json` 已 reseal 为 `sealed`（待跑
+`scripts/reseal_exp012_preregistration.py` 落实真实 payload_sha256）。
+
+**2026-08-05 D2 最终结果更新（DEC-040）**：以
+`output/outer_lambda_exp012/student_d2_report_v4.json` 为最终报告，direct-gap student 的
+3 个 leave-one-run-out fold × 3 seeds 共 9 个 checkpoint，分别在三条真实 run 的 frame 0
+上执行，共 27 组坐标/autograd 资格检查；`all_checkpoints_passed=true`，状态为
+`COMPLETED_D2_CHECKS`，report SHA-256
+`329a98331400f22fe13b76e00f435f4c3a83431441f33bc35af502540d56f08b`。27/27 组有限差分、
+cutoff 平滑性和 force-tail 检查全部通过：最大有限差分绝对误差
+`2.4711e-7`（门 `1e-4`），最大相对误差 `1.8242e-5`（门 `1e-2`），所有非参与原子力均
+严格为零；cutoff 粗/细扫描的能量跳变缩放比为 `22.6405–24.9856`（连续行为期望 25），
+且每组被探测 pair 均只发生一次 membership flip；0.3 Å 合成近接触的能量和力 27/27
+有限。由此 D2 正式通过，允许进入 D3 部署资格；本报告明确未使用 TorchForce、未执行
+NVT，也未以 held-out run 选择 checkpoint，因此不授予 D3、D4、WP-5 或 production 资格。
 ---
 
 ## 3. 数学定义

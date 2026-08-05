@@ -67,13 +67,89 @@ def test_dexp_veto_is_unchanged_and_independent_of_dispersion_protocol():
 
 
 def test_membrane_native_protocol_disables_the_uniform_density_lrc():
-    """§1.3：膜体系必须关闭炼金 ligand–environment 的均匀密度 `lrc_coeff/V`。"""
+    """§1.3：**膜复合物腿**必须关闭炼金 ligand–environment 的均匀密度 `lrc_coeff/V`。
+
+    ⚠️ [B6-FIX 2026-08-04] 这条断言现在**必须带环境维度**。原先它写成"任何
+    ff_native_isotropic_lrc 都关"，而那正是被修掉的缺陷：同一次膜运行里的
+    纯水溶剂腿也被这条规则关掉了合法的体相尾项修正。
+    """
     assert (
         ie.ibs_lj_tail_lrc_is_applicable(
-            "softcore", core.DISPERSION_PROTOCOL_FF_NATIVE_ISOTROPIC_LRC
+            "softcore",
+            core.DISPERSION_PROTOCOL_FF_NATIVE_ISOTROPIC_LRC,
+            core.ENVIRONMENT_TYPE_MEMBRANE,
         )
         is False
     )
+
+
+def test_the_solvent_leg_of_a_membrane_run_keeps_its_legitimate_bulk_water_lrc():
+    """[B6-FIX] 纯水腿里"均匀体相密度"这个前提**成立**，不许跟着膜口袋一起关。
+
+    实测缺陷：膜运行的溶剂腿（4.05 nm 纯水盒、同一个 41 原子配体）在
+    `final_results.json` 里带着 `disabled_by_membrane_forcefield_protocol`
+    这句理由，而那条腿的 vanishing 因此从 96.96 掉到 83.83 kJ/mol（−13.1）。
+
+    溶剂腿天然落在 soluble 一侧：`runabfe` 构造溶剂腿 pipeline 时**刻意不传**
+    `environment_type`（B1 的接线契约测试钉着），所以这里不需要任何新标记。
+    """
+    assert (
+        ie.ibs_lj_tail_lrc_is_applicable(
+            "softcore",
+            core.DISPERSION_PROTOCOL_FF_NATIVE_ISOTROPIC_LRC,
+            core.ENVIRONMENT_TYPE_SOLUBLE,
+        )
+        is True
+    )
+    assert (
+        ie.ibs_lj_tail_lrc_inapplicable_reason(
+            "softcore",
+            core.DISPERSION_PROTOCOL_FF_NATIVE_ISOTROPIC_LRC,
+            core.ENVIRONMENT_TYPE_SOLUBLE,
+        )
+        == ""
+    )
+
+
+def test_non_legacy_protocol_without_an_environment_fails_closed():
+    """[B6-FIX] 缺环境维度时**不许猜**——两个方向都会静默产出错误的 ΔG。"""
+    with pytest.raises(ValueError, match="environment_type"):
+        ie.ibs_lj_tail_lrc_is_applicable(
+            "softcore", core.DISPERSION_PROTOCOL_FF_NATIVE_ISOTROPIC_LRC
+        )
+
+
+def test_target_and_per_leg_implementation_are_separate_facts():
+    """[B6-FIX] 目标（力场参数化条件）与实现（该腿环境下怎么达成）必须分开记录。
+
+    膜复合物腿把修正关掉 ⟹ **目标没达成**（力场是开着各向同性色散修正拟合的，
+    而这条腿的炼金 ligand–environment 现在是截断的）。这一点要如实写成
+    `target_met=False`，而不是把"关掉了"记成"处理好了"——真正的解是
+    §1.3 路线 C，尚未实现。
+    """
+    membrane = core.resolve_leg_dispersion_implementation(
+        core.DISPERSION_PROTOCOL_FF_NATIVE_ISOTROPIC_LRC,
+        core.ENVIRONMENT_TYPE_MEMBRANE,
+    )
+    solvent = core.resolve_leg_dispersion_implementation(
+        core.DISPERSION_PROTOCOL_FF_NATIVE_ISOTROPIC_LRC,
+        core.ENVIRONMENT_TYPE_SOLUBLE,
+    )
+    # 同一个目标，两条腿两种实现。
+    assert membrane["dispersion_protocol"] == solvent["dispersion_protocol"]
+    assert membrane["alchemical_uniform_density_lrc"] is False
+    assert solvent["alchemical_uniform_density_lrc"] is True
+    assert membrane["target_met"] is False
+    assert solvent["target_met"] is True
+    assert membrane["implementation"] == core.DISPERSION_IMPL_TRUNCATED_NO_TAIL
+    assert solvent["implementation"] == core.DISPERSION_IMPL_UNIFORM_BULK_ANALYTIC_TAIL
+    # 力场本身就不带 LRC 的那条路线：不加尾项**就是**达成目标。
+    for env in (core.ENVIRONMENT_TYPE_SOLUBLE, core.ENVIRONMENT_TYPE_MEMBRANE):
+        no_lrc = core.resolve_leg_dispersion_implementation(
+            core.DISPERSION_PROTOCOL_FF_NATIVE_FORCE_SWITCH_NO_LRC, env
+        )
+        assert no_lrc["alchemical_uniform_density_lrc"] is False
+        assert no_lrc["target_met"] is True
 
 
 def test_reason_uses_the_exact_string_the_plan_specifies():
@@ -81,7 +157,9 @@ def test_reason_uses_the_exact_string_the_plan_specifies():
     并且明确要求"**不能写成遗漏**"——理由必须是主动关闭，不是缺失。
     """
     reason = ie.ibs_lj_tail_lrc_inapplicable_reason(
-        "softcore", core.DISPERSION_PROTOCOL_FF_NATIVE_ISOTROPIC_LRC
+        "softcore",
+        core.DISPERSION_PROTOCOL_FF_NATIVE_ISOTROPIC_LRC,
+        core.ENVIRONMENT_TYPE_MEMBRANE,
     )
     assert reason.startswith("disabled_by_membrane_forcefield_protocol")
     # 理由里要说清"被关掉的只是炼金 ligand–environment 那一项"，
@@ -90,12 +168,26 @@ def test_reason_uses_the_exact_string_the_plan_specifies():
     assert "环境–环境" in reason
 
 
-def test_all_non_legacy_protocols_disable_the_alchemical_lrc():
-    """不只 amber 那一条：任何非 legacy 路线都不得沿用均匀密度假设。"""
-    for protocol in core.DISPERSION_PROTOCOLS:
+def test_no_non_legacy_protocol_keeps_the_uniform_density_assumption_in_a_membrane():
+    """膜环境下，任何非 legacy 路线都不得沿用均匀密度假设。
+
+    ⚠️ [B6-FIX] 原来这条写的是"任何非 legacy 路线一律关"，漏掉了环境维度 ——
+    可溶/纯水腿下 `ff_native_isotropic_lrc` 的均匀密度前提是成立的，见
+    `test_the_solvent_leg_of_a_membrane_run_keeps_its_legitimate_bulk_water_lrc`。
+    路线 B/C 在 `resolve_dispersion_protocol` 就已 NotImplementedError，
+    到不了这个谓词，所以这里只遍历已实现的那两条。
+    """
+    for protocol in core.DISPERSION_PROTOCOLS_IMPLEMENTED + (
+        core.DISPERSION_PROTOCOL_FF_NATIVE_FORCE_SWITCH_NO_LRC,
+    ):
         if protocol == core.DISPERSION_PROTOCOL_LEGACY_UNIFORM_LRC:
             continue
-        assert ie.ibs_lj_tail_lrc_is_applicable("softcore", protocol) is False, protocol
+        assert (
+            ie.ibs_lj_tail_lrc_is_applicable(
+                "softcore", protocol, core.ENVIRONMENT_TYPE_MEMBRANE
+            )
+            is False
+        ), protocol
 
 
 # ---------------------------------------------------------------------------
@@ -115,15 +207,18 @@ def test_producer_and_reporter_call_the_same_predicate_with_both_arguments():
     pipeline_src = (ROOT / "abfe_pipeline.py").read_text(encoding="utf-8")
 
     assert (
-        "ibs_lj_tail_lrc_is_applicable(potential_type, dispersion_protocol)"
+        "ibs_lj_tail_lrc_is_applicable(\n        potential_type, dispersion_protocol, environment_type\n    )"
         in engine_src
-    ), "生产者没有把 dispersion_protocol 传进谓词"
+    ), "生产者没有把 dispersion_protocol + environment_type 都传进谓词"
     # 报告者用 getattr 兜底：`compute_final_results` 会被 `ABFEPipeline.__new__`
     # 出来的裸实例调用（tests/test_lrc_reporting_honesty.py 刻意绕过 __init__），
     # 缺属性时按 None = legacy 处理，与改动前同义。
     assert (
         'getattr(self, "dispersion_protocol", None),' in pipeline_src
     ), "报告者没有把 dispersion_protocol 传进谓词"
+    assert (
+        'getattr(self, "environment_type", None),' in pipeline_src
+    ), "[B6-FIX] 报告者没有把 environment_type 传进谓词 —— 溶剂腿会被误报成膜口袋"
     reporter_call = pipeline_src.split("_lj_lrc_truth_source = (")[0]
     assert "ibs_lj_tail_lrc_is_applicable(" in reporter_call
 

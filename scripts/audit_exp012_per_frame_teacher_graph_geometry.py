@@ -2,13 +2,24 @@
 """DEC-032: pure-geometry, no-MACE sweep of the per-frame exact-closure graph.
 
 For every frame of the registered EXP-012 target-ledger trajectories
-(``hard_window0_run1/2/3``), this builds exactly the graph
-``local_residual.teacher_graph.build_teacher_graph_for_frame`` would build --
-the exact two-hop cutoff-graph closure, no fixed manifest, no residue
-completion -- and reports its size and composition. No MACE model runs here;
-this is graph construction only, so a frame's actual worst-case cost can be
-identified *before* spending any CPU/CUDA C1 smoke time on it, instead of
-assuming frame0 is representative.
+(``hard_window0_run1/2/3``), this decides that frame's exact two-hop
+cutoff-graph closure -- no fixed manifest, no residue completion -- via
+``local_residual.teacher_graph.compute_canonical_graph_membership`` and
+reports its size, a deterministic membership hash, and its composition. No
+MACE model runs here; this is graph construction only, so a frame's actual
+worst-case cost can be identified *before* spending any CPU/CUDA C1 smoke
+time on it, instead of assuming frame0 is representative.
+
+Membership is always decided on CPU in float64 -- not configurable -- because
+that is the exact same canonical computation
+``scripts/build_exp012_teacher_latent_cache.py`` uses to decide membership
+before handing the discrete result to CUDA for the actual MACE forward. An
+earlier version of this script let ``--dtype`` vary and ran everything on
+CPU regardless, and a bulk run on CUDA disagreed with it by a couple of
+edges on one frame -- not a bug in either side, just two independent
+floating-point implementations of the same boundary-sensitive discrete
+decision. Sharing one canonical CPU float64 computation removes that
+disagreement by construction; see DEC-032 Option C.
 """
 
 from __future__ import annotations
@@ -39,7 +50,7 @@ _ION_RESIDUE_NAMES = {"NA", "CL", "K", "MG", "CA", "ZN", "LI", "RB", "CS", "F", 
 
 from exp012_xed.schema import load_preregistration  # noqa: E402
 from local_residual.environment import canonical_json_bytes  # noqa: E402
-from local_residual.mace_graph import _build_cutoff_edges_chunked, topology_n_hop_closure  # noqa: E402
+from local_residual.teacher_graph import compute_canonical_graph_membership  # noqa: E402
 
 
 class GeometryAuditError(ValueError):
@@ -81,7 +92,6 @@ def _init_worker(
     residue_name_by_topology_index: list[str],
     edge_cutoff_angstrom: float,
     interaction_layers: int,
-    dtype_name: str,
 ) -> None:
     import torch
 
@@ -90,7 +100,6 @@ def _init_worker(
     _WORKER_STATE["residue_name_by_topology_index"] = residue_name_by_topology_index
     _WORKER_STATE["edge_cutoff_angstrom"] = edge_cutoff_angstrom
     _WORKER_STATE["interaction_layers"] = interaction_layers
-    _WORKER_STATE["dtype_name"] = dtype_name
 
 
 def _frame_geometry_worker(task: tuple) -> dict[str, Any]:
@@ -99,24 +108,21 @@ def _frame_geometry_worker(task: tuple) -> dict[str, Any]:
     residue_name_by_topology_index = _WORKER_STATE["residue_name_by_topology_index"]
     edge_cutoff_angstrom = _WORKER_STATE["edge_cutoff_angstrom"]
     interaction_layers = _WORKER_STATE["interaction_layers"]
-    dtype_name = _WORKER_STATE["dtype_name"]
     import numpy as np
     import torch
 
-    torch_dtype = torch.float64 if dtype_name == "float64" else torch.float32
-    positions = torch.tensor(np.asarray(positions_angstrom), dtype=torch_dtype)
-    cell = torch.tensor(np.asarray(cell_angstrom), dtype=torch_dtype)
-    closure, hop = topology_n_hop_closure(
-        positions, cell, ligand_indices,
+    # DEC-032 Option C: graph membership is decided exactly once, on CPU
+    # float64, by the same function the bulk CUDA cache uses for its
+    # membership decision -- so this report's counts and membership hash are
+    # what the bulk run will also compute, not an independent CPU estimate of
+    # it that can disagree at a cutoff-boundary pair.
+    positions = torch.tensor(np.asarray(positions_angstrom), dtype=torch.float64)
+    cell = torch.tensor(np.asarray(cell_angstrom), dtype=torch.float64)
+    membership = compute_canonical_graph_membership(
+        positions, cell, ligand_indices=ligand_indices,
         edge_cutoff_angstrom=edge_cutoff_angstrom, interaction_layers=interaction_layers,
     )
-    topology_order = sorted(
-        int(index) for index in torch.nonzero(closure, as_tuple=False).flatten().tolist()
-    )
-    topology_index = torch.tensor(topology_order, dtype=torch.long)
-    selected_positions = positions[topology_index]
-    edge_index, _ = _build_cutoff_edges_chunked(selected_positions, cell, edge_cutoff_angstrom)
-    hop_at_selected = hop[topology_index]
+    topology_order = membership["topology_index"].tolist()
 
     ligand_set = {int(index) for index in ligand_indices}
     water = ion = other_environment = 0
@@ -133,11 +139,10 @@ def _frame_geometry_worker(task: tuple) -> dict[str, Any]:
 
     return {
         "frame_index": frame_index,
-        "node_count": len(topology_order),
-        "edge_count": int(edge_index.shape[1]),
-        "hop_counts_by_layer": [
-            int((hop_at_selected == layer).sum().item()) for layer in range(interaction_layers + 1)
-        ],
+        "node_count": membership["node_count"],
+        "edge_count": membership["edge_count"],
+        "hop_counts_by_layer": membership["hop_counts_by_layer"],
+        "graph_membership_sha256": membership["graph_membership_sha256"],
         "environment_water_atom_count": water,
         "environment_ion_atom_count": ion,
         "environment_other_atom_count": other_environment,
@@ -195,7 +200,6 @@ def main(argv: list[str] | None = None) -> int:
         help="repeatable; default is every run_id registered in the preregistration",
     )
     parser.add_argument("--frame-stride", type=int, default=1)
-    parser.add_argument("--dtype", choices=("float32", "float64"), default="float64")
     parser.add_argument("--num-workers", type=int, default=_default_num_workers())
     parser.add_argument("--output", required=True)
     args = parser.parse_args(argv)
@@ -244,7 +248,7 @@ def main(argv: list[str] | None = None) -> int:
         max_workers=args.num_workers, initializer=_init_worker,
         initargs=(
             ligand_indices, residue_name_by_topology_index,
-            args.edge_cutoff_angstrom, args.interaction_layers, args.dtype,
+            args.edge_cutoff_angstrom, args.interaction_layers,
         ),
     ) as executor:
         for run_id in run_ids:
@@ -317,7 +321,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     body = {
-        "schema_version": "exp012-per-frame-teacher-graph-geometry-v1",
+        "schema_version": "exp012-per-frame-teacher-graph-geometry-v2",
         "status": "COMPLETED_GEOMETRY_ONLY_NO_MACE",
         "encoder_variant": ENCODER_VARIANTS[args.edge_cutoff_angstrom],
         "preregistration_sha256": registration.payload_sha256,
@@ -325,6 +329,8 @@ def main(argv: list[str] | None = None) -> int:
         "interaction_layers": args.interaction_layers,
         "ligand_atom_count": len(ligand_indices),
         "num_workers": args.num_workers,
+        "graph_membership_device": "cpu",
+        "graph_membership_dtype": "float64",
         "runs": run_reports,
         "overall_max_edge_count_frame": overall_max_edge,
         "overall_max_node_count_frame": overall_max_node,

@@ -563,16 +563,16 @@ CHARGE_TREATMENTS = (
 # 证据：`tests/test_charge_transfer_hamiltonian.py`（§7.2 逐 λ 电荷守恒 / §7.3 co-ion 物理）。
 CHARGE_TRANSFER_HAMILTONIAN_IMPLEMENTED = True
 
-# 🚧 B4 未落地：溶剂腿 builder 还不会构造"ligand + water + 普通盐 + reserved co-ion"
-# 那个盒子（§4.1）。复合物腿的哈密顿量已经可以跑（pilot / λ 阶梯重估、§6.4 明确要求
-# 用 pilot 重新定窗口数），但**整条热力学循环闭不上**：溶剂腿里没有 reserved co-ion，
-# ΔG_solv 与 ΔG_cplx 的 co-ion 项就不对消。
+# ✅ B4 已落地（2026-08-05）：`runabfe.build_and_cache_solvent_leg` 现在会在
+# `charge_treatment=co_alchemical_charge_transfer` 且配体带净电荷时，额外插入
+# `|q_L|` 个建系时预留的中性 ion-shaped dummy（§4.1），让
+# `ibs_engine.select_co_alchemical_ion_once` 能在溶剂腿里认出它——复合物腿和
+# 溶剂腿从此走同一条身份识别路径，热力学循环闭得上了。
 #
-# 所以这里**不**在 `resolve_charge_treatment` 里一刀切 fail closed（那会连 pilot 都做不了），
-# 而是：解析结果里如实带上 `solvent_leg_builder_implemented: False`，
-# 由真正构建溶剂腿的那一处 fail closed（唯一的门，不是两套判据），
-# 且 runabfe 在开跑前就大声警告"这条运行不得报出 ΔG_bind"。
-CHARGE_TRANSFER_SOLVENT_LEG_IMPLEMENTED = False
+# ⚠️ 这个 True 只代表"builder 会产出满足判据的粒子"，不代表已经在真实带电配体
+# 体系上跑通验证过（本仓库当前的生产体系 Atenolol 净电荷为 0，这条路径测不出来）；
+# §4.2/§4.4 的盒子尺寸敏感性、平衡稳定性仍待真正带电配体上机验证。
+CHARGE_TRANSFER_SOLVENT_LEG_IMPLEMENTED = True
 
 # §13.2 数值自洽的两个容差。放在这里是因为本层就要用；§13 的完整阈值表另立。
 LIGAND_NET_CHARGE_INTEGER_TOLERANCE_E = 1.0e-3
@@ -593,6 +593,15 @@ CO_ALCHEMICAL_ION_REQUIRED_FIELDS = (
     "restraint",
 )
 
+# Candidate residue names used by both the solvent builder and the frozen
+# identity layer.  A residue name alone never proves that a particle is a
+# reserved dummy; callers must also verify its zero lambda=1 charge.
+CO_ALCHEMICAL_ION_RESIDUE_NAMES = frozenset(
+    {"CL", "CLA", "CL-", "NA", "NA+", "SOD", "K", "K+", "POT", "MG", "CA"}
+)
+
+CO_ALCHEMICAL_ION_BUILDER_IDENTITY_SCHEMA_VERSION = 1
+
 # §5 / §1.2：选 Rocklin 路线时必须真的有 APBS 证据，不能只填一个数。
 APBS_REQUIRED_EVIDENCE_FIELDS = (
     "manifest_path",
@@ -608,6 +617,7 @@ def resolve_charge_treatment(
     ligand_net_charge_e: float,
     apbs_correction_kJ_mol: float = 0.0,
     co_alchemical_ion: Optional[Any] = None,
+    require_co_alchemical_ion: bool = False,
     environment_type: Optional[str] = None,
     apbs_evidence: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -616,6 +626,12 @@ def resolve_charge_treatment(
     `charge_treatment=None` 时按 §1.2 的生产默认推导：中性配体 → `neutral`，
     带电配体 → `co_alchemical_charge_transfer`。**这不是"猜协议"**——它只看配体
     净电荷这一个客观量，与清单禁止的"根据有没有 APBS 数值猜"是两回事。
+
+    `co_alchemical_ion` 现在只接受一个**可选的兼容性 override**：真正的 B3–B5
+    运行身份由 complex/solvent 两条 pipeline 各自选择并冻结，不能靠一个全局
+    atom-index spec 作为前置放行条件。若调用方确实要在这个纯校验层验证一份
+    外部 spec，可显式传入它；旧的“必须在前置阶段提供全局 spec”行为只有在
+    `require_co_alchemical_ion=True` 时才启用。
 
     `ligand_net_charge_e` 由调用方用现有实现算出并传入（复合物腿走
     `ibs_engine._compute_ligand_net_charge`），本函数不自己再数一遍电荷，
@@ -712,12 +728,13 @@ def resolve_charge_treatment(
                 )
         else:
             # fail-closed #3：charge-transfer 缺 co-ion 身份/参数/restraint。
-            if not co_alchemical_ion:
+            if require_co_alchemical_ion and co_alchemical_ion is None:
                 raise ValueError(
                     "charge_treatment=co_alchemical_charge_transfer 但没有提供 "
                     "co_alchemical_ion 身份、参数与 restraint（§1.2 fail-closed 第 3 条、§3.4）。"
                 )
-            _validate_co_alchemical_ion_spec(co_alchemical_ion, q_int)
+            if co_alchemical_ion is not None:
+                _validate_co_alchemical_ion_spec(co_alchemical_ion, q_int)
             if not CHARGE_TRANSFER_HAMILTONIAN_IMPLEMENTED:
                 raise NotImplementedError(
                     "charge_treatment=co_alchemical_charge_transfer 的 charging "
@@ -1652,6 +1669,166 @@ def verify_co_alchemical_ion_identity(
     if len(pinned) != len(set(pinned)):
         raise ValueError(f"co-ion 身份 spec 出现重复 atom_index{where}：{pinned}")
     return pinned
+
+
+def co_alchemical_ion_cache_identity_payload(
+    spec: Optional[Dict[str, Any]],
+    *,
+    system: Any,
+    topology: Any,
+    leg: str,
+    spec_relative_path: str,
+    charge_treatment: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return the minimal frozen co-ion identity consumed by cache protocols.
+
+    This is deliberately a thin read-only adapter around the one canonical
+    spec verifier/fingerprint.  It never selects an ion, never reads
+    coordinates, and never includes ``selection_provenance`` or absolute
+    positions.  Neutral legs return ``None`` so their legacy cache semantics
+    remain unchanged.
+    """
+    requested_treatment = (
+        None if charge_treatment is None else str(charge_treatment)
+    )
+    if spec is None:
+        if requested_treatment == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
+            raise ValueError(
+                "co-ion runtime identity 缺少 charge-transfer spec："
+                f"leg={leg!r}, path={spec_relative_path!r}"
+            )
+        return None
+    if not isinstance(spec, dict):
+        raise ValueError(
+            f"co-ion runtime identity for leg={leg!r} has invalid spec type "
+            f"{type(spec).__name__}; spec={spec_relative_path}"
+        )
+    resolved_leg = str(leg)
+    if resolved_leg not in {"complex", "solvent"}:
+        raise ValueError(f"co-ion runtime identity has unknown leg={resolved_leg!r}")
+    try:
+        q_l = int(spec["ligand_net_charge_e"])
+        treatment = str(spec["charge_treatment"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"co-ion runtime identity spec is incomplete for leg={resolved_leg!r}: "
+            f"{spec_relative_path}"
+        ) from exc
+    if requested_treatment is not None and requested_treatment != treatment:
+        raise ValueError(
+            "co-ion runtime identity charge_treatment 不匹配："
+            f"当前运行={requested_treatment!r}，spec={treatment!r}，"
+            f"leg={resolved_leg!r}, path={spec_relative_path!r}"
+        )
+    verify_co_alchemical_ion_identity(
+        spec,
+        system=system,
+        topology=topology,
+        # Always pass the route requested by the current caller.  When a
+        # legacy direct caller omits it, None deliberately means "no route
+        # assertion"; never substitute the spec's self-declaration here.
+        charge_treatment=requested_treatment,
+        ligand_net_charge_e=q_l,
+        context=f"B5 runtime identity leg={resolved_leg} path={spec_relative_path}",
+    )
+    return {
+        "schema_version": 1,
+        "leg": resolved_leg,
+        "charge_treatment": treatment,
+        "identity_protocol_version": int(spec["protocol_version"]),
+        "fingerprint": str(spec["fingerprint"]),
+        "ligand_net_charge_e": q_l,
+        "lambda_direction": str(spec["lambda_direction"]),
+        "ion_atom_indices": [int(ion["atom_index"]) for ion in spec["ions"]],
+        "spec_relative_path": os.path.normpath(str(spec_relative_path)),
+    }
+
+
+def co_alchemical_ion_builder_identity_payload(
+    *,
+    system: Any,
+    topology: Any,
+    charge_treatment: Optional[str],
+    ligand_net_charge_e: int,
+) -> Optional[Dict[str, Any]]:
+    """Recompute the coordinate-free identity of reserved co-ion dummies.
+
+    The identity is derived from the current base System/Topology, never
+    copied back from a manifest.  It is intentionally separate from the
+    runtime spec fingerprint: the builder identity answers *which dummy
+    particles were built*, while the runtime identity answers *which frozen
+    spec was used by a leg*.
+    """
+    treatment = None if charge_treatment is None else str(charge_treatment)
+    if treatment != CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
+        return None
+    q_l = int(ligand_net_charge_e)
+    if q_l == 0:
+        return None
+    try:
+        import openmm
+        nb_force = next(
+            force for force in system.getForces()
+            if isinstance(force, openmm.NonbondedForce)
+        )
+    except (StopIteration, AttributeError) as exc:
+        raise RuntimeError(
+            "无法重算 reserved co-ion builder identity：System 缺少 NonbondedForce"
+        ) from exc
+
+    atoms = list(topology.atoms())
+    candidates = []
+    for atom in atoms:
+        if str(atom.residue.name).upper() not in CO_ALCHEMICAL_ION_RESIDUE_NAMES:
+            continue
+        charge, sigma, epsilon = nb_force.getParticleParameters(int(atom.index))
+        charge_e = float(charge.value_in_unit(unit.elementary_charge))
+        if abs(charge_e) > TOTAL_CHARGE_CONSERVATION_TOLERANCE_E:
+            continue
+        candidates.append(
+            {
+                "atom_index": int(atom.index),
+                "residue_index": int(atom.residue.index),
+                "residue_name": str(atom.residue.name),
+                "element": str(getattr(atom.element, "symbol", "") or ""),
+                "charge_at_lambda1_e": charge_e,
+                "sigma_nm": float(sigma.value_in_unit(unit.nanometer)),
+                "epsilon_kj_mol": float(
+                    epsilon.value_in_unit(unit.kilojoule_per_mole)
+                ),
+                "mass_amu": float(
+                    system.getParticleMass(int(atom.index)).value_in_unit(unit.dalton)
+                ),
+            }
+        )
+    candidates.sort(key=lambda item: item["atom_index"])
+    expected_count = abs(q_l)
+    if len(candidates) != expected_count:
+        raise ValueError(
+            "reserved co-ion builder identity 不满足 charge-transfer 数量契约："
+            f"leg system 中找到 {len(candidates)} 个中性 ion-shaped dummy，"
+            f"但配体净电荷 {q_l:+d} e 需要 {expected_count} 个。"
+        )
+    return {
+        "schema_version": CO_ALCHEMICAL_ION_BUILDER_IDENTITY_SCHEMA_VERSION,
+        "charge_treatment": treatment,
+        "ligand_net_charge_e": q_l,
+        "reserved_coion_count": expected_count,
+        "ions": candidates,
+        "restraint_protocol": {
+            "protocol_version": int(CO_ALCHEMICAL_ION_IDENTITY_PROTOCOL_VERSION),
+            "form": CO_ALCHEMICAL_ION_RESTRAINT_FORM_FLAT_BOTTOM,
+            "reference_frame": CO_ALCHEMICAL_ION_RESTRAINT_REFERENCE_FRAME,
+            "expression": CO_ALCHEMICAL_ION_RESTRAINT_EXPRESSION,
+            "default_k_kj_per_mol_nm2": float(COION_FLAT_BOTTOM_K_KJ_PER_MOL_NM2),
+            "default_r0_nm": float(COION_FLAT_BOTTOM_RADIUS_NM),
+            "force_group": int(CO_ALCHEMICAL_ION_RESTRAINT_FORCE_GROUP),
+        },
+    }
+
+
+# Descriptive alias used by cache/provenance callers and tests.
+reserved_coion_builder_identity_payload = co_alchemical_ion_builder_identity_payload
 
 
 # ============================================================================
@@ -2984,12 +3161,162 @@ def resolve_dispersion_protocol(
             str(forcefield_family).strip().lower() if forcefield_family else None
         ),
         "implemented": resolved in DISPERSION_PROTOCOLS_IMPLEMENTED,
+        # ⚠️ 这个键说的是"**目标**是不是 legacy 那条均匀密度 LRC 路线"，
+        # **不是**"某一条腿实际加不加解析尾项"。后者要按腿的环境判，见
+        # `resolve_leg_dispersion_implementation()`。两者曾被混为一谈（B6-FIX）。
         "uniform_density_lrc_active": (
             resolved == DISPERSION_PROTOCOL_LEGACY_UNIFORM_LRC
         ),
         # §5 最后一条 / §6.5：APBS 与 LJ 色散正交，不得互相顶替。
         "apbs_is_orthogonal_to_dispersion": True,
     }
+
+
+# ============================================================================
+# B6-FIX（2026-08-04）：把"目标 Hamiltonian"与"每条腿实现该目标的环境专用长程处理"
+# 拆开。
+#
+# 起因是一条实测出来的自相矛盾：膜运行的**溶剂腿**（4.05 nm 纯水盒）在
+# `final_results.json` 里带着这句理由——
+#
+#     disabled_by_membrane_forcefield_protocol: …配体所在口袋的局域密度既不是水
+#     也不是体相脂质
+#
+# 而那条腿里配体周围**恰恰就是**均匀体相水。根因是判据只有一个全局布尔：
+#
+#     apply_lrc = (dispersion_protocol == "legacy_uniform_density_lrc")
+#
+# 它没有环境维度，于是"复合物腿口袋里不均匀"这个正确理由被原样套到了水盒上，
+# 把一条**合法**的 bulk-water 尾项修正一起关掉了。实测代价：同一个配体
+# （Atenolol，41 原子）的溶剂腿 vanishing 从 96.96 变成 83.83 kJ/mol（−13.1）。
+#
+# 正确的分层：
+#
+#     dispersion_protocol  = **目标**：所选力场原始参数化时的色散条件
+#                            （Amber Lipid21 = 开各向同性 LRC；CHARMM36 = force-switch 不加 LRC）
+#     ↓  每条腿在**自己的环境**里怎么达成这个目标
+#     实现              = f(目标, 该腿配体所处环境)
+#
+# 环境维度取 `system_type`，那是**用户在输入文件里显式声明**的值（B1 的规矩是
+# 「不许按残基名猜 system_type」，不是「不许用声明出来的 system_type 分派」），
+# 所以按它自动切换实现是合法的、可审计的，不是运行时猜测。
+#
+# 溶剂腿天然落在 soluble 一侧：`runabfe` 构造溶剂腿 pipeline 时**刻意不传**
+# `environment_type`/`membrane`（B1 的接线契约测试钉着这一点），于是它解析出来
+# 就是 soluble —— 不需要为这条腿新造任何标记。
+# ============================================================================
+
+# 实现名（进 provenance / final_results.json，机器可读，别改措辞）。
+DISPERSION_IMPL_UNIFORM_BULK_ANALYTIC_TAIL = "uniform_bulk_density_analytic_tail"
+DISPERSION_IMPL_TRUNCATED_NO_TAIL = "truncated_no_analytic_tail"
+DISPERSION_IMPL_FORCE_SWITCH_NO_TAIL = "force_switch_no_tail_by_forcefield_design"
+
+
+def resolve_leg_dispersion_implementation(
+    dispersion_protocol: Optional[str],
+    environment_type: Optional[str] = None,
+) -> Dict[str, Any]:
+    """给**一条腿**定"炼金 ligand–environment 的长程色散怎么处理"。
+
+    返回里 `alchemical_uniform_density_lrc` 就是那个唯一的布尔判据；
+    `target_met` 说明这条腿有没有真正达成力场参数化条件所要求的目标
+    —— 膜复合物腿目前**达不成**（需要 §1.3 路线 C 的非均匀修正，未实现），
+    这一点必须如实写进结果，而不是把"关掉了"记成"处理好了"。
+
+    | 目标 dispersion_protocol | 该腿环境 | 炼金 LRC | target_met |
+    | --- | --- | --- | --- |
+    | `legacy_uniform_density_lrc` | soluble | 开 | 是（改动前唯一行为，逐位不变）|
+    | `ff_native_isotropic_lrc`    | soluble（含膜运行的溶剂腿）| **开** | 是 |
+    | `ff_native_isotropic_lrc`    | membrane | 关 | **否**（路线 C 未实现）|
+    | `ff_native_force_switch_no_lrc` | 任意 | 关 | 是（力场本身就不加 LRC）|
+
+    ⚠️ 非 legacy 目标**必须显式给出 `environment_type`**：这一维决定加不加修正，
+    缺省猜哪一边都会静默出错（猜 soluble → 膜口袋里加上无效修正；猜 membrane →
+    又把水盒的合法修正关掉，即本次要修的 bug）。所以缺就 raise。
+    """
+    protocol = str(dispersion_protocol or "").strip().lower()
+    if not protocol:
+        protocol = DISPERSION_PROTOCOL_LEGACY_UNIFORM_LRC
+
+    if protocol == DISPERSION_PROTOCOL_LEGACY_UNIFORM_LRC:
+        # legacy 是本改动之前唯一存在的路线，且 membrane+legacy 在
+        # `resolve_dispersion_protocol` 就已 fail closed，所以这里不需要环境维度。
+        return {
+            "dispersion_protocol": protocol,
+            "environment_type": resolve_environment_type(environment_type),
+            "ligand_environment_is_uniform_bulk": True,
+            "alchemical_uniform_density_lrc": True,
+            "implementation": DISPERSION_IMPL_UNIFORM_BULK_ANALYTIC_TAIL,
+            "target_met": True,
+            "reason": "",
+        }
+
+    if environment_type is None:
+        raise ValueError(
+            f"dispersion_protocol={protocol!r} 是非 legacy 路线，必须显式给出这条腿的 "
+            "environment_type。它决定炼金 ligand–environment 的均匀密度尾项加不加：\n"
+            "    · 纯水/可溶腿：配体周围就是均匀体相 ⟹ 该修正**成立**，关掉是错的；\n"
+            "    · 膜复合物腿：口袋局域密度既不是水也不是体相脂质 ⟹ 该修正不成立。\n"
+            "    缺省猜任何一边都会静默产出错误的 ΔG（B6-FIX 修的正是猜错方向那一版）。"
+        )
+    resolved_env = resolve_environment_type(environment_type)
+    is_membrane = resolved_env == ENVIRONMENT_TYPE_MEMBRANE
+
+    if protocol == DISPERSION_PROTOCOL_FF_NATIVE_FORCE_SWITCH_NO_LRC:
+        return {
+            "dispersion_protocol": protocol,
+            "environment_type": resolved_env,
+            "ligand_environment_is_uniform_bulk": not is_membrane,
+            "alchemical_uniform_density_lrc": False,
+            "implementation": DISPERSION_IMPL_FORCE_SWITCH_NO_TAIL,
+            # 力场原始参数化就不带 LRC，所以"不加"正是达成目标。
+            "target_met": True,
+            "reason": (
+                "no_analytic_tail_by_forcefield_design: "
+                f"dispersion_protocol={protocol!r} 的力场原始参数化条件是 force-switch "
+                "且**不加**长程色散修正，因此炼金 ligand–environment 也不加解析尾项"
+            ),
+        }
+
+    if protocol == DISPERSION_PROTOCOL_FF_NATIVE_ISOTROPIC_LRC:
+        if is_membrane:
+            return {
+                "dispersion_protocol": protocol,
+                "environment_type": resolved_env,
+                "ligand_environment_is_uniform_bulk": False,
+                "alchemical_uniform_density_lrc": False,
+                "implementation": DISPERSION_IMPL_TRUNCATED_NO_TAIL,
+                # ⚠️ 达不成目标：力场是在开着各向同性色散修正的条件下拟合的，
+                # 而这条腿的炼金 ligand–environment 项现在是**截断**的。
+                # 正解是 §1.3 路线 C（膜非均匀色散修正），尚未实现。
+                "target_met": False,
+                # §1.3 指定的机器可读字符串，措辞不要改。
+                "reason": (
+                    "disabled_by_membrane_forcefield_protocol: "
+                    f"dispersion_protocol={protocol!r} 且该腿 environment_type='membrane' 时，"
+                    "炼金 ligand–environment 的均匀体相密度 LRC 不适用"
+                    "（配体所在口袋的局域密度既不是水也不是体相脂质）；"
+                    "环境–环境色散仍按所选力场的原始参数化条件由基础 NonbondedForce 处理。"
+                    "达成目标需要 §1.3 路线 C 的非均匀色散修正（未实现），"
+                    "所以本腿记为 target_met=false 而不是"
+                    "「已正确处理」"
+                ),
+            }
+        return {
+            "dispersion_protocol": protocol,
+            "environment_type": resolved_env,
+            "ligand_environment_is_uniform_bulk": True,
+            "alchemical_uniform_density_lrc": True,
+            "implementation": DISPERSION_IMPL_UNIFORM_BULK_ANALYTIC_TAIL,
+            "target_met": True,
+            "reason": "",
+        }
+
+    raise ValueError(
+        f"dispersion_protocol={protocol!r} 没有对应的每腿实现映射；"
+        f"合法值 {list(DISPERSION_PROTOCOLS)}，其中路线 B/C 在 "
+        "`resolve_dispersion_protocol` 就已 NotImplementedError。"
+    )
 
 
 # ============================================================================
@@ -6059,6 +6386,254 @@ Binding free energy:
 """.strip()
 
 
+# ============================================================================
+# P0-12a：配体构象诊断 + 跨腿构象一致性门（memtodolist §3.0 末条）
+#
+# §3.0 早就写着：「若配体本身亲脂，溶剂腿（纯水）里可能出现构象塌缩或自聚集；
+# 记录溶剂腿配体回转半径与内部氢键随 λ 的变化。」**那条诊断一直没实现**，
+# 于是 2026-08-04 那轮膜运行里它真的发生了、跑完了、汇总了，全程没有任何报警：
+#
+#     配体重原子最大内距（去电荷 12 个 replica、600 帧汇总）
+#       膜运行 复合物腿  p5–p95 = 1.34–1.44 nm   （口袋撑着，伸展）
+#       膜运行 溶剂腿    p5–p95 = 0.62–0.71 nm   ← 塌缩，且 12 个 replica 零涨落
+#       可溶   复合物腿  p5–p95 = 1.34–1.44 nm
+#       可溶   溶剂腿    p5–p95 = 0.73–1.39 nm   ← 健康：从塌缩到伸展都采到
+#
+# 后果不是"某个数偏了"，而是**两条腿在给不同的构象族做热力学循环**：
+# 塌缩构象把极性基团聚拢 ⟹ 配体–水静电耦合强 3 倍
+# （⟨U_lig-env⟩ = −569 ± 90 vs −190 ± 34 kJ/mol）⟹ 去电荷 191.05 vs 62.80 kJ/mol。
+# ΔG_bind = ΔG_solv − ΔG_cplx 在这种情况下没有意义。
+#
+# 判据为什么取「两条腿的 [p5, p95] 必须重叠」而不是某个绝对阈值：
+#   · 它是**物理要求**——循环有意义的前提是两条腿采的是同一个分子的同一个构象族，
+#     溶剂腿的分布应当**覆盖**复合物腿采到的那些构象（通常还更宽）；
+#   · 它不是为了让哪次运行变绿而调出来的数：实测可溶基线 1.34–1.44 vs 0.73–1.39
+#     **有重叠**（1.34–1.39）而膜运行 1.34–1.44 vs 0.62–0.71 **完全不重叠**，
+#     两者是被同一条判据分开的，没有留任何可调旋钮。
+# ⚠️ 不要为了让某次运行通过而把百分位放宽成 [p0, p100] 或改成"均值差 < 某个 nm"。
+#    不重叠的正解是修采样（双起点 / 加构象采样维度），不是放宽门。
+# ============================================================================
+
+LIGAND_CONFORMER_DIAGNOSTICS_VERSION = 1
+# 判重叠用的百分位区间。取 p5/p95 而不是 min/max：端点单帧极值噪声大，
+# 用它判"分布是否重叠"会把一次偶然的伸展当成充分采样。
+LIGAND_CONFORMER_OVERLAP_PERCENTILES = (5.0, 95.0)
+# 内部极性接触（§3.0 的"内部氢键"代理量）：N/O 重原子对，键路径隔 ≥ 4 键。
+# 用重原子距离而不是显式 H 几何，是为了不依赖氢的命名/位置，换体系不会挂。
+LIGAND_INTERNAL_POLAR_CONTACT_NM = 0.35
+LIGAND_INTERNAL_POLAR_MIN_BOND_SEPARATION = 4
+
+
+def ligand_conformer_metrics(
+    xyz_nm: Any,
+    heavy_local_indices: Sequence[int],
+    masses_amu: Optional[Sequence[float]] = None,
+    polar_pairs: Optional[Sequence[Tuple[int, int]]] = None,
+) -> Dict[str, np.ndarray]:
+    """逐帧算配体构象度量。`xyz_nm` 形状 (n_frames, n_ligand_atoms, 3)。
+
+    索引都是**配体局部**索引（0..n_ligand_atoms-1），不是全体系索引 ——
+    调用方只需要把配体那几十个原子的坐标切出来，不用搬整条轨迹。
+
+    返回三个逐帧数组：
+      * `max_internal_heavy_distance_nm`：重原子间最大距离。**主判据**，
+        对"塌缩 vs 伸展"最敏感（实测 0.66 vs 1.28 nm）。
+      * `radius_of_gyration_nm`：§3.0 明确要求记录的那个量（质量加权）。
+      * `internal_polar_contact_count`：§3.0 的"内部氢键"代理量。
+    """
+    xyz = np.asarray(xyz_nm, dtype=np.float64)
+    if xyz.ndim != 3 or xyz.shape[2] != 3:
+        raise ValueError(f"xyz_nm 形状非法：{xyz.shape}，期望 (n_frames, n_atoms, 3)")
+    heavy = np.asarray(list(heavy_local_indices), dtype=int)
+    if heavy.size < 2:
+        raise ValueError(
+            f"配体重原子少于 2 个（{heavy.size}），无法定义构象度量。"
+        )
+
+    h = xyz[:, heavy, :]
+    d = np.linalg.norm(h[:, :, None, :] - h[:, None, :, :], axis=-1)
+    max_internal = d.max(axis=(1, 2))
+
+    if masses_amu is None:
+        w = np.ones(heavy.size, dtype=np.float64)
+    else:
+        w = np.asarray([float(masses_amu[i]) for i in heavy], dtype=np.float64)
+    com = (h * w[None, :, None]).sum(axis=1) / w.sum()
+    rg = np.sqrt(
+        ((np.linalg.norm(h - com[:, None, :], axis=-1) ** 2) * w[None, :]).sum(axis=1)
+        / w.sum()
+    )
+
+    if polar_pairs:
+        pairs = np.asarray(polar_pairs, dtype=int)
+        pd = np.linalg.norm(xyz[:, pairs[:, 0], :] - xyz[:, pairs[:, 1], :], axis=-1)
+        contacts = (pd <= LIGAND_INTERNAL_POLAR_CONTACT_NM).sum(axis=1)
+    else:
+        contacts = np.zeros(xyz.shape[0], dtype=int)
+
+    return {
+        "max_internal_heavy_distance_nm": max_internal,
+        "radius_of_gyration_nm": rg,
+        "internal_polar_contact_count": contacts.astype(float),
+    }
+
+
+def _series_summary(values: Any) -> Dict[str, Any]:
+    v = np.asarray(values, dtype=np.float64).ravel()
+    lo, hi = LIGAND_CONFORMER_OVERLAP_PERCENTILES
+    return {
+        "n": int(v.size),
+        "mean": float(np.mean(v)),
+        "std": float(np.std(v)),
+        "min": float(np.min(v)),
+        f"p{lo:g}": float(np.percentile(v, lo)),
+        "p50": float(np.percentile(v, 50.0)),
+        f"p{hi:g}": float(np.percentile(v, hi)),
+        "max": float(np.max(v)),
+    }
+
+
+def ligand_conformer_summary(
+    metrics: Dict[str, Any],
+    *,
+    leg: str,
+    source: str = "",
+) -> Dict[str, Any]:
+    """把逐帧度量汇总成可落盘、可跨腿比较的 summary。"""
+    return {
+        "protocol_version": LIGAND_CONFORMER_DIAGNOSTICS_VERSION,
+        "leg": str(leg),
+        "source": str(source),
+        "overlap_percentiles": list(LIGAND_CONFORMER_OVERLAP_PERCENTILES),
+        "observables": {
+            name: _series_summary(values) for name, values in metrics.items()
+        },
+    }
+
+
+def ligand_conformer_fingerprint(
+    positions_nm: Any,
+    ligand_indices: Sequence[int],
+    heavy_indices: Optional[Sequence[int]] = None,
+    decimals: int = 3,
+) -> Dict[str, Any]:
+    """[P0-12b] 配体**起始构象**的指纹，进溶剂腿缓存身份。
+
+    用内部距离矩阵（排序后取整）而不是原始坐标：刚体平移/旋转不该让缓存失效，
+    **构象**变了才该失效。而构象确实必须进身份 —— 实测同一个分子换一个起始构象，
+    溶剂腿去电荷从 62.80 变成 191.05 kJ/mol（P0-12），旧口径里这两次却都判"缓存有效"。
+    """
+    import hashlib
+
+    pos = np.asarray(positions_nm, dtype=np.float64)
+    idx = np.asarray(sorted(int(i) for i in ligand_indices), dtype=int)
+    heavy = (
+        np.asarray(sorted(int(i) for i in heavy_indices), dtype=int)
+        if heavy_indices is not None
+        else idx
+    )
+    h = pos[heavy]
+    d = np.linalg.norm(h[:, None, :] - h[None, :, :], axis=-1)
+    iu = np.triu_indices(len(heavy), k=1)
+    rounded = np.round(np.sort(d[iu]), int(decimals))
+    blob = ",".join(f"{v:.{int(decimals)}f}" for v in rounded)
+    return {
+        "sha256": hashlib.sha256(blob.encode("utf-8")).hexdigest(),
+        "n_heavy_atoms": int(len(heavy)),
+        "decimals": int(decimals),
+        "max_internal_heavy_distance_nm": float(d.max()),
+        "radius_of_gyration_nm": float(
+            np.sqrt(np.mean(np.linalg.norm(h - h.mean(axis=0), axis=-1) ** 2))
+        ),
+        "invariant_under": "rigid_translation_and_rotation",
+    }
+
+
+def evaluate_cross_leg_conformer_consistency(
+    complex_summary: Optional[Dict[str, Any]],
+    solvent_summary: Optional[Dict[str, Any]],
+    observable: str = "max_internal_heavy_distance_nm",
+) -> Dict[str, Any]:
+    """[P0-12a] 两条腿的配体构象分布是否重叠；不重叠即不许汇总 ΔG_bind。
+
+    缺任何一侧的 summary 时**不判**（记 `not_evaluated` + 原因），因为判不了门
+    与"门过了"必须能区分开；这条路径留给 traditional / 后处理模式（它们没有
+    replica 轨迹可读）。IBS 生产路径两条腿都会给出 summary。
+    """
+    lo, hi = LIGAND_CONFORMER_OVERLAP_PERCENTILES
+    lo_key, hi_key = f"p{lo:g}", f"p{hi:g}"
+    report: Dict[str, Any] = {
+        "protocol_version": LIGAND_CONFORMER_DIAGNOSTICS_VERSION,
+        "observable": observable,
+        "overlap_percentiles": [lo, hi],
+        "evaluated": False,
+        "passed": None,
+        "reason": "",
+    }
+    if not complex_summary or not solvent_summary:
+        missing = [
+            name
+            for name, value in (("complex", complex_summary), ("solvent", solvent_summary))
+            if not value
+        ]
+        report["reason"] = (
+            f"not_evaluated_missing_conformer_summary_for_{'_and_'.join(missing)}"
+        )
+        return report
+    try:
+        c = complex_summary["observables"][observable]
+        s = solvent_summary["observables"][observable]
+    except (KeyError, TypeError):
+        report["reason"] = f"not_evaluated_observable_{observable}_absent"
+        return report
+
+    c_lo, c_hi = float(c[lo_key]), float(c[hi_key])
+    s_lo, s_hi = float(s[lo_key]), float(s[hi_key])
+    overlap = min(c_hi, s_hi) - max(c_lo, s_lo)
+    union = max(c_hi, s_hi) - min(c_lo, s_lo)
+    report.update(
+        {
+            "evaluated": True,
+            "complex_interval_nm": [c_lo, c_hi],
+            "solvent_interval_nm": [s_lo, s_hi],
+            "overlap_nm": float(overlap),
+            "union_nm": float(union),
+            "overlap_fraction_of_union": (
+                float(overlap / union) if union > 0 else None
+            ),
+            "complex_mean_nm": float(c["mean"]),
+            "solvent_mean_nm": float(s["mean"]),
+            "complex_std_nm": float(c["std"]),
+            "solvent_std_nm": float(s["std"]),
+            "passed": bool(overlap > 0.0),
+        }
+    )
+    if not report["passed"]:
+        report["reason"] = (
+            "cross_leg_conformer_ensembles_do_not_overlap: "
+            f"复合物腿 {observable} 的 [p{lo:g}, p{hi:g}] = [{c_lo:.3f}, {c_hi:.3f}] nm，"
+            f"溶剂腿 = [{s_lo:.3f}, {s_hi:.3f}] nm，两者不相交。"
+            "两条腿采的不是同一个构象族 ⟹ ΔG_bind = ΔG_solv − ΔG_cplx 没有意义（§3.0）。"
+            "⚠️ 严格说不重叠有两种读法：(1) 某条腿的构象系综**没收敛**（被困在一个 basin）；"
+            "(2) 两相的构象偏好**真的**差这么多，那个差值本该是 ΔG_bind 的一部分。"
+            "在当前每窗口 0.5 ns 的采样下这两者分辨不开 —— 看 "
+            "`per_replica_mean_max_internal_heavy_distance_nm`：若各 replica 挤在同一个"
+            "窄区间（实测 0.657–0.672 nm，σ=0.005）就是 (1)。所以门保守阻断，"
+            "由**溶剂腿双起点验证**（折叠/伸展各跑一遍，ΔG 差 ≤ 2σ）来区分，"
+            "**不是**放宽本判据的百分位区间。"
+        )
+    return report
+
+
+def assert_cross_leg_conformer_consistency(report: Dict[str, Any]) -> None:
+    """门：不重叠就 raise。判不了门（`evaluated=False`）不阻断，但会如实记录。"""
+    if report.get("evaluated") and not report.get("passed"):
+        raise ValueError(
+            "配体构象跨腿一致性门未通过（P0-12a / §3.0）：\n    "
+            + str(report.get("reason"))
+        )
+
+
 def combine_binding_free_energy(
     *,
     dg_complex_kJ_mol: float,
@@ -6068,6 +6643,8 @@ def combine_binding_free_energy(
     dg_boresch_kJ_mol: float = 0.0,
     boresch_already_included_in_complex: bool = True,
     apbs_correction_kJ_mol: float = 0.0,
+    complex_conformer_summary: Optional[Dict[str, Any]] = None,
+    solvent_conformer_summary: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """🔑 [ATT-09] 热力学循环闭合的**唯一**实现。
 
@@ -6111,6 +6688,14 @@ def combine_binding_free_energy(
     delta_g_bind = delta_g_bind_uncorrected + apbs
     total_err = float(np.sqrt(err_complex ** 2 + err_solvent ** 2))
 
+    # [P0-12a / §3.0] 汇总 ΔG_bind 之前先判跨腿构象一致性：不重叠就不许汇总。
+    # 门放在这里（热力学循环闭合的唯一实现）而不是各调用点，理由与 ATT-09 相同 ——
+    # 公式只有一份，门也只能有一份。
+    conformer_report = evaluate_cross_leg_conformer_consistency(
+        complex_conformer_summary, solvent_conformer_summary
+    )
+    assert_cross_leg_conformer_consistency(conformer_report)
+
     return {
         "complex_delta_G_kJ_mol": dg_complex,
         "solvent_delta_G_kJ_mol": dg_solvent,
@@ -6131,6 +6716,9 @@ def combine_binding_free_energy(
             "delta_G_bind = delta_G_solvent - delta_G_complex"
             " - boresch_term_subtracted + delta_G_APBS"
         ),
+        # [P0-12a] 循环闭合的前提是两条腿采的是同一个构象族。判不了门时
+        # `evaluated=False` 会如实记录，不会伪装成"通过"。
+        "ligand_conformer_cross_leg": conformer_report,
     }
 
 

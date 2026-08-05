@@ -1,6 +1,52 @@
 # 当前行动清单
 
-更新：2026-08-02。完整 2026-07-27 审计长记录已移入 [archive/TODO-2026-07-27-full.md](archive/TODO-2026-07-27-full.md)。历史原文见 [archive/todolist-2026-07-20.md](archive/todolist-2026-07-20.md)，审计证据见 [status/AUDIT_STATUS.md](status/AUDIT_STATUS.md)，运行验证见 [status/VALIDATION_MATRIX.md](status/VALIDATION_MATRIX.md)。本轮移出的完成/关闭项见 [../archive/todo-2026-07-29.md](../archive/todo-2026-07-29.md)。
+更新：2026-08-05。完整 2026-07-27 审计长记录已移入 [archive/TODO-2026-07-27-full.md](archive/TODO-2026-07-27-full.md)。历史原文见 [archive/todolist-2026-07-20.md](archive/todolist-2026-07-20.md)，审计证据见 [status/AUDIT_STATUS.md](status/AUDIT_STATUS.md)，运行验证见 [status/VALIDATION_MATRIX.md](status/VALIDATION_MATRIX.md)。本轮移出的完成/关闭项见 [../archive/todo-2026-07-29.md](../archive/todo-2026-07-29.md)。
+
+- **B4（溶剂腿 charge-transfer builder）已落地（2026-08-05）。** 详见 `memtodolist.md`
+  §1.2 `co_alchemical_charge_transfer` 条目与 §17.0。只在合成 topology 上单元测过，
+  未在真实带电配体体系上机验证（Atenolol 净电荷为 0，测不出来）。
+- **RESUME-FP-01：三处 resume 协议指纹误把"坐标数组"当强判据，已修（2026-08-05）。**
+  `abfe_pipeline.py` 的 `stage0_protocol_key`、`_stage_protocol_key`、
+  `_preopt_protocol_key`、`_build_top_level_protocol_key` 原本都把
+  `coordinates_nm_sha256`（即 `_positions_hash(self.positions)`）编进协议指纹。
+  但 `self.positions` 在"本次调用刚完成预平衡/Boresch 再平衡"（`run_full_pipeline`
+  第 1 节，额外叠了一次 2000 步最小化）与"resume 时直接读轨迹末帧"（不叠最小化）
+  这两条路径下，即使描述同一段已完成、内容完全相同的物理轨迹，也会产生不同的坐标
+  数组、从而不同的哈希——**用户真实运行的日志实测到了**："Boresch attachment stage0
+  缓存...不匹配，重新运行" + "已有 final_results.json 协议指纹不匹配"，即便预平衡/
+  Boresch 平衡值本身都通过了各自的校验（σ 偏差核对）。已把这四处的
+  `coordinates_nm_sha256` 移除；"坐标/构型是否还对得上"已经由
+  `boresch_equilibrium_committed.json` + `_assert_committed_boresch_still_matches_pose()`
+  与预平衡自己的 `pre_equilibration_fingerprint.json` + `status=completed` 门分别
+  守住。⚠️ 每 λ 窗口级的 GPU 采样 checkpoint（`_build_main_window_checkpoint_manifest`）
+  本来就不含这个哈希，不受影响——本次修复只影响"这条腿/这个 stage 是否已经整体
+  完成，可以直接跳过重算"这几处粗粒度快捷路径，不会让任何已完成的 λ 窗口采样重烧
+  GPU。回归：`tests/test_dispersion_protocol_is_honored.py`（15 passed）+ 全套
+  offline 回归（1056 passed 之外无新增失败；`test_exp012_schema.py` 的 11 个失败
+  与本次改动无关，是 `protocols/EXP-012_preregistration.json` 处于 `sealed` 状态
+  导致，另案）。
+- **BORESCH-ORDER-01：窗口预热在 EM 之后才打开 Boresch 限制力，排序反了，已修
+  （2026-08-05）。** 真实运行在窗口 5（vdw/vanishing，态 [19:23]）的 Boresch 安全
+  爬坡里，`sim.minimizeEnergy()` 内部直接崩溃：`openmm.OpenMMException: Particle
+  coordinate is NaN`。根因：`ibs_engine.run_all_windows()` 的"阶段1"最小化在
+  `lambda_boresch_scale`（System 级默认 0.0）从未被设置过的情况下就跑了——全新
+  窗口在**完全没有 Boresch 限制力**的状态下自由最小化，深度解耦窗口里配体没有
+  真实 vdW/Coulomb 力固定，实测漂出 committed 平衡几何（`r0=0.448nm` 漂到测得
+  `0.650nm`，~0.2nm 缺口）。原"阶段3"那段 16 级自定义爬坡（0.01→1.0）存在的
+  唯一理由就是靠一根逐渐加强、最终 kr=2000 kJ/mol/nm² 的弹簧把这 0.2nm 缺口拽
+  回来——窗口 5 就是在拽的中途（scale=0.05）内部发散。这是排序 bug，不是"需要
+  更精细的爬坡"：正常的 Boresch-restrained FEP/REMD 协议不会需要这种规模的分级
+  预热，爬坡的复杂度本身就是这个 bug 存在的证据。
+  修法（`ibs_engine.py::run_all_windows`，按用户明确指定的范围）：
+  `setPositions()` 之后、阶段1 最小化之前新增
+  `lambda_boresch_scale=1.0`；阶段1 现在就在生产哈密顿量下最小化；阶段2 里把
+  scale 压到 0.01 的那行**注释掉**（不删除）；原"阶段3"整段**注释掉**（不删除，
+  留作历史参考）；阶段2 的 dt 测试步进/约束死锁检测原样保留，只是现在全程在
+  Boresch 全强度下运行；checkpoint-restore 路径本来就在 restore 后重设 scale=1.0，
+  未改动。**不加**自适应爬坡、回滚/重试状态机或新 checkpoint 协议版本——已完成的
+  生产窗口本来就是在 scale=1.0 下采样完成的，不受影响。详见 `memtodolist.md`
+  §0.5.16。回归：`py_compile` 通过，全套 offline 回归无新增失败。⚠️ **未在真实
+  GPU 上验证窗口 5 现在能否正常收敛**，需要用户在自己的计算节点上实测确认。
 
 ## 当前决策
 
@@ -493,6 +539,154 @@
   charmm 分支因 OpenMM 无 force-switch 默认 fail closed；(3) 首个体系 SERT、配体 +1、
   结合位点非深埋，须排除结构性 Na⁺/Cl⁻ 进入 co-ion 候选。
   膜工作在 P1-19/P1-22 收口前不进生产（P1-23 已于 2026-08-03 修）。
+
+- [x] **膜体系第一次端到端跑通（2026-08-04）；§15 成本已按实测关闭。**
+  `memtest/output_membrane_100ns` 08:28 走完整条主链（预平衡 100 ns → attachment →
+  去电荷 → 去 VDW → 溶剂腿 → 汇总）。§17.0 第 ① 步的**工程**目标达到。
+  实测耗时/占用见 [`memtodolist.md`](../memtodolist.md) §15（已由估算改成实测表）：
+  单次 ΔG_bind 串行 **7.1 h**（其中 100 ns 预平衡 5.0 h，占 70%，且可跨重复共用），
+  3 重复 11.2 h，单次磁盘 3.1 GB（抽稀预平衡轨迹后 ≈0.5 GB）。§14 的 R6 不触发。
+
+  ```
+  复合物腿 175.57 ± 1.50   溶剂腿 272.93 ± 1.46   ΔG_bind = +23.27 kcal/mol
+  ```
+  ⚠️ **ΔG_bind 不得引用**（见下面两条溶剂腿缺陷）。复合物腿 175.57 已确认没问题。
+
+- [x] **B6-FIX：色散路线的"目标"与"每条腿的实现"必须分开（2026-08-04 已修）。**
+  缺陷：判据是一个**没有环境维度**的全局布尔
+  `apply_lrc = (dispersion_protocol == "legacy_uniform_density_lrc")`，
+  于是"膜口袋里局域密度不均匀"这个对复合物腿正确的理由被原样套到同一次运行的
+  **纯水溶剂腿**上 —— 那条腿的 `final_results.json` 里逐字写着
+  `disabled_by_membrane_forcefield_protocol: …口袋的局域密度既不是水也不是体相脂质`，
+  而那里配体周围就是均匀体相水。文档本身没错（§1.3 只说膜口袋不成立），
+  是实现把两件事合并了。
+
+  修法：`abfe_core.resolve_leg_dispersion_implementation(目标, 该腿环境)` 作为唯一实现，
+  `ibs_lj_tail_lrc_is_applicable(potential_type, dispersion_protocol, environment_type)`
+  只是它的布尔投影（生产者/报告者仍共用同一真相）。环境维度取用户在输入文件里
+  **显式声明**的 `system_type`（B1 禁的是按残基名猜，不是禁用声明值分派）；
+  溶剂腿天然是 soluble（runabfe 刻意不给它传 `environment_type`）。
+  膜复合物腿行为不变但如实记为 `target_met=false` —— 力场是开着各向同性色散修正
+  拟合的，而该腿的炼金 ligand–env 项是截断的，真正达成要 §1.3 路线 C（未实现）。
+
+  ⚠️ 量级要说准：它解释的是溶剂腿 **vanishing 的 −13.1 kJ/mol**（96.96→83.83，
+  符号也对），**不解释 decharging 的 +128**（LRC 不作用于去电荷腿）。而且修回去之后
+  溶剂腿会**变大**到 ≈286，ΔG_bind 更正 —— 修它是因为它本身错，不是它能救那个数。
+
+  缓存：`_stage_protocol_key` 只在决定为 True 时写 `alchemical_uniform_density_lrc`，
+  所以只有**行为真的变了**的那一类（膜运行的溶剂腿，≈43 min）旧缓存被拒绝；
+  膜复合物腿与可溶生产基线（181.00/157.84/−5.535906）的缓存都不受影响（§7.7）。
+  证据：`tests/test_dispersion_protocol_is_honored.py`（新增纯水腿保留修正、
+  缺环境维度 fail closed、目标 vs 实现分层三组断言）。详见 §0.5.13。
+
+- [x] **P0-13（2026-08-04 已修，P0-12 的真正根因）。**
+  handoff（排除路径 / 根因 / 被撤销的方案 / **重跑命令与验收三项**）：
+  [handoffs/MEMBRANE_SOLVENT_LEG_P013_HANDOFF.md](handoffs/MEMBRANE_SOLVENT_LEG_P013_HANDOFF.md)。
+  正文：**抽配体参数时对同类型力做了
+  单例假设，把配体**全部 71 个键角项**静默丢掉 —— 溶剂腿的分子是软的。**
+
+  `runabfe.generate_ligand_xml_from_top` 原先：
+
+  ```python
+  angle_force = next((f for f in extracted_system.getForces()
+                      if isinstance(f, openmm.HarmonicAngleForce)), None)
+  ```
+
+  而膜体系的 System 有**两个** `HarmonicAngleForce`（实测）：
+
+  ```
+  force[2]  31401 个角，配体 0 个    ← next() 抓到的是这个
+  force[4]     71 个角，配体 71 个
+  可溶体系只有 1 个角力（配体那 71 个混在里面）⟹ 这个 bug 侥幸一直没被踩到
+  ```
+
+  ⟹ `ligand_only.xml` 的 `<HarmonicAngleForce>` 是空的 ⟹ 溶剂腿配体无键角 ⟹
+  预平衡里 0.996 → 0.660 nm 塌缩且 12 个 replica 再没恢复（σ=0.005 nm）⟹
+  配体–水静电耦合强 3 倍（⟨U⟩ −569 ± 90 vs −190 ± 34 kJ/mol）⟹
+  去电荷 62.80 → **191.05** kJ/mol ⟹ ΔG_bind = **+23.27 kcal/mol**。
+
+  修法两层：
+  * **聚合而不是取第一个**：bond / angle / torsion 三类都遍历**所有**同类型力；
+    `NonbondedForce` 多于一个时直接报错让人收口拓扑（不猜）。
+    已 grep 全仓：其余地方都是 `for force in getForces()` 循环或显式列表，
+    只有这一处做了单例假设。
+  * **写完就对账**（这一步才是关键）：写出的成键项数必须与源体系里配体的项数逐项
+    相等；"多原子配体 0 个键角"直接 fail closed。事故本该在 0.1 秒内被拦住，
+    而不是烧完 7 小时再由人去比两次运行的分项。
+
+  实测修复后同一份 `memtest/topol.top`：`<Angle>` **0 → 71**，
+  对账 `bond=41 angle=71 torsion=104` 通过。
+  证据：`tests/test_ligand_xml_extraction.py`（5 条：真体系回归、"多于一个角力"这个
+  前提本身也被钉住、合成 floppy 拓扑触发 fail-closed、源码契约禁止 `next(` 回归）。
+  ⚠️ **可溶生产基线不受影响**（它只有一个角力，配体参数一直是全的），
+  181.00 / 157.84 / −5.535906 仍然有效。
+
+- [x] **P0-12（2026-08-04：根因 = 上面的 P0-13；检测层 a/b 已实现，c 撤销）：
+  溶剂腿配体构象塌缩，两条腿在给**不同构象族**做热力学循环。**
+
+  ⚠️ 原以为是"溶剂腿 decharging 高 128 kJ/mol"这个数值问题，实测下来它只是症状。
+  逐项排除（全部离线、CPU，证据可复现）：
+
+  | 假设 | 判定 |
+  | --- | --- |
+  | 估计量坏了 | ❌ MBAR 与相邻 BAR 都**逐位复现**落盘值（191.05 / 62.80）|
+  | PME 自能项不对消（α 或 Σq² 两腿不同）| ❌ 两条腿配体逐原子电荷**逐位相同**，Σq²=4.9909，α=2.6283/nm，ΔC=0.00 |
+  | 配体参数不同（CHARMM-GUI 重新赋电荷）| ❌ 两次运行电荷几乎相同（−0.8965 vs −0.9001…），Σq² 只差 0.036 e² → 7.35 kJ/mol |
+  | L-L 内部库仑被 λ 缩放 | ❌ 两边都 820/820 对全冻结、0 个挂 λ offset |
+  | 溶剂盒污染/重复配体/几何坏 | ❌ 组成干净（1 MOL + 水 + 6~7 对 NaCl），键长 0.096–0.159 nm，最近水 0.26–0.31 nm |
+  | u_kn 结构异常 | ❌ 两条腿**结构相同**：每帧严格 λ 线性（比值 10.994/10.998），σ/mean 都是 16–18% |
+
+  **根因（实测）**：配体在溶剂腿里塌缩，且整段采样都没出来。
+
+  | 配体重原子最大内距 | 复合物腿 | 溶剂腿 |
+  | --- | --- | --- |
+  | 膜运行 | **1.28 nm**（口袋撑着） | **0.66 nm**（预平衡 0.996→0.660，12 个 replica 全在 0.657–0.672，零涨落）|
+  | 可溶生产 | 1.39 nm | 1.10 nm（replica 分布 0.998–1.237）|
+
+  塌缩把极性基团聚到一起 ⟹ 配体–水静电耦合强 3 倍（⟨U_lig-env⟩ = −569 ± 90 vs
+  −190 ± 34 kJ/mol）⟹ 去电荷 191.05 vs 62.80。**两条腿不是同一个构象族**，
+  ΔG_bind = ΔG_solv − ΔG_cplx 因此没有意义。
+
+  🔗 **这正是 memtodolist §3.0 末条预言的失效模式**（"配体亲脂时溶剂腿可能构象塌缩，
+  记录 Rg 与内部氢键随 λ 的变化"）—— **那条诊断从来没实现**，所以塌缩全程无人看见。
+
+  待办（诊断/缓存两层可立即做；采样层需拍板）：
+  - [x] **P0-12a 诊断 + 跨腿门（2026-08-04 已实现）**：
+    `abfe_core.ligand_conformer_metrics/_summary`（Rg、重原子最大内距、内部极性接触
+    = §3.0 的"内部氢键"代理量，N/O 对且键路径隔 ≥ 4 键）；
+    `ABFEPipeline._ligand_conformer_diagnostics()` 从**去电荷 replica 轨迹**算
+    （只 `atom_indices=ligand` 读配体那几十个原子，膜体系也不占内存），
+    落进 `final_results.json` 的 `ligand_conformer_diagnostics`，
+    另记 `per_replica_mean_...` 与 `per_replica_spread_nm`（"12 个 replica 挤在同一个
+    窄 basin"这件事只有逐 replica 才看得见）。
+    门 = `evaluate_cross_leg_conformer_consistency` + `assert_...`，接在
+    `combine_binding_free_energy`（热力学循环闭合的**唯一**实现，ATT-09 同一条纪律），
+    两腿 [p5, p95] 不相交即 raise，不许汇总 ΔG_bind。
+    判据没有可调旋钮：实测**膜运行 overlap = −0.631 nm（拦下）/ 可溶基线 +0.053 nm
+    （放行）**，是同一条"区间必须相交"分开的。
+    缺任一侧 summary 时记 `evaluated=false`（判不了门 ≠ 门过了），traditional /
+    后处理路径照旧可用。⚠️ reason 里如实写了"不重叠有两种读法"（没收敛 vs 两相构象
+    偏好真的差这么多），并指向双起点验证去区分 —— 不许因此放宽百分位。
+    证据：`tests/test_ligand_conformer_gate.py`（14 条，含实测数字回归）。
+  - [x] **P0-12b 缓存可追溯（2026-08-04 已实现）**：
+    `abfe_core.ligand_conformer_fingerprint()` 用**内部距离矩阵**指纹（刚体平移/旋转
+    不敏感，构象变了才失效）进 `_ligand_parameter_identity` 的
+    `ligand_start_conformer`，两个调用点都传 `positions`；
+    `SOLVENT_CACHE_PROTOCOL_VERSION` **4 → 5**。
+    ⚠️ 升版本会让**所有**已有溶剂腿**盒**缓存重建（几十秒，不是采样）；
+    贵的 stage 采样缓存由 `_stage_protocol_key` 单独把关，不受影响。
+  - [x] ~~**P0-12c 采样**~~ **撤销（2026-08-04）**：根因是 P0-13 的哈密顿量错误，
+    不是采样不足，也不是"两相构象偏好真的差这么多"。参数修对之后没有理由再塌缩，
+    所以双起点验证 / 加构象采样维度 / 构象限制这三条都不做。
+    ⚠️ 如果修完重跑**仍然**塌缩，那时才回到这一条 —— 届时先跑双起点判性质，
+    不要直接上构象限制。
+  - [x] ⚠️ B4 的 charge-transfer 溶剂腿会走同一个 XML 抽取路径，
+    P0-13 的对账与 P0-12a 的门都已经在它之前落地了。
+
+  ~~原始记录：溶剂腿 decharging 比同一配体的可溶基线高 128 kJ/mol。~~
+  数值症状：同一个中性 Atenolol、同为纯水盒（4.052 vs 4.257 nm），
+  decharging 62.80 → **191.05**（+128.25），vanishing 96.96 → 83.83（−13.14，
+  那一段是上面的 B6-FIX）。⚠️ 在 P0-12a/c 收口之前，膜体系 ΔG_bind 一律不得报出。
 
 - [x] **B3 + MEM-00d：PME charge-transfer charging Hamiltonian 已落地（2026-08-04）。**
   主线 §17.0 的第 ② 步。`memtodolist.md` Phase B3 与 MEM-00d 绑定完成（restraint 形式

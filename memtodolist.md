@@ -876,6 +876,256 @@ B3/B4/B5 的方法开发。所以：
 
 ---
 
+### 0.5.13 第一次端到端跑通，暴露溶剂腿两处缺陷（2026-08-04）
+
+`memtest/output_membrane_100ns` 08-04 08:28 跑完了**整条主链**：
+预平衡 100 ns → Stage 0 attachment → Stage 1 去电荷 → Stage 2 去 VDW → 溶剂腿 → 汇总。
+§17.0 第 ① 步（工程 smoke test）的目标达到：主链 / 缓存 / REMD / λ 预优化 /
+溶剂腿构建 / 结果汇总全部走通，没有中途挂掉。耗时与占用见 §15（已据此关闭）。
+
+```
+复合物腿 ΔG_cplx  = 175.57 ± 1.50 kJ/mol     ← 用户确认没问题
+溶剂腿   ΔG_solv  = 272.93 ± 1.46 kJ/mol     ← 有缺陷
+ΔG_bind          = +97.36 ± 2.09 kJ/mol = +23.27 kcal/mol   ← **不可用**
+```
+
+⚠️ **这个 ΔG_bind 不得引用。** 配体是**中性 Atenolol**，与可溶生产体系是同一个分子
+（`memtest/topol.top` 的 moleculetype `Atenolol-rank11`，41 原子，Σq = 0.000000），
+所以两次运行的**溶剂腿必须可比** —— 但它们不可比：
+
+| 溶剂腿分项（同一配体、同为纯水盒） | 可溶生产 `output_lrc_fix` | 膜运行 | 差 |
+| --- | --- | --- | --- |
+| decharging | 62.80 | **191.05** | **+128.25** |
+| vanishing | 96.96 | 83.83 | −13.14 |
+| 合计 | 157.84 | 272.93 | +115.09 |
+
+#### 缺陷一：B6 把纯水腿**合法**的 bulk-water LRC 一起关掉了（已修）
+
+判据当时是一个没有环境维度的全局布尔：
+
+```python
+apply_lrc = (dispersion_protocol == "legacy_uniform_density_lrc")
+```
+
+于是"膜口袋里局域密度不均匀"这个**对复合物腿正确**的理由，被原样套到了同一次运行的
+**纯水溶剂腿**上 —— 那条腿的 `final_results.json` 里逐字写着
+`disabled_by_membrane_forcefield_protocol: …配体所在口袋的局域密度既不是水也不是体相脂质`，
+而那里配体周围恰恰**就是**均匀体相水。文档自己是对的（§1.3 只说膜口袋不成立），
+是实现把两件事合并成了一个布尔。
+
+**修法（2026-08-04，B6-FIX）：把"目标"与"每条腿的实现"拆开。**
+
+```text
+dispersion_protocol  = 目标：所选力场原始参数化时的色散条件
+   ↓  每条腿在自己的环境里怎么达成
+实现 = f(目标, 该腿配体所处环境)
+```
+
+| 目标 | 该腿环境 | 炼金 ligand–env LRC | target_met |
+| --- | --- | --- | --- |
+| `legacy_uniform_density_lrc` | soluble | 开 | 是（改动前唯一行为，逐位不变）|
+| `ff_native_isotropic_lrc` | soluble（含膜运行的溶剂腿）| **开** | 是 |
+| `ff_native_isotropic_lrc` | membrane | 关 | **否**（需路线 C，未实现）|
+| `ff_native_force_switch_no_lrc` | 任意 | 关 | 是（力场本身不加 LRC）|
+
+唯一实现 `abfe_core.resolve_leg_dispersion_implementation()`；
+`ibs_lj_tail_lrc_is_applicable(potential_type, dispersion_protocol, environment_type)`
+只是它的布尔投影，生产者与报告者仍共用同一真相。
+环境维度取 `system_type` —— 那是**用户在输入文件里显式声明**的值，
+B1 的规矩是「不许按残基名猜 system_type」，不是「不许用声明出来的值分派」，
+所以按它自动切换实现是合法且可审计的。溶剂腿天然是 soluble：`runabfe` 构造溶剂腿
+pipeline 时刻意不传 `environment_type`（B1 的接线契约测试钉着这一点）。
+
+⚠️ 三点要说清楚，免得期待错方向：
+1. 这条缺陷解释的是 **vanishing 的 −13.1**（符号也对：关掉吸引尾项 ⟹ 拔出配体更便宜），
+   **不解释 decharging 的 +128**（LRC 根本不作用于去电荷腿：
+   `needs_traditional_lrc = not is_pme_coulomb_leg`）；
+2. 修回去之后溶剂腿会**变大**到 ≈286 kJ/mol，ΔG_bind 更正。修它是因为它本身错，
+   **不是因为它能救那个数**；
+3. 膜复合物腿的行为不变（仍然不加），但现在如实记为 `target_met=false` ——
+   力场是开着各向同性色散修正拟合的，而这条腿的炼金 ligand–env 项是**截断**的，
+   真正达成目标要 §1.3 路线 C（未实现）。把"关掉了"记成"处理好了"是不诚实的。
+
+缓存影响：`_stage_protocol_key` 只在决定为 True 时写
+`alchemical_uniform_density_lrc`，所以**行为真的变了的那一类**（膜运行的溶剂腿）
+旧缓存被正确拒绝，膜复合物腿与可溶生产基线的缓存都不受影响（§7.7）。
+
+#### 缺陷二：溶剂腿配体**丢了全部 71 个键角项**（P0-13，2026-08-04 已修）
+
+decharging 62.80 → 191.05 只是最后一环。逐项排除（估计量、PME 自能/α、配体电荷、
+L-L 冻结、盒组成、几何、u_kn 结构全部否掉，见 `docs/TODO.md` P0-12 的排除表）之后，
+根因在 `runabfe.generate_ligand_xml_from_top`：
+
+```python
+angle_force = next((f for f in extracted_system.getForces()
+                    if isinstance(f, openmm.HarmonicAngleForce)), None)   # 取"第一个"
+```
+
+而膜体系的 System 里有**两个** `HarmonicAngleForce`：
+
+```
+force[2]  31401 个角，配体 0 个    ← next() 抓到的是这个
+force[4]     71 个角，配体 71 个   ← 配体的角全在这里
+可溶体系只有 1 个角力（配体那 71 个混在里面）⟹ 侥幸一直没踩到
+```
+
+于是 `ligand_only.xml` 的 `<HarmonicAngleForce>` 段是**空的**，溶剂腿配体**没有任何
+键角项** —— 分子是软的。因果链每一环都有实测：
+
+```
+无键角 ⟹ 预平衡里 0.996 → 0.660 nm 塌缩，12 个 replica 再没恢复（σ=0.005 nm）
+      ⟹ 极性基团聚拢，配体–水静电耦合强 3 倍（⟨U⟩ −569 ± 90 vs −190 ± 34 kJ/mol）
+      ⟹ 去电荷 62.80 → 191.05 kJ/mol
+      ⟹ ΔG_bind = +23.27 kcal/mol
+```
+
+⚠️ **所以这不是"采样不足"也不是"两相构象偏好不同"这类物理问题**，是哈密顿量本身错了。
+先前一度往"溶剂腿构象采样没收敛、需要双起点验证"的方向想，**那个方向被否掉了** ——
+参数修对之后没有理由再塌缩（P0-12c 因此撤销，不做）。
+
+修法两层：
+* **聚合而不是取第一个**：bond/angle/torsion 三类都遍历**所有**同类型力
+  （NonbondedForce 多于一个时直接报错让人收口拓扑，不猜）；
+* **写完就对账**：写出的成键项数必须与源体系里配体的项数逐项相等，且"多原子配体
+  0 个键角"直接 fail closed。这一步就是那个"7 小时之后才发现"的事故本该在 0.1 秒内
+  被拦住的地方。
+
+实测修复后同一份 memtest 拓扑：`<Angle>` **0 → 71**，对账 bond=41 angle=71 torsion=104 通过。
+证据：`tests/test_ligand_xml_extraction.py`（5 条，含真体系回归 + "多于一个角力"这个
+前提本身也被钉住 + 合成 floppy 拓扑触发 fail-closed）。
+
+#### 顺带（P0-12a/b）：这次事故的**检测层**也补上了
+
+即使根因修了，这类"某条腿的配体构象跑到另一族去"的失效模式也必须能当场被发现：
+* 两条腿都逐 λ 记录 Rg / 重原子最大内距 / 内部极性接触（§3.0 末条要求的诊断，
+  此前从未实现），另记逐 replica 均值 —— "12 个 replica 挤在同一个窄 basin"
+  只有逐 replica 才看得见；
+* **跨腿构象一致性门**接在 `combine_binding_free_energy`（循环闭合唯一实现）：
+  两腿 [p5, p95] 不相交即不许汇总 ΔG_bind。实测膜运行 overlap = −0.631 nm（拦下）、
+  可溶基线 +0.053 nm（放行），同一条判据分开，无可调旋钮；
+* 溶剂腿缓存身份加入配体**起始构象**指纹（内部距离矩阵，刚体运动不敏感），
+  `SOLVENT_CACHE_PROTOCOL_VERSION` 4 → 5 —— 此前两次运行拿到完全不同的构象却都判
+  "缓存有效"。
+
+落盘字段（重跑后要看的就是这几个，`final_results.json`）：
+`ligand_conformer_diagnostics.observables.{max_internal_heavy_distance_nm,
+radius_of_gyration_nm, internal_polar_contact_count}`、
+`ligand_conformer_diagnostics.per_replica_mean_max_internal_heavy_distance_nm`、
+`ligand_conformer_diagnostics.per_replica_spread_nm`、
+`ligand_conformer_cross_leg.{evaluated,passed,overlap_nm,reason}`。
+
+⚠️ **两件看着像 bug 但不是的**（查过，别再查）：
+1. 那轮日志里的 `[膜质量门 · advisory]` —— provenance 记
+   `config.membrane_quality_gate = advisory` 且 `config file = None`，说明那次是
+   **命令行**跑的 advisory，不是配置文件被忽略；`memtest/abfe_config.json` 一直是
+   `enforce`。重跑时别再加那个 flag。
+2. `ligand_only.xml` 不在 `resolve_ligand_ffxml` 的候选名单里 ⟹ 每次都用当前生成器
+   重写，**不存在复用旧 angle-less XML 的陷阱**。
+
+重跑命令、会作废什么（预平衡 5 h 保留 / 之后 2.1 h 重做）、跑完看哪三个数：
+见 `docs/handoffs/MEMBRANE_SOLVENT_LEG_P013_HANDOFF.md` §6。
+
+---
+
+### 0.5.14 RESUME-FP-01：三处 resume 协议指纹误把"坐标数组"当强判据（2026-08-05 已修）
+
+在中性 Atenolol 那轮跑的真实日志里当场抓到：resume 之后
+`Boresch attachment stage0 缓存...不匹配，重新运行` +
+`已有 final_results.json 协议指纹不匹配`，即便 Boresch 平衡值自己的 σ 偏差核对
+已经通过。根因与 MEM-00c 的坐标漂移是**同一个模式，换了个消费者**：
+
+`abfe_pipeline.py` 的 `stage0_protocol_key` / `_stage_protocol_key` /
+`_preopt_protocol_key` / `_build_top_level_protocol_key` 都把
+`coordinates_nm_sha256`（`_positions_hash(self.positions)`）编进了协议指纹，而
+`self.positions` 在两条路径下天然不同：
+
+* 本次调用刚完成预平衡：`run_full_pipeline` 第 1 节额外叠了一次 2000 步最小化
+  （"消除加载坐标的残余应力"）；
+* resume 时直接读 `pre_equilibration.dcd` 末帧：不叠这次最小化。
+
+同一段已完成、内容完全相同的物理轨迹，两条路径算出的坐标数组不同、哈希不同——
+**跟协议/System/Boresch 参数是否真的变了完全无关**。`_preopt_protocol_key` 尤其
+冤枉：它的 docstring 明确说这份指纹是特意收窄过的，为的就是不让"跟预优化无关的
+改动"连带让这份要跑好几个小时的缓存失效，但收窄时漏看了这一项。
+
+修法：这四处删掉 `coordinates_nm_sha256`。"坐标/构型是否还对得上"已经由
+`boresch_equilibrium_committed.json` + `_assert_committed_boresch_still_matches_pose()`
+（σ 偏差核对）与预平衡自己的 `pre_equilibration_fingerprint.json` +
+`status=completed` 门分别守住，不需要再叠一份对实现细节（有没有跑那额外 2000 步）
+比坐标数组的强判据。
+
+⚠️ **每 λ 窗口级的 GPU 采样 checkpoint 不受影响**：`ibs_engine._build_main_window_checkpoint_manifest`
+本来就不含这个坐标哈希（键在 `win_sys_xml`/`lambdas_coul`/`lambdas_vdw`/协议版本/
+平台），已实测确认——这次修复只影响"这条腿/这个 stage 是否已整体完成、可以直接
+跳过重算"这几处**粗粒度快捷路径**，不会让任何已完成的 λ 窗口采样重烧 GPU。
+真实证据：那次 resume 里 `stage0_attachment.json`/`preopt_dual_decharging.json`
+被重新写过，但 `stage1_decharging.json`/`production_window/` 时间戳完全没动。
+
+完整记录见 `docs/TODO.md` 的 RESUME-FP-01 条目。回归：
+`tests/test_dispersion_protocol_is_honored.py`（15 passed）+ 全套 offline 回归。
+
+⚠️ **同一模式还存在于 `TraditionalABFEPipeline.run_leg()` 的 `initial_positions_sha256`
+（`abfe_pipeline.py:7965`）**，但那是完全不同的"传统 REMD"路径，本轮跑的是 IBS
+双 λ 管线，没有证据这条也受影响，**没有动它**——留给真正用到 traditional 模式
+resume 时再验证，不要凭"看起来像"就顺手改。
+
+---
+
+### 0.5.16 窗口预热的排序 bug：EM 在 Boresch 限制力生效之前（2026-08-05 已修）
+
+RESUME-FP-01 修完、`stage1_decharging.json` 缓存也正确复用后，跑到窗口 5（vdw/
+vanishing，态 [19:23]）时在 Boresch 安全爬坡的 `sim.minimizeEnergy()` 内部直接抛
+`openmm.OpenMMException: Particle coordinate is NaN`——异常发生在 C++ 层内部
+迭代中途，`ibs_engine.py:9574`（当时行号）那段爬坡自己的能量/力检查全部是
+minimize **返回之后**才做，根本挡不住这一种失败模式，进程直接崩溃，resume 后
+从头再来，同一个窗口反复重演。
+
+**根因**：`run_all_windows()` 里 `lambda_boresch_scale` 这个 System 级全局参数
+默认值是 `0.0`，而"阶段1 能量最小化"（`sim.minimizeEnergy(maxIterations=20000)`）
+在**没有任何地方显式把它设成非零值**的情况下就跑了——也就是说全新窗口的最小化
+是在 Boresch 限制力完全关闭的状态下做的。这在深度解耦（vdW/softcore 几乎关闭）
+的窗口尤其致命：配体没有真实的 vdW/Coulomb 力把它固定在结合位点附近，自由最小化
+可以让它漂出委托好的 Boresch 平衡几何——实测 committed `r0=0.448nm` 漂到最小化后
+测得 `0.650nm`，约 0.2nm 的缺口。随后"阶段3"那段 16 级自定义阶梯（0.01→1.0）
+存在的**唯一理由**就是把这 0.2nm 的缺口，靠一根逐步加强、最终 kr=2000 kJ/mol/nm²
+的弹簧，一点点拽回来——窗口 5 就是在拽的某个中间强度（scale=0.05）时，
+`minimizeEnergy()` 内部一步踩过了头，直接把某个原子送进另一个原子的斥芯。
+
+这是**排序 bug**，不是"需要更精细的爬坡/更多诊断"：限制力应该在最小化**之前**
+就已经在生产强度，让最小化本身收敛到一个天然满足限制力平衡的构型，而不是先自由
+最小化、再事后用一根硬弹簧把结果拽回限制力允许的范围。任何正常的 Boresch-restrained
+FEP/REMD 协议都不会需要这种规模的分级爬坡——爬坡的复杂度本身就是这个排序 bug
+存在的证据，不是需要被加固的东西。
+
+**修法**（`ibs_engine.py::run_all_windows`）：
+
+- `sim.context.setPositions(positions)` 之后、阶段1 最小化之前，新增
+  `if _has_valid_boresch_restraint(self.boresch): sim.context.setParameter("lambda_boresch_scale", 1.0)`。
+- 阶段1 的 20000 步最小化现在就在生产哈密顿量（Boresch 已在 scale=1.0）下进行。
+- 阶段2 里那行把 scale 临时压到 0.01 的 `setParameter` 连同它的 print **注释掉**
+  （不是删除）——不再需要，全程保持 1.0。
+- 原"阶段3 Boresch 安全爬坡"整段（16 级自定义阶梯 + 能量/力检查 + 失败处理）
+  **整段注释掉**（不是删除，留作历史参考）——它存在的前提（EM 后需要拽回限制力）
+  已经不成立。
+- 阶段2 的 dt 测试步进、约束死锁检测**原样保留**，只是现在全程在 Boresch 全强度
+  下运行，不再需要单独处理"限制力还没爬到位"这个中间态。
+- checkpoint-restore 路径本来就在 restore 后显式把 scale 重设为 1.0
+  （防御性重设，未依赖 loadCheckpoint 是否保存了 global parameter），未改动——
+  现在两条路径（fresh window 与 checkpoint-restore）殊途同归，都在 scale=1.0
+  下进入采样。
+
+**不需要的东西（用户明确排除）**：不加自适应爬坡、不加回滚/重试状态机、不新增
+checkpoint 协议版本。已完成的生产窗口（`production_window/`）物理上全部是在
+scale=1.0 下采样完成的，这个修复只改变"全新窗口如何进入采样"，不影响任何已
+完成窗口的有效性，也不需要为此升级 `MAIN_WINDOW_CHECKPOINT_PROTOCOL_VERSION`。
+
+回归：`ibs_engine.py`/`abfe_pipeline.py` `py_compile` 通过，全套 offline 回归
+（无新增失败，见 `docs/TODO.md` 的这条记录）。⚠️ **未在真实 GPU 上验证窗口 5
+现在能否正常收敛**——这是代码层面的排序修复，物理效果需要用户在自己的计算节点上
+实测确认。
+
+---
+
 ### 0.5.2 已存在的、进膜之前必须先收口的非键协议不一致
 
 - [ ] **MEM-00h：ligand–environment 与 environment–environment 的 LJ cutoff 目前就不一致。**
@@ -890,6 +1140,32 @@ B3/B4/B5 的方法开发。所以：
   **在当前可溶体系里这一条就已经不满足**。膜体系里 APL/膜厚对脂质 vdW cutoff 直接敏感，
   这个不一致会被放大。**这是可溶体系的存量问题，必须在膜工作之前单独立项收口，
   不要塞进膜 PR 里一起改。**
+
+  **2026-08-05 复核（行号已随代码增长更新，值未变）**：
+  - 复合物腿基础 `NonbondedForce`：`runabfe.py:1410`，硬编码 `1.0 nm`；
+  - 溶剂腿：`SOLVENT_NONBONDED_CUTOFF_NM = 1.0`（`abfe_core.py:8868`）；
+  - 炼金 softcore CV：`SOFTCORE_CUTOFF_NM = 1.2`，`SOFTCORE_SWITCH_NM = 1.0`
+    （`ibs_engine.py:83-84`）；
+  - LJ 尾修积分：`LJ_TAIL_LRC_R_SWITCH_NM = 1.0`、`LJ_TAIL_LRC_R_CUTOFF_NM = 1.2`
+    （`ibs_engine.py:3158-3159`），与上面的 softcore CV 精确对应（有交叉测试钉住）；
+  - `COION_LIGAND_MIN_IMAGE_RUNTIME_NM = 1.2`（`abfe_core.py:1672`）是**派生量**，
+    跟随 `SOFTCORE_CUTOFF_NM`，不是第三个独立决策。
+
+  实际是两组自洽的值在打架，不是"三处各写各的"：{基础力 1.0} vs
+  {softcore CV / LJ 尾修下限 / co-ion 安全边距 1.2}，且 `SOFTCORE_SWITCH_NM`
+  已经和基础力的 1.0 对齐，只有 cutoff 尾巴多出的 0.2 nm switching 区间对不上。
+
+  **收口方向建议（尚未实施，只是分析结论，立项时才真正改代码）**：收敛到 **1.0 nm**，
+  不是 1.2 nm。理由：1.0 nm 是与 Amber 系力场原始参数化匹配的截断（§1.3 里 Amber
+  Lipid21/17 就是按 1.0 nm cutoff + LRC 拟合的），把基础力拉长到 1.2 会偏离已验证
+  的力场截断距离；而 1.2 nm 这组值目前找不到独立的物理依据。当前的不一致会导致
+  λ=1（完全耦合）端点与"关掉炼金描述、直接用普通力场"的真实系统不严格等价——1.0–1.2 nm
+  这个壳层里炼金力仍有非零 switched 相互作用，基础力却已经硬截断为零。
+  收口 PR 至少要覆盖：`SOFTCORE_CUTOFF_NM`→1.0、`LJ_TAIL_LRC_R_CUTOFF_NM`→1.0、
+  派生的 `COION_LIGAND_MIN_IMAGE_RUNTIME_NM`→1.0（连带更新交叉检查测试的断言值）、
+  以及 §1.3 路线 A 最后一条要求的 GROMACS↔OpenMM 单点能量对照。
+  ⚠️ 这条只要改了会影响哈密顿量/坐标输入的常量，就会作废已完成的预平衡/生产窗口——
+  立项执行前先盘一下哪些缓存结果会被作废。
 - [x] **MEM-00i：没有任何 `MonteCarloMembraneBarostat`。** ✅ 已实现（2026-07-30，B1）
   `abfe_pipeline.py:1378-1382` 原来无条件加 `MonteCarloBarostat(pressure, temperature, 25)`，
   只检测同类型是否已存在。
@@ -1016,10 +1292,25 @@ SERT 特有的坑，**必须在 Phase A 就处理，否则会静默选错 co-ion
   - 配体净电荷为 0；
   - 不创建 co-ion；
   - APBS/Rocklin 净电荷修正必须为 0。
-- [x] `co_alchemical_charge_transfer` ✅ 复合物腿 2026-08-04（B3）；**溶剂腿仍待 B4**
+- [x] `co_alchemical_charge_transfer` ✅ 复合物腿 2026-08-04（B3）；✅ 溶剂腿 2026-08-05（B4）
   - 配体净电荷不为 0；
-  - 两腿都必须存在、选择并约束 co-ion —— ⚠️ 复合物腿已实现并冻结身份，
-    **溶剂腿 builder 是 B4**，未落地，`build_and_cache_solvent_leg` fail closed；
+  - 两腿都必须存在、选择并约束 co-ion —— ✅ 复合物腿已实现并冻结身份；
+    ✅ **溶剂腿 builder（B4）已落地**：`runabfe._insert_reserved_coalchemical_ion_dummies`
+    在 `charge_treatment=co_alchemical_charge_transfer` 且配体带净电荷时，摘掉离配体
+    质心 minimum-image 最远的 `|q_L|` 个水分子，换成同号（Na⁺/Cl⁻ 形状、电荷强制
+    清零）的 ion-shaped dummy，`build_and_cache_solvent_leg` 不再 fail closed；
+    身份选择/restraint/charging 电荷映射复用既有的 leg-agnostic 实现
+    （`ibs_engine.select_co_alchemical_ion_once` /
+    `abfe_core.build_co_alchemical_ion_identity`），没有另造第二套判据。
+    `abfe_core.CHARGE_TRANSFER_SOLVENT_LEG_IMPLEMENTED = True`，
+    `SOLVENT_CACHE_PROTOCOL_VERSION` 5→6（manifest 加 `charge_treatment` /
+    `reserved_coion_*` 字段，旧缓存 fail closed 重建）。
+    单元测试：`tests/test_solvent_leg_coion_builder.py`（新增，插入逻辑本身）+
+    `tests/test_charge_transfer_hamiltonian.py` / `test_charge_treatment_protocol.py`
+    的相关断言已同步翻转。
+    ⚠️ **只测过合成 topology，没有在真实带电配体体系上机验证过**——本仓库的
+    生产体系 Atenolol 净电荷为 0，这条路径在这里测不出来；§4.2 的盒子尺寸敏感性、
+    §4.4 的预平衡稳定性仍待真正带电配体上机验证，不算已收口。
   - 所有 charging λ 上总电荷必须恒定 ✅ 由 `Σscale = 0` 代数保证 + 读回真实 Force 核对；
   - APBS/Rocklin 必须为 0 ✅（B2 起就在拦双计数）。
 - [ ] `rocklin_apbs_neutralizing_plasma`
@@ -1851,10 +2142,145 @@ independent_repeat_id
   `_create_co_alchemical_ion_restraint`（MEM-00d flat-bottom 锚点相对）、
   `_identify_reserved_neutral_co_ions`（charge-transfer 的身份来源，**与坐标无关**）。
   分派由冻结 spec 的 `charge_treatment` 决定，只有一个分派点。
-  🚧 `CHARGE_TRANSFER_SOLVENT_LEG_IMPLEMENTED = False` ⟹ 循环闭不上、不得报 ΔG_bind。
   证据：`tests/test_charge_transfer_hamiltonian.py`。详见 `docs/TODO.md` 的 B3 条目。
-- [ ] B4. 重写溶剂腿 builder，显式返回 co-ion identity。
-- [ ] B5. complex/solvent cache 加 co-ion 指纹。
+- [x] B4. 重写溶剂腿 builder，插入 reserved co-ion dummy。✅ 2026-08-05
+  `runabfe._insert_reserved_coalchemical_ion_dummies` + `build_and_cache_solvent_leg`
+  接线，`abfe_core.CHARGE_TRANSFER_SOLVENT_LEG_IMPLEMENTED = True`。
+  身份选择/restraint/charging 复用 B3 已有的 leg-agnostic 实现，没有重造一遍。
+  证据：`tests/test_solvent_leg_coion_builder.py`（新）。
+  ⚠️ 只在合成 topology 上单元测过，未在真实带电配体体系上机验证——详见 memtodolist
+  §1.2 `co_alchemical_charge_transfer` 条目下的完整说明。
+- [ ] B5. complex/solvent cache、resume 与 provenance 接入 co-ion 身份。
+
+  > **本条及后面的 C1–C5 是交接指示，不代表已经实现或跑过。** 执行者按下面的
+  > 文件、函数、测试和验收产物落地；没有证据文件时不得打勾。不要在本条里顺手改
+  > charging Hamiltonian、离子选择算法或 restraint 物理形式，那些分别属于 B3/B4/C5。
+
+  **B5 要解决的具体缺口**：B4 的 `solvent_cache_manifest.json` 已有
+  `charge_treatment` / `reserved_coion_*`，只能证明 builder 创建过中性 dummy；真正的
+  冻结身份在每条腿自己的 `checkpoints/coalchemical_ion_spec.json`。该文件的
+  `fingerprint` 目前还没有明确进入 `_stage_protocol_key()`、`_preopt_protocol_key()`、
+  PME `u_kn` metadata 和双腿总 provenance，因此旧 stage/checkpoint 仍可能在身份变化后
+  被错误复用。
+
+  **先定两层身份，不要混成一个哈希：**
+
+  1. `reserved_coion_builder_identity`：描述建系产物中“预留了哪些 dummy”。只含可由
+     base `System + Topology` 稳定重算的字段：`charge_treatment`、配体净电荷、dummy 数量、
+     atom/residue index、residue name、element、λ=1 电荷、sigma、epsilon、mass，以及
+     restraint **协议版本/形式/默认 k/r0/force group**。它进入
+     `system_cache_manifest.json` 和 `solvent_cache_manifest.json`，不得包含坐标。
+  2. `co_alchemical_ion_runtime_identity`：直接引用
+     `coalchemical_ion_spec.json` 的 `protocol_version` + `fingerprint`，并附腿身份
+     `complex|solvent` 与 spec 相对路径。该 fingerprint 已包含 atom identity、端点电荷、
+     LJ/mass、锚点、冻结位移及完整 restraint；它进入 stage/preopt/u_kn/resume/provenance。
+     **不得另写第二套 fingerprint 算法**，唯一算法仍是
+     `abfe_core.co_alchemical_ion_identity_fingerprint()`。
+
+  `selection_provenance`、选择时距离/水配位数、绝对坐标和当前帧距离只作诊断，禁止进入
+  上述任一 resume 强身份。否则首跑与跨进程 resume 的微小坐标差会再次制造
+  RESUME-FP-01 一类假失效。
+
+  **代码修改顺序：**
+
+  1. `abfe_core.py`
+     - 新增一个纯函数（建议名
+       `co_alchemical_ion_cache_identity_payload(spec, *, system, topology, leg,
+       spec_relative_path)`），先调用
+       `verify_co_alchemical_ion_identity()`，再返回 JSON-safe 的最小 payload；中性路线
+       返回 `None`，带电 charge-transfer 缺 spec 必须 raise，禁止返回空字典放行。
+     - payload 至少有：`schema_version`、`leg`、`charge_treatment`、
+       `identity_protocol_version`、`fingerprint`、`ligand_net_charge_e`、
+       `lambda_direction`、`ion_atom_indices`、`spec_relative_path`。
+     - builder identity 另用一个纯函数从 base System/Topology 重算；不要从 manifest
+       自己抄回自己。两腿必须调用同一函数，不能在 `runabfe.py` 各写一份字段拼装。
+  2. `runabfe.py`
+     - `MAIN_SYSTEM_CACHE_PROTOCOL_VERSION` 与 `SOLVENT_CACHE_PROTOCOL_VERSION` 各升一版；
+       旧 manifest 缺 builder identity 时，charge-transfer 路线 fail closed 并重建；
+       `neutral` 路线保持原行为，不因空 co-ion 字段无谓失效。
+     - `build_and_cache_solvent_leg()` 写入完整 builder identity；现有 `na_count/cl_count`
+       仍是拓扑计数，另加 `ordinary_na_count/ordinary_cl_count`，计算时减掉 reserved dummy，
+       防止 provenance 把 dummy 算进 0.15 M 物理盐。
+     - complex `ABFEPipeline` 构造并调用 `resolve_co_alchemical_ion_spec()` 后，先原子化写入
+       complex 身份；solvent pipeline 稍后构造时再原子化补入 solvent 身份。最终汇总前
+       强制要求两腿字段都存在。无需为了 provenance 改成“两条 pipeline 同时常驻内存”。
+       新增顶层结构应为
+
+       ```json
+       {
+         "co_alchemical_ions": {
+           "complex": {"fingerprint": "...", "spec_relative_path": "checkpoints/coalchemical_ion_spec.json"},
+           "solvent": {"fingerprint": "...", "spec_relative_path": "solvent_leg/checkpoints/coalchemical_ion_spec.json"}
+         }
+       }
+       ```
+
+       实际对象还要包含上一步列出的全部最小字段。不要继续只写当前含义含混的单数
+       `coion_identity`；为兼容旧读取器可暂时保留它，但必须标成 deprecated，且不得拿它
+       做 resume 判定。
+     - provenance 的二次写入必须用临时文件 + `os.replace`；禁止进程中断时留下半个 JSON。
+       `final_results.json` 与 `final_binding_results.json` 也保存双腿 fingerprint，便于结果
+       脱离 output 目录后仍可审计。
+  3. `abfe_pipeline.py`
+     - 在 `run_full_pipeline()` 生成 `_stage1_protocol_key` / `_stage2_protocol_key` /
+       `_stage1_preopt_key` / `_stage2_preopt_key` **之前**只解析一次本腿 spec，并缓存最小
+       identity payload；后面所有 key 只消费该 payload，不再次选择离子。
+     - `_stage_protocol_key()`：decharging 与 vanishing 都加入 runtime identity。虽然
+       stage 2 的 λ_coul 固定为 0，它仍依赖“哪个 co-ion 保持 fully charged”，不能只给
+       stage 1 加。
+     - `_preopt_protocol_key()`：同样加入 runtime identity；不要依赖完整
+       `code_sha256` 间接失效，因为该函数刻意使用窄指纹。
+     - `_pme_u_kn_meta_payload()`、`_is_pme_u_kn_cache_compatible()`、
+       `_write_pme_u_kn_meta()` 增加同一个 `coion_identity` 参数。metadata 缺字段或
+       fingerprint 不同必须返回 incompatible，随后重算 `u_kn`；不得只靠
+       `system_xml_sha256` 暗示身份一致。
+     - 顶层 `_build_top_level_protocol_key()` 也必须含本腿 runtime identity，否则
+       `final_results.json` 的 early-return 可能比 stage gate 更早命中并绕开新检查。
+  4. `ibs_engine.py`
+     - 窗口级 `main_window` / `production_window` / fixed-H probe manifest 已包含 System XML
+       哈希，物理上能随 restraint/offset 变化失效；为可审计性，再显式写入同一个
+       runtime fingerprint。把它作为参数沿调用链传入，禁止在窗口内部读文件或重选离子。
+     - `IBS_BIAS_PROTOCOL_VERSION` 不因“只加 manifest 字段”而升版；只提升对应 manifest
+       schema 版本。若实际更改了 bias、采样或 Hamiltonian，才另行升 IBS 版本。
+  5. `abfe_pipeline.py::resolve_co_alchemical_ion_spec()`
+     - 已有 spec：继续“读盘 → 重算 fingerprint → 对当前 System/Topology 只读核对”；
+       缺失/损坏/路线不符时 fail closed，不准自动挑一个替代品。
+     - 首跑：每条腿各选一次并立即原子化落盘；复合物与溶剂腿允许 atom index 不同，
+       但 `charge_treatment`、`ligand_net_charge_e`、`lambda_direction`、离子模型和 restraint
+       协议必须一致。双腿 fingerprint **预期不同**，禁止要求两个 SHA 相等。
+
+  **必须新增的测试**（建议集中到 `tests/test_coion_cache_resume_provenance.py`）：
+
+  - charge-transfer 下分别改 atom index、λ=0/1 电荷、sigma、epsilon、mass、anchor index、
+    frozen displacement、k、r0、force group、charge treatment、ligand net charge、lambda
+    direction；每次只改一项，断言对应 stage/preopt/u_kn/checkpoint 缓存被拒绝。
+  - spec 文件缺失、JSON 截断、自身 fingerprint 不符、complex spec 放到 solvent 腿，全部
+    fail closed；错误消息必须包含腿身份和 spec 路径。
+  - 原样 resume 两次：fingerprint 不变、atom index 不变、不得再次调用 selector、不得因
+    `selection_provenance` 或当前坐标不同而失效。
+  - neutral 路线：无 spec、无 co-ion payload，现有 Atenolol 缓存/结果语义不变。
+  - provenance 同时出现 `complex` 与 `solvent`，且各自 fingerprint 与磁盘 spec 重算结果
+    一致；普通盐计数不包含 reserved dummy。
+  - AST/源码契约测试：禁止生产代码绕过唯一 helper 自行拼 co-ion fingerprint；禁止新的
+    selector 调用点出现在 `resolve_co_alchemical_ion_spec()` 之外。
+
+  **执行与验收命令：**
+
+  ```bash
+  cd /home/ruigengji/ABFE_IBS/Atenolol-rank11
+  source /home/ruigengji/mambaforge/etc/profile.d/mamba.sh
+  mamba activate openmm_dev
+
+  python -m pytest tests/test_coalchemical_ion_identity.py \
+    tests/test_charge_transfer_hamiltonian.py \
+    tests/test_solvent_leg_coion_builder.py \
+    tests/test_coion_cache_resume_provenance.py -v
+  ./tests/run_offline_tests.sh -q
+  ```
+
+  完成证据：四个定向测试文件全绿、全套离线测试 0 failed；测试临时目录中的两份 spec、
+  两份 stage protocol payload、两份 `u_kn.meta.json` 和合并后的 provenance 均被断言。
+  **不要把当前测试总数写死**，只记录实际命令、日期、passed/skipped/failed。
 - [x] B6. membrane 模式禁用 legacy uniform-density LRC。✅ 2026-07-30（校验层 + **接线**）
   ⚠️ **首版只做了校验层，是个真缺陷**：`resolve_dispersion_protocol()` 会接受
   `ff_native_isotropic_lrc`，但当时**没有任何代码消费它**——`build_ibs_dual_system`
@@ -1890,11 +2316,182 @@ independent_repeat_id
 
 ### Phase C：物理与数值验证
 
-- [ ] C1. 水盒 charge-transfer 解析/盒长测试。
-- [ ] C2. lipid slab 测试。
+- [ ] C1. 带电配体小水盒 charge-transfer 解析/盒长测试。
+
+  **目的**：第一次用真实带电粒子和真实 PME Context 证明 `ligand q→0 / co-ion 0→q`
+  能运行、总电荷逐 λ 不变，并量化盒长依赖。当前 Atenolol 的净电荷是 0，不能拿它给
+  C1 打勾；必须准备至少一个 `q_L=+1` 和一个 `q_L=-1` 的可追溯小分子输入。
+
+  **应写的验证代码**：新增 `tools/validation/validate_charge_transfer_waterbox.py`，只做
+  validation harness，不复制生产 Hamiltonian。它必须调用
+  `select_co_alchemical_ion_once()`、`configure_pme_ligand_charge_offsets()`、
+  `charging_charge_conservation_report()` 和生产 `compute_u_kn` 路径。脚本参数至少包括
+  `--system-xml`、`--topology`、`--positions`、`--ligand-indices`、`--charge-sign`、
+  `--box-edge-nm`、`--n-steps-per-state`、`--seed`、`--output-dir`；输出 JSON 与 CSV，
+  不只打印日志。
+
+  **矩阵固定为 4 个主 case**：`q=+1/-1 × 小/大盒`。同一电荷的两盒除盒长和水数外，
+  水模型、离子模型、cutoff、PME tolerance、温度、盐浓度、λ 表、步数、seed 全相同。
+  建议先用 `L_small = max(ligand_extent + 2×1.5 nm, 3.2 nm)`，`L_large = L_small + 1.0 nm`；
+  若 minimum-image 条件不满足则只增大，不得缩 cutoff。每盒普通离子按 0.15 M + 中和
+  规则生成，reserved dummy 单独计数。
+
+  **每个 case 的执行顺序**：
+
+  1. 从独立 output 目录建盒；禁止复用本仓库 `output/` 或 `memtest/output_*`。
+  2. 落盘并重读 spec，核对 dummy 在 λ=1 为 0 e、LJ/mass 与同号物理离子一致。
+  3. 对生产 λ 表逐态创建 Context；记录全体系/ligand/co-ion 电荷、势能、最大力、
+     ligand–co-ion minimum-image 距离、co-ion 水配位数和 restraint 能量。
+  4. 短平衡后计算 charging ΔG；同一 case 至少 3 个 seed。先跑 1 seed 的 pilot，出现
+     NaN、PME error、距离越门或水合异常就停止，不烧完其余 seed。
+  5. 另跑 `co_annihilation_experimental` 与 neutralizing-plasma 仅作诊断对照；结果标
+     `diagnostic_only`，严禁加 APBS/Rocklin 到 charge-transfer 数值上。
+
+  **硬验收**：逐 λ 总电荷误差 ≤ `1e-6 e`；ligand/co-ion 电荷满足 §2.1；无非有限能量
+  或力；全程距离 ≥ §13.1；两盒 charging ΔG 差同时满足 `|ΔΔG| ≤ 2σ_combined` 与
+  `|ΔΔG| ≤ 1.0 kcal/mol`。任一电荷符号失败，C1 不通过。输出固定为
+  `validation/c1_waterbox/<case>/report.json`、`timeseries.csv`、`u_kn.npz`、
+  `coalchemical_ion_spec.json` 和 `summary.json`；summary 记录输入 SHA256、命令行、seed、
+  软件版本和明确的 `passed`。
+
+- [ ] C2. protein-free lipid slab 测试。
+
+  **输入要求**：使用与目标膜复合物相同的脂质力场、水模型、离子模型、cutoff、PME 与
+  dispersion protocol，构建无蛋白、无口袋的 lipid–water slab。至少两种水层厚度
+  （保持 XY 面积和每叶脂质数相同，只改 Z/水数），每个体系预先平衡并保存来源与 SHA256。
+  不要从含蛋白的 `memtest/` 轨迹删掉蛋白后直接冒充平衡 slab。
+
+  **应写的验证代码**：新增 `tools/validation/validate_charge_transfer_lipid_slab.py`，复用
+  生产 GROMACS loader、组成分类、膜法向/PBC、co-ion identity/restraint 和 charging
+  builder。只允许脚本层新增 slab 专用观测量汇总；禁止复制另一套离子选择判据。
+
+  **运行矩阵**：`2 个水层厚度 × 2 个合法 bulk-water 初始位置 × 3 seeds`；先完成每格
+  1 seed pilot，再扩展。固定同一个 `q=+1` 或 `q=-1` probe ligand/charge group，位置始终
+  在水相；若目标项目未来同时支持两种符号，再镜像补另一个符号。co-annihilation 只跑
+  小预算负对照，不进入通过判据。
+
+  **逐帧保存**：盒矢量、APL、P–P 膜厚、密度剖面、co-ion 相对中面 z、到最近磷原子/
+  ligand 的 minimum-image 距离、水配位数、restraint 能量、总电荷和各 λ 势能。slab
+  没有蛋白，不能硬塞进要求 protein RMSD 的完整 `evaluate_membrane_quality_gate()`；写
+  slab 专用 gate，只复用其中有定义的 APL/膜厚/周期镜像/水侵入判据。
+
+  **硬验收**：所有 λ 总电荷误差 ≤ `1e-6 e`；co-ion 全程在同一侧 bulk water 且满足
+  §13.1；无跨周期跳入另一叶片、无 restraint runaway；两种水层厚度及两个初始位置的
+  charging ΔG 差均 ≤ `max(2σ_combined, 1.0 kcal/mol)`；纯脂 slab 的末段 APL 与该力场
+  文献值差 ≤ 3%，膜厚无系统漂移。输出到 `validation/c2_lipid_slab/<case>/`，总表
+  `summary.csv/json` 必须能从一行追到输入、spec、seed 与轨迹。
+
 - [ ] C3. λ=1/λ=0 endpoint 能量与力测试。
-- [ ] C4. membrane complex/solvent 双腿 smoke test。
+
+  **不要把 B3 的合成单元测试当 C3。** C3 要在 C1 的真实小水盒和 C2 的真实 slab 上，
+  用生产建出的 System 与一个**独立直接改粒子参数**的 reference System 对照。
+
+  **应写的代码**：新增 `tools/validation/compare_charge_transfer_endpoints.py`。reference
+  builder 不调用 `co_alchemical_charge_offset_plan()`，否则 production/reference 会共享
+  同一个错误。它从 λ=1 base System 深拷贝后直接设置端点粒子电荷；vdW reference 直接
+  删除 ligand–environment LJ/静电耦合，但保留 ligand internal、Boresch、co-ion
+  restraint 和环境–环境项。固定同一 positions/box、同一 platform precision，并在
+  `getState(getEnergy=True, getForces=True, groups=...)` 下按 force group 和总量比较。
+
+  **必须对照四个物理端点**：
+
+  1. charging λ=1：ligand fully charged，co-ion neutral；应等于物理 λ=1 base System。
+  2. charging λ=0：ligand electrostatics off，co-ion fully charged。
+  3. vanishing λ=1：必须与 charging λ=0 同一个 Hamiltonian；这是两 stage 的接缝门。
+  4. vanishing λ=0：ligand–environment electrostatics 与 LJ 严格为零；co-ion 仍 fully
+     charged，ligand internal 与所有应保留 restraint 不变。
+
+  每个端点至少检查平衡轨迹抽取的 10 帧，不得只挑一帧。能量相对差 ≤ `1e-5`，逐原子力
+  `max|ΔF| ≤ 1e-3 kJ/mol/nm`，λ=0 ligand–environment 非键能绝对值 ≤
+  `1e-6 kJ/mol`，charging λ=0 与 vanishing λ=1 的能量/力也必须满足同一容差。
+  报告列出最大差所在 frame、atom、force group，禁止只给 pass/fail。测试入口建议为
+  `tests/test_charge_transfer_real_endpoints.py`（读取小型冻结 fixture，不依赖 GPU）；完整
+  轨迹报告放 `validation/c3_endpoints/report.json`。
+
+- [ ] C4. 带电膜体系 complex/solvent 双腿 smoke test。
+
+  **前置条件**：B5、C1、C2、C3 全通过；复合物输入已经在建系阶段额外含 `|q_L|` 个
+  λ=1 电荷为 0 的同号 ion-shaped dummy。普通盐/中和离子不能拿来顶替。当前中性
+  Atenolol `memtest` 只能证明工程主链，不能给本条打勾。
+
+  **配置制作**：复制目标 charged membrane 的生产配置为
+  `validation/c4_smoke/config.json`，只降低采样预算；必须保留
+  `system_type=membrane`、真实 membrane declaration、
+  `charge_treatment=co_alchemical_charge_transfer`、与生产一致的
+  `dispersion_protocol`、PME/cutoff、水盐模型和 Boresch 定义。smoke 可将质量门设为
+  `advisory`，但必须在 declaration 写清 `equilibration_shortfall_justification`；这只允许
+  工程验证，产物必须带 `production_qualified=false`。建议 pilot 用 4 个 charging λ、
+  4 个 vdW λ、每窗 5k–20k 步；不要用 smoke 数值报告正式 ΔG。
+
+  **命令模板**（路径和配体名替换成真实输入；第一次用全新目录，第二次只测 resume）：
+
+  ```bash
+  cd /home/ruigengji/ABFE_IBS/Atenolol-rank11
+  source /home/ruigengji/mambaforge/etc/profile.d/mamba.sh
+  mamba activate openmm_dev
+
+  python runabfe.py --config validation/c4_smoke/config.json \
+    --output validation/c4_smoke/output --reset
+
+  python runabfe.py --config validation/c4_smoke/config.json \
+    --output validation/c4_smoke/output --resume
+  ```
+
+  **检查顺序**：先 complex charging，确认无 NaN/PME/restraint runaway；再 stage 2，确认
+  co-ion 在进入和离开 stage 2 时都保持 fully charged；最后 solvent leg。第二次 resume
+  必须命中同一 co-ion index/fingerprint，并复用已完成窗口，不允许重新 selector 或重算
+  `u_kn`。另复制整个 output 到临时目录，单独篡改一份 spec 的 fingerprint，确认 resume
+  在建 Context 前 fail closed；绝不在唯一证据目录上做破坏性测试。
+
+  **硬验收产物**：
+
+  - `output/checkpoints/coalchemical_ion_spec.json`；
+  - `output/solvent_leg/checkpoints/coalchemical_ion_spec.json`；
+  - 两腿 `decharging/decharging_pme_u_kn.meta.json`；
+  - 两腿 stage1/stage2 protocol key 与窗口 manifest；
+  - `run_provenance.json` 中 `co_alchemical_ions.complex/solvent`；
+  - 两腿 `final_results.json` 和总 `final_binding_results.json`，均标 smoke/not production；
+  - `first_run.log`、`resume.log` 与机器/GPU/seed/耗时摘要。
+
+  所有 λ 电荷正确、全程有限、complex 用膜 barostat、solvent 用各向同性 barostat、两腿
+  dispersion protocol 相同、stage 2 co-ion 不恢复中性、resume 身份完全一致，才算通过。
+
 - [ ] C5. co-ion 位置与 restraint 敏感性测试。
+
+  **只在 C4 已跑通后做**，并冻结除“位置/restraint”外的一切输入。不得手改
+  `coalchemical_ion_spec.json`：每个变体都从 base System 重新调用
+  `build_co_alchemical_ion_identity()` 生成新 spec，使用全新 output 目录和 seed 表。
+
+  **预注册矩阵**：
+
+  - 位置：至少 3 个均满足 §13.1 的 bulk-water 位点——同侧近端、同侧远端、对侧水层；
+    不把头基层/孔道/结合口袋位置混进“合法位置”组。另加 1 个故意违规位置，只用于
+    证明 placement gate 会在采样前拒绝。
+  - restraint：基线 `k=100, r0=0.5`；弱/宽 `k=50, r0=0.7`；强/窄
+    `k=200, r0=0.3`（单位 kJ/mol/nm²、nm）。若要改这些点，必须在开跑前写入
+    `validation/c5_sensitivity/design.json`，看过结果后禁止补点挑结论。
+  - 每个合法组合 complex/solvent 两腿都跑，至少 3 seeds；pilot 可先用位置三点 + 基线
+    restraint，确认没有明显失败后再扩矩阵。
+
+  **应写的代码**：新增 `tools/validation/run_coion_sensitivity_matrix.py` 生成独立配置/spec/
+  命令，不直接执行生产目录；新增 `tools/validation/analyze_coion_sensitivity.py` 汇总两腿
+  ΔG、净 ΔG_bind、统计误差、位置时间序列、hydration、restraint 能量与触壁比例。
+  分析必须读取 B5 provenance 中的 fingerprint 连接每个结果，禁止用目录名猜参数。
+
+  **需要回答的三个问题**：
+
+  1. 换合法 bulk-water 位置后，complex/solvent 各腿与净 ΔG 是否在预注册容差内？
+  2. 改 k/r0 后两腿 restraint 自由能是否抵消？若不抵消，给出显式修正或判路线失败，
+     不能用“逐 λ 相同所以一定抵消”代替数据。
+  3. neutral dummy 是否在预平衡中吸附配体/膜，charged endpoint 是否维持正常水合？
+
+  **硬验收**：所有合法 case 全程满足 §13.1、restraint 非有限值为 0、触壁帧比例与最大
+  restraint 能量均落盘；位置或 restraint 变体相对基线的净 ΔG_bind 差必须同时满足
+  `|ΔΔG_bind| ≤ 2σ_combined` 与 `≤ 1.0 kcal/mol`。任何系统性位置趋势、跨叶片跳跃、
+  hydration 崩塌或两腿不抵消都判失败。结果固定写
+  `validation/c5_sensitivity/design.json`、`cases/<case>/...`、`summary.csv`、
+  `summary.json` 和 `plots/`；最终 summary 明确列出 excluded/failed case 及原因，不得只
+  汇报最好的一组。
 
 ### Phase D：生产资格
 
@@ -1994,27 +2591,63 @@ independent_repeat_id
 
 ---
 
-## 15. 成本与资源（原稿完全没提，但它决定 Phase C/D 可行不可行）
+## 15. 成本与资源（✅ 2026-08-04 已按**实测**关闭，不再是估算）
 
-- [ ] **Phase A 必须先实测**，不许拍脑袋：
-  - 目标膜体系原子数（当前可溶体系 `solv_ions.gro` 约 5 万原子；
-    GPCR + 脂双层 + 水通常 10–15 万，即 2–3×）；
-  - 在目标 GPU 上的 ns/day（NPT 生产设置，含 barostat 与 IBS bias 开销）。
-- [ ] 用下式估算并填表，两条腿分别算：
+数据来源：`memtest/output_membrane_100ns` 第一次端到端跑通的那一轮
+（POPC 膜 + PROA + 中性 Atenolol），时间戳全部取自 `pipeline.log`。
+⚠️ 这一轮的**数值结果**有已知缺陷（见 §0.5.13），但**耗时与占用**不受影响。
+
+- [x] **Phase A 实测（不是拍脑袋）**：
+  - 膜复合物 **45354 原子**，预平衡后盒 5.9417 × 5.9417 × 12.4657 nm；
+    溶剂盒 **12796 原子**，盒边 4.052 nm（padding 1.5 nm）。
+    对照：可溶体系 `solv_ions.gro` 约 5 万原子 —— 本膜体系并不比它大，
+    原稿担心的"2–3×"没有出现（小膜片 90 脂）。
+  - GPU：单卡 16 GB（日志 `total=16303 MiB`）。
+  - **预平衡 476 ns/day**（5e6 步 / 30.2 min，NPT + `MonteCarloMembraneBarostat`）。
+- [x] 逐阶段实测（每窗口 250k 步 = 0.5 ns，2 fs）：
+
+  | 阶段 | wall-clock | 态数 | 总采样 | 聚合 ns/day |
+  | --- | --- | --- | --- | --- |
+  | 预平衡 100 ns（5e7 步） | **≈ 5.0 h** | 1 | 100 ns | 476 |
+  | 复合物 Stage 0 attachment | 4.9 min | 4 | 2.4 ns | 708 |
+  | λ 预优化（stage1+2） | 4.5 min | — | — | — |
+  | 复合物 Stage 1 去电荷 | 19.2 min | 12 | 6.0 ns | 449 |
+  | 复合物 Stage 2 去 VDW | 52.3 min | 23 | 11.5 ns | 316 |
+  | 溶剂腿 预平衡 + 预优化 | 15.1 min | — | — | — |
+  | 溶剂腿 Stage 1 | 8.5 min | 12 | 6.0 ns | 1018 |
+  | 溶剂腿 Stage 2 | 19.6 min | 23 | 11.5 ns | 846 |
+  | **合计（不含 100 ns 预平衡）** | **2.07 h** | | 37.4 ns | |
+
+  注：REMD 是 12/23 个副本在**同一张卡上分时**，所以表里给的是**聚合**吞吐
+  （总采样 ÷ wall-clock），不是单副本速度 —— 估成本要用聚合值。
+- [x] **串行 wall-clock 关键路径**（比 GPU-hours 总量更能决定能不能做）：
 
   ```text
-  GPU-hours ≈ (窗口数 × 每窗口 ns + 预平衡 ns + warmup ns) / (ns/day) × 24 × 重复数
+  单次 ΔG_bind ≈ 5.0 h（100 ns 预平衡） + 2.07 h（两条腿全部炼金） ≈ 7.1 h
   ```
 
-  当前可溶体系参数供对照（`abfe_config.json`）：
-  stage1 12 态、stage2 17 态、每窗口 250k 步（2 fs → 0.5 ns）、
-  warmup 500k 步（1 ns）、预平衡 5e6 步（10 ns）。
-  **膜体系这几个数都会变大**（预平衡 ≥ 100 ns、窗口数按 §6.4 重估）。
-- [ ] 估算轨迹/能量缓存的磁盘占用，确认输出目录容量够；
-  给出保留策略（哪些帧长期留、哪些跑完即删）。
-- [ ] 给出**串行 wall-clock 关键路径**，不只是 GPU-hours 总量。
-- [ ] 若估算结果超出可接受范围，在 Phase A 就缩小体系（更小膜片 / 更少重复），
-  **不许**靠砍窗口数或砍采样时长来凑——那会直接打回 R1/R5。
+  **瓶颈是预平衡，占 70%**，而且它是**一次性**的：同一体系做 3 重复时可以共用
+  同一条预平衡 + rebalance，只在 stage 层换种子 ⟹
+  3 重复 ≈ 5.0 + 3 × 2.07 = **11.2 h**（各自重新预平衡则是 21.3 h）。
+- [x] **磁盘占用与保留策略**（实测 `du`）：
+
+  | 产物 | 大小 | 保留 |
+  | --- | --- | --- |
+  | `pre_equilibration.dcd`（5001 帧 × 45354 原子） | **2.6 GB** | 过完 §9 质量门后抽稀（保留末段 20 ns 或 100 ps/帧）|
+  | `decharging/`（u_kn / energies `.npy`） | 312 MB | **长期保留**——重算 ΔG 的唯一输入 |
+  | `checkpoints/` | 49 MB | 保留到该 stage 关闭 |
+  | `system_native.xml` | 22 MB | 长期（重建 Hamiltonian 用）|
+  | 溶剂腿全部 | 92 MB | 同上 |
+  | **单次运行合计** | **3.1 GB** | 抽稀预平衡轨迹后 ≈ 0.5 GB |
+
+- [x] **是否超预算（§14 R6 的早期信号）**：单个 ΔG_bind 7.1 h 串行、
+  3 重复 11.2 h —— 远低于任何合理上限，**R6 不触发**，不需要缩小体系。
+  真要压缩，压的是预平衡（一次性且可共用），不是窗口数或采样时长
+  （砍那两个会直接打回 R1/R5）。
+- [ ] ⚠️ **这张表的有效期**：它绑定当前 λ 阶梯（stage1 12 态 / stage2 23 态、
+  每窗口 0.5 ns）。§6.4 明确要求 charge-transfer 用 pilot **重估** stage1 窗口数
+  （两个位点同时改电荷，相邻 ΔF 与中性配体不可比），窗口数一变成本要按上表
+  的聚合 ns/day 重算 —— 重算方法已经有了，这一条留着提醒别沿用旧窗口数。
 
 ---
 
@@ -2043,8 +2676,15 @@ independent_repeat_id
 
 ### 17.0 当前主线（2026-08-04 拍定，按此顺序推进）
 
-**进度（2026-08-04 晚）**：② B3 已完成（含 MEM-00d），下一步是 ③ B4。
-① 仍在跑（`memtest/output_membrane_100ns`，Stage 2 vanishing 进行中）。
+**进度（2026-08-05）**：② B3、③ B4 已完成；④ B5 到 ⑨ C5 现已写成详细交接指示，
+本次只补文档，**没有实现代码、没有创建验证脚本、没有运行 C1–C5**。下一位执行者仍从
+④ B5 开始，必须按 §11 的证据门逐项关闭。
+① 仍在跑（`memtest/output_membrane_100ns`，Stage 2 vanishing 进行中；中性 Atenolol
+跑完后用户会再确认，届时才真正进入 B5/C1 的验收节奏）。同日在这轮的真实 resume
+日志里当场抓到并修了 **RESUME-FP-01**（见 §0.5.14）——resume 协议指纹误把坐标
+数组当强判据，导致 Stage 0 attachment / 最终结果的粗粒度缓存每次 resume 都被
+无谓判失效重算；已修，λ 窗口级 GPU 采样缓存本来就不受影响。用户正在用修复后的
+代码重新跑这一段，等这轮跑完会再确认。
 
 ```
 ① 让当前**中性 Atenolol** 跑完整个 Stage 2 + 溶剂腿
@@ -2054,11 +2694,22 @@ independent_repeat_id
        ↓  身份前置条件已就位（MEM-00c 已完成"选一次 / 冻结 / 六个消费点只读核对"）
        ↓  MEM-00d 一并解决：restraint 换成 flat-bottom + **锚点相对**（随体系缩放）。
        ↓  身份指纹协议版本 1 → 2，旧 spec/缓存自动作废（刻意）。
-       ↓  ⚠️ 只有复合物腿；溶剂腿 fail closed，所以现在**不得报出 ΔG_bind**。
-③ B4：溶剂腿 builder（三类离子分离：中和用普通 counterion / 维持盐浓度的普通盐 /
-       ↓  参与炼金的 reserved co-ion；不许事后按残基名再猜）
-④ B5：cache / resume / provenance（等 B3/B4 的对象定义稳定后再把 identity 写进指纹）
-⑤ C1：小水盒验证
+③ B4：溶剂腿 builder（reserved co-ion dummy）  ✅ **已完成 2026-08-05**
+       ↓  `_insert_reserved_coalchemical_ion_dummies`：摘最远的 |q_L| 个水，换成
+       ↓  同号中性 ion-shaped dummy；身份识别/restraint/charging 复用 B3 的实现。
+       ↓  两腿都能跑了，热力学循环闭得上——但**只在合成 topology 上单元测过**，
+       ↓  没有真实带电配体上机验证（Atenolol 净电荷=0，这条路径本仓库测不出来）。
+④ B5：cache / resume / provenance（等 B3/B4 的对象定义稳定后再把 identity 写进指纹；
+       ↓  B4 只加了"builder 造没造出粒子"的 manifest 字段，不是完整 co-ion 指纹）
+⑤ C1：带电配体小水盒验证
+       ↓
+⑥ C2：protein-free lipid slab
+       ↓
+⑦ C3：真实体系端点能量与力
+       ↓
+⑧ C4：带电膜体系 complex/solvent 双腿 smoke test
+       ↓
+⑨ C5：co-ion 位置与 restraint 敏感性
 ```
 
 **不属于当前主线、明确暂不投入**：新的 APL 指标、新的膜弛豫硬门、更多 Stage 0 λ、

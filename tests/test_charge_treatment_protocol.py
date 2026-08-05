@@ -105,19 +105,20 @@ def test_charged_ligand_with_neutral_treatment_fails():
         core.resolve_charge_treatment("neutral", ligand_net_charge_e=1.0)
 
 
-def test_charged_ligand_with_coion_passes_validation_and_reports_the_open_solvent_leg():
+def test_charged_ligand_with_coion_passes_validation_and_reports_the_closed_cycle():
     """§7.1 第 3 条：带电配体 + co-ion → 校验通过。
 
-    ⚠️ 2026-08-04 起这条断言变了：**B3（charging Hamiltonian）已落地**，所以这里不再
-    抛 `NotImplementedError`。原先那个"分两步断言"的设计意图（把"规格校验过了"与
-    "哈密顿量还没有"分开，好让 B3 落地时看得出当初是哪一环在挡）就在这一刻兑现了 ——
-    挡住的那一环是哈密顿量，现在它有了。
+    ⚠️ 2026-08-04 起这条断言变了一次：**B3（charging Hamiltonian）落地**，不再抛
+    `NotImplementedError`。原先"分两步断言"的设计意图（把"规格校验过了"与
+    "哈密顿量还没有"分开，好让 B3 落地时看得出当初是哪一环在挡）在那一刻兑现——
+    挡住的那一环是哈密顿量，当时它有了。
 
-    还没有的是 **B4 溶剂腿 builder**，所以解析结果必须如实说"循环闭不上"。
-    这个状态**不**在这里 raise：那会连 §6.4 要求的 pilot / λ 阶梯重估都做不了。
-    真正的门在 `runabfe.build_and_cache_solvent_leg`（唯一一处，见
+    2026-08-05 起再变一次：**B4（溶剂腿 builder）也落地**了
+    （`runabfe._insert_reserved_coalchemical_ion_dummies` +
+    `build_and_cache_solvent_leg` 不再对 charge-transfer fail closed，见
     `tests/test_charge_transfer_hamiltonian.py::
-    test_solvent_leg_builder_is_still_fail_closed_for_charge_transfer`）。
+    test_solvent_leg_builder_inserts_reserved_dummy_for_charge_transfer`）。
+    循环闭得上了，解析结果必须如实反映这一点。
     """
     spec = _coion(+1.0)
     # 规格本身合法：单独校验不抛错。
@@ -131,9 +132,9 @@ def test_charged_ligand_with_coion_passes_validation_and_reports_the_open_solven
     assert payload["charge_treatment"] == "co_alchemical_charge_transfer"
     assert payload["charging_hamiltonian_implemented"] is True
     assert core.CHARGE_TRANSFER_HAMILTONIAN_IMPLEMENTED is True
-    # B4 未落地 ⟹ 不得报出 ΔG_bind，这一条必须能从解析结果直接读出来。
-    assert payload["solvent_leg_builder_implemented"] is False
-    assert payload["closes_thermodynamic_cycle"] is False
+    # B4 已落地 ⟹ 循环闭得上，这一条必须能从解析结果直接读出来。
+    assert payload["solvent_leg_builder_implemented"] is True
+    assert payload["closes_thermodynamic_cycle"] is True
     # APBS 仍然一律为 0（co-ion 路线与 Rocklin 二选一，禁止双计数）。
     assert payload["apbs_applicable"] is False
     assert payload["apbs_correction_kJ_mol"] == 0.0
@@ -167,11 +168,21 @@ def test_neutral_treatment_with_nonzero_apbs_fails():
 
 
 def test_charge_transfer_without_coion_fails():
-    """§1.2 fail-closed #3：缺 co-ion 身份/参数/restraint。"""
+    """显式要求旧版全局 spec 时仍可使用 fail-closed 校验。"""
     with pytest.raises(ValueError, match="没有提供"):
         core.resolve_charge_treatment(
-            "co_alchemical_charge_transfer", ligand_net_charge_e=1.0
+            "co_alchemical_charge_transfer", ligand_net_charge_e=1.0,
+            require_co_alchemical_ion=True,
         )
+
+
+def test_charge_transfer_preflight_does_not_require_global_coion_spec():
+    """B5：全局前置解析只解析路线，spec 由两条 pipeline 各自冻结。"""
+    payload = core.resolve_charge_treatment(
+        "co_alchemical_charge_transfer", ligand_net_charge_e=1.0
+    )
+    assert payload["charge_treatment"] == "co_alchemical_charge_transfer"
+    assert payload["co_alchemical_ion"] is None
 
 
 def test_charge_transfer_with_coion_missing_restraint_fails():
@@ -354,14 +365,11 @@ def test_tiny_numerical_residue_in_net_charge_is_tolerated_as_neutral():
 def test_charged_ligand_defaults_to_charge_transfer_not_to_the_legacy_path():
     """不声明时带电配体默认 charge-transfer，而不是沿用现存的 co-annihilation。
 
-    §1.2 的生产默认值。默认解析成 charge-transfer 之后，因"没有提供 co_alchemical_ion"
-    而失败 —— 而不是静默落回 neutral、也不是沿用旧的 co-annihilation
-    （MEM-00a-4：旧带电配体数据一律作废）。
+    §1.2 的生产默认值。默认解析成 charge-transfer；spec 在每条 pipeline
+    构建后分别冻结，不从全局 CLI 输入借用。
     """
-    # 默认解析成 charge-transfer，于是因"没有提供 co_alchemical_ion"而失败——
-    # 而不是静默落回 neutral、也不是沿用旧的 co-annihilation。
-    with pytest.raises(ValueError, match="没有提供"):
-        core.resolve_charge_treatment(None, ligand_net_charge_e=1.0)
+    payload = core.resolve_charge_treatment(None, ligand_net_charge_e=1.0)
+    assert payload["charge_treatment"] == "co_alchemical_charge_transfer"
 
 
 def test_apbs_correction_must_be_finite_number():

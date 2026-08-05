@@ -16,7 +16,11 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from local_residual.mace_graph import MaceGraphConfig, MaceGraphError
-from local_residual.teacher_graph import build_teacher_graph_for_frame
+from local_residual.teacher_graph import (
+    build_teacher_graph_for_frame,
+    build_teacher_graph_from_membership,
+    compute_canonical_graph_membership,
+)
 
 
 def _config(edge_cutoff=6.0, layers=2, upper_bound=12.0):
@@ -120,3 +124,117 @@ def test_differentiable_through_selected_positions():
     )
     graph["data"]["positions"].square().sum().backward()
     assert positions.grad is not None and torch.isfinite(positions.grad).all()
+
+
+def _membership_case():
+    # Same layout as test_closure_only_no_residue_expansion: atom 4 sits
+    # inside the geometric upper bound but outside the true two-hop closure.
+    positions = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.0],
+            [5.0, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [-8.0, 0.0, 0.0],
+        ],
+        dtype=torch.float64,
+    )
+    cell = torch.eye(3, dtype=torch.float64) * 40.0
+    return positions, cell
+
+
+def test_membership_requires_cpu_float64():
+    positions, cell = _membership_case()
+    with pytest.raises(MaceGraphError, match="CPU in float64"):
+        compute_canonical_graph_membership(
+            positions.to(torch.float32), cell.to(torch.float32),
+            ligand_indices=[0, 1], edge_cutoff_angstrom=6.0, interaction_layers=2,
+        )
+
+
+def test_split_membership_and_assembly_matches_combined_function():
+    # DEC-032 Option C: deciding membership separately from execution must not
+    # change the resulting graph when both happen on the same device/dtype --
+    # the split is a refactor of *where* the decision is made, not a change
+    # to what it decides.
+    positions, cell = _membership_case()
+    atomic_numbers = [6, 6, 8, 8, 8]
+    model_atomic_numbers = [6, 8]
+
+    combined = build_teacher_graph_for_frame(
+        positions.clone().requires_grad_(True), cell,
+        ligand_indices=[0, 1],
+        atomic_numbers_by_topology_index=atomic_numbers,
+        model_atomic_numbers=model_atomic_numbers,
+        config=_config(),
+    )
+
+    membership = compute_canonical_graph_membership(
+        positions, cell, ligand_indices=[0, 1],
+        edge_cutoff_angstrom=6.0, interaction_layers=2,
+    )
+    split = build_teacher_graph_from_membership(
+        membership, positions.clone().requires_grad_(True), cell,
+        atomic_numbers_by_topology_index=atomic_numbers,
+        model_atomic_numbers=model_atomic_numbers,
+    )
+
+    assert split["diagnostics"]["node_count"] == combined["diagnostics"]["node_count"]
+    assert split["diagnostics"]["edge_count"] == combined["diagnostics"]["edge_count"]
+    assert split["diagnostics"]["hop_counts_by_layer"] == combined["diagnostics"]["hop_counts_by_layer"]
+    assert torch.equal(
+        split["topology_indices_by_mace_node_index"],
+        combined["topology_indices_by_mace_node_index"],
+    )
+    assert torch.equal(split["ligand_mask"], combined["ligand_mask"])
+    assert torch.allclose(split["data"]["positions"], combined["data"]["positions"])
+    assert torch.equal(split["data"]["edge_index"], combined["data"]["edge_index"])
+    assert split["diagnostics"]["graph_membership_device"] == "cpu"
+    assert split["diagnostics"]["graph_membership_dtype"] == "float64"
+    assert split["diagnostics"]["model_execution_device"] == "cpu"
+    assert split["diagnostics"]["model_execution_dtype"] == "torch.float64"
+
+
+def test_assembly_at_different_precision_keeps_membership_hash_and_reports_execution_precision():
+    # Simulates the real bulk-cache pathway (CPU float64 membership, CUDA
+    # float32 execution) using CPU float32 as the stand-in execution
+    # precision, since this test suite doesn't require a GPU. The membership
+    # hash must be carried through unchanged -- it describes a decision that
+    # was never re-derived at the new precision.
+    positions, cell = _membership_case()
+    atomic_numbers = [6, 6, 8, 8, 8]
+    membership = compute_canonical_graph_membership(
+        positions, cell, ligand_indices=[0, 1],
+        edge_cutoff_angstrom=6.0, interaction_layers=2,
+    )
+    execution_positions = positions.to(torch.float32).requires_grad_(True)
+    execution_cell = cell.to(torch.float32)
+    graph = build_teacher_graph_from_membership(
+        membership, execution_positions, execution_cell,
+        atomic_numbers_by_topology_index=atomic_numbers,
+        model_atomic_numbers=[6, 8],
+    )
+    assert graph["diagnostics"]["node_count"] == membership["node_count"]
+    assert graph["diagnostics"]["edge_count"] == membership["edge_count"]
+    assert graph["diagnostics"]["graph_membership_sha256"] == membership["graph_membership_sha256"]
+    assert graph["diagnostics"]["graph_membership_device"] == "cpu"
+    assert graph["diagnostics"]["graph_membership_dtype"] == "float64"
+    assert graph["diagnostics"]["model_execution_device"] == "cpu"
+    assert graph["diagnostics"]["model_execution_dtype"] == "torch.float32"
+    assert graph["data"]["positions"].dtype == torch.float32
+    assert graph["data"]["unit_shifts"].dtype == torch.float32
+
+
+def test_membership_topology_shorter_than_target_positions_fails_closed():
+    positions, cell = _membership_case()
+    membership = compute_canonical_graph_membership(
+        positions, cell, ligand_indices=[0, 1],
+        edge_cutoff_angstrom=6.0, interaction_layers=2,
+    )
+    truncated_positions = positions[:2].clone().requires_grad_(True)
+    with pytest.raises(MaceGraphError, match="fewer atoms"):
+        build_teacher_graph_from_membership(
+            membership, truncated_positions, cell,
+            atomic_numbers_by_topology_index=[6, 6],
+            model_atomic_numbers=[6, 8],
+        )

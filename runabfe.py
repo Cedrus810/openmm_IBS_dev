@@ -36,12 +36,14 @@ from abfe_core import (
     DEXPSurrogatePotential, LambdaDependentBoreschForce, ensure_owned_system,
     NumpyEncoder, THERMODYNAMIC_CYCLE_DOC, assess_boresch_harmonicity,  # ✅ 统一从 abfe_core 导入
     combine_binding_free_energy,  # [ATT-09] 热力学循环闭合的唯一实现
+    ligand_conformer_fingerprint,  # [P0-12b] 起始构象进溶剂腿缓存身份
     solvent_box_edge_nm, SOLVENT_NONBONDED_CUTOFF_NM,  # 溶剂盒唯一实现，勿在此重复
     resolve_water_model_xml,  # 溶剂腿水模型必须从复合物 .top 反推
     resolve_membrane_protocol,  # 膜体系协议唯一解析实现（B1）
     resolve_environment_type,  # 只看 config 的环境类型规范化（不需要 topology）
     resolve_charge_treatment,  # 净电荷处理协议唯一校验实现（B2）
     CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER,  # B3 生产路线；溶剂腿 builder 是 B4
+    CHARGE_TREATMENT_CO_ANNIHILATION_EXPERIMENTAL,
     CHARGE_TRANSFER_SOLVENT_LEG_IMPLEMENTED,  # B4 状态，进 provenance 与开跑前告警
     resolve_dispersion_protocol,  # LJ/色散路线唯一校验实现（B6）
     resolve_forcefield_family,  # 力场族识别唯一实现（§1.1）
@@ -57,6 +59,7 @@ from abfe_core import (
     openmm_compatible_gromacs_top,  # 需要时转换，返回可交给 OpenMM 的 .top
     load_gromacs_topology_for_openmm,  # **唯一**的拓扑加载入口
     GROMACS_PAIRS_FUNCT2_CONVERSION_VERSION,
+    co_alchemical_ion_builder_identity_payload,
 )
 from abfe_pipeline import (
     ABFEPipeline, TraditionalABFEPipeline, _collect_pipeline_provenance, _pme_u_kn_meta_payload,
@@ -113,12 +116,23 @@ PRESET_CONFIGS = {
     },
 }
 
-MAIN_SYSTEM_CACHE_PROTOCOL_VERSION = 2
+MAIN_SYSTEM_CACHE_PROTOCOL_VERSION = 3
 # version 4: 溶剂盒不再交给 addSolvent(padding=...) 自己推导。旧路径在本仓库
 #   产出过 box = 2*padding 的 3.000 nm 立方盒——溶质尺寸对盒长的贡献是 0，而
 #   配体最长轴 1.257 nm，每侧只剩 0.87 nm 溶剂，第二水化层直接和周期镜像重叠。
 #   所有 v3 及更早的溶剂缓存都是在那个盒子里建的，必须整体作废重建。
-SOLVENT_CACHE_PROTOCOL_VERSION = 4
+# 4 → 5（2026-08-04，P0-12b）：身份里加入配体**起始构象**指纹。
+# 实测同一个分子换一个起始构象，溶剂腿去电荷从 62.80 变成 191.05 kJ/mol（P0-12），
+# 而旧口径里这两次都判"缓存有效"——起始构象决定了溶剂腿采到哪个构象族，它必须进身份。
+# 5 → 6（2026-08-05，B4）：charge-transfer 路线的溶剂腿 builder 落地——现在会额外
+# 插入 reserved co-ion dummy，manifest 加了 `charge_treatment` /
+# `reserved_coion_*` 字段（§4.5）。旧缓存不含这些粒子，必须 fail closed 重建，
+# 不能被静默当成"已经有 co-ion"复用（那会让下游 `select_co_alchemical_ion_once`
+# 在一个没有 dummy 的盒子里报错，或更糟——如果盒子恰好凑巧有别的零电荷粒子，
+# 静默选错身份）。
+# ⚠️ 升版本会让**所有**已有溶剂腿盒缓存重建（盒构建只要几十秒；真正贵的 stage
+# 采样缓存由 `_stage_protocol_key` 单独把关，不受本版本号影响）。
+SOLVENT_CACHE_PROTOCOL_VERSION = 7
 DEFAULT_SOLVENT_IONIC_STRENGTH_MOLAR = 0.15
 SOLVENT_PADDING_NM = 1.5
 
@@ -178,6 +192,7 @@ def _main_cache_identity(
     top_file: Optional[str],
     ligand_resname: Optional[str],
     gmx_include_dir: Optional[str],
+    builder_identity: Optional[Dict] = None,
 ) -> Dict:
     if not gro_file or not os.path.isfile(gro_file):
         raise FileNotFoundError("主 System 缓存校验需要当前有效的 --gro 输入")
@@ -210,6 +225,8 @@ def _main_cache_identity(
             "ewald_error_tolerance": 0.0005,
         },
     }
+    if builder_identity is not None:
+        payload["reserved_coion_builder_identity"] = builder_identity
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return {"identity": payload, "identity_sha256": hashlib.sha256(encoded.encode()).hexdigest()}
 
@@ -223,6 +240,7 @@ def _ligand_parameter_identity(
     ligand_ffxml: Optional[str],
     gmx_include_dir: Optional[str],
     padding_nm: float = SOLVENT_PADDING_NM,
+    positions=None,
 ) -> Dict:
     nb_force = next(
         (force for force in system.getForces() if isinstance(force, openmm.NonbondedForce)),
@@ -280,6 +298,26 @@ def _ligand_parameter_identity(
         "solvent_forcefield": ["amber14-all.xml", resolve_water_model_xml(top_file)[0]],
         "padding_nm": float(padding_nm),
     }
+    # [P0-12b] 配体**起始构象**进身份。用内部距离矩阵指纹（刚体平移/旋转不敏感），
+    # 所以只有构象真的变了才让盒缓存失效。positions 缺省时明确记 None 而不是静默略过。
+    if positions is not None:
+        pos_nm = (
+            np.asarray(positions.value_in_unit(unit.nanometer), dtype=np.float64)
+            if hasattr(positions, "value_in_unit")
+            else np.asarray(positions, dtype=np.float64)
+        )
+        heavy = [
+            int(atom.index)
+            for atom in topology.atoms()
+            if int(atom.index) in set(indices)
+            and atom.element is not None
+            and float(atom.element.mass.value_in_unit(unit.dalton)) >= 2.5
+        ]
+        payload["ligand_start_conformer"] = ligand_conformer_fingerprint(
+            pos_nm, indices, heavy_indices=heavy or None
+        )
+    else:
+        payload["ligand_start_conformer"] = None
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return {"identity": payload, "identity_sha256": hashlib.sha256(encoded.encode()).hexdigest()}
 
@@ -324,12 +362,53 @@ def find_gmx_include_dir(user_path: Optional[str] = None) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # 状态检测函数
 # ---------------------------------------------------------------------------
+def _recompute_cached_builder_identity(
+    *,
+    xml_path: str,
+    topology_path: str,
+    ligand_indices_path: str,
+    charge_treatment: Optional[str],
+) -> Optional[Dict]:
+    """Recompute the reserved-dummy identity from cache payloads.
+
+    A manifest is metadata, not an authority.  For charge-transfer caches we
+    deserialize the cached base System and Topology and derive the ligand net
+    charge from the cached ligand indices, then call the single core helper.
+    This makes a one-field edit to ``reserved_coion_builder_identity`` fail
+    closed instead of being accepted merely because the field is a dictionary.
+    """
+    if str(charge_treatment) != CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
+        return None
+    try:
+        with open(xml_path, "r", encoding="utf-8") as handle:
+            cached_system = XmlSerializer.deserialize(handle.read())
+        cached_cif = app.PDBxFile(topology_path)
+        with open(ligand_indices_path, "r", encoding="utf-8") as handle:
+            ligand_indices = [int(i) for i in json.load(handle)["ligand_indices"]]
+        raw_q = _compute_ligand_net_charge(cached_system, ligand_indices)
+        q_l = int(round(float(raw_q)))
+        if abs(float(raw_q) - q_l) > 1.0e-3:
+            raise ValueError(
+                f"cached ligand net charge {raw_q:+.6f} e is not integral"
+            )
+        return co_alchemical_ion_builder_identity_payload(
+            system=cached_system,
+            topology=cached_cif.topology,
+            charge_treatment=charge_treatment,
+            ligand_net_charge_e=q_l,
+        )
+    except Exception as exc:
+        log.warning("⚠️ reserved co-ion builder identity 重算失败，将拒绝复用缓存: %s", exc)
+        return None
+
+
 def system_cache_exists(
     output_dir: str,
     gro_file: Optional[str] = None,
     top_file: Optional[str] = None,
     ligand_resname: Optional[str] = None,
     gmx_include_dir: Optional[str] = None,
+    charge_treatment: Optional[str] = None,
 ) -> bool:
     """Only accept a native cache bound to the complete current GROMACS input."""
     xml = os.path.join(output_dir, "system_native.xml")
@@ -348,6 +427,37 @@ def system_cache_exists(
     except Exception as exc:
         log.warning("⚠️ 主 System 缓存身份无法校验 (%s)，将重建", exc)
         return False
+    recorded_builder = recorded.get("reserved_coion_builder_identity")
+    recorded_treatment = recorded.get("charge_treatment")
+    if recorded_treatment is None and isinstance(recorded_builder, dict):
+        recorded_treatment = recorded_builder.get("charge_treatment")
+    # Old manifests did not carry a top-level route.  Infer it from the cached
+    # base System; this preserves neutral-cache behavior while still refusing
+    # to reuse an old charged cache that has no builder identity.
+    if recorded_treatment is None:
+        try:
+            with open(xml, "r", encoding="utf-8") as handle:
+                cached_system = XmlSerializer.deserialize(handle.read())
+            with open(idx, "r", encoding="utf-8") as handle:
+                cached_ligand_indices = [
+                    int(i) for i in json.load(handle)["ligand_indices"]
+                ]
+            cached_q = _compute_ligand_net_charge(
+                cached_system, cached_ligand_indices
+            )
+            recorded_treatment = (
+                CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER
+                if abs(float(cached_q)) > 1.0e-6
+                else "neutral"
+            )
+        except Exception:
+            # If route inference is impossible, retain the legacy comparison;
+            # the later charged identity check will fail closed when requested.
+            recorded_treatment = None
+    route_matches = True
+    if charge_treatment is not None and recorded_treatment is not None:
+        route_matches = str(charge_treatment) == str(recorded_treatment)
+    effective_treatment = charge_treatment or recorded_treatment
     matches = (
         recorded.get("protocol_version") == MAIN_SYSTEM_CACHE_PROTOCOL_VERSION
         and recorded.get("identity_sha256") == expected["identity_sha256"]
@@ -355,7 +465,17 @@ def system_cache_exists(
         and recorded.get("ligand_indices_sha256") == _sha256_file(idx)
         and recorded.get("topology_sha256") == _sha256_file(top)
         and recorded.get("box_vectors_sha256") == _sha256_file(box)
+        and route_matches
     )
+    if str(effective_treatment) == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
+        expected_builder = _recompute_cached_builder_identity(
+            xml_path=xml,
+            topology_path=top,
+            ligand_indices_path=idx,
+            charge_treatment=effective_treatment,
+        )
+        matches = matches and expected_builder is not None
+        matches = matches and recorded_builder == expected_builder
     if not matches:
         log.warning("⚠️ 主 System 缓存与当前 GRO/TOP/include/配体/构建参数不匹配，将重建")
     return bool(matches)
@@ -365,8 +485,15 @@ def solvent_cache_exists(
     output_dir: str,
     ionic_strength_molar: float = DEFAULT_SOLVENT_IONIC_STRENGTH_MOLAR,
     expected_identity: Optional[Dict] = None,
+    charge_treatment: Optional[str] = None,
+    expected_builder_identity: Optional[Dict] = None,
 ) -> bool:
-    """Only accept solvent caches built with the requested explicit salt."""
+    """Only accept solvent caches built with the requested explicit salt.
+
+    [B4，§4.5] 也校验 `charge_treatment` 是否与当前请求一致——同一个 output_dir
+    如果换了净电荷路线（例如从 `neutral` 换成 `co_alchemical_charge_transfer`），
+    旧盒子里没有 reserved co-ion，绝不能被静默复用。
+    """
     xml = os.path.join(output_dir, "system_solvent.xml")
     idx = os.path.join(output_dir, "ligand_indices_solvent.json")
     top = os.path.join(output_dir, "topology_solvent.cif")
@@ -390,10 +517,55 @@ def solvent_cache_exists(
         and manifest.get("system_xml_sha256") == _sha256_file(xml)
         and manifest.get("ligand_indices_sha256") == _sha256_file(idx)
         and manifest.get("topology_sha256") == _sha256_file(top)
+        and manifest.get("charge_treatment") == charge_treatment
     )
-    if expected_strength > 0.0:
-        matches = matches and int(manifest.get("na_count", 0)) > 0
-        matches = matches and int(manifest.get("cl_count", 0)) > 0
+    if str(charge_treatment) == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
+        if expected_builder_identity is None:
+            expected_builder_identity = _recompute_cached_builder_identity(
+                xml_path=xml,
+                topology_path=top,
+                ligand_indices_path=idx,
+                charge_treatment=charge_treatment,
+            )
+            matches = matches and expected_builder_identity is not None
+        else:
+            # The caller-provided identity is authoritative for a freshly built
+            # cache, but still require the persisted System/Topology to agree so
+            # a hand-edited manifest cannot make a mutated cache resumable.
+            recomputed = _recompute_cached_builder_identity(
+                xml_path=xml,
+                topology_path=top,
+                ligand_indices_path=idx,
+                charge_treatment=charge_treatment,
+            )
+            matches = matches and recomputed == expected_builder_identity
+        matches = matches and manifest.get(
+            "reserved_coion_builder_identity"
+        ) == expected_builder_identity
+    elif charge_treatment in (None, "neutral"):
+        # Neutral legacy caches intentionally carry no co-ion identity.
+        pass
+    # `na_count`/`cl_count` include reserved alchemical dummies and are not
+    # evidence that the requested physical salt was built.  New manifests
+    # carry ordinary counts; charge-transfer caches missing either field are
+    # rejected regardless of the requested strength rather than guessing from
+    # the legacy totals.
+    if str(charge_treatment) == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
+        ordinary_fields_present = (
+            "ordinary_na_count" in manifest and "ordinary_cl_count" in manifest
+        )
+        matches = matches and ordinary_fields_present
+        if expected_strength > 0.0 and ordinary_fields_present:
+            matches = matches and int(manifest["ordinary_na_count"]) > 0
+            matches = matches and int(manifest["ordinary_cl_count"]) > 0
+    elif expected_strength > 0.0:
+        if "ordinary_na_count" in manifest and "ordinary_cl_count" in manifest:
+            matches = matches and int(manifest["ordinary_na_count"]) > 0
+            matches = matches and int(manifest["ordinary_cl_count"]) > 0
+        else:
+            # Neutral legacy caches predate the split and remain compatible.
+            matches = matches and int(manifest.get("na_count", 0)) > 0
+            matches = matches and int(manifest.get("cl_count", 0)) > 0
     if not matches:
         log.warning(
             "⚠️ 已有溶剂腿缓存不是当前显式盐协议 "
@@ -612,24 +784,31 @@ def generate_ligand_xml_from_top(
         constraints=None,
         rigidWater=False,
     )
-    nb_force = next(
-        (f for f in extracted_system.getForces() if isinstance(f, openmm.NonbondedForce)),
-        None,
-    )
-    bond_force = next(
-        (f for f in extracted_system.getForces() if isinstance(f, openmm.HarmonicBondForce)),
-        None,
-    )
-    angle_force = next(
-        (f for f in extracted_system.getForces() if isinstance(f, openmm.HarmonicAngleForce)),
-        None,
-    )
-    torsion_force = next(
-        (f for f in extracted_system.getForces() if isinstance(f, openmm.PeriodicTorsionForce)),
-        None,
-    )
-    if nb_force is None:
-        raise RuntimeError("GROMACS 拓扑构建出的 System 中未找到 NonbondedForce，无法抽取配体参数")
+    # 🔑 [P0-13 2026-08-04] **必须聚合同类型的所有力，不能 next() 取第一个。**
+    #
+    # 实测事故：`memtest` 那个膜体系的 System 里有**两个** HarmonicAngleForce ——
+    # force[2] 有 31401 个角但**配体一个都不在里面**，force[4] 才是配体那 71 个。
+    # 旧代码 `next(...)` 抓到 force[2]，于是 `ligand_only.xml` 的
+    # <HarmonicAngleForce> 段是**空的**，溶剂腿的配体因此**没有任何键角项** ⟹
+    # 分子变软 ⟹ 预平衡里从 0.996 塌到 0.660 nm 再也回不来 ⟹ 配体–水静电耦合强
+    # 3 倍 ⟹ 溶剂腿去电荷 62.80 → 191.05 kJ/mol ⟹ ΔG_bind 变成 +23 kcal/mol。
+    # 可溶体系只有一个角力（配体那 71 个混在里面），所以侥幸一直没踩到。
+    #
+    # 同一个隐患对 bond/torsion 完全一样（那次只是恰好各只有一个力），所以三类
+    # 一起改成聚合，并在函数末尾对账写出的项数（见下方 self-check）。
+    def _forces_of(kind) -> List:
+        return [f for f in extracted_system.getForces() if isinstance(f, kind)]
+
+    nb_candidates = _forces_of(openmm.NonbondedForce)
+    if len(nb_candidates) != 1:
+        raise RuntimeError(
+            f"GROMACS 拓扑构建出的 System 里有 {len(nb_candidates)} 个 NonbondedForce，"
+            "无法确定配体的非键参数该从哪一个取。请先收口拓扑，不要让本函数猜。"
+        )
+    nb_force = nb_candidates[0]
+    bond_forces = _forces_of(openmm.HarmonicBondForce)
+    angle_forces = _forces_of(openmm.HarmonicAngleForce)
+    torsion_forces = _forces_of(openmm.PeriodicTorsionForce)
 
     def classify_torsion(p1: int, p2: int, p3: int, p4: int) -> Tuple[str, Tuple[int, int, int, int]]:
         atoms4 = (p1, p2, p3, p4)
@@ -667,13 +846,15 @@ def generate_ligand_xml_from_top(
             )
     xml_lines += ["    </Residue>", "  </Residues>"]
 
+    n_written = {"bond": 0, "angle": 0, "torsion": 0}
     xml_lines.append("  <HarmonicBondForce>")
-    if bond_force is not None:
+    for bond_force in bond_forces:
         for bidx in range(bond_force.getNumBonds()):
             p1, p2, length, k = bond_force.getBondParameters(bidx)
             p1 = int(p1)
             p2 = int(p2)
             if p1 in unique_names and p2 in unique_names:
+                n_written["bond"] += 1
                 xml_lines.append(
                     f'    <Bond class1="T{p1}" class2="T{p2}" '
                     f'length="{length.value_in_unit(unit.nanometer):.8f}" '
@@ -682,11 +863,12 @@ def generate_ligand_xml_from_top(
     xml_lines.append("  </HarmonicBondForce>")
 
     xml_lines.append("  <HarmonicAngleForce>")
-    if angle_force is not None:
+    for angle_force in angle_forces:
         for aidx in range(angle_force.getNumAngles()):
             p1, p2, p3, angle, k = angle_force.getAngleParameters(aidx)
             p1, p2, p3 = int(p1), int(p2), int(p3)
             if all(x in unique_names for x in (p1, p2, p3)):
+                n_written["angle"] += 1
                 xml_lines.append(
                     f'    <Angle class1="T{p1}" class2="T{p2}" class3="T{p3}" '
                     f'angle="{angle.value_in_unit(unit.radian):.8f}" '
@@ -695,11 +877,12 @@ def generate_ligand_xml_from_top(
     xml_lines.append("  </HarmonicAngleForce>")
 
     xml_lines.append("  <PeriodicTorsionForce>")
-    if torsion_force is not None:
+    for torsion_force in torsion_forces:
         for tidx in range(torsion_force.getNumTorsions()):
             p1, p2, p3, p4, periodicity, phase, k = torsion_force.getTorsionParameters(tidx)
             p1, p2, p3, p4 = int(p1), int(p2), int(p3), int(p4)
             if all(x in unique_names for x in (p1, p2, p3, p4)):
+                n_written["torsion"] += 1
                 torsion_tag, ordered = classify_torsion(p1, p2, p3, p4)
                 t1, t2, t3, t4 = ordered
                 xml_lines.append(
@@ -721,6 +904,50 @@ def generate_ligand_xml_from_top(
         )
     xml_lines.append("  </NonbondedForce>")
     xml_lines.append("</ForceField>")
+
+    # 🔑 [P0-13] 写完就对账：**源体系里配体有多少个成键项，XML 里就必须有多少个**。
+    # 这一步就是那个"7 小时之后才发现"的事故本该在 0.1 秒内被拦住的地方 ——
+    # 旧代码把 71 个键角悄悄丢成 0，而下游没有任何环节会注意到分子变软了。
+    expected = {
+        "bond": sum(
+            1
+            for f in bond_forces
+            for i in range(f.getNumBonds())
+            if all(int(x) in unique_names for x in f.getBondParameters(i)[:2])
+        ),
+        "angle": sum(
+            1
+            for f in angle_forces
+            for i in range(f.getNumAngles())
+            if all(int(x) in unique_names for x in f.getAngleParameters(i)[:3])
+        ),
+        "torsion": sum(
+            1
+            for f in torsion_forces
+            for i in range(f.getNumTorsions())
+            if all(int(x) in unique_names for x in f.getTorsionParameters(i)[:4])
+        ),
+    }
+    if n_written != expected:
+        raise RuntimeError(
+            "配体 XML 抽取对账失败（P0-13）：写出的成键项数与源 System 不一致。\n"
+            f"    写出 {n_written}，源体系 {expected}\n"
+            "    这类静默丢项的后果是分子变软：2026-08-04 实测丢掉全部 71 个键角后，"
+            "溶剂腿配体在预平衡里从 0.996 塌到 0.660 nm 且再不恢复，去电荷自由能从"
+            "62.80 变成 191.05 kJ/mol，ΔG_bind 变成 +23 kcal/mol。\n"
+            "    不要放宽本对账 —— 它是唯一能在 0.1 秒内发现这件事的地方。"
+        )
+    # 配体本来就该有键角：一个多原子分子写出 0 个角，只可能是抽取错了。
+    if len(lig_idx) > 2 and expected["angle"] == 0:
+        raise RuntimeError(
+            f"配体 {ligand_resname} 有 {len(lig_idx)} 个原子，但源 System 里"
+            "**一个键角项都没有** —— 拓扑或力场抽取有问题。"
+            "带着这样的参数跑，分子是软的（P0-13）。"
+        )
+    log.info(
+        "  ✓ [P0-13] 配体成键项对账通过: bond=%d angle=%d torsion=%d（源体系逐项相同）",
+        n_written["bond"], n_written["angle"], n_written["torsion"],
+    )
 
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, "ligand_only.xml")
@@ -771,6 +998,8 @@ def save_native_system(
     positions,
     box_vectors,
     cache_identity: Optional[Dict] = None,
+    reserved_coion_builder_identity: Optional[Dict] = None,
+    charge_treatment: Optional[str] = None,
 ):
     """持久化原生 System XML 与辅助数据至 output_dir（内置 convert 功能）"""
     os.makedirs(output_dir, exist_ok=True)
@@ -820,10 +1049,104 @@ def save_native_system(
             else None
         ),
     }
+    if reserved_coion_builder_identity is not None:
+        manifest["reserved_coion_builder_identity"] = reserved_coion_builder_identity
+    if charge_treatment is not None:
+        manifest["charge_treatment"] = str(charge_treatment)
     manifest_path = os.path.join(output_dir, "system_cache_manifest.json")
     with open(manifest_path, "w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2, sort_keys=True)
     log.info("  [缓存] 输入身份 manifest 已保存: %s", manifest_path)
+
+def _insert_reserved_coalchemical_ion_dummies(
+    modeller,
+    count: int,
+    cation: bool,
+    ligand_atom_indices: List[int],
+) -> List[int]:
+    """[B4，§4.1/§2.2] 在 `modeller` 里插入 `count` 个建系时预留的中性 ion-shaped
+    dummy 粒子，返回它们在**最终拓扑**里的 atom index。
+
+    只负责"让判据能找到粒子"——真正的身份选择/restraint/charging 电荷映射全部
+    交给已有的 `ibs_engine._identify_reserved_neutral_co_ions`（判据：残基名在
+    离子集合里、且电荷严格为 0，坐标无关）。这里造出来的粒子电荷仍是模板给的
+    ±1，调用方必须在 `createSystem()` 之后显式清零。
+
+    放置策略（§4.4 "初始位置远离配体且不与周期镜像过近"）：摘掉离配体质心
+    minimum-image 距离最远的 `count` 个水分子，把 dummy 放在被摘掉的氧原子
+    原来的位置——零额外体积冲突，且"越远的水优先被选中"天然满足安全边距。
+    是否真的够远由下游 `abfe_core.validate_co_alchemical_ion_placement`
+    （strict=True）兜底 fail closed，这里不重复判一遍阈值。
+
+    ⚠️ 先一次性摘完全部选中的水、再一次性加入全部 dummy——不要在循环里交替
+    delete/add：`Modeller.delete()` 会重新编号拓扑，交替做会让本函数早先加入的
+    dummy 的 index 被后面的 delete 悄悄移位。
+    """
+    if count <= 0:
+        return []
+    element = app.element.sodium if cation else app.element.chlorine
+    residue_name = "NA" if cation else "CL"
+
+    pos_nm = np.asarray(
+        modeller.positions.value_in_unit(unit.nanometer), dtype=np.float64
+    )
+    box_vecs = modeller.topology.getPeriodicBoxVectors()
+    if box_vecs is None:
+        raise RuntimeError("插入 reserved co-ion dummy 需要周期盒向量，但拓扑里没有")
+    box_nm = np.array(
+        [v.value_in_unit(unit.nanometer) for v in box_vecs], dtype=np.float64
+    )
+    inv_box = np.linalg.inv(box_nm)
+    lig_centroid_nm = pos_nm[list(ligand_atom_indices)].mean(axis=0)
+
+    def _mic_distance(p: np.ndarray) -> float:
+        delta = p - lig_centroid_nm
+        frac = delta @ inv_box
+        frac -= np.round(frac)
+        return float(np.linalg.norm(frac @ box_nm))
+
+    water_residues = [
+        res for res in modeller.topology.residues() if res.name in ("HOH", "WAT")
+    ]
+    if len(water_residues) < count:
+        raise RuntimeError(
+            f"溶剂盒里只有 {len(water_residues)} 个水分子，不够替换出 {count} 个 "
+            "reserved co-ion dummy（§4.2：盒子必须留够 bulk-water 壳层，"
+            "考虑加大 padding_nm）。"
+        )
+
+    scored = []
+    for res in water_residues:
+        atoms = list(res.atoms())
+        o_atom = next(
+            (a for a in atoms if a.element == app.element.oxygen), atoms[0]
+        )
+        scored.append((_mic_distance(pos_nm[o_atom.index]), o_atom.index))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    chosen_oxygen_indices = [idx for _dist, idx in scored[:count]]
+    chosen_positions_nm = [pos_nm[idx].copy() for idx in chosen_oxygen_indices]
+
+    # 摘掉这些水分子（连同它们的 H）——按 residue 删，不是按单个原子删。
+    index_to_residue = {
+        atom.index: res for res in water_residues for atom in res.atoms()
+    }
+    residues_to_delete = {index_to_residue[idx] for idx in chosen_oxygen_indices}
+    to_delete = [atom for res in residues_to_delete for atom in res.atoms()]
+    modeller.delete(to_delete)
+
+    dummy_top = app.Topology()
+    dummy_chain = dummy_top.addChain()
+    for _ in range(count):
+        residue = dummy_top.addResidue(residue_name, dummy_chain)
+        dummy_top.addAtom(residue_name, element, residue)
+    dummy_positions = [
+        Vec3(float(p[0]), float(p[1]), float(p[2])) for p in chosen_positions_nm
+    ] * unit.nanometer
+
+    n_before = sum(1 for _ in modeller.topology.atoms())
+    modeller.add(dummy_top, dummy_positions)
+    return list(range(n_before, n_before + count))
+
 
 # ================= runabfe.py =================
 # 完整替换 build_and_cache_solvent_leg 函数
@@ -844,26 +1167,18 @@ def build_and_cache_solvent_leg(
     """
     🔑 终极纯净版：彻底抛弃 mmCIF，直接从原始 .top 提取配体并自动加水。
 
-    ⚠️ [B4 未落地] 本 builder 只产 `ligand + water + 普通盐` 的盒子。§4.1 要求
-    charge-transfer 的溶剂腿还必须显式产出 **reserved co-alchemical ion**，
-    并把三类电荷来源（配体形式电荷 / 中和+盐浓度的普通离子 / reserved co-ion）
-    分开登记（§4.3）。那是 B4，尚未实现，所以这里 fail closed。
+    [B4，2026-08-05 落地] `charge_treatment=co_alchemical_charge_transfer` 且配体带
+    净电荷时，本 builder 在 `addSolvent()` 产出的普通盐/中和离子之外，额外插入
+    `|q_L|` 个建系时预留的**中性 ion-shaped dummy** 粒子（§4.1/§2.2）：电荷强制为 0，
+    LJ/mass 取同号物理离子模板（配体净电荷 >0 → Na⁺ 形状，<0 → Cl⁻ 形状），放置在
+    离配体最远的 bulk-water 位置（§4.4）。
+
+    这里**只负责让粒子存在**，不重新实现选择/身份/restraint 逻辑——那些已经是
+    leg-agnostic 的既有实现：`ibs_engine.select_co_alchemical_ion_once` 靠"残基名在
+    离子集合里且电荷严格为 0"这个坐标无关的判据认出它（`_identify_reserved_neutral_co_ions`），
+    `abfe_core.build_co_alchemical_ion_identity` 冻结成可落盘身份。复合物腿的输入
+    拓扑靠建系脚本预先带上同一种粒子，两条腿殊途同归，不需要两套判据。
     """
-    # 唯一的 B4 门：放在真正建溶剂盒的这一处，而不是再在上游写一遍判据。
-    if charge_treatment == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
-        raise NotImplementedError(
-            "charge_treatment=co_alchemical_charge_transfer 的**溶剂腿 builder 尚未实现**"
-            "（memtodolist Phase B4）。\n"
-            "    复合物腿的 charging Hamiltonian 已经可用（B3，2026-08-04），可以用它做"
-            "pilot / λ 阶梯重估（§6.4 明确要求用 pilot 重定 stage1 窗口数）；\n"
-            "    但溶剂腿里没有 reserved co-ion，ΔG_solv 与 ΔG_cplx 的 co-ion 项就不对消，"
-            "热力学循环闭不上 ⟹ **不得报出 ΔG_bind**。\n"
-            "    需要的是 §4.1 那个一次性产出 "
-            "`ligand + water + ordinary salt/counterions + reserved co-alchemical ion` "
-            "并返回 `coion_indices` / `ordinary_ion_indices` 的 builder。\n"
-            "    ⚠️ 不要为了跑通而在这里临时挑一个盐离子当 co-ion —— 那既不是"
-            "charge-transfer（λ=1 端必须是中性 dummy），也会让两腿离子强度口径分叉（§4.3）。"
-        )
     padding_nm = float(padding_nm)
     log.info("💧 正在构建溶剂相 (配体腿) 系统并生成缓存...")
     from openmm.app import Modeller, ForceField
@@ -992,6 +1307,58 @@ def build_and_cache_solvent_leg(
                 f"实际边长 {[round(float(x), 6) for x in realized_edges]} nm"
             )
 
+        # [B4] charge-transfer 路线：在**最终** createSystem 之前插入 reserved
+        # co-ion dummy——下游只认"残基名在离子集合里且电荷严格为 0"的粒子
+        # （`ibs_engine._identify_reserved_neutral_co_ions`），必须真的进最终的
+        # NonbondedForce，不能是事后贴上去的。
+        reserved_coion_indices: List[int] = []
+        reserved_coion_cation: Optional[bool] = None
+        reserved_coion_ligand_net_charge_e = 0
+        if charge_treatment == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
+            probe_system = ff.createSystem(
+                modeller.topology,
+                nonbondedMethod=app.PME,
+                nonbondedCutoff=SOLVENT_NONBONDED_CUTOFF_NM * unit.nanometer,
+                constraints=app.HBonds,
+                rigidWater=True,
+            )
+            probe_nb = next(
+                f for f in probe_system.getForces()
+                if isinstance(f, openmm.NonbondedForce)
+            )
+            probe_lig_indices = [
+                a.index for a in modeller.topology.atoms()
+                if a.residue.name == ligand_resname
+            ]
+            raw_q = sum(
+                probe_nb.getParticleParameters(i)[0].value_in_unit(
+                    unit.elementary_charge
+                )
+                for i in probe_lig_indices
+            )
+            lig_net_charge = int(round(raw_q))
+            if abs(raw_q - lig_net_charge) > 1.0e-3:
+                raise RuntimeError(
+                    f"配体净电荷 {raw_q:+.6f} e 不接近整数（容差 1e-3 e），"
+                    "无法确定需要几个 reserved co-ion dummy（§2.2）。"
+                )
+            del probe_system
+            reserved_coion_ligand_net_charge_e = lig_net_charge
+            if lig_net_charge != 0:
+                reserved_coion_cation = lig_net_charge > 0
+                log.info(
+                    "  ⚗️ 配体净电荷 %+d e：插入 %d 个 %s 形 reserved co-ion dummy（B4，§4.1）",
+                    lig_net_charge,
+                    abs(lig_net_charge),
+                    "Na⁺" if reserved_coion_cation else "Cl⁻",
+                )
+                reserved_coion_indices = _insert_reserved_coalchemical_ion_dummies(
+                    modeller,
+                    count=abs(lig_net_charge),
+                    cation=reserved_coion_cation,
+                    ligand_atom_indices=probe_lig_indices,
+                )
+
         system = ff.createSystem(
             modeller.topology,
             nonbondedMethod=app.PME,
@@ -999,6 +1366,24 @@ def build_and_cache_solvent_leg(
             constraints=app.HBonds,
             rigidWater=True,
         )
+
+        if reserved_coion_indices:
+            # 模板给的是 ±1（Na⁺/Cl⁻ residue template）；charge-transfer 要求 λ=1
+            # 端它是"中性但保留 LJ 的 ion-shaped dummy"（§2.2），这里显式清零。
+            nb_force = next(
+                f for f in system.getForces()
+                if isinstance(f, openmm.NonbondedForce)
+            )
+            for idx in reserved_coion_indices:
+                _, sigma, epsilon = nb_force.getParticleParameters(idx)
+                nb_force.setParticleParameters(
+                    idx, 0.0 * unit.elementary_charge, sigma, epsilon
+                )
+            log.info(
+                "  ✅ %d 个 reserved co-ion dummy 电荷已清零 (indices=%s)",
+                len(reserved_coion_indices),
+                reserved_coion_indices,
+            )
     except Exception as e:
         log.error("❌ 溶剂相构建失败 (配体 XML 未正确接入或模板不匹配): %s", e)
         log.error("💡 当前使用的配体 XML: %s", ffxml_path)
@@ -1009,12 +1394,36 @@ def build_and_cache_solvent_leg(
     residue_names = [str(residue.name).upper() for residue in modeller.topology.residues()]
     na_count = sum(name in {"NA", "NA+", "SOD"} for name in residue_names)
     cl_count = sum(name in {"CL", "CL-", "CLA"} for name in residue_names)
-    if ionic_strength_molar > 0.0 and (na_count == 0 or cl_count == 0):
+    reserved_coion_builder_identity = co_alchemical_ion_builder_identity_payload(
+        system=system,
+        topology=modeller.topology,
+        charge_treatment=charge_treatment,
+        ligand_net_charge_e=reserved_coion_ligand_net_charge_e,
+    )
+    reserved_na_count = sum(
+        1 for idx in reserved_coion_indices
+        if str(list(modeller.topology.atoms())[idx].residue.name).upper()
+        in {"NA", "NA+", "SOD"}
+    )
+    reserved_cl_count = sum(
+        1 for idx in reserved_coion_indices
+        if str(list(modeller.topology.atoms())[idx].residue.name).upper()
+        in {"CL", "CL-", "CLA"}
+    )
+    ordinary_na_count = int(na_count - reserved_na_count)
+    ordinary_cl_count = int(cl_count - reserved_cl_count)
+    if ionic_strength_molar > 0.0 and (
+        ordinary_na_count == 0 or ordinary_cl_count == 0
+    ):
         log.error(
-            "❌ 请求 %.3f M NaCl，但生成拓扑中离子计数异常: Na=%d, Cl=%d",
+            "❌ 请求 %.3f M NaCl，但生成拓扑中普通盐离子计数异常: "
+            "ordinary_Na=%d, ordinary_Cl=%d (total Na=%d, Cl=%d, reserved=%d)",
             ionic_strength_molar,
+            ordinary_na_count,
+            ordinary_cl_count,
             na_count,
             cl_count,
+            len(reserved_coion_indices),
         )
         return False
     
@@ -1033,9 +1442,7 @@ def build_and_cache_solvent_leg(
     box_vecs = modeller.topology.getPeriodicBoxVectors()
     if box_vecs:
         np.save(sol_box, np.array([v.value_in_unit(unit.nanometer) for v in box_vecs]))
-    with open(sol_manifest, "w", encoding="utf-8") as f:
-        json.dump(
-            {
+    manifest_payload = {
                 "protocol_version": SOLVENT_CACHE_PROTOCOL_VERSION,
                 **cache_identity,
                 "padding_nm": padding_nm,
@@ -1048,25 +1455,48 @@ def build_and_cache_solvent_leg(
                 "neutralize": True,
                 "na_count": int(na_count),
                 "cl_count": int(cl_count),
+                "ordinary_na_count": ordinary_na_count,
+                "ordinary_cl_count": ordinary_cl_count,
+                # [B4，§4.3/§4.5] 三类电荷来源不能混算：na_count/cl_count 是
+                # "配体形式电荷/普通离子" 那一类的残基名总数（也包含下面这些
+                # reserved dummy，因为它们复用同一个残基名模板）；
+                # reserved_coion_* 才是 alchemical co-ion 的账目，不能把
+                # dummy 错算成普通盐浓度。
+                "charge_treatment": charge_treatment,
+                "reserved_coion_ligand_net_charge_e": int(
+                    reserved_coion_ligand_net_charge_e
+                ),
+                "reserved_coion_count": len(reserved_coion_indices),
+                "reserved_coion_indices": list(reserved_coion_indices),
+                "reserved_coion_cation": reserved_coion_cation,
                 "system_xml_sha256": _sha256_file(sol_xml),
                 "topology_sha256": _sha256_file(sol_cif),
                 "ligand_indices_sha256": _sha256_file(sol_idx),
-            },
-            f,
-            indent=2,
+            }
+    if reserved_coion_builder_identity is not None:
+        manifest_payload["reserved_coion_builder_identity"] = (
+            reserved_coion_builder_identity
         )
+    with open(sol_manifest, "w", encoding="utf-8") as f:
+        json.dump(manifest_payload, f, indent=2)
         
     box_lengths_nm = [
         float(np.linalg.norm(v.value_in_unit(unit.nanometer))) for v in box_vecs
     ]
     log.info(
-        "✅ 溶剂相缓存已保存 (padding %.2f nm, 盒长 %s nm, 原子数 %d, Na=%d, Cl=%d, %.3f M)",
+        "✅ 溶剂相缓存已保存 (padding %.2f nm, 盒长 %s nm, 原子数 %d, Na=%d, Cl=%d, %.3f M"
+        "%s)",
         padding_nm,
         [round(x, 3) for x in box_lengths_nm],
         system.getNumParticles(),
         na_count,
         cl_count,
         ionic_strength_molar,
+        (
+            f", reserved_coion={len(reserved_coion_indices)}"
+            if reserved_coion_indices
+            else ""
+        ),
     )
     return True
 
@@ -1722,6 +2152,7 @@ def _write_run_provenance(
     membrane_input: Optional[Dict] = None,
     pairs_conversion: Optional[Dict] = None,
     membrane_quality_gate_mode: Optional[str] = None,
+    co_alchemical_ions: Optional[Dict] = None,
 ) -> Dict:
     provenance = _collect_pipeline_provenance(
         config=config.as_dict(),
@@ -1760,7 +2191,16 @@ def _write_run_provenance(
         provenance["charge_protocol"] = charge_protocol
         provenance["charge_treatment"] = charge_protocol.get("charge_treatment")
         provenance["ligand_net_charge"] = charge_protocol.get("ligand_net_charge_e")
-        provenance["coion_identity"] = charge_protocol.get("co_alchemical_ion")
+        # The old global singular input is not a runtime identity: B5 freezes
+        # complex/solvent specs independently after each pipeline is built.
+        # Keep it only as an explicitly deprecated audit record so old readers
+        # can see what was supplied, but never let resume/provenance consumers
+        # treat it as the spec actually used by either leg.
+        provenance["deprecated_global_co_alchemical_ion_input"] = charge_protocol.get(
+            "co_alchemical_ion"
+        )
+        provenance["coion_identity"] = None
+        provenance["coion_identity_deprecated"] = True
         provenance["apbs_applicable"] = charge_protocol.get("apbs_applicable")
         provenance["apbs_applied"] = charge_protocol.get("apbs_applied")
         if charge_protocol.get("experimental_not_for_production"):
@@ -1773,6 +2213,8 @@ def _write_run_provenance(
             provenance["incomplete_cycle_reason"] = (
                 "charge_transfer_solvent_leg_builder_not_implemented_phase_b4"
             )
+    if co_alchemical_ions is not None:
+        provenance["co_alchemical_ions"] = co_alchemical_ions
     provenance["input_files"] = {
         "gro": config.get("gro"),
         "top": config.get("top"),
@@ -1783,9 +2225,168 @@ def _write_run_provenance(
     }
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, "run_provenance.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(provenance, f, indent=2, cls=NumpyEncoder)
+    _atomic_write_json_with_encoder(path, provenance)
     return provenance
+
+
+def _atomic_write_json_with_encoder(path: str, payload: Dict) -> None:
+    """Write a JSON object atomically while retaining the project's encoder.
+
+    Provenance is read by resume and by external audit tooling.  A process being
+    interrupted between ``open(..., 'w')`` and ``json.dump`` must not leave a
+    truncated document that looks like a valid-but-empty provenance record.
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, cls=NumpyEncoder)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        if os.name == "posix":
+            parent = os.path.dirname(path) or "."
+            dir_fd = os.open(parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def _update_run_provenance_co_alchemical_ions(
+    output_dir: str,
+    co_alchemical_ions: Dict,
+    current: Optional[Dict] = None,
+) -> Dict:
+    """Merge the two-leg co-ion identities into run provenance atomically."""
+    path = os.path.join(output_dir, "run_provenance.json")
+    if current is not None:
+        provenance = dict(current)
+    elif os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            provenance = loaded if isinstance(loaded, dict) else {}
+        except (OSError, ValueError):
+            provenance = {}
+    else:
+        provenance = {}
+    provenance["co_alchemical_ions"] = co_alchemical_ions
+    _atomic_write_json_with_encoder(path, provenance)
+    return provenance
+
+
+def _augment_final_result_with_co_alchemical_ions(
+    path: str, co_alchemical_ions: Dict
+) -> None:
+    """Add the combined two-leg identity block to an already-written leg result."""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"应写入 co-ion 双腿身份的 final_results 不存在：{path}"
+        )
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            result = json.load(handle)
+        if not isinstance(result, dict):
+            return
+        result["co_alchemical_ions"] = co_alchemical_ions
+        _atomic_write_json_with_encoder(path, result)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"无法原子更新 co-ion 双腿身份到 final_results：{path}: {exc}"
+        ) from exc
+
+
+def _coion_leg_protocol_signature(spec: Dict) -> Dict:
+    """Return the cross-leg co-ion *protocol*, excluding leg-local identity.
+
+    Atom/residue indices, anchors, and frozen displacements are intentionally
+    omitted: complex and solvent have different topologies/coordinates and
+    therefore are allowed to have different fingerprints.  The route, charge,
+    endpoint convention, ion model, and restraint implementation must still be
+    identical, otherwise the two legs do not form the same thermodynamic cycle.
+    """
+    if not isinstance(spec, dict):
+        raise ValueError(f"co-ion spec 必须是 dict，收到 {type(spec).__name__}")
+    ions = spec.get("ions")
+    if not isinstance(ions, list) or not ions:
+        raise ValueError("co-ion spec 缺少非空 ions 列表")
+    ion_protocol = []
+    for ion in ions:
+        if not isinstance(ion, dict):
+            raise ValueError("co-ion spec 的 ions 项必须是 dict")
+        restraint = ion.get("restraint")
+        if not isinstance(restraint, dict):
+            raise ValueError("co-ion spec 缺少 restraint 协议")
+        ion_protocol.append(
+            {
+                "residue_name": str(ion.get("residue_name")),
+                "element": str(ion.get("element")),
+                "charge_at_lambda1_e": float(ion.get("charge_at_lambda1_e")),
+                "charge_at_lambda0_e": float(ion.get("charge_at_lambda0_e")),
+                "sigma_nm": float(ion.get("sigma_nm")),
+                "epsilon_kj_mol": float(ion.get("epsilon_kj_mol")),
+                "mass_amu": float(ion.get("mass_amu")),
+                "restraint": {
+                    key: restraint.get(key)
+                    for key in (
+                        "form",
+                        "expression",
+                        "reference_frame",
+                        "k_kj_per_mol_nm2",
+                        "flat_bottom_radius_nm",
+                        "force_group",
+                        "anchor_selection_rule",
+                    )
+                },
+            }
+        )
+    return {
+        "charge_treatment": str(spec.get("charge_treatment")),
+        "ligand_net_charge_e": int(spec.get("ligand_net_charge_e")),
+        "lambda_direction": str(spec.get("lambda_direction")),
+        "ions": ion_protocol,
+    }
+
+
+def _assert_coion_legs_complete_and_compatible(
+    coion_identities: Dict[str, Optional[Dict]],
+    complex_spec: Optional[Dict],
+    solvent_spec: Optional[Dict],
+    charge_treatment: Optional[str],
+) -> None:
+    """Fail closed before a charge-transfer two-leg cycle can be reported."""
+    if str(charge_treatment) != CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
+        return
+    if set(coion_identities) != {"complex", "solvent"}:
+        raise RuntimeError(
+            "charge-transfer 最终汇总要求 complex 与 solvent 两条腿都提供 co-ion 身份；"
+            f"当前字段={sorted(coion_identities)}"
+        )
+    complex_identity = coion_identities.get("complex")
+    solvent_identity = coion_identities.get("solvent")
+    if not isinstance(complex_identity, dict) or not isinstance(solvent_identity, dict):
+        raise RuntimeError(
+            "charge-transfer 两腿 co-ion 身份必须都是有效 dict，不能为 None。"
+        )
+    if not isinstance(complex_spec, dict) or not isinstance(solvent_spec, dict):
+        raise RuntimeError(
+            "charge-transfer 两腿必须各自有已冻结并验证的 co-ion spec。"
+        )
+    complex_protocol = _coion_leg_protocol_signature(complex_spec)
+    solvent_protocol = _coion_leg_protocol_signature(solvent_spec)
+    if complex_protocol != solvent_protocol:
+        raise RuntimeError(
+            "charge-transfer complex/solvent co-ion 协议不一致："
+            "charge_treatment、配体净电荷、lambda 方向、ion 模型或 restraint 协议不同；"
+            "两腿 fingerprint 可以不同，但物理协议必须一致。"
+        )
 
 
 def run_self_tests() -> int:
@@ -2955,9 +3556,13 @@ def run_traditional_mode(config: RunConfig):
         config.top,
         getattr(config, "ligand_xml", None),
         find_gmx_include_dir(config.gmx_path),
+        positions=positions,
     )
     if config.reset or not solvent_cache_exists(
-        output_dir, config.solvent_ionic_strength_molar, solvent_identity
+        output_dir,
+        config.solvent_ionic_strength_molar,
+        solvent_identity,
+        charge_treatment=config.get("charge_treatment"),
     ):
         log.info("💧 traditional 模式准备溶剂腿缓存...")
         if not build_and_cache_solvent_leg(
@@ -3860,6 +4465,7 @@ def main():
         config.top,
         config.ligand,
         include_dir,
+        charge_treatment=config.get("charge_treatment"),
     ):
         system, topology, positions, box_vectors, ligand_indices = load_native_system(
             output_dir, 
@@ -3905,6 +4511,19 @@ def main():
             include_dir
         )
         diagnose_14_scaling(system)
+        _raw_ligand_net_charge = _compute_ligand_net_charge(system, ligand_indices)
+        _resolved_builder_treatment = config.get("charge_treatment")
+        if not _resolved_builder_treatment:
+            _resolved_builder_treatment = (
+                "neutral" if int(round(_raw_ligand_net_charge)) == 0
+                else CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER
+            )
+        _builder_identity = co_alchemical_ion_builder_identity_payload(
+            system=system,
+            topology=topology,
+            charge_treatment=_resolved_builder_treatment,
+            ligand_net_charge_e=int(round(_raw_ligand_net_charge)),
+        )
         # 立即保存为原生缓存
         save_native_system(
             output_dir,
@@ -3914,6 +4533,8 @@ def main():
             positions,
             box_vectors,
             cache_identity=main_cache_identity,
+            reserved_coion_builder_identity=_builder_identity,
+            charge_treatment=_resolved_builder_treatment,
         )
         log.info("✅ 原生缓存已生成")
         # 重新从缓存加载，确保后续所有对象都来自落盘文件
@@ -3987,11 +4608,6 @@ def main():
         config.get("charge_treatment"),
         ligand_net_charge_e=_ligand_net_charge_e,
         apbs_correction_kJ_mol=config.get("apbs_correction_kJ_mol", 0.0),
-        co_alchemical_ion=(
-            _load_json_object_file(config.get("co_alchemical_ion"), "co-alchemical ion 规格")
-            if config.get("co_alchemical_ion")
-            else None
-        ),
         environment_type=config.get("system_type"),
         apbs_evidence=(
             _load_json_object_file(config.get("apbs_evidence"), "APBS 证据")
@@ -3999,6 +4615,12 @@ def main():
             else None
         ),
     )
+    if config.get("co_alchemical_ion"):
+        log.warning(
+            "⚠️ --co-alchemical-ion / co_alchemical_ion 是旧版全局输入，"
+            "仅作 deprecated audit record；B5 不会把它用于任一条腿。"
+            "请让 complex/solvent pipeline 各自冻结 coalchemical_ion_spec.json。"
+        )
     if _charge_protocol["charge_treatment"] != "neutral":
         log.info(
             "⚡ 净电荷协议=%s（配体净电荷 %+d e，APBS %s）",
@@ -4168,6 +4790,7 @@ def main():
             )
 
     run_provenance = None
+    coion_identities = {}
     if not config.only_complex_charging:
         run_provenance = _write_run_provenance(
             output_dir, config, system, topology, positions,
@@ -4203,9 +4826,13 @@ def main():
             config.top,
             getattr(config, "ligand_xml", None),
             include_dir,
+            positions=positions,
         )
         if config.reset or not solvent_cache_exists(
-            output_dir, config.solvent_ionic_strength_molar, solvent_identity
+            output_dir,
+            config.solvent_ionic_strength_molar,
+            solvent_identity,
+            charge_treatment=_charge_protocol["charge_treatment"],
         ):
             log.info(
                 "💧 溶剂腿缓存缺失或盐协议不匹配，开始构建 %.3f M NaCl 配体体系...",
@@ -4360,6 +4987,25 @@ def main():
         )
         return
 
+    # [B5] Freeze the complex-leg co-ion identity before any stage, preopt, or
+    # top-level protocol key is built.  The spec is selected once (or read and
+    # verified on resume) and the minimal identity is what downstream caches
+    # receive; no later stage is allowed to select from coordinates again.
+    _complex_coion_spec_relpath = os.path.relpath(
+        pipeline._co_alchemical_ion_spec_path(), output_dir
+    )
+    pipeline._coion_spec_relative_path = _complex_coion_spec_relpath
+    complex_coion_identity = pipeline.co_alchemical_ion_runtime_identity(
+        "complex", spec_relative_path=_complex_coion_spec_relpath
+    )
+    if complex_coion_identity is not None:
+        coion_identities["complex"] = complex_coion_identity
+        run_provenance = _update_run_provenance_co_alchemical_ions(
+            output_dir,
+            {"complex": complex_coion_identity, "solvent": None},
+            current=run_provenance,
+        )
+
     # ----- 6. 运行复合物腿主流程 -----
     log.info("🔄 启动复合物腿主采样流程 (%s)", config.decoupling)
     complex_results = pipeline.run_full_pipeline(
@@ -4467,6 +5113,38 @@ def main():
         # 只有 environment_type/membrane 是溶剂腿刻意不接的。
         charge_treatment=_charge_protocol["charge_treatment"],
     )
+
+    # [B5] Use a path relative to the run root so complex and solvent records
+    # are unambiguous when audited together.  This call is before the solvent
+    # stage protocol key is built inside run_full_pipeline().
+    _solvent_coion_spec_relpath = os.path.relpath(
+        pipeline_solv._co_alchemical_ion_spec_path(), output_dir
+    )
+    pipeline_solv._coion_spec_relative_path = _solvent_coion_spec_relpath
+    solvent_coion_identity = pipeline_solv.co_alchemical_ion_runtime_identity(
+        "solvent", spec_relative_path=_solvent_coion_spec_relpath
+    )
+    if solvent_coion_identity is not None:
+        coion_identities["solvent"] = solvent_coion_identity
+        run_provenance = _update_run_provenance_co_alchemical_ions(
+            output_dir,
+            {
+                "complex": coion_identities.get("complex"),
+                "solvent": solvent_coion_identity,
+            },
+            current=run_provenance,
+        )
+
+    # [B5] Do not start the solvent leg (and never reach final aggregation)
+    # with a partially populated charge-transfer identity block.  The two legs
+    # may select different atom indices/fingerprints, but their route and ion /
+    # restraint protocol must be the same.
+    _assert_coion_legs_complete_and_compatible(
+        coion_identities,
+        pipeline.resolve_co_alchemical_ion_spec(),
+        pipeline_solv.resolve_co_alchemical_ion_spec(),
+        _charge_protocol["charge_treatment"],
+    )
     
     # 运行溶剂腿 (🔑 强制关闭 Boresch)
     solv_results = pipeline_solv.run_full_pipeline(
@@ -4522,6 +5200,32 @@ def main():
     
     dg_solvent = solv_results.get("total_delta_G_complex_kJ_mol", solv_results.get("decoupling_delta_G_kJ_mol", 0.0))
     err_solvent = solv_results.get("total_error_kJ_mol", 0.0)
+
+    # Repeat the final-summary gate at the last boundary so a future change to
+    # either pipeline cannot turn a valid preflight into a null leg in output.
+    _assert_coion_legs_complete_and_compatible(
+        coion_identities,
+        pipeline.resolve_co_alchemical_ion_spec(),
+        pipeline_solv.resolve_co_alchemical_ion_spec(),
+        _charge_protocol["charge_treatment"],
+    )
+
+    if coion_identities:
+        # Both leg result files must remain self-auditing when copied away from
+        # the run directory.  The complex file was written before solvent was
+        # constructed, so merge the now-complete two-leg block atomically.
+        _combined_coion_identities = {
+            "complex": coion_identities.get("complex"),
+            "solvent": coion_identities.get("solvent"),
+        }
+        _augment_final_result_with_co_alchemical_ions(
+            os.path.join(output_dir, "final_results.json"),
+            _combined_coion_identities,
+        )
+        _augment_final_result_with_co_alchemical_ions(
+            os.path.join(solvent_out_dir, "final_results.json"),
+            _combined_coion_identities,
+        )
     
     # ----- 8. 计算最终结合自由能 ΔG_bind -----
     # 🔑 关键修复：标准双解耦循环推导（态 A=复合物真实结合；态 D=去耦+释放限制力后
@@ -4545,6 +5249,11 @@ def main():
         dg_boresch_kJ_mol=dg_boresch,
         boresch_already_included_in_complex=True,
         apbs_correction_kJ_mol=apbs_correction,
+        # [P0-12a / §3.0] 两条腿的配体构象系综必须重叠，否则这个减法没有意义。
+        # 门在 combine_binding_free_energy 里（唯一一处），这里只负责把两侧的
+        # 自报 summary 交上去；缺哪一侧就记 not_evaluated，不会伪装成通过。
+        complex_conformer_summary=complex_results.get("ligand_conformer_diagnostics"),
+        solvent_conformer_summary=solv_results.get("ligand_conformer_diagnostics"),
     )
     delta_g_bind_uncorrected = cycle["delta_G_bind_uncorrected_kJ_mol"]
     delta_g_bind = cycle["delta_G_bind_kJ_mol"]
@@ -4632,9 +5341,15 @@ def main():
             },
         },
     }
+    if coion_identities:
+        # [B5] The combined result records both leg identities, while neutral
+        # runs retain the legacy shape (no synthetic empty co-ion record).
+        final_bind_result["co_alchemical_ions"] = {
+            "complex": coion_identities.get("complex"),
+            "solvent": coion_identities.get("solvent"),
+        }
     bind_out_path = os.path.join(output_dir, "final_binding_results.json")
-    with open(bind_out_path, "w") as f:
-        json.dump(final_bind_result, f, indent=2, cls=NumpyEncoder)
+    _atomic_write_json_with_encoder(bind_out_path, final_bind_result)
     log.info("💾 最终结合自由能结果已保存: %s", bind_out_path)
 
     # ----- 7. 输出最终结果 -----
