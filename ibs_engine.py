@@ -81,8 +81,20 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 IBS_WINDOW_DATA_PROTOCOL_VERSION = 1
-SOFTCORE_CUTOFF_NM = 1.2
-SOFTCORE_SWITCH_NM = 1.0
+
+# 🔑 [MEM-00h，2026-08-06] 统一到物理力场的 1.0 nm、无 switching——不是 1.2 nm。
+# 之前这里跟基础 `NonbondedForce`（PME cutoff=1.0 nm，`SOLVENT_NONBONDED_CUTOFF_NM`/
+# `runabfe.py` 的建系）不一致：softcore CV 在 1.0-1.2 nm 这段还有非零 switched
+# 相互作用，基础力却已经硬截断为零，导致 λ=1（完全耦合端点）跟"关掉炼金描述、
+# 直接用普通力场"的真实系统不严格等价。1.0 nm 是与 Amber 系力场原始参数化匹配的
+# 截断（§1.3），1.2 这组值找不到独立物理依据，所以收敛方向是让 softcore 让步，
+# 不是把基础力拉长。同步关闭 switching：基础力从来没开过 switching
+# （实测 System XML：cutoff=1、switchingDistance=-1、useSwitchingFunction=0），
+# switching 只是 softcore 这条线自己多加的一段，没有独立存在的理由。
+# ⚠️ 只影响 `potential_type="softcore"`（ACE 传统路径，当前生产配置）；
+# `potential_type="dexp"` 用完全独立的 DEXP_VDW_CUTOFF_NM=0.70/
+# DEXP_VDW_SWITCH_WIDTH_NM=0.20，不受这条改动影响，见 _create_softcore_force。
+SOFTCORE_CUTOFF_NM = 1.0
 
 # 🔑 [2026-07-28] 「分析协议」版本，与「采样协议」版本严格分离。
 #
@@ -3149,11 +3161,38 @@ def _lj_tail_correction_sigma_resolved_moments(
 # v2 及更早版本号下产出的能量文件/u_kn 缓存对 v3 一律 fail closed。
 TRADITIONAL_LJ_LRC_PROTOCOL_VERSION = 3
 
+# 🔑 [MEM-00h，2026-08-06] vdW/softcore 非键协议版本——单独一个版本号，只覆盖
+# softcore cutoff/switching（1.2nm+switch → 1.0nm 无switch）这一次改动本身，
+# 不复用 TRADITIONAL_LJ_LRC_PROTOCOL_VERSION。
+#
+# 为什么不直接 bump TRADITIONAL_LJ_LRC_PROTOCOL_VERSION：那个字段目前是
+# `stage_type in {"coul","vdw"}` 都写、都校验（见 convergence 字典构造与
+# _resume_cached_window_gate_status）——即便 LRC 概念上只跟 vdW 有关。沿用它会
+# 把 Stage 1 charging 的缓存也一起判废，而 Stage 1 charging 完全不受这次改动
+# 影响（它不构造软核 CV，SOFTCORE_CUTOFF_NM/switching 跟它无关）。这是本仓库
+# 明确要求的边界：只作废 Stage 2 vdW window 与对应 u_kn，Stage 1 charging、
+# Boresch attachment、预平衡、C1 的 charging 轨迹一律不许重跑。
+#
+# 因此这个新版本号只在 stage_type=="vdw" 时写入 convergence.json、只在
+# stage_type=="vdw" 时参与 resume 门判定（见 _resume_cached_window_gate_status
+# 的 stage_type 形参与 vdw_nb_version_match）；stage_type=="coul" 的窗口完全
+# 不受影响，缺这个字段也不会被判无效。
+VDW_NONBONDED_PROTOCOL_VERSION = 1
+
 # 两条路径（ACE `_create_softcore_force` 与传统 `BeutlerSoftcoreBuilder.build`）
 # 目前都硬编码用这组 switching/cutoff 距离构造软核 CustomNonbondedForce，LRC 积分
 # 必须用完全相同的边界，否则修正的是一个跟实际采样哈密顿量不匹配的积分区间。
+#
+# [MEM-00h，2026-08-06] 统一到 1.0 nm、无 switching 后，switch==cutoff，下面积分
+# 公式里 [r_switch, r_cutoff] 那段"switching 壳层补偿"区间宽度精确为 0（自动贡献
+# 0，不需要为"switching 已关闭"另写一条积分分支），只剩 [r_cutoff, ∞) 的标准
+# r^-6/r^-12 尾项——这正是"解析 LRC 不再补偿 1.0-1.2nm switching 壳层，只积分
+# 1.0nm→∞"这句话在代码里的落地方式。这两个值仅作函数默认参数；实际调用（见
+# build_ibs_dual_system）都会传入从活的 softcore force 读回的 template_cutoff/
+# template_switch，因此哪怕只改了 _create_softcore_force 忘了改这里，行为也不会
+# 悄悄分叉——但两处都改是为了让默认值本身也如实反映现状，不留一个说谎的常量。
 LJ_TAIL_LRC_R_SWITCH_NM = 1.0
-LJ_TAIL_LRC_R_CUTOFF_NM = 1.2
+LJ_TAIL_LRC_R_CUTOFF_NM = 1.0
 
 
 def _lj_switching_function_value(r_nm: float, r_switch_nm: float, r_cutoff_nm: float) -> float:
@@ -3376,8 +3415,17 @@ def _create_softcore_force(
                 f"cutoff={cutoff_nm}, switch_width={switch_width_nm}, "
                 f"derived_switch={switch_nm} nm"
             )
+        use_switching = True
     else:
-        cutoff_nm, switch_nm = SOFTCORE_CUTOFF_NM, SOFTCORE_SWITCH_NM
+        # [MEM-00h] 统一到基础力场的 1.0 nm、无 switching——见 SOFTCORE_CUTOFF_NM
+        # 定义处的理由。switch_nm 特意设成等于 cutoff_nm（而不是干脆不设）：
+        # 下游 build_ibs_dual_system 会读 cv_template.getSwitchingDistance() 去算
+        # LJ 解析尾项的积分下限（见 _lj_softcore_tail_radial_integrals），switch==
+        # cutoff 让那段"switching 壳层"积分区间宽度精确为 0，自动退化成纯
+        # cutoff→∞ 的标准尾项，不需要为"switching 已关闭"另开一条积分公式分支。
+        cutoff_nm = SOFTCORE_CUTOFF_NM
+        switch_nm = SOFTCORE_CUTOFF_NM
+        use_switching = False
     sc_force.setCutoffDistance(cutoff_nm * unit.nanometer)
     print(
         "  ⚠️ [VDW softcore] OpenMM 原生 CustomNonbondedForce.setUseLongRangeCorrection 已禁用"
@@ -3397,7 +3445,7 @@ def _create_softcore_force(
             if p1 < total_particles and p2 < total_particles:
                 sc_force.addExclusion(p1, p2)
                 
-    sc_force.setUseSwitchingFunction(True)
+    sc_force.setUseSwitchingFunction(use_switching)
     sc_force.setSwitchingDistance(switch_nm * unit.nanometer)
     return sc_force
 
@@ -4027,6 +4075,7 @@ def build_ibs_dual_system(
         print("  ⚠️ [IBS CV] 检测到旧版 VDW softcore 表达式签名；请检查 CV 构造路径。")
     template_cutoff = cv_template.getCutoffDistance()
     template_switch = cv_template.getSwitchingDistance()
+    template_use_switching = cv_template.getUseSwitchingFunction()
     template_method = cv_template.getNonbondedMethod()
     template_excl = {
         tuple(sorted(map(int, cv_template.getExclusionParticles(i))))
@@ -4107,7 +4156,12 @@ def build_ibs_dual_system(
             "请勿直接等同于已含 dispersion correction 的 PME/LJPME 循环；APBS 修正应作为最终外部项记录。"
         )
         int_f_cv.setUseLongRangeCorrection(False)
-        int_f_cv.setUseSwitchingFunction(True)
+        # [MEM-00h，2026-08-06] 之前这里无条件写 True，会把 _create_softcore_force
+        # 按 potential_type 已经算好的 use_switching 悄悄覆盖回"总是开 switching"——
+        # 对当前生产的 softcore（非 dexp）路径来说，那会让每个 λ_vdw 态实际使用的
+        # CV 力switching 状态跟 cv_template（同一份构造逻辑理应产出同样的状态）不
+        # 一致。改成跟随 template 的真实状态，而不是硬编码常量。
+        int_f_cv.setUseSwitchingFunction(template_use_switching)
         current_excl = {
             tuple(sorted(map(int, int_f_cv.getExclusionParticles(i))))
             for i in range(int_f_cv.getNumExclusions())
@@ -5239,8 +5293,9 @@ def _resume_cached_window_gate_status(
     current_early_stop_config: Dict[str, Any],
     effective_target_steps: int,
     current_coion_identity: Optional[Dict[str, Any]] = None,
+    stage_type: str = "coul",
 ) -> Dict[str, Any]:
-    """一份磁盘窗口缓存在 resume 时能不能直接复用：8 个门的纯函数求值。
+    """一份磁盘窗口缓存在 resume 时能不能直接复用：9 个门的纯函数求值。
 
     原先这 ~110 行判断内联在 ``run_all_windows`` 里，依赖 8 个局部变量，没有任何
     办法单独调用，因此"缺字段是否真的 fail-closed""步数预算门是否真的不管
@@ -5323,6 +5378,18 @@ def _resume_cached_window_gate_status(
         == TRADITIONAL_LJ_LRC_PROTOCOL_VERSION
     )
 
+    # 🔑 [vdw_nonbonded_protocol_version，MEM-00h] softcore cutoff/switching 只
+    # 影响 Stage 2 vdW window（构造软核 CV 的那条路径），跟 Stage 1 charging
+    # 完全无关——charging 阶段不建软核 CV，SOFTCORE_CUTOFF_NM 对它没有意义。
+    # 所以这道门只在 stage_type=="vdw" 时才生效；stage_type=="coul" 一律
+    # pass-through（True），不因为这个字段缺失就把充电阶段的缓存判废。
+    vdw_nb_version_match = (
+        True
+        if stage_type != "vdw"
+        else cached_conv.get("vdw_nonbonded_protocol_version")
+        == VDW_NONBONDED_PROTOCOL_VERSION
+    )
+
     # 🔑 [non_mutating_v1] 采样修复策略必须匹配：旧的变异策略缓存（其 f_k 可能被
     # fixed-H 累计 ΔF 就地覆盖过，属于不同参考系）绝不能被非变异策略的 run 复用。
     # 旧缓存没有这个字段（None），与 "non_mutating_v1" 不相等，因此自动判无效。
@@ -5384,6 +5451,7 @@ def _resume_cached_window_gate_status(
         and bias_protocol_match
         and lse_tolerance_match
         and lrc_version_match
+        and vdw_nb_version_match
         and repair_policy_match
         and coion_identity_match
         and early_stop_ok
@@ -5420,6 +5488,12 @@ def _resume_cached_window_gate_status(
             f"{cached_conv.get('lj_tail_lrc_protocol_version')!r}"
             f"（期望 {TRADITIONAL_LJ_LRC_PROTOCOL_VERSION}）"
         )
+    elif not vdw_nb_version_match:
+        reason = (
+            f"vdw_nonbonded_protocol_version="
+            f"{cached_conv.get('vdw_nonbonded_protocol_version')!r}"
+            f"（期望 {VDW_NONBONDED_PROTOCOL_VERSION}，stage_type={stage_type!r}）"
+        )
     elif not repair_policy_match:
         reason = (
             f"sampling_repair_policy="
@@ -5445,6 +5519,7 @@ def _resume_cached_window_gate_status(
         "lse_tolerance_match": lse_tolerance_match,
         "cached_lse_tolerance": cached_lse_tolerance,
         "lrc_version_match": lrc_version_match,
+        "vdw_nb_version_match": vdw_nb_version_match,
         "repair_policy_match": repair_policy_match,
         "coion_identity_match": coion_identity_match,
         "cached_coion_identity": cached_coion_identity,
@@ -6714,7 +6789,13 @@ class IBSSampler:
         self.energy_buffer = []
         return mean_p_batch
 # ================= ibs_engine.py -> IBSSampler 类 =================
-    def save_ibs_state(self, filepath: str, lambdas_coul=None, lambdas_vdw=None):
+    def save_ibs_state(
+        self,
+        filepath: str,
+        lambdas_coul=None,
+        lambdas_vdw=None,
+        stage_type: Optional[str] = None,
+    ):
         """同步保存 IBS 状态，使用原子替换避免损坏。
 
         lambdas_coul/lambdas_vdw：本窗口这次真正对应的 λ 值（跟 convergence.json
@@ -6780,9 +6861,17 @@ class IBSSampler:
             "lambdas_coul": [float(x) for x in lambdas_coul] if lambdas_coul is not None else None,
             "lambdas_vdw": [float(x) for x in lambdas_vdw] if lambdas_vdw is not None else None,
         }
+        if stage_type == "vdw":
+            state["vdw_nonbonded_protocol_version"] = VDW_NONBONDED_PROTOCOL_VERSION
         _atomic_write_json(filepath, state)
 
-    def load_ibs_state(self, filepath: str, lambdas_coul=None, lambdas_vdw=None) -> bool:
+    def load_ibs_state(
+        self,
+        filepath: str,
+        lambdas_coul=None,
+        lambdas_vdw=None,
+        stage_type: Optional[str] = None,
+    ) -> bool:
         """反序列化并注入 IBS 状态，恢复历史记忆。
 
         🔑 n_states/prefix/协议版本/λ 内容任何一项对不上，一律完全拒绝这份旧
@@ -6855,6 +6944,23 @@ class IBSSampler:
                     "重新划分窗口，或旧状态缺少 λ 元数据），完全忽略旧状态（不作为"
                     "热启动，f_k[k] 错配到不同 λ 上是主动引入偏差，不是中性起点），"
                     "从 f_k=0 重新开始"
+                )
+                return False
+
+            # The persisted tmbar_history is the actual u_kn history used to
+            # continue bias learning.  A Stage 2 history sampled with the old
+            # softcore Hamiltonian must never seed the current Hamiltonian;
+            # Stage 1 charging states intentionally do not carry this gate.
+            if (
+                stage_type == "vdw"
+                and state.get("vdw_nonbonded_protocol_version")
+                != VDW_NONBONDED_PROTOCOL_VERSION
+            ):
+                print(
+                    "  ⚠️ Stage 2 IBS 状态的 "
+                    f"vdw_nonbonded_protocol_version={state.get('vdw_nonbonded_protocol_version')!r} "
+                    f"与当前 {VDW_NONBONDED_PROTOCOL_VERSION} 不匹配，"
+                    "拒绝恢复旧 Hamiltonian 的 f_k/u_kn 历史"
                 )
                 return False
 
@@ -7667,6 +7773,8 @@ def _build_fixed_h_probe_bank_manifest(
     }
     if coion_identity is not None:
         manifest["coion_identity"] = coion_identity
+    if stage_type == "vdw":
+        manifest["vdw_nonbonded_protocol_version"] = VDW_NONBONDED_PROTOCOL_VERSION
     return manifest
 
 
@@ -7894,6 +8002,8 @@ def _build_main_window_checkpoint_manifest(
     }
     if coion_identity is not None:
         manifest["coion_identity"] = coion_identity
+    if stage_type == "vdw":
+        manifest["vdw_nonbonded_protocol_version"] = VDW_NONBONDED_PROTOCOL_VERSION
     return manifest
 
 
@@ -8033,6 +8143,8 @@ def _build_production_window_checkpoint_manifest(
     }
     if coion_identity is not None:
         manifest["coion_identity"] = coion_identity
+    if stage_type == "vdw":
+        manifest["vdw_nonbonded_protocol_version"] = VDW_NONBONDED_PROTOCOL_VERSION
     return manifest
 
 
@@ -9285,8 +9397,9 @@ class IBSWindowManagerDualLambda:
                                 else int(n_steps_per_window)
                             ),
                             current_coion_identity=self.coion_identity,
+                            stage_type=stage_type,
                         )
-                        # 🔑 这 8 个门原先内联在这里（~110 行），现已抽成模块级纯函数
+                        # 🔑 这 9 个门原先内联在这里（~110 行），现已抽成模块级纯函数
                         # _resume_cached_window_gate_status，逐门语义与阈值一字未改，
                         # 只是变得可以用 mock 的 convergence.json 单独测试（见
                         # test_resume_reuse_contracts.py）。下面那串逐门诊断打印仍然
@@ -9297,6 +9410,7 @@ class IBSWindowManagerDualLambda:
                         cached_lse_tolerance = _gate["cached_lse_tolerance"]
                         lse_tolerance_match = _gate["lse_tolerance_match"]
                         lrc_version_match = _gate["lrc_version_match"]
+                        vdw_nb_version_match = _gate["vdw_nb_version_match"]
                         repair_policy_match = _gate["repair_policy_match"]
                         coion_identity_match = _gate["coion_identity_match"]
                         early_stop_ok = _gate["early_stop_ok"]
@@ -9332,6 +9446,15 @@ class IBSWindowManagerDualLambda:
                                 f"{cached_conv.get('lj_tail_lrc_protocol_version')!r}（期望 "
                                 f"{TRADITIONAL_LJ_LRC_PROTOCOL_VERSION}），LJ 长程尾项修正公式已变更"
                                 "（switching-aware），视为无效缓存，将重新采样该窗口。"
+                            )
+                        elif cached_e.ndim == 2 and cached_e.shape[0] == len(lc_win) and cached_e.shape[1] > 0 and not vdw_nb_version_match:
+                            print(
+                                f"  ⚠️ 窗口 {window_idx}（stage_type={stage_type!r}）缓存的 "
+                                f"vdw_nonbonded_protocol_version="
+                                f"{cached_conv.get('vdw_nonbonded_protocol_version')!r}（期望 "
+                                f"{VDW_NONBONDED_PROTOCOL_VERSION}），vdW softcore cutoff/switching "
+                                "协议已变更（MEM-00h：1.2nm+switch → 1.0nm 无switch），"
+                                "视为无效缓存，将重新采样该窗口。"
                             )
                         elif cached_e.ndim == 2 and cached_e.shape[0] == len(lc_win) and cached_e.shape[1] > 0 and not repair_policy_match:
                             # 🔑 [non_mutating_v1] 磁盘上已有旧策略的能量数据。绝不能
@@ -9698,7 +9821,9 @@ class IBSWindowManagerDualLambda:
             # 🔑 核心修复：断点续传状态检测
             is_resumed_ibs = False
             if resume and os.path.exists(ibs_state_file):
-                is_resumed_ibs = sampler.load_ibs_state(ibs_state_file, lc_win, lv_win)
+                is_resumed_ibs = sampler.load_ibs_state(
+                    ibs_state_file, lc_win, lv_win, stage_type=stage_type
+                )
 
             # 🔑 [终态硬停止] load_ibs_state 已经完成了 n_states/prefix/协议版本/
             # λ 内容的严格匹配（不是廉价 peek），确认这份状态真的属于当前窗口后，
@@ -10334,7 +10459,9 @@ class IBSWindowManagerDualLambda:
                     sampler.frozen_validation_cumulative_steps = (
                         prior_cumulative_steps + steps_at_full_bias
                     )
-                    sampler.save_ibs_state(ibs_state_file, lc_win, lv_win)
+                    sampler.save_ibs_state(
+                        ibs_state_file, lc_win, lv_win, stage_type=stage_type
+                    )
                 # 只看最近 IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES 批：攒齐再解一次。
                 if len(frozen_mbar_batches) < IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES:
                     continue
@@ -10964,7 +11091,9 @@ class IBSWindowManagerDualLambda:
                         # 累计步数就是这次 attempt 里已经跑过的 calibration_steps_used，
                         # 必须跟 .chk 同频率落盘，理由同上。
                         sampler.frozen_validation_cumulative_steps = int(calibration_steps_used)
-                        sampler.save_ibs_state(ibs_state_file, lc_win, lv_win)
+                        sampler.save_ibs_state(
+                            ibs_state_file, lc_win, lv_win, stage_type=stage_type
+                        )
                         calib_lse_ok = bool(
                             last_lse_balance.get("available", False)
                             and last_lse_balance["max_abs_log_residual"]
@@ -11070,7 +11199,9 @@ class IBSWindowManagerDualLambda:
                 sampler.bias_converged = True
                 sampler.bias_status = "converged"
                 sampler.frozen_f_k_pending = None
-                sampler.save_ibs_state(ibs_state_file, lc_win, lv_win)
+                sampler.save_ibs_state(
+                    ibs_state_file, lc_win, lv_win, stage_type=stage_type
+                )
                 # 🔑 一次成功的收敛必须让这个窗口的失败记录彻底过期——否则一次
                 # 先失败、重跑后成功的窗口会留下一份跟当前 convergence.json 矛盾
                 # 的旧 warmup_failure.json，误导任何检查"这个窗口是否曾失败过"的
@@ -11190,7 +11321,9 @@ class IBSWindowManagerDualLambda:
                     sampler.frozen_validation_cumulative_steps = 0
                 _atomic_write_json(failure_path, bias_warmup_diag)
                 sampler.bias_converged = False
-                sampler.save_ibs_state(ibs_state_file, lc_win, lv_win)
+                sampler.save_ibs_state(
+                    ibs_state_file, lc_win, lv_win, stage_type=stage_type
+                )
                 print(
                     f" 未收敛（{bias_update_count}/{max_bias_updates} 次权重更新，"
                     f"{learning_to_validation_cycles} 次冻结验证失败重学习，"
@@ -11771,6 +11904,10 @@ class IBSWindowManagerDualLambda:
                     _periodic_conv["window_data_protocol_version"] = (
                         IBS_WINDOW_DATA_PROTOCOL_VERSION
                     )
+                    if stage_type == "vdw":
+                        _periodic_conv["vdw_nonbonded_protocol_version"] = (
+                            VDW_NONBONDED_PROTOCOL_VERSION
+                        )
                     _periodic_conv["window_data"] = _window_data_metadata(
                         production_energies_path,
                         production_bias_path,
@@ -12021,6 +12158,15 @@ class IBSWindowManagerDualLambda:
                 # 跟当前公式不是同一回事，resume / 窗口产物复用逻辑必须校验这个
                 # 字段，不能只看 λ/WCA/IBS 偏置协议是否匹配。
                 "lj_tail_lrc_protocol_version": TRADITIONAL_LJ_LRC_PROTOCOL_VERSION,
+                # 🔑 [vdw_nonbonded_protocol_version，MEM-00h] softcore cutoff/
+                # switching 协议版本（1.2nm+switch → 1.0nm 无switch）。只在
+                # stage_type=="vdw" 时写真实版本号——Stage 1 charging 不构造软核
+                # CV，这个字段对它没有意义，写 None 也不会被 _resume_cached_
+                # window_gate_status 拿来判它无效（该门对 stage_type!="vdw" 恒为
+                # True，见该函数定义处）。
+                "vdw_nonbonded_protocol_version": (
+                    VDW_NONBONDED_PROTOCOL_VERSION if stage_type == "vdw" else None
+                ),
                 # 🔑 [non_mutating_v1] 采样修复策略。旧的变异策略可能在采样中途用
                 # 累计 ΔF 就地覆盖过 f_k（不同参考系）；resume / 窗口产物复用必须校
                 # 验这个字段，绝不能把旧策略缓存当成非变异策略的有效数据复用。
@@ -12257,6 +12403,17 @@ class IBSWindowManagerDualLambda:
                 )
             with open(conv_path, encoding="utf-8") as handle:
                 convergence = json.load(handle)
+            if (
+                stage_type == "vdw"
+                and convergence.get("vdw_nonbonded_protocol_version")
+                != VDW_NONBONDED_PROTOCOL_VERSION
+            ):
+                raise ValueError(
+                    f"窗口 {i} 的 vdW 非键协议版本="
+                    f"{convergence.get('vdw_nonbonded_protocol_version')!r}，"
+                    f"当前期望 {VDW_NONBONDED_PROTOCOL_VERSION}；"
+                    "拒绝把旧 Hamiltonian 的 u_kn 纳入 Stage 2 分析"
+                )
             u_kn, bias, base = _load_validated_window_data_triplet(
                 e_path,
                 b_path,

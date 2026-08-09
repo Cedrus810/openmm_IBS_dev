@@ -4,6 +4,13 @@
 > [`PLAN_outer_lambda_neural_basis.md`](PLAN_outer_lambda_neural_basis.md)，真实运行结果记录在
 > [`EXPERIMENT_LOG_outer_lambda_neural_basis.md`](EXPERIMENT_LOG_outer_lambda_neural_basis.md)。
 > 本文同时维护任务状态；设计项不等于 production 已接入。
+>
+> **2026-08-07 归档说明**：所有已完成/已终止工作包的完整时间线、通过门、数值证据和
+> 历史决策记录已整体归档至
+> [`IMPLEMENTATION_PLAN_outer_lambda_neural_basis_archive.md`](IMPLEMENTATION_PLAN_outer_lambda_neural_basis_archive.md)
+> （该文件是归档前本文档的完整快照）。本文档此后只保留：仍在生效的目标/约束/设计规范、
+> 当前代码地图、以及**尚未完成或尚未关闭**的工作。任何"已完成"条目如需查证据，去归档文件按
+> 章节标题或工作包编号搜索。
 
 ## 1. 实施目标
 
@@ -25,9 +32,9 @@
 - production 前冻结模型和系数；production 中禁止在线训练。
 - 默认关闭；关闭时必须保持当前结果和缓存语义不变。
 
-### 1.1 截至 2026-08-03 的工程状态
+### 1.1 当前工程状态（2026-08-07 精简，完整证据见归档）
 
-| 工作包 | 状态 | 当前证据/边界 |
+| 工作包 | 状态 | 摘要 |
 |---|---|---|
 | WP-0 | 完成 | window 0、primary torsion 和两个 secondary/diagnostic 候选已登记 |
 | WP-1 | 完成 | 外层包络、系数、端点归零、协议哈希 |
@@ -35,11 +42,12 @@
 | WP-3 | 完成（通用骨架） | TorchForce、CustomCVForce、序列化、CPU/CUDA/checkpoint 接口 |
 | WP-3A | 失败并停止 | EXP-009 的 PythonForce/CUDA MTS 后端在 \(N=1\) 失败 |
 | WP-4 | 完成直接 MACE qualification | `coefficient=0.09` 的 EXP-007 通过；不等于可接受的生产成本 |
-| WP-4A / EXP-010 | `FAILED` | atom-cut protein MACE 教师的 290-frame 数据集完成；教师边界无物理闭合且六候选跨 run 验证失败 |
-| WP-4B / EXP-011 | `FAILED / STOPPED` | AUG-001 后 mutual overlap `0.02353 < 0.03` 且 22 个去相关样本 `< 25`；不再补采、不拟合 PMF |
-| WP-4C / EXP-012 | `PREREG_SEALED_V2 / L2_FORMALIZED(DEC-030) / ARMS_A_B_D_NOT_PURSUED(DEC-039) / d0-5_PARTIAL(DEC-039) / derived_5a_C1_CPU+CUDA_PASSED / original_6a_C1_CPU_PASSED_CUDA_BLOCKED_ON_VRAM` | 路线正式定性为 L2（DEC-030）：`original_6a`/`derived_5a` 是离线 teacher，`LocalResidualStudent`（尚不存在代码）是唯一在线模型，L1 降级为非当前下一步。五态 ledger/backend audit 已通过；两个显式候选臂（DEC-027）：`original_6a`（6 Å，2135 节点/155624 边）CPU C1 通过，CUDA 同帧对照三次尝试均在同一 product-layer-1 张量积算子 OOM（真实峰值需求 `>=~24.07 GiB`，已排除碎片化），6 Å 分支 gradient checkpointing 未实现（与 teacher/student 分工无关，独立线程）；`derived_5a`（5 Å，1444 节点/60048 边）CPU 与 CUDA C1 均已通过（DEC-028/029，CPU↔CUDA 相对差 ~1e-7、CUDA 无 OOM），是首个完整通过 C1 的候选臂。（2026-08-04/05 更新，DEC-031→039）多帧支持域审计、逐帧 latent cache、held-out gap-variance 验证均已完成且通过（DEC-033/035/036，三 fold 均改善，均值 44.6%）；`LocalResidualStudent` 编码前设计契约（d0）第 1 项"在线动态环境表示"已由 DEC-038 real-data smoke 解决。**DEC-039（2026-08-05）**：Arm A/B/D 正式退役为 `not_pursued`（从未实现，非数值失败；预注册偏离已显式记录，`C_vs_A`/`C_vs_B` 增量比较从未执行，结论收窄为"MACE latent 信号可泛化、值得蒸馏"而非"Arm C 优于 A/B"）；`protocols/EXP-012_preregistration.json` reseal 为 `sealed`（待跑 `scripts/reseal_exp012_preregistration.py` 落实真实 payload_sha256）；(d0-5) 计算/部署预算除 ms/step 生产基线外全部冻结，训练 epoch/seed/早停改为训练 run 内时间块早停验证；ms/step 基线的哈希不匹配根因已定位（`box_vectors.npy` 陈旧）并修复诊断脚本，重新测量待执行。当前下一步是拿到哈希匹配的 ms/step 报告后完整关闭 (d0-5)，随后进入 (d1) 离线 student 拟合；仍不得训练 |
-| WP-5 | 未开始 | EXP-012 增量信息、守恒力、TorchForce/CUDA 和独立重复资格通过前不启动 |
-| WP-6–8 | 未开始 | 由 WP-5 结果条件触发 |
+| WP-4A / EXP-010 | `FAILED` | atom-cut protein MACE 教师六候选跨 run 验证全部失败，教师边界无物理闭合 |
+| WP-4B / EXP-011 | `FAILED / STOPPED` | AUG-001 后 mutual overlap `0.02353 < 0.03`；不再补采、不拟合 PMF |
+| WP-4C / EXP-012 | D0-D4 全部关闭；**单基势在线部署路线已正式关闭（DEC-050，2026-08-07）** | teacher(`derived_5a`) 已双平台通过 C1；`LocalResidualStudent` direct-gap 路线已通过 (d1)/(d2)/(d3)/(d4)；WP-5A 的三次 paired-reseed exploratory pilot 中 raw `mixture_ess_proxy` 均提升 10.7-27.8%，但这不是三组独立平衡的 production repeats，且当前部署成本使 ESS/GPU-hour 三次均下降（DEC-048/050：授权的性能救援目标 `1.10×baseline` 判定 `TARGET_UNREACHABLE`，即使假设动态建图成本降到零仍差远）；(d0-2/3/4) 设计冻结未完成，现已不再相关 |
+| WP-4D / EXP-013 | **未晋级：方案③ `FAILED`（DEC-055/056），方案① Qualification `NOT_MET`（DEC-058），方案② N=1 ESS `FAILED`（DEC-059）** | 方案①禁止 N=16/013-C；方案② `mixture_ess_proxy` 下降 `18.88%`，不运行其 MTS、不重调 `c1`；EXP-014 离线压缩筛选未通过（DEC-060），不进入 OpenMM 资格化或 production promotion |
+| WP-5 | **`NOT_PROMOTED / FROZEN`（DEC-048/050/059/060，2026-08-09）** | WP-5A pilot、EXP-013 三种在线/MTS 方案及 EXP-014 compression screen 均未晋级；不直接重开 WP-5，不重调 `c1`/checkpoint，不继续搜索 MTS 间隔 |
+| WP-6–8 | 未开始，已阻塞 | 由 WP-5 结果条件触发，WP-5 未晋级故不启动 |
 
 当前所有新增实现均位于独立文件 `outer_lambda_neural_basis.py` 及独立测试/脚本中。
 `runabfe.py`、`abfe_core.py`、`abfe_pipeline.py`、`ibs_engine.py` 未接入该模块，这是
@@ -80,11 +88,11 @@ dexp_params=null
 | 文件 | 当前职责 | 计划中的职责 |
 |---|---|---|
 | `outer_lambda_neural_basis.py` | 独立外层控制器、账本适配、慢变量筛选与历史 CLI 兼容入口；EXP-010/011 实现已迁至 `archive/outer_lambda_exp010_exp011_legacy.py` | 只复用 controller、shared CV、ledger、PBC、TorchForce 和 benchmark 骨架；旧 fragment/PMF 实现不复用 |
-| `local_residual/` | EXP-012 v2 主命名空间；当前别名复用表示无关的 schema、MM ledger、ledger audit 与 metrics，production 不导入 | 后续承载 A/B/C/D、MACE latent adapter、student、训练和部署实现 |
+| `local_residual/` | EXP-012 v2 主命名空间；`LocalResidualStudent`（direct-gap）、`student_deploy.py`（TorchForce 部署路径）、`teacher_graph.py`（逐帧构图）、`mace_latent.py`（C1 latent adapter）等已实现；production 不导入 | 承载 A/B/C/D、MACE latent adapter、student、训练和部署实现（进行中） |
 | `exp012_xed/` | DEC-018 早期兼容/证据命名空间；现有 ledger/schema 实现继续可复现 | 不再定义方法身份；XED 只允许作为 Arm D 可选消融 |
-| `protocols/EXP-012_preregistration.json` | `exp012-local-residual-prereg-v2` draft；已登记三条 CUDA ledger/report SHA、统一权重口径、whole-run folds 与 ledger audit | 补齐全局 `A_k`、A/B/C/D 表示、图边界、readout、训练预算和数值判决门后重新哈希并 sealed |
-| `MaceLatentBasisAdapter`（C1 底层接口） | 合成 OFF24 合约与 Atenolol 真帧 OMOL CPU smoke 均通过；OMOL 明确 early-stop 于 zero-based product layer 1，输出该层首个 `1024x0e` 标量块 | CUDA 同帧通过后再接 invariant scalar readout |
-| `LocalResidualStudent`（计划） | 尚不存在 | 轻量等变 ligand-environment cross encoder；既可独立训练，也可承接 MACE-latent teacher 蒸馏 |
+| `protocols/EXP-012_preregistration.json` | `exp012-local-residual-prereg-v2`，`sealed`（DEC-039） | 已冻结的部分不再改；(d0-5) ms/step 缺口补齐后视需要重新哈希 |
+| `MaceLatentBasisAdapter`（C1 底层接口） | `derived_5a` CPU+CUDA 均已通过 C1；`original_6a` CPU 通过、CUDA `BLOCKED_ON_VRAM` | 无变化计划，`original_6a` CUDA 视 gradient checkpointing 实现情况决定是否重试 |
+| `LocalResidualStudent` | direct-gap 训练与 (d1)/(d2) 资格已通过；distilled 变体未通过相对 direct-gap 的增量门，未采用 | (d3) 部署资格（TorchScript/OpenMM/CUDA/耗时）已 `CLOSED`（DEC-043），(d4) 短 NVT 动力学资格已通过（DEC-044），D0-D4 全部关闭 |
 | XED-inspired feature（可选） | 现有 schema 名称中出现，但尚无 feature 实现 | 仅作为 Arm D 消融；不创建 PME 电荷或 OpenMM virtual particles |
 | `runabfe.py` | CLI、配置合并、模式路由 | WP-5 独立资格通过后才考虑接收显式神经路径配置 |
 | `abfe_core.py` | 基础势、DEXP、MACE 辅助能力 | 当前不修改；后期只合并已冻结接口 |
@@ -266,371 +274,394 @@ neural_path:
 
 ## WP-0：冻结基线
 
-状态：`COMPLETED`。
-
-冻结结果：
-
-- complex vanishing Stage 2 window 0，states `[0,5)`；
-- primary torsion `[4591,4592,4593,4585]`，三种子 core transitions
-  `14/4/10`；
-- secondary torsion `[4593,4585,4594,4595]`；
-- `VAL251 chi1` 与 hydration 仅保留作诊断。
-
-任务：
-
-- 固定一个小型测试体系和一个真实困难 Stage 2 ensemble。
-- 指定唯一首个目标慢自由度。
-- 保存基础路径 ESS、转换次数、异常率和 GPU 性能。
-- 验证简单 λ 重排是否已经足够。
-
-通过门：
-
-- 基线可重复；
-- 瓶颈明确；
-- 不是单纯增加采样就能解决。
+状态：`COMPLETED`。完整冻结结果（体系、torsion、任务清单、通过门）见归档 §WP-0。
 
 ## WP-1：外层控制器纯数学测试
 
-状态：`COMPLETED`（独立模块）。
-
-任务：
-
-- 实现 `sin2 + constant coefficient`；
-- 生成 \(A_{km}\)；
-- 验证端点和有限性；
-- 生成稳定协议 payload。
-
-必须测试：
-
-- \(A_{0m}=A_{Km}=0\)；
-- 相同 λ 的系数逐位相同；
-- 非有限参数 fail closed；
-- 任一系数变化都会改变协议哈希。
-
-通过门：全部 CPU 测试通过，不加载 MACE/TorchForce。
+状态：`COMPLETED`（独立模块）。任务与通过门见归档 §WP-1。
 
 ## WP-2：解析 mock 基势的 IBS 账本
 
-状态：`COMPLETED`（独立模块，尚未合入 production IBS）。
-
-先用简单谐波或原子对势，不使用神经网络。
-
-必须验证：
-
-1. 禁用路径时旧行为不变。
-2. λ=0、1 能量和力与基础路径一致。
-3. 中间态增量等于解析值。
-4. target energies 包含路径项。
-5. `bias_history` 不消除路径项。
-6. 公共 λ 状态跨窗口完全一致。
-7. TMBAR 使用修改后能量。
-8. 不同模型/系数不能复用旧缓存。
-
-通过门：无 ML 依赖即可证明端点和统计账本闭合。
+状态：`COMPLETED`（独立模块，尚未合入 production IBS）。8 项验证与通过门见归档 §WP-2。
 
 ## WP-3：TorchForce 最小部署
 
-状态：`COMPLETED`（通用独立部署骨架）。
-
-使用极小 TorchScript 标量模型验证：
-
-- `TorchForce` 单独运行；
-- 作为 `CustomCVForce` 的共享 CV；
-- 坐标梯度；
-- 周期盒；
-- XML 序列化或可靠重建；
-- 主 Context 与 probe Context 共存；
-- CPU/CUDA 一致性；
-- checkpoint 恢复；
-- 单步时间和显存。
-
-若嵌套、复制或序列化失败，停止 production 接入，先更换明确的重建方案或后端。
+状态：`COMPLETED`（通用独立部署骨架）。验证范围见归档 §WP-3。
 
 ### WP-3A：神经 Force 多时间步调度
 
-状态：`FAILED / STOPPED`。EXP-009 在相同 MTS 后端的 \(N=1\) 已触发
-`CUDA_ERROR_INVALID_HANDLE`。当前 openmmml 1.6 和实时桥接均依赖
-`PythonForce`，因此不再执行 \(N=2/4/8\)，也不通过放宽 coefficient 或换节点重复
-同一后端。以下矩阵保留为历史预注册协议，不能误写成尚待运行。
-
-完整 MACE 只有在作为独立 force group 接入 MTS/r-RESPA 后，才允许降低评价频率。
-禁止在普通积分循环外“每 \(N\) 步更新一次，然后冻结旧力”。
-
-EXP-007 已冻结外层系数 0.09。降低系数不会减少单次 MACE 推理成本，因此性能实验
-不得同时扫描系数和更新时间；第一轮只比较 MTS ratio：
-
-| 外层系数 | MTS ratio \(N\) | 当前 0.5 fs 内步长下的 MACE 间隔 | 用途 |
-|---:|---:|---:|---|
-| 0.09 | 1 | 0.5 fs | 同一 MTS 实现内的参考 |
-| 0.09 | 2 | 1 fs | 第一档降频 |
-| 0.09 | 4 | 2 fs | 第二档降频 |
-
-只有 \(N=2,4\) 相对 \(N=1\) 均通过后，才探索 \(N=8,16\)（4、8 fs）。若以后
-恢复 2 fs 内步长，必须重新登记物理时间，不得直接复用上述 ratio 结论。若未来重新
-改变系数，应作为新的幅度协议先完成独立力学资格，不能混入本性能矩阵。
-
-每个组合至少比较：
-
-- 温度和势能分布；
-- path-only 能量与最大原子力；
-- 约束错误、NaN 和异常结构；
-- 同初态短轨迹的能量漂移或 shadow-work 代理；
-- 目标慢变量分布和转换；
-- wall time、ns/day、显存和预测 ESS/GPU-hour。
-
-MTS 通过门不能只看“模拟没有崩溃”。相对 \(N=1\) 参考，必须没有可分辨的结构分布
-偏移或系统性积分偏差。
+状态：`FAILED / STOPPED`。EXP-009 在 PythonForce/CUDA MTS 后端 \(N=1\) 已触发
+`CUDA_ERROR_INVALID_HANDLE`；不再执行 \(N=2/4/8\)。完整预注册矩阵、性能比较项和
+MTS 通过门定义见归档 §WP-3A（保留为历史预注册协议，不能误写成尚待运行）。
 
 ## WP-4：单个真实任务化基势
 
 状态：直接完整 MACE 的 EXP-007 qualification 已通过；由于成本和 EXP-009 后端失败，
-它只保留为教师。
-
-第一候选范围：
-
-- ligand；
-- 固定关键口袋残基；
-- 暂不加入交换水和离子；
-- 只针对一个 torsion、rotamer 或接触重组。
-
-EXP-010 实际选择为 ligand 41 原子 + 固定 protein environment 216 原子。旧环境中的
-39 个水原子涉及 14 个水残基且包含不完整水，已从教师选择中全部移除。该变化生成新的
-选择哈希，不复用含水选择的资格结论。
-
-模型要求：
-
-- 标量能量和守恒力；
-- 固定粒子映射；
-- 元素覆盖明确；
-- 平滑有界输出；
-- 支持域检测；
-- 模型和训练数据哈希固定。
-
-通过门：
-
-- 代表性轨迹上无 NaN 和非物理大力；
-- 短 NVT 稳定；
-- 推理成本允许进入单窗口试验。
+它只保留为教师。候选范围、模型要求和通过门见归档 §WP-4。
 
 ### WP-4A：直接 MACE 与廉价蒸馏的双路线
 
-当前决策：直接 MACE 路线结束；只执行廉价蒸馏路线。
-
-历史直接 MACE 路线（EXP-009 后已关闭）：
-
-1. 完成固定原子身份、PBC、support domain 和能量 offset；
-2. 先通过 \(N=1\) 力学资格；
-3. 再执行 WP-3A 的 MTS 矩阵；
-4. 只有预测 ESS/GPU-hour 仍有竞争力时才进入 WP-5。
-
-廉价蒸馏路线：
-
-1. 用冻结 MACE 给独立训练轨迹标注局部能量、力和 descriptor；
-2. 预先指定一个目标慢变量 \(s(\mathbf R)\)，例如 torsion、rotamer、
-   coordination number 或 hydration number；
-3. 检验 MACE 输出中与该慢变量相关的可解释分量；
-4. 拟合 1D/2D spline、tabulated bias、低阶多项式或小型 MLP
-   \(V_\phi(s)\)；
-5. 冻结模型、训练集哈希、支持区间和外推衰减；
-6. cheap bias 每个生产积分步计算，MACE 不再进入每个 MD step。
-
-EXP-010 已实现的具体协议：
-
-1. 从三个独立困难窗口 scratch run 各选 100 帧，共 300 个 source frames；
-2. 保持原支持域 `min pair >= 0.07 nm`、`max pair <= 2.5 nm`、
-   `Rg <= 0.85 nm`；
-3. 支持域外帧在 MACE 前排除并登记，最大允许排除率 5%；预检为 10/300；
-4. MACE 教师输出局部 interaction energy、最大原子力和 primary torsion 广义力；
-5. energy offset 固定为全部合格训练帧的均值，只移除常数，不调整
-   `coefficient=0.09`；
-6. 候选矩阵固定为 1D Fourier order 2/4/6 与 2D Fourier order 2/3/4；
-7. 验证按整条 run 留一，不允许随机拆帧造成轨迹泄漏；
-8. 最终 Force 使用 `CustomTorsionForce` 或 `CustomCompoundBondForce`，不含
-   Torch、MACE 或 `PythonForce`。
-
-实际结果：290/300 帧通过支持域门，排除率 3.333%。intercept-only 能量 RMSE 为
-`21.5109 kJ/mol`；最佳候选 1D order 2 的 leave-one-run-out 能量 RMSE 为
-`22.1737 kJ/mol`，广义力 \(R^2=-13.5934\)。其余 1D 候选更差，2D 候选出现严重
-病态拟合。因此没有候选被冻结为最终 Force，EXP-010 记为 `FAILED`。
-
-事后选择完整性审计进一步发现，216 个 protein atoms 涉及 26 个残基，但完整残基为
-0；原选择器是单帧 0.5 nm 逐原子半径选择。这一人工断键簇的分解能量只在
-冻结原子集的代数定义上闭合，不能当作完整蛋白环境下的物理 interaction energy。
-因此 EXP-010 失败不用于排除 primary torsion，而是排除当前教师构造和逐帧能量目标。
+当前决策：直接 MACE 路线结束；EXP-010 廉价蒸馏路线 `FAILED`——290/300 帧通过支持域门，
+intercept-only 能量 RMSE `21.5109 kJ/mol`，最佳候选（1D Fourier order 2）leave-one-run-out
+RMSE `22.1737 kJ/mol`、广义力 \(R^2=-13.5934\)，其余候选更差；事后审计还发现 216 个
+protein atoms 涉及的 26 个残基无一完整。因此没有候选被冻结，失败原因是教师构造和逐帧
+能量目标，不排除 primary torsion 本身。完整协议见归档 §WP-4A。
 
 ### WP-4B：EXP-011 完整 MM 条件平均力/PMF
 
-2026-08-02 准备状态：已新增 `exp011-coverage`、`exp011-fit-pmf`、
-`protocols/EXP-011_preregistration.json` 和
-`docs/experiments/EXP-011_PREREGISTRATION.md`。历史三 run 覆盖报告位于
-`output/outer_lambda_exp011/coverage_report_v2.json`。EXP-011 manifest 状态为
-`frozen_for_exp011_complete_mm_pmf`，primary CV 为 `[4591,4592,4593,4585]`，且
-`production_approval=false`。覆盖报告未通过硬门，故当前没有
-PMF model、OpenMM candidate 或 NVT 资格结果；这不是 EXP-011 正式 PMF 的失败结论。
-
-2026-08-02 已新增：
-
-1. `exp011-umbrella-sample`：在完整 window-0 MM expanded-mixture System 上增加周期
-   torsion restraint，使用独立输出目录，逐帧记录角度、restraint energy、中心、力常数、
-   seed 和 System/protocol 哈希；
-2. `exp011-reweight-umbrella`：汇总各 umbrella window，构造跨窗口 reduced-potential
-   矩阵，用 MBAR 输出每帧显式 `log_target_weight` 和 overlap/连通性报告；
-3. 周期最短角差、MBAR 显式权重、overlap 连通和 CLI 回归测试。
-
-普通 `sample-hard-window-scratch` 没有 torsion restraint 和重加权账本，不得冒充上述
-采样。相关两个测试文件当前为 `58 passed`。
-
-完整体系 smoke 结果：`--minimize-max-iterations 0` 的 Reference 诊断在第一积分步出现
-NaN，因此跳过最小化明确不合格；随后在可用 GPU 环境完成 `200` 次最小化的正式 smoke。
-`output/outer_lambda_exp011/cuda_smoke_center_m172p5/report.json` 报告 `ok=true`、
-`platform=CUDA`、1 个样本、angle `-173.5426°`、umbrella energy `0.01656 kJ/mol`、
-temperature `278.03 K`，checkpoint 与 DCD 完整。下一执行点是同一中心的短时稳定性 pilot，
-确认多帧均有限且 restraint 后再扩展中心。
-
-同一中心 10 ps 稳定性 pilot 已通过：10/10 帧有限，temperature `298.12–302.11 K`，
-angle `-173.12°` 至 `-158.97°`，最大 umbrella energy `2.79 kJ/mol`，报告见
-`output/outer_lambda_exp011/pilot_run1_center_m172p5/report.json`。这只批准运行相邻的
-`-157.5°` 中心并检查两窗 overlap；不批准直接生成 PMF 或批量运行 24 centers。
-
-`-157.5°` pilot 已通过，两窗 MBAR 的邻窗 overlap 为 `0.3584`（门为 `0.03`），各窗
-保留 10/10 样本，局部 overlap 图连通。`qualified_for_pmf_input=true` 的范围仅限这两个
-局部窗口，不表示 24-bin 周期覆盖、正式平衡性或 PMF 验收完成。下一执行点为第三个相邻
-中心 `-142.5°`，之后重新检查三窗 overlap。
-
-第三窗及三窗 MBAR 已通过：相邻 overlap 为 `0.3105` 与 `0.1864/0.3728`，均超过
-`0.03`。第三窗只有 5/10 个去相关样本（`g=1.943`），所以短 pilot 不晋级为正式 PMF
-数据。15° spacing 与 `k=100` 已通过局部执行资格；在冻结正式每窗长度前，先运行历史
-空白区 `75°–165°` 中部的 `112.5°` 哨兵窗，确认从共同初态到远端中心的可达性。
-
-`112.5°` 哨兵窗已到达目标区：10/10 帧有限，angle `93.22°–112.21°`，最后一帧
-`112.21°`，最大 umbrella energy `5.66 kJ/mol`。由于样本分布偏向中心低侧，尚不能冻结
-全套正式采样；先运行高侧相邻 `127.5°` 并检查该空白区界面的 MBAR overlap。
-
-空白区界面 overlap 已通过：正反向为 `0.0759/0.0949`，但仅保留 5/10 与 4/10 个
-去相关样本，故 pilot 不作为正式 PMF 数据。正式采样机器协议现已冻结在
-`protocols/EXP-011_umbrella_sampling_plan.json`（内部 SHA-256
-`1cd78aba12f15b52a52f27b5f6c8980544843887ebc2cf84d1b5bc12660c6912`）：24 centers ×
-3 replicates，每窗 50 ps burn-in、100 ps sampling、1 ps 报告间隔，并使用三条不同历史
-困难窗口轨迹作为 replicate 初态。`scripts/run_exp011_umbrella_grid.py` 默认仅跑一个 pending
-window，验证计划哈希、已有报告参数、初态轨迹哈希及非空残缺目录；dry-run 已通过。
-
-主路线不使用局部 MACE 能量标签。实施顺序：
-
-1. 对三条困难窗口 run 生成 primary torsion 周期 bin 覆盖、重叠和有效样本数报告；
-2. 覆盖不足时，新建受限/umbrella 或其他增强采样，不用空 bin 拟合；
-3. 从完整 MM Hamiltonian 获得条件平均力或 PMF，包含完整蛋白、水和现有约束；
-4. 执行整条 run 留一，验证平均力方向、PMF 形状和周期积分闭合；
-5. 在查看正式结果前冻结 spline/Fourier 候选、平滑度、幅度与验收门；
-6. 只有跨 run 验证通过后，才导出周期 OpenMM Force 并执行独立 NVT qualification。
-
-可选 MACE 教师不属于 EXP-011 主路线。如需重启，必须另立协议，使用完整残基、
-backbone buffer 和封端/局部 readout，并对多个环境半径进行能量与 ligand-force 收敛检查。
-
-蒸馏验收不能只看训练 RMSE，还必须检查：
-
-- 沿慢变量的平均力/自由能形状；
-- 独立轨迹上的能量排序和力方向；
-- 支持区间外是否平滑衰减；
-- 端点归零和 IBS target/bias 账本；
-- 相对于直接 MACE 的慢变量采样收益与 ESS/GPU-hour。
-
-若直接 MACE 只有在外层间隔大于已验证稳定范围时才有可接受成本，则停止直接生产
-路线，保留 MACE 作为教师/分析器。
+状态：`FAILED / STOPPED`（`FORMAL_RUN1_OVERLAP_FAILED`）。24 centers × 3 replicates 正式
+采样已完成（2400 帧全部有限），但 AUG-001 补采 `127.5°` 后严格 MBAR 显示
+`112.5°↔127.5°` mutual overlap 仍为 `0.02353 < 0.03` 门，且只有 22 个去相关样本
+（门 25）。结论 `COMPLETED_NOT_ACCEPTED`；不再补采、不拟合 PMF、不进入 NVT 或 WP-5。
+完整实施顺序、umbrella/reweight 实现、逐窗 overlap 时间线见归档 §WP-4B。
 
 ### WP-4C：EXP-012 CV-free 通用局部残差路径势
 
-状态：`PLANNED / PREREG_DRAFT_V2`。三条 scratch DCD 的逐帧五态完整 target-state ledger
-已经用统一 CUDA backend 完成；三条 arrays/report SHA、scratch System SHA、force-group/IBS
-闭合以及 run1 CPU/CUDA 公共帧一致性均通过机器审计。协议主语义和导入入口已迁移为
-`local_residual` A/B/C/D，`exp012_xed` 保留作 DEC-018 兼容证据。当前仍禁止训练、feature
-判决或 production Force，因为 (A_k)、表示细节、MACE layer/图边界、readout、训练预算
-和数值判决门尚未冻结，preregistration 仍为 draft。
+**已完成/已冻结部分**（完整时间线、DEC 决策编号、SHA-256 证据见归档 §WP-4C）：
 
-`ExistingOrbMaceBasisAdapter` / `MaceDecompositionPythonComputation` 继续只作 EXP-010
-历史证据。新实现必须建立 `MaceLatentBasisAdapter`，读取 frozen MACE 中间层 node
-features，而不是最终 interaction energy 或三次 fragment subtraction。
-#### WP-4C.1 数据与训练目标
+- 协议主语义与导入入口已迁移为 `local_residual` A/B/C/D；三条 scratch run 的逐帧五态
+  target ledger、CPU/CUDA backend audit 均已通过。
+- 路线正式定性为 L2（DEC-030）：`derived_5a`（5 Å，1444 节点/60048 边）teacher 已
+  双平台（CPU+CUDA）通过 C1；`original_6a`（6 Å，2135 节点/155624 边）CPU C1 通过，
+  CUDA 因 product-layer-1 张量积算子真实峰值需求 `>=~24.07 GiB` 仍 `BLOCKED_ON_VRAM`
+  （未完成，见下方开放项）。
+- (a) 多帧支持域审计、(b) 逐帧独立构图的离线 latent cache（三条 run 各 500 帧，
+  `local_residual/teacher_graph.py::build_teacher_graph_for_frame`）、(c) teacher-side
+  cached-latent 线性 readout 的 leave-one-run-out held-out 验证（held-out run1/2/3 相对
+  `B=0` 基线分别改善 39.9%/29.1%/64.8%，均值 44.6%，3/3 fold 全部改善）均已完成并通过。
+- Arm A/B/D 正式退役为 `not_pursued`（DEC-039）：三者从未实现任何代码，非数值跑输；
+  结论收窄为"MACE latent 存在可泛化 gap-variance 信号、值得蒸馏"，不得声称 Arm C 优于
+  A/B。
+- (d0-1) 在线动态环境表示已由 DEC-038 real-data smoke 解决（动态 cutoff funnel +
+  `quintic_c2_cutoff` 平滑权重，与 teacher canonical membership 逐对一致）。
+- (d0-5) 模型规模（≤50k 参数目标/≤100k 硬上限）、图规模（S1≤256/320，边≤1536/2048，
+  单原子 neighbor≤64/80，1500 帧真实审计）、CPU float64/CUDA float32 funnel 一致性、
+  训练 seed（≥3/变体/折）、早停规则（训练 run 内末尾 20% 时间块，`max_epoch=500`、
+  `early_stop_patience=30`）、D1 go/no-go 判据均已冻结（DEC-039）；唯一未关闭的缺口是
+  ms/step 生产基线重新测量（见下方开放项）。
+- (d1) 离线 `LocalResidualStudent` 拟合：direct-gap 路线保留进入 D2；distilled 路线未
+  通过相对 direct-gap 的增量门，未采用。
+- D1 direct-gap 的最终 held-out 结果须与上述 teacher-side readout 分开解释：平均
+  gap-variance 改善为 `13.9348%`，fold-level 门计 `2/3`，且
+  `direct_gap_all_folds_improved=false`（原始报告：
+  `output/outer_lambda_exp012/student_training_report_direct_gap_only.json`）。因此只能称为
+  candidate offline signal，不能称为 direct-gap student 全折一致改善。
+- (d2) 坐标/autograd 资格：3 folds × 3 seeds 共 27 组检查（有限差分、非参与原子零力、
+  cutoff 平滑性、force tail）全部通过，`COMPLETED_D2_CHECKS`，report SHA
+  `75f0e2ca...aeec8c97c`。
+- D3-0 provenance gate 已关闭（DEC-041，`CLOSED_STEP3_OPERATIONAL_SEMANTIC_PASS`）：
+  System 身份判定为无可检测语义差异，`no_student_window0_baseline_v2.json`
+  （median/P95 `1.3959/1.3968` ms/step）可采信为无 student 生产基线。
 
-对相邻状态和 frame \(a\) 定义：
+**当前仍开放的工作**（这是项目当前前沿，完整细节见第 13 节）：
+
+- (d0-2)（最小架构候选冻结）、(d0-3)（teacher-target 协议冻结）、(d0-4)（必需对照实验
+  冻结）三项设计冻结尚未完成——即使 (d1)/(d2) 已经用某个具体架构跑过，这三项作为
+  正式冻结文档仍是未勾选状态，不得默认已经等价冻结。
+- (d0-5) 剩余缺口：当前无 student 的生产 ms/step 基线待重新测量（根因
+  `box_vectors.npy` 陈旧已定位并修复诊断脚本，重新测量尚未执行）。
+- (d3) 部署资格：**`CLOSED`（DEC-043，2026-08-07）**。四个 sub-item 现状：
+  sub-item 1（deployment 一致性）`PASSED_OPERATIONAL_NUMERICAL_EQUIVALENCE`——
+  `.pow(2)`→`.square()` 假设已用真实数据重跑（`student_d3_1_2_report_v3.json`）证伪
+  （对残差无可测量影响，真正根因未查明、裁定不再追查）；`reference_eager_vs_
+  deployable_eager` 残差 `1.69e-7` 比已接受的 CPU64→CPU32 精度包络（`1.32e-5`）小
+  约 2 个数量级、比已接受的 CPU32↔CUDA32 设备误差（`7.65e-7`）还小，`correctness_
+  cpu64_vs_cpu64=1e-8` 判定为未进入 sealed preregistration 的自定工程阈值，不再拿它
+  卡住项目。sub-item 2/3（TorchForce/OpenMM 注入、端点归零）`PASSED`（DEC-042，严格
+  `0.000e+00`）。sub-item 4-correctness（cell-list 与 brute-force 等价性）`PASSED`——
+  新增 `tests/test_exp012_student_deploy_cell_list.py` 全部通过（重构 `student_deploy.
+  py::_DeployableStudent` 抽出 `_energy_from_edges` 消除了初版测试用 box 扰动强制切
+  分支引入的物理混淆变量后）。sub-item 4-performance（生产 Context 耗时 `~95%`
+  overhead）按 §16 是非阻塞工程目标，如实保留，不再是 D3/D4 前置门。
+- (d4) 动力学资格：**`PASSED`（DEC-044，2026-08-07）**，首次执行即通过。新增
+  `scripts/check_exp012_student_d4_short_nvt.py`：把 student TorchForce 挂到真实
+  `hard_window0` win_sys 独立 force group 上，用同一真实 checkpoint 的 3 个不同
+  `LangevinMiddleIntegrator` 种子做独立重复（种子在 `loadCheckpoint()` 之后设置，避免
+  checkpoint 内嵌 RNG 状态覆盖种子选择），每个重复成对跑 no-student/with-student；500
+  步 warmup + 2000 步监控。report_sha256
+  `f06ad7b03ce85ab4ee443fab20e259124e3ea2bc7e41777b0a586f9648783554`：
+  `all_finite=true`，student 力贡献 `10.0–39.4 kJ/mol/nm`（阈值 `500`），student 能量
+  `-7.52~+0.31 kJ/mol`（与 `a_k=0.5` 理论上界 `±12.47 kJ/mol` 一致），两种配置温度全程
+  `298.3–302.5K`（目标 `300K`，sanity 门 `150–600K`），全系统最大力 `~4300–6300
+  kJ/mol/nm`（显式溶剂正常键伸缩背景，与 student 无关）。安全阈值是脚本自定的工程
+  sanity 门，非 sealed 数值门（D4 从未预注册过）。D4 只回答"积分会不会炸"，不回答
+  "采样有没有变好"——ESS/GPU-hour/mutual overlap 资格是 WP-5A 的工作。
+
+## WP-4D / EXP-013：低频在线 student（MTS/rRESPA）
+
+状态：**DEC-060：EXP-013 全顺序不晋级；EXP-014 native-compression screen 未通过**（2026-08-09）。方案③ 013-B `FAILED`；方案① Qualification gate 未通过；方案② N=1 ESS signal 未通过，EXP-013 不晋级。DEC-050 关闭的是"每个 MD
+步都调用一次 student TorchForce"这一种在线部署模式；EXP-013 改变的是**评价频率**这个
+正交轴——把 student 的（昂贵的）能量/力评价放进独立的慢 force group，用 OpenMM 原生
+MTS/rRESPA 积分器（`MTSLangevinIntegrator`）每 \(N\) 个内步才调用一次，而不是优化
+`student_deploy.py` 本身的推理成本。**不是重开 EXP-009**：EXP-009 死的是 openmmml
+1.6 的完整 MACE + `openmm.PythonForce` 后端，在 `MTSLangevinIntegrator` 的 force-group
+内核里于 \(N=1\) 就触发 `CUDA_ERROR_INVALID_HANDLE`（历史代码见
+`outer_lambda_neural_basis.py:2779-2789`，明确记录"普通 LangevinMiddleIntegrator 通过
+不能证明该组合可用于 MTS"，并预注册了 `start_exp010_cheap_cv_due_to_backend` 的转向）；
+当前 `LocalResidualStudent` 走的是 openmm-torch 的 `TorchForce` 后端，是完全独立的一条
+通道，此前从未在 MTS 场景下测试过，不受 EXP-009 结论约束。
+
+本节其余内容是已执行方案的历史设计与证据解释，不构成新的实验授权；当前在线/MTS 分支已
+封存，不再继续搜索评价间隔或改变 `c1`、checkpoint。
+
+**理想成本下界的算术**（DEC-050 report_sha256 `98496b12...`）：设 \(t_0=1.4765\)、
+\(\Delta t=t_{\text{full}}-t_0=2.0913\) ms/step，若 student 每 \(N\) 个内步只评价一次，
+理想下界 \(t(N)\approx t_0+\Delta t/N\)：
+
+| \(N\) | 理想成本 / baseline |
+|---:|---:|
+| 4 | 1.354× |
+| 8 | 1.177× |
+| 12 | 1.118× |
+| 16 | 1.089× |
+| 24 | 1.059× |
+| 32 | 1.044× |
+
+\(N\approx16\) 才进入经济上有意义的区域；\(N=2/4\) 不值得做正式性能实验。
+
+**关键架构约束**：OpenMM 的 MTS 机制在 force-GROUP 粒度上工作——
+`MTSLangevinIntegrator(temperature, friction, dt_outer, [(慢group, 1), (快group, N)])`，
+每个 Force 对象只能整体属于一个 group，组间能量/力是**线性加和**的（历史 EXP-009
+precedent，`outer_lambda_neural_basis.py:2761-2796`：全部经典力被塞进 group 0，MACE
+单独占 group 31，两组线性相加；`dt_outer` 是最外层步长，`N` 是一个 outer step 内快
+group 被计算的次数，慢 group 只算 1 次——EXP-009 里 `outer_timestep_fs = mts_ratio *
+inner_dt`，`N=mts_ratio`）。但 DEC-048 实测有正向信号的那个设计
+（`OuterLambdaIBSBiasForce`，wiring smoke 起）是把 student 的 basis 值作为一个
+collective variable **融合进** IBS log-sum-exp 判别式 \(X_k=\text{cv}_k^{int}+
+\text{cv}_k^{rest}+A_k\cdot\text{basis}-f_k\) 内部——这是一个**非线性**函数
+（`log(sum(exp(...)))`），不能拆成"经典部分的 log-sum-exp + 神经部分的 log-sum-exp"
+再线性相加。
+
+**三个候选方案，按优先级排序（2026-08-07 用户提出并核实，DEC-052）**：
+
+- **③ exact residual split（首选）**。定义
+  \(V_0(\mathbf R)=-\beta^{-1}\log\sum_k\exp[-\beta(U_k^0(\mathbf R)-f_k)]\)
+  （无 student 的经典判别式）与
+  \(V_*(\mathbf R)=-\beta^{-1}\log\sum_k\exp[-\beta(U_k^0(\mathbf R)+A_kB_\theta(\mathbf
+  R)-f_k)]\)（DEC-048 验证过的融合判别式），取
+  \(\Delta V_\theta(\mathbf R)=V_*(\mathbf R)-V_0(\mathbf R)\)，MTS 分组为
+  \(V_{\text{sampling}}=V_0^{\text{fast}}+\Delta V_\theta^{\text{slow}}\)。因为
+  \(V_0+\Delta V_\theta\equiv V_*\) 是构造性代数恒等式，\(N=1\) 时的 Hamiltonian
+  与 DEC-048 的融合设计**严格相同**，不需要为新设计重新证明 ESS 信号，只需要验证
+  "\(\Delta V_\theta\) 这个 `CustomCVForce` 写对了没有"——数值等价性检查，沿用 D3
+  的方法学，不是物理有效性检查。**唯一真正的风险是计算重复**：`CustomCVForce` 各自
+  有自己的 inner Context，\(\Delta V_\theta\) 的慢 Force 必须在自己内部重新算一份
+  \(U_k^0\)（`cv_k_int`/`cv_k_rest`），不能免费复用快 group 已经算出的值——这部分
+  重复开销是真实成本，必须先测，不能假设"student 部分才贵"。
+- **① whole fused Group-1 slow（③工程/成本失败才选）**。整个 Group 1（含经典
+  `cv_k_int`/`cv_k_rest` 和 student CV）一起放进慢 group，不改变 \(N=1\) 时的
+  Hamiltonian，但经典软核项也变成每 \(N\) 个内步才更新一次——这些项未必是"慢力"，
+  \(N=16\) 对应 outer step \(8\) fs（若沿用 EXP-009 的 0.5 fs 内步长），\(N=32\)
+  对应 \(16\) fs，经典相互作用在这个尺度上可能先于 student 出问题。013-B 必须专门
+  检查这一点，不能只看 student 力/能量分布。
+- **② independent additive student（① Qualification gate 未通过才选）**。student 拆成独立的、线性
+  加和的额外 Force/group（回到 D3/D4 最初"独立 force group"设计），不再融合进
+  log-sum-exp 判别式，配合经典 IBS bias（Group 1，逐步更新，不含 student）。这
+  **已经是一个新的 sampling Hamiltonian**——融合判别式下 neural force 实际带一个
+  构象依赖系数 \(-\nabla V_*\supset-[\sum_k p_k(\mathbf R)A_k]\nabla B_\theta\)（其中
+  \(p_k(\mathbf R)\propto e^{-\beta(U_k^0+A_kB_\theta-f_k)}\)），不能用固定系数
+  \(c\,B_\theta\) 代替。选②必须先在 \(N=1\) 补做一次简单 ESS 对照（不需要完整 3
+  重复 pilot），确认这个新设计本身还有没有 DEC-048 那种正向信号，否则"MTS 有没有
+  用"会被"这个新设计本身有没有用"混进去，重复 DEC-045~050 警告过的"把部署问题和
+  模型/设计问题混在一起"的错误。
+
+**决策顺序固定为 ③→①→②，不并列评估、不跳着选**；每一步的失败标准见下方各小节，
+失败即进入下一个候选，不回头重试同一个。
+
+### 013-A：exact-residual 数值等价性 + 单次调用成本（首选③的验证）
+
+状态：**`PASSED`（DEC-053，2026-08-07）**。`scripts/check_exp013_residual_split_
+equivalence_and_cost.py`，report_sha256
+`bc9eb24dcb5d54297664028b2207156efff83b6693d8569e2f3c76d0bcc45519`：数值等价性
+成立（相对容差 `1e-3` 内）；`ΔV_θ` 单次调用真实增量 `1.8822ms`；`N=8` 不可行
+（预算 `1.1058ms`），**`N=16`（预算 `2.2115ms`，余量约 15%）与 `N=32`（预算
+`4.4230ms`）均可行**。方案③不需要转方案①。下一步 013-B。
+
+不是先测 MTS 能不能跑，也不是先测 ESS，是先测两件事：
+
+1. **数值等价性**（D3 方法学，不是新物理）：在真实生产帧上分别构造 \(V_0+\Delta
+   V_\theta\)（快 group 用未改动的经典 `IBSBiasForce`，慢 group 用新建的
+   \(\Delta V_\theta\) `CustomCVForce`）与 \(V_*\)（wiring smoke 已验证过的
+   `OuterLambdaIBSBiasForce`），核对 \(E_{V_0+\Delta V}-E_{V_*}\approx0\) 与
+   \(\mathbf F_{V_0+\Delta V}-\mathbf F_{V_*}\approx0\)（严格容差，因为这是同一个
+   Hamiltonian 的两种等价写法，不是跨精度/跨方法比较）。
+2. **单次调用成本**：直接测 \(\Delta V_\theta\) 作为一个独立 force group 注入真实
+   `win_sys` 后单次评价的真实耗时（沿用 DEC-050"同一 Context、同一调用路径"的
+   matched-path 方法，不用独立 Python 微基准）。用 DEC-050 的
+   \(t_0=1.4765\)ms、目标比例 \(1.10\times\) 给出预算：每个内步允许增加
+   \(0.14765\)ms，\(\Delta V_\theta\) 单次调用允许成本 \(C_\Delta\le
+   N\times0.14765\)ms：
+
+   | \(N\) | \(C_\Delta\) 预算上限 |
+   |---:|---:|
+   | 8 | 1.181 ms |
+   | 16 | 2.362 ms |
+   | 32 | 4.725 ms |
+
+   已知 `full-baseline` 增量约 `2.0913ms`（DEC-050），\(\Delta V_\theta\) 因为要
+   重复算一份经典 CV，预期成本 \(\gtrsim2.09\)ms——\(N=16\) 非常紧、可能刚好不够，
+   \(N=32\) 有明显余量但 outer interval 更长、动力学资格门槛更严，这正好构成一组
+   干净的 go/no-go：**若 \(C_\Delta\) 在 \(N=8\) 甚至 \(N=16\) 都超预算，③在工程上
+   即告失败，转①**；若有余量，才进入 013-B 的物理/动力学资格。此外仍需确认
+   `MTSLangevinIntegrator` 配 `CustomCVForce`+`TorchForce` 嵌套在 \(N=1\) 能正常跑
+   （数值应与①②检查一致，避免 EXP-009 式 backend 报错；出现类似报错 EXP-013 当场
+   结束，不重试、不换节点、不调系数）。
+
+### 013-B：时间尺度资格
+
+短程验证 \(N=1,8,16,32\)，逐一对比：student/判别式相关能量分布；力范数与尾部；温度；
+结构合理性；相对 \(N=1\) 的能量/构象分布偏移；如可行，shadow-work 或积分误差代理。
+\(N=8\) 是物理诊断用，不是经济候选；真正候选是 \(N=16/32\)。通过门：相对 \(N=1\) 参考
+没有可分辨的系统性偏移（不是"没崩溃"就算过）。
+
+**状态（DEC-054/055/056，2026-08-09）：首次执行报告已
+`INVALIDATED_BY_INITIALIZATION_BUG`；修复后绝对健康门通过，但预注册相对系统性偏移门
+失败。DEC-056 已完成裁决：方案③在 013-B `FAILED`，禁止进入 013-C；按冻结顺序转方案①。**
+
+首次执行表面 `all_passed=true`，但复核发现 N=1 参考态本身已从 300 K 崩溃到 ~0.003 K，
+四臂共病，相对门（只比较 N vs N=1）结构性看不见这种共同病灶。6 步消除法定位真根因：
+`scripts/check_exp013_013b_mts_dynamics_qualification.py` 把生产 checkpoint
+（`LangevinMiddleIntegrator` 写入）直接 `loadCheckpoint()` 到 `MTSLangevinIntegrator`
+（`CustomIntegrator`）Context——OpenMM 文档明确 checkpoint 绑定写入它的具体
+Context/Integrator，跨类型迁移不在支持范围内。已排除的候选（force-group coverage、
+逐 group 力求和一致性、热浴 `a/b/kT` 系数、逐步计算程序结构、`ΔV_θ`/TorchForce 残差
+项本身）全部正常；换成状态转移（`getState`→`setPositions/setVelocities/
+setPeriodicBoxVectors/setParameter`，全程不对 MTS Context 调用 `loadCheckpoint()`）后，
+同一 System、同一 integrator、同一初始物理态在整个 0–6.4 ps 窗口稳定在 296.5–302.4 K。
+脚本已按此修复，并新增独立于相对比较的**绝对健康门**（`mean_temperature_k`/
+`warmup_end_temperature_k` ∈ `[270,330]K`，`relative_energy_drift ≤ 0.10`，
+`all_passed` 要求先过 N=1 自身绝对健康门再看相对门）防止未来同类共病再次被判过。
+013-A 不受影响，仍 `PASSED`。详见 EXPERIMENT_LOG DEC-054 与
+`output/outer_lambda_exp012/exp013_013b_mts_dynamics_qualification_report.json.INVALIDATED.md`。
+
+**修复后重新执行（DEC-055，report_sha256 `64a963626ef36893d440823bd9845ca7c6123cda1b76159e175d9a893810caf3`）**：
+`all_absolute_health_passed=true`（四个 N 的 `mean_temperature_k`
+`298.50/299.16/299.51/299.78 K`、`relative_energy_drift` `0.0020/0.0020/0.0008/0.0019`，
+均在健康门内，`relative_comparison_meaningful=true`）——DEC-054 的修复确认生效，N=1
+这次是真实健康的参考态。但预注册的相对系统性偏移门（`z_threshold=3.0`）在 N=8/16/32
+**全部失败**：`temperature_k` 随 N 单调升高（+0.66/+1.01/+1.29 K，z=9.57/14.59/18.32，
+干净的 dose-response）；`e_v0_plus_dv_kj_mol`（驱动 IBS 判别式的量）也显著偏离参考
+（z=10.67/4.85/11.68），但不随 N 单调。温度的单调升高量级虽小（<1.3K），但统计上
+极显著，物理解释与此前已预见的风险一致：`ΔV_θ` 依赖构象相关的态权重
+\(p_k(\mathbf R)\)，这些权重随快原子运动快速涨落，降频评价会引入 MTS 式共振/离散化
+升温——不是新 bug，是方案③在这个系统里的真实统计行为。**这是真实物理结果，不是
+初始化 artifact；`<1.3 K` 仅作为物理量级补充报告，不能推翻预注册的 `z>3` 主门。**
+详见 EXPERIMENT_LOG DEC-055/056。
+
+### 013-B/①：方案① whole fused Group-1 低成本预检
+
+DEC-056 的下一执行点是新增的
+`scripts/check_exp013_design1_mts_precheck.py`（入口
+`run_exp013_design1_mts_precheck.sh`）。它把完整的 fused
+`OuterLambdaIBSBiasForce` 放在 Group 1 慢组，Group 0/2/3/4/5 作为快组；固定
+`inner_dt=2 fs`，只跑 `N=1/2/4/8`，使用相同物理时间的 macro tick。入口分两阶段：
+
+- `smoke` 保留短默认值 `16/32` ticks（`0.256/0.512 ps`），只检查 CUDA/MTS backend、
+  State API 初始化、有限值和温度健康；即使短程普通 SEM 出现 `z>3`，也只能作为诊断，
+  永远不能设置 `eligible_for_n16_followup=true`；
+- `qualification` 固定为 `400/2000` ticks（`6.4/32 ps`，与 DEC-055 时间尺度一致），
+  固定每 tick `0.016 ps` 的物理采样间隔，并以连续 `50`-tick block（`0.8 ps`）的
+  block-mean SEM 计算相对偏移。只有该阶段四臂绝对健康且无系统偏移，才允许设置
+  `eligible_for_n16_followup=true`。
+
+两阶段都同时检查每个 N 的绝对健康门、相对 N=1 的温度/Group-1 fused energy 偏移和
+非有限值；资格门只在 qualification 阶段生效。
+
+**Qualification 结果（DEC-058，2026-08-09）**：报告
+`output/outer_lambda_exp013_design1_qualification/report.json` 的
+`report_sha256=2d96b39e4f6571e131cc16fb98ee4a5b645f35b66455d8d53dfbd442ea3d6d9a`。四臂
+绝对健康门通过，但 block-aware SEM 下 temperature 的 N=2/4/8 为 `z=5.61/5.79/6.83`，
+fused Group-1 energy 的 N=8 为 `z=5.62`；`systematic_shift_detected_by_n` 三个 N
+全部为 `true`，`eligible_for_n16_followup=false`。方案①判定
+`DESIGN_1_QUALIFICATION_GATE_NOT_MET` 和 `N16_NOT_AUTHORIZED`；由于这是单种子
+Qualification，`PHYSICAL_SYSTEMATIC_BIAS_INCONCLUSIVE`。不运行 N=16/32，不进入 013-C，
+随后按 DEC-056 完成方案② N=1 ESS 信号检查；该检查结果见 DEC-059。
+
+这里的“不通过”是程序性 gate 结果，不是“方案①已被证明物理失败”：block-aware SEM
+没有跨 seed 重复间变异估计，且不同 MTS 轨迹分叉后不构成真正配对重复。N=2/4 的 fused
+energy 未越门，N=8 才越门；因此不能把本次单轨迹结果外推为普遍系统偏差或错误系综。
+
+只有四个 N 均健康且没有可分辨的系统性偏移，才允许另行执行方案①的 N=16；Qualification
+gate 未通过则停止，不直接上 N=16/32，更不做三重复。N=16/32 在当前 `inner_dt=2 fs` 下分别是
+`32/64 fs` outer step，风险必须先由低成本门筛掉。初始化沿用 DEC-054 修复后的
+State API：只有同类 `LangevinMiddleIntegrator` probe Context 调用 `loadCheckpoint()`，
+MTS Context 禁止跨 Integrator `loadCheckpoint()`。
+
+### 013-C：WP-5A-mini 三重复
+
+**EXP-013 的方案③、方案①和方案②均未获授权进入 013-C。** 方案① Qualification
+gate 未通过，但其物理系统偏差结论仍为 `INCONCLUSIVE`；方案②的 N=1 ESS signal 又未
+通过（DEC-059）。因此不运行方案② MTS，也不重新定义 013-C；只有另立新候选并完成
+独立资格后，才可重新讨论新的 013-C。
+Go/no-go：
+
+- 至少 2/3 重复的 `mixture_ess_proxy_per_gpu_hour` > baseline；
+- \(\Delta G_{\text{MTS}}\) 与 \(N=1\) student / converged MM 在预定统计容差内一致。
+
+通过后才重新打开 WP-5B；不通过则按下述 EXP-014 转向，且**同样不重开 EXP-013 本身**
+（同一失败即停规则）。
+
+### 若 EXP-013 也失败：EXP-014（原生 OpenMM 压缩）
+
+不是重开 EXP-010（那次失败的是特定的单 torsion Fourier cheap-CV 教师/目标/CV 协议，
+不能推广成"局部径向/类型对多体压缩"本身无效；Arm A/B/D 当时是 `not_pursued`，从未
+实现，不是数值跑输）。EXP-014 把已经证明有信号的 `LocalResidualStudent` 再做一次
+"编译/压缩"：
 
 \[
-\delta_{ak}(\theta)=\Delta u^0_{ak}
-+\beta(A_{k+1}-A_k)B_\theta^{\rm local}(\mathbf R_a).
+B_{\text{fast}}(\mathbf R)=\sum_{i\in L}\sum_{j\in E}\sum_p a_{t_i t_j}^{p}\,
+\phi_p(r_{ij})\,s(r_{ij})
 \]
 
-第一轮固定全局 \(A_k\)，只训练 encoder/readout：
+即 typed pair + radial spline/RBF + cutoff，直接用 `CustomNonbondedForce`/等价原生
+OpenMM 表达式执行，不需要每步调用 TorchForce。这是"gap → neural student → 原生解析
+局部基"的压缩路径，不是回到 EXP-010 那条路线。
 
-\[
-\mathcal L_{\rm gap}
-=\sum_k\frac12\left[
-\operatorname{Var}_{p_k}(\delta_k)
-+\operatorname{Var}_{p_{k+1}}(\delta_k)
-\right]
-+\lambda_E\langle B_\theta^2\rangle
-+\lambda_F\langle\|\nabla B_\theta\|^2\rangle.
-\]
+**EXP-014 离线筛选结果（DEC-060，2026-08-09）**：按 DEC-059 在独立目录
+`output/outer_lambda_exp014_native_compression_audit_after_exp013/` 完成；`n_radial=8/16/32`
+均未满足三折共同的 `held-out R²≥0.90` 与 retained student gap-variance improvement
+`≥0.80` 门。`screening_passed=false`，`openmm_force_qualification=NOT_STARTED`，
+`production_promotion=STOP`。此前标记 `INVALIDATED_OUT_OF_ORDER` 的报告不作为证据；
+本次结果关闭当前冻结的 compression screen，但不外推为所有 analytic compression
+形式均无效。
 
-必须使用完整 MM target-state ledger、target/MBAR 权重和 whole-run holdout。禁止随机拆帧，
-禁止第一轮联合训练 \(A_k\) 与 \(B_\theta\)，禁止以训练集 ESS 选模型。ESS、BAR mutual
-overlap、force tails 和 ESS/GPU-hour 均在 held-out/独立运行上判决。
+### 路线总览
 
-#### WP-4C.2 表示消融
+EXP-012 证明 neural residual 有用（完成）→ DEC-050 证明每步 neural inference 不划算
+（完成）→ EXP-013 方案③ 013-B 失败（DEC-055/056）→ 方案①先做
+`N=1/2/4/8` 预检，合格后才考虑 `N=16`；方案①的 Qualification gate 未通过才进入
+方案②，再失败转 EXP-014；EXP-014 当前冻结 screen 也未通过，停止该路线。当前不再考虑其它
+compression、post-hoc/reweighting 或 MTS 间隔搜索；任何未来讨论都必须另立范围与决策，不能
+作为本分支的自动后续
+（EXP-015 候选，不是现在的优先级——DEC-050 已说明理由：post-hoc 只能改善 estimator，
+不能改变已经生成的坐标覆盖，而 DEC-048 观察到的 mixture ESS 提升恰恰来自神经修正
+真正参与了动力学）。
 
-| Arm | 表示 | 判决目的 |
-|---|---|---|
-| A | typed atom-centered RBF/contact | 最低复杂度和解析成本基线 |
-| B | 轻量等变 ligand-environment cross encoder | 判断通用角向/多体表示是否足够 |
-| C | frozen-MACE latent + 小型 invariant MLP | 判断 pretrained latent 是否有 held-out 增量 |
-| D | XED-inspired field（可选） | 仅判断物理启发特征是否在 A–C 之外有增量 |
-
-Arm C 必须冻结 MACE encoder 权重，明确选择 layer、invariant/equivariant channels、ligand
-node pooling 和 readout。环境图需冻结 cutoff、候选原子、message-passing receptive-field
-buffer、PBC、元素/电荷支持域和边界失败策略。MACE latent 不能解释为显式孤对电子或
-Pauli energy。
-
-#### WP-4C.3 两种 MACE 执行路线
-
-- **L1 在线 encoder：** `FrozenMaceEncoder -> node features -> MLP -> B` 全部位于同一
-  Torch autograd 图中，直接产生 ligand 和 environment 守恒力。不能调用返回 NumPy 的
-  descriptor API 后把特征当常数。
-- **L2 离线 teacher：** frozen MACE latent 用于表示诊断/蒸馏，production 运行
-  `LocalResidualStudent`。若 L1 的 ESS/GPU-hour 无竞争力而 L2 保留统计收益，优先 L2。
-
-“小 MLP”不等于“便宜模型”；L1 每步仍包含 MACE forward/backward。两路线必须使用
-相同 frame folds、gap loss 和判决口径，并报告 feature 构造、host/device copy 与完整
-OpenMM step 成本。
-
-**现状（DEC-030，2026-08-04）**：本轮正式定性为 L2。`original_6a`/`derived_5a`
-是离线 teacher（不进 MD 每步，不需要过 OpenMM/NVT/ns-day 门），`LocalResidualStudent`
-是唯一计划中的在线模型（尚不存在代码）。这不是绕开上面"必须实际比较 L1/L2
-ESS/GPU-hour"的要求：本 session 已测得 teacher 侧单帧离线 latent 提取成本为
-`derived_5a` CUDA 19.8s、`original_6a` CPU 172.7s，而每 MD 步预算需要 O(ms) 级，
-两者差 3–4 个数量级，L1 在当前证据下已不可行，与 student 成本无关。L1 定义保留
-在上面，不删除，只是不再是当前下一步。详见 EXPERIMENT_LOG DEC-030。
-
-#### WP-4C.4 力学、部署和安全门
-
-复用 `OuterLambdaController`、shared-CV/ledger、模型 SHA-256、TorchForce/OpenMM 注入和
-benchmark harness。资格顺序：
-
-1. 补齐三条 run 的逐帧五态 ledger，重新校验坐标/能量/状态顺序哈希；
-2. 冻结 A/B/C/D、MACE layer/readout、图边界、(A_k)、训练预算和判决门并 seal；
-3. 对 ligand/environment 坐标分别做 autograd/finite-difference force check；
-4. TorchScript 与 OpenMM Reference 能量/力一致，XML round-trip 和全局端点归零；
-5. CPU/CUDA 一致，单困难窗口短 NVT 稳定并记录 ns/day；
-6. 至少 3 个独立重复通过后才允许 WP-5 通用性验证。
-
-运行时检查 finite、\(|A_kB|\)、\(|A_k\nabla B|\)、图支持域、公共 λ 一致性和协议哈希。
-第一版不使用既有 PythonForce/CUDA MTS 后端，不为每个 λ 复制 encoder。
-
-停止条件：所有表示均不能改善 held-out gap/overlap；Arm C 对 A/B 无增量；在线 MACE
-成本抵消 ESS；student 蒸馏不保留收益；图边界/环境半径不收敛；出现非守恒力、端点漂移、
-TorchScript/CUDA 不一致、短 NVT 不稳定，或需要未预注册地放宽门限。
 ## WP-5：CV-free 局部残差的体系内与跨体系验收
+
+状态：D0-D4 已全部关闭（DEC-044，2026-08-07），但 WP-5A pilot 已由 DEC-048/050 判定
+`NOT_PROMOTED`；EXP-013 方案③→①→② 及当前 EXP-014 screen 均未形成
+production-qualified route（DEC-059/060），
+不得直接启动新的 WP-5A 三重复。当前最终边界为：不重调 `c1`、不重选或重训
+checkpoint、不继续搜索 MTS 间隔、不直接重开 WP-5；本分支冻结。
+
+**Production 候选冻结（DEC-045，2026-08-07）**：唯一候选 = `output/outer_lambda_exp012/
+student_checkpoints/hard_window0_run1__direct_gap__seed0.pt`（SHA-256
+`61abcd1f0d0ff809914003de522f05db66f9dc4b341391bfa0b7f1cb99e6f2e3`；D2/D3/D4 全程只用
+这一个 checkpoint，未做过跨 checkpoint 挑选）。WP-5A 及以下所有工作**不得**因为
+production 结果不理想就切换到其余 8 个已训练 checkpoint（`run2`/`run3`×`seed0/1/2`
+等），也**不得**重新训练——重新训练需要重新走 D1→D4 整条资格链。D4 用的
+`student_torchscript_d4.pt`（`a_k=0.5` 已烤进模块输出）**不可直接复用**于 WP-5A 的
+IBS/TMBAR 接线：真实多态 wiring 需要 `OuterLambdaController` 按每态 `A_k=w(λ_k)·c_m`
+在 `OuterLambdaIBSBiasForce` 的 CV 表达式里逐态相乘，喂给它的 basis Force 必须只输出
+未缩放的原始模型能量（`a_k=1.0`），否则系数会被重复乘两次；需要为 WP-5A 重新导出一份
+`a_k=1.0` 的 TorchScript。D4 运行环境：`torch 2.12.0`（CUDA 12.9）、`openmm
+8.5.2.dev-36a30cb`、GPU `NVIDIA GeForce RTX 2080 Ti`（driver `580.173.02`）、conda 环境
+`openmm_dev`。
 
 ### WP-5A：Atenolol 困难窗口体系内资格
 
-固定四组对照：
+固定四组对照（最终资格判定需要全部四组）：
 
 1. 原始基础路径；
 2. 仅 λ 重排；
@@ -640,6 +671,63 @@ TorchScript/CUDA 不一致、短 NVT 不稳定，或需要未预注册地放宽�
 至少 3 个独立重复。主指标为 BAR mutual overlap、absolute/importance ESS、ESS/GPU-hour、
 能量/力分位数、异常结构率和 converged-MM 自由能一致性。晋级要求端点与账本闭合、
 稳定性不劣化、统计收益不能由 λ 重排或 Arm A 完全替代。
+
+**当前执行步骤（2026-08-07 起，DEC-047）**：
+
+- step 1（IBS/TMBAR 接线 smoke）：**`CLOSED`**（DEC-047）。`scripts/check_
+  exp012_ibs_tmbar_wiring_smoke.py` 修正版全部通过（report_sha256
+  `7d8f7ab3d4f98c950be589bbf7020ac1d94c2a1698761b6cdad2c631c97b9e06`）：ledger 闭合、
+  target 组合逻辑严格正确（`2.842e-14`）、CUDA-mixed vs 独立 numpy 交叉验证通过（相对
+  容差 `1e-4`）、端点 `A_0=0` 精确成立、DEC-041 provenance verdict 采信。
+- step 2（production 候选冻结）：**`FROZEN`**（DEC-045/047）。checkpoint
+  `hard_window0_run1__direct_gap__seed0.pt`（SHA
+  `61abcd1f0d0ff809914003de522f05db66f9dc4b341391bfa0b7f1cb99e6f2e3`）、wiring
+  smoke 用的 `a_k=1.0` TorchScript 导出方式、`c1=0.5`、`A_k` 系数矩阵（`sin2` 包络 ×
+  常数系数）、cutoff 与运行配置全部冻结，不再因下游 production 结果调整；不重新训练。
+- step 3（baseline/student paired-reseed exploratory pilot）：**`COMPLETED`（DEC-048，2026-08-07）**。
+  3 次配对重抽全部执行完成（`velocity_draw_matches=true`）；它们是探索性两臂比较，
+  不是三组独立平衡的 production repeats，也不是四组对照的完整 WP-5A——"仅 λ 重排"
+  和"Arm A 解析接触基线"两组尚未安排。
+- step 4（判据评估）：**`pilot_promotion_verdict=FALSE`（DEC-048）**——不晋级，不进入
+  WP-5B。关键发现（细节见 EXPERIMENT_LOG DEC-048）：原始 `mixture_ess_proxy`（min-
+  over-states 混合覆盖 ESS 代理）在 3/3 次 paired-reseed exploratory pilot 里 student 都比 baseline 高
+  （+10.7%/+10.6%/+27.8%）——神经修正对混合覆盖确有真实正向信号；但 student 每步
+  计算成本涨了 `1.81×~1.89×`（与 DEC-042/043 已测的 ~95% TorchForce 额外开销/约
+  1.95× 单步成本一致），ESS 增益远不足以补偿成本涨幅，故 `mixture_ess_proxy_per_
+  gpu_hour` 3/3 全部下降（中位数改善 `-684.22`）。ΔG：3 个重复里 2 个未收敛（100 帧
+  pilot 量级下 `solve_stage_integrated` 默认去相关门槛未达标，疑为样本量不足而非
+  物理不一致），收敛的那个 repeat `delta_g_z=2.268`（刚过门槛 2.0，原始差值仅
+  `2.67 kJ/mol≈0.64 kcal/mol`）。按§16 已预先写明的规则（"若约 1.95× 单步成本没有
+  被足够的 ESS 增益补偿，才判该路线性能失败"）判定为**性能失败，不是科学假设失败**。
+  按"每个子阶段失败即停"规则，暂停在此，等待用户对三个方向之一做出新的、显式记录的
+  决策：(a) 就此关闭单基势路线；(b) 优化 `student_deploy.py` 推理开销；(c) 尝试更大
+  的 `c1`（需作为新决策而非事后调参）。不得未经这类明确决策就直接推进 WP-5B。
+  上述三个方向是当时的待决选项，已被 DEC-059/DEC-060 及当前最终执行边界 supersede；不再执行。
+
+- **DEC-049（2026-08-07）授权部署性能救援**：用户选择 (b)，并给出精确成功标准——
+  仅限部署实现（不改模型权重、不改 `c1`/`A_k`、不改物理路径）；成功标准 = 物理输出
+  等价 + 总步耗降到约 `1.10×baseline`（当前 `1.81×~1.89×`）。`1.10×` 的选取依据：
+  三个重复里最小的 ESS 增益是 `10.6%`，`1.10×` 成本涨幅卡在增益下限附近留安全边际，
+  确保救援成功后 ESS/GPU-hour 是真实净改善而非刚好归零。**未达到 `1.10×` 即正式关闭
+  当前单基势在线（real-time TorchForce-during-MD）路线**，不再无限期尝试。
+- **DEC-050（2026-08-07）终局判决：`TARGET_UNREACHABLE_CLOSE_ONLINE_PATH`**——正式
+  关闭。首次 profiling 尝试（stage 相减）产出物理上不可能的负数"sync overhead"，
+  被判定方法论有误后弃用；改为 4 变体（`baseline`/`zero_output`/`network_only`/
+  `full`）同一 win_sys、同一调用路径、同一计时方法的终局实验
+  （`scripts/measure_exp012_student_matched_path_lower_bound.py`，report_sha256
+  `98496b12fa9ca61f74415d732478c4011f1361cecf268d3c761e61036104d9e1`）：
+  `baseline=1.4765`、`zero_output=1.6683`（桥接成本 `+0.1918ms`）、
+  `network_only=2.7042`（固定边集+真实网络前向反向，`+1.2277ms`）、
+  `full=3.5678`（当前真实部署，`+2.0913ms`）ms/step。预算 `0.14765ms`；
+  `network_only_delta(1.2277)` 超预算 `8.3×`——**不是边际未达标，是结构性不可达**：
+  即便假设动态建图成本能优化到零，剩下的 `network_only` 本身仍是 `1.83×baseline`，
+  离 `1.10×` 差距巨大。**关闭范围明确限定为"在线/real-time-during-dynamics"这一种
+  部署模式**；不代表关闭"离线/post-hoc reweighting"式应用（完全不同的研究方向，
+  需独立设计，本决策不隐含批准或否定）。D0-D4/wiring smoke/pilot 的全部结果（模型
+  有真实统计信号、接线力学正确、ledger 闭合）依然作为有效证据保留，不因此被推翻——
+  关闭的是"当前部署实现能不能在本项目产生净收益"，不是"模型本身没用"。不进入
+  WP-5B/WP-6-8。DEC-045/047/048/049/050 构成完整证据链；重开此路线前必须先说明
+  证据链哪里不成立。
 
 ### WP-5B：通用训练管线验收
 
@@ -660,6 +748,9 @@ TorchScript/CUDA 不一致、短 NVT 不稳定，或需要未预注册地放宽�
 实验 \(\Delta G\) 误差 `<1.0 kcal/mol` 作为次级报告指标，不作为路径势主正确性门，因为
 端点归零的路径残差不能修复原 MM 力场的系统误差。
 
+候选架构（shared trunk + 体系专属 head 等）已于 2026-08-05 设计存档，阻塞于 WP-5A
+通过、当前不执行，完整设计见归档 §WP-5B候选架构。
+
 ### WP-5C：更强的冻结模型迁移（条件目标）
 
 只有 WP-5B 通过后，才测试同一 frozen encoder/readout 权重跨体系不微调。必须与
@@ -668,58 +759,6 @@ TorchScript/CUDA 不一致、短 NVT 不稳定，或需要未预注册地放宽�
 TYK2/CDK2 通常属于 RBFE benchmark。它们只能在 RBFE Hamiltonian、mapping、target
 ledger、公共状态和端点协议通过独立接口资格后使用；不得直接把当前 ABFE 结果外推为
 TYK2/CDK2 通用性证据。
-
-#### WP-5B 候选架构（2026-08-05 设计存档，阻塞于 WP-5A 通过，当前不执行）
-
-D1 单体系结果（Atenolol `hard_window0`，DEC-039 训练报告）显示：`direct_gap` 过硬下限
-（2/3 折全部 seed 改善，均值 +13.9%），但 `distilled`（对每折 teacher ridge readout 的
-scalar 输出做 MSE 蒸馏）没有稳定跟上——三折的 inner-CV 选中的 ridge 系数本身就不稳定
-（`0.1/0.001/0.001`），且 distilled 在 held-out run3 上明显劣于 direct_gap（+13.3% 对
-+23.1%）。这提示：把 teacher 蒸馏目标定在"每折重新拟合的 scalar ridge 输出"上，这个
-目标本身太下游、太体系/fold 特定，不是将来做多体系蒸馏时应该复用的形式。
-
-若未来要做跨体系蒸馏（WP-5B 的候选实现之一，而非替代 WP-5B 本身的验收要求），推荐
-形式改为 **shared trunk + 体系专属 head**，而不是让多个体系共享同一个最终标量 \(B\)：
-
-\[
-\mathbf h_s(\mathbf R)=f_\theta^{\rm shared}(\text{typed local geometry}),
-\qquad
-B_s(\mathbf R)=g_{\phi_s}\bigl(\mathbf h_s(\mathbf R)\bigr)
-\]
-
-理由：\(B_s\) 依赖该体系的 MM 力场、ligand/pocket、所选 alchemical states、\(A_k\)/
-\(\Delta A_k\)、原始 gap 的尺度和方向、pilot 轨迹覆盖的构象分布——两个体系里几何上
-相似的局部结构，最优 path correction 未必数值相同。真正可能跨体系共享的是"哪些局部
-接触/溶剂重排/化学环境重要、如何把它们编码成一个便宜的表示"，不是"这段局部结构必须
-输出固定的 +x kJ/mol"。
-
-蒸馏目标同理应下沉到表示层，而不是每折重拟合的 scalar teacher 输出，候选包括：
-
-- 把 1024 维 MACE latent 投影到低维（如 16–64 维）后让 student 逐维/relational 匹配
-  （Gram matrix、frame–frame similarity、子空间），而非只匹配一个标量；
-- 训练目标写成 \(\mathcal L_s=\mathcal L_{{\rm gap},s}(g_{\phi_s}(h_\theta))+
-  \lambda_T\mathcal L_{\rm latent}(h_\theta,z_s^{\rm MACE})\)——teacher 只监督共享
-  trunk 的表示，最终 scalar 完全由该体系自己的 gap loss 决定，不再由 teacher scalar
-  直接规定。
-
-三层验证（体系内 held-out run → leave-one-system-out trunk 预训练+体系专属 head 微调
-→ zero-shot）与四组必需对照（单体系 direct-gap / 单体系 distilled / 多体系
-direct-gap 预训练 / 多体系 MACE-distilled 预训练）与 WP-5B 正文的通用训练管线验收
-要求兼容，可以直接复用同一批已冻结的数值门，不需要另立一套判据。
-
-当前架构（typed atom embedding + radial/contact + ligand-only pooling）概念上可以
-迁移，前提是 embedding 严格只用可跨体系定义的 atom type/element/role，topology index
-只能用于当前帧的身份识别和构边，不得混入 embedding 特征——这一条现有代码已经满足。
-但 Atenolol 审计出的图规模上限（S1≤320、边≤2048、单原子 neighbor≤80）是本体系的
-部署预算，不是跨体系上限；新体系必须先各自跑一遍相同的 geometry audit，不能直接
-沿用这几个数字。
-
-**执行前置条件（明确写清楚，不得绕过）**：本节只是设计存档，不是新的下一步。启动
-前必须先满足 WP-5A——即证明当前单体系 direct-gap 原型在**真实生产采样**里
-（不只是离线 gap-variance-loss）对 mutual overlap / ESS / ESS/GPU-hour 有可测改善；
-在此之前，本节所有内容都不执行、不分配算力。若未来真的启动，必须作为独立预注册的
-新实验登记（新 DEC + 新 preregistration 或其修订），不得把本次已完成的 D1 单体系
-结果事后包装成"多体系工作一直都是这么规划的"。
 
 ## WP-6：2–4 个基势
 
@@ -859,430 +898,91 @@ NEURAL_PATH_ACCOUNTING_VERSION
 
 ## 13. 开工检查单
 
-- [x] 已选择 softcore 原型起步。
-- [x] 已指定 complex vanishing window 0。
-- [x] 已冻结 primary torsion。
-- [x] 已保存基础 ESS benchmark 和三条 scratch 慢变量轨迹。
-- [x] 已定义教师能量为局部 MACE decomposition interaction energy。
-- [x] 已确认不是未经处理的全体系 MACE 总能量。
-- [x] 已冻结 protein-only 教师原子集合并生成选择哈希。
-- [x] 已定义端点容差。
-- [x] 已定义能量、力和支持域安全门。
-- [x] 已定义模型/配置/缓存哈希。
-- [x] 已准备无 ML 的 mock Force。
-- [x] 已准备独立输出目录。
-- [x] 已决定完整 MACE 仅作为教师。
-- [x] MTS 的内步长、ratio 和失败后端已记录；该路线已停止。
-- [x] EXP-010 正式 GPU 教师数据集已完成并通过支持域门。
-- [x] 六个预注册 cheap-CV 候选已按整条 run 留一比较；全部失败，未冻结最终模型。
-- [x] EXP-010 protein selection 已完成残基完整性审计；26/26 个涉及残基均为部分截断。
-- [x] EXP-011 周期 CV 覆盖、目标加权 PMF 定义和跨 run 门已预注册；历史覆盖诊断要求增加受限/增强采样。
-- [x] EXP-011 CV manifest 已正确标记为 `frozen_for_exp011_complete_mm_pmf`，内部哈希有效。
-- [x] `exp011-umbrella-sample` 周期 restraint、独立输出和逐帧 bias-energy 账本实现。
-- [x] `exp011-reweight-umbrella` MBAR 权重、overlap 连通性与 `target_samples.json` 导出。
-- [x] 周期 restraint、MBAR 纯数值和 CLI 回归测试（58 passed）。
-- [x] 有 GPU 节点上的完整体系单中心 smoke（正式最小化、1 step、报告/checkpoint/DCD 完整）。
-- [x] 同一中心短时稳定性 pilot 与多帧有限值检查（10/10 帧有限）。
-- [x] 相邻 `-157.5°` 中心 pilot 与两窗 MBAR overlap 检查（overlap `0.3584`）。
-- [x] 第三个 `-142.5°` 中心 pilot 与三窗 MBAR overlap 检查。
-- [x] 历史空白区 `112.5°` 哨兵窗的可达性与稳定性检查。
-- [x] 空白区高侧 `127.5°` 邻窗及 `112.5°/127.5°` MBAR overlap。
-- [x] 24 centers × 3 replicates 正式采样计划与 fail-closed 断点续跑入口冻结。
-- [x] formal_run1 单窗正式 smoke（100/100 帧有限，初态哈希与 resume 校验通过）。
-- [x] formal_run1 剩余 23 窗完成（24/24 窗、2400 帧有限）。
-- [x] MBAR 验收语义修正为 mutual overlap + 每个周期邻接接口，schema v2（58 passed）。
-- [ ] formal_run1 环形 MBAR overlap：AUG-001 后唯一失败接口仍为 `0.02353 < 0.03`。
-- [x] EXP-011-AUG-001 已补采 `127.5°` 500 ps 并重跑严格 MBAR；22 个去相关样本与
-  `0.02353` mutual overlap 均未达到冻结门，结论为 `COMPLETED_NOT_ACCEPTED`。
-- [x] EXP-011 已在 AUG-001 后冻结为 `FORMAL_RUN1_OVERLAP_FAILED`；不再补采或拟合 PMF。
-- [x] EXP-012 三条逐帧五态 target ledger、SHA/System/账本闭合与 CPU/CUDA backend audit。
-- [x] C1 合成图 graph/latent/autograd 合约：真实 OFF24、严格 `[512:640]`、两类坐标非零梯度、MACE 参数零梯度；联合回归 `107 passed, 2 skipped`。
-- [x] 为 `run1/frame0` CPU smoke 生成并审计 Atenolol 两跳 provisional environment manifest 与 atom mapping。
-  第一次尝试（`pocket_cutoff_nm=0.5`、`hard_window0_run1/2/3` 末帧并集，sha `ffa52ebc...254f05`
-  / `2c74e5e0...86597a`）已作废：`run1/frame0` CPU smoke 在 `build_mace_graph` 两跳完整性检查处
-  失败。DEC-023 将其误诊为“必须覆盖 ligand-centered 12 Å 球”，该结论已由 DEC-024 撤销。
-  正确支持域是 6 Å 邻接图的两跳闭包：`S0=L`、`S1=N_6Å(S0)`、`S2=N_6Å(S1)`；12 Å
-  只作为几何上界，不能直接用于径向选原子。discovery 与 smoke 现共用
-  `topology_n_hop_closure`，多参考帧闭包取并集、触及的环境残基整残基纳入。需要用
-  `--edge-cutoff-angstrom 6.0 --interaction-layers 2`，并把 smoke 所用 frame 纳入参考帧后
-  重新生成 provisional config/manifest/mapping。当前 frame0-only 产物位于
-  `output/outer_lambda_exp012/two_hop_frame0/`：manifest canonical SHA
-  `0e399a9e...e223935`、mapping canonical SHA `d84a65f9...88d00f`；它们已通过同帧 CPU smoke，
-  但仍是 provisional，不能替代后续多参考帧冻结身份。
-  旧错误算法与结论已存档到 `archive/exp012_radial_support_bug_20260803.md`。
-- [x] `run1/frame0` 真实 CPU float32 latent/autograd smoke：OMOL extra-large-1024、product layer 1
-  early-stop、两层精确闭包、2135 节点/155624 有向边、latent `[41,1024]`；ligand/environment
-  梯度 norm `32.2197/22.2791`，repeat 最大差 `0`，MACE 参数梯度数 `0`，报告 SHA
-  `ce8fd06c...58db5`。该结果只通过 C1 CPU 可导性，不是性能或科学资格。
-- [ ] 同一 frame0、同一 manifest/mapping、同一 product layer 1 的 CUDA float32 对照。
-  `BLOCKED_ON_VRAM`：三次尝试（15.47/10.57/23.58 GiB 卡）均在同一 product-layer-1
-  张量积 `cat`/`reshape` 算子 OOM；加 `torch.cuda.empty_cache()`（`mace_latent.py`
-  no-grad 参考 forward 后）与 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
-  后已占用显存数字不变（14.57 对 14.59 GiB），排除碎片化；真实峰值需求
-  `>=~24.07 GiB`。同时修复代码缺陷：`MaceLatentBasisAdapter.forward` 对不带 index
-  的 `--device cuda` 与实际张量具体 device 比较不相等（`mace_latent.py:223-225`
-  已归一化修复）。详见 EXPERIMENT_LOG §11A.11、DEC-026。
-- [x] DEC-027/028：`original_6a`（6 Å）与 `derived_5a`（5 Å）并列候选臂已双双通过 CPU C1。
-  `smoke_exp012_mace_latent.py` 只接受 `--edge-cutoff-angstrom` ∈ `{6.0, 5.0}`，报告含
-  `encoder_variant`/`model_r_max_angstrom`/`graph_cutoff_angstrom`/
-  `original_encoder_numerically_preserved` 四字段与 `--output` 防覆盖门；`mace_graph.py`
-  写死的 “6-Angstrom” 注释/报错已参数化。`derived_5a` CPU smoke（报告 SHA
-  `d28be435...9c7a0d`）：两跳精确闭包 974 原子（hop 0/1/2=`41/219/714`），整残基收口后
-  1444 节点/60048 边（对比 `original_6a` 的 2135 节点/155624 边，边数降到 38.6%），
-  float32 latent `[41,1024]` 有限，ligand/environment 梯度 norm `32.9454/19.9347`，
-  repeat 差 `0`，参数梯度数 `0`，CPU 耗时 34.5s（对比 172.7s）。
-- [x] `derived_5a` 的 CUDA float32 对照（DEC-029，报告 SHA `ba7d053d...deb37bc8d59`）：
-  无 OOM，23.87s；CPU↔CUDA 相对差 latent/ligand-grad/env-grad norm 分别为
-  `7.53e-7`/`1.16e-7`/`-3.83e-7`，均为 float32 舍入量级。`derived_5a` 是首个完整通过
-  C1（CPU+CUDA）的候选臂。
-- [ ] `original_6a` 的 CUDA float32 对照仍 `BLOCKED_ON_VRAM`，等 6 Å 分支 gradient
-  checkpointing 实现后重试。两臂最终按 held-out gap variance、梯度稳定性、显存成本判决，
-  不能仅凭 C1 通过就选 `derived_5a`。
-- [x] DEC-030(a) `derived_5a` 多帧支持域审计，report-only，不设硬门：已针对三条
-  真实 run（1500 帧）执行，report_sha256 `a74ea2352263ea9b25e324c9d0930a0199b0fb826d453ab2715b54cd82cf9b69`。
-  结果：1499/1500 帧（99.9%）违规，最坏单帧遗漏 122–141/1444 个固定原子。分解：
-  遗漏原子约 86–88% 是水（正常——水在两跳壳层内持续扩散进出，非缺陷）；但有约 24 个
-  非水残基（ALA50/63/131/168、ARG167、ASN166、ASP246、CYS154/160/227、ILE233、
-  LEU57/142/182/229/256、PHE77、PRO230、TRP4/130、TYR155、VAL129/245）与一个钠离子
-  在三条独立 run 中都被遗漏——同一批真实残基，不是逐 run 随机噪声，说明它们结构上
-  正好卡在 5 Å/两跳边界。结论：frame0-only 的 `derived_5a` manifest 不足以支撑
-  (b) 的离线多帧 latent cache。
-  第一次尝试（DEC-031）用这 1500 帧闭包的并集重建了 `derived_5a` manifest：
-  `--frame-stride-all` 扩展见下方 DEC-031 记录，discovery 报告显示候选池从
-  1444 膨胀到 **4874 个环境原子（1136 个残基）**——固定图节点数变成 4915，比
-  `original_6a` 那个已经在 CUDA 上 OOM 的 2135 节点图还大一倍以上。DEC-032
-  撤销了这个方向：**根本不该为离线 teacher 固定 environment node set**。teacher
-  从不进 OpenMM/MD，所以没有理由为一张跨帧共用的固定图付出这个代价；正确做法是
-  逐帧独立构造精确两跳闭包 \(S_a=S_{0,a}\cup S_{1,a}\cup S_{2,a}\)（`local_residual/teacher_graph.py`
-  新增 `build_teacher_graph_for_frame`，不接受也不需要 environment manifest/atom
-  mapping，直接对当前帧调用 `topology_n_hop_closure` 拿到 \(S_a\)，按 topology
-  index 升序排列——ligand 41 个原子的相对顺序因此帧帧不变，缓存的 `[41,1024]`
-  latent 可以直接跨帧比较/喂线性 probe）。同时不再做整残基收口：EXP-010 的整残基
-  要求来自 fragment energy subtraction，当前 ligand latent 读出不算 fragment
-  energy，收口是否必要是可以验证而非该假设的问题（`tests/test_exp012_teacher_graph.py`
-  锁定：无收口、闭包本身即节点集、ligand 顺序在环境原子数变化时保持相对不变）。
-  4874-atom union discovery 报告保留存档，标记
-  `FIXED_UNION_POLICY_REJECTED_FOR_OFFLINE_TEACHER`，不晋升为任何运行时 manifest。
-  新增三个工具，均未在真实数据上执行（需要 openmm_dev 环境+真实 MACE 模型/GPU）：
-  - `scripts/smoke_exp012_teacher_graph_equivalence.py`：frame0 上比较
-    974-node 精确闭包（graph A，新策略）与 1444-node 整残基收口图（graph B，
-    复用 DEC-028/029 已冻结的 frame0 derived_5a manifest/mapping）——比较完整
-    ligand latent 张量（不仅是 norm）、scalar probe 和 ligand 坐标梯度，只报告
-    差异，不设通过/失败门（`status=COMPARISON_ONLY_NOT_A_GATE`）。收口是否可以
-    正式删除，由这份报告的数值差异决定。
-  - `scripts/audit_exp012_per_frame_teacher_graph_geometry.py`：对三条 run
-    1500 帧只做几何构图（不跑 MACE），报告每帧 node/edge count、hop 0/1/2
-    计数、water/ion/other 环境原子组成，以及 max/mean/P95/P99 汇总，并显式给出
-    `overall_max_edge_count_frame`/`overall_max_node_count_frame`（哪个 run
-    的哪一帧图最大）——用于替代"猜 frame0 是最坏情况"。
-  - `scripts/smoke_exp012_teacher_graph_latent.py`：`smoke_exp012_mace_latent.py`
-    的对应版本，改用 `build_teacher_graph_for_frame`（无需 environment
-    manifest/atom mapping 参数，改为 `--ligand-indices` JSON），供在
-    geometry 扫描选出的最大图那一帧上跑 CPU/CUDA C1。
-  下一步顺序（均需在 openmm_dev 环境的真实计算节点执行）：
-  ① 跑 equivalence smoke，看 974 vs 1444 的 ligand latent 数值差异，决定是否
-  正式删除整残基收口——已执行，frame0 上 ligand latent 最大差 `3.33e-16`、
-  ligand 梯度最大差 `1.07e-14`、scalar probe 差 `2.84e-14`，均为 float64 舍入
-  量级，证实整残基收口对两层 ligand latent 无实际贡献，正式确认删除；
-  ② 跑 1500 帧 geometry-only 扫描，拿到真实的 node/edge count 分布与最大图
-  所在帧——已执行，最大图为 `hard_window0_run3`/frame343（1066 节点/45656 边）；
-  ③ 用 `smoke_exp012_teacher_graph_latent.py` 对该最大图帧跑 CPU C1，再跑
-  CUDA C1——均已通过（CPU 72.3s、CUDA 10.4s，CPU↔CUDA 相对差 `2.2e-7`，
-  float32 舍入量级，无 OOM）；④ 通过后才能开始 (b) 的逐帧 latent cache 生成——
-  已完成，见下。
-  中途发现并修复了一个真实的 CPU/CUDA 不一致（非 dtype 问题）：几何审计脚本在
-  CPU 上、bulk 脚本在 CUDA 上各自独立判定 graph membership，导致某一帧两侧
-  edge count 相差 2（一对原子对在 cutoff 边界因浮点实现差异翻转）。修复为
-  DEC-032 Option C：membership 永远在 CPU float64 决定一次
-  （`local_residual/teacher_graph.py::compute_canonical_graph_membership`），
-  只把离散结果（topology indices/edge_index/unit_shifts）搬到目标 device 执行
-  MACE forward（`build_teacher_graph_from_membership`），并新增
-  `graph_membership_sha256` 做逐帧硬门核对，而非容忍 count 级别的 ±几条边
-  误差。`local_residual/mace_latent.py` 相应放宽了
-  `positions.requires_grad` 检查（仅在 `require_coordinate_grad=True` 时强制），
-  使 bulk 生成可以老老实实用 `requires_grad=False`+`torch.no_grad()`，不用为
-  满足契约假造一个不需要的 autograd leaf。
-- [x] (b) `derived_5a` 离线多帧 latent cache（逐帧独立构图，CPU float64 决定
-  membership、CUDA float32 执行 MACE forward，不使用固定 manifest）：三条 run
-  各 500 帧全部生成完成且通过硬门（node/edge count 与 graph_membership_sha256
-  逐帧精确核对，无一帧违规）。`output/outer_lambda_exp012/teacher_latent_cache/`
-  下 `latent_cache_hard_window0_run{1,2,3}.npz`（各 `ligand_latent [500,41,1024]`
-  float32，~86.16 MB）+ 对应 `_report.json`，report_sha256 分别为
-  `bfd1a8ef9df26b111b593ea734f1a8cf76c6658a087cd653d2bcdb3ab3bbb639`（run1）、
-  `50138e76b239e39944f2c9e55305b77f66f6c447cb44b20921ae02d15f0b72a8`（run2）、
-  `077c8737ef7d9674a9cf7a818ce5b9734ade0b407b3c943b4cf6b2e233476fcc`（run3）；
-  npz_sha256 均与文件实际哈希核对一致。三次运行实际耗时共 ~7.7 分钟（单次 no-grad
-  前向，远低于早先双前向 smoke 外推的 ~4.3 小时估计）。`ledger_joined=False`，
-  纯 representation，未拼 target/gap-variance 数据。
-- [x] (c) cached-latent 线性/ridge readout 的 held-out（leave-one-run-out）gap-variance
-  验证，对比 `B=0` 基线；只有 held-out 上有增益才进入 (d)。
-  **已在真实数据上执行，全部通过**：三个 leave-one-run-out fold 全部相对 `B=0`
-  基线改善（held-out run1 39.9%、run2 29.1%、run3 64.8%，均值 44.6%），比
-  "至少一个 fold 有增益"的最低门槛更强。join 报告 report_sha256
-  `8dfc47e3352534f8b67826ee570f6830de2b618cf935ff9354e74f0082c016ce`，readout
-  报告 report_sha256 `d77a8e132780270363abb4a33572912e518c102ef8c1f4ed38d36df92c7b05c3`。
-  待办：2/3 fold 选中了 ridge 网格里最小的候选值 `1e-3`，说明内层 CV 可能想要更小的
-  正则化，建议后续把网格向下扩展（如 `1e-6/1e-5/1e-4`）复核，但不影响"held-out 确有
-  改善"这一定性结论。下一步是 (d)，需要先与用户对齐范围（工具本身如下，只需
-  numpy/torch，不需要 MACE/GPU，纯 CPU 线性回归）：
-  - `scripts/join_exp012_teacher_latent_cache_with_ledger.py`：拼接 latent cache
-    （`pooled_latent`）与 `output/outer_lambda_exp012/mm_ledger_cuda/<run_id>/`
-    的 `adjacent_gap_reduced`/`log_importance_unnormalized`。`delta_A`（每条相邻边
-    的包络增量）直接从 `protocols/EXP-012_preregistration.json` 的
-    `target.global_schedule.A_k`（`sin^2(pi*lambda_vdw)`，`global_state_ids=[0,1,2,3,4]`
-    切片）读取并独立用 `sin^2(pi*lambda_vdw)` 公式重新核对，不重新拟合、不猜测——
-    对齐 PLAN 文档"第一轮冻结全局 A_k"的明确要求。fail-closed 校验：cache report 的
-    `preregistration_sha256` 必须等于当前 preregistration；ledger report 自己的
-    `preregistration_payload_sha256` **不**要求相等（ledger 生成时间早于文档后续
-    的无关编辑，已核实 `f_k_kj_mol`/`lambdas_vdw` 本身与当前 preregistration 的
-    target 部分精确一致），改为直接比对这两个物理相关字段；cache 与 ledger 的
-    `frame_index` 数组必须逐位等于 `0..499`，否则拒绝按位置拼接。
-  - `scripts/fit_exp012_local_residual_linear_readout.py`：线性 readout
-    `basis_reduced = w^T·standardize(pooled_latent)`（无 intercept——`Var(X+c)=Var(X)`，
-    intercept 对 `bidirectional_gap_variance_loss` 的贡献恒为零，不是遗漏）；
-    ridge 系数用只用两条训练 run 的内层 2-way CV 选择（不碰 held-out run，避免泄漏），
-    再在两条训练 run 合并数据上用选中的 ridge 系数重新拟合，最后在真正 held-out
-    的第三条 run 上比较 `B=0` 基线与拟合值的 `gap_variance_loss`。`A_k`/`delta_A`
-    全程冻结（不联合拟合），复用已测试的
-    `local_residual/loss.py::bidirectional_gap_variance_loss`（不重新推导闭式解）；
-    由于 `delta_A` 固定后目标函数是 `w` 的凸二次型，用 `torch.optim.LBFGS`
-    （strong Wolfe）收敛到唯一全局最优，不需要调学习率。
-  - 新增测试 `tests/test_exp012_local_residual_linear_readout.py`：构造一个
-    "gap 恰好是 pooled_latent 的线性函数、三条 run 共享同一真实关系"的合成数据集，
-    验证三个 leave-one-run-out fold 全部相对 `B=0` 基线改善（`>90%`），以及输出
-    policy 明确标注 `a_k_learned=false`/`mace_encoder_trained=false`/
-    `local_residual_student_trained=false`（这一步训练的只是线性 readout，
-    不是训练 MACE、不是学习 A_k、也不是训练 (d) 的 `LocalResidualStudent`）。
-  示例命令（openmm_dev 环境）：
-  ```
-  python scripts/join_exp012_teacher_latent_cache_with_ledger.py \
-    --latent-cache-dir output/outer_lambda_exp012/teacher_latent_cache \
-    --output output/outer_lambda_exp012/teacher_latent_ledger_join.npz
+约 50 条已完成/已终止条目（WP-0 至 WP-4C 基线、EXP-010/011/EXP-012 前半段全部通过项）
+已归档，见归档文件 §13。此处仅保留尚未完成/尚未关闭的项：
 
-  python scripts/fit_exp012_local_residual_linear_readout.py \
-    --joined output/outer_lambda_exp012/teacher_latent_ledger_join.npz \
-    --output output/outer_lambda_exp012/local_residual_linear_readout_report.json
-  ```
-- [x] DEC-030(c) 已冻结登记结果（39.9%/29.1%/64.8%，均值 44.6%，全部 fold 改善）；
-  不因 2/3 fold 选中 ridge 网格最小值 `1e-3` 而重跑更宽网格替换它——那是看到边界结果后
-  才决定加宽网格，事后调整（post-hoc）不能改变已经很强的 go/no-go 结论。后续若要跑更宽
-  网格（如 `1e-6/1e-5/1e-4`），必须显式标注 `sensitivity-only`，不得替换 DEC-034/035 的
-  登记结果。
-- [ ] (d) 蒸馏 `LocalResidualStudent`（尚不存在代码）。编码前必须先完成 DEC-030(d0) 设计
-  契约（PLAN 文档同名章节），本轮已冻结契约框架；契约第 1 项（在线动态环境表示）已由
-  DEC-038 real-data smoke 解决，其余各项仍待 (d0-5) 完成后才能进入 (d1)：
-  - [x] **(d0-1) 在线动态环境表示**（DEC-038，2026-08-05）：不追踪瞬态水分子持久身份，
-    用 `local_residual.geometry.ligand_environment_cross_edges` 每步动态重算
-    ligand–environment cutoff funnel（无固定 manifest），能量权重用
-    `local_residual.geometry.quintic_c2_cutoff` 平滑包络而非硬 0/1 门控。
-    `scripts/smoke_exp012_student_environment_funnel.py` 在 `openmm_dev` 环境对
-    run1/frame0 与 run3/frame343（teacher 已知最坏图帧）两条真实帧实测，与
-    `local_residual/teacher_graph.py` 的已审计 canonical membership 逐对（含周期
-    unit shift）完全一致，边界平滑性扫描确认离散候选翻转不产生能量跳变；
-    report_sha256 `101e3364f0cebd91694b43bc3b93e239ace49f54a8b5cefbaa960cade411bc7a`
-    / `107416dad1bf09c6c371adece36a969143be21610af0ac8254b6f22ea05a7ae4`。只证明设计
-    可实现，不代表 student 有统计增益或生产资格，不改变网络结构（d0-2）本身的选择。
-  - [ ] (d0-2) 最小架构候选冻结：typed atom embedding + 平滑 ligand–environment
-    radial/contact 特征 + 至多 1–2 个轻量 interaction block + ligand-only 不变
-    pooling + 有界标量 `B_student`；不是完整张量-equivariant MACE 式 student；只有
-    这个最简单候选失败才升级。
-  - [ ] (d0-3) Teacher-target 协议冻结：与 (c) 同构的 leave-one-run-out（两条 run 拟合/
-    训练，第三条 run 评估）；student loss 同时包含直接 gap 优化项和蒸馏项，teacher 不能
-    被当成无条件 ground truth。
-  - [ ] (d0-4) 必需对照实验冻结：同一架构的 direct-gap student（无 teacher target）与
-    distilled student（同架构 + teacher loss）都要训练，否则任何增益无法归因于 MACE
-    teacher 本身。
-  - [~] (d0-5) 计算/部署预算冻结：**部分完成（DEC-039，2026-08-05）**。已冻结：最大参数量
-    （≤50k 目标/≤100k 硬上限）、图规模（S1≤256/320 原子、边≤1536/2048、单原子
-    neighbor≤64/80，1500 帧真实审计，`report_sha256 782e58242233d3b2153e719dda7685d08f0e65e61f1dc35f4d6d33c114cf416f`）、
-    CPU float64/CUDA float32 funnel 一致性（`report_sha256
-    9671470e03e12029ae503f1a6f7b5fd31e193d51fc4fd5ede385fa93cfcf934b`）、训练 seed
-    （≥3/变体/折，硬下限）、早停规则（**改用训练 run 内部末尾 20% 连续时间块**做早停
-    验证集，不复用被隔离的第三条 run 兼职早停+最终评估——原草案"早停判据必须用该折
-    被完全隔离的第三条 run"已被用户否决，因为那样第三条 run 同时当验证集和测试集，
-    存在乐观偏差）、`max_epoch=500`、`early_stop_patience=30`、held-out 改善判据（3 折
-    目标全部改善、硬下限 2/3、均值下降 >0%、最差单折不劣化超过 10%、蒸馏相对
-    direct-gap 不得更差）。**尚未冻结**：目标每 MD 步毫秒数（生产基线 ms/step 待用户
-    用修复后的 `scripts/benchmark_exp012_no_student_window0_baseline.py` 重新测量，
-    `win_sys_xml_sha256_matches_manifest` 根因已定位为 `box_vectors.npy` 陈旧并已修复
-    诊断脚本，见 DEC-039，但尚未拿到哈希匹配的新报告）、GPU 显存上限（依赖 D3 实测）、
-    允许的 cutoff（沿用 teacher 侧 5.0 Å support cutoff，student 侧待 D1/D2 验证）。
-  - [x] (d1) 离线 student 拟合，held-out gap variance 与 teacher fidelity；用真实逐帧
-    坐标计算 student 自己的特征，不是只读 teacher 的 cached `pooled_latent`。最终保留
-    direct-gap 路线进入 D2；distilled 路线未通过相对 direct-gap 的增量门。
-  - [x] (d2) 坐标/autograd 资格：有限差分、cutoff 平滑性、力尾部行为。最终证据为
-    `output/outer_lambda_exp012/student_d2_report_v4.json`：3 folds × 3 seeds 的 9 个
-    direct-gap checkpoint 在三条 run 上共 27 组检查，`all_checkpoints_passed=true`；
-    report SHA-256 `329a98331400f22fe13b76e00f435f4c3a83431441f33bc35af502540d56f08b`。
-  - [ ] (d3) 部署资格：TorchScript、OpenMM Reference、CUDA 一致性、耗时（仅在 d1 仍保留
-    有意义的 held-out 改善后才启动）。
-  - [ ] (d4) 动力学资格：短 NVT、稳定性，再做独立重复（仅在 d3 通过后启动）。
-  每个子阶段失败即停，不得跳阶段推进到下一个。
+- [ ] `original_6a`（6 Å teacher）的 CUDA float32 对照仍 `BLOCKED_ON_VRAM`，等 6 Å 分支
+  gradient checkpointing 实现后重试。两臂最终按 held-out gap variance、梯度稳定性、
+  显存成本判决，不能仅凭 C1 通过就选 `derived_5a`。
+- [ ] (d0-2) 最小架构候选冻结：typed atom embedding + 平滑 ligand–environment
+  radial/contact 特征 + 至多 1–2 个轻量 interaction block + ligand-only 不变
+  pooling + 有界标量 `B_student`；不是完整张量-equivariant MACE 式 student；只有
+  这个最简单候选失败才升级。
+- [ ] (d0-3) Teacher-target 协议冻结：与 (c) 同构的 leave-one-run-out（两条 run 拟合/
+  训练，第三条 run 评估）；student loss 同时包含直接 gap 优化项和蒸馏项，teacher 不能
+  被当成无条件 ground truth。
+- [ ] (d0-4) 必需对照实验冻结：同一架构的 direct-gap student（无 teacher target）与
+  distilled student（同架构 + teacher loss）都要训练，否则任何增益无法归因于 MACE
+  teacher 本身。
+- [~] (d0-5) 计算/部署预算冻结：**部分完成（DEC-039，2026-08-05）**。已冻结：最大参数量
+  （≤50k 目标/≤100k 硬上限）、图规模（S1≤256/320 原子、边≤1536/2048、单原子
+  neighbor≤64/80，1500 帧真实审计，`report_sha256 782e5824...4d33c114cf416f`）、
+  CPU float64/CUDA float32 funnel 一致性（`report_sha256
+  9671470e...ede385fa93cfcf934b`）、训练 seed（≥3/变体/折，硬下限）、早停规则（改用
+  训练 run 内部末尾 20% 连续时间块做早停验证集，不复用被隔离的第三条 run 兼职早停+
+  最终评估）、`max_epoch=500`、`early_stop_patience=30`、held-out 改善判据（3 折目标
+  全部改善、硬下限 2/3、均值下降 >0%、最差单折不劣化超过 10%、蒸馏相对 direct-gap
+  不得更差）。**尚未冻结**：目标每 MD 步毫秒数——生产基线 ms/step 待用户用修复后的
+  `scripts/benchmark_exp012_no_student_window0_baseline.py` 重新测量。根因已定位：
+  `output_lrc_fix/box_vectors.npy` 只在初次建系统缓存时写一次，真正建窗口 0 用的盒子
+  在 NPT 弛豫和 Boresch rebalance 后被内存内重新赋值但从不写回磁盘；脚本已改为两阶段
+  构造（先用陈旧盒子 `loadCheckpoint` 读回真实盒子，再用它重建用于哈希校验和计时的
+  System），schema 升到 v2；**修复后的重新测量尚未执行**，在拿到
+  `win_sys_xml_sha256_matches_manifest=true` 的新报告前，现有 v1 数字
+  （median `1.3961`、P95 `1.3988` ms/step）仍只作为参考量级。GPU 显存上限（依赖 D3
+  实测）与 student 侧允许 cutoff（待 D1/D2 验证，目前沿用 teacher 侧 5.0 Å）也待定。
+- [x] (d3) 部署资格：TorchScript、OpenMM Reference、CUDA 一致性、耗时。**`CLOSED`**
+  （DEC-043，2026-08-07）：
 
-#### (d2) 最终资格结果（2026-08-05，DEC-040）
+  | sub-item | 状态 | 证据 |
+  |---|---|---|
+  | 1. deployment 一致性（eager vs scripted，CPU64/CPU32/CUDA32） | **`PASSED_OPERATIONAL_NUMERICAL_EQUIVALENCE`** | `student_d3_1_2_report_v3.json`（report_sha256 `c8d940818111f0150c754690e2f519904166587effdfbe60f7383c696b8ca148`）：`.square()` 修复后真实重跑，`reference_eager_vs_deployable_eager` 残差 `1.6908728595e-07`（v2 用 `.pow(2)` 时是 `1.6908728728e-07`，只在第 10 位有效数字有差）——`.pow(2)`/`.square()` 假设被证伪，真正根因未查明、裁定不再追查；残差比已接受的 CPU64→CPU32 精度包络（`1.32e-5`）小约 2 个数量级、比已接受的 CPU32↔CUDA32 设备误差（`7.65e-7`）还小；`1e-8` 绝对阈值未进入 sealed preregistration，不再作为卡点 |
+  | 2. TorchForce/OpenMM Reference 注入 | **通过** | `all_passed=true`，`torchforce_consistency` 误差 `0.000e+00`，report_sha256 `d71fe52e...4f66e5b0908c8bf88` |
+  | 3. 端点归零 | **通过** | `endpoint_zeroing` 误差 `0.000e+00`（同一报告） |
+  | 4. 生产 Context 耗时（correctness 部分） | **通过** | `tests/test_exp012_student_deploy_cell_list.py` 全部通过：cell list 与 brute force 找到完全相同候选边/距离（`<1e-10`）、完整前向+反向能量力一致（重构 `_energy_from_edges` 消除了初版测试用 box 扰动强制切分支引入的物理混淆变量后）、小 box 安全回退、TorchScript 导出后数值一致 |
+  | 4. 生产 Context 耗时（performance 部分） | 非阻塞工程目标（§16） | all-pairs 近邻发现原耗时 7.68ms/call；替换为周期性 linked-cell list 后开销从 258% 降到 **95%**（report_sha256 `02ecc152...b93def9181d6abb1`），如实保留，不再是 D3/D4 前置门（`≤50%`/`≤15%` 未进入 sealed preregistration） |
 
-| 检查 | v4 结果 | 结论 |
-|---|---:|---|
-| 覆盖 | 9 checkpoints；每个检查 3 runs，共 27 组 | 3 folds × seeds 0/1/2 全覆盖 |
-| 有限差分 | 最大绝对误差 `2.4711e-7`；最大相对误差 `1.8242e-5` | 均低于 `1e-4` / `1e-2` 硬门；27/27 通过 |
-| 非参与原子 | 27/27 组均为零力 | 通过 |
-| Cutoff 平滑性 | 粗/细步长能量跳变缩放比 `22.6405–24.9856`，连续期望值 25；被探测 pair 每组恰好一次 membership flip | 27/27 通过 |
-| Force tail / 近接触 | 0.3 Å 合成近接触能量和力全部有限；最大近接触力范数 `5.956` reduced/Å | 27/27 通过 |
-
-报告状态为 `COMPLETED_D2_CHECKS`，dataset report SHA-256 为
-`75f0e2ca5a9613ee7cc77964ade9112814ccb136c94a74ec3244d0aaebd8c97c`。报告 policy 明确：
-只检查 direct-gap checkpoints，排除 distilled checkpoints；不按 held-out run 选择
-checkpoint；未使用 TorchForce、未执行 NVT。故本结果只关闭 D2，下一未完成门为 D3，
-不得将其写成 OpenMM/CUDA、短 NVT 或 production 已通过。
-
-#### (d0-5) 预注册提案 → DEC-039（2026-08-05，部分冻结）
-
-> 状态：**除 ms/step 生产基线外已以 DEC-039 正式冻结**（EXPERIMENT_LOG 决策日志表，
-> DEC-038 行之后）。ms/step 基线仍待用户用修复后的
-> `scripts/benchmark_exp012_no_student_window0_baseline.py` 重新测量并确认
-> `win_sys_xml_sha256_matches_manifest=true`，因此上面 `(d0-5)` 复选框标记为
-> `[~]`（部分完成）而非 `[x]`。**本提案本身只授权 (d1) 离线 student 拟合；不授权
-> TorchScript、OpenMM、CUDA 部署或 NVT——那些仍分别要求 d2/d3/d4 各自通过。**
-
-三类数字：**硬上限**（超过即拒绝训练/部署）、**目标值**（首选设计应达到）、
-**淘汰门**（D1/D3 测得不达标时停止，不得静默放宽）。凡标注"PROPOSED"的数字尚无
-既有实测支撑，需要用户确认或调整；凡引用真实数字的行都标出了来源。
-
-**1. 模型规模**（2026-08-05 用户确认，替换此前 PROPOSED 数字）
-
-| Item | Target | Hard ceiling | Measurement definition | Evidence/rationale |
-|---|---|---|---|---|
-| Trainable parameter count | ≤50,000 | ≤100,000 | 对 `requires_grad=True` 的张量求 `numel()` 之和，覆盖 embedding + interaction block(s) + readout + 有界标量头；显式排除冻结 buffer（如固定 cutoff 常数）；**direct-gap 与 distilled 两个 student 各自独立满足此上限，不得合并计算** | 50k 足以覆盖 typed embedding + RBF/contact + 1–2 个小 block + scalar readout；100k（而非此前提议的 500k）是因为更松的上限可能在 edge-wise MLP 上产生明显计算成本；100k float32 本体约 0.4 MB。超过 100k 必须另立设计决策，不得训练时静默放大 |
-| Serialized model size on disk | ≤1 MB | ≤2 MB | float32 `torch.save(state_dict())` 文件字节数；与参数量分开报告，因为 dtype/buffer/序列化元数据可能使两者不成比例 | 参数量是主硬门，文件大小是辅助完整性门；100k 参数 + buffers + 元数据，2 MB 留有余量 |
-
-**2. 图规模**（student funnel graph ≠ teacher 两跳闭包图，不能共用同一个数字；2026-08-05 用户确认/修订）
-
-方向语义写死为 **environment sender → ligand receiver**（不是含糊的"ligand→environment"）：
-唯一允许的边类型是这一种 bipartite cross edge，不含 reverse edge、不含 ligand–ligand edge、不含
-environment–environment edge、不含 self edge。
-
-| Item | Target | Hard ceiling/gate | Measurement definition | Evidence/rationale |
-|---|---|---|---|---|
-| Unique S1 environment atoms | ≤256 | ≤320；超过即 fail closed，不得截断多余原子 | 5.0 Å cutoff 下 `ligand_environment_cross_edges` 输出中出现的唯一环境侧（receiver）原子数；DEC-038 已证明与 teacher 的 `hop_counts_by_layer[1]` 完全一致 | **真实测量**（1500 帧全集，`output/outer_lambda_exp012/per_frame_teacher_graph_geometry.json`）：min 209 / mean 233.8 / P95 246 / P99 250 / **max 255**。250 已低于实测最大值，不适合作目标；256 覆盖已测最大值并留清晰边界 |
-| Directed environment→ligand cross edges | **1536**（已确认） | **2048**（已确认） | 5.0 Å 下 `ligand_environment_cross_edges` 输出 `edge_index` 的列数 | **真实测量，1500 帧全集**：`scripts/audit_exp012_student_environment_funnel_geometry.py`，report_sha256 `782e58242233d3b2153e719dda7685d08f0e65e61f1dc35f4d6d33c114cf416f`。实测最大值 **1464**（`hard_window0_run2` frame202）≤1536，按规则直接冻结 target=1536/ceiling=2048，不需要上调、不触发 redesign。**明确不是**teacher 的 45,656 条两跳闭包边（不同的图） |
-| 单个 ligand atom 的最大 neighbor 数 | **64**（已确认） | **80**（已确认） | 每个 ligand atom 作为 receiver 端点被计数的 environment 邻居数（bipartite 邻接矩阵的逐 ligand-atom 度数） | **真实测量，1500 帧全集**：同一份审计报告。实测最大值 **55**（`hard_window0_run1` frame85，ligand topology index 4607，分布 mean 31.23 / P95 42 / P99 46）。按规则 target=向上取整到 16 的倍数=64，hard ceiling=64×1.25 向上取整到 16 的倍数=80 |
-| 边的组成 | 硬性要求（非数字）：仅 environment→ligand bipartite | 不含 ligand–ligand、environment–environment、reverse、self edge | — | 对齐 DEC-037 (d0-2) 已冻结的最小架构；审计脚本对全部 1500 帧逐帧结构性断言此不变量，零违反。若未来升级到需要 environment–environment 消息传递的架构，这一行必须重新冻结，不得默默加入 |
-
-**1500 帧几何审计（2026-08-05 已完成，真实执行，非抽样外推）**：
-`scripts/audit_exp012_student_environment_funnel_geometry.py`——纯几何、无 MACE、无 GPU、无
-student，复用 `local_residual.geometry.ligand_environment_cross_edges`（CPU float64，5.0 Å
-cutoff，32 workers，耗时 107.5s）对 `hard_window0_run1/2/3` 全部 1500 帧扫描。三条 run 各自的
-edge_count/s1_atom_count 分布（max/mean/P95/P99）：run1 `1445/1281.91/1371.10/1410.07` 与
-`249/230.34/242.05/245.00`；run2 `1464/1294.11/1379.05/1412.05` 与
-`255/235.76/248.00/251.02`；run3 `1443/1265.59/1344.05/1384.01` 与
-`253/235.25/246.00/250.00`。全局 S1 最大值 255 与此前 teacher 两跳闭包审计
-（`per_frame_teacher_graph_geometry.json`）独立测得的 hop1 最大值**完全一致**，交叉验证通过。
-顺带确认 `system_atom_count=73536`，与此前 grep 估计值精确吻合。
-`preregistration_sha256` 一致性核对通过（`aba95cd2a8f42d58172aad71117a646a13557496fec21b7cb59f76bb39ebbd1a`）。
-
-**3. 性能计量口径**（禁止只报"裸网络 forward"；必须逐项 + 求和）
-
-| Item | Proposed target | Hard ceiling/gate | Measurement definition | Evidence/rationale |
-|---|---|---|---|---|
-| Dynamic neighbor discovery | 待预算内分摊 | — | `ligand_environment_cross_edges` 调用本身的 GPU 同步耗时 | 未在 GPU 上测过——DEC-038 为了与 teacher 精确比对，全程跑在 CPU float64 |
-| Triclinic PBC / shifts | 待预算内分摊 | — | 当前实现中此步嵌在 `minimum_image_displacement` 内部，不可分离；d3 前必须决定是并入上一行合并计时，还是加独立子计时器 | 尚未决定 |
-| Feature construction | 待预算内分摊 | — | 从 wrapped displacement 到网络输入张量之间的耗时 | 依赖 (d0-2) 最终特征选择，尚未定案 |
-| Student forward | 待预算内分摊 | — | 可训练网络本身前向传播耗时 | 无 student 代码 |
-| Autograd force | 待预算内分摊 | — | `torch.autograd.grad` 产生 `-∇R B_student` 的耗时 | 无 student 代码 |
-| TorchForce/OpenMM 调用开销 | 待预算内分摊 | — | 复用 `outer_lambda_neural_basis.py::benchmark_torchforce_outer_lambda`（WP-3 已有、已验证过 mock/analytic basis 的计时框架），不新造一套 | 已有可复用工具，不必新写 |
-| **合计每 MD 步** | PROPOSED：相对当前无 student 的生产步耗时增加 ≤15%；次要绝对参考 ≤5 ms/step（**PROVISIONAL**，未锚定真实基线） | PROPOSED：相对增加 ≤50%（淘汰门：D3 测得超过即停，不得默许进生产） | 端到端测量，嵌在真实 OpenMM 步循环里（对齐生产 `LangevinMiddleIntegrator` 2.0 fs，`ibs_engine.py:1622`），不是网络的独立 microbenchmark | **缺口**：尚未在这块 RTX 2080 Ti 上实测"当前无 student 的生产步耗时/ns-day"基线，相对目标换算成绝对 ms 数之前需要先补这一测——不是靠猜 |
-
-**4. 硬件基线**
-
-| Item | Value | Note |
-|---|---|---|
-| GPU | NVIDIA GeForce RTX 2080 Ti, 11264 MiB, driver 580.173.02 | 本 session `nvidia-smi` 确认 |
-| 软件栈 | torch 2.10.0 / OpenMM 8.5.1 / openmm-ml 1.6 / openmmtorch 1.5 / mace_torch 0.3.16 / mdtraj 1.11.1，均在 `openmm_dev`（`/home/ruigengji/mambaforge/envs/openmm_dev`） | 本 session `site-packages` 确认；`omm_torch_126`（torch 2.6.0 / OpenMM 8.2.0 / 有 NNPOps 但无 mdtraj）不是生产执行环境（`docs/handoffs/RESUME_DEXP_SESSION.md:93`，DEC-021/022/032/033 均在 `openmm_dev` 实测），若未来真用 NNPOps 后端必须单独重测，不得挪用这里的数字 |
-| Precision | 在线 student forward/backward 用 float32（对齐 DEC-029 teacher CUDA float32 C1）；funnel 直接在 CUDA float32 上执行，**不需要**教师那样的 CPU-float64-决定/GPU-执行拆分 | **已闭合（2026-08-05）**：`scripts/smoke_exp012_student_funnel_cuda_consistency.py`，report_sha256 `9671470e03e12029ae503f1a6f7b5fd31e193d51fc4fd5ede385fa93cfcf934b`。在 run1/frame0（1206 边）与本轮审计确认的真实最坏边数帧 run2/frame202（1464 边）上，CPU float64 与直接 CUDA float32 执行的 `ligand_environment_cross_edges` **edge set 完全一致**（`all_edge_sets_identical=true`），无一处 cutoff 边界分歧；共有 pair 的距离最大绝对差 `3.38e-6` Å、`quintic_c2_cutoff` 权重最大绝对差 `1.55e-6`，均为 float32 舍入量级，不是真实分歧。结论：funnel 不需要 DEC-032/033 Option C 那样的 CPU-float64-决定/GPU-执行拆分，可以直接在 CUDA float32 上跑 |
-| 积分步长 | 2.0 fs（`LangevinMiddleIntegrator`） | grep 确认，`ibs_engine.py:1622`，生产真实值，非提议 |
-| 体系原子数 | ≈73,536（对 `output_lrc_fix/topology.cif` 的 `ATOM`/`HETATM` 记录行数计数得到） | 近似值，未跑 `mdtraj.load(topology).n_atoms` 精确核实（遵循"不亲自跑"的既有约定）；DEC-039 冻结前应补一个精确值 |
-
-**5. Cutoff / 平滑权重语义**
-
-| Item | Value | Note |
-|---|---|---|
-| Support cutoff | 5.0 Å（DEC-038，`derived_5a`） | 已用真实数据验证，非本提案新增 |
-| 平滑权重族 | `quintic_c2_cutoff`，outer=5.0 Å；inner=4.0 Å | DEC-038 明确记录 `inner_cutoff=4.0Å` 只是 smoke 测试选择，不是已冻结的生产参数——本提案要么显式采纳这个值，要么现在提出别的值，不能继续隐式沿用 smoke 的选择 |
-| 成员资格与权重分层 | 硬性要求：离散 neighbor membership（图里有没有这条边）可以逐步变化；能量权重必须在原子离开图之前就已连续降到精确 `0.0`（DEC-038 已用真实边界扫描证实） | 违反此项（把离散 membership 直接当 0/1 能量门）在 d2 视为硬性失败；检查方法与 DEC-038 边界扫描同构，但作用对象是 student 实际能量输出，不只是权重函数本身 |
-
-**6. 训练预算与判决口径**
-
-| Item | Proposed target | Hard ceiling/gate | Measurement definition | Evidence/rationale |
-|---|---|---|---|---|
-| Outer 验证划分 | 沿用 DEC-034/035/037(第③项) 已冻结的 `hard_window0_run1/2/3` 三折 leave-one-run-out | 不得用单条轨迹内的随机分帧代替 | — | 帧内高度自相关，DEC-011 已因同一理由拒绝过单轨迹结论 |
-| 训练 seed 数 | PROPOSED：direct-gap 与 distilled 每种、每折 ≥3 个独立 seed | 硬下限 3 | 模型初始化 + minibatch 顺序均需不同 seed，不是重跑同一 seed | 对齐本项目已有的"至少 3 个独立重复"惯例（DEC-011、§14 完成定义第 8 条） |
-| 最大 epoch / 早停 | **PROPOSED — 需要用户给出具体数字，本仓库无先例可套** | 早停判据必须用该折被完全隔离的第三条 run，不得用从两条训练 run 里切出的随机验证集 | — | DEC-034 的 ridge readout 是闭式解（LBFGS 直接收敛到唯一全局最优），没有 epoch/早停概念可以直接借用；这是真正的新数字 |
-
-**7. D1 go/no-go**
-
-| Item | Proposed target | Hard ceiling/gate | Measurement definition | Evidence/rationale |
-|---|---|---|---|---|
-| 至少几折改善 | 目标：3/3（对齐 DEC-034/035 已登记的线性 readout 结果） | 硬下限：3 折中至少 2 折相对 `B=0` 有 gap-variance 下降 | 与 DEC-034/035 相同的 `bidirectional_gap_variance_loss`，只在该折被隔离的 run 上评估 | 2/3 提议为硬底线（对应 DEC-030(c) 最初的最低门槛，DEC-034/035 后来以 3/3 超额通过）；已登记的线性 readout 结果（3/3，均值 44.6%）是参考基准，不是对不同参数化模型的保证 |
-| 平均 gap-variance 下降幅度 | 目标：与已登记线性 readout 同量级（~44.6%） | 硬下限：均值 >0%（严格优于 `B=0`） | 3 折相对下降幅度的均值 | 线性 readout 直接读 teacher 缓存的 `pooled_latent`，是不同的函数族；student 用真实坐标现算特征——达到同量级是目标，不是保证 |
-| 最差单折容忍度 | 目标：无单折退化 | **PROPOSED** 硬门：最差单折相对 `B=0` 恶化不超过 10% | — | 防止"2 折很好、1 折严重崩坏"仅凭均值蒙混过关；具体阈值需用户确认 |
-| Distillation 相对 direct-gap 对照的增量 | **PROPOSED** 目标：held-out gap variance 相对下降再多 ≥10%（相对值） | 硬门：distilled 不得劣于 direct-gap 对照（劣于即视为 teacher target 起反作用，硬性失败） | 两个变体必须用同架构/同 seed/同数据划分训练（对齐 DEC-037 第③项必需对照），在同一被隔离的 run 上比较 | 落实 DEC-037 第③项"否则任何增益无法归因于 MACE teacher"；没有这个margin，即使数字表面更好也不能宣称"蒸馏有效" |
-
-**冻结 DEC-039 前必须先补齐的缺口（不是数值分歧，是缺失的测量）**：
-1. ~~单个 ligand atom 的最大 neighbor 数与 edges 上限~~ **已解决**（1500 帧真实审计，见上，
-   report_sha256 `782e58242233d3b2153e719dda7685d08f0e65e61f1dc35f4d6d33c114cf416f`）；
-2. ~~funnel 的 CPU float64 vs CUDA float32 一致性 smoke~~ **已解决**（见上，`all_edge_sets_identical=true`，report_sha256 `9671470e03e12029ae503f1a6f7b5fd31e193d51fc4fd5ede385fa93cfcf934b`）；
-3. 当前无 student 的生产每步耗时 / ns-day 基线——**根因已定位，等待重新测量**（DEC-039，
-   2026-08-05）：v1 report_sha256 `062c63b2b4dfa4e2939504766b5f7692164dbc05527335a5d02b44209e620a57`
-   （`1.3902/1.3961/1.3991 ms/step`，median `1.3961`、P95 `1.3988`）里
-   `win_sys_xml_sha256_matches_manifest=false` 的根因是 `output_lrc_fix/box_vectors.npy`
-   陈旧——它只在初次建系统缓存时写一次（`runabfe.py:880`/`1117`），真正建窗口 0 用的盒子
-   取自 `pipeline.box_vectors`，会在 `pre_equilibrate()` NPT 弛豫后（`abfe_pipeline.py:1915`/
-   `6294`/`6308`）与 Boresch rebalance 后（`abfe_pipeline.py:2195` → `runabfe.py:4420`）被
-   内存内重新赋值但从不写回磁盘；`output_lrc_fix/` 真实文件 mtime（`box_vectors.npy` 01:18 →
-   `rebalance.chk` 08:27 → `manifest.json` 09:08）佐证两者相差近 8 小时。窗口 0 生产
-   System 无 `MonteCarloBarostat`（v1 报告自带的 `force_groups` 已确认），故盒子一旦建窗口
-   即冻结，可以直接从已加载的 `openmm.chk` 读回真实盒子，不需要重放具体走了哪条 pipeline
-   分支。`reference_positions=None` 仍确认与此无关（只在
-   `not _has_valid_boresch_restraint(...)` 分支使用，`hard_window0` 的 Boresch 约束有效，
-   此分支本就不会执行）。`scripts/benchmark_exp012_no_student_window0_baseline.py` 已改为
-   两阶段构造（先用陈旧盒子建一次性 probe System/Context 去 `loadCheckpoint`，读回真实盒子，
-   再用它重建真正用于哈希校验和计时的 System），schema 升到 v2；**修复后的重新测量尚未
-   执行，在拿到 `win_sys_xml_sha256_matches_manifest=true` 的新报告前，这份 ms/step 数字
-   仍只作为参考量级，不计入本条已冻结的 DEC-039 生产基线**；
-4. 训练 epoch 数与早停判据的具体数字——**已解决**（DEC-039，2026-08-05）：改用训练 run
-   内部末尾 20% 连续时间块做早停验证集（不复用被完全隔离的第三条 run 兼职早停+最终评估，
-   避免乐观偏差），`max_epoch=500`、`early_stop_patience=30`、`seeds_per_variant_per_fold=3`；
-5. ~~体系精确原子数~~ **已解决**：同一份审计报告 `system_atom_count=73536`，与 grep 估计值精确吻合。
-
-- [x] Arm A/B/D 表示消融：**正式退役为 `not_pursued`**（DEC-039，§11A.12，
-  `EXPERIMENT_LOG_outer_lambda_neural_basis.md`）——三者从未实现任何代码，不是数值
-  跑输。预注册偏离已显式记录：`decision.arm_C_increment_comparisons=["C_vs_A","C_vs_B"]`
-  从未执行，实际只做了 `C vs B=0`（无残差项基线）对照，`B=0` 不是 Arm B。结论收窄为
-  "MACE latent 存在可泛化 gap-variance 信号、值得蒸馏"，不得声称 Arm C 优于 A/B；
-  该论文级结论需另立独立预注册对照实验，不阻塞 D1。Arm C 的 whole-run holdout 与
-  3 个 leave-one-run-out fold（教师侧线性 readout）已通过，`LocalResidualStudent`
-  自己的 ≥3 seed/变体训练在 D1 中执行。
+  sub-item 4 的 profiling 脚本自身的 graph-construction 计时函数曾是替换前旧逻辑的手写
+  镜像副本、未随 `student_deploy.py` 一起更新（测的是已废弃的旧代码），已修复为直接调用
+  真实方法；由于 §16 已把 `95%→50%` 的优化降级为可选工程目标，修复后的 profiling 脚本
+  重新定位新瓶颈不再是 D3/D4 前置条件，留作可选后续工作。详见 EXPERIMENT_LOG DEC-043。
+- [x] (d4) 动力学资格：短 NVT、稳定性，再做独立重复。**`PASSED`（DEC-044，
+  2026-08-07）**，详见第 7 节与 EXPERIMENT_LOG。
 - [ ] L1/L2 性能对照及 TorchScript/OpenMM Reference/CUDA、短 NVT 性能资格（L1 目前降级，
   不是当前下一步，见 DEC-030）。
 - [ ] WP-5A Atenolol 三重复体系内资格。
 - [ ] WP-5B 至少两个额外 ABFE 体系的同协议通用性验收。
 - [ ] RBFE 接口资格通过后，才考虑 TYK2/CDK2。
 
+每个子阶段失败即停，不得跳阶段推进到下一个。
+
 ## 14. 完成定义
 
-EXP-010 GPU 标注与候选拟合已完成。六个候选均不能优于 intercept-only 基线，且
-广义力方向/幅度不稳定，因此已按预注册规则记为 `FAILED`，不能直接进入 WP-5。
+(d3) 部署资格已于 2026-08-07（DEC-043）判定 `CLOSED`：cell-list 等价性单元测试通过，
+`.pow(2)`/`.square()` 假设已用真实数据证伪但不再追查根因，`reference_eager_vs_
+deployable_eager` 残差裁定为 `PASSED_OPERATIONAL_NUMERICAL_EQUIVALENCE`（理由见第 7
+节与 EXPERIMENT_LOG DEC-043，核心是该残差比已接受的 CPU64→CPU32/CPU32↔CUDA32 误差还
+小两个数量级，`1e-8` 绝对阈值本身未进入 sealed preregistration）。(d4) 短 NVT 动力学
+资格已于同日（DEC-044）首次执行即通过：student TorchForce 真实注入 `hard_window0`
+win_sys 并驱动 3 个独立种子重复的实际积分，全程有限值、student 力/温度均在 sanity
+门内。EXP-012 的 D0-D4 至此全部关闭。D4 只验证了"积分不会炸"，不验证"采样是否变好"，
+后者是 WP-5A 的职责——WP-5A step 1/2（接线 smoke、候选冻结）已通过（DEC-047），
+step 3（baseline/student 配对独立重复 pilot）已执行（DEC-048）：模型对 mixture ESS
+有真实正向信号（3/3 重复提升 10.7-27.8%），但 ESS/GPU-hour 判据不通过（当前部署
+成本涨幅补不上增益）。授权的一次部署性能救援（DEC-049，目标 `1.10×baseline`）经
+终局实验（DEC-050）判定结构性不可达，**单基势"每步在线"部署路线已正式关闭**（只
+关这一种部署模式，不代表否定模型本身或离线应用）。当前下一执行点是 **WP-4D /
+EXP-013**（低频在线 student，MTS/rRESPA，把 student 评价频率而非部署实现本身作为
+优化对象）。DEC-053 已确认方案③通过 013-A，但 DEC-055/056 已按预注册主门判定其
+013-B `FAILED`；方案③禁止进入 013-C。当前执行方案① whole fused Group-1 slow 的
+`N=1/2/4/8` 低成本预检，只有 Qualification gate 通过才考虑 N=16；方案① gate 未
+通过才进入方案②，
+再失败才转 EXP-014。WP-5B/6-8 仍全部阻塞，不直接推进。
+（本段为 EXP-013 启动前的历史计划；已由 DEC-059/DEC-060 及当前最终执行边界取代，不能据此重新启动 EXP-013 或 WP-5。）
 
-EXP-011 已在 AUG-001 后冻结：补采 500 帧均有限，但合并后 `127.5°` 状态只有 22 个
-去相关样本（门为 25），`112.5°↔127.5°` mutual overlap 为 `0.02353`（门为 `0.03`）。
-严格 v2 报告保持 `qualified_for_pmf_input=false`。不执行第二次补采，不启动
-formal_run2/3，不拟合 PMF，也不进入其 NVT、WP-5 或 production。
-
-三条 run 的逐帧五态 target ledger、backend audit 和 `local_residual` v2 语义迁移已经完成。
-当前下一执行点是冻结并 seal A/B/C/D 精确表示、MACE layer/图边界、(A_k)、readout、训练
-预算和数值门。随后先做 whole-run gap-variance 表示消融，再实现
-`MaceLatentBasisAdapter` 的可导在线路线和轻量 student 路线。未通过信息、守恒力、稳定性、
-ESS/GPU-hour 与跨 ABFE 通用性门前，不得修改 production 模块或宣称模型通用。
+EXP-010/EXP-011 已分别终止为 `FAILED`/`FORMAL_RUN1_OVERLAP_FAILED`，不再补采、不再
+拟合模型；完整历史见归档。未通过信息、守恒力、稳定性、ESS/GPU-hour 与跨 ABFE 通用性
+门前，不得修改 production 模块或宣称模型通用。
 
 只有同时满足以下条件，才可宣称方案在当前项目中“可实现并有效”：
 
@@ -1296,3 +996,32 @@ ESS/GPU-hour 与跨 ABFE 通用性门前，不得修改 production 模块或宣�
 8. 至少 3 个独立重复显示 ESS/GPU-hour 改善；
 9. 改善不能由简单 λ 重排完全替代；
 10. complex/solvent 完整循环与基础路径统计一致。
+
+## 16. 2026-08-07 规范性澄清：D3 性能不作为 D4 的单独阻塞门
+
+本节是当前有效规则，明确覆盖本文较早位置及 DEC-042 中把 `≤50%` 写成“冻结硬淘汰门”
+的措辞。核对 sealed `protocols/EXP-012_preregistration.json` 后确认：其中没有 `≤15%`、
+`≤50%`、per-step overhead 或同义的 deployment performance 数值门；旧预算表中的这些数字
+原本标为 `PROPOSED`，并未进入 sealed preregistration。因此不得把当前约 `95%` overhead
+解释为违反预注册硬门，也不得仅凭这一数字阻塞 D4。
+
+当前规则如下：
+
+1. `≤15%` 仅保留为工程优化目标；`≤50%` 仅保留为 preferred engineering ceiling，二者都
+   不是 D3 correctness gate，也不是进入 D4 的必要条件。
+2. 当前 cell-list 版本相对无 student production Context 的约 `95%` overhead 必须如实记录，
+   不得删除或美化；但其是否值得，只能由独立 production 重复中的 ESS/GPU-hour 判决。
+3. 最终性能硬门是：计入全部 wall-clock/GPU 成本后，student 路线的 ESS/GPU-hour 必须优于
+   基础路径。若约 1.95× 单步成本没有被足够的 ESS 增益补偿，才判该路线性能失败。
+4. D3 继续保留真正的正确性门：cell-list 与 canonical/brute-force funnel 的 edge、PBC shift、
+   energy、force 等价性；eager/TorchScript 与 CPU/CUDA 的 dtype-aware 一致性；TorchForce/
+   OpenMM 注入；端点严格归零；有限值与显存可运行性。这些门未通过仍不得进入 D4。
+5. `.square()` 修复后的真实数据重跑和新增 cell-list 单元测试属于必要 correctness regression，
+   必须完成；进一步 profiling 和把 overhead 从 95% 优化到 50% 以下是可选工程工作，不再是
+   D4 前置条件。
+6. 上述 correctness regression 全部通过后即可关闭 D3 并进入 D4 短 NVT；D4/WP-5A 才负责
+   测量稳定性、采样改善和最终 ESS/GPU-hour。不得再次以旧的 `≤50%` 文本单独停止推进。
+
+因此，§7/§13/§14 中“95% 高于 ≤50%，故 D3 未通过/不得进入 D4”的旧句均由本节取代；
+它们只保留为 DEC-042 当时的历史判断，不再是当前执行规则。D3 当前真正剩余的前置工作仅为：
+运行 cell-list 等价性单元测试，并在真实数据上重跑 `.square()` 后的 deployment 一致性检查。

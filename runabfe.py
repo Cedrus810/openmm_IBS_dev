@@ -60,6 +60,7 @@ from abfe_core import (
     load_gromacs_topology_for_openmm,  # **唯一**的拓扑加载入口
     GROMACS_PAIRS_FUNCT2_CONVERSION_VERSION,
     co_alchemical_ion_builder_identity_payload,
+    COION_COION_MIN_IMAGE_INITIAL_NM,  # §2.2 多个 reserved co-ion 彼此的安全边距
 )
 from abfe_pipeline import (
     ABFEPipeline, TraditionalABFEPipeline, _collect_pipeline_provenance, _pme_u_kn_meta_payload,
@@ -1072,11 +1073,21 @@ def _insert_reserved_coalchemical_ion_dummies(
     离子集合里、且电荷严格为 0，坐标无关）。这里造出来的粒子电荷仍是模板给的
     ±1，调用方必须在 `createSystem()` 之后显式清零。
 
-    放置策略（§4.4 "初始位置远离配体且不与周期镜像过近"）：摘掉离配体质心
-    minimum-image 距离最远的 `count` 个水分子，把 dummy 放在被摘掉的氧原子
-    原来的位置——零额外体积冲突，且"越远的水优先被选中"天然满足安全边距。
-    是否真的够远由下游 `abfe_core.validate_co_alchemical_ion_placement`
-    （strict=True）兜底 fail closed，这里不重复判一遍阈值。
+    放置策略（§4.4 "初始位置远离配体且不与周期镜像过近"）：贪心 farthest-first
+    地摘水分子——按离配体质心 minimum-image 距离从远到近扫描候选，但跳过与
+    **已选中**的 dummy 距离不够 `COION_COION_MIN_IMAGE_INITIAL_NM` 的候选，
+    把 dummy 放在被摘掉的氧原子原来的位置。零额外体积冲突，且"越远的水优先
+    被选中"天然满足配体↔dummy 的安全边距；是否真的够远由下游
+    `abfe_core.validate_co_alchemical_ion_placement`（strict=True）兜底 fail
+    closed，这里不重复判一遍阈值。
+
+    ⚠️ `count > 1` 时（§2.2 多价配体分摊成多个单价 co-ion）不能只按"离配体最远"
+    独立给每个候选打分——方盒里"离配体质心最远的 N 个点"天然会挤在同一个远角，
+    2026-08-06 用 Ca²⁺(+2) 实测踩到过：两个 dummy 只相距 0.18~0.43 nm，λ→0 时
+    两者同号各带 +1e，几乎贴脸的静电排斥直接把 charging MBAR 拖到不收敛
+    （ΔG≈660 kJ/mol，min_overlap<0.02）。所以选点时额外要求任意两个已选 dummy
+    之间也满足这个下限，找不满 `count` 个就 fail closed（不静默退化成"离得近也
+    凑合用"）。
 
     ⚠️ 先一次性摘完全部选中的水、再一次性加入全部 dummy——不要在循环里交替
     delete/add：`Modeller.delete()` 会重新编号拓扑，交替做会让本函数早先加入的
@@ -1099,11 +1110,17 @@ def _insert_reserved_coalchemical_ion_dummies(
     inv_box = np.linalg.inv(box_nm)
     lig_centroid_nm = pos_nm[list(ligand_atom_indices)].mean(axis=0)
 
-    def _mic_distance(p: np.ndarray) -> float:
-        delta = p - lig_centroid_nm
+    def _mic_delta(p: np.ndarray, q: np.ndarray) -> np.ndarray:
+        delta = p - q
         frac = delta @ inv_box
         frac -= np.round(frac)
-        return float(np.linalg.norm(frac @ box_nm))
+        return frac @ box_nm
+
+    def _mic_distance(p: np.ndarray) -> float:
+        return float(np.linalg.norm(_mic_delta(p, lig_centroid_nm)))
+
+    def _mic_distance_between(p: np.ndarray, q: np.ndarray) -> float:
+        return float(np.linalg.norm(_mic_delta(p, q)))
 
     water_residues = [
         res for res in modeller.topology.residues() if res.name in ("HOH", "WAT")
@@ -1123,8 +1140,35 @@ def _insert_reserved_coalchemical_ion_dummies(
         )
         scored.append((_mic_distance(pos_nm[o_atom.index]), o_atom.index))
     scored.sort(key=lambda item: item[0], reverse=True)
-    chosen_oxygen_indices = [idx for _dist, idx in scored[:count]]
-    chosen_positions_nm = [pos_nm[idx].copy() for idx in chosen_oxygen_indices]
+
+    # [§2.2/§4.4，2026-08-06] 只按"离配体最远"独立给每个 dummy 打分，在 |q_L|≥2
+    # 时会踩坑：方盒里"离配体质心最远的 N 个点"天然会挤在同一个远角——Ca²⁺(+2)
+    # 实测两个 dummy 只相距 0.18~0.43 nm，λ→0 时两者同号各带 +1e，近乎贴脸的
+    # 静电排斥直接把 charging MBAR 拖到不收敛。这里改成贪心farthest-first选取：
+    # 仍然优先摘离配体最远的水，但跳过与**已选中**的 dummy 距离不够的候选，
+    # 保证任意两个 dummy 之间也留够 `COION_COION_MIN_IMAGE_INITIAL_NM` 的安全边距。
+    chosen_oxygen_indices: List[int] = []
+    chosen_positions_nm: List[np.ndarray] = []
+    for _dist, idx in scored:
+        if len(chosen_oxygen_indices) == count:
+            break
+        candidate_pos = pos_nm[idx]
+        if all(
+            _mic_distance_between(candidate_pos, p) >= COION_COION_MIN_IMAGE_INITIAL_NM
+            for p in chosen_positions_nm
+        ):
+            chosen_oxygen_indices.append(idx)
+            chosen_positions_nm.append(candidate_pos.copy())
+
+    if len(chosen_oxygen_indices) < count:
+        raise RuntimeError(
+            f"在这个盒子里找不到 {count} 个彼此 minimum-image 距离 ≥ "
+            f"{COION_COION_MIN_IMAGE_INITIAL_NM} nm 的候选水分子来放 reserved "
+            f"co-ion dummy（§2.2：多个 dummy 之间也必须留够安全边距，否则它们在 "
+            "λ→0 同号带电时会彼此靠得太近、产生非物理静电排斥）。只找到 "
+            f"{len(chosen_oxygen_indices)} 个满足条件的候选，考虑加大 padding_nm/"
+            "盒子。"
+        )
 
     # 摘掉这些水分子（连同它们的 H）——按 residue 删，不是按单个原子删。
     index_to_residue = {
@@ -1413,7 +1457,7 @@ def build_and_cache_solvent_leg(
     ordinary_na_count = int(na_count - reserved_na_count)
     ordinary_cl_count = int(cl_count - reserved_cl_count)
     if ionic_strength_molar > 0.0 and (
-        ordinary_na_count == 0 or ordinary_cl_count == 0
+        ordinary_na_count <= 0 or ordinary_cl_count <= 0
     ):
         log.error(
             "❌ 请求 %.3f M NaCl，但生成拓扑中普通盐离子计数异常: "
@@ -1458,10 +1502,9 @@ def build_and_cache_solvent_leg(
                 "ordinary_na_count": ordinary_na_count,
                 "ordinary_cl_count": ordinary_cl_count,
                 # [B4，§4.3/§4.5] 三类电荷来源不能混算：na_count/cl_count 是
-                # "配体形式电荷/普通离子" 那一类的残基名总数（也包含下面这些
-                # reserved dummy，因为它们复用同一个残基名模板）；
-                # reserved_coion_* 才是 alchemical co-ion 的账目，不能把
-                # dummy 错算成普通盐浓度。
+                # 残基名总数（也包含下面这些 reserved dummy，因为它们复用同一个
+                # 残基名模板）；ordinary_* 才是物理 NaCl 计数，reserved_coion_*
+                # 是 alchemical co-ion 账目，不能把 dummy 错算成普通盐浓度。
                 "charge_treatment": charge_treatment,
                 "reserved_coion_ligand_net_charge_e": int(
                     reserved_coion_ligand_net_charge_e
@@ -2196,8 +2239,9 @@ def _write_run_provenance(
         # Keep it only as an explicitly deprecated audit record so old readers
         # can see what was supplied, but never let resume/provenance consumers
         # treat it as the spec actually used by either leg.
-        provenance["deprecated_global_co_alchemical_ion_input"] = charge_protocol.get(
-            "co_alchemical_ion"
+        provenance["deprecated_global_co_alchemical_ion_input"] = config.get(
+            "co_alchemical_ion",
+            charge_protocol.get("co_alchemical_ion"),
         )
         provenance["coion_identity"] = None
         provenance["coion_identity_deprecated"] = True
@@ -2979,7 +3023,10 @@ def parse_arguments():
     parser.add_argument(
         "--co-alchemical-ion",
         default=None,
-        help="co-alchemical ion 身份/参数/restraint 的 JSON 文件路径（§3.4 字段）",
+        help=(
+            "[deprecated] 旧版全局 co-ion spec；不参与实际运行。"
+            "B5 会为 complex/solvent 各自冻结并验证身份。"
+        ),
     )
     parser.add_argument(
         "--apbs-evidence",

@@ -121,6 +121,24 @@ def test_build_stage_cache_payload_persists_convergence_evidence():
     assert payload["coverage_diagnostics"]["dropped_window_indices"] == [3]
 
 
+def test_vdw_protocol_version_is_written_only_to_stage2_cache_payload():
+    from abfe_pipeline import ABFEPipeline
+    from ibs_engine import VDW_NONBONDED_PROTOCOL_VERSION
+
+    result = {
+        "total_delta_G": 1.0, "total_error": 0.1,
+        "converged": True, "coverage_diagnostics": {},
+    }
+    stage2 = ABFEPipeline._build_stage_cache_payload(
+        "vanishing", result, 2, {}, [1.0, 0.0], [(0, 2)]
+    )
+    stage1 = ABFEPipeline._build_stage_cache_payload(
+        "decharging", result, 2, {}, [1.0, 0.0], [(0, 2)]
+    )
+    assert stage2["vdw_nonbonded_protocol_version"] == VDW_NONBONDED_PROTOCOL_VERSION
+    assert "vdw_nonbonded_protocol_version" not in stage1
+
+
 def _pipeline_without_init():
     from abfe_pipeline import ABFEPipeline
 

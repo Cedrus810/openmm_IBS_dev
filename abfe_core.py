@@ -83,6 +83,14 @@ DEXP_VDW_SWITCH_WIDTH_NM = 0.20
 GAUSS_COUL_SIGMA_NM = 0.10
 GAUSS_COUL_CUTOFF_NM = 0.70
 
+# [MEM-00h，2026-08-06] 传统 Beutler REMD 路径（BeutlerSoftcoreBuilder）的
+# softcore cutoff——必须与 `ibs_engine.SOFTCORE_CUTOFF_NM` 一致（同一次决策：
+# 统一到基础 NonbondedForce 的 1.0 nm、关闭 switching，不是拉长到 1.2）。
+# abfe_core 在 ibs_engine 的下层不能反向 import，所以由
+# tests/test_dispersion_and_forcefield_protocol.py 的交叉检查测试钉住，防止
+# 两处各改一半。
+BEUTLER_SOFTCORE_CUTOFF_NM = 1.0
+
 # Retired global Orb-fit payloads must never be silently interpreted as the
 # pair-specific LJ-matched production Hamiltonian.
 DEXP_LEGACY_FIT_KEYS = frozenset(
@@ -727,7 +735,9 @@ def resolve_charge_treatment(
                     "本路线只允许用于水盒 / lipid slab 的方法对照（§8.1/§8.2 末条）。"
                 )
         else:
-            # fail-closed #3：charge-transfer 缺 co-ion 身份/参数/restraint。
+            # B5：前置解析不再依赖一个全局 atom-index spec；真正的
+            # co-ion 身份/参数/restraint 会在每条 pipeline 冻结后由 runtime
+            # verifier fail closed。显式 override 仍可在这里做兼容性校验。
             if require_co_alchemical_ion and co_alchemical_ion is None:
                 raise ValueError(
                     "charge_treatment=co_alchemical_charge_transfer 但没有提供 "
@@ -1839,14 +1849,28 @@ reserved_coion_builder_identity_payload = co_alchemical_ion_builder_identity_pay
 # 这里就是那份常量表；数值取 §13 的提案值，可改，但改必须改这里、且会进 provenance。
 # ============================================================================
 
-ACCEPTANCE_THRESHOLDS_VERSION = 1
+ACCEPTANCE_THRESHOLDS_VERSION = 2
 
 # ---- §13.1 co-ion 几何 ----
 COION_LIGAND_MIN_IMAGE_INITIAL_NM = 1.6
-# 全程下限取 softcore cutoff。⚠️ 这个值必须与 `ibs_engine.SOFTCORE_CUTOFF_NM` 一致；
-# abfe_core 在 ibs_engine 的下层不能反向 import，所以由
-# tests/test_acceptance_thresholds.py 的交叉检查测试钉住，防止两处各改一半。
+# [MEM-00h，2026-08-06 复核后拍板] 这个值**不再**要求等于
+# `ibs_engine.SOFTCORE_CUTOFF_NM`——早先的注释/交叉检查测试把它当成 softcore
+# cutoff 的派生量，但用户明确决定两者解耦：这是一条独立的、保守的几何安全
+# 门（防止 co-ion 在动力学里游到离配体太近的地方），不是"必须等于 softcore
+# cutoff 才有意义"的量。softcore cutoff 这次统一收敛到 1.0 nm（见
+# ibs_engine.SOFTCORE_CUTOFF_NM），但这条门槛保持 1.2 nm 不变——没必要为了
+# 那次 cutoff 收敛顺带把这里也降到 1.0，1.2 本来就更保守。
+# 见 tests/test_dispersion_and_forcefield_protocol.py 里的对应测试
+# （已改成断言"独立常量、不要求相等"，不再断言相等）。
 COION_LIGAND_MIN_IMAGE_RUNTIME_NM = 1.2
+# §2.2 多个单价 co-ion 分摊（|q_L| ≥ 2）：这些 dummy 彼此之间也必须留够安全边距。
+# 2026-08-06 用 Ca²⁺(+2) 在真实水盒里第一次测这条路径就抓到：
+# `runabfe._insert_reserved_coalchemical_ion_dummies` 原来只按"离配体质心最远"
+# 独立给每个 dummy 打分，方盒里"离中心最远的 N 个点"天然会挤在同一个远角——
+# 实测两个 dummy 相距 0.18~0.43 nm，λ→0 时两者同号各带 +1e，几乎贴脸的静电
+# 排斥直接把 charging MBAR 拖到不收敛（ΔG≈660 kJ/mol，min_overlap<0.02）。
+# 阈值取与 COION_LIGAND_MIN_IMAGE_INITIAL_NM 相同量级，不是拍脑袋另设一档。
+COION_COION_MIN_IMAGE_INITIAL_NM = 1.6
 COION_PROTEIN_HEAVY_ATOM_MIN_NM = 1.2
 COION_MEMBRANE_MIDPLANE_MIN_ABS_Z_NM = 3.0
 COION_NEAREST_PHOSPHORUS_MIN_NM = 1.0
@@ -1958,6 +1982,7 @@ def acceptance_thresholds_payload() -> Dict[str, Any]:
         "coion_geometry": {
             "ligand_min_image_initial_nm": COION_LIGAND_MIN_IMAGE_INITIAL_NM,
             "ligand_min_image_runtime_nm": COION_LIGAND_MIN_IMAGE_RUNTIME_NM,
+            "coion_coion_min_image_initial_nm": COION_COION_MIN_IMAGE_INITIAL_NM,
             "protein_heavy_atom_min_nm": COION_PROTEIN_HEAVY_ATOM_MIN_NM,
             "membrane_midplane_min_abs_z_nm": COION_MEMBRANE_MIDPLANE_MIN_ABS_Z_NM,
             "nearest_phosphorus_min_nm": COION_NEAREST_PHOSPHORUS_MIN_NM,
@@ -6169,9 +6194,14 @@ class BeutlerSoftcoreBuilder:
 
         sc_force.addInteractionGroup(set(ligand_indices), set(env_indices))
         sc_force.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
-        sc_force.setCutoffDistance(1.2 * unit.nanometer)
-        sc_force.setUseSwitchingFunction(True)
-        sc_force.setSwitchingDistance(1.0 * unit.nanometer)
+        # [MEM-00h，2026-08-06] 统一到基础力场的 1.0 nm、无 switching——理由见
+        # BEUTLER_SOFTCORE_CUTOFF_NM 定义处。switchingDistance 仍显式设成等于
+        # cutoff（而不是干脆不调用）：保持跟 ibs_engine._create_softcore_force
+        # 同样的写法，任何读 getSwitchingDistance() 的下游代码都不会读到一个
+        # 语义不明的哨兵值。
+        sc_force.setCutoffDistance(BEUTLER_SOFTCORE_CUTOFF_NM * unit.nanometer)
+        sc_force.setUseSwitchingFunction(False)
+        sc_force.setSwitchingDistance(BEUTLER_SOFTCORE_CUTOFF_NM * unit.nanometer)
 
         for i in range(nb_force.getNumExceptions()):
             p1, p2, _, _, _ = nb_force.getExceptionParameters(i)
@@ -9506,8 +9536,11 @@ class UnitFormatter:
         # 2. 构建标准嵌套输出 (严格带单位后缀)
         return {
             "boresch_anchors": {
-                "receptor_indices": rec_idx,
-                "ligand_indices": lig_idx,
+                # Anchor indices may originate from OpenMM/NumPy arrays.  Cast
+                # them here so the formatter's documented JSON output is
+                # directly serializable even before the final write boundary.
+                "receptor_indices": [int(i) for i in rec_idx],
+                "ligand_indices": [int(i) for i in lig_idx],
                 "equilibrium_values": {
                     "r0_nm": float(eq.get("r0", 0)),
                     "thetaA0_rad": float(eq.get("thetaA0", 0)),
@@ -9681,7 +9714,11 @@ def create_ligand_internal_force(
 
     ll_force.addInteractionGroup(perturbed_set, perturbed_set)
     ll_force.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
-    ll_force.setCutoffDistance(1.2 * unit.nanometer)
+    # [MEM-00h，2026-08-06] 统一到基础力场的 1.0 nm、无 switching——理由见
+    # BEUTLER_SOFTCORE_CUTOFF_NM 定义处；这个力此前用的是跟 softcore CV 一样的
+    # 1.2nm+switch，跟基础 NonbondedForce 的 1.0nm 不一致，是同一个 MEM-00h
+    # 存量问题的一部分。
+    ll_force.setCutoffDistance(BEUTLER_SOFTCORE_CUTOFF_NM * unit.nanometer)
     ll_force.setUseLongRangeCorrection(False)
 
     # ========================================================================
@@ -9762,8 +9799,8 @@ def create_ligand_internal_force(
                 eps.value_in_unit(unit.kilojoule_per_mole)
             ])
 
-    ll_force.setUseSwitchingFunction(True)
-    ll_force.setSwitchingDistance(1.0 * unit.nanometer)
+    ll_force.setUseSwitchingFunction(False)
+    ll_force.setSwitchingDistance(BEUTLER_SOFTCORE_CUTOFF_NM * unit.nanometer)
     return ll_force, ll_14_force
 
 # ============================================================================

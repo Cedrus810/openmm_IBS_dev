@@ -72,6 +72,7 @@ from ibs_engine import (
     WCA_ACCOUNTING_VERSION,
     IBS_BIAS_PROTOCOL_VERSION,
     TRADITIONAL_LJ_LRC_PROTOCOL_VERSION,
+    VDW_NONBONDED_PROTOCOL_VERSION,
     FROZEN_VALIDATION_LADDER_SCHEDULE_STEPS,
     IBSWarmupConvergenceError,
     IBSFrozenCalibrationValidationError,
@@ -163,6 +164,16 @@ MEMBRANE_EQUILIBRATION_MONITOR_INTERVAL = 5000
 MEMBRANE_POST_MINIMIZATION_MAX_FORCE_KJ_PER_MOL_NM = 1.0e6
 
 logger = logging.getLogger(__name__)
+
+# 预优化协议版本只在探针 Hamiltonian、有限差分测量或路径优化算法发生
+# 物理变化时递增。它不是 Python 源文件的 hash：在 abfe_core.py 增加与
+# 预优化无关的 cache/provenance helper 不应让数小时级 pilot 失效。
+PREOPT_HAMILTONIAN_PROTOCOL_VERSION = 1
+GEODESIC_PATH_PROTOCOL_VERSION = 1
+# The co-ion-aware pilot changed the charged probe Hamiltonian (native B3
+# offsets/restraint plus PME in the pilot energy group).  Keep this version
+# separate so neutral Atenolol preopt/geodesic caches remain reusable.
+COION_PREOPT_HAMILTONIAN_PROTOCOL_VERSION = 1
 
 
 def _stage_lambda_endpoint_diagnostics(
@@ -556,7 +567,7 @@ _DEBUG_CODE_HASH_WARNED = False
 
 def _debug_code_hash_frozen() -> Optional[str]:
     """开发/调试专用逃生舱：设置环境变量 ABFE_DEBUG_FREEZE_CODE_HASH=1 时，
-    `_code_hash()`/`_preopt_code_hash()` 都返回同一个固定常量，而不是真的
+    `_code_hash()` 返回固定常量，而不是真的
     读盘算哈希——这样反复修改 abfe_pipeline.py/ibs_engine.py 等文件本身
     （调试修复循环/收敛逻辑时几乎每轮都要改代码）不会连带让 stage 完成
     缓存/fixed-H 探针缓存/IBS 状态/λ 路径预优化缓存全部失效重算。
@@ -577,9 +588,9 @@ def _debug_code_hash_frozen() -> Optional[str]:
         return None
     if not _DEBUG_CODE_HASH_WARNED:
         print(
-            "  🚨 [DEBUG] ABFE_DEBUG_FREEZE_CODE_HASH=1：code_sha256/preopt_code_sha256 "
-            "已冻结为固定常量，不反映当前磁盘上的代码改动——仅供调试收敛逻辑时使用，"
-            "正式出结果前必须取消设置这个环境变量并至少完整跑一次真正的哈希校验。"
+            "  🚨 [DEBUG] ABFE_DEBUG_FREEZE_CODE_HASH=1：code_sha256 已冻结为固定常量，"
+            "不反映当前磁盘上的代码改动——仅供调试收敛逻辑时使用，正式出结果前必须"
+            "取消设置这个环境变量并至少完整跑一次真正的哈希校验。"
         )
         _DEBUG_CODE_HASH_WARNED = True
     return "DEBUG_CODE_HASH_FROZEN_ABFE_DEBUG_FREEZE_CODE_HASH"
@@ -616,48 +627,6 @@ def _code_hash() -> str:
             payload[name] = None
     _CODE_HASH_CACHE = _sha256_text(json.dumps(payload, sort_keys=True))
     return _CODE_HASH_CACHE
-
-
-_PREOPT_CODE_HASH_CACHE: Optional[str] = None
-
-
-def _preopt_code_hash() -> str:
-    """λ 路径预优化（thermodynamic-length 逐点扫描）专用的、范围更窄的代码指纹。
-
-    🔑 [预优化被无关 bug 修复连带失效] `_code_hash()` 把 abfe_pipeline.py/
-    abfe_core.py/ibs_engine.py/abfe_preoptimizer.py 四个文件哈希成一个整体，
-    任何一处改动（哪怕只是修 ibs_engine.py 里窗口修复循环/reseed_resample
-    续采这类跟预优化完全无关的 bug）都会让它变化，进而让 _stage_protocol_key
-    里嵌的 code_sha256 跟着变，连带把 Stage 1/Stage 2 那份跑一次要几个小时的
-    λ 路径预优化缓存也判定失效、逼着重新跑一遍——预优化（
-    optimize_stage1_decharging/optimize_stage2_vanishing，见 abfe_preoptimizer.py）
-    只是在探针 Context 上测 dU/dλ 的方差来定 λ 路径，完全不涉及 IBS bias/f_k/
-    窗口修复循环，本不该被这些代码的改动连带作废。这里只哈希预优化真正会
-    执行到的代码：abfe_preoptimizer.py 本身，以及它复用的力场/软核势构建代码
-    abfe_core.py（AlchemicalPotentialFactory/ensure_owned_system/
-    create_ligand_internal_force/sync_all_exclusions，见 abfe_preoptimizer.py
-    顶部 import）——不包含 abfe_pipeline.py/ibs_engine.py，所以修复窗口管理/
-    修复循环/production checkpoint 续采这类 bug 不会再连带让预优化缓存失效。
-    如果将来预优化本身用到的代码（这两个文件）真的改了，这份指纹会正确
-    变化，缓存依然会失效重算——收窄范围不等于放弃校验。
-    """
-    debug_frozen = _debug_code_hash_frozen()
-    if debug_frozen is not None:
-        return debug_frozen
-    global _PREOPT_CODE_HASH_CACHE
-    if _PREOPT_CODE_HASH_CACHE is not None:
-        return _PREOPT_CODE_HASH_CACHE
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    payload = {}
-    for name in ("abfe_preoptimizer.py", "abfe_core.py"):
-        path = os.path.join(base_dir, name)
-        try:
-            with open(path, "rb") as handle:
-                payload[name] = hashlib.sha256(handle.read()).hexdigest()
-        except OSError:
-            payload[name] = None
-    _PREOPT_CODE_HASH_CACHE = _sha256_text(json.dumps(payload, sort_keys=True))
-    return _PREOPT_CODE_HASH_CACHE
 
 
 PROTOCOL_FINGERPRINT_SCHEMA_VERSION = 1
@@ -723,6 +692,108 @@ def _protocol_fingerprint(payload: Dict) -> Dict:
         # being an opaque hash-only cache miss.
         "payload": canonical,
     }
+
+
+_PREOPT_EQ_KEYS = (
+    "r0", "thetaA0", "thetaB0", "phiA0", "phiB0", "phiC0",
+)
+_PREOPT_FC_KEYS = (
+    "kr", "kthetaA", "kthetaB", "kphiA", "kphiB", "kphiC",
+)
+_PREOPT_EQ_ALIASES = {
+    **{key: key for key in _PREOPT_EQ_KEYS},
+    "r0_nm": "r0",
+    "thetaA0_rad": "thetaA0",
+    "thetaB0_rad": "thetaB0",
+    "phiA0_rad": "phiA0",
+    "phiB0_rad": "phiB0",
+    "phiC0_rad": "phiC0",
+}
+_PREOPT_FC_ALIASES = {
+    **{key: key for key in _PREOPT_FC_KEYS},
+    "kr_kJ_mol_nm2": "kr",
+    "kthetaA_kJ_mol_rad2": "kthetaA",
+    "kthetaB_kJ_mol_rad2": "kthetaB",
+    "kphiA_kJ_mol_rad2": "kphiA",
+    "kphiB_kJ_mol_rad2": "kphiB",
+    "kphiC_kJ_mol_rad2": "kphiC",
+}
+
+
+def _preopt_boresch_protocol_payload(boresch_params: Optional[Dict]) -> Optional[Dict]:
+    """Return only Boresch fields that can identify the restraint Hamiltonian.
+
+    Diagnostics, scores, provenance and timestamps are deliberately excluded:
+    changing an explanation of the same restraint must not rerun λ pilot scans.
+    """
+    if not isinstance(boresch_params, dict):
+        return None
+    anchors = boresch_params.get("boresch_anchors", boresch_params)
+    if not isinstance(anchors, dict):
+        return None
+
+    rec_idx = anchors.get("receptor_indices") or boresch_params.get(
+        "receptor_indices", []
+    )
+    lig_idx = anchors.get("ligand_indices") or boresch_params.get(
+        "ligand_indices", []
+    )
+    eq = anchors.get("equilibrium_values") or boresch_params.get(
+        "equilibrium_values", {}
+    )
+    fc = anchors.get("force_constants") or boresch_params.get(
+        "force_constants", {}
+    )
+    if not isinstance(eq, dict) or not isinstance(fc, dict):
+        return None
+
+    def _normalize(source, aliases):
+        result = {}
+        for raw_key, value in source.items():
+            key = aliases.get(str(raw_key))
+            if key is not None and key not in result:
+                result[key] = value
+        return result
+
+    payload = {
+        "receptor_indices": [int(i) for i in rec_idx],
+        "ligand_indices": [int(i) for i in lig_idx],
+        "equilibrium_values": _normalize(eq, _PREOPT_EQ_ALIASES),
+        "force_constants": _normalize(fc, _PREOPT_FC_ALIASES),
+    }
+    if not any(payload[key] for key in (
+        "receptor_indices", "ligand_indices", "equilibrium_values", "force_constants"
+    )):
+        return None
+    return payload
+
+
+def _protocol_key_differences(cached_protocol: Optional[Dict], current_protocol: Dict) -> List[str]:
+    """Return concise, recursive field differences for cache diagnostics."""
+    missing = object()
+    old = cached_protocol.get("payload") if isinstance(cached_protocol, dict) else None
+    new = current_protocol.get("payload") if isinstance(current_protocol, dict) else None
+    if not isinstance(old, dict) or not isinstance(new, dict):
+        return ["protocol payload: <missing or invalid> -> current fingerprint"]
+
+    differences: List[str] = []
+
+    def _walk(path: str, left, right):
+        if isinstance(left, dict) and isinstance(right, dict):
+            for key in sorted(set(left) | set(right), key=str):
+                _walk(
+                    f"{path}.{key}" if path else str(key),
+                    left.get(key, missing),
+                    right.get(key, missing),
+                )
+            return
+        if left is missing or right is missing or left != right:
+            left_text = "<missing>" if left is missing else repr(left)
+            right_text = "<missing>" if right is missing else repr(right)
+            differences.append(f"{path}: {left_text} -> {right_text}")
+
+    _walk("", old, new)
+    return differences
 
 
 def _package_version(package_name: str) -> Optional[str]:
@@ -1462,6 +1533,12 @@ class ABFEPipeline:
     ) -> Optional[Dict[str, Any]]:
         """Resolve and cache this leg's minimal B5 runtime identity once."""
         if hasattr(self, "_coion_runtime_identity_cache"):
+            cached_leg = getattr(self, "_coion_expected_leg", None)
+            if cached_leg is not None and str(cached_leg) != str(leg):
+                raise ValueError(
+                    "co-ion runtime identity 已绑定另一条腿，不能跨腿复用："
+                    f"cached_leg={cached_leg!r}, requested_leg={leg!r}"
+                )
             return self._coion_runtime_identity_cache
         # The leg marker is diagnostic metadata (excluded from the canonical
         # fingerprint) but is required to prevent a complex spec being copied
@@ -2783,7 +2860,23 @@ class ABFEPipeline:
                 ),
             }
         
-        probe_sys = build_aces_probe_system_dual_lambda(self.system, self.ligand_indices, softcore_obj, fixed_lam_coul=0.0, fixed_lam_vdw=1.0)
+        # Stage-2 pilot must consume the same frozen co-ion Hamiltonian as
+        # production.  Resolve once here; the resolver is read-only after the
+        # per-leg spec has been frozen by run_full_pipeline.
+        coion_spec = None
+        if getattr(self, "charge_treatment", None):
+            coion_spec = self.resolve_co_alchemical_ion_spec()
+        probe_sys = build_aces_probe_system_dual_lambda(
+            self.system,
+            self.ligand_indices,
+            softcore_obj,
+            fixed_lam_coul=0.0,
+            fixed_lam_vdw=1.0,
+            topology=self.topology,
+            positions=self.positions,
+            box_vectors=self.box_vectors,
+            co_alchemical_ion_spec=coion_spec,
+        )
 
         integrator = openmm.LangevinMiddleIntegrator(self.temperature, 1.0 / unit.picosecond, 0.002 * unit.picosecond)
         try:
@@ -3031,6 +3124,19 @@ class ABFEPipeline:
                 coion_identity=getattr(self, "_coion_runtime_identity", None),
                 max_resident_contexts=remd_max_resident_contexts,
             )
+            expected_frames = max(1, _expected_remd_frame_count(n_steps_per_window))
+            sampling_cache_ok = bool(
+                resume
+                and _remd_sampling_metadata_matches(
+                    stage_output_dir, stage_name, sampling_fingerprint
+                )
+                and _all_remd_trajs_valid(
+                    stage_output_dir,
+                    stage_name,
+                    len(lambdas_coul),
+                    min_frames=expected_frames,
+                )
+            )
             if resume and os.path.exists(u_kn_path) and _is_pme_u_kn_cache_compatible(
                 stage_output_dir,
                 stage_name,
@@ -3043,7 +3149,7 @@ class ABFEPipeline:
                 self.ligand_indices,
                 boresch_params,
                 coion_identity=getattr(self, "_coion_runtime_identity", None),
-            ):
+            ) and sampling_cache_ok:
                 self._log("  ♻️ 检测到已有 PME u_kn，跳过 REMD 采样与重算，直接求解 MBAR")
                 u_kn = np.load(u_kn_path)
                 analyzer = TraditionalMBARAnalyzer(temperature=temp_k)
@@ -3083,21 +3189,27 @@ class ABFEPipeline:
                     "diagnostics": res.get("diagnostics", {}),
                 }
             elif resume and os.path.exists(u_kn_path):
-                self._log("  ♻️ 检测到旧版 PME u_kn 缓存，但模型版本不兼容；保留轨迹并重新执行离线 MBAR 重算。")
-
-            expected_frames = max(1, _expected_remd_frame_count(n_steps_per_window))
-            if (
-                resume
-                and _remd_sampling_metadata_matches(
-                    stage_output_dir, stage_name, sampling_fingerprint
-                )
-                and _all_remd_trajs_valid(
+                if _is_pme_u_kn_cache_compatible(
                     stage_output_dir,
                     stage_name,
-                    len(lambdas_coul),
-                    min_frames=expected_frames,
-                )
-            ):
+                    n_states,
+                    lambdas_coul,
+                    lambdas_vdw,
+                    temp_k,
+                    self.system,
+                    self.topology,
+                    self.ligand_indices,
+                    boresch_params,
+                    coion_identity=getattr(self, "_coion_runtime_identity", None),
+                ) and not sampling_cache_ok:
+                    self._log(
+                        "  ⚠️ PME u_kn 虽匹配当前 Hamiltonian，但 REMD sampling "
+                        "fingerprint 缺失/不匹配；拒绝跳过 REMD，重新采样并重算。"
+                    )
+                else:
+                    self._log("  ♻️ 检测到旧版 PME u_kn 缓存，但模型版本不兼容；保留轨迹并重新执行离线 MBAR 重算。")
+
+            if sampling_cache_ok:
                 self._log("  ♻️ 检测到完整 REMD DCD，视为采样已完成，跳过 REMD 继续离线 MBAR")
             else:
                 if resume and _all_remd_trajs_valid(
@@ -3695,6 +3807,16 @@ class ABFEPipeline:
             platform_name=self.platform_name,
             coion_identity=getattr(self, "_coion_runtime_identity", None),
         )
+        expected_frames = max(1, _expected_remd_frame_count(n_steps_per_window))
+        sampling_cache_ok = bool(
+            resume
+            and _remd_sampling_metadata_matches(
+                stage_output_dir, label, sampling_fingerprint
+            )
+            and _all_remd_trajs_valid(
+                stage_output_dir, label, n_states, min_frames=expected_frames
+            )
+        )
         if resume and os.path.exists(u_kn_path) and _is_pme_u_kn_cache_compatible(
             stage_output_dir,
             label,
@@ -3707,7 +3829,7 @@ class ABFEPipeline:
             self.ligand_indices,
             boresch_params,
             coion_identity=getattr(self, "_coion_runtime_identity", None),
-        ):
+        ) and sampling_cache_ok:
             self._log("  ♻️ 检测到兼容的 PME u_kn 缓存，直接求解 MBAR")
             u_kn = np.load(u_kn_path)
             analyzer = TraditionalMBARAnalyzer(
@@ -3718,16 +3840,7 @@ class ABFEPipeline:
             analyzer._last_n_k = np.load(n_k_path)
             res = analyzer.solve(u_kn)
         else:
-            expected_frames = max(1, _expected_remd_frame_count(n_steps_per_window))
-            if (
-                resume
-                and _remd_sampling_metadata_matches(
-                    stage_output_dir, label, sampling_fingerprint
-                )
-                and _all_remd_trajs_valid(
-                    stage_output_dir, label, n_states, min_frames=expected_frames
-                )
-            ):
+            if sampling_cache_ok:
                 self._log("  ♻️ 检测到完整 REMD 轨迹，跳过采样直接重算 u_kn")
             else:
                 if resume and _all_remd_trajs_valid(
@@ -3917,8 +4030,10 @@ class ABFEPipeline:
         # ✅ 唯一出口：参数落盘 + 返回
         boresch_json = UnitFormatter.format_boresch_json(boresch_params)
         boresch_json_path = os.path.join(self.output_dir, "boresch_params.json")
-        with open(boresch_json_path, "w") as f:
-            json.dump(boresch_json, f, indent=2)
+        _atomic_write_json(
+            boresch_json_path,
+            _json_safe(boresch_json),
+        )
         self._log(f"  ✓ Boresch 参数已保存 (JSON): {boresch_json_path}")
         
         return {
@@ -6223,6 +6338,15 @@ class ABFEPipeline:
             # 变了，缓存也会正确失效。
             "final_gate_thresholds": final_gate_thresholds,
         }
+        # 🔑 [MEM-00h] This is deliberately a Stage 2-only cache gate.  The
+        # softcore cutoff/switching change does not alter the Stage 1
+        # charging Hamiltonian, Boresch attachment, pre-equilibration, or the
+        # C1 Na-charging trajectory, so do not put this field in their cache
+        # identities.
+        if stage_name == "vanishing":
+            payload["vdw_nonbonded_protocol_version"] = (
+                VDW_NONBONDED_PROTOCOL_VERSION
+            )
         # 🔑 [B6 / memtodolist §6.4] 新 LJ 色散协议必须进 resume gate：换了
         # dispersion_protocol 之后，炼金 ligand–environment 的均匀密度 LRC 从"加"
         # 变成"不加"，u_kn 口径就变了，旧的 "completed" stage 缓存不能再复用。
@@ -6261,6 +6385,9 @@ class ABFEPipeline:
         boresch_params: Optional[Dict],
         decharge_method: str = "pme",
         dexp_params: Optional[Dict] = None,
+        requested_n_states: Optional[int] = None,
+        pilot_n_steps_per_state: Optional[int] = None,
+        pilot_finite_difference_delta: Optional[float] = None,
     ) -> Dict:
         """λ 路径预优化（optimize_stage1_decharging/optimize_stage2_vanishing）
         专用的、范围更窄的协议指纹——只保留真正影响"这次预优化测到的 dU/dλ
@@ -6273,27 +6400,35 @@ class ABFEPipeline:
             完全不涉及 IBS bias/f_k。
           - `final_gate_thresholds`：管最终聚合 ΔG 是否通过收敛门，是 stage
             完成之后才有意义的判据，预优化阶段还没有任何 ΔG 可言。
-          - 完整版 `code_sha256`（四文件合并哈希）：换成范围更窄的
-            `_preopt_code_hash()`（只哈希 abfe_preoptimizer.py + abfe_core.py），
-            这样修 ibs_engine.py/abfe_pipeline.py 里跟预优化无关的 bug
-            （窗口修复循环、production checkpoint 续采等）不会连带让这份
-            要跑好几个小时的预优化缓存失效——这正是收窄这份指纹的直接原因。
+          - 完整版 `code_sha256` / 任意源文件 hash：预优化 Hamiltonian 的变化
+            通过显式 `PREOPT_HAMILTONIAN_PROTOCOL_VERSION` 管理；在
+            abfe_core.py 增加无关的 provenance/cache helper 不会触发重算。
         `thermodynamic_path_protocol_version` 仍然保留：它是预优化算法本身
         的版本号，理应让这份指纹随之变化。
         """
-        run_config = dict(getattr(self, "_last_run_config", {}) or {})
-        run_config.pop("resume", None)
-        run_config.pop("run_equilibration", None)
+        stage_name = str(stage_name)
+        last_config = dict(getattr(self, "_last_run_config", {}) or {})
+        if requested_n_states is None:
+            requested_n_states = last_config.get("n_states_per_stage")
+        if pilot_n_steps_per_state is None:
+            pilot_n_steps_per_state = 10000
+        if pilot_finite_difference_delta is None:
+            pilot_finite_difference_delta = (
+                0.01 if stage_name == "vanishing" else "n/a"
+            )
         payload = {
             "kind": "dual_lambda_preopt",
             "stage_name": stage_name,
+            "preopt_hamiltonian_protocol_version": PREOPT_HAMILTONIAN_PROTOCOL_VERSION,
             "potential_type": str(potential_type),
             "dexp_params": dexp_params,
-            "boresch_params": boresch_params,
-            "decharge_method": str(decharge_method) if stage_name == "decharging" else "n/a",
-            "run_config": run_config,
+            "boresch_params": _preopt_boresch_protocol_payload(boresch_params),
+            "requested_n_states": (
+                None if requested_n_states is None else int(requested_n_states)
+            ),
+            "pilot_n_steps_per_state": int(pilot_n_steps_per_state),
+            "pilot_finite_difference_delta": pilot_finite_difference_delta,
             "temperature_K": self.temperature.value_in_unit(unit.kelvin),
-            "pressure_bar": self.pressure.value_in_unit(unit.bar),
             "ligand_indices": [int(i) for i in self.ligand_indices],
             "system_xml_sha256": _system_xml_hash(self.system),
             "topology_sha256": _topology_hash(self.topology),
@@ -6305,7 +6440,6 @@ class ABFEPipeline:
             # 平衡"与"resume 时读轨迹末帧"两条路径下产生不同坐标数组（前者多叠了
             # 一次 2000 步最小化），恰恰是 docstring 想避免的那种"跟预优化本身无关
             # 的实现细节波动却让这份小时级缓存失效"。
-            "preopt_code_sha256": _preopt_code_hash(),
             "aces_softcore_params": ACESoftcorePotential.optimize_alpha(
                 len(self.ligand_indices)
             ),
@@ -6319,29 +6453,23 @@ class ABFEPipeline:
             payload["co_alchemical_ion_runtime_identity"] = (
                 self._coion_runtime_identity
             )
+            payload["coion_probe_hamiltonian_protocol_version"] = (
+                COION_PREOPT_HAMILTONIAN_PROTOCOL_VERSION
+            )
         return _protocol_fingerprint(payload)
 
     @staticmethod
     def _preopt_cache_matches_ignoring_code_hash(
         cached_protocol: Optional[Dict], fresh_preopt_key: Dict
     ) -> bool:
-        """[预优化缓存 schema 迁移兼容] 判断磁盘上缓存的 protocol_key——无论是
-        `_preopt_protocol_key` 上线之前的旧宽指纹（`_stage_protocol_key`，含
-        `code_sha256`/`wca_accounting_version`/`ibs_bias_protocol_version`/
-        `final_gate_thresholds`）还是现在的新窄指纹——除了这几个字段本身之外，
-        物理相关的其余字段是否跟当前这次运行完全一致。
+        """Accept a legacy broad preopt cache only after a physical projection.
 
-        目的：旧缓存文件的 protocol_key 是按宽指纹写的，跟新窄指纹连顶层键
-        集合都不一样，永远不可能逐字节相等——直接比较会把"物理输入完全没变、
-        只是指纹 schema 换了"误判成"协议不一致"，逼着重新跑一遍代价高达数
-        小时的 λ 路径预优化。只要除了那几个刻意跟预优化物理内容无关的字段
-        之外，其余每一项都完全一致，就认为这份旧缓存仍然可信；调用方应据此
-        直接复用 lambdas_var/window_ranges，并把 protocol_key 原地重新盖成
-        新窄指纹（自愈式迁移一次即可，之后的 resume 都是正常的窄指纹比较）。
-
-        任何一步比较失败（缺字段、类型不对、payload 结构变了）都保守地返回
-        False，交由调用方按"协议不一致"的原有逻辑处理——这个函数只放行
-        "确认物理输入没变"的情况，不放行"看起来大概没变"。
+        Old caches contain a whole-file ``preopt_code_sha256``, a full
+        ``run_config`` and a diagnostic-rich Boresch dict.  Those fields cannot
+        be compared to the new narrow schema directly.  This migration path
+        deliberately ignores the old code hash and compares only the fields that
+        can be reconstructed as actual pilot inputs; it then rewrites the cache
+        with the new explicit protocol key.
         """
         if not isinstance(cached_protocol, dict) or not isinstance(fresh_preopt_key, dict):
             return False
@@ -6349,15 +6477,83 @@ class ABFEPipeline:
         fresh_payload = fresh_preopt_key.get("payload")
         if not isinstance(cached_payload, dict) or not isinstance(fresh_payload, dict):
             return False
-        legacy_only_fields = ("code_sha256", "wca_accounting_version", "ibs_bias_protocol_version")
-        if not all(field in cached_payload for field in legacy_only_fields):
+        # Backward-compatible behavior for callers still comparing two old
+        # broad-schema keys.  Production now emits the explicit version schema
+        # below, but keeping this branch avoids surprising library callers.
+        if "preopt_code_sha256" in fresh_payload:
+            for key, fresh_value in fresh_payload.items():
+                if key in {"kind", "preopt_code_sha256"}:
+                    continue
+                if key not in cached_payload or cached_payload[key] != fresh_value:
+                    return False
+            return "preopt_code_sha256" in cached_payload
+        # Only preopt caches written by the old broad schema may enter this
+        # migration.  A malformed/new cache must fail closed.
+        if "preopt_code_sha256" not in cached_payload:
             return False
-        code_identity_fields = {"kind", "preopt_code_sha256"}
+
+        stage_name = str(fresh_payload.get("stage_name", ""))
+        legacy_run_config = cached_payload.get("run_config")
+        if not isinstance(legacy_run_config, dict):
+            return False
+        legacy_kwargs = legacy_run_config.get("kwargs")
+        if not isinstance(legacy_kwargs, dict):
+            legacy_kwargs = {}
+
+        def _legacy_requested_n_states():
+            stage_key = "stage1_n_states" if stage_name == "decharging" else "stage2_n_states"
+            return legacy_run_config.get(stage_key) or legacy_run_config.get(
+                "n_states_per_stage"
+            )
+
+        def _legacy_pilot_steps():
+            return legacy_kwargs.get("pilot_n_steps_per_state", 10000)
+
+        def _legacy_pilot_delta():
+            return legacy_kwargs.get(
+                "pilot_finite_difference_delta",
+                0.01 if stage_name == "vanishing" else "n/a",
+            )
+
+        legacy_values = {
+            "kind": cached_payload.get("kind"),
+            "stage_name": cached_payload.get("stage_name"),
+            "potential_type": cached_payload.get("potential_type"),
+            "dexp_params": cached_payload.get("dexp_params"),
+            "boresch_params": _preopt_boresch_protocol_payload(
+                cached_payload.get("boresch_params")
+            ),
+            "requested_n_states": _legacy_requested_n_states(),
+            "pilot_n_steps_per_state": _legacy_pilot_steps(),
+            "pilot_finite_difference_delta": _legacy_pilot_delta(),
+            "temperature_K": cached_payload.get("temperature_K"),
+            "ligand_indices": cached_payload.get("ligand_indices"),
+            "system_xml_sha256": cached_payload.get("system_xml_sha256"),
+            "topology_sha256": cached_payload.get("topology_sha256"),
+            "aces_softcore_params": cached_payload.get("aces_softcore_params"),
+            # Old broad preopt keys were written while the first explicit
+            # Hamiltonian protocol was v1.  Keep this in the migration
+            # projection: a future v2 must not be accepted merely because the
+            # unrelated legacy code hash happened to match.
+            "preopt_hamiltonian_protocol_version": 1,
+            "thermodynamic_path_protocol_version": cached_payload.get(
+                "thermodynamic_path_protocol_version"
+            ),
+        }
         for key, fresh_value in fresh_payload.items():
-            if key in code_identity_fields:
+            if key == "co_alchemical_ion_runtime_identity":
                 continue
-            if key not in cached_payload or cached_payload[key] != fresh_value:
+            if key not in legacy_values or legacy_values[key] != fresh_value:
                 return False
+
+        # A charged current run must have an exact old runtime identity.  Neutral
+        # legacy caches have no such field and remain migratable.
+        fresh_coion = fresh_payload.get("co_alchemical_ion_runtime_identity")
+        if fresh_coion is not None:
+            if cached_payload.get("co_alchemical_ion_runtime_identity") != fresh_coion:
+                return False
+        elif cached_payload.get("co_alchemical_ion_runtime_identity") is not None:
+            return False
         return True
 
     @staticmethod
@@ -6396,7 +6592,7 @@ class ABFEPipeline:
         `coverage_diagnostics` 里混着 numpy 标量与数组，直接塞进去会 `TypeError`
         并让整个 checkpoint 写失败。所以这里统一过一遍 `_json_safe`。
         """
-        return {
+        payload = {
             "stage": stage_name,
             "total_delta_G": float(result["total_delta_G"]),
             "total_error": float(result["total_error"]),
@@ -6435,6 +6631,12 @@ class ABFEPipeline:
         ):
             if field in result:
                 payload[field] = _json_safe(result[field])
+        # Keep this explicit field alongside the stage result as an auditable
+        # cache gate.  It is intentionally absent from Stage 1 payloads.
+        if stage_name == "vanishing":
+            payload["vdw_nonbonded_protocol_version"] = (
+                VDW_NONBONDED_PROTOCOL_VERSION
+            )
         return payload
 
     # =========================================================================
@@ -6786,6 +6988,67 @@ class ABFEPipeline:
                 )
             return _protocol_fingerprint(payload)
 
+        def _build_sampling_protocol_key(path, scheme: Optional[str] = None) -> Dict:
+            """Build the identity for a completed single/2D sampling result.
+
+            The outer ``sampling_*.json`` files are aggregate results.  A cache hit
+            here must therefore be at least as strict as the REMD/u_kn gates below;
+            otherwise a changed co-ion identity can be hidden by an old aggregate
+            result and ``_run_2d_lambda_stage`` (where the detailed gates live) is
+            never reached.
+            """
+            selected_scheme = str(scheme or decoupling_scheme)
+            normalized_path = [
+                [float(point[0]), float(point[1])] for point in (path or [])
+            ]
+            payload = {
+                "kind": "abfe_sampling_result",
+                "scheme": selected_scheme,
+                "path": normalized_path,
+                "n_steps_per_window": int(n_steps_per_window),
+                "steps_per_update": int(steps_per_update),
+                "potential_type": str(potential_type),
+                "system_type": str(system_type),
+                "enable_early_stop": bool(enable_early_stop),
+                "enable_gradual_warmup": bool(
+                    kwargs.get("enable_gradual_warmup", True)
+                ),
+                "warmup_steps": int(kwargs.get("warmup_steps", 500000)),
+                "dexp_params": dexp_params,
+                "system_xml_sha256": _system_xml_hash(self.system),
+                "topology_sha256": _topology_hash(self.topology),
+                "ligand_indices": [int(i) for i in self.ligand_indices],
+                "temperature_K": self.temperature.value_in_unit(unit.kelvin),
+                # Diagnostics/source/timestamps are provenance, not sampling
+                # Hamiltonian inputs. Keep this payload narrow so re-derived
+                # diagnostics do not invalidate an identical result.
+                "boresch_params": _preopt_boresch_protocol_payload(boresch_params),
+                "coion_identity": getattr(self, "_coion_runtime_identity", None),
+            }
+            return _protocol_fingerprint(payload)
+
+        def _build_geodesic_path_protocol_key() -> Dict:
+            """Build the pre-optimization identity for the 2D geodesic path."""
+            payload = {
+                "kind": "abfe_2d_geodesic_path",
+                "scheme": "2d_geodesic",
+                "system_xml_sha256": _system_xml_hash(self.system),
+                "topology_sha256": _topology_hash(self.topology),
+                "ligand_indices": [int(i) for i in self.ligand_indices],
+                "potential_type": str(potential_type),
+                "n_grid": int(n_states_per_stage),
+                "n_steps_per_point": 3000,
+                "temperature_K": self.temperature.value_in_unit(unit.kelvin),
+                "platform_name": str(self.platform_name),
+                "optimizer_protocol_version": GEODESIC_PATH_PROTOCOL_VERSION,
+                "coion_identity": getattr(self, "_coion_runtime_identity", None),
+            }
+            if getattr(self, "_coion_runtime_identity", None) is not None:
+                payload["coion_probe_hamiltonian_protocol_version"] = (
+                    COION_PREOPT_HAMILTONIAN_PROTOCOL_VERSION
+                )
+            return _protocol_fingerprint(payload)
+
         _top_level_protocol_key = _build_top_level_protocol_key()
 
         sampling_key = f"sampling_{decoupling_scheme}"
@@ -6845,10 +7108,20 @@ class ABFEPipeline:
             _stage1_preopt_key = self._preopt_protocol_key(
                 "decharging", potential_type, boresch_params, _decharge_method,
                 dexp_params=dexp_params,
+                requested_n_states=stage1_states,
+                pilot_n_steps_per_state=10000,
+                pilot_finite_difference_delta="n/a",
             )
             _stage2_preopt_key = self._preopt_protocol_key(
                 "vanishing", potential_type, boresch_params, _decharge_method,
                 dexp_params=dexp_params,
+                requested_n_states=stage2_states,
+                pilot_n_steps_per_state=int(
+                    kwargs.get("pilot_n_steps_per_state", 10000)
+                ),
+                pilot_finite_difference_delta=float(
+                    kwargs.get("pilot_finite_difference_delta", 0.01)
+                ),
             )
             stage1_key = "sampling_dual_decharging"
             stage2_key = "sampling_dual_vanishing"
@@ -7073,8 +7346,8 @@ class ABFEPipeline:
                         # 原地把 protocol_key 重新盖成新窄指纹（自愈一次即可）。
                         self._log(
                             "  🩹 Stage 1 预优化缓存是旧 schema（_preopt_protocol_key 上线之前写入的"
-                            "宽指纹），但物理输入（potential_type/Boresch/温度/压力/坐标/预优化代码本身"
-                            "等）逐项核对完全一致——判定为 schema 迁移，不重新优化，原地重盖 protocol_key。"
+                            "宽指纹），但预优化实际输入逐项核对完全一致——判定为 schema 迁移，"
+                            "不重新优化，原地重盖 protocol_key。"
                         )
                         cached["protocol_key"] = _stage1_preopt_key
                         with open(preopt1_file, "w") as f:
@@ -7111,10 +7384,13 @@ class ABFEPipeline:
                             + ("，含手动窗口边界" if window_ranges_1 else "")
                         )
                     elif not protocol_match:
+                        differences = _protocol_key_differences(
+                            cached_protocol, _stage1_preopt_key
+                        )
                         self._log(
-                            "  ⚠️ Stage 1 预优化缓存协议指纹不一致（potential_type/Boresch/"
-                            "decharge_method/WCA/IBS 偏置协议版本等已变化），将重新优化完整 "
-                            "λ 路径（此前版本会在态数恰好相同时静默复用旧协议下的缓存）。"
+                            "  ⚠️ Stage 1 preopt cache mismatch:\n"
+                            + "\n".join(f"    - {item}" for item in differences[:12])
+                            + "\n    将重新优化完整 λ 路径。"
                         )
                     else:
                         self._log(
@@ -7261,8 +7537,8 @@ class ABFEPipeline:
                         # 重盖 protocol_key。
                         self._log(
                             "  🩹 Stage 2 预优化缓存是旧 schema（_preopt_protocol_key 上线之前写入的"
-                            "宽指纹），但物理输入（potential_type/Boresch/温度/压力/坐标/预优化代码本身"
-                            "等）逐项核对完全一致——判定为 schema 迁移，不重新优化，原地重盖 protocol_key。"
+                            "宽指纹），但预优化实际输入逐项核对完全一致——判定为 schema 迁移，"
+                            "不重新优化，原地重盖 protocol_key。"
                         )
                         cached["protocol_key"] = _stage2_preopt_key
                         with open(preopt2_file, "w") as f:
@@ -7321,11 +7597,13 @@ class ABFEPipeline:
                                     p.get("mean_dU_dlambda_kJ_mol") for p in _cached_pilot_points
                                 ]
                     elif not protocol_match:
+                        differences = _protocol_key_differences(
+                            cached_protocol, _stage2_preopt_key
+                        )
                         self._log(
-                            "  ⚠️ Stage 2 预优化缓存协议指纹不一致（potential_type/Boresch/"
-                            "decharge_method/WCA/IBS 偏置协议版本/热力学路径协议版本等已变化），"
-                            "将重新优化完整 λ 路径（此前版本会在态数恰好相同时静默复用旧协议下"
-                            "的缓存）。"
+                            "  ⚠️ Stage 2 preopt cache mismatch:\n"
+                            + "\n".join(f"    - {item}" for item in differences[:12])
+                            + "\n    将重新优化完整 λ 路径。"
                         )
                     else:
                         self._log(
@@ -7949,6 +8227,10 @@ class ABFEPipeline:
                 with open(path_cache_file, "w") as f:
                     json.dump({"path": path_1d, "scheme": "single_lambda"}, f, indent=2)
 
+            scheme_protocol_key = _build_sampling_protocol_key(
+                path_1d, "single_lambda"
+            )
+
             _samp_file = os.path.join(self.checkpoint_dir, "sampling_single_lambda.json")
             _should_run = True
             if resume:
@@ -7957,11 +8239,26 @@ class ABFEPipeline:
                 if _status == "completed" and os.path.exists(_samp_file):
                     try:
                         with open(_samp_file) as f:
-                            sample_result = json.load(f)
-                        self._log("  ♻️ single_lambda 采样已完成，跳过")
-                        _should_run = False
-                    except Exception:
-                        pass
+                            cached_sample = json.load(f)
+                        if (
+                            isinstance(cached_sample, dict)
+                            and cached_sample.get("protocol_key") == scheme_protocol_key
+                            and "total_delta_G" in cached_sample
+                            and "total_error" in cached_sample
+                        ):
+                            sample_result = cached_sample
+                            self._log("  ♻️ single_lambda 采样已完成，协议指纹一致，跳过")
+                            _should_run = False
+                        else:
+                            self._log(
+                                "  ⚠️ single_lambda 外层采样缓存协议指纹缺失或不匹配，"
+                                "拒绝复用并重新执行采样"
+                            )
+                    except Exception as exc:
+                        self._log(
+                            f"  ⚠️ single_lambda 外层采样缓存读取失败: {exc}，"
+                            "重新执行采样"
+                        )
 
             if _should_run:
                 sample_result = self._run_2d_lambda_stage(
@@ -7979,6 +8276,7 @@ class ABFEPipeline:
                     warmup_steps=kwargs.get("warmup_steps", 500000),
                 )
                 _save = {
+                    "protocol_key": scheme_protocol_key,
                     "total_delta_G": sample_result["total_delta_G"],
                     "total_error": sample_result["total_error"],
                 }
@@ -8038,6 +8336,10 @@ class ABFEPipeline:
                 with open(path_cache_file, "w") as f:
                     json.dump({"path": path_2d, "scheme": "2d_diagonal"}, f, indent=2)
 
+            scheme_protocol_key = _build_sampling_protocol_key(
+                path_2d, "2d_diagonal"
+            )
+
             # === 采样 ===
             _samp_file = os.path.join(self.checkpoint_dir, "sampling_2d_diagonal.json")
             _should_run = True
@@ -8047,11 +8349,26 @@ class ABFEPipeline:
                 if _status == "completed" and os.path.exists(_samp_file):
                     try:
                         with open(_samp_file) as f:
-                            sample_result = json.load(f)
-                        self._log("  ♻️ 对角线 2D 采样已完成，跳过")
-                        _should_run = False
-                    except Exception:
-                        pass
+                            cached_sample = json.load(f)
+                        if (
+                            isinstance(cached_sample, dict)
+                            and cached_sample.get("protocol_key") == scheme_protocol_key
+                            and "total_delta_G" in cached_sample
+                            and "total_error" in cached_sample
+                        ):
+                            sample_result = cached_sample
+                            self._log("  ♻️ 对角线 2D 采样已完成，协议指纹一致，跳过")
+                            _should_run = False
+                        else:
+                            self._log(
+                                "  ⚠️ 对角线 2D 外层采样缓存协议指纹缺失或不匹配，"
+                                "拒绝复用并重新执行采样"
+                            )
+                    except Exception as exc:
+                        self._log(
+                            f"  ⚠️ 对角线 2D 外层采样缓存读取失败: {exc}，"
+                            "重新执行采样"
+                        )
 
             if _should_run:
                 sample_result = self._run_2d_lambda_stage(
@@ -8068,8 +8385,11 @@ class ABFEPipeline:
                     enable_gradual_warmup=kwargs.get("enable_gradual_warmup", True),
                     warmup_steps=kwargs.get("warmup_steps", 500000),
                 )
-                _save = {"total_delta_G": sample_result["total_delta_G"],
-                         "total_error": sample_result["total_error"]}
+                _save = {
+                    "protocol_key": scheme_protocol_key,
+                    "total_delta_G": sample_result["total_delta_G"],
+                    "total_error": sample_result["total_error"],
+                }
                 os.makedirs(self.checkpoint_dir, exist_ok=True)
                 with open(_samp_file, "w") as f:
                     json.dump(_save, f, indent=2)
@@ -8098,13 +8418,20 @@ class ABFEPipeline:
         elif decoupling_scheme == "2d_geodesic":
             # === 测地线路径优化 ===
             path_cache_file = os.path.join(self.checkpoint_dir, "path_2d_geodesic.json")
+            geodesic_path_protocol_key = _build_geodesic_path_protocol_key()
             path_2d = None
             if resume and os.path.exists(path_cache_file):
                 try:
                     with open(path_cache_file) as f:
                         _cached = json.load(f)
-                    path_2d = [tuple(p) for p in _cached["path"]]
-                    self._log(f"  ♻️ 已加载测地线 2D 路径缓存 ({len(path_2d)} 个状态)")
+                    if _cached.get("protocol_key") != geodesic_path_protocol_key:
+                        self._log(
+                            "  ⚠️ 测地线路径缓存协议指纹缺失或不匹配，"
+                            "拒绝复用并重新优化路径"
+                        )
+                    else:
+                        path_2d = [tuple(p) for p in _cached["path"]]
+                        self._log(f"  ♻️ 已加载测地线 2D 路径缓存 ({len(path_2d)} 个状态)")
                 except Exception as e:
                     self._log(f"  ⚠️ 加载测地线路径缓存失败: {e}，将重新优化")
 
@@ -8120,11 +8447,28 @@ class ABFEPipeline:
                     n_steps_per_point=3000,
                     temperature=self.temperature.value_in_unit(unit.kelvin),
                     platform_name=self.platform_name,
+                    co_alchemical_ion_spec=(
+                        self.resolve_co_alchemical_ion_spec()
+                        if getattr(self, "charge_treatment", None)
+                        else None
+                    ),
                 )
                 self._log(f"  🗺️ 测地线优化完成 ({len(path_2d)} 个状态)")
                 os.makedirs(self.checkpoint_dir, exist_ok=True)
                 with open(path_cache_file, "w") as f:
-                    json.dump({"path": path_2d, "scheme": "2d_geodesic"}, f, indent=2)
+                    json.dump(
+                        {
+                            "path": path_2d,
+                            "scheme": "2d_geodesic",
+                            "protocol_key": geodesic_path_protocol_key,
+                        },
+                        f,
+                        indent=2,
+                    )
+
+            scheme_protocol_key = _build_sampling_protocol_key(
+                path_2d, "2d_geodesic"
+            )
 
             # === 采样 (复用 _run_2d_lambda_stage) ===
             _samp_file = os.path.join(self.checkpoint_dir, "sampling_2d_geodesic.json")
@@ -8135,11 +8479,26 @@ class ABFEPipeline:
                 if _status == "completed" and os.path.exists(_samp_file):
                     try:
                         with open(_samp_file) as f:
-                            sample_result = json.load(f)
-                        self._log("  ♻️ 测地线 2D 采样已完成，跳过")
-                        _should_run = False
-                    except Exception:
-                        pass
+                            cached_sample = json.load(f)
+                        if (
+                            isinstance(cached_sample, dict)
+                            and cached_sample.get("protocol_key") == scheme_protocol_key
+                            and "total_delta_G" in cached_sample
+                            and "total_error" in cached_sample
+                        ):
+                            sample_result = cached_sample
+                            self._log("  ♻️ 测地线 2D 采样已完成，协议指纹一致，跳过")
+                            _should_run = False
+                        else:
+                            self._log(
+                                "  ⚠️ 测地线 2D 外层采样缓存协议指纹缺失或不匹配，"
+                                "拒绝复用并重新执行采样"
+                            )
+                    except Exception as exc:
+                        self._log(
+                            f"  ⚠️ 测地线 2D 外层采样缓存读取失败: {exc}，"
+                            "重新执行采样"
+                        )
 
             if _should_run:
                 sample_result = self._run_2d_lambda_stage(
@@ -8156,8 +8515,11 @@ class ABFEPipeline:
                     enable_gradual_warmup=kwargs.get("enable_gradual_warmup", True),
                     warmup_steps=kwargs.get("warmup_steps", 500000),
                 )
-                _save = {"total_delta_G": sample_result["total_delta_G"],
-                         "total_error": sample_result["total_error"]}
+                _save = {
+                    "protocol_key": scheme_protocol_key,
+                    "total_delta_G": sample_result["total_delta_G"],
+                    "total_error": sample_result["total_error"],
+                }
                 os.makedirs(self.checkpoint_dir, exist_ok=True)
                 with open(_samp_file, "w") as f:
                     json.dump(_save, f, indent=2)

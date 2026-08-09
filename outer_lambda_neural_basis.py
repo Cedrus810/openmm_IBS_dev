@@ -122,8 +122,12 @@ def _normalize_sha256(value: Any, field: str) -> str:
 
 
 def _absolute_file_path(value: Any, field: str) -> Path:
-    raw = _nonempty_string(value, field)
-    path = Path(raw).expanduser()
+    if isinstance(value, Path):
+        path = value.expanduser()
+        raw = str(value)
+    else:
+        raw = _nonempty_string(value, field)
+        path = Path(raw).expanduser()
     if not path.is_absolute():
         raise NeuralPathConfigError(f"{field} 必须是绝对路径，收到 {raw!r}")
     return path
@@ -245,6 +249,7 @@ class NeuralBasisModelSpec:
     precision: str
     periodic: bool
     model_name: str | None = None
+    coordinate_imaging: str = "none"
     support_domain: NeuralBasisSupportDomain | None = None
     model_protocol_version: int = NEURAL_BASIS_MODEL_PROTOCOL_VERSION
 
@@ -329,6 +334,22 @@ class NeuralBasisModelSpec:
         periodic = config.get("periodic")
         if not isinstance(periodic, bool):
             raise NeuralPathConfigError(f"basis[{name}].periodic 必须是 bool")
+        coordinate_imaging = _nonempty_string(
+            config.get(
+                "coordinate_imaging",
+                (
+                    "minimum_image_local"
+                    if backend == "existing_openmmml"
+                    else "none"
+                ),
+            ),
+            f"basis[{name}].coordinate_imaging",
+        )
+        if coordinate_imaging not in {"none", "minimum_image_local"}:
+            raise NeuralPathConfigError(
+                f"basis[{name}].coordinate_imaging 必须是 "
+                "'none' 或 'minimum_image_local'"
+            )
         raw_support_domain = config.get("support_domain")
         support_domain = (
             NeuralBasisSupportDomain.from_mapping(raw_support_domain)
@@ -349,6 +370,7 @@ class NeuralBasisModelSpec:
             precision=precision,
             periodic=periodic,
             model_name=model_name,
+            coordinate_imaging=coordinate_imaging,
             support_domain=support_domain,
         )
 
@@ -369,6 +391,7 @@ class NeuralBasisModelSpec:
             "precision": self.precision,
             "periodic": self.periodic,
             "model_name": self.model_name,
+            "coordinate_imaging": self.coordinate_imaging,
             "support_domain": (
                 self.support_domain.protocol_payload()
                 if self.support_domain is not None
@@ -1114,15 +1137,16 @@ class OuterLambdaController:
                     f"超出坐标原子数 {len(normalized)}"
                 )
             selected = [normalized[index] for index in indices]
-            if (
+            uses_minimum_image = (
                 basis.periodic
-                and basis.support_domain is not None
-                and box_rows is None
-            ):
+                or basis.coordinate_imaging == "minimum_image_local"
+            )
+            if uses_minimum_image and box_rows is None:
                 raise NeuralPathConfigError(
-                    f"basis[{basis.name}] 是 periodic 支持域，必须提供 box_vectors_nm"
+                    f"basis[{basis.name}] 的支持域要求 minimum-image，"
+                    "必须提供 box_vectors_nm"
                 )
-            if basis.periodic and box_rows is not None:
+            if uses_minimum_image and box_rows is not None:
                 anchor = selected[0]
                 unwrapped = [anchor]
                 for position in selected[1:]:
@@ -1164,7 +1188,7 @@ class OuterLambdaController:
                         selected[left][axis] - selected[right][axis]
                         for axis in range(3)
                     )
-                    if basis.periodic and box_rows is not None:
+                    if uses_minimum_image and box_rows is not None:
                         displacement = _minimum_image_displacement(
                             displacement, box_rows, inverse_box_rows
                         )
@@ -1860,7 +1884,6 @@ class MaceDecompositionPythonComputation:
 
     def __call__(self, state):
         import numpy as np
-        from openmm import unit
 
         parameters = state.getParameters()
         if self.lambda_parameter_name not in parameters:
@@ -1877,6 +1900,39 @@ class MaceDecompositionPythonComputation:
         if lam == 0.0 or lam == 1.0:
             return 0.0, np.zeros((atom_count, 3), dtype=np.float64)
         amplitude = self.coefficient * math.sin(math.pi * lam) ** 2
+        centered_energy, basis_forces = (
+            self._evaluate_centered_basis_from_state(state)
+        )
+        path_energy = amplitude * centered_energy
+        path_forces = amplitude * basis_forces
+        if abs(path_energy) > self.max_abs_path_energy_kj_mol:
+            raise NeuralPathFrameError(
+                "MACE path energy "
+                f"{path_energy:.9g} kJ/mol 超过安全门 "
+                f"{self.max_abs_path_energy_kj_mol:.9g} kJ/mol "
+                f"(lambda={lam:.9g}, centered_basis={centered_energy:.9g} "
+                f"kJ/mol, coefficient={self.coefficient:.9g})"
+            )
+        if (
+            path_forces.size
+            and float(np.max(np.linalg.norm(path_forces, axis=1)))
+            > self.max_force_norm_kj_mol_nm
+        ):
+            observed_force = float(
+                np.max(np.linalg.norm(path_forces, axis=1))
+            )
+            raise NeuralPathFrameError(
+                "MACE path force "
+                f"{observed_force:.9g} kJ/(mol*nm) 超过安全门 "
+                f"{self.max_force_norm_kj_mol_nm:.9g} kJ/(mol*nm) "
+                f"(lambda={lam:.9g}, coefficient={self.coefficient:.9g})"
+            )
+        return float(path_energy), path_forces
+
+    def _evaluate_centered_basis_from_state(self, state):
+        import numpy as np
+        from openmm import unit
+
         positions = state.getPositions(asNumpy=True).value_in_unit(
             unit.nanometer
         )
@@ -1904,17 +1960,16 @@ class MaceDecompositionPythonComputation:
             > self.max_force_norm_kj_mol_nm
         ):
             raise NeuralPathFrameError("MACE basis force 超过安全门")
-        path_energy = amplitude * centered_energy
-        path_forces = amplitude * basis_forces
-        if abs(path_energy) > self.max_abs_path_energy_kj_mol:
-            raise NeuralPathFrameError("MACE path energy 超过安全门")
-        if (
-            path_forces.size
-            and float(np.max(np.linalg.norm(path_forces, axis=1)))
-            > self.max_force_norm_kj_mol_nm
-        ):
-            raise NeuralPathFrameError("MACE path force 超过安全门")
-        return float(path_energy), path_forces
+        return float(centered_energy), basis_forces
+
+
+class MaceDecompositionBasisPythonComputation(
+    MaceDecompositionPythonComputation
+):
+    """返回未乘外层系数的中心化 MACE basis，供多个 IBS 状态共享。"""
+
+    def __call__(self, state):
+        return self._evaluate_centered_basis_from_state(state)
 
 
 def build_mace_decomposition_python_force(
@@ -1986,6 +2041,356 @@ def build_mace_decomposition_python_force(
     return force
 
 
+def build_mace_decomposition_basis_python_force(
+    controller: OuterLambdaController,
+    *,
+    atomic_numbers: Sequence[int],
+    ligand_indices: Sequence[int],
+    environment_indices: Sequence[int],
+    device: str = "cuda",
+):
+    """构建一次评价、由全部 IBS λ 状态共享的中心化 MACE basis Force。"""
+
+    if not controller.enabled or len(controller.bases) != 1:
+        raise NeuralPathConfigError("共享 MACE basis Force 要求 enabled 且 M=1")
+    basis = controller.bases[0]
+    if basis.backend != "existing_openmmml":
+        raise NeuralPathConfigError(
+            "共享 MACE basis Force 要求 backend='existing_openmmml'"
+        )
+    if basis.model_name is None or "mace" not in basis.model_name.lower():
+        raise NeuralPathConfigError("共享 basis builder 只支持 MACE 模型")
+    if (
+        set(ligand_indices).union(environment_indices)
+        != set(basis.atom_indices())
+    ):
+        raise NeuralPathConfigError(
+            "共享 MACE basis Force 选择与 fixed atom selection 不一致"
+        )
+    if controller.safety is None:
+        raise NeuralPathConfigError("共享 MACE basis Force 要求 safety 配置")
+    computation = MaceDecompositionBasisPythonComputation(
+        model_path=basis.model_path,
+        model_sha256=basis.sha256,
+        atomic_numbers=atomic_numbers,
+        ligand_indices=ligand_indices,
+        environment_indices=environment_indices,
+        coefficient=1.0,
+        energy_offset_kj_mol=basis.energy_offset_kj_mol,
+        lambda_parameter_name="unused_outer_lambda",
+        device=device,
+        precision=basis.precision,
+        max_abs_basis_energy_kj_mol=(
+            controller.safety.max_abs_basis_energy_kj_mol
+        ),
+        max_abs_path_energy_kj_mol=(
+            controller.safety.max_abs_path_energy_kj_mol
+        ),
+        max_force_norm_kj_mol_nm=(
+            controller.safety.max_force_norm_kj_mol_nm
+        ),
+    )
+    openmm, _ = _require_openmm()
+    force = openmm.PythonForce(computation)
+    force.setUsesPeriodicBoundaryConditions(True)
+    return force
+
+
+class OuterLambdaIBSBiasForce:
+    """与现有 IBSBiasForce API 兼容的独立共享-basis 偏置力。
+
+    每个 ``neural_basis_m`` 只作为一个 collective variable 加入一次；各状态
+    ``X_k`` 通过冻结的 ``A[k,m]`` 组合它，不会为 K 个状态复制 K 份模型。
+    """
+
+    def __init__(
+        self,
+        controller: OuterLambdaController,
+        lambdas: Iterable[float],
+        temperature_kelvin: Any,
+        basis_forces: Sequence[Any],
+        *,
+        prefix: str = "abfe_neural",
+    ) -> None:
+        if not isinstance(controller, OuterLambdaController):
+            raise TypeError("controller 必须是 OuterLambdaController")
+        self.controller = controller
+        self.lambdas = tuple(
+            _finite_float(value, "lambda") for value in lambdas
+        )
+        if not self.lambdas:
+            raise NeuralPathConfigError("IBS lambda schedule 不能为空")
+        self.n_states = len(self.lambdas)
+        self.prefix = _nonempty_string(prefix, "prefix")
+        self.controller.validate_cv_budget(self.n_states)
+        if len(basis_forces) != self.controller.basis_count:
+            raise NeuralPathConfigError(
+                "basis_forces 数量必须等于 controller.basis_count"
+            )
+        openmm, unit = _require_openmm()
+        try:
+            temperature = temperature_kelvin.value_in_unit(unit.kelvin)
+        except AttributeError:
+            temperature = _finite_float(
+                temperature_kelvin, "temperature_kelvin"
+            )
+        if not math.isfinite(float(temperature)) or float(temperature) <= 0.0:
+            raise NeuralPathConfigError("temperature_kelvin 必须为有限正数")
+        kt = (
+            unit.MOLAR_GAS_CONSTANT_R * (float(temperature) * unit.kelvin)
+        ).value_in_unit(unit.kilojoules_per_mole)
+        beta = 1.0 / kt
+        matrix = self.controller.coefficient_matrix(self.lambdas)
+
+        def state_expression(index: int) -> str:
+            path_terms = [
+                f"({coefficient:.17g})*neural_basis_{basis_index}"
+                for basis_index, coefficient in enumerate(matrix[index])
+                if coefficient != 0.0
+            ]
+            expression = f"cv_{index}_int+cv_{index}_rest"
+            if path_terms:
+                expression += "+" + "+".join(path_terms)
+            expression += f"-{self.prefix}_f_{index}"
+            return f"({expression})"
+
+        state_expressions = [
+            state_expression(index) for index in range(self.n_states)
+        ]
+        logit_expressions = {
+            index: (
+                f"(-beta*(({state_expressions[index]})"
+                f"-({state_expressions[0]})))"
+            )
+            for index in range(1, self.n_states)
+        }
+        pivot = "0.0"
+        for index in range(1, self.n_states):
+            pivot = f"max({pivot},{logit_expressions[index]})"
+        sum_terms = [f"exp(-({pivot}))"] + [
+            f"exp({logit_expressions[index]}-({pivot}))"
+            for index in range(1, self.n_states)
+        ]
+        energy_expression = (
+            f"{self.prefix}_bias_scale*("
+            f"{state_expressions[0]}-kt*("
+            f"({pivot})+log(max(1e-300,{'+'.join(sum_terms)}))))"
+        )
+        self.force = openmm.CustomCVForce(energy_expression)
+        self.force.addGlobalParameter("kt", kt)
+        self.force.addGlobalParameter("beta", beta)
+        self.force.addGlobalParameter(f"{self.prefix}_bias_scale", 1.0)
+        for index in range(self.n_states):
+            self.force.addGlobalParameter(f"{self.prefix}_f_{index}", 0.0)
+        self.force.setForceGroup(1)
+        self._cv_keeper = []
+        self._int_cv_force_xmls = []
+        self._basis_cv_indices = []
+        for basis_index, basis_force in enumerate(basis_forces):
+            self._cv_keeper.append(basis_force)
+            cv_index = self.force.addCollectiveVariable(
+                f"neural_basis_{basis_index}", basis_force
+            )
+            self._basis_cv_indices.append(cv_index)
+        self.neural_path_protocol_sha256 = controller.protocol_sha256(
+            lambdas=self.lambdas
+        )
+
+    def addCollectiveVariable(self, name: str, cv_force: Any) -> int:
+        variable_name = _nonempty_string(name, "collective variable name")
+        if variable_name.startswith("neural_basis_"):
+            raise NeuralPathConfigError(
+                "neural_basis_* 名称由 OuterLambdaIBSBiasForce 保留"
+            )
+        self._cv_keeper.append(cv_force)
+        if variable_name.endswith("_int"):
+            openmm, _ = _require_openmm()
+            self._int_cv_force_xmls.append(
+                openmm.XmlSerializer.serialize(cv_force)
+            )
+        return self.force.addCollectiveVariable(variable_name, cv_force)
+
+    def get_force(self):
+        return self.force
+
+    def setForceGroup(self, group_id: int) -> None:
+        self.force.setForceGroup(group_id)
+
+    def set_bias_enabled(self, context: Any, enabled: bool) -> None:
+        context.setParameter(
+            f"{self.prefix}_bias_scale", 1.0 if enabled else 0.0
+        )
+
+    def update_parameters(
+        self, context: Any, f_values: Sequence[float]
+    ) -> None:
+        if len(f_values) != self.n_states:
+            raise NeuralPathConfigError("f_values 数量与 IBS 状态数不一致")
+        for index, value in enumerate(f_values):
+            context.setParameter(
+                f"{self.prefix}_f_{index}",
+                _finite_float(value, f"f_values[{index}]"),
+            )
+
+    def get_centered_basis_energies_kj_mol(
+        self, context: Any
+    ) -> tuple[float, ...]:
+        values = self.force.getCollectiveVariableValues(context)
+        return tuple(
+            _finite_float(values[index], f"neural_basis[{basis_index}]")
+            for basis_index, index in enumerate(self._basis_cv_indices)
+        )
+
+
+class OuterLambdaResidualBiasForce:
+    """DEC-052 / EXP-013 design (3): the exact residual `dV = V_* - V_0`.
+
+    `V_0 = -kT*log(sum_k exp(-(U_k^0 - f_k)/kT))` is the classical-only IBS
+    discriminant (no student); `V_* = -kT*log(sum_k exp(-(U_k^0 + A_k*basis -
+    f_k)/kT))` is the DEC-048-validated fused discriminant
+    (`OuterLambdaIBSBiasForce`). `dV := V_* - V_0` by definition, so
+    `V_0 + dV === V_*` is a *construction* identity, not something that needs
+    re-deriving physics for -- putting the UNMODIFIED classical `IBSBiasForce`
+    (`V_0`) on a fast MTS force group and this Force (`dV`) on a slow one
+    reproduces the exact `N=1` Hamiltonian `OuterLambdaIBSBiasForce` already
+    validated (DEC-047/048), letting MTS change only *how often* `dV` gets
+    re-evaluated, not *what* Hamiltonian is being sampled.
+
+    The one real cost this design cannot avoid: `CustomCVForce` collective
+    variables each get their own inner Context, so this Force cannot reuse
+    the classical `cv_k_int`/`cv_k_rest` CV *values* the fast `V_0` group
+    already computed -- it must register its OWN fresh copies (same pattern
+    `_build_probe_context`/the wiring smoke already use: deserialize from
+    `IBSBiasForce._int_cv_force_xmls`, never share a live Force object across
+    two different `CustomCVForce` parents) and recompute them internally.
+    That redundant classical-CV cost, plus the student TorchForce call, plus
+    doing the log-sum-exp math twice, is `dV`'s real per-call cost -- EXP-013
+    013-A measures it directly rather than assuming it equals the student's
+    cost alone.
+    """
+
+    def __init__(
+        self,
+        controller: OuterLambdaController,
+        lambdas: Iterable[float],
+        temperature_kelvin: Any,
+        basis_forces: Sequence[Any],
+        *,
+        prefix: str,
+    ) -> None:
+        if not isinstance(controller, OuterLambdaController):
+            raise TypeError("controller 必须是 OuterLambdaController")
+        self.controller = controller
+        self.lambdas = tuple(_finite_float(value, "lambda") for value in lambdas)
+        if not self.lambdas:
+            raise NeuralPathConfigError("IBS lambda schedule 不能为空")
+        self.n_states = len(self.lambdas)
+        self.prefix = _nonempty_string(prefix, "prefix")
+        self.controller.validate_cv_budget(self.n_states)
+        if len(basis_forces) != self.controller.basis_count:
+            raise NeuralPathConfigError("basis_forces 数量必须等于 controller.basis_count")
+        openmm, unit = _require_openmm()
+        try:
+            temperature = temperature_kelvin.value_in_unit(unit.kelvin)
+        except AttributeError:
+            temperature = _finite_float(temperature_kelvin, "temperature_kelvin")
+        if not math.isfinite(float(temperature)) or float(temperature) <= 0.0:
+            raise NeuralPathConfigError("temperature_kelvin 必须为有限正数")
+        kt = (unit.MOLAR_GAS_CONSTANT_R * (float(temperature) * unit.kelvin)).value_in_unit(
+            unit.kilojoules_per_mole
+        )
+        beta = 1.0 / kt
+        matrix = self.controller.coefficient_matrix(self.lambdas)
+
+        def state_expression(index: int, include_path: bool) -> str:
+            expression = f"cv_{index}_int+cv_{index}_rest"
+            if include_path:
+                path_terms = [
+                    f"({coefficient:.17g})*neural_basis_{basis_index}"
+                    for basis_index, coefficient in enumerate(matrix[index])
+                    if coefficient != 0.0
+                ]
+                if path_terms:
+                    expression += "+" + "+".join(path_terms)
+            expression += f"-{self.prefix}_f_{index}"
+            return f"({expression})"
+
+        def log_sum_exp_expression(state_exprs: list[str]) -> str:
+            logit_expressions = {
+                index: f"(-beta*(({state_exprs[index]})-({state_exprs[0]})))"
+                for index in range(1, self.n_states)
+            }
+            pivot = "0.0"
+            for index in range(1, self.n_states):
+                pivot = f"max({pivot},{logit_expressions[index]})"
+            sum_terms = [f"exp(-({pivot}))"] + [
+                f"exp({logit_expressions[index]}-({pivot}))" for index in range(1, self.n_states)
+            ]
+            return f"({state_exprs[0]}-kt*(({pivot})+log(max(1e-300,{'+'.join(sum_terms)}))))"
+
+        state_expressions_fused = [state_expression(index, True) for index in range(self.n_states)]
+        state_expressions_classical = [state_expression(index, False) for index in range(self.n_states)]
+        v_fused_expression = log_sum_exp_expression(state_expressions_fused)
+        v_classical_expression = log_sum_exp_expression(state_expressions_classical)
+        # bias_scale applied ONCE on the outside of the difference -- correct only as long as
+        # whatever sets {prefix}_bias_scale/{prefix}_f_{k} keeps this Force and the classical
+        # V_0 Force (same prefix, shared Context-level global parameters) in sync; both default
+        # to the SAME OpenMM global parameter namespace here by construction (see class docstring).
+        energy_expression = (
+            f"{self.prefix}_bias_scale*(({v_fused_expression})-({v_classical_expression}))"
+        )
+        self.force = openmm.CustomCVForce(energy_expression)
+        self.force.addGlobalParameter("kt", kt)
+        self.force.addGlobalParameter("beta", beta)
+        self.force.addGlobalParameter(f"{self.prefix}_bias_scale", 1.0)
+        for index in range(self.n_states):
+            self.force.addGlobalParameter(f"{self.prefix}_f_{index}", 0.0)
+        self._cv_keeper: list[Any] = []
+        self._int_cv_force_xmls: list[str] = []
+        self._basis_cv_indices: list[int] = []
+        for basis_index, basis_force in enumerate(basis_forces):
+            self._cv_keeper.append(basis_force)
+            cv_index = self.force.addCollectiveVariable(f"neural_basis_{basis_index}", basis_force)
+            self._basis_cv_indices.append(cv_index)
+        self.neural_path_protocol_sha256 = controller.protocol_sha256(lambdas=self.lambdas)
+
+    def addCollectiveVariable(self, name: str, cv_force: Any) -> int:
+        # Mirrors OuterLambdaIBSBiasForce.addCollectiveVariable's `_int`-suffix XML
+        # stashing (not needed by 013-A itself, but IBSSampler._build_probe_context
+        # duck-types on this exact attribute -- keeping it here means this class is
+        # already ready for 013-B/C's IBSSampler-based energy collection later).
+        variable_name = _nonempty_string(name, "collective variable name")
+        if variable_name.startswith("neural_basis_"):
+            raise NeuralPathConfigError("neural_basis_* 名称由构造函数保留")
+        self._cv_keeper.append(cv_force)
+        if variable_name.endswith("_int"):
+            openmm, _ = _require_openmm()
+            self._int_cv_force_xmls.append(openmm.XmlSerializer.serialize(cv_force))
+        return self.force.addCollectiveVariable(variable_name, cv_force)
+
+    def get_force(self):
+        return self.force
+
+    def setForceGroup(self, group_id: int) -> None:
+        self.force.setForceGroup(group_id)
+
+    def set_bias_enabled(self, context: Any, enabled: bool) -> None:
+        context.setParameter(f"{self.prefix}_bias_scale", 1.0 if enabled else 0.0)
+
+    def update_parameters(self, context: Any, f_values: Sequence[float]) -> None:
+        if len(f_values) != self.n_states:
+            raise NeuralPathConfigError("f_values 数量与 IBS 状态数不一致")
+        for index, value in enumerate(f_values):
+            context.setParameter(f"{self.prefix}_f_{index}", _finite_float(value, f"f_values[{index}]"))
+
+    def get_centered_basis_energies_kj_mol(self, context: Any) -> tuple[float, ...]:
+        values = self.force.getCollectiveVariableValues(context)
+        return tuple(
+            _finite_float(values[index], f"neural_basis[{basis_index}]")
+            for basis_index, index in enumerate(self._basis_cv_indices)
+        )
+
+
 def evaluate_outer_lambda_force_group_states(
     context,
     lambdas: Iterable[float],
@@ -2055,7 +2460,7 @@ def evaluate_outer_lambda_force_group_states(
     return tuple(energies)
 
 
-def run_mace_decomposition_nvt_smoke(
+def run_mace_decomposition_nvt(
     controller: OuterLambdaController,
     base_system,
     *,
@@ -2074,7 +2479,7 @@ def run_mace_decomposition_nvt_smoke(
     platform_name: str = "CUDA",
     random_seed: int = 20260730,
 ) -> dict[str, Any]:
-    """在 base System 深拷贝中运行真实 MACE 路径短 NVT，不修改调用方 System。"""
+    """在 base System 深拷贝中运行真实 MACE 路径 NVT，不修改调用方 System。"""
 
     if isinstance(n_steps, bool) or not isinstance(n_steps, int) or n_steps <= 0:
         raise NeuralPathConfigError("n_steps 必须是正整数")
@@ -2096,7 +2501,7 @@ def run_mace_decomposition_nvt_smoke(
     normalized_positions = _normalize_frame_collection([positions_nm])[0]
     box_rows = _normalize_box_vectors_nm(box_vectors_nm)
     if box_rows is None:
-        raise NeuralPathConfigError("MACE NVT smoke 必须提供周期盒")
+        raise NeuralPathConfigError("MACE NVT 必须提供周期盒")
     openmm, unit = _require_openmm()
     try:
         system_xml = openmm.XmlSerializer.serialize(base_system)
@@ -2109,7 +2514,7 @@ def run_mace_decomposition_nvt_smoke(
         raise NeuralPathConfigError(
             "base System 粒子数与 positions_nm 不一致"
         )
-    # NVT smoke 明确移除复制体中的 barostat；原 System 不受影响。
+    # NVT 明确移除复制体中的 barostat；原 System 不受影响。
     for force_index in reversed(range(system.getNumForces())):
         force_name = type(system.getForce(force_index)).__name__
         if "Barostat" in force_name:
@@ -2146,6 +2551,8 @@ def run_mace_decomposition_nvt_smoke(
     integrator.setRandomNumberSeed(int(random_seed))
     platform = openmm.Platform.getPlatformByName(platform_name)
     samples = []
+    integration_seconds = 0.0
+    diagnostic_seconds = 0.0
     started = time.perf_counter()
     try:
         context = openmm.Context(system, integrator, platform)
@@ -2163,13 +2570,16 @@ def run_mace_decomposition_nvt_smoke(
         base_mask = ((1 << 32) - 1) ^ path_mask
         while completed < n_steps:
             chunk = min(report_interval, n_steps - completed)
+            integration_started = time.perf_counter()
             integrator.step(chunk)
+            integration_seconds += time.perf_counter() - integration_started
             completed += chunk
+            diagnostic_started = time.perf_counter()
             base_state = context.getState(
                 getEnergy=True, groups=base_mask
             )
             path_state = context.getState(
-                getEnergy=True, groups=path_mask
+                getEnergy=True, getForces=True, groups=path_mask
             )
             total_state = context.getState(
                 getEnergy=True,
@@ -2188,11 +2598,22 @@ def run_mace_decomposition_nvt_smoke(
             forces = total_state.getForces(asNumpy=True).value_in_unit(
                 unit.kilojoules_per_mole / unit.nanometer
             )
+            path_forces = path_state.getForces(
+                asNumpy=True
+            ).value_in_unit(
+                unit.kilojoules_per_mole / unit.nanometer
+            )
             force_norms = [
                 math.sqrt(
                     math.fsum(float(component) ** 2 for component in vector)
                 )
                 for vector in forces
+            ]
+            path_force_norms = [
+                math.sqrt(
+                    math.fsum(float(component) ** 2 for component in vector)
+                )
+                for vector in path_forces
             ]
             current_positions = total_state.getPositions(
                 asNumpy=True
@@ -2203,6 +2624,7 @@ def run_mace_decomposition_nvt_smoke(
                     for value in (base_energy, path_energy, total_energy)
                 )
                 and all(math.isfinite(value) for value in force_norms)
+                and all(math.isfinite(value) for value in path_force_norms)
             )
             if not finite:
                 raise TorchForceDeploymentError(
@@ -2220,6 +2642,9 @@ def run_mace_decomposition_nvt_smoke(
                     "max_total_force_kj_mol_nm": max(
                         force_norms, default=0.0
                     ),
+                    "max_path_force_kj_mol_nm": max(
+                        path_force_norms, default=0.0
+                    ),
                     "support_domain": [
                         evaluation.payload()
                         for evaluation in controller.evaluate_support_domains(
@@ -2235,6 +2660,7 @@ def run_mace_decomposition_nvt_smoke(
                     ],
                 }
             )
+            diagnostic_seconds += time.perf_counter() - diagnostic_started
     except Exception as exc:
         if isinstance(
             exc,
@@ -2247,17 +2673,29 @@ def run_mace_decomposition_nvt_smoke(
         ):
             raise
         raise TorchForceDeploymentError(
-            f"MACE decomposition NVT smoke 失败: {exc}"
+            f"MACE decomposition NVT 失败: {exc}"
         ) from exc
     finally:
         if "context" in locals():
             del context
         del integrator
     elapsed = time.perf_counter() - started
+    support_violation_count = sum(
+        1
+        for sample in samples
+        if any(
+            not evaluation["supported"]
+            for evaluation in sample["support_domain"]
+        )
+    )
+    fail_on_support = (
+        controller.safety is not None
+        and controller.safety.fail_on_support_domain_violation
+    )
     return {
-        "report_type": "outer_lambda_mace_decomposition_nvt_smoke",
+        "report_type": "outer_lambda_mace_decomposition_nvt",
         "report_version": 1,
-        "passed": True,
+        "passed": not (support_violation_count and fail_on_support),
         "platform": platform_name,
         "device": device,
         "lambda": lam,
@@ -2266,6 +2704,16 @@ def run_mace_decomposition_nvt_smoke(
         "report_interval": report_interval,
         "elapsed_seconds": elapsed,
         "seconds_per_step": elapsed / n_steps,
+        "integration_seconds": integration_seconds,
+        "integration_seconds_per_step": integration_seconds / n_steps,
+        "diagnostic_seconds": diagnostic_seconds,
+        "diagnostic_seconds_per_report": (
+            diagnostic_seconds / len(samples) if samples else None
+        ),
+        "support_domain_configured": all(
+            basis.support_domain is not None for basis in controller.bases
+        ),
+        "support_domain_violation_count": support_violation_count,
         "samples": samples,
         "base_energy_kj_mol": summarize_finite_series(
             [sample["base_energy_kj_mol"] for sample in samples]
@@ -2279,6 +2727,9 @@ def run_mace_decomposition_nvt_smoke(
         "max_total_force_kj_mol_nm": summarize_finite_series(
             [sample["max_total_force_kj_mol_nm"] for sample in samples]
         ),
+        "max_path_force_kj_mol_nm": summarize_finite_series(
+            [sample["max_path_force_kj_mol_nm"] for sample in samples]
+        ),
         "max_energy_closure_error_kj_mol": max(
             (
                 abs(sample["energy_closure_error_kj_mol"])
@@ -2287,6 +2738,692 @@ def run_mace_decomposition_nvt_smoke(
             default=0.0,
         ),
         "protocol_sha256": controller.protocol_sha256(lambdas=[lam]),
+    }
+
+
+def run_mace_decomposition_nvt_smoke(*args, **kwargs) -> dict[str, Any]:
+    """兼容旧调用的快速连通性包装；正式验收使用通用 NVT 执行器。"""
+
+    report = run_mace_decomposition_nvt(*args, **kwargs)
+    report["report_type"] = "outer_lambda_mace_decomposition_nvt_smoke"
+    return report
+
+
+def _openmm_system_degrees_of_freedom(system: Any) -> int:
+    """计算恒温诊断使用的经典自由度。"""
+
+    openmm, unit = _require_openmm()
+    positive_mass_particles = sum(
+        1
+        for index in range(system.getNumParticles())
+        if system.getParticleMass(index).value_in_unit(unit.dalton) > 0.0
+    )
+    dof = 3 * positive_mass_particles - system.getNumConstraints()
+    if any(
+        isinstance(system.getForce(index), openmm.CMMotionRemover)
+        for index in range(system.getNumForces())
+    ):
+        dof -= 3
+    if dof <= 0:
+        raise NeuralPathConfigError("OpenMM System 的有效自由度必须为正")
+    return dof
+
+
+def _aligned_selected_rmsd_nm(
+    positions_nm: Sequence[Sequence[float]],
+    reference_positions_nm: Sequence[Sequence[float]],
+    atom_indices: Sequence[int],
+    box_vectors_nm: Sequence[Sequence[float]],
+) -> float:
+    """minimum-image 后对固定选择做 Kabsch 对齐 RMSD。"""
+
+    import numpy as np
+
+    current = np.asarray(positions_nm, dtype=np.float64)
+    reference = np.asarray(reference_positions_nm, dtype=np.float64)
+    indices = list(atom_indices)
+    box = np.asarray(_normalize_box_vectors_nm(box_vectors_nm), dtype=np.float64)
+    inverse_box = np.linalg.inv(box)
+
+    def image_selected(frame):
+        selected = frame[indices].copy()
+        anchor = selected[0].copy()
+        displacement = selected - anchor
+        fractional = displacement @ inverse_box
+        displacement -= np.floor(fractional + 0.5) @ box
+        return anchor + displacement
+
+    mobile = image_selected(current)
+    target = image_selected(reference)
+    mobile -= np.mean(mobile, axis=0)
+    target -= np.mean(target, axis=0)
+    covariance = mobile.T @ target
+    left, _, right = np.linalg.svd(covariance)
+    correction = np.identity(3)
+    correction[2, 2] = np.sign(np.linalg.det(left @ right))
+    rotation = left @ correction @ right
+    difference = mobile @ rotation - target
+    return float(np.sqrt(np.mean(np.sum(difference * difference, axis=1))))
+
+
+def run_mace_decomposition_mts_arm(
+    controller: OuterLambdaController,
+    base_system: Any,
+    *,
+    atomic_numbers: Sequence[int],
+    ligand_indices: Sequence[int],
+    environment_indices: Sequence[int],
+    positions_nm: Sequence[Sequence[float]],
+    box_vectors_nm: Sequence[Sequence[float]],
+    torsion_atom_indices: Sequence[int],
+    mts_ratio: int,
+    lambda_value: float = 0.5,
+    n_inner_steps: int = 10_000,
+    report_interval_inner_steps: int = 100,
+    inner_timestep_fs: float = 0.5,
+    temperature_kelvin: float = 300.0,
+    friction_per_ps: float = 1.0,
+    device: str = "cuda",
+    platform_name: str = "CUDA",
+    random_seed: int = 20260730,
+    required_coefficient: float = 0.09,
+) -> dict[str, Any]:
+    """运行 EXP-009 单个 BAOAB-rRESPA MTS ratio，固定 MACE 为慢力。"""
+
+    import numpy as np
+
+    if (
+        isinstance(mts_ratio, bool)
+        or not isinstance(mts_ratio, int)
+        or mts_ratio not in {1, 2, 4, 8}
+    ):
+        raise NeuralPathConfigError("mts_ratio 必须是 1/2/4/8")
+    if controller.basis_count != 1 or not controller.enabled:
+        raise NeuralPathConfigError("EXP-009 要求 enabled 且 M=1")
+    frozen_coefficient = _finite_float(
+        required_coefficient, "required_coefficient"
+    )
+    if controller.coefficients != (frozen_coefficient,):
+        raise NeuralPathConfigError(
+            "EXP-009 coefficient 已冻结为 "
+            f"{frozen_coefficient}，配置为 {controller.coefficients}"
+        )
+    for field, value in (
+        ("n_inner_steps", n_inner_steps),
+        ("report_interval_inner_steps", report_interval_inner_steps),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise NeuralPathConfigError(f"{field} 必须是正整数")
+        if value % mts_ratio != 0:
+            raise NeuralPathConfigError(
+                f"{field} 必须能被 mts_ratio={mts_ratio} 整除"
+            )
+    lam = _finite_float(lambda_value, "lambda_value")
+    controller.envelope(lam)
+    inner_dt = _finite_float(inner_timestep_fs, "inner_timestep_fs")
+    temperature = _finite_float(temperature_kelvin, "temperature_kelvin")
+    friction = _finite_float(friction_per_ps, "friction_per_ps")
+    if min(inner_dt, temperature, friction) <= 0.0:
+        raise NeuralPathConfigError("MTS 时间步、温度和摩擦必须为正")
+    normalized_positions = _normalize_frame_collection([positions_nm])[0]
+    box_rows = _normalize_box_vectors_nm(box_vectors_nm)
+    if box_rows is None:
+        raise NeuralPathConfigError("MACE MTS 必须提供周期盒")
+    initial_support = controller.evaluate_support_domains(
+        normalized_positions,
+        box_vectors_nm=box_rows,
+    )
+    initial_support_payload = [
+        evaluation.payload() for evaluation in initial_support
+    ]
+    initial_unsupported = [
+        evaluation
+        for evaluation in initial_support
+        if not evaluation.supported
+    ]
+    if (
+        initial_unsupported
+        and controller.safety is not None
+        and controller.safety.fail_on_support_domain_violation
+    ):
+        details = "; ".join(
+            f"{evaluation.basis_name}: violations="
+            f"{','.join(evaluation.violations)}, "
+            f"max_pair={evaluation.max_pair_distance_nm!r} nm, "
+            f"Rg={evaluation.radius_of_gyration_nm:.9g} nm"
+            for evaluation in initial_unsupported
+        )
+        raise NeuralPathFrameError(
+            "MACE MTS 初始坐标不在冻结支持域，积分未启动: " + details
+        )
+    openmm, unit = _require_openmm()
+    try:
+        system = openmm.XmlSerializer.deserialize(
+            openmm.XmlSerializer.serialize(base_system)
+        )
+    except Exception as exc:
+        raise TorchForceDeploymentError(f"无法复制 base System: {exc}") from exc
+    if system.getNumParticles() != len(normalized_positions):
+        raise NeuralPathConfigError("base System 粒子数与 positions 不一致")
+    for force_index in reversed(range(system.getNumForces())):
+        force = system.getForce(force_index)
+        if "Barostat" in type(force).__name__:
+            system.removeForce(force_index)
+            continue
+        force.setForceGroup(0)
+        if hasattr(force, "setReciprocalSpaceForceGroup"):
+            force.setReciprocalSpaceForceGroup(0)
+    path_group = 31
+    path_force = build_mace_decomposition_python_force(
+        controller,
+        atomic_numbers=atomic_numbers,
+        ligand_indices=ligand_indices,
+        environment_indices=environment_indices,
+        default_lambda=lam,
+        device=device,
+        force_group=path_group,
+    )
+    if (
+        platform_name.split(":", 1)[0].strip().upper() == "CUDA"
+        and device.lower() == "cuda"
+        and type(path_force).__name__ == "PythonForce"
+    ):
+        raise TorchForceDeploymentError(
+            "EXP-009 后端不兼容: 当前完整 MACE 路径是 "
+            "openmm.PythonForce，节点实测它在 OpenMM CUDA "
+            "MTSLangevinIntegrator force-group 内核中触发 "
+            "CUDA_ERROR_INVALID_HANDLE。普通 LangevinMiddleIntegrator "
+            "通过不能证明该组合可用于 MTS。禁止继续重试或调 coefficient；"
+            "预注册决策为 start_exp010_cheap_cv_due_to_backend。"
+        )
+    system.addForce(path_force)
+    vectors = tuple(
+        openmm.Vec3(*row) * unit.nanometer for row in box_rows
+    )
+    system.setDefaultPeriodicBoxVectors(*vectors)
+    outer_timestep_fs = mts_ratio * inner_dt
+    integrator = openmm.MTSLangevinIntegrator(
+        temperature * unit.kelvin,
+        friction / unit.picosecond,
+        outer_timestep_fs * unit.femtoseconds,
+        [(path_group, 1), (0, mts_ratio)],
+    )
+    integrator.setRandomNumberSeed(int(random_seed))
+    platform = openmm.Platform.getPlatformByName(platform_name)
+    dof = _openmm_system_degrees_of_freedom(system)
+    gas_constant = unit.MOLAR_GAS_CONSTANT_R.value_in_unit(
+        unit.kilojoules_per_mole / unit.kelvin
+    )
+    reference_positions = np.asarray(normalized_positions, dtype=np.float64)
+    samples = []
+    integration_seconds = 0.0
+    diagnostic_seconds = 0.0
+    started = time.perf_counter()
+    try:
+        context = openmm.Context(system, integrator, platform)
+        context.setPositions(
+            [openmm.Vec3(*position) for position in normalized_positions]
+            * unit.nanometer
+        )
+        context.setPeriodicBoxVectors(*vectors)
+        context.setParameter("outer_lambda", lam)
+        context.setVelocitiesToTemperature(
+            temperature * unit.kelvin, int(random_seed)
+        )
+        completed_inner = 0
+        outer_chunk = report_interval_inner_steps // mts_ratio
+        path_mask = 1 << path_group
+        base_mask = 1
+        while completed_inner < n_inner_steps:
+            integration_started = time.perf_counter()
+            integrator.step(outer_chunk)
+            integration_seconds += time.perf_counter() - integration_started
+            completed_inner += report_interval_inner_steps
+            diagnostic_started = time.perf_counter()
+            base_state = context.getState(getEnergy=True, groups=base_mask)
+            path_state = context.getState(
+                getEnergy=True, getForces=True, groups=path_mask
+            )
+            total_state = context.getState(
+                getEnergy=True,
+                getForces=True,
+                getPositions=True,
+            )
+            base_energy = base_state.getPotentialEnergy().value_in_unit(
+                unit.kilojoules_per_mole
+            )
+            path_energy = path_state.getPotentialEnergy().value_in_unit(
+                unit.kilojoules_per_mole
+            )
+            total_energy = total_state.getPotentialEnergy().value_in_unit(
+                unit.kilojoules_per_mole
+            )
+            kinetic_energy = total_state.getKineticEnergy().value_in_unit(
+                unit.kilojoules_per_mole
+            )
+            instantaneous_temperature = (
+                2.0 * kinetic_energy / (dof * gas_constant)
+            )
+            path_forces = path_state.getForces(
+                asNumpy=True
+            ).value_in_unit(
+                unit.kilojoules_per_mole / unit.nanometer
+            )
+            path_force_norms = np.linalg.norm(
+                np.asarray(path_forces, dtype=np.float64), axis=1
+            )
+            current_positions = total_state.getPositions(
+                asNumpy=True
+            ).value_in_unit(unit.nanometer)
+            current_positions_array = np.asarray(
+                current_positions, dtype=np.float64
+            )
+            support = controller.evaluate_support_domains(
+                current_positions_array.tolist(),
+                box_vectors_nm=box_rows,
+            )
+            sample = {
+                "inner_step": completed_inner,
+                "physical_time_ps": completed_inner * inner_dt / 1000.0,
+                "base_energy_kj_mol": float(base_energy),
+                "path_energy_kj_mol": float(path_energy),
+                "total_energy_kj_mol": float(total_energy),
+                "kinetic_energy_kj_mol": float(kinetic_energy),
+                "temperature_kelvin": float(instantaneous_temperature),
+                "energy_closure_error_kj_mol": float(
+                    total_energy - base_energy - path_energy
+                ),
+                "max_path_force_kj_mol_nm": float(
+                    np.max(path_force_norms)
+                    if path_force_norms.size
+                    else 0.0
+                ),
+                "slow_torsion_degrees": periodic_dihedral_degrees(
+                    current_positions_array.tolist(),
+                    torsion_atom_indices,
+                    box_vectors_nm=box_rows,
+                ),
+                "selected_aligned_rmsd_nm": _aligned_selected_rmsd_nm(
+                    current_positions_array,
+                    reference_positions,
+                    ligand_indices,
+                    box_rows,
+                ),
+                "support_domain": [
+                    evaluation.payload() for evaluation in support
+                ],
+            }
+            if any(
+                not math.isfinite(float(value))
+                for key, value in sample.items()
+                if key
+                not in {
+                    "support_domain",
+                    "inner_step",
+                }
+            ):
+                raise TorchForceDeploymentError(
+                    f"MACE MTS N={mts_ratio} 出现非有限诊断"
+                )
+            samples.append(sample)
+            diagnostic_seconds += time.perf_counter() - diagnostic_started
+    except Exception as exc:
+        if isinstance(
+            exc,
+            (
+                NeuralPathConfigError,
+                NeuralPathIntegrityError,
+                NeuralPathFrameError,
+                TorchForceDeploymentError,
+            ),
+        ):
+            raise
+        raise TorchForceDeploymentError(
+            f"MACE MTS N={mts_ratio} 失败: {exc}"
+        ) from exc
+    finally:
+        if "context" in locals():
+            del context
+        del integrator
+    elapsed = time.perf_counter() - started
+    support_violations = sum(
+        1
+        for sample in samples
+        if any(
+            not evaluation["supported"]
+            for evaluation in sample["support_domain"]
+        )
+    )
+    simulated_ns = n_inner_steps * inner_dt * 1.0e-6
+    return {
+        "report_type": "outer_lambda_mace_mts_arm",
+        "report_version": 1,
+        "passed": support_violations == 0,
+        "mts_ratio": mts_ratio,
+        "inner_timestep_fs": inner_dt,
+        "outer_timestep_fs": outer_timestep_fs,
+        "mace_interval_fs": outer_timestep_fs,
+        "n_inner_steps": n_inner_steps,
+        "n_outer_steps": n_inner_steps // mts_ratio,
+        "simulated_time_ps": n_inner_steps * inner_dt / 1000.0,
+        "report_interval_inner_steps": report_interval_inner_steps,
+        "temperature_target_kelvin": temperature,
+        "lambda": lam,
+        "coefficient": controller.coefficients[0],
+        "random_seed": int(random_seed),
+        "platform": platform_name,
+        "device": device,
+        "force_groups": {
+            "base": 0,
+            "mace_path": path_group,
+            "mts_groups": [[path_group, 1], [0, mts_ratio]],
+        },
+        "elapsed_seconds": elapsed,
+        "integration_seconds": integration_seconds,
+        "diagnostic_seconds": diagnostic_seconds,
+        "integration_seconds_per_inner_step": (
+            integration_seconds / n_inner_steps
+        ),
+        "ns_per_day": (
+            simulated_ns * 86400.0 / integration_seconds
+            if integration_seconds > 0.0
+            else None
+        ),
+        "support_domain_configured": all(
+            basis.support_domain is not None for basis in controller.bases
+        ),
+        "initial_support_domain": initial_support_payload,
+        "support_domain_violation_count": support_violations,
+        "max_energy_closure_error_kj_mol": max(
+            (
+                abs(sample["energy_closure_error_kj_mol"])
+                for sample in samples
+            ),
+            default=0.0,
+        ),
+        "base_energy_kj_mol": summarize_finite_series(
+            [sample["base_energy_kj_mol"] for sample in samples]
+        ),
+        "path_energy_kj_mol": summarize_finite_series(
+            [sample["path_energy_kj_mol"] for sample in samples]
+        ),
+        "total_energy_kj_mol": summarize_finite_series(
+            [sample["total_energy_kj_mol"] for sample in samples]
+        ),
+        "temperature_kelvin": summarize_finite_series(
+            [sample["temperature_kelvin"] for sample in samples]
+        ),
+        "max_path_force_kj_mol_nm": summarize_finite_series(
+            [sample["max_path_force_kj_mol_nm"] for sample in samples]
+        ),
+        "selected_aligned_rmsd_nm": summarize_finite_series(
+            [sample["selected_aligned_rmsd_nm"] for sample in samples]
+        ),
+        "slow_torsion": analyze_periodic_torsion_series(
+            [sample["slow_torsion_degrees"] for sample in samples]
+        ),
+        "samples": samples,
+        "protocol_sha256": controller.protocol_sha256(lambdas=[lam]),
+    }
+
+
+def _jensen_shannon_divergence(
+    probabilities_a: Sequence[float],
+    probabilities_b: Sequence[float],
+) -> float:
+    """自然对数定义的有限 Jensen-Shannon divergence。"""
+
+    a = tuple(_finite_float(value, "probability_a") for value in probabilities_a)
+    b = tuple(_finite_float(value, "probability_b") for value in probabilities_b)
+    if len(a) != len(b) or not a:
+        raise NeuralPathConfigError("概率向量必须等长且非空")
+    if any(value < 0.0 for value in a + b):
+        raise NeuralPathConfigError("概率不允许为负")
+    sum_a = math.fsum(a)
+    sum_b = math.fsum(b)
+    if min(sum_a, sum_b) <= 0.0:
+        raise NeuralPathConfigError("概率向量总和必须为正")
+    normalized_a = tuple(value / sum_a for value in a)
+    normalized_b = tuple(value / sum_b for value in b)
+    midpoint = tuple(
+        0.5 * (left + right)
+        for left, right in zip(normalized_a, normalized_b, strict=True)
+    )
+
+    def divergence(values):
+        return math.fsum(
+            value * math.log(value / center)
+            for value, center in zip(values, midpoint, strict=True)
+            if value > 0.0
+        )
+
+    return 0.5 * (divergence(normalized_a) + divergence(normalized_b))
+
+
+def assess_mace_mts_matrix(
+    arm_reports: Sequence[Mapping[str, Any]],
+    *,
+    max_path_force_kj_mol_nm: float = 250.0,
+    max_energy_closure_error_kj_mol: float = 0.1,
+    max_temperature_mean_difference_kelvin: float = 5.0,
+    max_energy_standardized_mean_difference: float = 0.25,
+    max_torsion_js_divergence: float = 0.05,
+    max_rmsd_mean_difference_nm: float = 0.05,
+    minimum_n4_ns_per_day: float = 1.0,
+) -> dict[str, Any]:
+    """以 N=1 为参考执行 EXP-009 的 N=1/2/4 分布和性能硬门。"""
+
+    reports = {int(report.get("mts_ratio", -1)): report for report in arm_reports}
+    if set(reports) != {1, 2, 4} or len(arm_reports) != 3:
+        raise NeuralPathConfigError("MTS matrix 必须恰好包含 N=1/2/4")
+    limits = {
+        "max_path_force_kj_mol_nm": _finite_float(
+            max_path_force_kj_mol_nm, "max_path_force_kj_mol_nm"
+        ),
+        "max_energy_closure_error_kj_mol": _finite_float(
+            max_energy_closure_error_kj_mol,
+            "max_energy_closure_error_kj_mol",
+        ),
+        "max_temperature_mean_difference_kelvin": _finite_float(
+            max_temperature_mean_difference_kelvin,
+            "max_temperature_mean_difference_kelvin",
+        ),
+        "max_energy_standardized_mean_difference": _finite_float(
+            max_energy_standardized_mean_difference,
+            "max_energy_standardized_mean_difference",
+        ),
+        "max_torsion_js_divergence": _finite_float(
+            max_torsion_js_divergence, "max_torsion_js_divergence"
+        ),
+        "max_rmsd_mean_difference_nm": _finite_float(
+            max_rmsd_mean_difference_nm,
+            "max_rmsd_mean_difference_nm",
+        ),
+        "minimum_n4_ns_per_day": _finite_float(
+            minimum_n4_ns_per_day, "minimum_n4_ns_per_day"
+        ),
+    }
+    if min(limits.values()) <= 0.0:
+        raise NeuralPathConfigError("所有 MTS qualification 阈值必须为正")
+    reference = reports[1]
+    reference_energy = reference["total_energy_kj_mol"]
+    reference_temperature = reference["temperature_kelvin"]
+    reference_rmsd = reference["selected_aligned_rmsd_nm"]
+    reference_histogram = reference["slow_torsion"]["histogram"][
+        "probabilities"
+    ]
+    arm_assessments = {}
+    for ratio in (1, 2, 4):
+        report = reports[ratio]
+        energy_scale = max(
+            float(reference_energy["std"]),
+            float(report["total_energy_kj_mol"]["std"]),
+            1.0e-12,
+        )
+        energy_effect = abs(
+            float(report["total_energy_kj_mol"]["mean"])
+            - float(reference_energy["mean"])
+        ) / energy_scale
+        temperature_difference = abs(
+            float(report["temperature_kelvin"]["mean"])
+            - float(reference_temperature["mean"])
+        )
+        rmsd_difference = abs(
+            float(report["selected_aligned_rmsd_nm"]["mean"])
+            - float(reference_rmsd["mean"])
+        )
+        torsion_js = _jensen_shannon_divergence(
+            report["slow_torsion"]["histogram"]["probabilities"],
+            reference_histogram,
+        )
+        checks = {
+            "run_completed": report.get("passed") is True,
+            "support_domain": (
+                report.get("support_domain_configured") is True
+                and report.get("support_domain_violation_count") == 0
+            ),
+            "path_force": (
+                float(report["max_path_force_kj_mol_nm"]["max"])
+                <= limits["max_path_force_kj_mol_nm"]
+            ),
+            "energy_closure": (
+                float(report["max_energy_closure_error_kj_mol"])
+                <= limits["max_energy_closure_error_kj_mol"]
+            ),
+            "temperature_distribution": (
+                temperature_difference
+                <= limits["max_temperature_mean_difference_kelvin"]
+            ),
+            "energy_distribution": (
+                energy_effect
+                <= limits["max_energy_standardized_mean_difference"]
+            ),
+            "torsion_distribution": (
+                torsion_js <= limits["max_torsion_js_divergence"]
+            ),
+            "structure_distribution": (
+                rmsd_difference <= limits["max_rmsd_mean_difference_nm"]
+            ),
+        }
+        arm_assessments[str(ratio)] = {
+            "passed": all(checks.values()),
+            "checks": checks,
+            "observed_vs_n1": {
+                "temperature_mean_difference_kelvin": temperature_difference,
+                "energy_standardized_mean_difference": energy_effect,
+                "torsion_js_divergence": torsion_js,
+                "rmsd_mean_difference_nm": rmsd_difference,
+            },
+            "ns_per_day": report.get("ns_per_day"),
+        }
+    physics_passed = all(
+        arm_assessments[str(ratio)]["passed"] for ratio in (1, 2, 4)
+    )
+    speed_passed = (
+        float(reports[4].get("ns_per_day", 0.0))
+        >= limits["minimum_n4_ns_per_day"]
+    )
+    if not physics_passed:
+        decision = "direct_mace_teacher_only_due_to_mts_bias"
+    elif not speed_passed:
+        decision = "start_exp010_cheap_cv_due_to_cost"
+    else:
+        decision = "qualified_to_test_n8_before_wp5"
+    return {
+        "report_type": "outer_lambda_mace_mts_qualification",
+        "report_version": 1,
+        "qualified": physics_passed and speed_passed,
+        "physics_passed": physics_passed,
+        "speed_passed": speed_passed,
+        "decision": decision,
+        "thresholds": limits,
+        "arms": arm_assessments,
+        "arm_reports": [dict(reports[ratio]) for ratio in (1, 2, 4)],
+    }
+
+
+def assess_mace_nvt_qualification(
+    run_report: Mapping[str, Any],
+    *,
+    minimum_steps: int = 1000,
+    max_path_force_kj_mol_nm: float = 250.0,
+    max_energy_closure_error_kj_mol: float = 0.1,
+    max_integration_seconds_per_step: float = 0.2,
+) -> dict[str, Any]:
+    """对冻结阈值下的 MACE NVT run 执行 WP-4 qualification 判定。"""
+
+    if not isinstance(run_report, Mapping):
+        raise NeuralPathConfigError("run_report 必须是映射")
+    if (
+        isinstance(minimum_steps, bool)
+        or not isinstance(minimum_steps, int)
+        or minimum_steps <= 0
+    ):
+        raise NeuralPathConfigError("minimum_steps 必须是正整数")
+    force_limit = _finite_float(
+        max_path_force_kj_mol_nm, "max_path_force_kj_mol_nm"
+    )
+    closure_limit = _finite_float(
+        max_energy_closure_error_kj_mol,
+        "max_energy_closure_error_kj_mol",
+    )
+    speed_limit = _finite_float(
+        max_integration_seconds_per_step,
+        "max_integration_seconds_per_step",
+    )
+    if min(force_limit, closure_limit, speed_limit) <= 0.0:
+        raise NeuralPathConfigError("qualification 阈值必须为正")
+    path_force_summary = run_report.get("max_path_force_kj_mol_nm")
+    if not isinstance(path_force_summary, Mapping):
+        raise NeuralPathConfigError(
+            "run report 缺少 max_path_force_kj_mol_nm summary"
+        )
+    observed_path_force = _finite_float(
+        path_force_summary.get("max"),
+        "run.max_path_force_kj_mol_nm.max",
+    )
+    observed_closure = _finite_float(
+        run_report.get("max_energy_closure_error_kj_mol"),
+        "run.max_energy_closure_error_kj_mol",
+    )
+    observed_speed = _finite_float(
+        run_report.get("integration_seconds_per_step"),
+        "run.integration_seconds_per_step",
+    )
+    checks = {
+        "run_completed": run_report.get("passed") is True,
+        "minimum_steps": int(run_report.get("n_steps", 0)) >= minimum_steps,
+        "support_domain": (
+            run_report.get("support_domain_configured") is True
+            and run_report.get("support_domain_violation_count") == 0
+        ),
+        "path_force": observed_path_force <= force_limit,
+        "energy_closure": observed_closure <= closure_limit,
+        "integration_speed": observed_speed <= speed_limit,
+    }
+    failed_checks = [name for name, passed in checks.items() if not passed]
+    return {
+        "report_type": "outer_lambda_mace_nvt_qualification",
+        "report_version": 1,
+        "qualified": not failed_checks,
+        "checks": checks,
+        "failed_checks": failed_checks,
+        "thresholds": {
+            "minimum_steps": minimum_steps,
+            "max_path_force_kj_mol_nm": force_limit,
+            "max_energy_closure_error_kj_mol": closure_limit,
+            "max_integration_seconds_per_step": speed_limit,
+        },
+        "observed": {
+            "n_steps": run_report.get("n_steps"),
+            "support_domain_violation_count": run_report.get(
+                "support_domain_violation_count"
+            ),
+            "max_path_force_kj_mol_nm": observed_path_force,
+            "max_energy_closure_error_kj_mol": observed_closure,
+            "integration_seconds_per_step": observed_speed,
+        },
+        "run_report": dict(run_report),
     }
 
 
@@ -2455,6 +3592,179 @@ class IBSEnergyLedger:
                 f"IBS ledger 原子追加失败，已同步回滚: {after}"
             )
         return frame
+
+
+class IBSSamplerNeuralPathAdapter:
+    """在不改 ``ibs_engine.py`` 的情况下扩展现有 IBSSampler 能量收集。
+
+    适配器复用 sampler 的 Context、interaction probe、LRC、TMBAR buffer 和四份
+    production history。唯一替换的方法是 ``collect_energies()``，并额外保留
+    neural-path/basis history 供协议审计。
+    """
+
+    def __init__(
+        self,
+        sampler: Any,
+        controller: OuterLambdaController,
+        lambdas: Iterable[float],
+        ibs_wrapper: OuterLambdaIBSBiasForce,
+    ) -> None:
+        if not isinstance(ibs_wrapper, OuterLambdaIBSBiasForce):
+            raise TypeError(
+                "ibs_wrapper 必须是 OuterLambdaIBSBiasForce"
+            )
+        self.sampler = sampler
+        self.controller = controller
+        self.lambdas = tuple(
+            _finite_float(value, "lambda") for value in lambdas
+        )
+        if len(self.lambdas) != int(getattr(sampler, "n_states", -1)):
+            raise NeuralPathConfigError(
+                "lambda schedule 数量与 sampler.n_states 不一致"
+            )
+        if ibs_wrapper.lambdas != self.lambdas:
+            raise NeuralPathConfigError(
+                "sampler adapter 与 IBS wrapper 的 lambda schedule 不一致"
+            )
+        if ibs_wrapper.controller.protocol_sha256(lambdas=self.lambdas) != (
+            controller.protocol_sha256(lambdas=self.lambdas)
+        ):
+            raise NeuralPathConfigError(
+                "sampler adapter 与 IBS wrapper 的神经路径协议不一致"
+            )
+        required_histories = (
+            "energy_buffer",
+            "energy_history",
+            "bias_history",
+            "base_energy_history",
+        )
+        missing = [
+            name for name in required_histories if not hasattr(sampler, name)
+        ]
+        if missing:
+            raise NeuralPathConfigError(
+                "sampler 缺少历史字段: " + ", ".join(missing)
+            )
+        self.ibs_wrapper = ibs_wrapper
+        self.neural_path_energy_history: list[tuple[float, ...]] = []
+        self.basis_energy_history: list[tuple[float, ...]] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.sampler, name)
+
+    def _record_query(self, success: bool, reason: str | None = None) -> None:
+        recorder = getattr(self.sampler, "_record_energy_query_result", None)
+        if callable(recorder):
+            recorder(success, reason)
+
+    def collect_energies(self):
+        """收集一帧完整神经 IBS 账本；任一分量失败则不追加任何 history。"""
+
+        import numpy as np
+
+        openmm, unit = _require_openmm()
+        del openmm
+        self.sampler._energy_query_attempts = int(
+            getattr(self.sampler, "_energy_query_attempts", 0)
+        ) + 1
+        try:
+            base_state = self.sampler.context.getState(
+                getEnergy=True, groups={0, 2, 3, 5}
+            )
+            base_energy = base_state.getPotentialEnergy().value_in_unit(
+                unit.kilojoules_per_mole
+            )
+            bias_state = self.sampler.context.getState(
+                getEnergy=True, groups={1, 4}
+            )
+            sampling_bias = bias_state.getPotentialEnergy().value_in_unit(
+                unit.kilojoules_per_mole
+            )
+            original = tuple(
+                float(value)
+                for value in self.sampler._collect_interaction_energies()
+            )
+            lrc = tuple(
+                float(value)
+                for value in self.sampler._lj_tail_correction_kj_mol()
+            )
+            centered_basis = (
+                self.ibs_wrapper.get_centered_basis_energies_kj_mol(
+                    self.sampler.context
+                )
+            )
+            raw_basis = tuple(
+                centered + basis.energy_offset_kj_mol
+                for centered, basis in zip(
+                    centered_basis, self.controller.bases, strict=True
+                )
+            )
+            frame = compose_ibs_energy_frame(
+                self.controller,
+                lambdas=self.lambdas,
+                original_interaction_energies_kj_mol=original,
+                lrc_state_energies_kj_mol=lrc,
+                basis_energies_kj_mol=raw_basis,
+                sampling_bias_energy_kj_mol=sampling_bias,
+                base_energy_kj_mol=base_energy,
+            )
+            if frame.bias_cv_state_energies_kj_mol:
+                self.sampler.e_offset = (
+                    frame.bias_cv_state_energies_kj_mol[0]
+                )
+            relative_bias_cv = np.asarray(
+                [
+                    value - float(self.sampler.e_offset)
+                    for value in frame.bias_cv_state_energies_kj_mol
+                ],
+                dtype=np.float64,
+            )
+            before = {
+                "energy_buffer": len(self.sampler.energy_buffer),
+                "energy_history": len(self.sampler.energy_history),
+                "bias_history": len(self.sampler.bias_history),
+                "base_energy_history": len(self.sampler.base_energy_history),
+                "neural_path": len(self.neural_path_energy_history),
+                "basis": len(self.basis_energy_history),
+            }
+            try:
+                self.sampler.energy_buffer.append(relative_bias_cv)
+                self.sampler.energy_history.append(
+                    np.asarray(
+                        frame.target_state_energies_kj_mol,
+                        dtype=np.float64,
+                    )
+                )
+                self.sampler.bias_history.append(
+                    frame.sampling_bias_energy_kj_mol
+                )
+                self.sampler.base_energy_history.append(
+                    frame.base_energy_kj_mol
+                )
+                self.neural_path_energy_history.append(
+                    frame.neural_path_state_energies_kj_mol
+                )
+                self.basis_energy_history.append(
+                    frame.basis_energies_kj_mol
+                )
+            except Exception:
+                for name, history in (
+                    ("energy_buffer", self.sampler.energy_buffer),
+                    ("energy_history", self.sampler.energy_history),
+                    ("bias_history", self.sampler.bias_history),
+                    ("base_energy_history", self.sampler.base_energy_history),
+                    ("neural_path", self.neural_path_energy_history),
+                    ("basis", self.basis_energy_history),
+                ):
+                    del history[before[name] :]
+                raise
+            self._record_query(True)
+            return relative_bias_cv
+        except Exception as exc:
+            if isinstance(exc, RuntimeError) and "hard gate" in str(exc):
+                raise
+            self._record_query(False, f"neural_path:{type(exc).__name__}")
+            return np.full(len(self.lambdas), np.nan, dtype=np.float64)
 
 
 @dataclass(frozen=True)
@@ -2887,6 +4197,7 @@ def benchmark_existing_orb_mace_basis(
     ligand_indices: Sequence[int],
     environment_indices: Sequence[int],
     atomic_numbers: Sequence[int],
+    box_vectors_by_frame_nm: Sequence[Sequence[Sequence[float]]] | None = None,
 ) -> dict[str, Any]:
     """用项目已有 MACE/ORB pipeline 批量标注并组合外层 λ，不改生产 System。"""
 
@@ -2905,6 +4216,23 @@ def benchmark_existing_orb_mace_basis(
             "该 benchmark 要求 basis.periodic=false"
         )
     frames = _normalize_frame_collection(frames_nm)
+    if box_vectors_by_frame_nm is None:
+        frame_boxes = (None,) * len(frames)
+    else:
+        if len(box_vectors_by_frame_nm) != len(frames):
+            raise NeuralPathConfigError(
+                "box_vectors_by_frame_nm 数量必须与 frames 一致"
+            )
+        frame_boxes = tuple(
+            _normalize_box_vectors_nm(box) for box in box_vectors_by_frame_nm
+        )
+    if (
+        basis_spec.coordinate_imaging == "minimum_image_local"
+        and any(box is None for box in frame_boxes)
+    ):
+        raise NeuralPathConfigError(
+            "minimum_image_local benchmark 必须为每个 frame 提供盒向量"
+        )
     lambda_values = tuple(
         _finite_float(value, "lambda") for value in lambdas
     )
@@ -2930,10 +4258,28 @@ def benchmark_existing_orb_mace_basis(
     ) as adapter:
         effective_device = adapter.device
         label_mode = adapter.label_mode
-        for frame_index, frame in enumerate(frames):
+        for frame_index, (frame, frame_box) in enumerate(
+            zip(frames, frame_boxes, strict=True)
+        ):
             frame_started = time.perf_counter()
+            evaluation_frame = frame
+            if frame_box is not None:
+                import numpy as np
+
+                full_positions = np.asarray(frame, dtype=np.float64).copy()
+                combined_indices = tuple(ligand_indices) + tuple(
+                    environment_indices
+                )
+                full_positions[list(combined_indices)] = (
+                    MaceDecompositionPythonComputation._minimum_image_selected(
+                        full_positions,
+                        list(combined_indices),
+                        np.asarray(frame_box, dtype=np.float64),
+                    )
+                )
+                evaluation_frame = full_positions.tolist()
             evaluation = adapter.evaluate(
-                frame,
+                evaluation_frame,
                 ligand_indices=ligand_indices,
                 environment_indices=environment_indices,
                 atomic_numbers=atomic_numbers,
@@ -2963,7 +4309,9 @@ def benchmark_existing_orb_mace_basis(
                         default=0.0,
                     )
                 )
-            support = controller.evaluate_support_domains(frame)
+            support = controller.evaluate_support_domains(
+                frame, box_vectors_nm=frame_box
+            )
             raw_energies.append(evaluation.energy_kj_mol)
             centered_energies.append(centered)
             max_basis_forces.append(evaluation.max_force_norm_kj_mol_nm)
@@ -4034,6 +5382,1053 @@ def resolve_existing_model_artifact(
     )
 
 
+def periodic_dihedral_degrees(
+    positions_nm: Sequence[Sequence[float]],
+    atom_indices: Sequence[int],
+    *,
+    box_vectors_nm: Sequence[Sequence[float]] | None = None,
+) -> float:
+    """计算四原子周期二面角，返回 ``[-180, 180)`` 度。"""
+
+    import numpy as np
+
+    frame = np.asarray(
+        _normalize_frame_collection([positions_nm])[0], dtype=np.float64
+    )
+    if (
+        not isinstance(atom_indices, Sequence)
+        or isinstance(atom_indices, (str, bytes))
+        or len(atom_indices) != 4
+    ):
+        raise NeuralPathConfigError("torsion atom_indices 必须恰好含 4 个整数")
+    indices = []
+    for position, value in enumerate(atom_indices):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            or value >= len(frame)
+        ):
+            raise NeuralPathConfigError(
+                f"torsion atom_indices[{position}] 超出坐标范围"
+            )
+        indices.append(value)
+    if len(set(indices)) != 4:
+        raise NeuralPathConfigError("torsion atom_indices 不允许重复")
+    points = frame[indices]
+    box = _normalize_box_vectors_nm(box_vectors_nm)
+    inverse_box = None
+    box_array = None
+    if box is not None:
+        box_array = np.asarray(box, dtype=np.float64)
+        inverse_box = np.linalg.inv(box_array)
+
+    def displacement(left, right):
+        vector = np.asarray(right - left, dtype=np.float64)
+        if inverse_box is not None:
+            fractional = vector @ inverse_box
+            vector -= np.floor(fractional + 0.5) @ box_array
+        return vector
+
+    b0 = -displacement(points[0], points[1])
+    b1 = displacement(points[1], points[2])
+    b2 = displacement(points[2], points[3])
+    norm_b1 = float(np.linalg.norm(b1))
+    if norm_b1 <= 1.0e-12:
+        raise NeuralPathFrameError("torsion 中央键长度接近零")
+    axis = b1 / norm_b1
+    v = b0 - np.dot(b0, axis) * axis
+    w = b2 - np.dot(b2, axis) * axis
+    if min(float(np.linalg.norm(v)), float(np.linalg.norm(w))) <= 1.0e-12:
+        raise NeuralPathFrameError("torsion 四原子近共线，角度未定义")
+    angle = math.degrees(
+        math.atan2(float(np.dot(np.cross(axis, v), w)), float(np.dot(v, w)))
+    )
+    return ((angle + 180.0) % 360.0) - 180.0
+
+
+def classify_torsion_basin(angle_degrees: float) -> str:
+    """按预注册三盆定义分类 trans/gauche-/gauche+。"""
+
+    angle = ((_finite_float(angle_degrees, "torsion angle") + 180.0) % 360.0) - 180.0
+    if abs(angle) >= 120.0:
+        return "trans"
+    if angle < 0.0:
+        return "gauche_minus"
+    return "gauche_plus"
+
+
+def analyze_periodic_torsion_series(
+    angles_degrees: Sequence[float],
+) -> dict[str, Any]:
+    """汇总周期 torsion 分布，并用 core hysteresis 统计盆间转换。"""
+
+    import numpy as np
+
+    values = np.asarray(
+        [
+            ((_finite_float(value, "torsion angle") + 180.0) % 360.0)
+            - 180.0
+            for value in angles_degrees
+        ],
+        dtype=np.float64,
+    )
+    if values.size == 0:
+        raise NeuralPathConfigError("torsion series 不能为空")
+    radians = np.deg2rad(values)
+    mean_vector = np.mean(np.exp(1j * radians))
+    circular_mean = math.degrees(math.atan2(mean_vector.imag, mean_vector.real))
+    resultant = float(abs(mean_vector))
+    circular_std = (
+        math.degrees(math.sqrt(max(0.0, -2.0 * math.log(resultant))))
+        if resultant > 0.0
+        else 180.0
+    )
+    basin_order = ("trans", "gauche_minus", "gauche_plus")
+    basin_labels = [classify_torsion_basin(value) for value in values]
+    occupancy = {
+        basin: basin_labels.count(basin) / len(basin_labels)
+        for basin in basin_order
+    }
+
+    def core_label(value: float) -> str | None:
+        if abs(value) >= 150.0:
+            return "trans"
+        if -90.0 <= value <= -30.0:
+            return "gauche_minus"
+        if 30.0 <= value <= 90.0:
+            return "gauche_plus"
+        return None
+
+    transition_counts = {
+        f"{left}->{right}": 0
+        for left in basin_order
+        for right in basin_order
+        if left != right
+    }
+    last_core = None
+    for value in values:
+        current_core = core_label(float(value))
+        if current_core is None:
+            continue
+        if last_core is not None and current_core != last_core:
+            transition_counts[f"{last_core}->{current_core}"] += 1
+        last_core = current_core
+    histogram, edges = np.histogram(
+        values, bins=np.linspace(-180.0, 180.0, 25)
+    )
+    return {
+        "count": int(values.size),
+        "circular_mean_degrees": circular_mean,
+        "circular_resultant_length": resultant,
+        "circular_std_degrees": circular_std,
+        "basin_definition": {
+            "trans": "|phi| >= 120 deg",
+            "gauche_minus": "-120 <= phi < 0 deg",
+            "gauche_plus": "0 <= phi < 120 deg",
+            "transition_core_hysteresis": {
+                "trans": "|phi| >= 150 deg",
+                "gauche_minus": "-90 <= phi <= -30 deg",
+                "gauche_plus": "30 <= phi <= 90 deg",
+            },
+        },
+        "basin_occupancy": occupancy,
+        "core_transition_count": int(sum(transition_counts.values())),
+        "core_transition_counts": transition_counts,
+        "histogram": {
+            "bin_edges_degrees": edges.tolist(),
+            "counts": histogram.astype(int).tolist(),
+            "probabilities": (histogram / values.size).tolist(),
+        },
+    }
+
+
+def _atom_identity(atom: Any) -> dict[str, Any]:
+    """返回跨 System 重建仍可审计的 topology 原子身份。"""
+
+    residue = atom.residue
+    chain = residue.chain
+    element = getattr(atom, "element", None)
+    residue_atoms = list(residue.atoms)
+    return {
+        "index": int(atom.index),
+        "name": str(atom.name),
+        "serial": (
+            int(atom.serial) if getattr(atom, "serial", None) is not None else None
+        ),
+        "residue_atom_ordinal": residue_atoms.index(atom),
+        "element": (
+            str(getattr(element, "symbol", "")) if element is not None else None
+        ),
+        "residue_name": str(residue.name),
+        "residue_id": int(getattr(residue, "resSeq", residue.index)),
+        "residue_index": int(residue.index),
+        "chain_index": int(chain.index),
+    }
+
+
+def discover_ligand_rotatable_torsions(
+    topology: Any,
+    ligand_indices: Sequence[int],
+    *,
+    bond_pairs: Sequence[Sequence[int]] | None = None,
+) -> list[dict[str, Any]]:
+    """从键图发现非环、非末端的 ligand 重原子中央键及确定性 torsion。"""
+
+    ligand = {int(index) for index in ligand_indices}
+    if len(ligand) < 4:
+        raise NeuralPathConfigError("ligand_indices 至少需要四个原子")
+    atoms = list(topology.atoms)
+    if min(ligand) < 0 or max(ligand) >= len(atoms):
+        raise NeuralPathConfigError("ligand_indices 超出 topology")
+    neighbors = {index: set() for index in ligand}
+    topology_bonds = (
+        [(int(atom_a.index), int(atom_b.index)) for atom_a, atom_b in topology.bonds]
+        if bond_pairs is None
+        else [(int(pair[0]), int(pair[1])) for pair in bond_pairs]
+    )
+    for left, right in topology_bonds:
+        if left in ligand and right in ligand:
+            neighbors[left].add(right)
+            neighbors[right].add(left)
+
+    def is_heavy(index: int) -> bool:
+        element = getattr(atoms[index], "element", None)
+        return element is not None and getattr(element, "atomic_number", 0) > 1
+
+    def central_bond_is_in_ring(left: int, right: int) -> bool:
+        stack = [left]
+        visited = {left}
+        while stack:
+            current = stack.pop()
+            for neighbor in neighbors[current]:
+                if {current, neighbor} == {left, right}:
+                    continue
+                if neighbor == right:
+                    return True
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    stack.append(neighbor)
+        return False
+
+    candidates = []
+    for left in sorted(ligand):
+        for right in sorted(neighbors[left]):
+            if left >= right or not (is_heavy(left) and is_heavy(right)):
+                continue
+            outer_left = sorted(
+                index
+                for index in neighbors[left] - {right}
+                if is_heavy(index)
+            )
+            outer_right = sorted(
+                index
+                for index in neighbors[right] - {left}
+                if is_heavy(index)
+            )
+            if not outer_left or not outer_right:
+                continue
+            if central_bond_is_in_ring(left, right):
+                continue
+
+            def outer_priority(index: int):
+                element = getattr(atoms[index], "element", None)
+                return (
+                    len(neighbors[index]),
+                    int(getattr(element, "atomic_number", 0)),
+                    -index,
+                )
+
+            atom_a = max(outer_left, key=outer_priority)
+            atom_d = max(outer_right, key=outer_priority)
+            indices = [atom_a, left, right, atom_d]
+            identities = [_atom_identity(atoms[index]) for index in indices]
+            candidates.append(
+                {
+                    "candidate_type": "ligand_rotatable_torsion",
+                    "atom_indices": indices,
+                    "central_bond_indices": [left, right],
+                    "atoms": identities,
+                    "stable_id": "ligand_torsion:"
+                    + "-".join(
+                        f"chain{identity['chain_index']}:"
+                        f"{identity['residue_name']}:{identity['residue_id']}:"
+                        f"{identity['name']}@{identity['residue_atom_ordinal']}"
+                        for identity in identities
+                    ),
+                }
+            )
+    return candidates
+
+
+def discover_pocket_sidechain_chi1_torsions(
+    topology: Any,
+    reference_positions_nm: Sequence[Sequence[float]],
+    ligand_indices: Sequence[int],
+    *,
+    box_vectors_nm: Sequence[Sequence[float]] | None = None,
+    pocket_cutoff_nm: float = 0.6,
+) -> list[dict[str, Any]]:
+    """按 ligand 距离发现口袋残基，并用稳定原子名定义标准 chi1。"""
+
+    import numpy as np
+
+    cutoff = _finite_float(pocket_cutoff_nm, "pocket_cutoff_nm")
+    if cutoff <= 0.0:
+        raise NeuralPathConfigError("pocket_cutoff_nm 必须为正")
+    atoms = list(topology.atoms)
+    positions = np.asarray(
+        _normalize_frame_collection([reference_positions_nm])[0],
+        dtype=np.float64,
+    )
+    ligand = {int(index) for index in ligand_indices}
+    ligand_heavy = [
+        index
+        for index in ligand
+        if getattr(getattr(atoms[index], "element", None), "atomic_number", 0)
+        > 1
+    ]
+    if not ligand_heavy:
+        raise NeuralPathConfigError("ligand 没有重原子")
+    box = _normalize_box_vectors_nm(box_vectors_nm)
+    box_array = np.asarray(box, dtype=np.float64) if box is not None else None
+    inverse_box = np.linalg.inv(box_array) if box is not None else None
+
+    def distance_to_ligand(index: int) -> float:
+        delta = positions[ligand_heavy] - positions[index]
+        if inverse_box is not None:
+            fractional = delta @ inverse_box
+            delta -= np.floor(fractional + 0.5) @ box_array
+        return float(np.min(np.linalg.norm(delta, axis=1)))
+
+    gamma_names = ("CG", "CG1", "OG", "OG1", "SG")
+    water_names = {"HOH", "WAT", "SOL", "TP3", "TIP3"}
+    candidates = []
+    for residue in topology.residues:
+        residue_atoms = list(residue.atoms)
+        if residue.name.upper() in water_names:
+            continue
+        by_name = {atom.name.upper(): atom for atom in residue_atoms}
+        gamma = next(
+            (by_name[name] for name in gamma_names if name in by_name),
+            None,
+        )
+        required = [by_name.get("N"), by_name.get("CA"), by_name.get("CB"), gamma]
+        if any(atom is None for atom in required):
+            continue
+        if any(atom.index in ligand for atom in required):
+            continue
+        residue_heavy = [
+            atom.index
+            for atom in residue_atoms
+            if getattr(getattr(atom, "element", None), "atomic_number", 0) > 1
+        ]
+        minimum_distance = min(
+            (distance_to_ligand(index) for index in residue_heavy),
+            default=math.inf,
+        )
+        if minimum_distance > cutoff:
+            continue
+        indices = [int(atom.index) for atom in required]
+        candidates.append(
+            {
+                "candidate_type": "pocket_sidechain_chi1",
+                "atom_indices": indices,
+                "atoms": [_atom_identity(atom) for atom in required],
+                "reference_min_ligand_distance_nm": minimum_distance,
+                "stable_id": (
+                    f"sidechain_chi1:chain{residue.chain.index}:"
+                    f"{residue.name}:{getattr(residue, 'resSeq', residue.index)}"
+                ),
+            }
+        )
+    return candidates
+
+
+def screen_periodic_torsion_candidates(
+    frames_nm: Sequence[Sequence[Sequence[float]]],
+    box_vectors_by_frame_nm: Sequence[Sequence[Sequence[float]]] | None,
+    candidates: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """对候选 torsion 计算周期 IAT；只排序，不自动宣称 production CV。"""
+
+    import numpy as np
+
+    frames = np.asarray(frames_nm, dtype=np.float64)
+    if frames.ndim != 3 or frames.shape[2] != 3:
+        raise NeuralPathConfigError("frames_nm 必须是 [frames, atoms, 3]")
+    if not np.all(np.isfinite(frames)):
+        raise NeuralPathFrameError("frames_nm 含非有限坐标")
+    if len(frames) < 10:
+        raise NeuralPathConfigError("慢变量筛选至少需要 10 帧")
+    if box_vectors_by_frame_nm is None:
+        boxes = None
+    else:
+        boxes = np.asarray(box_vectors_by_frame_nm, dtype=np.float64)
+        if len(boxes) != len(frames):
+            raise NeuralPathConfigError("box_vectors_by_frame_nm 与 frames 不等长")
+        if boxes.shape != (len(frames), 3, 3):
+            raise NeuralPathConfigError(
+                "box_vectors_by_frame_nm 必须是 [frames,3,3]"
+            )
+        if not np.all(np.isfinite(boxes)):
+            raise NeuralPathFrameError("box vectors 含非有限值")
+
+    def displacement(left, right):
+        vectors = right - left
+        if boxes is not None:
+            inverse_boxes = np.linalg.inv(boxes)
+            fractional = np.einsum(
+                "fi,fij->fj", vectors, inverse_boxes
+            )
+            vectors = vectors - np.einsum(
+                "fi,fij->fj", np.floor(fractional + 0.5), boxes
+            )
+        return vectors
+
+    def torsion_series(indices):
+        points = frames[:, indices, :]
+        b0 = -displacement(points[:, 0], points[:, 1])
+        b1 = displacement(points[:, 1], points[:, 2])
+        b2 = displacement(points[:, 2], points[:, 3])
+        b1_norm = np.linalg.norm(b1, axis=1)
+        if np.any(b1_norm <= 1.0e-12):
+            raise NeuralPathFrameError("torsion 中央键长度接近零")
+        axis = b1 / b1_norm[:, None]
+        v = b0 - np.sum(b0 * axis, axis=1)[:, None] * axis
+        w = b2 - np.sum(b2 * axis, axis=1)[:, None] * axis
+        if np.any(
+            np.minimum(np.linalg.norm(v, axis=1), np.linalg.norm(w, axis=1))
+            <= 1.0e-12
+        ):
+            raise NeuralPathFrameError("torsion 四原子近共线")
+        x = np.sum(v * w, axis=1)
+        y = np.sum(np.cross(axis, v) * w, axis=1)
+        return np.rad2deg(np.arctan2(y, x))
+
+    reports = []
+    for candidate in candidates:
+        indices = [int(index) for index in candidate["atom_indices"]]
+        if len(indices) != 4 or min(indices) < 0 or max(indices) >= frames.shape[1]:
+            raise NeuralPathConfigError("candidate atom_indices 超出 frame")
+        angles = torsion_series(indices).tolist()
+        radians = np.deg2rad(np.asarray(angles, dtype=np.float64))
+        sin_iat = integrated_autocorrelation_time(np.sin(radians).tolist())
+        cos_iat = integrated_autocorrelation_time(np.cos(radians).tolist())
+        periodic_g = max(
+            float(sin_iat["statistical_inefficiency"]),
+            float(cos_iat["statistical_inefficiency"]),
+        )
+        summary = analyze_periodic_torsion_series(angles)
+        variability = 1.0 - float(summary["circular_resultant_length"])
+        report = dict(candidate)
+        report.update(
+            {
+                "periodic_statistical_inefficiency": periodic_g,
+                "effective_uncorrelated_samples": len(angles) / periodic_g,
+                "variability_factor": variability,
+                "screening_score": periodic_g * variability,
+                "torsion": summary,
+            }
+        )
+        reports.append(report)
+    reports.sort(
+        key=lambda item: (
+            -float(item["screening_score"]),
+            -float(item["periodic_statistical_inefficiency"]),
+            str(item["stable_id"]),
+        )
+    )
+    for rank, report in enumerate(reports, start=1):
+        report["rank_within_periodic_torsions"] = rank
+    return {
+        "report_type": "outer_lambda_slow_variable_screen",
+        "report_version": 2,
+        "n_frames": len(frames),
+        "selection_status": "candidate_ranking_only",
+        "selection_warning": (
+            "排名只表示当前困难窗口轨迹中的慢且有变化；必须结合重复轨迹、"
+            "状态转换和 ESS 关联后才能冻结 production CV"
+        ),
+        "periodic_torsion_candidates": reports,
+    }
+
+
+def screen_ligand_hydration_coordination(
+    frames_nm: Sequence[Sequence[Sequence[float]]],
+    box_vectors_by_frame_nm: Sequence[Sequence[Sequence[float]]] | None,
+    topology: Any,
+    ligand_indices: Sequence[int],
+    *,
+    switching_distance_nm: float = 0.35,
+    switching_power: int = 6,
+) -> dict[str, Any]:
+    """筛选 ligand 第一水合壳层；结果是候选描述符，不是已冻结的生产 CV。"""
+
+    import numpy as np
+
+    frames = np.asarray(frames_nm, dtype=np.float64)
+    if frames.ndim != 3 or frames.shape[2] != 3 or len(frames) < 10:
+        raise NeuralPathConfigError(
+            "hydration screening 需要至少 10 帧 [frames, atoms, 3] 坐标"
+        )
+    if not np.all(np.isfinite(frames)):
+        raise NeuralPathFrameError("hydration screening 坐标含非有限值")
+    atoms = list(topology.atoms)
+    if len(atoms) != frames.shape[1]:
+        raise NeuralPathConfigError("topology 原子数与 hydration frames 不一致")
+    ligand = {int(index) for index in ligand_indices}
+    if not ligand or min(ligand) < 0 or max(ligand) >= len(atoms):
+        raise NeuralPathConfigError("ligand_indices 超出 hydration frames")
+    ligand_heavy = [
+        index
+        for index in sorted(ligand)
+        if getattr(getattr(atoms[index], "element", None), "atomic_number", 0)
+        > 1
+    ]
+    if not ligand_heavy:
+        raise NeuralPathConfigError("ligand 没有可用于 hydration CV 的重原子")
+    water_names = {"HOH", "WAT", "SOL", "TP3", "TIP3", "TIP3P"}
+    water_oxygens = [
+        int(atom.index)
+        for atom in atoms
+        if atom.residue.name.upper() in water_names
+        and getattr(getattr(atom, "element", None), "atomic_number", 0) == 8
+    ]
+    if not water_oxygens:
+        raise NeuralPathConfigError("topology 中没有识别到水氧原子")
+    cutoff = _finite_float(
+        switching_distance_nm, "hydration.switching_distance_nm"
+    )
+    if cutoff <= 0.0:
+        raise NeuralPathConfigError(
+            "hydration.switching_distance_nm 必须为正"
+        )
+    if (
+        isinstance(switching_power, bool)
+        or not isinstance(switching_power, int)
+        or switching_power <= 0
+    ):
+        raise NeuralPathConfigError("hydration.switching_power 必须为正整数")
+    boxes = None
+    inverse_boxes = None
+    if box_vectors_by_frame_nm is not None:
+        boxes = np.asarray(box_vectors_by_frame_nm, dtype=np.float64)
+        if boxes.shape != (len(frames), 3, 3):
+            raise NeuralPathConfigError(
+                "hydration box vectors 必须是 [frames,3,3]"
+            )
+        if not np.all(np.isfinite(boxes)):
+            raise NeuralPathFrameError("hydration box vectors 含非有限值")
+        inverse_boxes = np.linalg.inv(boxes)
+
+    values = []
+    for frame_index, frame in enumerate(frames):
+        displacement = (
+            frame[np.asarray(water_oxygens), None, :]
+            - frame[None, np.asarray(ligand_heavy), :]
+        )
+        if boxes is not None:
+            fractional = displacement @ inverse_boxes[frame_index]
+            displacement -= (
+                np.floor(fractional + 0.5) @ boxes[frame_index]
+            )
+        minimum_distance = np.min(
+            np.linalg.norm(displacement, axis=2), axis=1
+        )
+        coordination = np.sum(
+            1.0 / (1.0 + (minimum_distance / cutoff) ** switching_power)
+        )
+        values.append(float(coordination))
+
+    array = np.asarray(values, dtype=np.float64)
+    iat = integrated_autocorrelation_time(values)
+    mean = float(np.mean(array))
+    std = float(np.std(array))
+    percentiles = np.percentile(array, [5.0, 25.0, 50.0, 75.0, 95.0])
+    return {
+        "candidate_type": "ligand_first_shell_hydration",
+        "stable_id": (
+            f"ligand_hydration:min_heavy_distance:r0={cutoff:.6g}:"
+            f"power={switching_power}"
+        ),
+        "definition": {
+            "water_site": "water oxygen",
+            "ligand_site": "nearest ligand heavy atom",
+            "switching_function": "sum_w 1/(1+(min_i(r_wi)/r0)^power)",
+            "switching_distance_nm": cutoff,
+            "switching_power": switching_power,
+            "periodic_minimum_image": boxes is not None,
+        },
+        "ligand_heavy_atom_count": len(ligand_heavy),
+        "water_oxygen_count": len(water_oxygens),
+        "count": len(values),
+        "mean": mean,
+        "std": std,
+        "minimum": float(np.min(array)),
+        "maximum": float(np.max(array)),
+        "percentiles": {
+            "p05": float(percentiles[0]),
+            "p25": float(percentiles[1]),
+            "p50": float(percentiles[2]),
+            "p75": float(percentiles[3]),
+            "p95": float(percentiles[4]),
+        },
+        "relative_std": std / max(abs(mean), 1.0),
+        "statistical_inefficiency": float(
+            iat["statistical_inefficiency"]
+        ),
+        "effective_uncorrelated_samples": float(
+            iat["effective_uncorrelated_samples"]
+        ),
+        "selection_status": "candidate_ranking_only",
+    }
+
+
+def compare_slow_variable_screens(
+    screen_reports: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """按 stable_id 对齐独立种子；至少三条轨迹才允许自动给出资格结论。"""
+
+    if len(screen_reports) < 2:
+        raise NeuralPathConfigError("慢变量重复比较至少需要两个 screen report")
+    normalized = []
+    for report_index, report in enumerate(screen_reports):
+        if not isinstance(report, Mapping):
+            raise NeuralPathConfigError(
+                f"screen_reports[{report_index}] 必须是映射"
+            )
+        if report.get("report_type") != "outer_lambda_slow_variable_screen":
+            raise NeuralPathConfigError(
+                f"screen_reports[{report_index}] report_type 不正确"
+            )
+        candidates = report.get("periodic_torsion_candidates")
+        if not isinstance(candidates, list):
+            raise NeuralPathConfigError(
+                f"screen_reports[{report_index}] 缺少 torsion candidates"
+            )
+        by_id = {}
+        for candidate in candidates:
+            stable_id = _nonempty_string(
+                candidate.get("stable_id"), "candidate.stable_id"
+            )
+            if stable_id in by_id:
+                raise NeuralPathConfigError(
+                    f"同一 screen report 中 stable_id 重复: {stable_id}"
+                )
+            by_id[stable_id] = candidate
+        normalized.append((report, by_id))
+
+    common_ids = set(normalized[0][1])
+    for _, by_id in normalized[1:]:
+        common_ids &= set(by_id)
+    required_transition_runs = math.ceil(len(normalized) / 2)
+    periodic = []
+    for stable_id in sorted(common_ids):
+        observations = [by_id[stable_id] for _, by_id in normalized]
+        transition_counts = [
+            int(item["torsion"]["core_transition_count"])
+            for item in observations
+        ]
+        transition_positive_runs = sum(
+            count > 0 for count in transition_counts
+        )
+        median_g = statistics.median(
+            float(item["periodic_statistical_inefficiency"])
+            for item in observations
+        )
+        median_std = statistics.median(
+            float(item["torsion"]["circular_std_degrees"])
+            for item in observations
+        )
+        reproducible_switching = (
+            transition_positive_runs >= required_transition_runs
+            and median_g >= 5.0
+            and median_std >= 15.0
+        )
+        periodic.append(
+            {
+                "stable_id": stable_id,
+                "candidate_type": observations[0].get("candidate_type"),
+                "atom_indices": observations[0].get("atom_indices"),
+                "atoms": observations[0].get("atoms"),
+                "runs_present": len(observations),
+                "rank_by_run": [
+                    int(item["rank_within_periodic_torsions"])
+                    for item in observations
+                ],
+                "statistical_inefficiency_by_run": [
+                    float(item["periodic_statistical_inefficiency"])
+                    for item in observations
+                ],
+                "core_transition_count_by_run": transition_counts,
+                "transition_positive_runs": transition_positive_runs,
+                "median_statistical_inefficiency": median_g,
+                "median_circular_std_degrees": median_std,
+                "classification": (
+                    "reproducible_switching_candidate"
+                    if reproducible_switching
+                    else "not_yet_reproducible"
+                ),
+            }
+        )
+    periodic.sort(
+        key=lambda item: (
+            item["classification"] != "reproducible_switching_candidate",
+            -int(item["transition_positive_runs"]),
+            -float(item["median_statistical_inefficiency"]),
+            str(item["stable_id"]),
+        )
+    )
+    for rank, candidate in enumerate(periodic, start=1):
+        candidate["replicate_rank"] = rank
+
+    hydration_observations = []
+    hydration_id = None
+    for report, _ in normalized:
+        hydration = report.get("hydration_candidate")
+        if not isinstance(hydration, Mapping):
+            hydration_observations = []
+            break
+        current_id = hydration.get("stable_id")
+        if hydration_id is None:
+            hydration_id = current_id
+        if current_id != hydration_id:
+            raise NeuralPathConfigError(
+                "hydration candidate 定义在重复之间不一致"
+            )
+        hydration_observations.append(hydration)
+    hydration_summary = None
+    if hydration_observations:
+        hydration_summary = {
+            "stable_id": hydration_id,
+            "statistical_inefficiency_by_run": [
+                float(item["statistical_inefficiency"])
+                for item in hydration_observations
+            ],
+            "relative_std_by_run": [
+                float(item["relative_std"])
+                for item in hydration_observations
+            ],
+            "median_statistical_inefficiency": statistics.median(
+                float(item["statistical_inefficiency"])
+                for item in hydration_observations
+            ),
+            "median_relative_std": statistics.median(
+                float(item["relative_std"])
+                for item in hydration_observations
+            ),
+            "classification": "descriptor_only_requires_state_definition",
+        }
+
+    three_or_more = len(normalized) >= 3
+    qualified = [
+        item["stable_id"]
+        for item in periodic
+        if item["classification"] == "reproducible_switching_candidate"
+    ]
+    return {
+        "report_type": "outer_lambda_slow_variable_replicate_comparison",
+        "report_version": 1,
+        "n_reports": len(normalized),
+        "common_periodic_candidate_count": len(periodic),
+        "minimum_reports_for_freeze": 3,
+        "selection_status": (
+            "qualified_candidates_available"
+            if three_or_more and qualified
+            else "more_independent_sampling_required"
+            if not three_or_more
+            else "no_reproducible_switching_candidate"
+        ),
+        "production_cv_may_be_frozen": bool(three_or_more and qualified),
+        "qualified_periodic_stable_ids": qualified if three_or_more else [],
+        "periodic_candidates": periodic,
+        "hydration_candidate": hydration_summary,
+        "warning": (
+            "该门只验证跨种子动力学可重复性；冻结 production CV 前仍需确认"
+            "其与困难 window ESS/状态混合相关，且 hydration 需要预定义 wet/dry 状态"
+        ),
+    }
+
+
+def freeze_slow_variable_manifest(comparison_report: Mapping[str, Any], difficult_window: Mapping[str, Any], *, replicate_rank: int=1, experiment_id: str='EXP-010') -> dict[str, Any]:
+    """已归档历史实现的延迟兼容入口；新实验请勿依赖。"""
+
+    from archive.outer_lambda_exp010_exp011_legacy import (
+        freeze_slow_variable_manifest as _legacy_implementation,
+    )
+
+    return _legacy_implementation(comparison_report, difficult_window, replicate_rank=replicate_rank, experiment_id=experiment_id)
+
+
+def torsion_coordinate_gradient_radians(positions_nm: Sequence[Sequence[float]], atom_indices: Sequence[int], *, box_vectors_nm: Sequence[Sequence[float]] | None=None, displacement_nm: float=1e-06) -> tuple[tuple[float, float, float], ...]:
+    """已归档历史实现的延迟兼容入口；新实验请勿依赖。"""
+
+    from archive.outer_lambda_exp010_exp011_legacy import (
+        torsion_coordinate_gradient_radians as _legacy_implementation,
+    )
+
+    return _legacy_implementation(positions_nm, atom_indices, box_vectors_nm=box_vectors_nm, displacement_nm=displacement_nm)
+
+
+def build_exp010_protein_only_selection(selection_meta: Mapping[str, Any], topology: Any) -> dict[str, Any]:
+    """已归档历史实现的延迟兼容入口；新实验请勿依赖。"""
+
+    from archive.outer_lambda_exp010_exp011_legacy import (
+        build_exp010_protein_only_selection as _legacy_implementation,
+    )
+
+    return _legacy_implementation(selection_meta, topology)
+
+
+def project_force_onto_torsion(forces_kj_mol_nm: Sequence[Sequence[float]], torsion_gradient_radian_per_nm: Sequence[Sequence[float]]) -> dict[str, float]:
+    """已归档历史实现的延迟兼容入口；新实验请勿依赖。"""
+
+    from archive.outer_lambda_exp010_exp011_legacy import (
+        project_force_onto_torsion as _legacy_implementation,
+    )
+
+    return _legacy_implementation(forces_kj_mol_nm, torsion_gradient_radian_per_nm)
+
+
+def build_exp010_teacher_dataset(adapter: Any, frame_records: Iterable[Mapping[str, Any]], slow_variable_manifest: Mapping[str, Any], *, ligand_indices: Sequence[int], environment_indices: Sequence[int], atomic_numbers: Sequence[int], energy_offset_kj_mol: float | None, include_secondary: bool=True) -> dict[str, Any]:
+    """已归档历史实现的延迟兼容入口；新实验请勿依赖。"""
+
+    from archive.outer_lambda_exp010_exp011_legacy import (
+        build_exp010_teacher_dataset as _legacy_implementation,
+    )
+
+    return _legacy_implementation(adapter, frame_records, slow_variable_manifest, ligand_indices=ligand_indices, environment_indices=environment_indices, atomic_numbers=atomic_numbers, energy_offset_kj_mol=energy_offset_kj_mol, include_secondary=include_secondary)
+
+
+def _periodic_fourier_wavevectors(dimensions: int, order: int) -> list[tuple[int, ...]]:
+    """已归档历史实现的延迟兼容入口；新实验请勿依赖。"""
+
+    from archive.outer_lambda_exp010_exp011_legacy import (
+        _periodic_fourier_wavevectors as _legacy_implementation,
+    )
+
+    return _legacy_implementation(dimensions, order)
+
+
+def _fourier_design_matrix(angles, wavevectors):
+    import numpy as np
+
+    phase = np.asarray(angles, dtype=np.float64) @ np.asarray(
+        wavevectors, dtype=np.float64
+    ).T
+    return np.column_stack(
+        [np.ones(len(phase), dtype=np.float64), np.cos(phase), np.sin(phase)]
+    )
+
+
+def _regression_metrics(observed, predicted) -> dict[str, float]:
+    import numpy as np
+
+    observed = np.asarray(observed, dtype=np.float64)
+    predicted = np.asarray(predicted, dtype=np.float64)
+    residual = predicted - observed
+    rmse = float(np.sqrt(np.mean(residual * residual)))
+    mae = float(np.mean(np.abs(residual)))
+    variance = float(np.sum((observed - np.mean(observed)) ** 2))
+    r2 = (
+        1.0 - float(np.sum(residual * residual)) / variance
+        if variance > 0.0
+        else 0.0
+    )
+    correlation = (
+        float(np.corrcoef(observed, predicted)[0, 1])
+        if len(observed) >= 2
+        and float(np.std(observed)) > 0.0
+        and float(np.std(predicted)) > 0.0
+        else 0.0
+    )
+    return {
+        "count": int(len(observed)),
+        "rmse": rmse,
+        "mae": mae,
+        "r2": r2,
+        "pearson_correlation": correlation,
+    }
+
+
+def fit_periodic_fourier_distillation(teacher_dataset: Mapping[str, Any], *, dimensions: int=1, order: int=4, ridge: float=1e-06, conditional_bins: int=24) -> dict[str, Any]:
+    """已归档历史实现的延迟兼容入口；新实验请勿依赖。"""
+
+    from archive.outer_lambda_exp010_exp011_legacy import (
+        fit_periodic_fourier_distillation as _legacy_implementation,
+    )
+
+    return _legacy_implementation(teacher_dataset, dimensions=dimensions, order=order, ridge=ridge, conditional_bins=conditional_bins)
+
+
+def build_periodic_fourier_openmm_force(model: Mapping[str, Any], *, force_group: int=0) -> Any:
+    """已归档历史实现的延迟兼容入口；新实验请勿依赖。"""
+
+    from archive.outer_lambda_exp010_exp011_legacy import (
+        build_periodic_fourier_openmm_force as _legacy_implementation,
+    )
+
+    return _legacy_implementation(model, force_group=force_group)
+
+
+def build_exp011_periodic_umbrella_force(atom_indices: Sequence[int], *, center_degrees: float, force_constant_kj_mol_radian2: float, force_group: int=31):
+    """已归档历史实现的延迟兼容入口；新实验请勿依赖。"""
+
+    from archive.outer_lambda_exp010_exp011_legacy import (
+        build_exp011_periodic_umbrella_force as _legacy_implementation,
+    )
+
+    return _legacy_implementation(atom_indices, center_degrees=center_degrees, force_constant_kj_mol_radian2=force_constant_kj_mol_radian2, force_group=force_group)
+
+
+def run_hard_window_scratch_trajectory(baseline_root: str | Path, output_dir: str | Path, *, window_index: int=0, initial_trajectory_path: str | Path | None=None, burnin_steps: int=10000, sampling_steps: int=100000, report_interval_steps: int=500, platform_name: str='CUDA', random_seed: int=20260731, umbrella_torsion_atom_indices: Sequence[int] | None=None, umbrella_center_degrees: float | None=None, umbrella_force_constant_kj_mol_radian2: float | None=None, umbrella_run_id: str | None=None, minimize_max_iterations: int=200) -> dict[str, Any]:
+    """已归档历史实现的延迟兼容入口；新实验请勿依赖。"""
+
+    from archive.outer_lambda_exp010_exp011_legacy import (
+        run_hard_window_scratch_trajectory as _legacy_implementation,
+    )
+
+    return _legacy_implementation(baseline_root, output_dir, window_index=window_index, initial_trajectory_path=initial_trajectory_path, burnin_steps=burnin_steps, sampling_steps=sampling_steps, report_interval_steps=report_interval_steps, platform_name=platform_name, random_seed=random_seed, umbrella_torsion_atom_indices=umbrella_torsion_atom_indices, umbrella_center_degrees=umbrella_center_degrees, umbrella_force_constant_kj_mol_radian2=umbrella_force_constant_kj_mol_radian2, umbrella_run_id=umbrella_run_id, minimize_max_iterations=minimize_max_iterations)
+
+
+def select_wp0_difficult_window(
+    final_results: Mapping[str, Any],
+) -> dict[str, Any]:
+    """从已完成 Stage-2 诊断中按最低最终 ESS ratio 选择困难窗口。"""
+
+    try:
+        windows = final_results["stage_diagnostics"]["stage2"][
+            "window_overlap_diagnostics"
+        ]
+    except (KeyError, TypeError) as exc:
+        raise NeuralPathConfigError(
+            "final results 缺少 stage2.window_overlap_diagnostics"
+        ) from exc
+    if (
+        not isinstance(windows, Sequence)
+        or isinstance(windows, (str, bytes))
+        or not windows
+    ):
+        raise NeuralPathConfigError("window_overlap_diagnostics 必须是非空序列")
+    normalized = []
+    for position, window in enumerate(windows):
+        if not isinstance(window, Mapping):
+            raise NeuralPathConfigError(f"window[{position}] 必须是映射")
+        normalized.append(
+            {
+                "window_index": int(window["window_index"]),
+                "window_range": list(window.get("window_range", [])),
+                "lambdas_vdw": list(window.get("lambdas_vdw", [])),
+                "min_ess_ratio": _finite_float(
+                    window.get("min_ess_ratio"),
+                    f"window[{position}].min_ess_ratio",
+                ),
+                "absolute_ess": _finite_float(
+                    window.get("absolute_ess"),
+                    f"window[{position}].absolute_ess",
+                ),
+                "statistical_inefficiency": _finite_float(
+                    window.get("statistical_inefficiency"),
+                    f"window[{position}].statistical_inefficiency",
+                ),
+                "endpoint_diff_uncertainty_kj_mol": _finite_float(
+                    window.get("endpoint_diff_uncertainty_kJ_mol"),
+                    f"window[{position}].endpoint uncertainty",
+                ),
+            }
+        )
+    ranked = sorted(
+        normalized,
+        key=lambda item: (
+            item["min_ess_ratio"],
+            item["absolute_ess"],
+            -item["statistical_inefficiency"],
+        ),
+    )
+    return {
+        "selection_rule": (
+            "minimum final stage2 min_ess_ratio; ties use lower absolute_ess "
+            "then higher statistical_inefficiency"
+        ),
+        "selected_window": ranked[0],
+        "ranked_windows": ranked,
+    }
+
+
+def build_wp0_selection_report(
+    *,
+    final_results_path: str | Path,
+    topology_path: str | Path,
+    trajectory_paths: Sequence[str | Path],
+    torsion_atom_indices: Sequence[int],
+    slow_variable_name: str,
+) -> dict[str, Any]:
+    """生成冻结困难窗口与首个 torsion 慢变量的 WP-0 报告。"""
+
+    final_results = _cli_read_json_mapping(final_results_path, "final-results")
+    topology = Path(topology_path).expanduser().resolve()
+    if not topology.is_file():
+        raise NeuralPathIntegrityError(f"topology 文件不存在: {topology}")
+    if not trajectory_paths:
+        raise NeuralPathConfigError("至少需要一条基线 trajectory")
+    try:
+        import mdtraj as md
+    except ImportError as exc:
+        raise NeuralPathConfigError("WP-0 trajectory 分析需要 mdtraj") from exc
+    trajectory_reports = []
+    for raw_path in trajectory_paths:
+        trajectory = Path(raw_path).expanduser().resolve()
+        if not trajectory.is_file():
+            raise NeuralPathIntegrityError(
+                f"trajectory 文件不存在: {trajectory}"
+            )
+        angles = []
+        for chunk in md.iterload(
+            str(trajectory), top=str(topology), chunk=500
+        ):
+            values = md.compute_dihedrals(
+                chunk,
+                [list(torsion_atom_indices)],
+                periodic=True,
+            )
+            angles.extend(
+                math.degrees(float(value)) for value in values[:, 0]
+            )
+        trajectory_reports.append(
+            {
+                "trajectory_path": str(trajectory),
+                "trajectory_sha256": sha256_file(trajectory),
+                "torsion": analyze_periodic_torsion_series(angles),
+            }
+        )
+    final_path = Path(final_results_path).expanduser().resolve()
+    return {
+        "report_type": "outer_lambda_wp0_selection",
+        "report_version": 1,
+        "hard_window": select_wp0_difficult_window(final_results),
+        "slow_variable": {
+            "name": _nonempty_string(
+                slow_variable_name, "slow_variable_name"
+            ),
+            "type": "periodic_torsion",
+            "atom_indices": [int(value) for value in torsion_atom_indices],
+            "period_degrees": 360.0,
+            "range_degrees": [-180.0, 180.0],
+        },
+        "trajectory_reports": trajectory_reports,
+        "baseline_coordinate_gap": (
+            "completed IBS window files contain energy/bias/base histories but "
+            "no window coordinate trajectory; EXP-009 N=1 must record the "
+            "selected torsion before WP-0 transition counts are final"
+        ),
+        "final_results_path": str(final_path),
+        "final_results_sha256": sha256_file(final_path),
+        "topology_path": str(topology),
+        "topology_sha256": sha256_file(topology),
+    }
+
+
 def prepare_existing_model_node_config(
     *,
     selection_meta_path: str | Path,
@@ -4045,6 +6440,9 @@ def prepare_existing_model_node_config(
     max_abs_basis_energy_kj_mol: float = 5000.0,
     max_abs_path_energy_kj_mol: float = 1000.0,
     max_force_norm_kj_mol_nm: float = 5000.0,
+    min_pair_distance_nm: float | None = None,
+    max_pair_distance_nm: float | None = None,
+    max_radius_of_gyration_nm: float | None = None,
 ) -> dict[str, Any]:
     """从现有 DEXP meta 生成节点所需的固定选择和独立配置文件。"""
 
@@ -4090,6 +6488,19 @@ def prepare_existing_model_node_config(
     )
     if min(basis_energy_limit, path_energy_limit, force_limit) <= 0.0:
         raise NeuralPathConfigError("三个 safety limit 都必须为正")
+    support_values = {
+        "min_pair_distance_nm": min_pair_distance_nm,
+        "max_pair_distance_nm": max_pair_distance_nm,
+        "max_radius_of_gyration_nm": max_radius_of_gyration_nm,
+    }
+    support_payload = {
+        name: _finite_float(value, name)
+        for name, value in support_values.items()
+        if value is not None
+    }
+    if support_payload:
+        # 在写配置前执行与加载器相同的完整关系校验。
+        NeuralBasisSupportDomain.from_mapping(support_payload)
 
     destination = Path(output_dir).expanduser().resolve()
     destination.mkdir(parents=True, exist_ok=True)
@@ -4100,6 +6511,22 @@ def prepare_existing_model_node_config(
         json.dumps(indices_payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    basis_payload = {
+        "name": "existing_local_interaction_basis",
+        "backend": "existing_openmmml",
+        "model_name": _nonempty_string(model_name, "model_name"),
+        "model_path": str(artifact_path),
+        "sha256": artifact_sha,
+        "energy_offset_kj_mol": offset,
+        "atom_selection": "fixed_indices",
+        "atom_indices_path": str(indices_path),
+        "output_unit": "kJ_per_mol",
+        "precision": "single",
+        "periodic": False,
+        "coordinate_imaging": "minimum_image_local",
+    }
+    if support_payload:
+        basis_payload["support_domain"] = support_payload
     config_payload = {
         "neural_path": {
             "enabled": True,
@@ -4113,23 +6540,7 @@ def prepare_existing_model_node_config(
                 "coefficients": [coefficient_value],
                 "max_abs_coefficient": max(1.0, abs(coefficient_value)),
             },
-            "bases": [
-                {
-                    "name": "existing_local_interaction_basis",
-                    "backend": "existing_openmmml",
-                    "model_name": _nonempty_string(
-                        model_name, "model_name"
-                    ),
-                    "model_path": str(artifact_path),
-                    "sha256": artifact_sha,
-                    "energy_offset_kj_mol": offset,
-                    "atom_selection": "fixed_indices",
-                    "atom_indices_path": str(indices_path),
-                    "output_unit": "kJ_per_mol",
-                    "precision": "single",
-                    "periodic": False,
-                }
-            ],
+            "bases": [basis_payload],
             "safety": {
                 "max_abs_basis_energy_kj_mol": basis_energy_limit,
                 "max_abs_path_energy_kj_mol": path_energy_limit,
@@ -4227,6 +6638,22 @@ def _cli_lambda_schedule(value: str) -> tuple[float, ...]:
     if any(item < 0.0 or item > 1.0 for item in lambdas):
         raise argparse.ArgumentTypeError("所有 λ 必须位于 [0, 1]")
     return lambdas
+
+
+def _cli_four_atom_indices(value: str) -> tuple[int, int, int, int]:
+    try:
+        values = tuple(int(part.strip()) for part in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "atom indices 必须是逗号分隔整数"
+        ) from exc
+    if len(values) != 4 or any(item < 0 for item in values):
+        raise argparse.ArgumentTypeError(
+            "atom indices 必须恰好是四个非负整数"
+        )
+    if len(set(values)) != 4:
+        raise argparse.ArgumentTypeError("atom indices 不允许重复")
+    return values
 
 
 def _cli_write_json(payload: Mapping[str, Any], output: str | None) -> None:
@@ -4494,35 +6921,336 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         type=_cli_lambda_schedule,
     )
 
+    def add_mace_nvt_arguments(
+        command_parser: argparse.ArgumentParser,
+        *,
+        default_steps: int,
+        default_report_interval: int,
+    ) -> None:
+        add_common_config(command_parser)
+        command_parser.add_argument("--system-xml", required=True)
+        command_parser.add_argument("--trajectory", required=True)
+        command_parser.add_argument("--topology", required=True)
+        command_parser.add_argument("--selection-meta", required=True)
+        command_parser.add_argument("--frame", default="last")
+        command_parser.add_argument(
+            "--lambda", dest="lambda_value", type=float, default=0.5
+        )
+        command_parser.add_argument("--steps", type=int, default=default_steps)
+        command_parser.add_argument(
+            "--report-interval", type=int, default=default_report_interval
+        )
+        command_parser.add_argument(
+            "--timestep-fs", type=float, default=0.5
+        )
+        command_parser.add_argument(
+            "--temperature-k", type=float, default=300.0
+        )
+        command_parser.add_argument(
+            "--friction-per-ps", type=float, default=1.0
+        )
+        command_parser.add_argument(
+            "--device", choices=("cpu", "cuda"), default="cuda"
+        )
+        command_parser.add_argument("--platform", default="CUDA")
+        command_parser.add_argument("--seed", type=int, default=20260730)
+
     mace_nvt_parser = subparsers.add_parser(
         "mace-nvt-smoke",
-        help="在 base System 复制体中运行每步 MACE 分解 Force 的短 NVT",
+        help="快速检查每步 MACE 分解 Force 的 OpenMM 连通性",
     )
-    add_common_config(mace_nvt_parser)
-    mace_nvt_parser.add_argument("--system-xml", required=True)
-    mace_nvt_parser.add_argument("--trajectory", required=True)
-    mace_nvt_parser.add_argument("--topology", required=True)
-    mace_nvt_parser.add_argument("--selection-meta", required=True)
-    mace_nvt_parser.add_argument("--frame", default="last")
-    mace_nvt_parser.add_argument(
+    add_mace_nvt_arguments(
+        mace_nvt_parser, default_steps=10, default_report_interval=1
+    )
+
+    mace_qualification_parser = subparsers.add_parser(
+        "mace-nvt-qualification",
+        help="运行冻结协议的 WP-4 MACE NVT 资格测试并执行硬门判定",
+    )
+    add_mace_nvt_arguments(
+        mace_qualification_parser,
+        default_steps=1000,
+        default_report_interval=25,
+    )
+    mace_qualification_parser.add_argument(
+        "--minimum-steps", type=int, default=1000
+    )
+    mace_qualification_parser.add_argument(
+        "--max-path-force-kj-mol-nm", type=float, default=250.0
+    )
+    mace_qualification_parser.add_argument(
+        "--max-energy-closure-error-kj-mol", type=float, default=0.1
+    )
+    mace_qualification_parser.add_argument(
+        "--max-integration-seconds-per-step", type=float, default=0.2
+    )
+
+    mace_mts_parser = subparsers.add_parser(
+        "mace-mts-qualification",
+        help="运行冻结 coefficient=0.09 的 EXP-009 N=1/2/4 MTS 矩阵",
+    )
+    add_common_config(mace_mts_parser)
+    mace_mts_parser.add_argument("--system-xml", required=True)
+    mace_mts_parser.add_argument("--trajectory", required=True)
+    mace_mts_parser.add_argument("--topology", required=True)
+    mace_mts_parser.add_argument("--selection-meta", required=True)
+    mace_mts_parser.add_argument("--frame", default="last")
+    mace_mts_parser.add_argument(
+        "--torsion-indices",
+        required=True,
+        type=_cli_four_atom_indices,
+    )
+    mace_mts_parser.add_argument(
         "--lambda", dest="lambda_value", type=float, default=0.5
     )
-    mace_nvt_parser.add_argument("--steps", type=int, default=10)
-    mace_nvt_parser.add_argument(
-        "--report-interval", type=int, default=1
+    mace_mts_parser.add_argument("--inner-steps", type=int, default=10_000)
+    mace_mts_parser.add_argument(
+        "--report-interval-inner-steps", type=int, default=100
     )
-    mace_nvt_parser.add_argument("--timestep-fs", type=float, default=0.5)
-    mace_nvt_parser.add_argument(
+    mace_mts_parser.add_argument(
+        "--inner-timestep-fs", type=float, default=0.5
+    )
+    mace_mts_parser.add_argument(
         "--temperature-k", type=float, default=300.0
     )
-    mace_nvt_parser.add_argument(
+    mace_mts_parser.add_argument(
         "--friction-per-ps", type=float, default=1.0
     )
-    mace_nvt_parser.add_argument(
+    mace_mts_parser.add_argument(
         "--device", choices=("cpu", "cuda"), default="cuda"
     )
-    mace_nvt_parser.add_argument("--platform", default="CUDA")
-    mace_nvt_parser.add_argument("--seed", type=int, default=20260730)
+    mace_mts_parser.add_argument("--platform", default="CUDA")
+    mace_mts_parser.add_argument("--seed", type=int, default=20260730)
+    mace_mts_parser.add_argument(
+        "--minimum-n4-ns-per-day", type=float, required=True
+    )
+
+    wp0_parser = subparsers.add_parser(
+        "wp0-select",
+        help="从现有 Stage-2 结果冻结困难窗口并分析首个周期 torsion",
+    )
+    wp0_parser.add_argument("--final-results", required=True)
+    wp0_parser.add_argument("--topology", required=True)
+    wp0_parser.add_argument(
+        "--trajectory",
+        required=True,
+        action="append",
+        help="可重复提供多条基线轨迹",
+    )
+    wp0_parser.add_argument(
+        "--torsion-indices",
+        required=True,
+        type=_cli_four_atom_indices,
+        help="四个逗号分隔的 system atom indices",
+    )
+    wp0_parser.add_argument(
+        "--slow-variable-name",
+        default="atenolol_C4_N2_C9_C10",
+    )
+    wp0_parser.add_argument("-o", "--output")
+
+    slow_screen_parser = subparsers.add_parser(
+        "screen-slow-variables",
+        help="从坐标轨迹自动发现并排序 ligand torsion 与口袋残基 chi1",
+    )
+    slow_screen_parser.add_argument("--trajectory", required=True)
+    slow_screen_parser.add_argument("--topology", required=True)
+    slow_screen_parser.add_argument(
+        "--ligand-indices",
+        required=True,
+        help="含 ligand_indices 数组的 JSON 文件",
+    )
+    slow_screen_parser.add_argument(
+        "--system-xml",
+        help="可选；从 HarmonicBondForce 读取 ligand 键图，补足 CIF 缺失键",
+    )
+    slow_screen_parser.add_argument(
+        "--frames",
+        default="all",
+        help="all、last、tail:N、start:stop:step 或逗号分隔索引",
+    )
+    slow_screen_parser.add_argument(
+        "--pocket-cutoff-nm", type=float, default=0.6
+    )
+    slow_screen_parser.add_argument(
+        "--hydration-switching-distance-nm", type=float, default=0.35
+    )
+    slow_screen_parser.add_argument(
+        "--hydration-switching-power", type=int, default=6
+    )
+    slow_screen_parser.add_argument("-o", "--output")
+
+    slow_compare_parser = subparsers.add_parser(
+        "compare-slow-variable-screens",
+        help="按 stable_id 比较独立随机种子的慢变量筛选报告",
+    )
+    slow_compare_parser.add_argument(
+        "--input",
+        required=True,
+        action="append",
+        help="可重复提供 candidate_screen.json；至少两个",
+    )
+    slow_compare_parser.add_argument("-o", "--output")
+
+    slow_freeze_parser = subparsers.add_parser(
+        "freeze-slow-variable",
+        help="把已通过三种子门的周期候选冻结为指定实验输入 manifest",
+    )
+    slow_freeze_parser.add_argument("--comparison", required=True)
+    slow_freeze_parser.add_argument("--final-results", required=True)
+    slow_freeze_parser.add_argument("--replicate-rank", type=int, default=1)
+    slow_freeze_parser.add_argument(
+        "--experiment",
+        choices=("exp010", "exp011"),
+        default="exp010",
+    )
+    slow_freeze_parser.add_argument("-o", "--output")
+
+    exp011_coverage_parser = subparsers.add_parser(
+        "exp011-coverage",
+        help="按冻结协议诊断三条 run 的周期覆盖、重叠和有效样本数",
+    )
+    exp011_coverage_parser.add_argument("--protocol", required=True)
+    exp011_coverage_parser.add_argument(
+        "--trajectory", action="append"
+    )
+    exp011_coverage_parser.add_argument(
+        "--screen-report",
+        action="append",
+        help="可重复提供已有 candidate_screen JSON，避免重新读取 DCD",
+    )
+    exp011_coverage_parser.add_argument("--topology", required=True)
+    exp011_coverage_parser.add_argument("--manifest", required=True)
+    exp011_coverage_parser.add_argument(
+        "--frames", default="all", help="all 或每条轨迹共用的 frame spec"
+    )
+    exp011_coverage_parser.add_argument("-o", "--output")
+
+    exp011_fit_parser = subparsers.add_parser(
+        "exp011-fit-pmf",
+        help="从显式目标权重样本拟合周期 PMF，并执行整条 run 留一硬门",
+    )
+    exp011_fit_parser.add_argument("--protocol", required=True)
+    exp011_fit_parser.add_argument("--dataset", required=True)
+    exp011_fit_parser.add_argument("-o", "--output")
+
+    exp011_umbrella_parser = subparsers.add_parser(
+        "exp011-umbrella-sample",
+        help="在完整困难窗口 MM System 上运行单个周期 torsion umbrella window",
+    )
+    exp011_umbrella_parser.add_argument("--baseline-root", required=True)
+    exp011_umbrella_parser.add_argument("--manifest", required=True)
+    exp011_umbrella_parser.add_argument("--protocol", required=True)
+    exp011_umbrella_parser.add_argument("--output-dir", required=True)
+    exp011_umbrella_parser.add_argument("--run-id", required=True)
+    exp011_umbrella_parser.add_argument("--center-degrees", required=True, type=float)
+    exp011_umbrella_parser.add_argument(
+        "--force-constant-kj-mol-radian2", type=float, default=100.0
+    )
+    exp011_umbrella_parser.add_argument("--initial-trajectory")
+    exp011_umbrella_parser.add_argument("--burnin-steps", type=int, default=1000)
+    exp011_umbrella_parser.add_argument(
+        "--minimize-max-iterations", type=int, default=200
+    )
+    exp011_umbrella_parser.add_argument("--sampling-steps", type=int, default=5000)
+    exp011_umbrella_parser.add_argument("--report-interval-steps", type=int, default=500)
+    exp011_umbrella_parser.add_argument("--platform", default="Reference")
+    exp011_umbrella_parser.add_argument("--seed", type=int, default=20260802)
+    exp011_umbrella_parser.add_argument("-o", "--output")
+
+    exp011_reweight_parser = subparsers.add_parser(
+        "exp011-reweight-umbrella",
+        help="对多个 umbrella window 去相关并用 MBAR 导出目标权重",
+    )
+    exp011_reweight_parser.add_argument("--protocol", required=True)
+    exp011_reweight_parser.add_argument(
+        "--input", required=True, action="append", help="可重复提供 umbrella report JSON"
+    )
+    exp011_reweight_parser.add_argument("--minimum-neighbor-overlap", type=float, default=0.03)
+    exp011_reweight_parser.add_argument("--output-dataset", required=True)
+    exp011_reweight_parser.add_argument("-o", "--output")
+
+    exp010_label_parser = subparsers.add_parser(
+        "exp010-label",
+        help="用冻结 MACE 为慢变量轨迹生成能量和广义力教师数据集",
+    )
+    exp010_label_parser.add_argument("-c", "--config", required=True)
+    exp010_label_parser.add_argument("--manifest", required=True)
+    exp010_label_parser.add_argument(
+        "--trajectory", required=True, action="append"
+    )
+    exp010_label_parser.add_argument("--topology", required=True)
+    exp010_label_parser.add_argument("--selection-meta", required=True)
+    exp010_label_parser.add_argument(
+        "--frames",
+        default="::5",
+        help="每条轨迹独立应用的 frame spec；默认每 5 帧",
+    )
+    exp010_label_parser.add_argument(
+        "--device", choices=("cpu", "cuda"), default="cuda"
+    )
+    exp010_label_parser.add_argument(
+        "--primary-only", action="store_true"
+    )
+    exp010_label_parser.add_argument(
+        "--energy-offset-mode",
+        choices=("dataset_mean", "config"),
+        default="dataset_mean",
+    )
+    exp010_label_parser.add_argument(
+        "--support-violation-policy",
+        choices=("exclude", "reject"),
+        default="exclude",
+    )
+    exp010_label_parser.add_argument(
+        "--max-support-exclusion-fraction", type=float, default=0.05
+    )
+    exp010_label_parser.add_argument("-o", "--output")
+
+    exp010_selection_parser = subparsers.add_parser(
+        "exp010-prepare-selection",
+        help="从旧局部选择移除交换水，冻结 protein-only 教师环境",
+    )
+    exp010_selection_parser.add_argument("--selection-meta", required=True)
+    exp010_selection_parser.add_argument("--topology", required=True)
+    exp010_selection_parser.add_argument(
+        "--output-selection-meta", required=True
+    )
+    exp010_selection_parser.add_argument("-o", "--output")
+
+    exp010_fit_parser = subparsers.add_parser(
+        "exp010-fit",
+        help="拟合周期 1D/2D Fourier cheap-CV 并做整条 run 留一验证",
+    )
+    exp010_fit_parser.add_argument("--dataset", required=True)
+    exp010_fit_parser.add_argument(
+        "--dimensions", type=int, choices=(1, 2), default=1
+    )
+    exp010_fit_parser.add_argument("--order", type=int, default=4)
+    exp010_fit_parser.add_argument("--ridge", type=float, default=1.0e-6)
+    exp010_fit_parser.add_argument(
+        "--conditional-bins", type=int, default=24
+    )
+    exp010_fit_parser.add_argument("-o", "--output")
+
+    hard_window_parser = subparsers.add_parser(
+        "sample-hard-window-scratch",
+        help="只读历史 IBS 协议，在独立目录生成困难窗口 CV-screening 轨迹",
+    )
+    hard_window_parser.add_argument("--baseline-root", required=True)
+    hard_window_parser.add_argument("--output-dir", required=True)
+    hard_window_parser.add_argument("--window-index", type=int, default=0)
+    hard_window_parser.add_argument("--initial-trajectory")
+    hard_window_parser.add_argument("--burnin-steps", type=int, default=10_000)
+    hard_window_parser.add_argument(
+        "--sampling-steps", type=int, default=100_000
+    )
+    hard_window_parser.add_argument(
+        "--report-interval-steps", type=int, default=500
+    )
+    hard_window_parser.add_argument("--platform", default="CUDA")
+    hard_window_parser.add_argument("--seed", type=int, default=20260731)
+    hard_window_parser.add_argument("-o", "--output")
 
     prepare_parser = subparsers.add_parser(
         "prepare-existing",
@@ -4551,6 +7279,9 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument(
         "--max-force-norm-kj-mol-nm", type=float, default=5000.0
     )
+    prepare_parser.add_argument("--min-pair-distance-nm", type=float)
+    prepare_parser.add_argument("--max-pair-distance-nm", type=float)
+    prepare_parser.add_argument("--max-radius-of-gyration-nm", type=float)
     prepare_parser.add_argument(
         "-o", "--output", help="可选 JSON 准备报告"
     )
@@ -4595,7 +7326,1276 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     return parser
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def assess_exp011_periodic_coverage(run_angles_degrees: Mapping[str, Sequence[float]], *, run_log_target_weights: Mapping[str, Sequence[float]] | None=None, run_statistical_inefficiencies: Mapping[str, float] | None=None, bins: int=24, minimum_runs: int=3, minimum_frames_per_run: int=500, minimum_effective_samples_per_run: float=25.0, minimum_occupied_fraction_per_run: float=0.5, minimum_effective_samples_per_pooled_bin: float=2.0, minimum_runs_per_bin: int=2, minimum_raw_samples_per_run_bin: int=3, minimum_pairwise_bhattacharyya: float=0.5, minimum_effective_samples_per_basin: float=5.0) -> dict[str, Any]:
+    """已归档历史实现的延迟兼容入口；新实验请勿依赖。"""
+
+    from archive.outer_lambda_exp010_exp011_legacy import (
+        assess_exp011_periodic_coverage as _legacy_implementation,
+    )
+
+    return _legacy_implementation(run_angles_degrees, run_log_target_weights=run_log_target_weights, run_statistical_inefficiencies=run_statistical_inefficiencies, bins=bins, minimum_runs=minimum_runs, minimum_frames_per_run=minimum_frames_per_run, minimum_effective_samples_per_run=minimum_effective_samples_per_run, minimum_occupied_fraction_per_run=minimum_occupied_fraction_per_run, minimum_effective_samples_per_pooled_bin=minimum_effective_samples_per_pooled_bin, minimum_runs_per_bin=minimum_runs_per_bin, minimum_raw_samples_per_run_bin=minimum_raw_samples_per_run_bin, minimum_pairwise_bhattacharyya=minimum_pairwise_bhattacharyya, minimum_effective_samples_per_basin=minimum_effective_samples_per_basin)
+
+
+def fit_exp011_reweighted_periodic_pmf(dataset: Mapping[str, Any], protocol: Mapping[str, Any]) -> dict[str, Any]:
+    """已归档历史实现的延迟兼容入口；新实验请勿依赖。"""
+
+    from archive.outer_lambda_exp010_exp011_legacy import (
+        fit_exp011_reweighted_periodic_pmf as _legacy_implementation,
+    )
+
+    return _legacy_implementation(dataset, protocol)
+
+
+def reweight_exp011_umbrella_reports(reports: Sequence[Mapping[str, Any]], *, target_hamiltonian_id: str, minimum_neighbor_overlap: float=0.03) -> dict[str, Any]:
+    """已归档历史实现的延迟兼容入口；新实验请勿依赖。"""
+
+    from archive.outer_lambda_exp010_exp011_legacy import (
+        reweight_exp011_umbrella_reports as _legacy_implementation,
+    )
+
+    return _legacy_implementation(reports, target_hamiltonian_id=target_hamiltonian_id, minimum_neighbor_overlap=minimum_neighbor_overlap)
+
+
 def _run_cli_command(args: argparse.Namespace) -> dict[str, Any]:
+    if args.command in {"exp011-umbrella-sample", "exp011-reweight-umbrella"}:
+        protocol = _cli_read_json_mapping(args.protocol, "EXP-011 protocol")
+        stored_hash = protocol.get("protocol_sha256")
+        protocol_core = dict(protocol)
+        protocol_core.pop("protocol_sha256", None)
+        if (
+            protocol.get("protocol_type") != "outer_lambda_exp011_preregistration"
+            or not isinstance(stored_hash, str)
+            or stable_payload_sha256(protocol_core) != stored_hash
+        ):
+            raise NeuralPathIntegrityError("EXP-011 protocol 类型或内部 SHA-256 不匹配")
+        target = protocol.get("target")
+        if not isinstance(target, Mapping):
+            raise NeuralPathConfigError("EXP-011 protocol 缺少 target")
+
+        if args.command == "exp011-umbrella-sample":
+            manifest = _cli_read_json_mapping(args.manifest, "EXP-011 manifest")
+            if (
+                manifest.get("status") != "frozen_for_exp011_complete_mm_pmf"
+                or manifest.get("target_experiment") != "EXP-011"
+                or manifest.get("production_approval") is not False
+            ):
+                raise NeuralPathConfigError("manifest 不是冻结的 EXP-011 非生产 CV")
+            torsion = manifest.get("primary_slow_variable", {}).get("atom_indices")
+            if torsion != target.get("atom_indices"):
+                raise NeuralPathIntegrityError("manifest torsion 与 EXP-011 protocol 不一致")
+            report = run_hard_window_scratch_trajectory(
+                args.baseline_root,
+                args.output_dir,
+                window_index=0,
+                initial_trajectory_path=args.initial_trajectory,
+                burnin_steps=args.burnin_steps,
+                sampling_steps=args.sampling_steps,
+                report_interval_steps=args.report_interval_steps,
+                platform_name=args.platform,
+                random_seed=args.seed,
+                umbrella_torsion_atom_indices=torsion,
+                umbrella_center_degrees=args.center_degrees,
+                umbrella_force_constant_kj_mol_radian2=(
+                    args.force_constant_kj_mol_radian2
+                ),
+                umbrella_run_id=args.run_id,
+                minimize_max_iterations=args.minimize_max_iterations,
+            )
+            report.update(
+                {
+                    "command": "exp011-umbrella-sample",
+                    "protocol_sha256": stored_hash,
+                    "protocol_file_sha256": sha256_file(args.protocol),
+                    "manifest_file_sha256": sha256_file(args.manifest),
+                }
+            )
+            return report
+
+        reports = [
+            _cli_read_json_mapping(path, f"umbrella input[{index}]")
+            for index, path in enumerate(args.input)
+        ]
+        report = reweight_exp011_umbrella_reports(
+            reports,
+            target_hamiltonian_id=target.get("target_hamiltonian_id"),
+            minimum_neighbor_overlap=args.minimum_neighbor_overlap,
+        )
+        dataset = report.pop("dataset")
+        dataset.update(
+            {
+                "protocol_sha256": stored_hash,
+                "source_report_file_sha256": [sha256_file(path) for path in args.input],
+            }
+        )
+        _cli_write_json(dataset, args.output_dataset)
+        report.update(
+            {
+                "ok": True,
+                "command": "exp011-reweight-umbrella",
+                "protocol_sha256": stored_hash,
+                "output_dataset": str(Path(args.output_dataset).expanduser().resolve()),
+                "output_dataset_sha256": sha256_file(args.output_dataset),
+            }
+        )
+        return report
+
+    if args.command in {"exp011-coverage", "exp011-fit-pmf"}:
+        protocol = _cli_read_json_mapping(args.protocol, "EXP-011 protocol")
+        stored_hash = protocol.get("protocol_sha256")
+        protocol_core = dict(protocol)
+        protocol_core.pop("protocol_sha256", None)
+        if (
+            protocol.get("protocol_type") != "outer_lambda_exp011_preregistration"
+            or not isinstance(stored_hash, str)
+            or stable_payload_sha256(protocol_core) != stored_hash
+        ):
+            raise NeuralPathIntegrityError(
+                "EXP-011 protocol 类型或内部 SHA-256 不匹配"
+            )
+        if protocol.get("status") != "PREREGISTERED_NOT_STARTED":
+            raise NeuralPathConfigError(
+                "EXP-011 protocol status 必须为 PREREGISTERED_NOT_STARTED"
+            )
+
+        if args.command == "exp011-fit-pmf":
+            dataset = _cli_read_json_mapping(args.dataset, "EXP-011 dataset")
+            report = fit_exp011_reweighted_periodic_pmf(dataset, protocol)
+            report.update(
+                {
+                    "ok": True,
+                    "command": "exp011-fit-pmf",
+                    "protocol_path": str(Path(args.protocol).expanduser().resolve()),
+                    "protocol_file_sha256": sha256_file(args.protocol),
+                    "protocol_sha256": stored_hash,
+                    "dataset_path": str(Path(args.dataset).expanduser().resolve()),
+                    "dataset_file_sha256": sha256_file(args.dataset),
+                }
+            )
+            return report
+
+        topology_path = Path(args.topology).expanduser()
+        manifest_path = Path(args.manifest).expanduser()
+        if not topology_path.is_file() or not manifest_path.is_file():
+            raise NeuralPathConfigError("EXP-011 topology/manifest 文件不存在")
+        manifest = _cli_read_json_mapping(manifest_path, "slow-variable manifest")
+        primary = manifest.get("primary_slow_variable")
+        atom_indices = primary.get("atom_indices") if isinstance(primary, Mapping) else None
+        if not isinstance(atom_indices, list) or len(atom_indices) != 4:
+            raise NeuralPathConfigError("slow-variable manifest 缺少 primary 四原子 torsion")
+        run_angles = {}
+        trajectory_records = []
+        frozen_g = None
+        if bool(args.trajectory) == bool(args.screen_report):
+            raise NeuralPathConfigError(
+                "exp011-coverage 必须且只能提供 trajectory 或 screen-report"
+            )
+        if args.screen_report:
+            frozen_g = {}
+            primary_id = primary.get("stable_id")
+            for run_index, raw_report_path in enumerate(args.screen_report, start=1):
+                report_path = Path(raw_report_path).expanduser()
+                screen = _cli_read_json_mapping(report_path, "screen-report")
+                candidates = screen.get("periodic_torsion_candidates")
+                if not isinstance(candidates, list):
+                    raise NeuralPathConfigError("screen-report 缺少 periodic candidates")
+                candidate = next(
+                    (item for item in candidates if item.get("stable_id") == primary_id),
+                    None,
+                )
+                if candidate is None:
+                    raise NeuralPathConfigError("screen-report 缺少冻结 primary torsion")
+                histogram = candidate.get("torsion", {}).get("histogram", {})
+                counts = histogram.get("counts")
+                edges = histogram.get("bin_edges_degrees")
+                if (
+                    not isinstance(counts, list)
+                    or not isinstance(edges, list)
+                    or len(edges) != len(counts) + 1
+                    or len(counts) != int(protocol["coverage"]["bins"])
+                ):
+                    raise NeuralPathConfigError("screen-report histogram 与冻结 bins 不一致")
+                angles = []
+                for bin_index, count in enumerate(counts):
+                    center = 0.5 * (float(edges[bin_index]) + float(edges[bin_index + 1]))
+                    angles.extend([center] * int(count))
+                run_id = f"run{run_index}:{report_path.parent.name}"
+                run_angles[run_id] = angles
+                frozen_g[run_id] = _finite_float(
+                    candidate.get("periodic_statistical_inefficiency"),
+                    "screen-report periodic g",
+                )
+                trajectory_records.append(
+                    {
+                        "run_id": run_id,
+                        "screen_report_path": str(report_path.resolve()),
+                        "screen_report_sha256": sha256_file(report_path),
+                        "selected_frame_count": len(angles),
+                        "statistics_source": "precomputed_exact_histogram_and_periodic_g",
+                    }
+                )
+        else:
+            try:
+                import mdtraj as md
+            except ImportError as exc:
+                raise NeuralPathConfigError("trajectory 模式需要安装 mdtraj") from exc
+            trajectories = [Path(path).expanduser() for path in args.trajectory]
+            if any(not path.is_file() for path in trajectories):
+                raise NeuralPathConfigError("EXP-011 trajectory 文件不存在")
+            for run_index, trajectory_path in enumerate(trajectories, start=1):
+                with md.open(str(trajectory_path)) as handle:
+                    frame_count = len(handle)
+                frame_indices = (
+                    tuple(range(frame_count))
+                    if args.frames == "all"
+                    else _resolve_trajectory_frame_spec(args.frames, frame_count)
+                )
+                selected = set(frame_indices)
+                angles = []
+                offset = 0
+                for chunk in md.iterload(
+                    str(trajectory_path), top=str(topology_path), chunk=250
+                ):
+                    values = md.compute_dihedrals(
+                        chunk, [list(map(int, atom_indices))], periodic=True
+                    )[:, 0]
+                    for local_index, value in enumerate(values):
+                        if offset + local_index in selected:
+                            angles.append(math.degrees(float(value)))
+                    offset += len(chunk)
+                run_id = f"run{run_index}:{trajectory_path.parent.parent.name}"
+                run_angles[run_id] = angles
+                trajectory_records.append(
+                    {
+                        "run_id": run_id,
+                        "path": str(trajectory_path.resolve()),
+                        "sha256": sha256_file(trajectory_path),
+                        "total_frame_count": frame_count,
+                        "selected_frame_count": len(angles),
+                    }
+                )
+        report = assess_exp011_periodic_coverage(
+            run_angles,
+            run_statistical_inefficiencies=frozen_g,
+            **dict(protocol["coverage"]),
+        )
+        report.update(
+            {
+                "ok": True,
+                "command": "exp011-coverage",
+                "analysis_scope": "coverage_only_not_target_pmf_samples",
+                "torsion_atom_indices": list(map(int, atom_indices)),
+                "protocol_path": str(Path(args.protocol).expanduser().resolve()),
+                "protocol_file_sha256": sha256_file(args.protocol),
+                "protocol_sha256": stored_hash,
+                "manifest_path": str(manifest_path.resolve()),
+                "manifest_sha256": sha256_file(manifest_path),
+                "topology_path": str(topology_path.resolve()),
+                "topology_sha256": sha256_file(topology_path),
+                "frame_spec": args.frames,
+                "trajectories": trajectory_records,
+                "pmf_prohibition": (
+                    "这些 IBS mixture scratch 轨迹没有逐帧目标态权重；只能判定 CV 覆盖，"
+                    "不得直接当作单一目标 Hamiltonian 的 PMF 样本"
+                ),
+            }
+        )
+        return report
+
+    if args.command == "sample-hard-window-scratch":
+        report = run_hard_window_scratch_trajectory(
+            args.baseline_root,
+            args.output_dir,
+            window_index=args.window_index,
+            initial_trajectory_path=args.initial_trajectory,
+            burnin_steps=args.burnin_steps,
+            sampling_steps=args.sampling_steps,
+            report_interval_steps=args.report_interval_steps,
+            platform_name=args.platform,
+            random_seed=args.seed,
+        )
+        report["command"] = "sample-hard-window-scratch"
+        return report
+
+
+
+    if args.command == "screen-slow-variables":
+        try:
+            import mdtraj as md
+        except ImportError as exc:
+            raise NeuralPathConfigError(
+                "screen-slow-variables 需要安装 mdtraj"
+            ) from exc
+        trajectory_path = Path(args.trajectory).expanduser()
+        topology_path = Path(args.topology).expanduser()
+        if not trajectory_path.is_file() or not topology_path.is_file():
+            raise NeuralPathConfigError("trajectory/topology 文件不存在")
+        with md.open(str(trajectory_path)) as handle:
+            frame_count = len(handle)
+        if args.frames == "all":
+            frame_indices = tuple(range(frame_count))
+        else:
+            frame_indices = _resolve_trajectory_frame_spec(
+                args.frames, frame_count
+            )
+        if len(frame_indices) == 1:
+            loaded = md.load_frame(
+                str(trajectory_path),
+                frame_indices[0],
+                top=str(topology_path),
+            )
+        else:
+            step = frame_indices[1] - frame_indices[0]
+            arithmetic = (
+                step > 0
+                and tuple(
+                    range(
+                        frame_indices[0],
+                        frame_indices[-1] + step,
+                        step,
+                    )
+                )
+                == tuple(frame_indices)
+                and frame_indices[0] % step == 0
+            )
+            if arithmetic:
+                strided = md.load(
+                    str(trajectory_path),
+                    top=str(topology_path),
+                    stride=step,
+                )
+                selected_positions = [
+                    index // step for index in frame_indices
+                ]
+                loaded = strided[selected_positions]
+            else:
+                full_trajectory = md.load(
+                    str(trajectory_path), top=str(topology_path)
+                )
+                loaded = full_trajectory[list(frame_indices)]
+        ligand_payload = _cli_read_json_mapping(
+            args.ligand_indices, "ligand-indices"
+        )
+        ligand_indices = ligand_payload.get("ligand_indices")
+        if not isinstance(ligand_indices, list) or not ligand_indices:
+            raise NeuralPathConfigError(
+                "ligand-indices JSON 缺少非空 ligand_indices"
+            )
+        topology = loaded.topology
+        bond_pairs = None
+        system_sha = None
+        if args.system_xml:
+            system_path = Path(args.system_xml).expanduser()
+            if not system_path.is_file():
+                raise NeuralPathConfigError("system-xml 文件不存在")
+            openmm, _ = _require_openmm()
+            system = openmm.XmlSerializer.deserialize(
+                system_path.read_text(encoding="utf-8")
+            )
+            bond_pairs = []
+            for force_index in range(system.getNumForces()):
+                force = system.getForce(force_index)
+                if isinstance(force, openmm.HarmonicBondForce):
+                    for bond_index in range(force.getNumBonds()):
+                        left, right, _, _ = force.getBondParameters(bond_index)
+                        bond_pairs.append([int(left), int(right)])
+            system_sha = sha256_file(system_path)
+        ligand_torsions = discover_ligand_rotatable_torsions(
+            topology, ligand_indices, bond_pairs=bond_pairs
+        )
+        sidechain_torsions = discover_pocket_sidechain_chi1_torsions(
+            topology,
+            loaded.xyz[0].tolist(),
+            ligand_indices,
+            box_vectors_nm=(
+                loaded.unitcell_vectors[0].tolist()
+                if loaded.unitcell_vectors is not None
+                else None
+            ),
+            pocket_cutoff_nm=args.pocket_cutoff_nm,
+        )
+        report = screen_periodic_torsion_candidates(
+            loaded.xyz.tolist(),
+            (
+                loaded.unitcell_vectors.tolist()
+                if loaded.unitcell_vectors is not None
+                else None
+            ),
+            ligand_torsions + sidechain_torsions,
+        )
+        report["hydration_candidate"] = screen_ligand_hydration_coordination(
+            loaded.xyz.tolist(),
+            (
+                loaded.unitcell_vectors.tolist()
+                if loaded.unitcell_vectors is not None
+                else None
+            ),
+            topology,
+            ligand_indices,
+            switching_distance_nm=args.hydration_switching_distance_nm,
+            switching_power=args.hydration_switching_power,
+        )
+        report.update(
+            {
+                "ok": True,
+                "command": "screen-slow-variables",
+                "trajectory": str(trajectory_path.resolve()),
+                "trajectory_sha256": sha256_file(trajectory_path),
+                "topology": str(topology_path.resolve()),
+                "topology_sha256": sha256_file(topology_path),
+                "frame_indices": list(frame_indices),
+                "ligand_rotatable_torsion_count": len(ligand_torsions),
+                "pocket_sidechain_chi1_count": len(sidechain_torsions),
+                "pocket_cutoff_nm": float(args.pocket_cutoff_nm),
+                "system_xml": (
+                    str(Path(args.system_xml).expanduser().resolve())
+                    if args.system_xml
+                    else None
+                ),
+                "system_xml_sha256": system_sha,
+                "ligand_bond_source": (
+                    "system_harmonic_bond_force"
+                    if bond_pairs is not None
+                    else "topology"
+                ),
+            }
+        )
+        return report
+
+    if args.command == "compare-slow-variable-screens":
+        reports = [
+            _cli_read_json_mapping(path, f"input[{index}]")
+            for index, path in enumerate(args.input)
+        ]
+        report = compare_slow_variable_screens(reports)
+        report.update(
+            {
+                "ok": True,
+                "command": "compare-slow-variable-screens",
+                "inputs": [
+                    {
+                        "path": str(Path(path).expanduser().resolve()),
+                        "sha256": sha256_file(path),
+                    }
+                    for path in args.input
+                ],
+            }
+        )
+        return report
+
+    if args.command == "freeze-slow-variable":
+        comparison = _cli_read_json_mapping(
+            args.comparison, "comparison"
+        )
+        final_results = _cli_read_json_mapping(
+            args.final_results, "final-results"
+        )
+        selected_window = select_wp0_difficult_window(final_results)[
+            "selected_window"
+        ]
+        report = freeze_slow_variable_manifest(
+            comparison,
+            selected_window,
+            replicate_rank=args.replicate_rank,
+            experiment_id=args.experiment,
+        )
+        report.update(
+            {
+                "ok": True,
+                "command": "freeze-slow-variable",
+                "comparison_path": str(
+                    Path(args.comparison).expanduser().resolve()
+                ),
+                "comparison_sha256": sha256_file(args.comparison),
+                "final_results_path": str(
+                    Path(args.final_results).expanduser().resolve()
+                ),
+                "final_results_sha256": sha256_file(args.final_results),
+            }
+        )
+        return report
+
+    if args.command == "exp010-prepare-selection":
+        try:
+            import mdtraj as md
+        except ImportError as exc:
+            raise NeuralPathConfigError(
+                "exp010-prepare-selection 需要安装 mdtraj"
+            ) from exc
+        topology_path = Path(args.topology).expanduser()
+        if not topology_path.is_file():
+            raise NeuralPathConfigError("exp010 topology 文件不存在")
+        topology = md.load(str(topology_path)).topology
+        source = _cli_read_json_mapping(
+            args.selection_meta, "selection-meta"
+        )
+        selection = build_exp010_protein_only_selection(source, topology)
+        _cli_write_json(selection, args.output_selection_meta)
+        return {
+            "ok": True,
+            "command": "exp010-prepare-selection",
+            "report_type": "outer_lambda_exp010_selection_preparation",
+            "report_version": 1,
+            "source_selection_meta": str(
+                Path(args.selection_meta).expanduser().resolve()
+            ),
+            "source_selection_meta_sha256": sha256_file(args.selection_meta),
+            "output_selection_meta": str(
+                Path(args.output_selection_meta).expanduser().resolve()
+            ),
+            "output_selection_meta_sha256": sha256_file(
+                args.output_selection_meta
+            ),
+            "selection_policy": selection[
+                "outer_lambda_exp010_selection_policy"
+            ],
+            "selection_protocol_sha256": selection["selection_sha256"],
+        }
+
+    if args.command == "exp010-label":
+        try:
+            import mdtraj as md
+        except ImportError as exc:
+            raise NeuralPathConfigError("exp010-label 需要安装 mdtraj") from exc
+        controller = load_neural_path_config(
+            args.config, verify_basis_files=True
+        )
+        if not controller.enabled or controller.basis_count != 1:
+            raise NeuralPathConfigError("exp010-label 要求启用且严格 M=1")
+        basis = controller.bases[0]
+        if basis.backend != "existing_openmmml" or not basis.model_name:
+            raise NeuralPathConfigError(
+                "exp010-label 要求 existing_openmmml MACE/ORB basis"
+            )
+        manifest = _cli_read_json_mapping(args.manifest, "manifest")
+        stored_manifest_sha = manifest.get("manifest_sha256")
+        manifest_core = dict(manifest)
+        for key in (
+            "manifest_sha256",
+            "ok",
+            "command",
+            "comparison_path",
+            "comparison_sha256",
+            "final_results_path",
+            "final_results_sha256",
+        ):
+            manifest_core.pop(key, None)
+        if (
+            not isinstance(stored_manifest_sha, str)
+            or stable_payload_sha256(manifest_core) != stored_manifest_sha
+        ):
+            raise NeuralPathIntegrityError(
+                "slow-variable manifest 内部 SHA-256 不匹配"
+            )
+        selection = _cli_read_json_mapping(
+            args.selection_meta, "selection-meta"
+        )
+        ligand_indices = selection.get("ligand_indices")
+        environment_indices = selection.get("env_indices")
+        if not isinstance(ligand_indices, list) or not isinstance(
+            environment_indices, list
+        ):
+            raise NeuralPathConfigError(
+                "selection-meta 缺少 ligand_indices/env_indices"
+            )
+        if set(basis.atom_indices()) != set(ligand_indices).union(
+            environment_indices
+        ):
+            raise NeuralPathConfigError(
+                "配置 atom selection 与 selection-meta 不一致"
+            )
+        topology_path = Path(args.topology).expanduser()
+        if not topology_path.is_file():
+            raise NeuralPathConfigError("exp010 topology 文件不存在")
+        trajectory_paths = [
+            Path(path).expanduser() for path in args.trajectory
+        ]
+        if any(not path.is_file() for path in trajectory_paths):
+            raise NeuralPathConfigError("exp010 trajectory 文件不存在")
+        reference = md.load_frame(
+            str(trajectory_paths[0]), 0, top=str(topology_path)
+        )
+        atomic_numbers = []
+        for atom in reference.topology.atoms:
+            if atom.element is None:
+                raise NeuralPathConfigError(
+                    f"topology atom {atom.index} 缺少元素"
+                )
+            atomic_numbers.append(int(atom.element.atomic_number))
+        run_specs = []
+        for run_index, path in enumerate(trajectory_paths):
+            with md.open(str(path)) as handle:
+                frame_count = len(handle)
+            indices = _resolve_trajectory_frame_spec(args.frames, frame_count)
+            run_specs.append(
+                {
+                    "run_id": f"run{run_index + 1}:{path.parent.name}",
+                    "path": path,
+                    "frame_count": frame_count,
+                    "frame_indices": indices,
+                }
+            )
+
+        support_evaluations = []
+        exclusion_limit = _finite_float(
+            args.max_support_exclusion_fraction,
+            "max_support_exclusion_fraction",
+        )
+        if not 0.0 <= exclusion_limit < 1.0:
+            raise NeuralPathConfigError(
+                "max_support_exclusion_fraction 必须位于 [0,1)"
+            )
+
+        def frame_records():
+            for run_spec in run_specs:
+                indices = run_spec["frame_indices"]
+                step = indices[1] - indices[0] if len(indices) > 1 else 0
+                arithmetic = (
+                    step > 0
+                    and tuple(range(indices[0], indices[-1] + step, step))
+                    == tuple(indices)
+                    and indices[0] % step == 0
+                )
+                strided = (
+                    md.load(
+                        str(run_spec["path"]),
+                        top=str(topology_path),
+                        stride=step,
+                    )
+                    if arithmetic
+                    else None
+                )
+                for frame_index in indices:
+                    frame = (
+                        strided[frame_index // step]
+                        if strided is not None
+                        else md.load_frame(
+                            str(run_spec["path"]),
+                            frame_index,
+                            top=str(topology_path),
+                        )
+                    )
+                    box_vectors = (
+                        frame.unitcell_vectors[0].tolist()
+                        if frame.unitcell_vectors is not None
+                        else None
+                    )
+                    support = controller.evaluate_support_domains(
+                        frame.xyz[0].tolist(),
+                        box_vectors_nm=box_vectors,
+                    )
+                    supported = all(item.supported for item in support)
+                    support_record = {
+                        "run_id": run_spec["run_id"],
+                        "frame_index": frame_index,
+                        "supported": supported,
+                        "included_in_teacher_dataset": supported,
+                        "details": [
+                            item.payload() for item in support
+                        ],
+                    }
+                    support_evaluations.append(support_record)
+                    if not supported:
+                        if args.support_violation_policy == "reject":
+                            raise NeuralPathConfigError(
+                                "EXP-010 source frame 超出冻结 MACE 支持域: "
+                                f"{run_spec['run_id']} frame={frame_index}"
+                            )
+                        continue
+                    yield {
+                        "run_id": run_spec["run_id"],
+                        "frame_index": frame_index,
+                        "positions_nm": frame.xyz[0].tolist(),
+                        "box_vectors_nm": box_vectors,
+                    }
+
+        with ExistingOrbMaceBasisAdapter(
+            model_name=basis.model_name, device=args.device
+        ) as adapter:
+            report = build_exp010_teacher_dataset(
+                adapter,
+                frame_records(),
+                manifest,
+                ligand_indices=ligand_indices,
+                environment_indices=environment_indices,
+                atomic_numbers=atomic_numbers,
+                energy_offset_kj_mol=(
+                    basis.energy_offset_kj_mol
+                    if args.energy_offset_mode == "config"
+                    else None
+                ),
+                include_secondary=not args.primary_only,
+            )
+        source_support_violation_count = sum(
+            not item["supported"] for item in support_evaluations
+        )
+        source_frame_count = len(support_evaluations)
+        exclusion_fraction = (
+            source_support_violation_count / source_frame_count
+            if source_frame_count
+            else 1.0
+        )
+        safety_violation_count = 0
+        if controller.safety is not None:
+            for sample in report["samples"]:
+                if (
+                    abs(sample["teacher_centered_energy_kj_mol"])
+                    > controller.safety.max_abs_basis_energy_kj_mol
+                    or sample["teacher_max_force_kj_mol_nm"]
+                    > controller.safety.max_force_norm_kj_mol_nm
+                ):
+                    safety_violation_count += 1
+        report["support_domain_violation_count"] = 0
+        report["source_support_domain_violation_count"] = (
+            source_support_violation_count
+        )
+        report["source_frame_count"] = source_frame_count
+        report["support_exclusion_fraction"] = exclusion_fraction
+        report["max_support_exclusion_fraction"] = exclusion_limit
+        report["support_violation_policy"] = args.support_violation_policy
+        report["safety_violation_count"] = safety_violation_count
+        report["qualified_for_fit"] = (
+            safety_violation_count == 0
+            and exclusion_fraction <= exclusion_limit
+        )
+        report["support_domain"] = support_evaluations
+        report.update(
+            {
+                "ok": True,
+                "command": "exp010-label",
+                "config_path": str(Path(args.config).expanduser().resolve()),
+                "config_sha256": sha256_file(args.config),
+                "controller_protocol_sha256": controller.protocol_sha256(),
+                "teacher_model_sha256": basis.sha256,
+                "atom_selection_sha256": basis.atom_indices_sha256,
+                "slow_variable_manifest_path": str(
+                    Path(args.manifest).expanduser().resolve()
+                ),
+                "slow_variable_manifest_file_sha256": sha256_file(
+                    args.manifest
+                ),
+                "slow_variable_manifest_protocol_sha256": stored_manifest_sha,
+                "topology_path": str(topology_path.resolve()),
+                "topology_sha256": sha256_file(topology_path),
+                "selection_meta_path": str(
+                    Path(args.selection_meta).expanduser().resolve()
+                ),
+                "selection_meta_sha256": sha256_file(args.selection_meta),
+                "frame_spec": args.frames,
+                "trajectories": [
+                    {
+                        "run_id": spec["run_id"],
+                        "path": str(spec["path"].resolve()),
+                        "sha256": sha256_file(spec["path"]),
+                        "total_frame_count": spec["frame_count"],
+                        "selected_frame_indices": list(spec["frame_indices"]),
+                    }
+                    for spec in run_specs
+                ],
+            }
+        )
+        return report
+
+    if args.command == "exp010-fit":
+        dataset = _cli_read_json_mapping(args.dataset, "dataset")
+        if dataset.get("qualified_for_fit") is not True:
+            raise NeuralPathConfigError(
+                "teacher dataset 未通过 support/safety 门，拒绝拟合"
+            )
+        report = fit_periodic_fourier_distillation(
+            dataset,
+            dimensions=args.dimensions,
+            order=args.order,
+            ridge=args.ridge,
+            conditional_bins=args.conditional_bins,
+        )
+        dataset_sha = sha256_file(args.dataset)
+        model = report["model"]
+        model.pop("model_sha256", None)
+        model["training_dataset_sha256"] = dataset_sha
+        model["teacher_model_sha256"] = dataset.get(
+            "teacher_model_sha256"
+        )
+        model["slow_variable_manifest_protocol_sha256"] = dataset.get(
+            "slow_variable_manifest_protocol_sha256"
+        )
+        model["model_sha256"] = stable_payload_sha256(model)
+        report.update(
+            {
+                "ok": True,
+                "command": "exp010-fit",
+                "dataset_path": str(
+                    Path(args.dataset).expanduser().resolve()
+                ),
+                "dataset_sha256": dataset_sha,
+            }
+        )
+        return report
+
+    if args.command == "wp0-select":
+        report = build_wp0_selection_report(
+            final_results_path=args.final_results,
+            topology_path=args.topology,
+            trajectory_paths=args.trajectory,
+            torsion_atom_indices=args.torsion_indices,
+            slow_variable_name=args.slow_variable_name,
+        )
+        report["ok"] = True
+        report["command"] = "wp0-select"
+        return report
+
     if args.command == "prepare-existing":
         report = prepare_existing_model_node_config(
             selection_meta_path=args.selection_meta,
@@ -4609,6 +8609,9 @@ def _run_cli_command(args: argparse.Namespace) -> dict[str, Any]:
             ),
             max_abs_path_energy_kj_mol=args.max_abs_path_energy_kj_mol,
             max_force_norm_kj_mol_nm=args.max_force_norm_kj_mol_nm,
+            min_pair_distance_nm=args.min_pair_distance_nm,
+            max_pair_distance_nm=args.max_pair_distance_nm,
+            max_radius_of_gyration_nm=args.max_radius_of_gyration_nm,
         )
         report["ok"] = True
         report["command"] = "prepare-existing"
@@ -4770,6 +8773,14 @@ def _run_cli_command(args: argparse.Namespace) -> dict[str, Any]:
             ligand_indices=existing_input["ligand_indices"],
             environment_indices=existing_input["environment_indices"],
             atomic_numbers=existing_input["atomic_numbers"],
+            box_vectors_by_frame_nm=(
+                existing_input.get("box_vectors_by_frame_nm")
+                or (
+                    [existing_input["box_vectors_nm"]] * len(frames)
+                    if "box_vectors_nm" in existing_input
+                    else None
+                )
+            ),
         )
         report["ok"] = True
         report["command"] = "label-existing"
@@ -4832,6 +8843,10 @@ def _run_cli_command(args: argparse.Namespace) -> dict[str, Any]:
             ligand_indices=selection_meta["ligand_indices"],
             environment_indices=selection_meta["env_indices"],
             atomic_numbers=atomic_numbers,
+            box_vectors_by_frame_nm=[
+                frame.unitcell_vectors[0].tolist()
+                for frame in loaded_frames
+            ],
         )
         report["ok"] = True
         report["command"] = "label-trajectory"
@@ -4841,12 +8856,12 @@ def _run_cli_command(args: argparse.Namespace) -> dict[str, Any]:
         report["frame_indices"] = list(frame_indices)
         return report
 
-    if args.command == "mace-nvt-smoke":
+    if args.command == "mace-mts-qualification":
         try:
             import mdtraj as md
         except ImportError as exc:
             raise NeuralPathConfigError(
-                "mace-nvt-smoke 需要安装 mdtraj"
+                "mace-mts-qualification 需要安装 mdtraj"
             ) from exc
         system_xml_path = Path(args.system_xml).expanduser()
         trajectory_path = Path(args.trajectory).expanduser()
@@ -4866,7 +8881,7 @@ def _run_cli_command(args: argparse.Namespace) -> dict[str, Any]:
             )
             if len(frame_indices) != 1:
                 raise NeuralPathConfigError(
-                    "mace-nvt-smoke --frame 必须只选择一个 frame"
+                    "mace-mts-qualification --frame 必须只选择一个 frame"
                 )
             frame = md.load_frame(
                 str(trajectory_path),
@@ -4877,7 +8892,111 @@ def _run_cli_command(args: argparse.Namespace) -> dict[str, Any]:
             raise
         except Exception as exc:
             raise NeuralPathConfigError(
-                f"mace-nvt-smoke 无法读取轨迹: {exc}"
+                f"mace-mts-qualification 无法读取轨迹: {exc}"
+            ) from exc
+        if frame.unitcell_vectors is None:
+            raise NeuralPathConfigError("轨迹 frame 缺少周期盒向量")
+        atomic_numbers = []
+        for atom in frame.topology.atoms:
+            if atom.element is None:
+                raise NeuralPathConfigError(
+                    f"topology atom {atom.index} 缺少元素"
+                )
+            atomic_numbers.append(int(atom.element.atomic_number))
+        selection_meta = _cli_read_json_mapping(
+            args.selection_meta, "selection-meta"
+        )
+        try:
+            openmm, _ = _require_openmm()
+            base_system = openmm.XmlSerializer.deserialize(
+                system_xml_path.read_text(encoding="utf-8")
+            )
+        except Exception as exc:
+            raise TorchForceDeploymentError(
+                f"base System XML 反序列化失败: {exc}"
+            ) from exc
+        arm_reports = []
+        for ratio in (1, 2, 4):
+            arm_reports.append(
+                run_mace_decomposition_mts_arm(
+                    controller,
+                    base_system,
+                    atomic_numbers=atomic_numbers,
+                    ligand_indices=selection_meta.get("ligand_indices"),
+                    environment_indices=selection_meta.get("env_indices"),
+                    positions_nm=frame.xyz[0].tolist(),
+                    box_vectors_nm=frame.unitcell_vectors[0].tolist(),
+                    torsion_atom_indices=args.torsion_indices,
+                    mts_ratio=ratio,
+                    lambda_value=args.lambda_value,
+                    n_inner_steps=args.inner_steps,
+                    report_interval_inner_steps=(
+                        args.report_interval_inner_steps
+                    ),
+                    inner_timestep_fs=args.inner_timestep_fs,
+                    temperature_kelvin=args.temperature_k,
+                    friction_per_ps=args.friction_per_ps,
+                    device=args.device,
+                    platform_name=args.platform,
+                    random_seed=args.seed,
+                    required_coefficient=0.09,
+                )
+            )
+        report = assess_mace_mts_matrix(
+            arm_reports,
+            minimum_n4_ns_per_day=args.minimum_n4_ns_per_day,
+        )
+        report.update(
+            {
+                "ok": True,
+                "command": "mace-mts-qualification",
+                "system_xml": str(system_xml_path.resolve()),
+                "trajectory": str(trajectory_path.resolve()),
+                "topology": str(topology_path.resolve()),
+                "frame_index": frame_indices[0],
+                "torsion_atom_indices": list(args.torsion_indices),
+            }
+        )
+        return report
+
+    if args.command in {"mace-nvt-smoke", "mace-nvt-qualification"}:
+        command_name = args.command
+        try:
+            import mdtraj as md
+        except ImportError as exc:
+            raise NeuralPathConfigError(
+                f"{command_name} 需要安装 mdtraj"
+            ) from exc
+        system_xml_path = Path(args.system_xml).expanduser()
+        trajectory_path = Path(args.trajectory).expanduser()
+        topology_path = Path(args.topology).expanduser()
+        for label, path in (
+            ("system XML", system_xml_path),
+            ("trajectory", trajectory_path),
+            ("topology", topology_path),
+        ):
+            if not path.is_file():
+                raise NeuralPathConfigError(f"{label} 文件不存在: {path}")
+        try:
+            with md.open(str(trajectory_path)) as trajectory_handle:
+                trajectory_frame_count = len(trajectory_handle)
+            frame_indices = _resolve_trajectory_frame_spec(
+                args.frame, trajectory_frame_count
+            )
+            if len(frame_indices) != 1:
+                raise NeuralPathConfigError(
+                    f"{command_name} --frame 必须只选择一个 frame"
+                )
+            frame = md.load_frame(
+                str(trajectory_path),
+                frame_indices[0],
+                top=str(topology_path),
+            )
+        except NeuralPathConfigError:
+            raise
+        except Exception as exc:
+            raise NeuralPathConfigError(
+                f"{command_name} 无法读取轨迹: {exc}"
             ) from exc
         atomic_numbers = []
         for atom in frame.topology.atoms:
@@ -4900,7 +9019,12 @@ def _run_cli_command(args: argparse.Namespace) -> dict[str, Any]:
             ) from exc
         if frame.unitcell_vectors is None:
             raise NeuralPathConfigError("轨迹 frame 缺少周期盒向量")
-        report = run_mace_decomposition_nvt_smoke(
+        nvt_runner = (
+            run_mace_decomposition_nvt_smoke
+            if command_name == "mace-nvt-smoke"
+            else run_mace_decomposition_nvt
+        )
+        report = nvt_runner(
             controller,
             base_system,
             atomic_numbers=atomic_numbers,
@@ -4918,13 +9042,31 @@ def _run_cli_command(args: argparse.Namespace) -> dict[str, Any]:
             platform_name=args.platform,
             random_seed=args.seed,
         )
-        report["ok"] = True
-        report["command"] = "mace-nvt-smoke"
-        report["system_xml"] = str(system_xml_path.resolve())
-        report["trajectory"] = str(trajectory_path.resolve())
-        report["topology"] = str(topology_path.resolve())
-        report["frame_index"] = frame_indices[0]
-        return report
+        run_metadata = {
+            "system_xml": str(system_xml_path.resolve()),
+            "trajectory": str(trajectory_path.resolve()),
+            "topology": str(topology_path.resolve()),
+            "frame_index": frame_indices[0],
+        }
+        report.update(run_metadata)
+        if command_name == "mace-nvt-smoke":
+            report["ok"] = True
+            report["command"] = command_name
+            return report
+        qualification = assess_mace_nvt_qualification(
+            report,
+            minimum_steps=args.minimum_steps,
+            max_path_force_kj_mol_nm=args.max_path_force_kj_mol_nm,
+            max_energy_closure_error_kj_mol=(
+                args.max_energy_closure_error_kj_mol
+            ),
+            max_integration_seconds_per_step=(
+                args.max_integration_seconds_per_step
+            ),
+        )
+        qualification["ok"] = True
+        qualification["command"] = command_name
+        return qualification
 
     if args.command == "compare":
         comparison_input = _cli_read_json_mapping(args.input, "compare")
@@ -5025,6 +9167,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         result = _run_cli_command(args)
         _cli_write_json(result, args.output)
+        if (
+            args.command
+            in {"mace-nvt-qualification", "mace-mts-qualification"}
+            and result.get("qualified") is not True
+        ):
+            return 1
         return 0
     except (
         NeuralPathConfigError,
@@ -5070,16 +9218,46 @@ __all__ = [
     "ExistingOpenMMMLBasisEvaluation",
     "ExistingOrbMaceBasisAdapter",
     "MaceDecompositionPythonComputation",
+    "MaceDecompositionBasisPythonComputation",
+    "OuterLambdaIBSBiasForce",
     "IBSEnergyFrame",
     "IBSEnergyLedger",
+    "IBSSamplerNeuralPathAdapter",
     "compose_ibs_energy_frame",
     "OpenMMPathEvaluation",
     "build_torchforce_from_spec",
     "build_openmm_outer_lambda_force",
     "build_torchforce_outer_lambda_force",
     "build_mace_decomposition_python_force",
+    "build_mace_decomposition_basis_python_force",
     "evaluate_outer_lambda_force_group_states",
+    "run_mace_decomposition_nvt",
     "run_mace_decomposition_nvt_smoke",
+    "assess_mace_nvt_qualification",
+    "run_mace_decomposition_mts_arm",
+    "assess_mace_mts_matrix",
+    "periodic_dihedral_degrees",
+    "classify_torsion_basin",
+    "analyze_periodic_torsion_series",
+    "discover_ligand_rotatable_torsions",
+    "discover_pocket_sidechain_chi1_torsions",
+    "screen_periodic_torsion_candidates",
+    "screen_ligand_hydration_coordination",
+    "compare_slow_variable_screens",
+    "freeze_slow_variable_manifest",
+    "torsion_coordinate_gradient_radians",
+    "build_exp010_protein_only_selection",
+    "project_force_onto_torsion",
+    "build_exp010_teacher_dataset",
+    "fit_periodic_fourier_distillation",
+    "assess_exp011_periodic_coverage",
+    "fit_exp011_reweighted_periodic_pmf",
+    "build_exp011_periodic_umbrella_force",
+    "reweight_exp011_umbrella_reports",
+    "build_periodic_fourier_openmm_force",
+    "run_hard_window_scratch_trajectory",
+    "select_wp0_difficult_window",
+    "build_wp0_selection_report",
     "serialize_openmm_force",
     "deserialize_openmm_force",
     "evaluate_openmm_outer_lambda_force",

@@ -14,11 +14,13 @@
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 pytestmark = pytest.mark.cpu_only
 
-pytest.importorskip("openmm")
+openmm = pytest.importorskip("openmm")
+from openmm import unit
 
 import abfe_core as core
 
@@ -221,17 +223,22 @@ def test_apbs_is_recorded_as_orthogonal_to_dispersion():
 # ---------------------------------------------------------------------------
 
 
-def test_coion_runtime_distance_threshold_matches_softcore_cutoff():
-    """§13.1 把"全程 ≥ 1.2 nm"定义为 **= softcore cutoff**。
+def test_coion_runtime_distance_is_independent_of_softcore_cutoff():
+    """[MEM-00h，2026-08-06 复核后拍板] 这两个值**不再要求相等**。
 
-    `abfe_core` 在 `ibs_engine` 下层不能反向 import，所以这个值在两处各有一份。
-    这条测试就是防止两处各改一半的唯一防线——改了 `SOFTCORE_CUTOFF_NM` 就会在这里失败。
+    旧版本把 `COION_LIGAND_MIN_IMAGE_RUNTIME_NM` 定义成"= softcore cutoff"的
+    派生量；这次统一非键协议时用户明确决定解耦：co-ion 全程距离门是一条独立、
+    保守的几何安全门，不用为了让 softcore cutoff 收敛到 1.0 nm 就跟着降到
+    1.0——1.2 nm 本来就更保守，没必要降。
+
+    这条测试只钉住"当前这条门槛仍然是 1.2 nm、且≥ softcore cutoff"这两件事，
+    不再断言两者相等；`ibs_engine.SOFTCORE_CUTOFF_NM` 以后再变，这条测试也
+    不应该因此失败。
     """
     import ibs_engine
 
-    assert core.COION_LIGAND_MIN_IMAGE_RUNTIME_NM == pytest.approx(
-        ibs_engine.SOFTCORE_CUTOFF_NM
-    )
+    assert core.COION_LIGAND_MIN_IMAGE_RUNTIME_NM == pytest.approx(1.2)
+    assert core.COION_LIGAND_MIN_IMAGE_RUNTIME_NM >= ibs_engine.SOFTCORE_CUTOFF_NM
 
 
 def test_initial_coion_distance_is_stricter_than_runtime():
@@ -281,3 +288,193 @@ def test_thresholds_payload_reflects_the_constants_not_a_hardcoded_copy():
     assert payload["numerical_selfconsistency"]["total_charge_conservation_e"] == (
         core.TOTAL_CHARGE_CONSERVATION_TOLERANCE_E
     )
+
+
+# ---------------------------------------------------------------------------
+# MEM-00h 物理验收：1.0 nm、无 switching、端点与零力门
+# ---------------------------------------------------------------------------
+
+
+def _two_particle_nb(*, charge_lig=0.0, charge_env=0.0, use_lrc=False):
+    nb = openmm.NonbondedForce()
+    nb.setNonbondedMethod(openmm.NonbondedForce.CutoffPeriodic)
+    nb.setCutoffDistance(1.0 * unit.nanometer)
+    nb.setUseSwitchingFunction(False)
+    nb.setUseDispersionCorrection(bool(use_lrc))
+    nb.addParticle(
+        charge_lig * unit.elementary_charge,
+        0.34 * unit.nanometer,
+        0.40 * unit.kilojoule_per_mole,
+    )
+    nb.addParticle(
+        charge_env * unit.elementary_charge,
+        0.30 * unit.nanometer,
+        0.50 * unit.kilojoule_per_mole,
+    )
+    return nb
+
+
+def _evaluate_single_force(force, positions_nm, box_nm=4.0):
+    system = openmm.System()
+    for _ in range(len(positions_nm)):
+        system.addParticle(12.0 * unit.dalton)
+    vectors = (
+        openmm.Vec3(box_nm, 0.0, 0.0),
+        openmm.Vec3(0.0, box_nm, 0.0),
+        openmm.Vec3(0.0, 0.0, box_nm),
+    ) * unit.nanometer
+    system.setDefaultPeriodicBoxVectors(*vectors)
+    force.setForceGroup(1)
+    system.addForce(force)
+    integrator = openmm.VerletIntegrator(0.001 * unit.picoseconds)
+    context = openmm.Context(
+        system, integrator, openmm.Platform.getPlatformByName("Reference")
+    )
+    context.setPositions(np.asarray(positions_nm, dtype=float) * unit.nanometer)
+    state = context.getState(getEnergy=True, getForces=True, groups={1})
+    energy = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+    forces = state.getForces(asNumpy=True).value_in_unit(
+        unit.kilojoule_per_mole / unit.nanometer
+    )
+    del context, integrator
+    return float(energy), np.asarray(forces, dtype=float)
+
+
+def _ace_softcore_force(nb, ligand, environment, lambda_vdw):
+    import ibs_engine
+
+    params = core.ACESoftcorePotential.from_dict(
+        core.ACESoftcorePotential.optimize_alpha(len(ligand))
+    )
+    return ibs_engine._create_softcore_force(
+        nb,
+        ligand,
+        environment,
+        lam_coul=0.0,
+        lam_vdw=float(lambda_vdw),
+        alchemical_params=params,
+        potential_type="softcore",
+    )
+
+
+def test_softcore_and_reconstruction_builders_use_the_physical_1nm_no_switch_protocol():
+    nb = _two_particle_nb()
+    beutler = core.BeutlerSoftcoreBuilder.build(nb, [0], [1])
+    ligand_internal, _ = core.create_ligand_internal_force(
+        nb,
+        [0, 1],
+        [nb.getParticleParameters(i) for i in range(2)],
+        num_particles=2,
+    )
+    for force in (beutler, ligand_internal):
+        assert force.getCutoffDistance().value_in_unit(unit.nanometer) == pytest.approx(1.0)
+        assert force.getUseSwitchingFunction() is False
+
+
+def test_lambda_vdw_one_matches_original_nonbonded_energy_and_forces_with_lrc():
+    """λvdW=1 的 CV + 项目 LRC 必须回到原始 1.0 nm LJ Hamiltonian。
+
+    OpenMM 的 ``NonbondedForce`` 原生 LRC 是 whole-system correction，而这里的
+    alchemical CV 只含 ligand-environment interaction group。用它直接和 cross
+    term 的手算 LRC 比，会把非 cross 的 finite-system correction 混进参考值；
+    因此短程部分与原始 NonbondedForce 对比，LRC 部分单独按项目的 cross-term
+    协议加回。
+    """
+    import ibs_engine
+
+    positions = [[1.5, 2.0, 2.0], [2.4, 2.0, 2.0]]  # r=0.9 nm
+    nb_reference = _two_particle_nb(use_lrc=False)
+    ref_energy, ref_forces = _evaluate_single_force(nb_reference, positions)
+
+    nb_for_cv = _two_particle_nb(use_lrc=False)
+    cv = _ace_softcore_force(nb_for_cv, [0], [1], lambda_vdw=1.0)
+    cv_energy, cv_forces = _evaluate_single_force(cv, positions)
+
+    all_params = [nb_for_cv.getParticleParameters(i) for i in range(2)]
+    sigma, s6, s12 = ibs_engine._lj_tail_correction_sigma_resolved_moments(
+        all_params, [0], [1]
+    )
+    alpha = core.ACESoftcorePotential.from_dict(
+        core.ACESoftcorePotential.optimize_alpha(1)
+    )
+    lrc_coeff = ibs_engine._lj_tail_lrc_coefficients_kj_mol(
+        [1.0], sigma, s6, s12, alpha.alpha_lj, alpha.m_lj, alpha.n_lj, 1.0, 1.0
+    )[0]
+    cv_plus_lrc = cv_energy + lrc_coeff / (4.0 ** 3)
+
+    assert cv_energy == pytest.approx(ref_energy, rel=2e-6, abs=2e-6)
+    assert cv_plus_lrc == pytest.approx(
+        ref_energy + lrc_coeff / (4.0 ** 3), rel=2e-6, abs=2e-6
+    )
+    # The uniform analytic tail has no coordinate derivative, so the raw CV
+    # force must equal the native NonbondedForce force exactly at this point.
+    assert cv_forces == pytest.approx(ref_forces, rel=2e-6, abs=2e-6)
+
+
+def test_softcore_force_is_zero_strictly_outside_1nm_and_at_lambda_zero():
+    """Dedicated 0.9/1.05/1.1 nm probes pin the hard 1.0 nm boundary."""
+    nb = openmm.NonbondedForce()
+    nb.setNonbondedMethod(openmm.NonbondedForce.CutoffPeriodic)
+    nb.setCutoffDistance(1.0 * unit.nanometer)
+    nb.setUseSwitchingFunction(False)
+    for charge in (0.25, -0.30, 0.10, -0.05):
+        nb.addParticle(
+            charge * unit.elementary_charge,
+            0.32 * unit.nanometer,
+            0.45 * unit.kilojoule_per_mole,
+        )
+
+    positions = [
+        [2.0, 2.0, 2.0],
+        [2.9, 2.0, 2.0],   # 0.90 nm: inside
+        [3.05, 2.0, 2.0],  # 1.05 nm: outside
+        [3.10, 2.0, 2.0],  # 1.10 nm: outside
+    ]
+    force = _ace_softcore_force(nb, [0], [1, 2, 3], lambda_vdw=0.5)
+    energy, forces = _evaluate_single_force(force, positions, box_nm=5.0)
+    assert energy != pytest.approx(0.0)
+    assert np.max(np.abs(forces[0])) > 0.0
+    assert np.array_equal(forces[2:], np.zeros_like(forces[2:]))
+
+    # The force carries all particles from ``nb``.  Use a matching two-particle
+    # reference for the separate λ=0 endpoint context.
+    zero_nb = _two_particle_nb()
+    zero_force = _ace_softcore_force(zero_nb, [0], [1], lambda_vdw=0.0)
+    zero_energy, zero_forces = _evaluate_single_force(zero_force, positions[:2], box_nm=5.0)
+    assert zero_energy == 0.0
+    assert np.array_equal(zero_forces, np.zeros_like(zero_forces))
+
+
+def test_every_production_softcore_cv_state_inherits_cutoff_and_switching_template():
+    """Catches the old per-λ unconditional setUseSwitchingFunction(True) bug."""
+    import ibs_engine
+
+    system = openmm.System()
+    system.setDefaultPeriodicBoxVectors(
+        openmm.Vec3(4.0, 0.0, 0.0) * unit.nanometer,
+        openmm.Vec3(0.0, 4.0, 0.0) * unit.nanometer,
+        openmm.Vec3(0.0, 0.0, 4.0) * unit.nanometer,
+    )
+    for _ in range(2):
+        system.addParticle(12.0 * unit.dalton)
+    nb = _two_particle_nb()
+    system.addForce(nb)
+    new_system, wrapper = ibs_engine.build_ibs_dual_system(
+        system,
+        topology=None,
+        perturbed_indices=[0],
+        lambdas_coul=[0.0, 0.0, 0.0],
+        lambdas_vdw=[1.0, 0.5, 0.0],
+        alchemical_params=core.ACESoftcorePotential.from_dict(
+            core.ACESoftcorePotential.optimize_alpha(1)
+        ),
+        potential_type="softcore",
+        box_vectors=system.getDefaultPeriodicBoxVectors(),
+    )
+    assert new_system.getNumParticles() == 2
+    assert len(wrapper._int_cv_force_xmls) == 3
+    for force_xml in wrapper._int_cv_force_xmls:
+        force = openmm.XmlSerializer.deserialize(force_xml)
+        assert force.getCutoffDistance().value_in_unit(unit.nanometer) == pytest.approx(1.0)
+        assert force.getSwitchingDistance().value_in_unit(unit.nanometer) == pytest.approx(1.0)
+        assert force.getUseSwitchingFunction() is False

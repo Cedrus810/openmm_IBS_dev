@@ -386,7 +386,7 @@ def _matching_conv(**overrides):
 
 def _gate(conv, shape=GOOD_SHAPE, enable_early_stop=False, target_steps=TARGET_STEPS,
           early_stop_config=None, lse_tolerance=LSE_TOL,
-          current_coion_identity=None):
+          current_coion_identity=None, stage_type="coul"):
     return ie._resume_cached_window_gate_status(
         conv,
         shape,
@@ -398,6 +398,7 @@ def _gate(conv, shape=GOOD_SHAPE, enable_early_stop=False, target_steps=TARGET_S
         dict(EARLY_STOP_CONFIG if early_stop_config is None else early_stop_config),
         target_steps,
         current_coion_identity=current_coion_identity,
+        stage_type=stage_type,
     )
 
 
@@ -411,6 +412,32 @@ def test_resume_accepts_fully_matching_cache():
         "early_stop_ok",
     ):
         assert status[gate_name] is True, f"{gate_name} 应为 True"
+
+
+def test_vdw_window_requires_its_separate_nonbonded_protocol_version():
+    matching = _matching_conv(
+        vdw_nonbonded_protocol_version=ie.VDW_NONBONDED_PROTOCOL_VERSION
+    )
+    status = _gate(matching, stage_type="vdw")
+    assert status["usable"] is True
+    assert status["vdw_nb_version_match"] is True
+
+    for stale in (None, -1, ie.VDW_NONBONDED_PROTOCOL_VERSION + 1):
+        conv = dict(matching)
+        if stale is None:
+            conv.pop("vdw_nonbonded_protocol_version")
+        else:
+            conv["vdw_nonbonded_protocol_version"] = stale
+        rejected = _gate(conv, stage_type="vdw")
+        assert rejected["usable"] is False
+        assert rejected["vdw_nb_version_match"] is False
+        assert "vdw_nonbonded_protocol_version" in rejected["reason"]
+
+    # Charging is deliberately independent: missing this Stage-2-only field
+    # must not invalidate the Stage-1 window gate.
+    coul = _gate(_matching_conv(), stage_type="coul")
+    assert coul["usable"] is True
+    assert coul["vdw_nb_version_match"] is True
 
 
 @pytest.mark.parametrize(

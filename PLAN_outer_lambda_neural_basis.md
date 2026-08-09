@@ -70,7 +70,7 @@ Boresch 锚点或口袋力估计，尚未进入 ABFE production Hamiltonian。
 | 完整 MACE 生产路线 | 停止；PythonForce/CUDA MTS 在 EXP-009 后端资格失败 |
 | 当前路线 | EXP-012：CV-free 通用局部残差路径势；frozen-MACE latent 是主要候选表示，XED 仅作可选消融 |
 | EXP-011 冻结状态 | `FORMAL_RUN1_OVERLAP_FAILED`；AUG-001 后 mutual overlap `0.02353 < 0.03` 且 22 个去相关样本 `< 25`，不再补采、不拟合 PMF |
-| EXP-012 状态 | `PLANNED / PREREG_DRAFT_V2 / C1_REAL_FRAME_CPU_PASSED`；三条 run 的逐帧五态 ledger 与 backend audit 已通过；MACE-OMOL-0 extra-large-1024 在 Atenolol `run1/frame0` 的两层、6 Å 精确图闭包上完成 CPU float32 latent/autograd smoke：2135 节点、155624 条有向边、ligand latent `[41,1024]`，ligand/environment 梯度均有限且非零，MACE 参数梯度为零；CUDA 同帧尚未执行，未 sealed、未训练模型 |
+| EXP-012 状态 | `SEALED`；preregistration 已 reseal（DEC-039）。`LocalResidualStudent` D1（held-out gap variance 改善，DEC-040）、D2（27/27 坐标/autograd 检查通过，DEC-040）已关闭；System 身份门已关闭（DEC-041）。D3 已于 2026-08-07（DEC-043）判定 `CLOSED`：cell-list 等价性单元测试通过；`.pow(2)`/`.square()` 假设已用真实数据（`student_d3_1_2_report_v3.json`）证伪（对残差无可测量影响），真正根因未查明、裁定不再追查；`reference_eager_vs_deployable_eager` 残差 `1.69e-7` 裁定为 `PASSED_OPERATIONAL_NUMERICAL_EQUIVALENCE`（比已接受的 CPU64→CPU32/CPU32↔CUDA32 误差还小 2 个数量级，`1e-8` 绝对阈值未进入 sealed preregistration）；sub-item 4 的 `~95%` overhead 按 §16 降级为非阻塞工程目标，如实保留。D4（短 NVT 动力学资格）已于同日（DEC-044）首次执行即通过：student TorchForce 真实注入 `hard_window0` win_sys、3 个独立种子重复实际积分，全程有限值、student 力/温度均在 sanity 门内。EXP-012 D0-D4 全部关闭，详见 EXPERIMENT_LOG DEC-043/DEC-044；WP-5A pilot 已由 DEC-048/050 判定 `NOT_PROMOTED`，当前执行方向以 §2.5 DEC-056 为准 |
 | EXP-010 教师局部选择 | ligand 41 + protein atoms 216；事后审计显示 26 个涉及残基全部是不完整截断，仅作失败证据 |
 | cheap-CV 候选 | EXP-010 的 1D order 2/4/6、2D order 2/3/4 全部不晋级；当前无 production 候选 |
 | production 接入 | 尚未进行；生产模块明确不导入独立研发模块 |
@@ -302,8 +302,38 @@ cutoff 平滑性和 force-tail 检查全部通过：最大有限差分绝对误�
 `2.4711e-7`（门 `1e-4`），最大相对误差 `1.8242e-5`（门 `1e-2`），所有非参与原子力均
 严格为零；cutoff 粗/细扫描的能量跳变缩放比为 `22.6405–24.9856`（连续行为期望 25），
 且每组被探测 pair 均只发生一次 membership flip；0.3 Å 合成近接触的能量和力 27/27
-有限。由此 D2 正式通过，允许进入 D3 部署资格；本报告明确未使用 TorchForce、未执行
-NVT，也未以 held-out run 选择 checkpoint，因此不授予 D3、D4、WP-5 或 production 资格。
+有限。由此 D2 正式通过；本报告明确未使用 TorchForce、未执行 NVT，也未以 held-out
+run 选择 checkpoint，因此不授予 D3、D4、WP-5 或 production 资格。
+
+**D3-0 provenance gate 已关闭（DEC-041，同日）**：`win_sys_xml_sha256_matches_manifest=false`
+经冻结协议（同进程两次重建确定性一致 → 换真实 `resolve_dispersion_protocol`/
+`resolve_membrane_protocol` 后哈希仍不匹配 → 10 项独立字段核对 + Force canonical
+fingerprint 全部一致）判定为 `CLOSED_STEP3_OPERATIONAL_SEMANTIC_PASS`，report SHA-256
+`2dc557092ce327c8af3eb2d137c489817a0267377604b077e4469b4d54ba32a8`。结论按冻结措辞
+原样记录：记录里没有可检测出的语义差异，历史 byte-level 不一致视为非阻塞，不猜测
+具体机制。`no_student_window0_baseline_v2.json` 的 median/P95 `1.3959/1.3968` ms/step
+现在可采信为生产基线。System 身份门解除，D3 中依赖真实生产 System 的部分可以开始；
+协议只跑一次，不再开第二轮调查。
+---
+
+### 2.5 当前执行裁决（DEC-056，2026-08-09）
+
+上面的基线表按其标题日期保留为历史快照；当前主线以本节为准：EXP-012 已完成且
+`NOT_PROMOTED`（DEC-048/050），EXP-016 已完成但结论为不晋级，后续没有动作。EXP-013
+方案③的 013-B 已按预注册主门判定 `FAILED`（DEC-055/056）：N=8/16/32 的 `z>3`
+系统性偏移不能被 `<1.3 K` 的物理量级补充报告推翻，也不得进入 013-C 或事后放宽阈值。
+
+当前只执行方案①的独立资格入口：整个 fused Group-1 作为慢组，沿用 State API 初始化，
+禁止跨 integrator `loadCheckpoint()`；先做 `N=1/2/4/8` 低成本物理预检，未通过不得触碰
+N=16。Smoke 已通过但不授予 N=16；Qualification 使用 `400/2000` ticks 和 block-aware
+SEM 后，N=2/4/8 系统偏移 gate 未通过（DEC-058），因此 `N16_NOT_AUTHORIZED`；该单
+种子结果不足以判定方案①普遍存在物理系统偏差，登记
+`PHYSICAL_SYSTEMATIC_BIAS_INCONCLUSIVE`。当前进入方案②的 N=1 ESS
+信号检查；方案② N=1 无信号后已按 DEC-059 转 EXP-014；EXP-014 当前冻结 screen
+未通过（DEC-060），不进入 OpenMM 资格化。ORB 暂只做 charge/spin
+contract audit；若父体系总电荷与闭壳层 multiplicity 的合约不能冻结，OMol arm 保持
+`EXPLORATORY_ONLY`，不执行 ORB-001 1500-frame probe。
+
 ---
 
 ## 3. 数学定义

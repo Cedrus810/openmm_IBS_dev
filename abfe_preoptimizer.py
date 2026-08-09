@@ -18,8 +18,16 @@ import glob
 import json
 import shutil
 from typing import Any, Dict, List, Tuple, Optional
-from abfe_core import ACESoftcorePotential
-from ibs_engine import generate_overlapping_windows
+from abfe_core import (
+    ACESoftcorePotential,
+    CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER,
+    CHARGE_TREATMENT_CO_ANNIHILATION_EXPERIMENTAL,
+)
+from ibs_engine import (
+    generate_overlapping_windows,
+    configure_charge_transfer_decharging,
+    configure_coalchemical_neutral_decharging,
+)
 try:
     from scipy.interpolate import PchipInterpolator
     HAS_SCIPY = True
@@ -2696,9 +2704,16 @@ def _create_softcore_force_dual_lambda(
     particle_params_override=None,
     num_particles=None,
     use_global_lambda=False,
-    cutoff_distance=1.2,
+    cutoff_distance=1.0,
 ):
-    """构建带双全局 lambda 的软核力，用于探针系统"""
+    """构建带双全局 lambda 的软核力，用于探针系统。
+
+    [MEM-00h，2026-08-06] 默认值从 1.2 nm 改为 1.0 nm、关闭 switching——探针
+    体系是给 λ 路径预优化用的，如果它的非键协议跟生产 `ibs_engine.
+    _create_softcore_force` 不一致，预优化出来的 overlap/度量场就是在一个跟
+    实际采样不一样的哈密顿量上算的，没有意义。所有调用方都没有显式传
+    `cutoff_distance`，全部吃这个默认值，改这里即可。
+    """
     if num_particles is None:
         num_particles = nb_force.getNumParticles()
     perturbed_set = set(perturbed_indices)
@@ -2737,8 +2752,8 @@ def _create_softcore_force_dual_lambda(
             if p1 < num_particles and p2 < num_particles:
                 force.addExclusion(p1, p2)
 
-    force.setUseSwitchingFunction(True)
-    force.setSwitchingDistance(1.0 * unit.nanometer)
+    force.setUseSwitchingFunction(False)
+    force.setSwitchingDistance(cutoff_distance * unit.nanometer)
     return force
 
 
@@ -2748,10 +2763,22 @@ def build_aces_probe_system_dual_lambda(
     softcore_params,
     fixed_lam_coul=None,
     fixed_lam_vdw=None,
-    cutoff_distance=1.2,
+    cutoff_distance=1.0,  # [MEM-00h，2026-08-06] 1.2→1.0，见 _create_softcore_force_dual_lambda 的说明
     use_reaction_field=False,
+    topology=None,
+    positions=None,
+    box_vectors=None,
+    co_alchemical_ion_spec=None,
 ):
-    """双λ探针系统构建 (用于预优化)"""
+    """双λ探针系统构建 (用于预优化).
+
+    For a charged leg the probe must contain the *same* frozen co-ion
+    Hamiltonian as production.  The canonical B3 builders in ``ibs_engine``
+    write the ligand/co-ion ``NonbondedForce`` offsets and inject the shared
+    flat-bottom restraint; this function only adapts their result to the
+    ACES pilot (soft-core Lennard-Jones in the custom force).  In particular,
+    it does not re-derive a second charge-transfer formula.
+    """
     system = ensure_owned_system(system)
     new_sys = ensure_owned_system(XmlSerializer.deserialize(XmlSerializer.serialize(system)))
     num_atoms = new_sys.getNumParticles()
@@ -2760,11 +2787,69 @@ def build_aces_probe_system_dual_lambda(
 
     nb_forces = [f for f in new_sys.getForces() if isinstance(f, openmm.NonbondedForce)]
     nb = nb_forces[0]
+    # Keep the physical parameters for the ACES force before B3 mutates the
+    # native NonbondedForce to its base+offset representation.
     all_p = [nb.getParticleParameters(i) for i in range(num_atoms)]
     ref_excl = [
         (int(nb.getExceptionParameters(i)[0]), int(nb.getExceptionParameters(i)[1]))
         for i in range(nb.getNumExceptions())
     ]
+
+    charge_offsets_active = False
+    if co_alchemical_ion_spec is not None:
+        if topology is None:
+            raise ValueError(
+                "带 co-ion spec 的 ACES probe 必须传入 topology，"
+                "以便复用 B3 verify_co_alchemical_ion_identity()。"
+            )
+        treatment = str(co_alchemical_ion_spec.get("charge_treatment", ""))
+        if treatment == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
+            configure_charge_transfer_decharging(
+                new_sys,
+                list(perturbed_indices),
+                topology,
+                lambda_name="lam_coul",
+                co_alchemical_ion_spec=co_alchemical_ion_spec,
+            )
+            charge_offsets_active = True
+        elif treatment == CHARGE_TREATMENT_CO_ANNIHILATION_EXPERIMENTAL:
+            if positions is None:
+                raise ValueError(
+                    "co-annihilation ACES probe 需要 positions，"
+                    "以复用 B3 restraint 注入路径。"
+                )
+            configure_coalchemical_neutral_decharging(
+                new_sys,
+                list(perturbed_indices),
+                topology,
+                positions,
+                box_vectors=box_vectors,
+                lambda_name="lam_coul",
+                co_alchemical_ion_spec=co_alchemical_ion_spec,
+            )
+            charge_offsets_active = True
+        else:
+            raise ValueError(
+                f"ACES probe 收到未知 co-ion charge_treatment={treatment!r}；"
+                "拒绝生成未绑定生产路线的 Hamiltonian。"
+            )
+
+        # The custom ACES force remains responsible for the soft-core LJ
+        # interaction.  Its per-particle q for ligand atoms must be zero when
+        # B3's PME ParameterOffset carries the real λ-dependent Coulomb term,
+        # otherwise ligand/environment Coulomb would be counted twice.  The
+        # native NonbondedForce still exposes the actual offsets for both the
+        # ligand and co-ion, so endpoint charge audits inspect the real force.
+        for idx in range(nb.getNumGlobalParameters()):
+            if nb.getGlobalParameterName(idx) == "lam_coul":
+                default_lam = 1.0 if fixed_lam_coul is None else float(fixed_lam_coul)
+                nb.setGlobalParameterDefaultValue(idx, default_lam)
+                break
+        # Dual-lambda pilot diagnostics sample force group 1.  Include the
+        # native PME/NonbondedForce there so finite differences see the same
+        # λ-dependent Coulomb energy that the offsets just installed control.
+        nb.setForceGroup(1)
+
     zero_q = 0.0 * unit.elementary_charge
     zero_sig = 0.1 * unit.nanometer  # 保留极小半径防除零，但能量为0
     zero_eps = 0.0 * unit.kilojoule_per_mole
@@ -2783,12 +2868,25 @@ def build_aces_probe_system_dual_lambda(
         new_sys.addForce(ll_14_f)
 
     # Group 1: 双λ软核力
+    aces_particle_params = all_p
+    if charge_offsets_active:
+        # Keep LJ sigma/epsilon and environment charges in the probe payload,
+        # but leave ligand Coulomb to the canonical B3 offsets above.
+        aces_particle_params = list(all_p)
+        for idx in perturbed_indices:
+            _q, sig, eps = aces_particle_params[int(idx)]
+            aces_particle_params[int(idx)] = (
+                zero_q,
+                sig,
+                eps,
+            )
+
     ac_f = _create_softcore_force_dual_lambda(
         nb, perturbed_indices, env_idx,
         fixed_lam_coul, fixed_lam_vdw,
         softcore_params,
         reference_exclusions=ref_excl,
-        particle_params_override=all_p,
+        particle_params_override=aces_particle_params,
         num_particles=num_atoms,
         use_global_lambda=True,
         cutoff_distance=cutoff_distance
@@ -2802,12 +2900,21 @@ def build_aces_probe_system_dual_lambda(
     return new_sys
 
 
-def build_aces_probe_system(system, perturbed_indices, softcore_params, prefix="aces_pre",
-                            fixed_lam_coul=0.5, fixed_lam_vdw=1.0):
+def build_aces_probe_system(
+    system,
+    perturbed_indices,
+    softcore_params,
+    prefix="aces_pre",
+    fixed_lam_coul=0.5,
+    fixed_lam_vdw=1.0,
+    **probe_kwargs,
+):
     """单λ探针系统构建（内部委托给双λ版本）"""
     return build_aces_probe_system_dual_lambda(
         system, perturbed_indices, softcore_params,
-        fixed_lam_coul=fixed_lam_coul, fixed_lam_vdw=fixed_lam_vdw
+        fixed_lam_coul=fixed_lam_coul,
+        fixed_lam_vdw=fixed_lam_vdw,
+        **probe_kwargs,
     )
 
 
@@ -2970,6 +3077,7 @@ def optimize_2d_geodesic_path(
     n_steps_per_point: int = 3000,
     temperature: float = 300.0,
     platform_name: str = "CUDA",
+    co_alchemical_ion_spec: Optional[Dict[str, Any]] = None,
 ) -> List[Tuple[float, float]]:
     """运行 2D 度量张量场采集 + Dijkstra 测地线寻径
 
@@ -2982,6 +3090,10 @@ def optimize_2d_geodesic_path(
     probe_sys = build_aces_probe_system_dual_lambda(
         system, ligand_indices, sc_obj,
         fixed_lam_coul=0.5, fixed_lam_vdw=1.0,
+        topology=topology,
+        positions=positions,
+        box_vectors=box_vectors,
+        co_alchemical_ion_spec=co_alchemical_ion_spec,
     )
 
     platform = openmm.Platform.getPlatformByName(platform_name)

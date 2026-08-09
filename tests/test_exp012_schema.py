@@ -21,17 +21,48 @@ PREREG = ROOT / "protocols" / "EXP-012_preregistration.json"
 
 
 def _draft():
-    return json.loads(PREREG.read_text(encoding="utf-8"))
+    """A self-contained draft-status fixture for exercising the validator's
+    logic in isolation.
+
+    This intentionally does NOT read the live `protocols/EXP-012_preregistration.json`
+    (unlike an earlier version of this helper): that file is the real,
+    mutable project artifact, and its `freeze.status` legitimately changed
+    from "draft" to "sealed" on 2026-08-05 (DEC-039/§11A.12 arm retirement +
+    reseal). Tests of the schema *validator's* behavior (does it reject role
+    leakage, a corrupted fingerprint, a length mismatch, ...) must not depend
+    on whichever state the real preregistration happens to be in at the time
+    -- that coupling is exactly what broke every test below the moment the
+    real file was sealed for real, permanent, correct reasons. The scientific
+    content here (lambda schedule, A_k envelope, ledger slice, run records)
+    is snapshotted from the real file since it's real, frozen, cross-checked
+    data; only the freeze bookkeeping is forced back to an ordinary draft
+    shape so mutate-one-field-and-expect-a-specific-error tests don't trip
+    the (correct, fail-closed) "sealed payload digest must match" check
+    before they ever reach the specific behavior they're testing.
+    """
+
+    payload = json.loads(PREREG.read_text(encoding="utf-8"))
+    payload["freeze"] = {
+        "status": "draft",
+        "allow_postseal_override": False,
+        "source_identity": payload["freeze"]["source_identity"],
+    }
+    payload["unresolved"] = ["schema_test_fixture_placeholder"]
+    return payload
 
 
-def test_repository_draft_is_valid_but_not_executable():
+def test_repository_is_currently_sealed_and_executable():
+    """Regression check on the real, live artifact (not the `_draft()` fixture):
+    the real preregistration was resealed on 2026-08-05 (arm retirement +
+    (d0-5) freeze, DEC-039) and is expected to stay sealed and executable
+    from here on. If this ever fails, either the real file regressed to
+    draft, or its content changed without the digest being recomputed --
+    both are real problems, not something to silence by reverting this test.
+    """
     registration = load_preregistration(PREREG, workspace_root=ROOT)
-    assert registration.status == "draft"
-    assert not registration.executable
-    assert "inputs.runs[*].ledger" not in registration.unresolved
-    assert "target.A_k" not in registration.unresolved
-    with pytest.raises(Exp012ProtocolError, match="blocked"):
-        registration.require_executable()
+    assert registration.status == "sealed"
+    assert registration.executable
+    assert registration.unresolved == ()
 
 
 def test_repository_draft_freezes_global_stage2_schedule_and_local_ledger_slice():
@@ -148,5 +179,6 @@ def test_sealed_payload_requires_ledgers_Ak_and_matching_digest():
 
 
 def test_draft_cannot_be_required_as_sealed():
+    payload = _draft()
     with pytest.raises(Exp012ProtocolError, match="blocked"):
-        load_preregistration(PREREG, workspace_root=ROOT, require_sealed=True)
+        validate_preregistration(payload, require_sealed=True)
