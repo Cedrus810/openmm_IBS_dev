@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pycache_check/
+.rocklin_review_check/
+.rocklin_smoke/
+
+# Editor and manual backup files belong in archive/, not beside live source.
+\#*\#
+*.bak
+*.pre_*
+* - 副本.py

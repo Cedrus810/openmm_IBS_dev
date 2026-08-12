@@ -27,6 +27,13 @@ python runabfe.py self-test
 4. 根据 stage diagnostics 判断是否需要进一步加密 vanishing 阶段窗口或增加采样；其余源码级 P2 以 `TODO.md` 为准。
 
 
+## 版本控制现状
+
+本目录不是一个可用的 git 仓库：`.git/` 下只有一个空的 `info/` 子目录，没有
+`HEAD`/`refs`/`objects`，`git log`、`git status` 等命令会直接报错退出。不要假设
+可以用 git 历史核对改动时间线或找回旧版本；改动的时间线和依据只能靠文件 mtime 和
+`EXPERIMENT_LOG_*.md`/`IMPLEMENTATION_PLAN_*.md` 里的 DEC 记录追溯。
+
 ## 最低验证
 
 ```bash

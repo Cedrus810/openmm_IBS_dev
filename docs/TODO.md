@@ -1,6 +1,6 @@
 # 当前行动清单
 
-更新：2026-08-05。完整 2026-07-27 审计长记录已移入 [archive/TODO-2026-07-27-full.md](archive/TODO-2026-07-27-full.md)。历史原文见 [archive/todolist-2026-07-20.md](archive/todolist-2026-07-20.md)，审计证据见 [status/AUDIT_STATUS.md](status/AUDIT_STATUS.md)，运行验证见 [status/VALIDATION_MATRIX.md](status/VALIDATION_MATRIX.md)。本轮移出的完成/关闭项见 [../archive/todo-2026-07-29.md](../archive/todo-2026-07-29.md)。
+更新：2026-08-06。完整 2026-07-27 审计长记录已移入 [archive/TODO-2026-07-27-full.md](archive/TODO-2026-07-27-full.md)。历史原文见 [archive/todolist-2026-07-20.md](archive/todolist-2026-07-20.md)，审计证据见 [status/AUDIT_STATUS.md](status/AUDIT_STATUS.md)，运行验证见 [status/VALIDATION_MATRIX.md](status/VALIDATION_MATRIX.md)。本轮移出的完成/关闭项见 [../archive/todo-2026-07-29.md](../archive/todo-2026-07-29.md)。
 
 - **B4（溶剂腿 charge-transfer builder）已落地（2026-08-05）。** 详见 `memtodolist.md`
   §1.2 `co_alchemical_charge_transfer` 条目与 §17.0。只在合成 topology 上单元测过，
@@ -47,6 +47,89 @@
   生产窗口本来就是在 scale=1.0 下采样完成的，不受影响。详见 `memtodolist.md`
   §0.5.16。回归：`py_compile` 通过，全套 offline 回归无新增失败。⚠️ **未在真实
   GPU 上验证窗口 5 现在能否正常收敛**，需要用户在自己的计算节点上实测确认。
+- **C1（带电小水盒验证）改用单原子离子当"配体"，脚本已写完（2026-08-06）。**
+  `memtodolist.md` 原稿 C1 要求质子化 Atenolol(+1)/acetate(-1) 这类现造小分子，
+  需要 Gaussian+Sobtop 重新做 RESP/GAFF 参数化。用户提议改用 Na⁺/Cl⁻/Ca²⁺ 当
+  "配体"：净电荷严格是整数、参数直接来自 OpenMM 自带 `amber14/tip3p.xml`（实测
+  Ca²⁺ 也在其中），不需要任何外部 QM 流程；Ca²⁺（+2）还正好实测了 §2.2"多个单价
+  co-ion 分摊"这条此前只有合成 topology 测过的路径。核心共炼金函数
+  （`select_co_alchemical_ion_once`/`configure_pme_ligand_charge_offsets`/
+  `charging_charge_conservation_report`/`TraditionalMBARAnalyzer.compute_u_kn`）
+  全部是通用 System/Topology 签名、不绑定 GROMACS `.top`，所以直接用
+  `Modeller.addSolvent` 建盒，不必经过 `build_and_cache_solvent_leg` 的配体 ffxml
+  抽取流程。新文件 `tools/validation/validate_charge_transfer_waterbox.py`，六个
+  子命令：`build`/`static-check`（纯 CPU，已自测：Na/Cl/Ca 三个 small-box case
+  全过）、`dynamics`/`ukn`（需要 GPU/CUDA 建 Context 采样，按规矩交给用户在计算
+  节点跑，本轮未执行）、`report`/`compare-box`（汇总+§13.4 盒长敏感性判定，纯
+  CPU，已用 stub JSON 自测逻辑通过）。
+  ⚠️ 自测 `build` 时抓到并修了两个 bug（写完当场自己发现自己改，不是蒙混过关）：
+  reserved co-ion 计数用了 dummy 插入*之前*的 stale 原子索引去查插入*之后*的新
+  编号（`Modeller.delete()` 会重新编号）；单原子离子当配体时配体自己和普通盐共用
+  同一残基名（都叫"NA"之类），"普通盐计数"必须同时减掉 dummy *和*配体自己，只减
+  dummy 会把配体也错算成普通盐。加了一条 fail-closed 断言（配体+普通盐+已清零
+  dummy 的物理体系总电荷必须严格为 0）钉住这类计数逻辑本身的 bug。
+  详见 `memtodolist.md` §17.0/C1 与脚本头部 docstring。
+- **C1 剩余矩阵跑完（用户在真机跑，2026-08-06）：Na/Cl 硬性验收通过；Ca 额外验证
+  暴露并修了一个真 bug。**
+  * **Na(+1)/Cl(−1) 大小盒比较（原稿硬性验收）：全部通过。**
+    `compare_box_Na.json`/`compare_box_Cl.json`：`|ΔΔG|` 分别 0.137 / 0.263
+    kcal/mol，远低于 §13.4 的 1.0 kcal/mol 与各自 2σ 阈值；四个 case 的 MBAR 都
+    `converged: true`（`min_overlap` 0.07~0.10）；charge conservation / finite
+    energy / co-ion 几何 / restraint / endpoint 电荷五项子检查全过。
+    ⚠️ 目前只跑了 1 个 seed（`--seed 2026` 默认值）；原稿第 4 步写的是"至少 3
+    seed"才算正式关闭验收——**用户已确认这次先不补 seed，单 seed pilot 当前先够
+    用**，正式关闭前仍需补跑另外 2 个 seed。
+  * **Ca(2+)（额外验证，非硬性要求）：不通过，且是真 bug，不是统计噪音。**
+    `Ca_small`/`Ca_large` 的 charging ΔG 算出 158/157 kcal/mol，MBAR
+    `converged: false`（`min_overlap` 仅 0.009~0.013，Na/Cl 是 0.07~0.10）。
+    查了两个 reserved co-ion dummy 的相互 minimum-image 距离：**Ca_small 只有
+    0.43 nm，Ca_large 只有 0.18 nm**——λ→0 时两者同号各带 +1e，几乎贴脸的静电
+    排斥直接把 MBAR 拖到不收敛。
+    **根因（已定位并修复，2026-08-06）**：`runabfe._insert_reserved_coalchemical_ion_dummies`
+    对 `count>1`（`|q_L|≥2`）的多个 dummy，只按"离配体质心 minimum-image 距离
+    最远"独立打分，完全没约束这几个被选中的候选彼此之间的距离——方盒里"离配体
+    最远的 N 个点"天然会挤在同一个远角，Ca²⁺ 正好是本仓库第一次在真实体系上测
+    §2.2"多个单价 co-ion 分摊"这条路径，一测就测出来了。
+    **修法**：`abfe_core.py` 新增命名常量 `COION_COION_MIN_IMAGE_INITIAL_NM = 1.6`
+    （进 `acceptance_thresholds_payload()`，`ACCEPTANCE_THRESHOLDS_VERSION` 1→2）；
+    选点算法改成贪心 farthest-first，但跳过与**已选中**的 dummy 距离不够这个
+    下限的候选，找不满 `count` 个就 fail closed。`tests/test_solvent_leg_coion_builder.py`
+    重写了原来"选最远 N 个"的契约测试（原测试用共线候选，测不出互斥距离这件
+    事）+ 新增两条回归：一条专门复现"选出彼此贴脸的两个候选"再断言修复后改选
+    够远的替代候选，一条断言候选数量够但彼此挤在一起时 fail closed。
+    回归：`py_compile` 通过；**尚未跑 pytest，也未在 GPU 上重新验证 Ca_small/
+    Ca_large 确实能收敛**——这两步都需要用户在 `openmm_dev` 环境/计算节点上跑，
+    本轮未执行。Ca 不影响 C1 通过（原稿硬性矩阵只要求 `q=±1`），但这是一个会
+    影响任何未来 `|q_L|≥2` 配体的真实缺陷，值得记录。
+
+  **用户重跑后的复核（2026-08-06 稍晚）：几何 bug 确实修好了，但它不是 Ca 不
+  收敛的（主要）根因——之前的判断需要修正。**
+  重跑后 `Ca_large` 两个 dummy 的相互距离从 0.18 nm 变成 **1.99 nm**（
+  `≥ COION_COION_MIN_IMAGE_INITIAL_NM`，修复确认生效），但 `charging ΔG`
+  几乎没变（658→663 kJ/mol）、MBAR 仍然 `converged: false`
+  （`min_overlap` 0.0097，之前是 0.0093）。⚠️ `Ca_small` 这次**没有被真正重
+  建**——`build_manifest.json`/`system.xml` 的 mtime 早于这次代码修复的时间，
+  说明它复用的还是修复前、两 dummy 相距 0.43 nm 的旧建系产物；`compare_box_Ca.json`
+  这次算出的 `passed: true` 是拿"旧建系的 Ca_small" 和"新建系的 Ca_large"比，
+  **不是一次干净的同代码对照，不能当作"修复后通过"的证据**。
+
+  把 `u_kn.npz` 逐 λ 相邻态的平均能量差摊开看（`n_k=100`、11 个态，纯读盘算术，
+  没有再起 GPU）：Ca 每一步（Δλ_coul=0.1）的平均位移在 ~27~117 kJ/mol 量级、
+  全程都很大且平滑变化，不是只有某一两步异常；相比之下 Na/Cl 每一步只有
+  ~7~35 kJ/mol。比值大致是 3~4 倍，量级上更接近"配体电荷 Z² 标度"（Z=2 时是
+  Z=1 的 4 倍）而不是"两个 dummy 靠太近"能解释的范围。物理上更可能的解释：
+  这条 charge-transfer 路线把配体的 1 个二价电荷拆成 2 个独立放置、彼此隔开的
+  单价 dummy——"1 个集中的 2 价点电荷"的自能（∝ Z²=4）与"2 个分开摆放的 1 价
+  点电荷"的自能之和（∝ 1+1=2，另加一个较小的正 mutual 项）本来就不相等，这个
+  差值是**真实的、该在的**电荷"合并/拆分"自由能，只是量级大到 11 个均匀 λ 点
+  给不出足够 overlap，MBAR 才收敛不了——不是几何 bug，是这条方案对 `|q_L|≥2`
+  配体本身需要更密的 λ 表（或非均匀加密）才能收敛。
+
+  **结论**：几何 bug 修复本身是对的、该留着（防止真正的贴脸静电灾难），但
+  **不要**把它当成"Ca 现在应该收敛"的理由。Ca 仍然是未收敛、不可报数的状态，
+  这是本方案对多价配体的一个已知统计限制，不是这轮能顺手解决的东西。当前
+  Atenolol 项目用不到 `|q_L|≥2`，**不追加投入**；留给以后真正需要多价配体时，
+  按"加密 λ 表"这个方向处理。C1 硬性验收（Na/Cl）不受影响。
 
 ## 当前决策
 

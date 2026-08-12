@@ -534,3 +534,50 @@ ORB OMol shallow layer 2
 ```
 
 即使 ORB 无法满足每步在线预算，只要 layer 2 primary 稳定通过冻结的 held-out 统计门，它仍可作为离线 teacher、后处理 reweighting 表示或后续小型 student 的设计依据。反之，如果 primary probe、charge/spin 合约或 cap/图规模审计失败，应在对应 ORB-000/001/003 门停止，不继续投入 OpenMM 桥接和 production 工程。
+## 16. ORB-003 CUDA matched-path 最终结论（2026-08-10）
+
+### 16.1 封存状态
+
+- [x] CUDA production checkpoint restore：`COMPLETED`；本次没有使用 fallback trajectory。
+- [x] OpenMM platform：`CUDA`；ORB compute device：`cuda:0`。
+- [x] matched production baseline：`1.273 ms/step`。
+- [x] matched production + temporary ORB scalar：`78.896 ms/step`。
+- [x] incremental delta：`77.622 ms/step`。
+- [x] frozen online budget：`0.1–0.2 ms/step`。
+- [x] wrapper 与 offline adapter scalar absolute difference：`7.59e-7`。
+- [x] report SHA-256：`10ac708502f5a3fdf160db7d1e8c55a9494052e3053989f5f5bfce7abea335be`。
+
+证据文件：`output/outer_lambda_orb/orb003_cost_probe_cuda_node.json`。
+
+### 16.2 结果解释
+
+这不是设备不匹配或 checkpoint restore 失败，而是同一 production CUDA path 上的真实成本门失败：
+
+```text
+ORB-001  REPRESENTATION_PROMISING
+ORB-003  CUDA_MATCHED_COMPLETED / COST_GATE_FAILED
+ORB-004  STOPPED
+ORB-005  STOPPED
+ORB online TorchForce path  CLOSED
+ORB role  OFFLINE_TEACHER_ONLY
+```
+
+CUDA timing 的数量级经过独立路径交叉核对：layer-2 forward 约 `36.64 ms`，scalar coordinate backward 约 `80.49 ms`，TorchForce group evaluation 稳态约 `77.93 ms`，与完整 MD 每步增量 `77.62 ms` 一致。`4.05 s` 的首次 TorchForce bridge 样本属于冷启动/JIT 离群值，未进入 median；正式 matched step timing 另有 warmup steps。
+
+本次 L2 closure 是 `1569 nodes / 113804 edges`，最大 outgoing neighbor 为 `107`，无 120-cap 命中。该图规模和 ORB-v3 内部 1024-wide message-passing MLP 使 layer-2 scalar 的坐标反向传播仍然昂贵；256 维 latent 不代表整个计算图只有 256 维宽度。
+
+### 16.3 成本口径边界
+
+- baseline 与 with-ORB 使用同一 checkpoint、box、parameters、integrator 和 production System 构建逻辑；with-ORB 只额外加入 temporary scalar TorchForce。
+- `77.622 ms/step` 是当前冻结的静态 local-edge TorchForce wrapper 在 matched CUDA production path 上的实测增量，不是把 Context、Integrator 或 checkpoint 初始化混入的数字。
+- 当前 wrapper 使用已冻结的 L2 edge set；若未来在线路线要求每步动态 full-parent closure/neighbor rebuild，额外图构造成本只会增加。因此本结果已经足以停止当前在线路线。
+- temporary scalar 仅用于成本/坐标梯度探针，不是 ORB-004 的科学 readout，也不构成 ORB scalar Hamiltonian 资格。
+
+### 16.4 封存边界和后续政策
+
+本结论关闭的是当前冻结配置的在线部署路线：`orb-v3-conservative-omol`、layer 2、父体系 `Q=0/M=1`、`compile=False`、scalar-autograd TorchForce、约 1569-node/113804-edge 局部图。它不否定已经通过 ORB-001 primary statistical gate 的 representation，也不否定其作为 offline teacher、post-hoc reweighting 表示或后续小型 student 设计依据的价值。
+
+- [x] 不进入 ORB-004/005。
+- [x] 不继续做在线 TorchForce、MTS 或 OpenMM production wiring。
+- [x] 不因本次成本失败事后重选 model、layer、checkpoint、contract 或 neighbor policy。
+- [ ] 任何未来 matched CUDA 复核必须另立独立实验和报告，不能覆盖本次封存结果。
