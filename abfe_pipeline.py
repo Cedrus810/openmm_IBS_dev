@@ -92,6 +92,11 @@ from ibs_engine import (
     select_co_alchemical_ion_once,
     # [P0-REMD-CUDA] 显存读数唯一实现（走 nvidia-smi 子进程，绝不在本进程初始化 CUDA）。
     _gpu_memory_mib,
+    # [Stage2 handoff] charge-transfer 配体的 vanishing 输入需要先走一遍
+    # charging 配置（复用同一个生产入口，不重新发明）。
+    configure_pme_ligand_charge_offsets,
+    Exp019SeedLedger,
+    EXP019_SEED_WIRING_PROTOCOL_VERSION,
 )
 from abfe_core import (
     calculate_boresch_analytical_correction,
@@ -134,6 +139,13 @@ from abfe_core import (
     # [MEM-00c] 只读核对冻结的 co-ion 身份（唯一实现，不在 pipeline 里另写一份）。
     verify_co_alchemical_ion_identity,
     co_alchemical_ion_cache_identity_payload,
+    # [Stage2 handoff，2026-08-11] 把某个 GlobalParameter 在给定端点上的取值
+    # 固化成静态 NonbondedForce 参数并彻底删除该参数——charge-transfer 配体的
+    # charging→vanishing 交接就是靠它，不是靠"调用方记得设 λ=0"。
+    bake_global_parameter_into_fixed_nonbonded_force,
+    ensure_owned_system,
+    CHARGE_TRANSFER_VANISHING_HANDOFF_PROTOCOL_VERSION,
+    charge_treatment_qualification_payload,
 )
 import warnings
 
@@ -812,7 +824,12 @@ def _collect_pipeline_provenance(
     positions,
     command_line: Optional[List[str]] = None,
 ) -> Dict:
-    env_seed_keys = ("OPENMM_RANDOM_SEED", "ABFE_RANDOM_SEED", "PYTHONHASHSEED")
+    env_seed_keys = (
+        "OPENMM_RANDOM_SEED",
+        "ABFE_RANDOM_SEED",
+        "IBS_RANDOM_SEED",
+        "PYTHONHASHSEED",
+    )
     return {
         "config": config or {},
         "command_line": command_line if command_line is not None else sys.argv,
@@ -1337,6 +1354,8 @@ class ABFEPipeline:
         membrane_quality_inputs: Optional[Dict] = None,
         membrane_quality_gate_mode: Optional[str] = None,
         charge_treatment: Optional[str] = None,
+        repeat_seed: Optional[int] = None,
+        leg_name: Optional[str] = None,
     ):
 
         # 统一温度/压力单位
@@ -1355,6 +1374,18 @@ class ABFEPipeline:
         self.positions = positions
         self.box_vectors = box_vectors
         self.ligand_indices = ligand_indices or []
+        self.repeat_seed = int(repeat_seed) if repeat_seed is not None else None
+        self.leg_name = str(leg_name) if leg_name is not None else None
+        if self.repeat_seed is not None:
+            if self.repeat_seed <= 0:
+                raise ValueError("EXP-019 repeat_seed must be positive")
+            if self.leg_name not in {"complex", "solvent"}:
+                raise ValueError(
+                    "EXP-019 seeded pipelines require leg_name='complex' or 'solvent'"
+                )
+            self.seed_ledger = Exp019SeedLedger(self.repeat_seed, self.leg_name)
+        else:
+            self.seed_ledger = None
 
         # 膜体系协议（memtodolist §3.1/§3.2，B1）。**纯增量**：不声明 system_type 时
         # 解析结果是 legacy soluble 协议（MonteCarloBarostat，频率 25），
@@ -1432,10 +1463,32 @@ class ABFEPipeline:
         self._log(f"{'=' * 60}")
         self._log(f"ABFE Pipeline v4.0 初始化完成 | {datetime.now().isoformat()}")
         self._log(f"输出目录: {self.output_dir}")
+        if self.seed_ledger is not None:
+            self._log(
+                f"EXP-019 seed wiring 已启用 | leg={self.leg_name} | "
+                f"repeat_seed={self.repeat_seed} | "
+                f"protocol=v{EXP019_SEED_WIRING_PROTOCOL_VERSION}"
+            )
         self._log(
             f"配体原子数: {len(self.ligand_indices)} | 温度: {self.temperature} | 压力: {self.pressure}"
         )
         self._log(f"{'=' * 60}")
+
+    def _seed_for(
+        self,
+        phase: str,
+        stage: str,
+        window: Any,
+        stream: str,
+        attempt: int = 0,
+    ) -> Optional[int]:
+        """Return and record a derived seed for this pipeline's leg."""
+        if self.seed_ledger is None:
+            return None
+        return self.seed_ledger.derive(phase, stage, window, stream, attempt)
+
+    def seed_contract_snapshot(self) -> Optional[Dict[str, Any]]:
+        return self.seed_ledger.snapshot() if self.seed_ledger is not None else None
 
     # =========================================================================
     # 0. Native System 缓存 (XML 持久化，支持续跑跳过 GROMACS 重建)
@@ -1678,6 +1731,22 @@ class ABFEPipeline:
         )
         self._co_alchemical_ion_spec_cached = spec
         return spec
+
+    def _charge_transfer_vanishing_handoff_active(self) -> bool:
+        """charge-transfer 配体的 Stage2 handoff 是否真的会被触发。
+
+        单一实现——`_stage_protocol_key`（缓存指纹）与 `_run_dual_lambda_stage`
+        （vanishing 分支实际执行）共用这个判据，不允许两处各写一份、悄悄不
+        同步（那样缓存指纹判定的条件和真实行为的条件就可能对不上，正是
+        resume 静默用错缓存的经典成因）。
+
+        中性配体（当前唯一生产路径，`charge_treatment` 解析为 `"neutral"`）
+        必然返回 `False`：`self.charge_treatment` 不等于 charge-transfer。
+        """
+        if self.charge_treatment != CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
+            return False
+        spec = self.resolve_co_alchemical_ion_spec()
+        return spec is not None and int(spec.get("ligand_net_charge_e", 0)) != 0
 
     def _load_pipeline_state(self) -> Dict:
         """加载 Pipeline 状态"""
@@ -2005,6 +2074,11 @@ class ABFEPipeline:
             1.0 / unit.picosecond,
             PRE_EQUILIBRATION_TIMESTEP_PS * unit.picosecond,
         )
+        equil_integrator_seed = self._seed_for(
+            "equilibration", "pre_equilibration", "global", "integrator"
+        )
+        if equil_integrator_seed is not None:
+            integrator.setRandomNumberSeed(equil_integrator_seed)
         
         # ✅ 修复：正确初始化 Platform，支持 CUDA
         try:
@@ -2040,7 +2114,7 @@ class ABFEPipeline:
             self._log("  → 能量最小化...")
             openmm.LocalEnergyMinimizer.minimize(simulation.context, maxIterations=1000)
 
-            # 🔑 膜体系：最小化后必须把速度初始化到目标温度，**再**开始 NPT。
+            # 🔑 最小化后必须把速度初始化到目标温度，**再**开始 NPT。
             #
             # 这个函数原来从不调 `setVelocitiesToTemperature`（`ibs_engine` 里有 10 处
             # 都调，唯独这里没有），于是体系从 **0 K** 起跑，而 barostat 从第 0 步就
@@ -2053,8 +2127,8 @@ class ABFEPipeline:
             # 近似定容下 XY 收 / Z 涨（零表面张力膜 barostat 的正常弛豫），
             # 所以"冷启动压塌盒子"这个假设并未被证实。NaN 在 0.4 ns 之后。
             #
-            # ⚠️ **只对膜体系生效**：给可溶路径加速度初始化会改变现有生产基线的轨迹
-            # （§7.7 / R7 要求 `system_type` 默认时逐位一致），那属于单独的课题。
+            # EXP-019 seeded runs initialize both legs explicitly.  Legacy runs
+            # retain the historical soluble-path behavior below.
             # 膜体系：最小化后立刻报**势能与最大受力**。
             #
             # 这一步是为了能一眼看出"起始态本身是否异常"。首跑 NaN 时这里什么都不报，
@@ -2063,7 +2137,14 @@ class ABFEPipeline:
             # 有了这两个数，下一次崩的时候立刻能判断是"起点就坏"还是"跑着坏"。
             # 参考量级（memtest，45354 原子）：最小化后 PE ≈ −6.5e5 kJ/mol，
             # max|F| ≈ 2.5e3 kJ/mol/nm 且落在水上。
-            if self.environment_type == ENVIRONMENT_TYPE_MEMBRANE:
+            if self.seed_ledger is not None:
+                equil_velocity_seed = self._seed_for(
+                    "equilibration", "pre_equilibration", "global", "velocity"
+                )
+                simulation.context.setVelocitiesToTemperature(
+                    self.temperature, equil_velocity_seed
+                )
+            elif self.environment_type == ENVIRONMENT_TYPE_MEMBRANE:
                 # 门只有一份实现（`abfe_core.assert_starting_state_is_sane`），
                 # Boresch attachment 腿的起点体检调的是同一个函数。
                 assert_starting_state_is_sane(
@@ -2323,8 +2404,11 @@ class ABFEPipeline:
             target_r0 = eq.get("r0", 1.0)  # nm
 
             if abs(actual_dist - target_r0) > 0.15:
-                self._log(f"  🔧 动态校正 Boresch r0: {target_r0*10:.2f}Å → {actual_dist*10:.2f}Å (防爬坡撕裂)")
-                boresch_params["equilibrium_values"]["r0"] = float(actual_dist)
+                self._log(
+                    f"  ⚠️ Boresch 末帧 r0 偏离系综均值: "
+                    f"{target_r0*10:.2f}Å → {actual_dist*10:.2f}Å；"
+                    "仅作 deviation diagnostic，不覆盖已冻结的系综均值。"
+                )
 
         # ✅ fingerprint 必须在上面的动态 r0 校正之后计算：它要描述的是"最终
         # 实际会被注入 LambdaDependentBoreschForce、写进 rebalance.chk 的那组
@@ -2406,6 +2490,11 @@ class ABFEPipeline:
             1.0 / unit.picosecond,
             0.002 * unit.picosecond
         )
+        rebalance_integrator_seed = self._seed_for(
+            "equilibration", "boresch_rebalance", "global", "integrator"
+        )
+        if rebalance_integrator_seed is not None:
+            integrator.setRandomNumberSeed(rebalance_integrator_seed)
         equil_platform = platform_name or self.platform_name
         
         try:
@@ -2451,6 +2540,13 @@ class ABFEPipeline:
                 simulation.context.setPeriodicBoxVectors(*self.box_vectors)
             self._log("  → 能量最小化...")
             simulation.minimizeEnergy(maxIterations=1000)
+            rebalance_velocity_seed = self._seed_for(
+                "equilibration", "boresch_rebalance", "global", "velocity"
+            )
+            if rebalance_velocity_seed is not None:
+                simulation.context.setVelocitiesToTemperature(
+                    self.temperature, rebalance_velocity_seed
+                )
         
         # 5. 运行
         if steps_remaining > 0:
@@ -2602,6 +2698,11 @@ class ABFEPipeline:
         integrator = openmm.LangevinMiddleIntegrator(
             self.temperature, 1.0 / unit.picosecond, 0.002 * unit.picosecond
         )
+        preopt_integrator_seed = self._seed_for(
+            "preoptimization", system_type, "global", "integrator"
+        )
+        if preopt_integrator_seed is not None:
+            integrator.setRandomNumberSeed(preopt_integrator_seed)
         try:
             platform = openmm.Platform.getPlatformByName("CUDA")
             props = {"Precision": "mixed"}
@@ -2879,6 +2980,11 @@ class ABFEPipeline:
         )
 
         integrator = openmm.LangevinMiddleIntegrator(self.temperature, 1.0 / unit.picosecond, 0.002 * unit.picosecond)
+        preopt_integrator_seed = self._seed_for(
+            "preoptimization", stage_name, "dual_lambda", "integrator"
+        )
+        if preopt_integrator_seed is not None:
+            integrator.setRandomNumberSeed(preopt_integrator_seed)
         try:
             platform = openmm.Platform.getPlatformByName("CUDA")
             props = {"Precision": "mixed"}
@@ -3377,8 +3483,48 @@ class ABFEPipeline:
         alchemical_params = _resolve_alchemical_params(
             potential_type, dexp_params, self.ligand_indices
         )
+
+        # [Stage2 charge-transfer handoff，2026-08-11] charging（decharging
+        # 分支）与 vanishing 是两次独立调用，各自从同一份原始 `self.system`
+        # 重新出发（charging 内部的 REMD/MBAR 用的 System 是它自己临时建的，
+        # 不会存活下来给这里复用——见 STAGE2_CHARGE_TRANSFER_HANDOFF_PROPOSAL.md
+        # §0/§1）。带净电的 charge-transfer 配体如果直接把 `self.system`
+        # （配体仍是满电）传给 `build_ibs_dual_system`，会被它自己的静态电
+        # 中性防御拒绝——vanishing 阶段全程 λ_coul≡0，物理上配体本该在这个
+        # 阶段全程是 0 电荷、co-ion 全程满电。这里独立建一份 charging 配置
+        # （只用来烘焙这一个端点，不做任何采样），再把它烘焙成没有活
+        # GlobalParameter 的静态 System，喂给下面的 `IBSWindowManagerDualLambda`
+        # ——不改 `build_ibs_dual_system`/`create_ligand_internal_force` 本身。
+        #
+        # 中性配体（`self.charge_treatment` 不是 charge-transfer，当前唯一
+        # 生产路径）完全走原来的分支：`vanishing_system_template = self.system`，
+        # 逐位不变。
+        vanishing_system_template = self.system
+        if stage_name == "vanishing" and self._charge_transfer_vanishing_handoff_active():
+            _charging_snapshot = ensure_owned_system(
+                XmlSerializer.deserialize(XmlSerializer.serialize(self.system))
+            )
+            configure_pme_ligand_charge_offsets(
+                _charging_snapshot,
+                self.ligand_indices,
+                lambda_name="lambda_coul",
+                allow_charged_ligand=True,
+                topology=self.topology,
+                positions=self.positions,
+                box_vectors=self.box_vectors,
+                co_alchemical_ion_spec=self.resolve_co_alchemical_ion_spec(),
+            )
+            vanishing_system_template = bake_global_parameter_into_fixed_nonbonded_force(
+                _charging_snapshot, "lambda_coul", 0.0
+            )
+            self._log(
+                "  🔗 [Stage2 handoff] charge-transfer 配体：vanishing 输入已"
+                "固化为 charging λ_coul=0 端点（配体 0 电荷、co-ion 满电，"
+                f"protocol_version={CHARGE_TRANSFER_VANISHING_HANDOFF_PROTOCOL_VERSION}）。"
+            )
+
         manager = IBSWindowManagerDualLambda(
-            system_template=self.system,
+            system_template=vanishing_system_template,
             topology=self.topology,
             perturbed_atom_indices=self.ligand_indices,
             lambdas_coul=lambdas_var if stage_name == "decharging" else lambdas_fix,
@@ -3403,6 +3549,8 @@ class ABFEPipeline:
             pilot_lambdas=pilot_lambdas,
             pilot_mean_dU_dlambda=pilot_mean_dU_dlambda,
             coion_identity=getattr(self, "_coion_runtime_identity", None),
+            seed_ledger=self.seed_ledger,
+            leg_name=self.leg_name,
         )
 
         # 🔑 关键：设置输出目录，确保 combine_results 能找到文件
@@ -3863,7 +4011,13 @@ class ABFEPipeline:
                     platform_name=self.platform_name,
                     output_dir=stage_output_dir,
                     boresch_params=boresch_params,
+                    random_seed=self._seed_for(
+                        "charging", stage_name, "exchange", "numpy"
+                    ),
                     co_alchemical_ion_spec=self.resolve_co_alchemical_ion_spec(),
+                    seed_ledger=self.seed_ledger,
+                    seed_stage=stage_name,
+                    seed_leg=self.leg_name,
                 )
                 traj_files = remd.run(
                     n_steps=n_steps_per_window,
@@ -4166,6 +4320,82 @@ class ABFEPipeline:
             "    B. 若该腿已有采样数据：那些数据是在这组平衡值下采的，与当前结构不匹配，\n"
             "       必须连同该腿的采样输出一起作废重跑，不能只换平衡值继续拼接。"
         )
+
+    def _diagnose_boresch_last_frame(self, boresch_params: Dict) -> Dict[str, Any]:
+        """记录末帧相对系综均值的偏离，但绝不改变 Boresch 参数。"""
+        if not _has_valid_boresch_restraint(boresch_params):
+            return {"status": "NOT_AVAILABLE", "reason": "invalid_boresch_params"}
+        try:
+            from abfe_core import calc_boresch_from_last_frame
+
+            committed_eq = dict(boresch_params["equilibrium_values"])
+            current_eq = calc_boresch_from_last_frame(
+                self.positions,
+                boresch_params["receptor_indices"],
+                boresch_params["ligand_indices"],
+            )
+            report = boresch_committed_deviation_sigma(
+                committed_eq,
+                current_eq,
+                boresch_params.get("force_constants") or {},
+                float(self.temperature.value_in_unit(unit.kelvin)),
+            )
+            worst_key, worst = None, 0.0
+            for key, row in (report or {}).items():
+                value = float(row.get("deviation_sigma", 0.0) or 0.0)
+                if np.isfinite(value) and value > worst:
+                    worst_key, worst = key, value
+            return _json_safe({
+                "status": "DIAGNOSTIC_ONLY",
+                "committed_source": "boresch_simple_ensemble_mean",
+                "current_equilibrium_values": current_eq,
+                "deviation_sigma": report,
+                "max_deviation_sigma": float(worst),
+                "max_deviation_coordinate": worst_key,
+                "reanchor_applied": False,
+            })
+        except Exception as exc:  # diagnostic failure must not create a new center
+            return {
+                "status": "UNAVAILABLE",
+                "committed_source": "boresch_simple_ensemble_mean",
+                "reanchor_applied": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+    def _commit_ensemble_boresch_equilibrium(
+        self, boresch_params: Dict, committed_path: str
+    ) -> Dict:
+        """提交预平衡系综均值，并把末帧几何保留为诊断字段。"""
+        committed_eq = dict(boresch_params["equilibrium_values"])
+        diagnostic = self._diagnose_boresch_last_frame(boresch_params)
+        committed_params = dict(boresch_params)
+        committed_params["equilibrium_values"] = committed_eq
+        committed_params["last_frame_geometry_diagnostic"] = diagnostic
+
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        _atomic_write_json(
+            committed_path,
+            _json_safe({
+                "schema_version": BORESCH_COMMITTED_SCHEMA_VERSION,
+                "equilibrium_values": committed_eq,
+                "receptor_indices": list(boresch_params.get("receptor_indices", [])),
+                "ligand_indices": list(boresch_params.get("ligand_indices", [])),
+                "force_constants": dict(boresch_params.get("force_constants", {})),
+                "temperature_K": self.temperature.value_in_unit(unit.kelvin),
+                "equilibrium_source": "boresch_simple_ensemble_mean",
+                "last_frame_geometry_diagnostic": diagnostic,
+                "reanchor_applied": False,
+                "note": (
+                    "本腿提交的是 boresch_simple.json 的预平衡轨迹系综均值；"
+                    "末帧几何仅作为 deviation diagnostic，禁止覆盖 equilibrium_values。"
+                ),
+            }),
+        )
+        self._log(
+            "  📌 已提交 Boresch 预平衡轨迹系综均值；末帧仅作 diagnostic，"
+            f"不进行 re-anchor: {committed_path}"
+        )
+        return committed_params
 
     def update_boresch_from_last_frame(self, boresch_params: Optional[Dict] = None) -> Optional[Dict]:
         """🔑 生产级修复：严格拦截奇点角度与异常漂移，防止自动更新引入 NaN 隐患"""
@@ -4486,6 +4716,15 @@ class ABFEPipeline:
                 command_line=getattr(self, "_command_line", None),
             ),
         }
+        _qualification = charge_treatment_qualification_payload(
+            getattr(self, "charge_treatment", None)
+        )
+        if _qualification:
+            final.update(_qualification)
+            final["provenance"]["production_qualification"] = dict(
+                _qualification
+            )
+
         # [B5] Keep the per-leg runtime identity directly beside the result as
         # well as in the protocol key.  This is deliberately the minimal cache
         # identity (fingerprint + protocol/leg/path), never coordinates or the
@@ -5875,6 +6114,8 @@ class ABFEPipeline:
             output_dir=stage_output_dir,
             checkpoint_dir=self.checkpoint_dir,
             coion_identity=getattr(self, "_coion_runtime_identity", None),
+            seed_ledger=self.seed_ledger,
+            leg_name=self.leg_name,
         )
         resolved_box = _resolve_periodic_box_vectors(
             self.box_vectors, topology=self.topology, system=self.system
@@ -5888,6 +6129,11 @@ class ABFEPipeline:
         integrator = openmm.LangevinMiddleIntegrator(
             self.temperature, 1.0 / unit.picosecond, 0.001 * unit.picoseconds
         )
+        probe_integrator_seed = self._seed_for(
+            "sampling", "vanishing", f"probe_{start}_{end}", "integrator"
+        )
+        if probe_integrator_seed is not None:
+            integrator.setRandomNumberSeed(probe_integrator_seed)
         relax_sim = app.Simulation(self.topology, win_sys, integrator, platform, props)
         relax_sim.context.setPeriodicBoxVectors(*resolved_box)
         relax_sim.context.setPositions(self.positions)
@@ -6347,6 +6593,15 @@ class ABFEPipeline:
             payload["vdw_nonbonded_protocol_version"] = (
                 VDW_NONBONDED_PROTOCOL_VERSION
             )
+        # 🔑 [Stage2 charge-transfer handoff，2026-08-11] 只在这条路线真的
+        # 会被触发时才写入——中性配体（当前唯一生产路径）的指纹不受影响，
+        # 旧缓存不会被误判失效。判据与 `_run_dual_lambda_stage` 里实际执行
+        # baking 的判据是同一个函数（`_charge_transfer_vanishing_handoff_active`），
+        # 不是两处各写一份。
+        if stage_name == "vanishing" and self._charge_transfer_vanishing_handoff_active():
+            payload["charge_transfer_vanishing_handoff_protocol_version"] = (
+                CHARGE_TRANSFER_VANISHING_HANDOFF_PROTOCOL_VERSION
+            )
         # 🔑 [B6 / memtodolist §6.4] 新 LJ 色散协议必须进 resume gate：换了
         # dispersion_protocol 之后，炼金 ligand–environment 的均匀密度 LRC 从"加"
         # 变成"不加"，u_kn 口径就变了，旧的 "completed" stage 缓存不能再复用。
@@ -6573,6 +6828,7 @@ class ABFEPipeline:
         protocol_key: Dict,
         lambdas_var,
         window_ranges,
+        charge_transfer_handoff_active: bool = False,
     ) -> Dict:
         """
         构造 stage1/stage2 缓存文件的完整落盘内容。
@@ -6636,6 +6892,13 @@ class ABFEPipeline:
         if stage_name == "vanishing":
             payload["vdw_nonbonded_protocol_version"] = (
                 VDW_NONBONDED_PROTOCOL_VERSION
+            )
+        # [Stage2 charge-transfer handoff] 同上，只在真的触发时写入；调用方
+        # 用 `_charge_transfer_vanishing_handoff_active()` 算出这个布尔值，
+        # 这个 staticmethod 本身没有 `self`，不能自己判定。
+        if stage_name == "vanishing" and charge_transfer_handoff_active:
+            payload["charge_transfer_vanishing_handoff_protocol_version"] = (
+                CHARGE_TRANSFER_VANISHING_HANDOFF_PROTOCOL_VERSION
             )
         return payload
 
@@ -6818,6 +7081,11 @@ class ABFEPipeline:
                     integrator = openmm.LangevinMiddleIntegrator(
                         self.temperature, 2.0/unit.picosecond, 0.002*unit.picosecond
                     )
+                    fast_min_integrator_seed = self._seed_for(
+                        "equilibration", "post_equilibration_minimize", "global", "integrator"
+                    )
+                    if fast_min_integrator_seed is not None:
+                        integrator.setRandomNumberSeed(fast_min_integrator_seed)
                     resolved_platform, props = _build_platform_props(self.platform_name)
                     platform = openmm.Platform.getPlatformByName(resolved_platform)
                     sim = app.Simulation(self.topology, temp_sys, integrator, platform, props)
@@ -6853,7 +7121,7 @@ class ABFEPipeline:
         # 导致同一条腿前后窗口的限制力基准不一致。
 
         # =========================================================================
-        # 3. 用最后一帧更新 Boresch 平衡几何量
+        # 3. 提交预平衡轨迹系综均值；末帧只作 deviation diagnostic
         # =========================================================================
         # 🔑 关键修复：此前每次调用 run_full_pipeline（包括每一次 --resume 重启）都会
         # 无条件重新从当前坐标推导 Boresch 平衡几何量。但 IBS 窗口/REMD 副本是按窗口
@@ -6893,28 +7161,12 @@ class ABFEPipeline:
                     "（已校验其与当前坐标的几何一致性）"
                 )
             else:
-                self._log("  🔧 正在用当前坐标更新 Boresch 平衡几何量...")
-                boresch_params = self.update_boresch_from_last_frame(boresch_params)
+                self._log("  🔒 提交 boresch_simple.json 的预平衡轨迹系综均值（禁止末帧 re-anchor）...")
+                boresch_params = self._commit_ensemble_boresch_equilibrium(
+                    boresch_params, committed_path
+                )
                 r0 = boresch_params["equilibrium_values"].get("r0", 0) * 10  # nm → Å
-                self._log(f"  ✓ Boresch 平衡值已更新: r0={r0:.2f} Å")
-                os.makedirs(self.checkpoint_dir, exist_ok=True)
-                # 🔑 [BORESCH-COMMIT] 带上身份信息落盘。裸的
-                # {"equilibrium_values": ...} 无法判断它是从哪个锚点/哪套力常数、
-                # 什么时候推出来的——正是它让上面那组错值活过了 17 天。
-                _atomic_write_json(committed_path, _json_safe({
-                    "schema_version": BORESCH_COMMITTED_SCHEMA_VERSION,
-                    "equilibrium_values": boresch_params["equilibrium_values"],
-                    "receptor_indices": list(boresch_params.get("receptor_indices", [])),
-                    "ligand_indices": list(boresch_params.get("ligand_indices", [])),
-                    "force_constants": dict(boresch_params.get("force_constants", {})),
-                    "temperature_K": self.temperature.value_in_unit(unit.kelvin),
-                    "derived_at": datetime.now().isoformat(),
-                    "note": (
-                        "本腿后续 resume 强制复用这组平衡值；复用前会用 "
-                        "boresch_committed_deviation_sigma 校验它是否仍描述当前构象。"
-                    ),
-                }))
-                self._log(f"  📌 Boresch 平衡值已提交落盘，本腿后续 resume 将强制复用: {committed_path}")
+                self._log(f"  ✓ Boresch 系综均值已提交: r0={r0:.2f} Å")
 
         # =========================================================================
         # 2. 路由采样 (支持阶段级 Resume)
@@ -8155,6 +8407,7 @@ class ABFEPipeline:
                 stage2_save = self._build_stage_cache_payload(
                     "vanishing", stage2, stage2_states, _stage2_protocol_key,
                     optimized_lambdas_2, window_ranges_2,
+                    charge_transfer_handoff_active=self._charge_transfer_vanishing_handoff_active(),
                 )
                 os.makedirs(self.checkpoint_dir, exist_ok=True)
                 with open(stage2_file, "w") as f:
@@ -8731,6 +8984,12 @@ class TraditionalABFEPipeline:
                 boresch_params=boresch_params,
                 # [MEM-00c] 所有 replica 共用同一份冻结身份。
                 co_alchemical_ion_spec=self.resolve_co_alchemical_ion_spec(),
+                random_seed=self._seed_for(
+                    "charging", label, "exchange", "numpy"
+                ),
+                seed_ledger=self.seed_ledger,
+                seed_stage=label,
+                seed_leg=self.leg_name,
             )
             traj_files = remd.run(
                 n_steps=n_steps,
