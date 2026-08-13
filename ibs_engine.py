@@ -82,6 +82,100 @@ logger = logging.getLogger(__name__)
 
 IBS_WINDOW_DATA_PROTOCOL_VERSION = 1
 
+# EXP-019 seed wiring contract.  This is deliberately implemented in the
+# backend (rather than in the launcher) so the value passed to OpenMM is the
+# value that gets recorded by provenance.  The hash-based derivation is stable
+# across processes and does not depend on Python's randomized hash().
+EXP019_SEED_WIRING_PROTOCOL_VERSION = 1
+_EXP019_OPENMM_SEED_MAX = 2_147_483_646
+
+
+def derive_exp019_seed(
+    repeat_seed: int,
+    leg: str,
+    phase: str,
+    stage: str,
+    window: Any,
+    stream: str,
+    attempt: int = 0,
+) -> int:
+    """Derive one stable, domain-separated OpenMM/NumPy seed.
+
+    ``window`` and ``attempt`` are part of the domain on purpose: a recovery
+    velocity draw must never silently reuse a production or another-window
+    random stream.  OpenMM accepts a positive signed 32-bit seed; zero is
+    excluded because it has special/default-like behavior in several APIs.
+    """
+    if int(repeat_seed) <= 0:
+        raise ValueError("EXP-019 repeat_seed must be a positive integer")
+    fields = (
+        "EXP-019",
+        f"v{EXP019_SEED_WIRING_PROTOCOL_VERSION}",
+        str(int(repeat_seed)),
+        str(leg),
+        str(phase),
+        str(stage),
+        str(window),
+        str(stream),
+        str(int(attempt)),
+    )
+    digest = hashlib.sha256("\x1f".join(fields).encode("utf-8")).digest()
+    value = int.from_bytes(digest[:8], "big") % _EXP019_OPENMM_SEED_MAX
+    return int(value or 1)
+
+
+class Exp019SeedLedger:
+    """Record every derived seed actually requested by a baseline run."""
+
+    def __init__(self, repeat_seed: int, leg: str):
+        self.repeat_seed = int(repeat_seed)
+        if self.repeat_seed <= 0:
+            raise ValueError("EXP-019 repeat_seed must be positive")
+        self.leg = str(leg)
+        if not self.leg:
+            raise ValueError("EXP-019 leg must be non-empty")
+        self.values: Dict[str, int] = {}
+
+    @staticmethod
+    def _key(phase: str, stage: str, window: Any, stream: str, attempt: int) -> str:
+        return "/".join(
+            (str(phase), str(stage), str(window), str(stream), str(int(attempt)))
+        )
+
+    def derive(
+        self,
+        phase: str,
+        stage: str,
+        window: Any,
+        stream: str,
+        attempt: int = 0,
+    ) -> int:
+        key = self._key(phase, stage, window, stream, attempt)
+        value = derive_exp019_seed(
+            self.repeat_seed,
+            self.leg,
+            phase,
+            stage,
+            window,
+            stream,
+            attempt,
+        )
+        previous = self.values.get(key)
+        if previous is not None and previous != value:
+            raise RuntimeError(f"EXP-019 seed ledger collision for {key!r}")
+        self.values[key] = int(value)
+        return int(value)
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "protocol_version": EXP019_SEED_WIRING_PROTOCOL_VERSION,
+            "repeat_seed": self.repeat_seed,
+            "leg": self.leg,
+            "derived_seed_map": {
+                key: int(self.values[key]) for key in sorted(self.values)
+            },
+        }
+
 # 🔑 [MEM-00h，2026-08-06] 统一到物理力场的 1.0 nm、无 switching——不是 1.2 nm。
 # 之前这里跟基础 `NonbondedForce`（PME cutoff=1.0 nm，`SOLVENT_NONBONDED_CUTOFF_NM`/
 # `runabfe.py` 的建系）不一致：softcore CV 在 1.0-1.2 nm 这段还有非零 switched
@@ -3884,6 +3978,17 @@ def build_ibs_dual_system(
     # [B6-FIX] 这条腿的环境（soluble/membrane）。非 legacy 色散路线必须给，
     # 否则 `resolve_leg_dispersion_implementation` 会 raise —— 刻意不设可猜的默认值。
     environment_type: Optional[str] = None,
+    *,
+    # EXP-025 G4 Layer-2 (2026-08-13): optional, disabled-by-default native
+    # shared residual basis, threaded straight into IBSBiasForce (see that
+    # class's docstring for the exact contract). Every EXISTING call site
+    # that never passes these keeps IBSBiasForce.residual_enabled=False and
+    # therefore the byte-identical Group-1 expression -- verified by
+    # scripts/test_exp025_g4_ibsbiasforce_native_residual.py, not just
+    # asserted here.
+    residual_basis_force: Optional[openmm.Force] = None,
+    residual_state_coefficients: Optional[Sequence[float]] = None,
+    residual_energy_offset_kj_mol: float = 0.0,
 ) -> Tuple[openmm.System, 'IBSBiasForce']:
     """
     构建双λ IBS 采样系统 (终极修复版：彻底剥离 Group 0 的 λ 依赖)
@@ -4055,7 +4160,12 @@ def build_ibs_dual_system(
         print("  ℹ️ 检测到有效 Boresch 锚定，跳过 Group 5 COM 限制力以避免双重定位约束冲突。")
 
     # ---------- 7. IBS 偏置力与纯 VDW 软核 CV (Group 1) ----------
-    ibs_wrapper = IBSBiasForce(len(lambdas_coul), temperature, prefix=prefix)
+    ibs_wrapper = IBSBiasForce(
+        len(lambdas_coul), temperature, prefix=prefix,
+        residual_basis_force=residual_basis_force,
+        residual_state_coefficients=residual_state_coefficients,
+        residual_energy_offset_kj_mol=residual_energy_offset_kj_mol,
+    )
     original_params_fresh = [original_nb.getParticleParameters(i) for i in range(num_atoms)]
 
     cv_template = _create_softcore_force(
@@ -4169,11 +4279,19 @@ def build_ibs_dual_system(
         if current_excl != template_excl:
             raise RuntimeError(f"CV {k} 排除表不一致，将破坏 VDW-IBS 邻居表复用条件。")
         ibs_wrapper.addCollectiveVariable(f"cv_{k}_int", int_f_cv)
-        
+
         # Boresch CV 保持零力（物理限制已在 Group 3）
         rest_f_cv = openmm.CustomExternalForce("0")
         ibs_wrapper.addCollectiveVariable(f"cv_{k}_rest", rest_f_cv)
 
+    # EXP-025 G4 Layer-2: fail closed HERE, before the Force ever enters the
+    # System/before any Context can be created, if the per-state loop above
+    # ever left a cv_k_int/cv_k_rest (or, when residual_basis_force is set,
+    # the shared exp025_residual_basis) unregistered or duplicated. This is
+    # not a hypothetical -- see g4_layer1_oracle_report.json's
+    # real_bug_found_and_fixed_during_this_gate for the exact silent-wrong-
+    # energy failure mode this closes.
+    ibs_wrapper.validate_wiring()
     new_sys.addForce(ibs_wrapper.get_force())
 
     # ---------- 8. 统一排除表同步 ----------
@@ -4618,17 +4736,85 @@ def build_shadow_bridge_system(
 # ============================================================================
 
 class IBSBiasForce:
-    """IBS 偏置力封装 (Group 1) - 数值稳定差分形式"""
-    def __init__(self, n_states: int, temperature: openmm.unit.Quantity, prefix: str = "abfe"):
+    """IBS 偏置力封装 (Group 1) - 数值稳定差分形式
+
+    EXP-025 G4 Layer-2 (2026-08-13): optional, disabled-by-default native
+    shared residual basis. When ``residual_basis_force`` is None (the
+    default), this class's behavior is BYTE-IDENTICAL to before this
+    addition -- same expression string, same CVs, same globals, same force
+    group. This is deliberate and load-bearing: production callers that
+    never pass the new keyword-only arguments must see zero behavior
+    change, verified by an XML-diff regression test (see
+    scripts/test_exp025_g4_ibsbiasforce_native_residual.py), not just
+    argued informally.
+
+    When enabled, each state's discriminant argument becomes
+    ``X_k = cv_k_int + cv_k_rest + A_k*(exp025_residual_basis - U_offset) - f_k``
+    with the shared basis Force registered as exactly ONE collective
+    variable (never duplicated per state) inside the SAME Group-1
+    CustomCVForce -- the plugin executes once per force evaluation, and the
+    max-pivot log-sum-exp discriminant is otherwise unchanged.
+    """
+    def __init__(
+        self,
+        n_states: int,
+        temperature: openmm.unit.Quantity,
+        prefix: str = "abfe",
+        *,
+        residual_basis_force: Optional[openmm.Force] = None,
+        residual_state_coefficients: Optional[Sequence[float]] = None,
+        residual_energy_offset_kj_mol: float = 0.0,
+    ):
         self.n_states = n_states
         self.prefix = prefix
         self._cv_keeper = []
         self._int_cv_force_xmls = []
+        self._residual_basis_cv_index: Optional[int] = None
+        self.residual_enabled = residual_basis_force is not None
+        if not self.residual_enabled:
+            if residual_state_coefficients is not None:
+                raise ValueError(
+                    "IBSBiasForce: residual_state_coefficients must be None when residual_basis_force is None "
+                    "(both or neither -- see class docstring)"
+                )
+            if residual_energy_offset_kj_mol != 0.0:
+                raise ValueError(
+                    "IBSBiasForce: residual_energy_offset_kj_mol must be 0.0 when residual_basis_force is None "
+                    "(both or neither -- see class docstring)"
+                )
+        else:
+            if residual_state_coefficients is None or len(residual_state_coefficients) != n_states:
+                raise ValueError(
+                    f"IBSBiasForce: residual_state_coefficients must have exactly n_states={n_states} entries "
+                    f"when residual_basis_force is provided (got "
+                    f"{None if residual_state_coefficients is None else len(residual_state_coefficients)})"
+                )
+            if not all(math.isfinite(float(c)) for c in residual_state_coefficients):
+                raise ValueError("IBSBiasForce: residual_state_coefficients must all be finite")
+            if not math.isfinite(float(residual_energy_offset_kj_mol)):
+                raise ValueError("IBSBiasForce: residual_energy_offset_kj_mol must be finite")
+            # Fail closed on the CV budget HERE, before any addCollectiveVariable()
+            # call -- do not rely on OpenMM to reject an over-budget CustomCVForce
+            # at some later, less predictable point (matches the EXP-025 G4
+            # Layer-1 lesson: a wiring contract violation must be caught by an
+            # explicit check, not "it didn't throw so it must be fine").
+            required_cv_count = 2 * n_states + 1
+            if required_cv_count > OPENMM_CUSTOM_CV_MAX_VARIABLES:
+                raise ValueError(
+                    f"IBSBiasForce: enabling the native residual basis needs {required_cv_count} collective "
+                    f"variables (2*n_states+1) for n_states={n_states}, exceeding the hard ceiling of "
+                    f"{OPENMM_CUSTOM_CV_MAX_VARIABLES} -- i.e. n_states must be <= "
+                    f"{(OPENMM_CUSTOM_CV_MAX_VARIABLES - 1) // 2} with the residual basis enabled"
+                )
+        self.residual_state_coefficients = (
+            [float(c) for c in residual_state_coefficients] if self.residual_enabled else None
+        )
+        self.residual_energy_offset_kj_mol = float(residual_energy_offset_kj_mol)
         if isinstance(temperature, float):
             temperature = temperature * openmm.unit.kelvin
         kt = (unit.MOLAR_GAS_CONSTANT_R * temperature).value_in_unit(openmm.unit.kilojoule_per_mole)
         beta = 1.0 / kt
-        
+
         # 🔑 修复 Bug 1: 使用差分形式避免数值溢出
         # V_bias = -kT * ln( sum_k exp(-beta * (U'_k - f_k)) )
         # 提取 k=0 项: = -kT * [ -beta*(U'_0 - f_0) + ln( 1 + sum_{k>0} exp(-beta * ((U'_k - f_k) - (U'_0 - f_0))) ) ]
@@ -4664,10 +4850,32 @@ class IBSBiasForce:
         # max-pivot log-sum-exp 替换后，偏置力精确等于 MBAR/SGD/冻结验证共用的
         # 同一个 softmax 公式（见 update_weights/evaluate_frozen_batch_probability），
         # 三者不再是三套不同的数学模型。
+        # EXP-025 G4 Layer-2: when residual_enabled, state k's parenthesized
+        # term gains "+ (A_k)*(exp025_residual_basis-(offset))" before the
+        # "- {prefix}_f_{k}" close. When NOT enabled, _state_expr(k) returns
+        # EXACTLY the original "(cv_{k}_int + cv_{k}_rest - {prefix}_f_{k})"
+        # string, byte-for-byte -- verified by
+        # scripts/test_exp025_g4_ibsbiasforce_native_residual.py, not just
+        # asserted here. Coefficients formatted with 17 significant digits
+        # (round-trips a double exactly), matching the existing
+        # OuterLambdaIBSBiasForce/OuterLambdaResidualBiasForce convention;
+        # a state whose OWN coefficient is exactly 0.0 (e.g. a genuine
+        # physical endpoint) omits the term entirely rather than adding a
+        # numerically-inert "+0.0*(...)" -- also matching that convention.
+        def _state_expr(k: int) -> str:
+            if self.residual_enabled and self.residual_state_coefficients[k] != 0.0:
+                coeff = self.residual_state_coefficients[k]
+                offset = self.residual_energy_offset_kj_mol
+                return (
+                    f"(cv_{k}_int + cv_{k}_rest + ({coeff:.17g})*"
+                    f"(exp025_residual_basis - ({offset:.17g})) - {prefix}_f_{k})"
+                )
+            return f"(cv_{k}_int + cv_{k}_rest - {prefix}_f_{k})"
+
         logit_exprs = {}
         for k in range(1, n_states):
-            # 相对 logit_k = -beta * ((cv_k_int+cv_k_rest-f_k) - (cv_0_int+cv_0_rest-f_0))
-            diff_expr = f"(cv_{k}_int + cv_{k}_rest - {prefix}_f_{k}) - (cv_0_int + cv_0_rest - {prefix}_f_0)"
+            # 相对 logit_k = -beta * (X_k - X_0)
+            diff_expr = f"{_state_expr(k)} - {_state_expr(0)}"
             logit_exprs[k] = f"(-beta * ({diff_expr}))"
 
         # 平移基准 M = max(0.0, logit_1, ..., logit_{K-1})（0.0 对应 k=0 自身的 logit）
@@ -4681,13 +4889,16 @@ class IBSBiasForce:
         sum_expr = " + ".join(sum_terms)
 
         # 最终能量表达式:
-        # V_bias = (cv_0_int + cv_0_rest - f_0) - kt * (M + log(sum(exp(logit_i - M))))
-        # 注意：第一项 (cv_0...) 是坐标依赖的，必须包含在内以保证力的正确性。
+        # V_bias = X_0 - kt * (M + log(sum(exp(logit_i - M))))
+        # 注意：第一项 (X_0...) 是坐标依赖的，必须包含在内以保证力的正确性。
+        # _state_expr(0) already carries its own parens, matching exactly
+        # what the original literal "(cv_0_int + cv_0_rest - {prefix}_f_0)"
+        # substring looked like when residual_enabled is False.
         energy_expr = (
-            f"{prefix}_bias_scale * ((cv_0_int + cv_0_rest - {prefix}_f_0) "
+            f"{prefix}_bias_scale * ({_state_expr(0)} "
             f"- kt * (({pivot_expr}) + log(max(1e-300, {sum_expr}))))"
         )
-        
+
         self.force = openmm.CustomCVForce(energy_expr)
         self.force.addGlobalParameter("kt", kt)
         self.force.addGlobalParameter("beta", beta)
@@ -4695,7 +4906,25 @@ class IBSBiasForce:
         for k in range(n_states):
             self.force.addGlobalParameter(f"{prefix}_f_{k}", 0.0)
         self.force.setForceGroup(1)
+        if self.residual_enabled:
+            # Registered here (inside __init__, not left to the caller) --
+            # unlike cv_k_int/cv_k_rest (which the caller must still register
+            # via addCollectiveVariable(), since only the caller has the
+            # per-state softcore Forces to hand), this ONE shared CV is fully
+            # determined by the constructor's own arguments, so there is no
+            # reason to defer it and risk the exact "caller forgot to
+            # register it" class of bug that G4 Layer-1 hit.
+            self._cv_keeper.append(residual_basis_force)
+            self._residual_basis_cv_index = self.force.addCollectiveVariable(
+                "exp025_residual_basis", residual_basis_force
+            )
+
     def addCollectiveVariable(self, name: str, cv_force: openmm.Force) -> int:
+        if name == "exp025_residual_basis":
+            raise ValueError(
+                "IBSBiasForce: the 'exp025_residual_basis' collective variable name is reserved "
+                "(registered automatically by __init__ when residual_basis_force is provided)"
+            )
         self._cv_keeper.append(cv_force)
         if name.endswith("_int"):
             self._int_cv_force_xmls.append(openmm.XmlSerializer.serialize(cv_force))
@@ -4706,6 +4935,51 @@ class IBSBiasForce:
 
     def setForceGroup(self, group_id: int):
         self.force.setForceGroup(group_id)
+
+    def validate_wiring(self) -> None:
+        """Fail closed BEFORE any Context is created if this Force's
+        CustomCVForce is missing a collective variable or global parameter
+        its own constructed expression actually references, or has a
+        duplicate name registered. See
+        outer_lambda_neural_basis.OuterLambdaResidualBiasForce.validate_wiring
+        for why this exists (EXP-025 G4 Layer-1, 2026-08-13): a missing
+        cv_k_int/cv_k_rest registration on that sibling class silently
+        produced a wrong, finite energy with no exception at all. This
+        class's cv_k_int/cv_k_rest are STILL the caller's responsibility
+        (see addCollectiveVariable() above) -- only exp025_residual_basis is
+        self-registered -- so callers must call this after registering all
+        per-state CVs, before creating any Context.
+        """
+        expected_cv_names = {f"cv_{k}_int" for k in range(self.n_states)}
+        expected_cv_names |= {f"cv_{k}_rest" for k in range(self.n_states)}
+        if self.residual_enabled:
+            expected_cv_names.add("exp025_residual_basis")
+
+        actual_cv_names = [
+            self.force.getCollectiveVariableName(i) for i in range(self.force.getNumCollectiveVariables())
+        ]
+        if len(actual_cv_names) != len(set(actual_cv_names)):
+            duplicates = sorted({name for name in actual_cv_names if actual_cv_names.count(name) > 1})
+            raise ValueError(f"IBSBiasForce.validate_wiring: duplicate collective variable name(s) {duplicates}")
+        actual_cv_set = set(actual_cv_names)
+        if actual_cv_set != expected_cv_names:
+            missing = sorted(expected_cv_names - actual_cv_set)
+            unexpected = sorted(actual_cv_set - expected_cv_names)
+            raise ValueError(
+                "IBSBiasForce.validate_wiring: collective variable set does not match this Force's own "
+                f"contract -- missing={missing}, unexpected={unexpected}. Every cv_{{k}}_int/cv_{{k}}_rest "
+                "for k in range(n_states) must be registered by the caller via addCollectiveVariable() before "
+                "creating any Context."
+            )
+
+        expected_global_names = {"kt", "beta", f"{self.prefix}_bias_scale"}
+        expected_global_names |= {f"{self.prefix}_f_{k}" for k in range(self.n_states)}
+        actual_global_names = {
+            self.force.getGlobalParameterName(i) for i in range(self.force.getNumGlobalParameters())
+        }
+        missing_globals = expected_global_names - actual_global_names
+        if missing_globals:
+            raise ValueError(f"IBSBiasForce.validate_wiring: missing required global parameter(s) {sorted(missing_globals)}")
 
     def set_bias_enabled(self, context: openmm.Context, enabled: bool):
         try:
@@ -9033,6 +9307,8 @@ class IBSWindowManagerDualLambda:
         pilot_lambdas: Optional[List[float]] = None,
         pilot_mean_dU_dlambda: Optional[List[float]] = None,
         coion_identity: Optional[Dict[str, Any]] = None,
+        seed_ledger: Optional[Exp019SeedLedger] = None,
+        leg_name: Optional[str] = None,
     ):
         self.system_template = system_template
         self.topology = topology
@@ -9055,6 +9331,10 @@ class IBSWindowManagerDualLambda:
         # B5: the caller resolves/freeze-checks this once; manifests only
         # record the payload and never read the spec or select an ion.
         self.coion_identity = coion_identity
+        self.seed_ledger = seed_ledger
+        self.leg_name = str(leg_name) if leg_name is not None else None
+        if self.seed_ledger is not None and self.leg_name != self.seed_ledger.leg:
+            raise ValueError("IBS manager leg_name 与 EXP-019 seed ledger 不一致")
         # [IBS_BIAS_PROTOCOL_VERSION warm-start] Stage 2's pilot probe already
         # measures the mean gradient (mean_dU_dlambda_kJ_mol), not just the
         # variance proxy used for lambda spacing -- kept here so
@@ -9070,6 +9350,18 @@ class IBSWindowManagerDualLambda:
 
         _temp_q = temperature if hasattr(temperature, 'value_in_unit') else temperature * unit.kelvin
         self.kt = (unit.MOLAR_GAS_CONSTANT_R * _temp_q).value_in_unit(unit.kilojoule_per_mole)
+
+    def _seed_for(
+        self,
+        phase: str,
+        stage: str,
+        window: Any,
+        stream: str,
+        attempt: int = 0,
+    ) -> Optional[int]:
+        if self.seed_ledger is None:
+            return None
+        return self.seed_ledger.derive(phase, stage, window, stream, attempt)
 
     def _build_window_system(self, lc_win, lv_win, resolved_box, positions):
         """构建单个窗口的 (System, IBSBiasForce)。
@@ -9552,6 +9844,11 @@ class IBSWindowManagerDualLambda:
             )
 
             integrator = LangevinMiddleIntegrator(self.temperature, 2.0 / unit.picosecond, 0.002 * unit.picosecond)
+            window_integrator_seed = self._seed_for(
+                "sampling", stage_type, window_idx, "integrator"
+            )
+            if window_integrator_seed is not None:
+                integrator.setRandomNumberSeed(window_integrator_seed)
             integrator.setConstraintTolerance(1e-3)
             if hasattr(integrator, 'setRemoveCMMotion'):
                 integrator.setRemoveCMMotion(True)
@@ -9607,6 +9904,13 @@ class IBSWindowManagerDualLambda:
                 print(f"\n  [阶段1] 开始能量最小化...")
                 sim.minimizeEnergy(maxIterations=20000)
                 print(f"  ✓ 最小化完成")
+                initial_velocity_seed = self._seed_for(
+                    "sampling", stage_type, window_idx, "velocity"
+                )
+                if initial_velocity_seed is not None:
+                    sim.context.setVelocitiesToTemperature(
+                        self.temperature, initial_velocity_seed
+                    )
 
             # 几何检查
             if _has_valid_boresch_restraint(self.boresch):
@@ -11825,7 +12129,15 @@ class IBSWindowManagerDualLambda:
 
                 if energy_bad or (fmax is not None and ((not np.isfinite(fmax)) or fmax > 10000.0)):
                     sim.context.setPositions(pos_backup)
-                    sim.context.setVelocitiesToTemperature(self.temperature)
+                    recovery_velocity_seed = self._seed_for(
+                        "recovery", stage_type, window_idx, "velocity", attempt=up + 1
+                    )
+                    if recovery_velocity_seed is None:
+                        sim.context.setVelocitiesToTemperature(self.temperature)
+                    else:
+                        sim.context.setVelocitiesToTemperature(
+                            self.temperature, recovery_velocity_seed
+                        )
                     print("    🔧 触发回退，执行局部最小化释放应力...")
                     sim.minimizeEnergy(maxIterations=2000, tolerance=1.0)
                     current_dt_ps = sim.integrator.getStepSize().value_in_unit(unit.picoseconds)
@@ -12079,7 +12391,16 @@ class IBSWindowManagerDualLambda:
                 fmax = np.max(np.linalg.norm(forces_n, axis=1))
                 if (not np.isfinite(e_total_n)) or (not np.isfinite(fmax)) or fmax > 10000.0:
                     sim.context.setPositions(pos_backup)
-                    sim.context.setVelocitiesToTemperature(self.temperature)
+                    recovery_velocity_seed = self._seed_for(
+                        "recovery", stage_type, window_idx, "velocity",
+                        attempt=n_updates + 1,
+                    )
+                    if recovery_velocity_seed is None:
+                        sim.context.setVelocitiesToTemperature(self.temperature)
+                    else:
+                        sim.context.setVelocitiesToTemperature(
+                            self.temperature, recovery_velocity_seed
+                        )
                     print("    🔧 余数补齐触发回退，执行局部最小化释放应力...")
                     sim.minimizeEnergy(maxIterations=2000, tolerance=1.0)
                     current_dt_ps = sim.integrator.getStepSize().value_in_unit(unit.picoseconds)
@@ -14463,6 +14784,9 @@ class REMDManager:
         random_seed: Optional[int] = None,
         max_resident_contexts: Optional[int] = None,
         co_alchemical_ion_spec: Optional[Dict[str, Any]] = None,
+        seed_ledger: Optional[Exp019SeedLedger] = None,
+        seed_stage: Optional[str] = None,
+        seed_leg: Optional[str] = None,
     ):
         self.topology = topology
         self.positions = positions
@@ -14472,6 +14796,11 @@ class REMDManager:
         # （`ibs_engine.select_co_alchemical_ion_once()` 选一次的产物）；
         # 中性配体为 None。所有 replica 共用它，不各自重选。
         self.co_alchemical_ion_spec = co_alchemical_ion_spec
+        self.seed_ledger = seed_ledger
+        self.seed_stage = str(seed_stage) if seed_stage is not None else "remd"
+        self.seed_leg = str(seed_leg) if seed_leg is not None else None
+        if self.seed_ledger is not None and self.seed_leg != self.seed_ledger.leg:
+            raise ValueError("REMD seed_leg 与 EXP-019 seed ledger 不一致")
         self.lambdas_coul = np.array(lambdas_coul)
         self.lambdas_vdw = np.array(lambdas_vdw)
         self.n_replicas = len(lambdas_coul)
@@ -14551,7 +14880,11 @@ class REMDManager:
             seed_env = os.environ.get("IBS_RANDOM_SEED") or os.environ.get("ABFE_RANDOM_SEED")
             random_seed = int(seed_env) if seed_env not in (None, "") else None
         self.random_seed = random_seed
-        self.rng = np.random.default_rng(random_seed)
+        if self.seed_ledger is not None and self.random_seed is None:
+            self.random_seed = self.seed_ledger.derive(
+                "charging", self.seed_stage, "exchange", "numpy"
+            )
+        self.rng = np.random.default_rng(self.random_seed)
         os.makedirs(output_dir, exist_ok=True)
 
         self.contexts = []
@@ -14569,6 +14902,18 @@ class REMDManager:
         if getattr(self, "platform_fallback_reason", None) is None:
             self.platform_fallback_reason = None
         self._build_replicas(system_template)
+
+    def _seed_for(
+        self,
+        phase: str,
+        stage: str,
+        window: Any,
+        stream: str,
+        attempt: int = 0,
+    ) -> Optional[int]:
+        if self.seed_ledger is None:
+            return None
+        return self.seed_ledger.derive(phase, stage, window, stream, attempt)
 
     @staticmethod
     def _try_set_context_parameter(context, name: str, value: float) -> None:
@@ -14679,13 +15024,24 @@ class REMDManager:
                         nb.setParticleParameters(idx, 0.0, 0.1*unit.nanometer, 0.0)
 
                 integ = openmm.LangevinMiddleIntegrator(self.temperature, 1.0/unit.picosecond, 0.002*unit.picosecond)
+                integrator_seed = self._seed_for(
+                    "charging", self.seed_stage, i, "integrator"
+                )
+                if integrator_seed is not None:
+                    integ.setRandomNumberSeed(integrator_seed)
                 ctx = openmm.Context(replica_sys, integ, platform, props)
                 ctx.setPositions(self.positions)
                 if self.box_vectors is not None:
                     ctx.setPeriodicBoxVectors(*self.box_vectors)
                 self._try_set_context_parameter(ctx, "lambda_coul", self.lambdas_coul[i])
                 self._try_set_context_parameter(ctx, "lambda_vdw", self.lambdas_vdw[i])
-                ctx.setVelocitiesToTemperature(self.temperature)
+                velocity_seed = self._seed_for(
+                    "charging", self.seed_stage, i, "velocity"
+                )
+                if velocity_seed is None:
+                    ctx.setVelocitiesToTemperature(self.temperature)
+                else:
+                    ctx.setVelocitiesToTemperature(self.temperature, velocity_seed)
 
                 self.contexts.append(ctx)
                 self.integrators.append(integ)
@@ -15036,7 +15392,13 @@ class REMDManager:
                     f"预检查 max|F|={max_force:.1f} > {max_force_limit:.1f}，执行短最小化"
                 )
                 openmm.LocalEnergyMinimizer.minimize(ctx, tolerance=20.0, maxIterations=1000)
-                ctx.setVelocitiesToTemperature(self.temperature)
+                velocity_seed = self._seed_for(
+                    "recovery", self.seed_stage, state_idx, "velocity", attempt=1
+                )
+                if velocity_seed is None:
+                    ctx.setVelocitiesToTemperature(self.temperature)
+                else:
+                    ctx.setVelocitiesToTemperature(self.temperature, velocity_seed)
         except Exception as exc:
             self._diagnose_context_failure(context_idx, f"preflight_state{state_idx}", exc)
             raise
@@ -15058,7 +15420,13 @@ class REMDManager:
                 tolerance=em_tol * unit.kilojoule_per_mole / unit.nanometer,
                 maxIterations=em_iters,
             )
-            ctx.setVelocitiesToTemperature(self.temperature)
+            velocity_seed = self._seed_for(
+                "recovery", self.seed_stage, state_idx, "velocity", attempt=2
+            )
+            if velocity_seed is None:
+                ctx.setVelocitiesToTemperature(self.temperature)
+            else:
+                ctx.setVelocitiesToTemperature(self.temperature, velocity_seed)
 
             state = ctx.getState(getEnergy=True, getForces=True)
             energy = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
@@ -15350,6 +15718,9 @@ class BoreschAttachmentREMDManager(REMDManager):
         platform_name: str = "CUDA",
         output_dir: str = "./boresch_attachment_remd",
         random_seed: Optional[int] = None,
+        seed_ledger: Optional[Exp019SeedLedger] = None,
+        seed_stage: Optional[str] = None,
+        seed_leg: Optional[str] = None,
     ):
         self.lambdas_boresch = np.asarray(lambdas_boresch, dtype=float)
         self.lam_name = lam_name
@@ -15368,6 +15739,9 @@ class BoreschAttachmentREMDManager(REMDManager):
             output_dir=output_dir,
             boresch_params=None,      # 限制力已经在 attachment_system 里了
             random_seed=random_seed,
+            seed_ledger=seed_ledger,
+            seed_stage=seed_stage or "boresch_attachment",
+            seed_leg=seed_leg,
         )
 
     def _build_replicas(self, system_template, allow_platform_fallback: bool = True):
@@ -15381,12 +15755,23 @@ class BoreschAttachmentREMDManager(REMDManager):
                 integ = openmm.LangevinMiddleIntegrator(
                     self.temperature, 1.0 / unit.picosecond, 0.002 * unit.picosecond
                 )
+                integrator_seed = self._seed_for(
+                    "attachment", self.seed_stage, i, "integrator"
+                )
+                if integrator_seed is not None:
+                    integ.setRandomNumberSeed(integrator_seed)
                 ctx = openmm.Context(replica_sys, integ, platform, props)
                 ctx.setPositions(self.positions)
                 if self.box_vectors is not None:
                     ctx.setPeriodicBoxVectors(*self.box_vectors)
                 self._try_set_context_parameter(ctx, self.lam_name, self.lambdas_boresch[i])
-                ctx.setVelocitiesToTemperature(self.temperature)
+                velocity_seed = self._seed_for(
+                    "attachment", self.seed_stage, i, "velocity"
+                )
+                if velocity_seed is None:
+                    ctx.setVelocitiesToTemperature(self.temperature)
+                else:
+                    ctx.setVelocitiesToTemperature(self.temperature, velocity_seed)
                 self.contexts.append(ctx)
                 self.integrators.append(integ)
                 self.replica_systems.append(replica_sys)
@@ -15635,6 +16020,9 @@ class ShadowBridgeREMDManager(REMDManager):
         platform_name: str = "CUDA",
         output_dir: str = "./shadow_bridge_remd",
         random_seed: Optional[int] = None,
+        seed_ledger: Optional[Exp019SeedLedger] = None,
+        seed_stage: Optional[str] = None,
+        seed_leg: Optional[str] = None,
     ):
         self.lambdas_bridge_s = np.asarray(lambdas_bridge_s, dtype=float)
         self.s_param_name = s_param_name
@@ -15653,6 +16041,9 @@ class ShadowBridgeREMDManager(REMDManager):
             output_dir=output_dir,
             boresch_params=None,
             random_seed=random_seed,
+            seed_ledger=seed_ledger,
+            seed_stage=seed_stage or "shadow_bridge",
+            seed_leg=seed_leg,
         )
 
     def _build_replicas(self, system_template, allow_platform_fallback: bool = True):
@@ -15664,12 +16055,23 @@ class ShadowBridgeREMDManager(REMDManager):
                 replica_sys = openmm.XmlSerializer.deserialize(sys_xml)
                 replica_sys.thisown = 1
                 integ = openmm.LangevinMiddleIntegrator(self.temperature, 1.0 / unit.picosecond, 0.002 * unit.picosecond)
+                integrator_seed = self._seed_for(
+                    "bridge", self.seed_stage, i, "integrator"
+                )
+                if integrator_seed is not None:
+                    integ.setRandomNumberSeed(integrator_seed)
                 ctx = openmm.Context(replica_sys, integ, platform, props)
                 ctx.setPositions(self.positions)
                 if self.box_vectors is not None:
                     ctx.setPeriodicBoxVectors(*self.box_vectors)
                 self._try_set_context_parameter(ctx, self.s_param_name, self.lambdas_bridge_s[i])
-                ctx.setVelocitiesToTemperature(self.temperature)
+                velocity_seed = self._seed_for(
+                    "bridge", self.seed_stage, i, "velocity"
+                )
+                if velocity_seed is None:
+                    ctx.setVelocitiesToTemperature(self.temperature)
+                else:
+                    ctx.setVelocitiesToTemperature(self.temperature, velocity_seed)
                 self.contexts.append(ctx)
                 self.integrators.append(integ)
                 self.replica_systems.append(replica_sys)

@@ -42,9 +42,9 @@ from abfe_core import (
     resolve_membrane_protocol,  # 膜体系协议唯一解析实现（B1）
     resolve_environment_type,  # 只看 config 的环境类型规范化（不需要 topology）
     resolve_charge_treatment,  # 净电荷处理协议唯一校验实现（B2）
-    CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER,  # B3 生产路线；溶剂腿 builder 是 B4
+    CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER,  # 已闭环实验路线；C4/C5 前不生产验收
     CHARGE_TREATMENT_CO_ANNIHILATION_EXPERIMENTAL,
-    CHARGE_TRANSFER_SOLVENT_LEG_IMPLEMENTED,  # B4 状态，进 provenance 与开跑前告警
+    CHARGE_TRANSFER_SOLVENT_LEG_IMPLEMENTED,  # 溶剂腿能力状态，进 provenance
     resolve_dispersion_protocol,  # LJ/色散路线唯一校验实现（B6）
     resolve_forcefield_family,  # 力场族识别唯一实现（§1.1）
     acceptance_thresholds_payload,  # §13 阈值快照，进 provenance
@@ -61,6 +61,7 @@ from abfe_core import (
     GROMACS_PAIRS_FUNCT2_CONVERSION_VERSION,
     co_alchemical_ion_builder_identity_payload,
     COION_COION_MIN_IMAGE_INITIAL_NM,  # §2.2 多个 reserved co-ion 彼此的安全边距
+    charge_treatment_qualification_payload,
 )
 from abfe_pipeline import (
     ABFEPipeline, TraditionalABFEPipeline, _collect_pipeline_provenance, _pme_u_kn_meta_payload,
@@ -2247,6 +2248,12 @@ def _write_run_provenance(
         provenance["coion_identity_deprecated"] = True
         provenance["apbs_applicable"] = charge_protocol.get("apbs_applicable")
         provenance["apbs_applied"] = charge_protocol.get("apbs_applied")
+        _qualification = charge_treatment_qualification_payload(
+            charge_protocol.get("charge_treatment")
+        )
+        if _qualification:
+            provenance.update(_qualification)
+            provenance["production_qualification"] = dict(_qualification)
         if charge_protocol.get("experimental_not_for_production"):
             provenance["experimental_not_for_production"] = True
         # B3/B4 实现状态如实落盘：一条声明 charge-transfer 的运行到底闭不闭合循环，
@@ -2322,6 +2329,35 @@ def _update_run_provenance_co_alchemical_ions(
     else:
         provenance = {}
     provenance["co_alchemical_ions"] = co_alchemical_ions
+    _atomic_write_json_with_encoder(path, provenance)
+    return provenance
+
+
+def _update_run_provenance_seed_contract(
+    output_dir: str,
+    contracts: Dict[str, Dict],
+    current: Optional[Dict] = None,
+) -> Dict:
+    """Persist the seed values actually requested by both backend legs."""
+    path = os.path.join(output_dir, "run_provenance.json")
+    if current is not None:
+        provenance = dict(current)
+    elif os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        provenance = loaded if isinstance(loaded, dict) else {}
+    else:
+        provenance = {}
+    versions = [
+        int(payload["protocol_version"])
+        for payload in contracts.values()
+        if isinstance(payload, dict) and payload.get("protocol_version") is not None
+    ]
+    provenance["random_seed_contract"] = {
+        "status": "APPLIED_BACKEND_SEED_MAP",
+        "protocol_version": max(versions) if versions else None,
+        "legs": contracts,
+    }
     _atomic_write_json_with_encoder(path, provenance)
     return provenance
 
@@ -3163,12 +3199,101 @@ def parse_arguments():
 # ---------------------------------------------------------------------------
 # 分析模式（简化版，调用原有后处理）
 # ---------------------------------------------------------------------------
+def _resolve_production_qualification_from_sources(*sources: Dict) -> Dict:
+    """Resolve one fail-closed production-qualification payload from result sources.
+
+    A post-analysis run may read two leg results plus run_provenance.json. A
+    charge-transfer result must not lose its experimental/not-qualified boundary
+    merely because this alternate output path was used. Conversely, disagreeing
+    leg/provenance identities are evidence of mixed artifacts and must not be
+    silently reconciled.
+    """
+    candidates = []
+    for source in sources:
+        if source is None:
+            continue
+        if not isinstance(source, dict):
+            raise RuntimeError(
+                "production qualification source must be a JSON object, got "
+                f"{type(source).__name__}"
+            )
+
+        explicit = source.get("production_qualification")
+        if explicit is not None:
+            if not isinstance(explicit, dict):
+                raise RuntimeError(
+                    "production_qualification must be a JSON object; refusing "
+                    "to post-process a malformed qualification record"
+                )
+            required_keys = {
+                "production_qualification_protocol_version",
+                "feature_status",
+                "production_qualified",
+                "production_qualification_reason",
+            }
+            missing_keys = sorted(required_keys.difference(explicit))
+            if missing_keys:
+                raise RuntimeError(
+                    "production_qualification is incomplete; missing "
+                    f"{missing_keys}; refusing to guess"
+                )
+            if not isinstance(explicit.get("production_qualified"), bool):
+                raise RuntimeError(
+                    "production_qualification is missing boolean "
+                    "production_qualified; refusing to guess"
+                )
+            candidates.append(dict(explicit))
+
+        treatments = []
+        charge_protocol = source.get("charge_protocol")
+        config = source.get("config")
+        for value in (
+            source.get("charge_treatment"),
+            charge_protocol.get("charge_treatment")
+            if isinstance(charge_protocol, dict)
+            else None,
+            config.get("charge_treatment") if isinstance(config, dict) else None,
+        ):
+            if value is not None:
+                treatments.append(str(value))
+        unique_treatments = sorted(set(treatments))
+        if len(unique_treatments) > 1:
+            raise RuntimeError(
+                "conflicting charge_treatment identities within one result "
+                f"source: {unique_treatments}"
+            )
+        if unique_treatments:
+            derived = charge_treatment_qualification_payload(unique_treatments[0])
+            if derived:
+                candidates.append(dict(derived))
+
+    if not candidates:
+        return {}
+    expected = candidates[0]
+    for candidate in candidates[1:]:
+        if candidate != expected:
+            raise RuntimeError(
+                "complex/solvent/provenance production qualification mismatch; "
+                "refusing to combine artifacts from different protocol states"
+            )
+    return dict(expected)
+
+
 def run_post_analysis(args):
     output_dir = args.output
     if not os.path.exists(output_dir):
         raise FileNotFoundError(f"输出目录不存在: {output_dir}")
 
     log.info("进入后处理分析模式...")
+    _run_provenance_path = os.path.join(output_dir, "run_provenance.json")
+    _run_provenance = {}
+    if os.path.exists(_run_provenance_path):
+        with open(_run_provenance_path, "r", encoding="utf-8") as f:
+            _run_provenance = json.load(f)
+        if not isinstance(_run_provenance, dict):
+            raise RuntimeError(
+                f"run provenance {_run_provenance_path} is not a JSON object"
+            )
     temp = args.temperature * unit.kelvin
     kt = (unit.MOLAR_GAS_CONSTANT_R * temp).value_in_unit(unit.kilojoule_per_mole)
     def _load_boresch_params(base_dir: str):
@@ -3425,13 +3550,14 @@ def run_post_analysis(args):
         apbs_correction = float(getattr(args, "apbs_correction_kj_mol", None) or 0.0)
     else:
         apbs_correction = 0.0
-        _provenance_path = os.path.join(output_dir, "run_provenance.json")
-        if os.path.exists(_provenance_path):
-            with open(_provenance_path) as f:
-                _provenance = json.load(f)
+        if _run_provenance:
             apbs_correction = float(
-                _provenance.get("config", {}).get("apbs_correction_kJ_mol", 0.0) or 0.0
+                _run_provenance.get("config", {}).get("apbs_correction_kJ_mol", 0.0) or 0.0
             )
+
+    _production_qualification = _resolve_production_qualification_from_sources(
+        complex_leg, solvent_leg, _run_provenance
+    )
     cycle = combine_binding_free_energy(
         dg_complex_kJ_mol=dg_complex,
         dg_solvent_kJ_mol=dg_solvent,
@@ -3473,6 +3599,9 @@ def run_post_analysis(args):
         "mode": args.mode,
         "decoupling": args.decoupling,
     }
+    if _production_qualification:
+        result.update(_production_qualification)
+        result["production_qualification"] = dict(_production_qualification)
     out_path = os.path.join(output_dir, "final_results_postprocess.json")
     with open(out_path, "w") as f:
         json.dump(result, f, indent=2, cls=NumpyEncoder)
@@ -4449,6 +4578,20 @@ def main():
 
     # 创建配置对象
     config = RunConfig(args)
+    _repeat_seed_raw = os.environ.get("ABFE_RANDOM_SEED")
+    _repeat_seed = None
+    if _repeat_seed_raw not in (None, ""):
+        try:
+            _repeat_seed = int(_repeat_seed_raw)
+        except ValueError as exc:
+            raise SystemExit(
+                f"ABFE_RANDOM_SEED 必须是正整数，收到 {_repeat_seed_raw!r}"
+            ) from exc
+        if _repeat_seed <= 0:
+            raise SystemExit("ABFE_RANDOM_SEED 必须是正整数")
+        # Include the resolved repeat seed in the immutable runtime snapshot;
+        # the backend's derived map is added after each leg completes.
+        config.data["repeat_seed"] = _repeat_seed
     dexp_params = _load_dexp_params_fail_closed(
         config.potential,
         config.dexp_params,
@@ -4956,6 +5099,8 @@ def main():
             else None
         ),
         membrane_quality_gate_mode=config.get("membrane_quality_gate"),
+        repeat_seed=_repeat_seed,
+        leg_name="complex",
     )
 
     # ----- 3. 加载可选参数 -----
@@ -5118,6 +5263,12 @@ def main():
     
     dg_complex = complex_results.get("total_delta_G_complex_kJ_mol", complex_results.get("decoupling_delta_G_kJ_mol", 0.0))
     err_complex = complex_results.get("total_error_kJ_mol", 0.0)
+    if _repeat_seed is not None:
+        run_provenance = _update_run_provenance_seed_contract(
+            output_dir,
+            {"complex": pipeline.seed_contract_snapshot()},
+            current=run_provenance,
+        )
     dg_boresch = complex_results.get("boresch_correction_kJ_mol", 0.0)
     attachment_result = complex_results.get("boresch_attachment", {})
 
@@ -5159,6 +5310,8 @@ def main():
         # ⚠️ 与恒压器方向相反：色散路线与净电荷路线**必须**两腿相同（§1.3 路线 A / §6.1），
         # 只有 environment_type/membrane 是溶剂腿刻意不接的。
         charge_treatment=_charge_protocol["charge_treatment"],
+        repeat_seed=_repeat_seed,
+        leg_name="solvent",
     )
 
     # [B5] Use a path relative to the run root so complex and solvent records
@@ -5247,6 +5400,15 @@ def main():
     
     dg_solvent = solv_results.get("total_delta_G_complex_kJ_mol", solv_results.get("decoupling_delta_G_kJ_mol", 0.0))
     err_solvent = solv_results.get("total_error_kJ_mol", 0.0)
+    if _repeat_seed is not None:
+        run_provenance = _update_run_provenance_seed_contract(
+            output_dir,
+            {
+                "complex": pipeline.seed_contract_snapshot(),
+                "solvent": pipeline_solv.seed_contract_snapshot(),
+            },
+            current=run_provenance,
+        )
 
     # Repeat the final-summary gate at the last boundary so a future change to
     # either pipeline cannot turn a valid preflight into a null leg in output.
@@ -5388,6 +5550,13 @@ def main():
             },
         },
     }
+    _qualification = charge_treatment_qualification_payload(
+        _charge_protocol.get("charge_treatment")
+    )
+    if _qualification:
+        final_bind_result.update(_qualification)
+        final_bind_result["production_qualification"] = dict(_qualification)
+
     if coion_identities:
         # [B5] The combined result records both leg identities, while neutral
         # runs retain the legacy shape (no synthetic empty co-ion record).

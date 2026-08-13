@@ -582,6 +582,27 @@ CHARGE_TRANSFER_HAMILTONIAN_IMPLEMENTED = True
 # §4.2/§4.4 的盒子尺寸敏感性、平衡稳定性仍待真正带电配体上机验证。
 CHARGE_TRANSFER_SOLVENT_LEG_IMPLEMENTED = True
 
+# C4/C5 是带电膜 charge-transfer 路线获得生产资格前的强制验收。底层
+# Hamiltonian/双腿 builder 已实现并不等于这两项科学验收已经完成。
+CHARGE_TRANSFER_FEATURE_STATUS = "experimental"
+CHARGE_TRANSFER_PRODUCTION_QUALIFICATION_PROTOCOL_VERSION = 1
+CHARGE_TRANSFER_C4_PASSED = False
+CHARGE_TRANSFER_C5_PASSED = False
+
+# [Stage2 handoff，2026-08-11] charge-transfer 配体的 charging→vanishing
+# 交接：vanishing 阶段的输入 System 现在会先用
+# `bake_global_parameter_into_fixed_nonbonded_force` 把一份独立的 charging
+# 配置固化到 λ_coul=0 端点（配体 0 电荷、co-ion 满电、配体内部 exception
+# 保留物理 chargeProd），再喂给 `build_ibs_dual_system`——不是直接把原始
+# `self.system` 传过去（那样带净电配体会被 `build_ibs_dual_system` 自己的
+# 电中性防御拒绝）。见 `STAGE2_CHARGE_TRANSFER_HANDOFF_PROPOSAL.md`。
+#
+# 这个协议版本号只在 `ABFEPipeline._charge_transfer_vanishing_handoff_active()`
+# 返回 True（即 charge_treatment 是 charge-transfer 且配体净电荷非零）时才
+# 写入 Stage 2 的缓存指纹——中性配体（当前唯一生产路径，Atenolol 净电荷为 0）
+# 完全不受影响，指纹不变，旧缓存不会被误判失效。
+CHARGE_TRANSFER_VANISHING_HANDOFF_PROTOCOL_VERSION = 1
+
 # §13.2 数值自洽的两个容差。放在这里是因为本层就要用；§13 的完整阈值表另立。
 LIGAND_NET_CHARGE_INTEGER_TOLERANCE_E = 1.0e-3
 TOTAL_CHARGE_CONSERVATION_TOLERANCE_E = 1.0e-6
@@ -618,6 +639,44 @@ APBS_REQUIRED_EVIDENCE_FIELDS = (
     "lipid_charge_map_path",
     "net_charge_e",
 )
+
+
+def charge_treatment_qualification_payload(charge_treatment: Optional[str]) -> Dict[str, Any]:
+    """Return the single-source production-qualification payload.
+
+    Neutral and Rocklin paths keep their legacy result shape. Charged
+    charge-transfer is merged as an experimental capability: C4/C5 are not
+    complete, so constructing a closed cycle cannot silently promote the
+    numerical result to production-qualified.
+    """
+    resolved = str(charge_treatment or "").strip().lower()
+    if resolved == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
+        c4_passed = bool(CHARGE_TRANSFER_C4_PASSED)
+        c5_passed = bool(CHARGE_TRANSFER_C5_PASSED)
+        return {
+            "qualification_protocol_version": (
+                CHARGE_TRANSFER_PRODUCTION_QUALIFICATION_PROTOCOL_VERSION
+            ),
+            "feature_status": CHARGE_TRANSFER_FEATURE_STATUS,
+            "production_qualified": bool(c4_passed and c5_passed),
+            "c4_passed": c4_passed,
+            "c5_passed": c5_passed,
+            "production_qualification_reason": (
+                "charged_membrane_charge_transfer_requires_c4_and_c5"
+            ),
+        }
+    if resolved == CHARGE_TREATMENT_CO_ANNIHILATION_EXPERIMENTAL:
+        return {
+            "qualification_protocol_version": (
+                CHARGE_TRANSFER_PRODUCTION_QUALIFICATION_PROTOCOL_VERSION
+            ),
+            "feature_status": "experimental_method_comparison_only",
+            "production_qualified": False,
+            "c4_passed": False,
+            "c5_passed": False,
+            "production_qualification_reason": "co_annihilation_not_for_production",
+        }
+    return {}
 
 
 def resolve_charge_treatment(
@@ -810,6 +869,7 @@ def resolve_charge_treatment(
         payload["closes_thermodynamic_cycle"] = bool(
             CHARGE_TRANSFER_SOLVENT_LEG_IMPLEMENTED
         ) or is_experimental
+        payload.update(charge_treatment_qualification_payload(resolved))
     elif resolved == CHARGE_TREATMENT_ROCKLIN_APBS:
         payload["total_charge_conserved_at_every_lambda"] = False
         payload["apbs_evidence"] = dict(apbs_evidence or {})
@@ -9677,6 +9737,293 @@ def sync_all_exclusions(system: openmm.System) -> int:
             c_force.addExclusion(p1, p2)
         total_synced += len(missing)
     return total_synced
+
+
+_NONBONDED_FORCE_SCALAR_PROPERTIES = (
+    # (getter, setter) —— 与电荷/λ 无关的 NonbondedForce 配置，烘焙时必须
+    # 原样保留，否则烘焙本身就悄悄改了 Hamiltonian（2026-08-11 用户审阅指出）。
+    ("getName", "setName"),
+    ("getForceGroup", "setForceGroup"),
+    ("getReciprocalSpaceForceGroup", "setReciprocalSpaceForceGroup"),
+    ("getNonbondedMethod", "setNonbondedMethod"),
+    ("getCutoffDistance", "setCutoffDistance"),
+    ("getUseSwitchingFunction", "setUseSwitchingFunction"),
+    ("getSwitchingDistance", "setSwitchingDistance"),
+    ("getUseDispersionCorrection", "setUseDispersionCorrection"),
+    ("getReactionFieldDielectric", "setReactionFieldDielectric"),
+    ("getEwaldErrorTolerance", "setEwaldErrorTolerance"),
+    ("getExceptionsUsePeriodicBoundaryConditions", "setExceptionsUsePeriodicBoundaryConditions"),
+    ("getIncludeDirectSpace", "setIncludeDirectSpace"),
+)
+_NONBONDED_FORCE_TUPLE_PROPERTIES = (
+    # 这两个 getter 返回一个元组（alpha, nx, ny, nz），要展开传给对应 setter。
+    ("getPMEParameters", "setPMEParameters"),
+    ("getLJPMEParameters", "setLJPMEParameters"),
+)
+
+
+def _copy_nonbonded_force_settings(
+    src: openmm.NonbondedForce, dst: openmm.NonbondedForce
+) -> List[str]:
+    """把 `src` 上与 particle/exception 参数无关的所有配置复制到 `dst`。
+
+    用 `getattr` 逐个探测而不是硬编码假设全部存在——不同 OpenMM 版本这组
+    属性不完全一样；缺哪个就跳过并如实报告，不假装复制了。返回跳过的
+    属性名列表（供调用方决定要不要打日志/报错）。
+    """
+    skipped: List[str] = []
+    for getter_name, setter_name in _NONBONDED_FORCE_SCALAR_PROPERTIES:
+        getter = getattr(src, getter_name, None)
+        setter = getattr(dst, setter_name, None)
+        if getter is None or setter is None:
+            skipped.append(getter_name)
+            continue
+        setter(getter())
+    for getter_name, setter_name in _NONBONDED_FORCE_TUPLE_PROPERTIES:
+        getter = getattr(src, getter_name, None)
+        setter = getattr(dst, setter_name, None)
+        if getter is None or setter is None:
+            skipped.append(getter_name)
+            continue
+        setter(*getter())
+    if skipped:
+        print(
+            "  ⚠️ [bake_global_parameter_into_fixed_nonbonded_force] 当前 OpenMM "
+            f"版本缺少以下 NonbondedForce 属性，未复制（版本差异，不是烘焙逻辑本身"
+            f"的缺陷）：{skipped}"
+        )
+    return skipped
+
+
+def _scan_forces_referencing_global_parameter(
+    system: openmm.System, parameter_name: str
+) -> List[Tuple[int, Any]]:
+    """返回 System 里所有把 `parameter_name` 声明为自己 GlobalParameter 的
+    `(force_index, force)`——不只看 NonbondedForce，任何 Custom*Force 都可能
+    引用同名参数。
+    """
+    hits: List[Tuple[int, Any]] = []
+    for idx in range(system.getNumForces()):
+        force = system.getForce(idx)
+        get_num = getattr(force, "getNumGlobalParameters", None)
+        get_name = getattr(force, "getGlobalParameterName", None)
+        if get_num is None or get_name is None:
+            continue
+        for p in range(get_num()):
+            if get_name(p) == parameter_name:
+                hits.append((idx, force))
+                break
+    return hits
+
+
+def bake_global_parameter_into_fixed_nonbonded_force(
+    system: openmm.System,
+    parameter_name: str,
+    lambda_value: float,
+) -> openmm.System:
+    """把某个 GlobalParameter 在给定端点上的取值烘焙成 `NonbondedForce` 的
+    静态参数，并把这个 GlobalParameter 从 System 里彻底删除——不是靠"调用方
+    记得把它设成这个值"这种纪律来保证安全，是让"忘了设"这条路径在结构上
+    就不存在。
+
+    背景（`STAGE2_CHARGE_TRANSFER_HANDOFF_PROPOSAL.md`）：C3-1 会话诊断
+    发现的真实 bug——`ibs_engine.build_ibs_dual_system` 会把 charging 配置
+    完成后 System 上的 `lam_coul`（默认值 **1.0**）连同它的
+    ParticleParameterOffset/ExceptionParameterOffset 原样克隆过去；后续
+    求值只要忘了显式 `context.setParameter("lam_coul", 0.0)`，OpenMM 就用
+    默认值 1.0，把"配体 0 电荷、co-ion 满电"的 λ=0 端点悄悄翻成"配体满电、
+    co-ion 中性"。这个函数就是那条缺失的、结构性的"安全交接"步骤。
+
+    契约（2026-08-11 用户审阅后钉死）：
+
+    1. 只删除 `parameter_name` 这一个 GlobalParameter；`NonbondedForce` 上
+       其它 GlobalParameter、挂在其它参数名下的 offset 原样保留。
+    2. 同一个粒子/exception 上如果有**多个**挂在 `parameter_name` 上的
+       offset，fail closed——**不是**"先把 scale 累加再烘焙一次"。这一条
+       在审阅时最初写反了：`parameter = base + Σ(global_i × scale_i)` 里的
+       Σ 说的是"同一个粒子上挂了多个不同 GlobalParameter 各自的 offset 要
+       相加"，不是"同一个 (parameter, particle) 重复挂多条也相加"。用真实
+       Context 实测过（2026-08-11）：对同一个 (parameter, particle) 追加两条
+       offset，`getNumParticleParameterOffsets()` 确实报出两条，但 Context
+       求值时只认**最后一条**，不是两条的和。这是没有文档、容易被误用的
+       OpenMM 行为；真实生产代码从不对同一个粒子重复调用
+       `addParticleParameterOffset`，所以这里选择不去复现"取最后一条"这个
+       隐藏规则，遇到真的重复就直接报错，不猜语义。
+    3. 新建的 `NonbondedForce` 完整复制原 force 的非 particle/exception 配置
+       （见 `_copy_nonbonded_force_settings`），当前 OpenMM 版本缺哪个属性
+       就跳过并打印警告，不假装复制了。
+    4. 若 `parameter_name` 还被 System 里其它（非目标）Force 引用，fail
+       closed——本函数只烘焙 `NonbondedForce`，不能宣称整个 System 已经不再
+       有这个活参数。
+    5. charge、sigma、epsilon 三个分量分别用同一个通用公式
+       `base + lambda_value * scale` 烘焙，不借用 `charge_at_lambda`
+       （那是电荷专用命名，这里是通用工具，同一个公式对三个分量都适用）。
+    6. `lambda_value` 必须是精确的 `0.0` 或 `1.0`——C3 的容差体系只在端点上
+       有意义，非端点值拒绝。
+    """
+    lambda_value = float(lambda_value)
+    if lambda_value not in (0.0, 1.0):
+        raise ValueError(
+            f"lambda_value={lambda_value} 不是精确的 0.0 或 1.0——烘焙只定义在端点上。"
+        )
+
+    system = ensure_owned_system(
+        XmlSerializer.deserialize(XmlSerializer.serialize(system))
+    )
+
+    hits = _scan_forces_referencing_global_parameter(system, parameter_name)
+    nb_hits = [(idx, f) for idx, f in hits if isinstance(f, openmm.NonbondedForce)]
+    other_hits = [(idx, f) for idx, f in hits if not isinstance(f, openmm.NonbondedForce)]
+    if not nb_hits:
+        raise RuntimeError(
+            f"{parameter_name!r} 不是这个 System 里任何 NonbondedForce 的 "
+            "GlobalParameter，无法烘焙（可能是名字拼错了，或者这个参数根本不在"
+            "这个 System 上）。"
+        )
+    if len(nb_hits) > 1:
+        raise RuntimeError(
+            f"{parameter_name!r} 出现在 {len(nb_hits)} 个 NonbondedForce 上——"
+            "当前实现只支持单个 NonbondedForce，多个的语义未定义，拒绝继续。"
+        )
+    if other_hits:
+        other_types = [type(f).__name__ for _idx, f in other_hits]
+        raise RuntimeError(
+            f"{parameter_name!r} 还被以下非 NonbondedForce 引用：{other_types}——"
+            "本函数只烘焙 NonbondedForce 的 offset，其它 Force 里这个参数不会被"
+            "处理。不能假装整个 System 已经不再有这个活参数；请先确认这些 Force "
+            "是否也需要烘焙（当前未实现），或者改用别的参数名把它们隔离开。"
+        )
+
+    nb_index, nb = nb_hits[0]
+    num_particles = nb.getNumParticles()
+
+    def _value(x, target_unit):
+        """SWIG 对"恰好是 0"的 offset scale 有时会返回裸 `float` 而不是
+        `Quantity`（已实测：`addParticleParameterOffset(..., 0.0*nm, ...)` 传
+        进去，读回来可能就是裸 `0.0`），返回值类型不稳定。这里统一转换成给定
+        单位下的裸 float，后续全部用 float 做累加，只在最后写回 System 时
+        才重新套上单位——不依赖 OpenMM 返回值本身的类型。
+        """
+        if unit.is_quantity(x):
+            return x.value_in_unit(target_unit)
+        return float(x)
+
+    # ---- particle offsets：同一 (parameter, particle) 上重复出现就 fail closed ----
+    #
+    # 2026-08-11 用户审阅时给的契约原本要求"多条 offset 先求和"（引用 OpenMM
+    # 文档里 `parameter = base + Σ(global_i × scale_i)` 的公式）。实测直接
+    # 用 Context 验证发现：**OpenMM 对同一个 (parameter, particle) 上的多条
+    # `ParticleParameterOffset` 并不求和**——`getNumParticleParameterOffsets()`
+    # 确实报出两条，但 Context 求值时只认最后一条（0.3 与 0.2 两条追加，
+    # 结果对应的是 0.2，不是 0.5；exception 同理，0.01+0.02 两条追加，结果
+    # 对应 0.02，不是 0.03）。那条公式里的 Σ 说的是"同一个粒子上挂了多个
+    # 不同 GlobalParameter 各自的 offset 要相加"，不是"同一个 (parameter,
+    # particle) 重复挂多条"。真实生产代码（`configure_charge_transfer_
+    # decharging` 等）从不对同一个粒子重复调用
+    # `addParticleParameterOffset`——每个粒子只出现一次。所以这里选择**不**
+    # 复现这个没有文档、容易被误用的"后者覆盖前者"行为，改成 fail closed：
+    # 一旦真的出现重复，说明调用方的假设已经出了问题，直接报错比"悄悄按
+    # OpenMM 的隐藏规则取最后一条"更安全。
+    target_particle_scale: Dict[int, Tuple[Any, Any, Any]] = {}
+    kept_particle_offsets: List[Tuple[str, int, Any, Any, Any]] = []
+    for i in range(nb.getNumParticleParameterOffsets()):
+        pname, particle, q_scale, sigma_scale, eps_scale = nb.getParticleParameterOffset(i)
+        particle = int(particle)
+        if pname != parameter_name:
+            kept_particle_offsets.append((pname, particle, q_scale, sigma_scale, eps_scale))
+            continue
+        if particle in target_particle_scale:
+            raise RuntimeError(
+                f"粒子 {particle} 上有多条挂在 {parameter_name!r} 下的 "
+                "ParticleParameterOffset——OpenMM 对这种重复不做加法（实测确认，"
+                "只认最后一条），这个函数拒绝猜测应该按哪种语义处理，请先在源头"
+                "去重。"
+            )
+        target_particle_scale[particle] = (
+            _value(q_scale, unit.elementary_charge),
+            _value(sigma_scale, unit.nanometer),
+            _value(eps_scale, unit.kilojoule_per_mole),
+        )
+
+    # ---- exception offsets，同理：重复就 fail closed，不猜语义 ----
+    target_exception_scale: Dict[int, Tuple[Any, Any, Any]] = {}
+    kept_exception_offsets: List[Tuple[str, int, Any, Any, Any]] = []
+    for i in range(nb.getNumExceptionParameterOffsets()):
+        pname, exc_index, cp_scale, sigma_scale, eps_scale = nb.getExceptionParameterOffset(i)
+        exc_index = int(exc_index)
+        if pname != parameter_name:
+            kept_exception_offsets.append((pname, exc_index, cp_scale, sigma_scale, eps_scale))
+            continue
+        if exc_index in target_exception_scale:
+            raise RuntimeError(
+                f"exception {exc_index} 上有多条挂在 {parameter_name!r} 下的 "
+                "ExceptionParameterOffset——同上，OpenMM 对这种重复不做加法，"
+                "拒绝猜测语义，请先在源头去重。"
+            )
+        target_exception_scale[exc_index] = (
+            _value(cp_scale, unit.elementary_charge**2),
+            _value(sigma_scale, unit.nanometer),
+            _value(eps_scale, unit.kilojoule_per_mole),
+        )
+
+    # ---- 建一个干净的新 NonbondedForce，完整复制配置 ----
+    new_nb = openmm.NonbondedForce()
+    _copy_nonbonded_force_settings(nb, new_nb)
+
+    # ---- 逐粒子烘焙：没有目标 offset 的粒子原样复制 ----
+    for idx in range(num_particles):
+        q, sigma, epsilon = nb.getParticleParameters(idx)
+        if idx in target_particle_scale:
+            q_scale, sigma_scale, eps_scale = target_particle_scale[idx]
+            q = q + (lambda_value * q_scale) * unit.elementary_charge
+            sigma = sigma + (lambda_value * sigma_scale) * unit.nanometer
+            epsilon = epsilon + (lambda_value * eps_scale) * unit.kilojoule_per_mole
+        new_nb.addParticle(q, sigma, epsilon)
+
+    # ---- 逐 exception 烘焙 ----
+    for idx in range(nb.getNumExceptions()):
+        p1, p2, charge_prod, sigma, epsilon = nb.getExceptionParameters(idx)
+        if idx in target_exception_scale:
+            cp_scale, sigma_scale, eps_scale = target_exception_scale[idx]
+            charge_prod = charge_prod + (lambda_value * cp_scale) * unit.elementary_charge**2
+            sigma = sigma + (lambda_value * sigma_scale) * unit.nanometer
+            epsilon = epsilon + (lambda_value * eps_scale) * unit.kilojoule_per_mole
+        new_nb.addException(int(p1), int(p2), charge_prod, sigma, epsilon)
+
+    # ---- 重新声明其它 GlobalParameter，重新挂回其它 offset（原样保留） ----
+    # kept_*_offsets 里的 scale 值同样可能是裸 float（同一个 SWIG 问题），
+    # 重新写回前用 _value 统一转成明确单位的 Quantity，不能假设它们已经是
+    # Quantity——那正是刚才炸掉的那个假设。
+    for gi in range(nb.getNumGlobalParameters()):
+        gname = nb.getGlobalParameterName(gi)
+        if gname == parameter_name:
+            continue
+        new_nb.addGlobalParameter(gname, nb.getGlobalParameterDefaultValue(gi))
+    for pname, particle, q_scale, sigma_scale, eps_scale in kept_particle_offsets:
+        new_nb.addParticleParameterOffset(
+            pname, particle,
+            _value(q_scale, unit.elementary_charge) * unit.elementary_charge,
+            _value(sigma_scale, unit.nanometer) * unit.nanometer,
+            _value(eps_scale, unit.kilojoule_per_mole) * unit.kilojoule_per_mole,
+        )
+    for pname, exc_index, cp_scale, sigma_scale, eps_scale in kept_exception_offsets:
+        new_nb.addExceptionParameterOffset(
+            pname, exc_index,
+            _value(cp_scale, unit.elementary_charge**2) * unit.elementary_charge**2,
+            _value(sigma_scale, unit.nanometer) * unit.nanometer,
+            _value(eps_scale, unit.kilojoule_per_mole) * unit.kilojoule_per_mole,
+        )
+
+    system.removeForce(nb_index)
+    system.addForce(new_nb)
+
+    remaining = _scan_forces_referencing_global_parameter(system, parameter_name)
+    if remaining:
+        raise RuntimeError(
+            f"内部错误：烘焙后 {parameter_name!r} 仍出现在 "
+            f"{[type(f).__name__ for _idx, f in remaining]} 上——烘焙没有做干净。"
+        )
+    return system
 
 
 def create_ligand_internal_force(
