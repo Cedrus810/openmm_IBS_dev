@@ -2390,6 +2390,63 @@ class OuterLambdaResidualBiasForce:
             for basis_index, index in enumerate(self._basis_cv_indices)
         )
 
+    def validate_wiring(self) -> None:
+        """Fail closed BEFORE any Context is created if this Force's
+        CustomCVForce is missing a collective variable or global parameter
+        the constructed expression actually references, or has a duplicate
+        name registered.
+
+        Why this exists (EXP-025 G4 Layer-1, 2026-08-13): this class's own
+        constructor registers ONLY the shared basis CV(s) -- by design, the
+        CALLER must separately register cv_{k}_int/cv_{k}_rest per state
+        (see this class's docstring). The first Layer-1 oracle script omitted
+        that registration loop entirely; the resulting CustomCVForce
+        referenced undefined cv_k_int/cv_k_rest symbols, yet Context
+        construction and every subsequent energy query completed WITHOUT
+        raising -- they silently returned a wrong, finite energy (~2.27
+        kJ/mol off on the real production window). This method does not
+        parse the expression string (Lepton's own validation apparently does
+        not reliably catch this class of omission either, or does so lazily
+        in a way that never actually fired here) -- it instead compares the
+        SET of names this constructor's own contract requires against what
+        is ACTUALLY registered on the CustomCVForce object, which is exact
+        and needs no parser.
+        """
+        expected_cv_names = {f"cv_{index}_int" for index in range(self.n_states)}
+        expected_cv_names |= {f"cv_{index}_rest" for index in range(self.n_states)}
+        expected_cv_names |= {f"neural_basis_{basis_index}" for basis_index in range(len(self._basis_cv_indices))}
+
+        actual_cv_names: list[str] = [
+            self.force.getCollectiveVariableName(i) for i in range(self.force.getNumCollectiveVariables())
+        ]
+        if len(actual_cv_names) != len(set(actual_cv_names)):
+            duplicates = sorted({name for name in actual_cv_names if actual_cv_names.count(name) > 1})
+            raise NeuralPathConfigError(
+                f"OuterLambdaResidualBiasForce.validate_wiring: duplicate collective variable name(s) {duplicates}"
+            )
+        actual_cv_set = set(actual_cv_names)
+        if actual_cv_set != expected_cv_names:
+            missing = sorted(expected_cv_names - actual_cv_set)
+            unexpected = sorted(actual_cv_set - expected_cv_names)
+            raise NeuralPathConfigError(
+                "OuterLambdaResidualBiasForce.validate_wiring: collective variable set does not match the "
+                f"constructor's contract -- missing={missing}, unexpected={unexpected}. Every cv_{{k}}_int/"
+                "cv_{k}_rest for k in range(n_states) must be registered by the caller via addCollectiveVariable() "
+                "before creating any Context (this constructor deliberately does not register them itself)."
+            )
+
+        expected_global_names = {"kt", "beta", f"{self.prefix}_bias_scale"}
+        expected_global_names |= {f"{self.prefix}_f_{index}" for index in range(self.n_states)}
+        actual_global_names = {
+            self.force.getGlobalParameterName(i) for i in range(self.force.getNumGlobalParameters())
+        }
+        missing_globals = expected_global_names - actual_global_names
+        if missing_globals:
+            raise NeuralPathConfigError(
+                f"OuterLambdaResidualBiasForce.validate_wiring: missing required global parameter(s) "
+                f"{sorted(missing_globals)}"
+            )
+
 
 def evaluate_outer_lambda_force_group_states(
     context,

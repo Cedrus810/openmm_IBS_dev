@@ -1131,7 +1131,7 @@ def _is_checkpoint_valid(chk_path: str) -> bool:
         with open(chk_path, "rb") as f:
             f.seek(-8, 2)  # 跳至文件末尾
             return True
-    except:
+    except (OSError, ValueError):
         return False
 
 def _is_traj_valid(dcd_path: str, min_frames: int = 1) -> bool:
@@ -4012,11 +4012,11 @@ class ABFEPipeline:
                     output_dir=stage_output_dir,
                     boresch_params=boresch_params,
                     random_seed=self._seed_for(
-                        "charging", stage_name, "exchange", "numpy"
+                        "charging", label, "exchange", "numpy"
                     ),
                     co_alchemical_ion_spec=self.resolve_co_alchemical_ion_spec(),
                     seed_ledger=self.seed_ledger,
-                    seed_stage=stage_name,
+                    seed_stage=label,
                     seed_leg=self.leg_name,
                 )
                 traj_files = remd.run(
@@ -8985,10 +8985,10 @@ class TraditionalABFEPipeline:
                 # [MEM-00c] 所有 replica 共用同一份冻结身份。
                 co_alchemical_ion_spec=self.resolve_co_alchemical_ion_spec(),
                 random_seed=self._seed_for(
-                    "charging", label, "exchange", "numpy"
+                    "charging", stage_name, "exchange", "numpy"
                 ),
                 seed_ledger=self.seed_ledger,
-                seed_stage=label,
+                seed_stage=stage_name,
                 seed_leg=self.leg_name,
             )
             traj_files = remd.run(

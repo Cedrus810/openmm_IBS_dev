@@ -1,0 +1,67 @@
+# 2026-07-28 审核后保留结论
+
+本文件只记录目前仍成立、且能由实际生产代码或已落盘数据直接支持的结论。
+被撤回的实现过程、测试计划、外围诊断脚本说明和未经验证的物理归因均已删除。
+
+## 本轮生产范围
+
+- stage1 = charging。生产主值已切换为相邻 BAR，并使用 FD-TI 作一致性门。
+- stage1 的正常计算路径和缓存命中路径都通过
+  `abfe_pipeline._CHARGING_ESTIMATOR_KWARGS()` 传入同一套策略；不是只改分析脚本。
+- stage2 = vdW。继续使用原来的去相关 Local-TMBAR；本轮不改 BAR、TI、全帧主值、
+  √g、bootstrap 或其他 σ 口径。
+- Boresch 的末帧重锚逻辑保持不变。本轮不删除、不替换为轨迹均值。
+- LRC 不在本文件讨论范围内。
+
+## 已核实的生产修复
+
+- charging 分析协议使用 `ESTIMATOR_ANALYSIS_PROTOCOL_VERSION = 2`。
+- `TraditionalMBARAnalyzer.solve(primary_estimator="adjacent_bar", ...)` 会将 BAR 作为
+  `delta_G/error` 主值；BAR 不可用或 FD-TI 门未明确通过时 fail closed，不回退 MBAR。
+- `ABFE_DEBUG_SKIP_STAGE2_FINGERPRINT` 的 fail-open 已删除；检测到旧环境变量会直接报错。
+- P0-10 的 committed Boresch 复用已增加 schema、锚点身份和当前 pose 几何一致性检查。
+  旧复合物腿使用了错误 committed 平衡值，因此旧复合物腿采样作废；修复效果必须由
+  fresh full rerun 验证。
+- P0-11 的溶剂盒构建已修：缓存协议为 v4，默认 padding 为 1.5 nm，盒长显式包含
+  配体尺寸；水模型由复合物 GROMACS 拓扑解析，旧 3.000 nm 缓存会失效并重建。
+
+## 旧数组能够证明的 charging 结论
+
+同一批旧 stage1 `u_kn` 的离线结果：
+
+| 腿 | 去相关 MBAR | 全帧 MBAR | 相邻 BAR | FD-TI |
+|---|---:|---:|---:|---:|
+| complex | 64.4113 | 65.0032 | 65.0762 ± 0.6148 | 65.1262 |
+| solvent | 62.8865 | 63.4637 | 63.4117 ± 0.6604 | 63.6378 |
+
+由此只能得到：
+
+- 两条 charging 腿上，相邻 BAR、全帧 MBAR 与 FD-TI 同量级，而去相关 MBAR 均偏低
+  约 0.5–0.7 kJ/mol。
+- 将 production charging 主值切到相邻 BAR 是有数据依据的。
+- 两腿的移动大部分在 binding 差分中抵消；在这批旧数据上，ΔG_bind 只移动约
+  −0.033 kcal/mol。因此它不能解释此前约 1.3 kcal/mol 的 charging 分项缺口。
+- 这些数值来自旧采样，只用于隔离估计量改动，不是 fresh rerun 的最终结果。
+
+## 已排除与尚未排除
+
+- 已排除的只是“GROMACS charging 同时湮灭配体分子内 L–L 库仑”这个假设。
+  参考 `charging-*.mdp` 使用 `couple_intramol = no`，与当前 llfreeze 口径一致。
+- 这不等于 charging 整体已经正确。此前 charging 残差的来源仍未解释。
+- 解析释放公式本身已经独立复算一致；不同锚点/力常数会改变分项，但按锚点不变性，
+  该变化应由 attachment 与受限制解耦腿补偿。因此不能把解析释放分项差直接宣布为
+  总 ΔG_bind 缺口的解释。
+
+## fresh full rerun 判决
+
+- 当前没有尚未修复、会阻挡正常生产全量重跑的 P0。
+- 必须重新生成复合物腿采样，以验证 P0-10 修复后的真实影响。
+- 溶剂腿按 v4 身份重建并重新采样。
+- charging 应在日志/结果中显示 adjacent BAR 主值和 FD-TI gate 通过。
+- vdW 应继续显示 Local-TMBAR，不应出现 charging 的 BAR/TI 策略。
+- attachment 应使用本次生产实际冻结的同一套 Boresch 参数闭合循环。
+- 旧输出只能作对照，不能继续作为本次最终 ΔG_bind 的组成部分。
+
+## 延期事项
+
+- P0-9 `--analyze-only` loader 完整性已移到未来工作；它不影响正常 full pipeline 重跑。

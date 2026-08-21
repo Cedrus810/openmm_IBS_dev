@@ -1879,7 +1879,8 @@ class ABFEPreOptimizer:
                         param_exists = True
                         print(f"  ✅ 强制注入成功: {p_name}")
                         break
-                    except: pass
+                    except (openmm.OpenMMException, AttributeError, TypeError, ValueError):
+                        continue
 
         if not param_exists:
             raise RuntimeError(f"❌ 无法在 Context 中找到或设置任何 Lambda 参数，优化终止。")

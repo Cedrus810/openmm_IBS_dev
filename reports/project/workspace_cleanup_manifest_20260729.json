@@ -1,0 +1,756 @@
+{
+  "created_at_utc": "2026-07-29T04:46:57.376352+00:00",
+  "scope": "Workspace organization only; core source, molecular inputs, pipeline.zsh, and all output* directories were left in place.",
+  "moves": [
+    {
+      "source": "test_att27_dead_code_removed.py",
+      "destination": "tests\\test_att27_dead_code_removed.py",
+      "files": 1,
+      "bytes": 6354
+    },
+    {
+      "source": "test_audit_protocol_regressions.py",
+      "destination": "tests\\test_audit_protocol_regressions.py",
+      "files": 1,
+      "bytes": 53501
+    },
+    {
+      "source": "test_boresch_anchor_and_pbc_fixes.py",
+      "destination": "tests\\test_boresch_anchor_and_pbc_fixes.py",
+      "files": 1,
+      "bytes": 17684
+    },
+    {
+      "source": "test_boresch_attachment_leg.py",
+      "destination": "tests\\test_boresch_attachment_leg.py",
+      "files": 1,
+      "bytes": 16188
+    },
+    {
+      "source": "test_boresch_committed_gate.py",
+      "destination": "tests\\test_boresch_committed_gate.py",
+      "files": 1,
+      "bytes": 10804
+    },
+    {
+      "source": "test_boresch_dihedral_convention.py",
+      "destination": "tests\\test_boresch_dihedral_convention.py",
+      "files": 1,
+      "bytes": 12402
+    },
+    {
+      "source": "test_charging_estimator_protocol.py",
+      "destination": "tests\\test_charging_estimator_protocol.py",
+      "files": 1,
+      "bytes": 19091
+    },
+    {
+      "source": "test_charging_only_mode.py",
+      "destination": "tests\\test_charging_only_mode.py",
+      "files": 1,
+      "bytes": 5754
+    },
+    {
+      "source": "test_core_physics_numerics.py",
+      "destination": "tests\\test_core_physics_numerics.py",
+      "files": 1,
+      "bytes": 42556
+    },
+    {
+      "source": "test_dexp_new_production.py",
+      "destination": "tests\\test_dexp_new_production.py",
+      "files": 1,
+      "bytes": 4409
+    },
+    {
+      "source": "test_import_time_side_effects.py",
+      "destination": "tests\\test_import_time_side_effects.py",
+      "files": 1,
+      "bytes": 5399
+    },
+    {
+      "source": "test_input_file_fail_closed.py",
+      "destination": "tests\\test_input_file_fail_closed.py",
+      "files": 1,
+      "bytes": 2767
+    },
+    {
+      "source": "test_lrc_interaction_group_compat.py",
+      "destination": "tests\\test_lrc_interaction_group_compat.py",
+      "files": 1,
+      "bytes": 31633
+    },
+    {
+      "source": "test_lrc_reporting_honesty.py",
+      "destination": "tests\\test_lrc_reporting_honesty.py",
+      "files": 1,
+      "bytes": 7162
+    },
+    {
+      "source": "test_non_mutating_policy.py",
+      "destination": "tests\\test_non_mutating_policy.py",
+      "files": 1,
+      "bytes": 12570
+    },
+    {
+      "source": "test_remd_gpu_context_budget.py",
+      "destination": "tests\\test_remd_gpu_context_budget.py",
+      "files": 1,
+      "bytes": 7191
+    },
+    {
+      "source": "test_resume_reuse_contracts.py",
+      "destination": "tests\\test_resume_reuse_contracts.py",
+      "files": 1,
+      "bytes": 30515
+    },
+    {
+      "source": "test_stage_coverage_fail_closed.py",
+      "destination": "tests\\test_stage_coverage_fail_closed.py",
+      "files": 1,
+      "bytes": 9808
+    },
+    {
+      "source": "test_stage_diagnostics_persistence.py",
+      "destination": "tests\\test_stage_diagnostics_persistence.py",
+      "files": 1,
+      "bytes": 13628
+    },
+    {
+      "source": "test_thermodynamic_cycle.py",
+      "destination": "tests\\test_thermodynamic_cycle.py",
+      "files": 1,
+      "bytes": 8128
+    },
+    {
+      "source": "test_todo_verified_fixes.py",
+      "destination": "tests\\test_todo_verified_fixes.py",
+      "files": 1,
+      "bytes": 8915
+    },
+    {
+      "source": "test_warmup_overlap_protocol.py",
+      "destination": "tests\\test_warmup_overlap_protocol.py",
+      "files": 1,
+      "bytes": 72192
+    },
+    {
+      "source": "conftest.py",
+      "destination": "tests\\conftest.py",
+      "files": 1,
+      "bytes": 1052
+    },
+    {
+      "source": "smoke_test_dexp_baseline.py",
+      "destination": "tests\\smoke_test_dexp_baseline.py",
+      "files": 1,
+      "bytes": 4248
+    },
+    {
+      "source": "run_offline_tests.sh",
+      "destination": "tests\\run_offline_tests.sh",
+      "files": 1,
+      "bytes": 3364
+    },
+    {
+      "source": "diagnose_boresch_ensemble_effect.py",
+      "destination": "tools\\diagnostics\\diagnose_boresch_ensemble_effect.py",
+      "files": 1,
+      "bytes": 25485
+    },
+    {
+      "source": "diagnose_charging_annihilation_reweight.py",
+      "destination": "tools\\diagnostics\\diagnose_charging_annihilation_reweight.py",
+      "files": 1,
+      "bytes": 32457
+    },
+    {
+      "source": "diagnose_charging_linear_response.py",
+      "destination": "tools\\diagnostics\\diagnose_charging_linear_response.py",
+      "files": 1,
+      "bytes": 7368
+    },
+    {
+      "source": "diagnose_endpoint_sigma.py",
+      "destination": "tools\\diagnostics\\diagnose_endpoint_sigma.py",
+      "files": 1,
+      "bytes": 32052
+    },
+    {
+      "source": "diagnose_estimator_matrix.py",
+      "destination": "tools\\diagnostics\\diagnose_estimator_matrix.py",
+      "files": 1,
+      "bytes": 24952
+    },
+    {
+      "source": "diagnose_pose_drift.py",
+      "destination": "tools\\diagnostics\\diagnose_pose_drift.py",
+      "files": 1,
+      "bytes": 6958
+    },
+    {
+      "source": "diagnose_solvent_box_scan.py",
+      "destination": "tools\\diagnostics\\diagnose_solvent_box_scan.py",
+      "files": 1,
+      "bytes": 9742
+    },
+    {
+      "source": "diagnose_split_half_convergence.py",
+      "destination": "tools\\diagnostics\\diagnose_split_half_convergence.py",
+      "files": 1,
+      "bytes": 13801
+    },
+    {
+      "source": "diagnose_window0_converged_gate.py",
+      "destination": "tools\\diagnostics\\diagnose_window0_converged_gate.py",
+      "files": 1,
+      "bytes": 6115
+    },
+    {
+      "source": "diagnose_window0_vdw_clash.py",
+      "destination": "tools\\diagnostics\\diagnose_window0_vdw_clash.py",
+      "files": 1,
+      "bytes": 17070
+    },
+    {
+      "source": "analyze_window0_real_tmbar_data.py",
+      "destination": "tools\\diagnostics\\analyze_window0_real_tmbar_data.py",
+      "files": 1,
+      "bytes": 5611
+    },
+    {
+      "source": "verify_boresch_anchor_convention.py",
+      "destination": "tools\\diagnostics\\verify_boresch_anchor_convention.py",
+      "files": 1,
+      "bytes": 7990
+    },
+    {
+      "source": "verify_vanishing_lambda_fix_offline.py",
+      "destination": "tools\\diagnostics\\verify_vanishing_lambda_fix_offline.py",
+      "files": 1,
+      "bytes": 2870
+    },
+    {
+      "source": "repair_stage2_tail_gap_local.py",
+      "destination": "tools\\repairs\\repair_stage2_tail_gap_local.py",
+      "files": 1,
+      "bytes": 9527
+    },
+    {
+      "source": "repair_stage2_window0_real_delta_f.py",
+      "destination": "tools\\repairs\\repair_stage2_window0_real_delta_f.py",
+      "files": 1,
+      "bytes": 10540
+    },
+    {
+      "source": "repair_stage2_window0_regroup.py",
+      "destination": "tools\\repairs\\repair_stage2_window0_regroup.py",
+      "files": 1,
+      "bytes": 4497
+    },
+    {
+      "source": "repair_stage2_window_partition.py",
+      "destination": "tools\\repairs\\repair_stage2_window_partition.py",
+      "files": 1,
+      "bytes": 6551
+    },
+    {
+      "source": "plot_alpha_beta_heatmap.py",
+      "destination": "tools\\plots\\plot_alpha_beta_heatmap.py",
+      "files": 1,
+      "bytes": 5188
+    },
+    {
+      "source": "plot_alpha_beta_ridge_scan.py",
+      "destination": "tools\\plots\\plot_alpha_beta_ridge_scan.py",
+      "files": 1,
+      "bytes": 4957
+    },
+    {
+      "source": "plot_dexp_vs_lj_vs_mace.py",
+      "destination": "tools\\plots\\plot_dexp_vs_lj_vs_mace.py",
+      "files": 1,
+      "bytes": 14448
+    },
+    {
+      "source": "plot_kernel_projection_benchmark.py",
+      "destination": "tools\\plots\\plot_kernel_projection_benchmark.py",
+      "files": 1,
+      "bytes": 7355
+    },
+    {
+      "source": "run_dexp_longmd.zsh",
+      "destination": "scripts\\experiments\\run_dexp_longmd.zsh",
+      "files": 1,
+      "bytes": 1914
+    },
+    {
+      "source": "run_dexp_relabel_10ns.zsh",
+      "destination": "scripts\\experiments\\run_dexp_relabel_10ns.zsh",
+      "files": 1,
+      "bytes": 2146
+    },
+    {
+      "source": "test.zsh",
+      "destination": "scripts\\pbs\\run_abfe_rank9_resume.pbs.zsh",
+      "files": 1,
+      "bytes": 535
+    },
+    {
+      "source": "test2.zsh",
+      "destination": "scripts\\pbs\\run_abfe_lrc_fix_reset.pbs.zsh",
+      "files": 1,
+      "bytes": 586
+    },
+    {
+      "source": "attachment_final.log",
+      "destination": "reports\\diagnostics\\attachment_final.log",
+      "files": 1,
+      "bytes": 6873
+    },
+    {
+      "source": "attachment_hremd.log",
+      "destination": "reports\\diagnostics\\attachment_hremd.log",
+      "files": 1,
+      "bytes": 9903
+    },
+    {
+      "source": "attachment_leg.log",
+      "destination": "reports\\diagnostics\\attachment_leg.log",
+      "files": 1,
+      "bytes": 9054
+    },
+    {
+      "source": "attachment_split_half.json",
+      "destination": "reports\\diagnostics\\attachment_split_half.json",
+      "files": 1,
+      "bytes": 1099
+    },
+    {
+      "source": "boresch_onoff.log",
+      "destination": "reports\\diagnostics\\boresch_onoff.log",
+      "files": 1,
+      "bytes": 4238
+    },
+    {
+      "source": "boresch_onoff_v2.log",
+      "destination": "reports\\diagnostics\\boresch_onoff_v2.log",
+      "files": 1,
+      "bytes": 4737
+    },
+    {
+      "source": "complex_split_half.json",
+      "destination": "reports\\diagnostics\\complex_split_half.json",
+      "files": 1,
+      "bytes": 2437
+    },
+    {
+      "source": "split_half_both.json",
+      "destination": "reports\\diagnostics\\split_half_both.json",
+      "files": 1,
+      "bytes": 7449
+    },
+    {
+      "source": "split_half_convergence.json",
+      "destination": "reports\\diagnostics\\split_half_convergence.json",
+      "files": 1,
+      "bytes": 3958
+    },
+    {
+      "source": "scan_pad1.5.log",
+      "destination": "reports\\diagnostics\\scan_pad1.5.log",
+      "files": 1,
+      "bytes": 100458
+    },
+    {
+      "source": "scan_pad2.4.log",
+      "destination": "reports\\diagnostics\\scan_pad2.4.log",
+      "files": 1,
+      "bytes": 111866
+    },
+    {
+      "source": "dexp_scan_test.csv",
+      "destination": "reports\\diagnostics\\dexp_scan_test.csv",
+      "files": 1,
+      "bytes": 536
+    },
+    {
+      "source": "dexp_vs_lj_vs_mace.png",
+      "destination": "reports\\diagnostics\\dexp_vs_lj_vs_mace.png",
+      "files": 1,
+      "bytes": 348193
+    },
+    {
+      "source": "kernel_projection_benchmark_core_figure.png",
+      "destination": "reports\\diagnostics\\kernel_projection_benchmark_core_figure.png",
+      "files": 1,
+      "bytes": 201089
+    },
+    {
+      "source": "boresch_attachment_remd",
+      "destination": "reports\\diagnostics\\boresch_attachment_remd",
+      "files": 5,
+      "bytes": 1990
+    },
+    {
+      "source": "boresch_ensemble_effect",
+      "destination": "reports\\diagnostics\\boresch_ensemble_effect",
+      "files": 2,
+      "bytes": 6397
+    },
+    {
+      "source": "boresch_onoff_v2",
+      "destination": "reports\\diagnostics\\boresch_onoff_v2",
+      "files": 2,
+      "bytes": 8226
+    },
+    {
+      "source": "solvent_box_scan",
+      "destination": "reports\\diagnostics\\solvent_box_scan",
+      "files": 154,
+      "bytes": 427665191
+    },
+    {
+      "source": "diagnostics",
+      "destination": "reports\\diagnostics\\legacy",
+      "files": 4,
+      "bytes": 140487
+    },
+    {
+      "source": "存档.md",
+      "destination": "reports\\project\\存档.md",
+      "files": 1,
+      "bytes": 11172
+    },
+    {
+      "source": "todo0728.txt",
+      "destination": "reports\\project\\todo0728.txt",
+      "files": 1,
+      "bytes": 3776
+    },
+    {
+      "source": "todo2.txt",
+      "destination": "reports\\project\\todo2.txt",
+      "files": 1,
+      "bytes": 356
+    },
+    {
+      "source": "新建文本文档.txt",
+      "destination": "archive\\project_notes\\新建文本文档.txt",
+      "files": 1,
+      "bytes": 239
+    },
+    {
+      "source": "abfe_pipeline.py.pre_warmup_overlap_patch",
+      "destination": "archive\\patches\\abfe_pipeline.py.pre_warmup_overlap_patch",
+      "files": 1,
+      "bytes": 228319
+    },
+    {
+      "source": "abfe_preoptimizer.py.pre_warmup_overlap_patch",
+      "destination": "archive\\patches\\abfe_preoptimizer.py.pre_warmup_overlap_patch",
+      "files": 1,
+      "bytes": 77468
+    },
+    {
+      "source": "ibs_engine.py.pre_resume_gate_extraction",
+      "destination": "archive\\patches\\ibs_engine.py.pre_resume_gate_extraction",
+      "files": 1,
+      "bytes": 710909
+    },
+    {
+      "source": "ibs_engine.py.pre_warmup_overlap_patch",
+      "destination": "archive\\patches\\ibs_engine.py.pre_warmup_overlap_patch",
+      "files": 1,
+      "bytes": 299285
+    },
+    {
+      "source": "test_audit_protocol_regressions.py.pre_resume_gate_extraction",
+      "destination": "archive\\patches\\test_audit_protocol_regressions.py.pre_resume_gate_extraction",
+      "files": 1,
+      "bytes": 47935
+    },
+    {
+      "source": "dexp_experiment.py.bak",
+      "destination": "archive\\patches\\dexp_experiment.py.bak",
+      "files": 1,
+      "bytes": 109351
+    },
+    {
+      "source": "dexp_experiment1 - 副本.py",
+      "destination": "archive\\patches\\dexp_experiment1 - 副本.py",
+      "files": 1,
+      "bytes": 167471
+    },
+    {
+      "source": "proposed_audit_remaining_fixes_current.diff",
+      "destination": "archive\\patches\\proposed_audit_remaining_fixes_current.diff",
+      "files": 1,
+      "bytes": 52374
+    },
+    {
+      "source": "proposed_audit_remaining_fixes_v1.diff",
+      "destination": "archive\\patches\\proposed_audit_remaining_fixes_v1.diff",
+      "files": 1,
+      "bytes": 49512
+    },
+    {
+      "source": "proposed_audit_remaining_fixes_v2.diff",
+      "destination": "archive\\patches\\proposed_audit_remaining_fixes_v2.diff",
+      "files": 1,
+      "bytes": 52374
+    },
+    {
+      "source": "proposed_non_mutating_resume_fail_closed_v1.diff",
+      "destination": "archive\\patches\\proposed_non_mutating_resume_fail_closed_v1.diff",
+      "files": 1,
+      "bytes": 11496
+    },
+    {
+      "source": "proposed_thermodynamic_path_bigfix_v1.diff",
+      "destination": "archive\\patches\\proposed_thermodynamic_path_bigfix_v1.diff",
+      "files": 1,
+      "bytes": 51625
+    },
+    {
+      "source": "proposed_warmup_fixed_overlap_v2.diff",
+      "destination": "archive\\patches\\proposed_warmup_fixed_overlap_v2.diff",
+      "files": 1,
+      "bytes": 40820
+    },
+    {
+      "source": "1.diff.txt",
+      "destination": "archive\\patches\\1.diff.txt",
+      "files": 1,
+      "bytes": 10357
+    },
+    {
+      "source": "#topol.top.1#",
+      "destination": "archive\\patches\\#topol.top.1#",
+      "files": 1,
+      "bytes": 1263928
+    },
+    {
+      "source": "#topol.top.2#",
+      "destination": "archive\\patches\\#topol.top.2#",
+      "files": 1,
+      "bytes": 1263959
+    },
+    {
+      "source": "abfe_core.check.pyc",
+      "destination": "archive\\generated\\abfe_core.check.pyc",
+      "files": 1,
+      "bytes": 185887
+    },
+    {
+      "source": "dexp_experiment.check.pyc",
+      "destination": "archive\\generated\\dexp_experiment.check.pyc",
+      "files": 1,
+      "bytes": 55353
+    },
+    {
+      "source": ".pycache_check",
+      "destination": "archive\\generated\\.pycache_check",
+      "files": 39,
+      "bytes": 1020642
+    },
+    {
+      "source": ".rocklin_review_check",
+      "destination": "archive\\test_runs\\.rocklin_review_check",
+      "files": 0,
+      "bytes": 0
+    },
+    {
+      "source": ".rocklin_smoke",
+      "destination": "archive\\test_runs\\.rocklin_smoke",
+      "files": 0,
+      "bytes": 0
+    },
+    {
+      "source": "rocklin_smoke_test",
+      "destination": "archive\\test_runs\\rocklin_smoke_test",
+      "files": 0,
+      "bytes": 0
+    },
+    {
+      "source": "a-relative-binding-free-energy-framework-for-structurally-dissimilar-molecules.MD",
+      "destination": "references\\papers\\a-relative-binding-free-energy-framework-for-structurally-dissimilar-molecules_extracted",
+      "files": 32,
+      "bytes": 8134474
+    },
+    {
+      "source": "a-relative-binding-free-energy-framework-for-structurally-dissimilar-molecules.md",
+      "destination": "references\\papers\\a-relative-binding-free-energy-framework-for-structurally-dissimilar-molecules.md",
+      "files": 1,
+      "bytes": 66919
+    },
+    {
+      "source": "a-relative-binding-free-energy-framework-for-structurally-dissimilar-molecules.pdf",
+      "destination": "references\\papers\\a-relative-binding-free-energy-framework-for-structurally-dissimilar-molecules.pdf",
+      "files": 1,
+      "bytes": 2881742
+    },
+    {
+      "source": "a-relative-binding-free-energy-framework-for-structurally-dissimilar-molecules_content_list.json",
+      "destination": "references\\papers\\a-relative-binding-free-energy-framework-for-structurally-dissimilar-molecules_content_list.json",
+      "files": 1,
+      "bytes": 110437
+    },
+    {
+      "source": "a-relative-binding-free-energy-framework-for-structurally-dissimilar-molecules_content_list_v2.json",
+      "destination": "references\\papers\\a-relative-binding-free-energy-framework-for-structurally-dissimilar-molecules_content_list_v2.json",
+      "files": 1,
+      "bytes": 193213
+    },
+    {
+      "source": "a-relative-binding-free-energy-framework-for-structurally-dissimilar-molecules_model.json",
+      "destination": "references\\papers\\a-relative-binding-free-energy-framework-for-structurally-dissimilar-molecules_model.json",
+      "files": 1,
+      "bytes": 365936
+    },
+    {
+      "source": "integrated-boltzmann-sampling",
+      "destination": "references\\papers\\integrated-boltzmann-sampling",
+      "files": 62,
+      "bytes": 15482856
+    },
+    {
+      "source": "integrated-boltzmann-sampling.md",
+      "destination": "references\\papers\\integrated-boltzmann-sampling.md",
+      "files": 1,
+      "bytes": 74037
+    },
+    {
+      "source": "integrated-boltzmann-sampling.pdf",
+      "destination": "references\\papers\\integrated-boltzmann-sampling.pdf",
+      "files": 1,
+      "bytes": 5825471
+    },
+    {
+      "source": "integrated-boltzmann-sampling_content_list.json",
+      "destination": "references\\papers\\integrated-boltzmann-sampling_content_list.json",
+      "files": 1,
+      "bytes": 130234
+    },
+    {
+      "source": "integrated-boltzmann-sampling_content_list_v2.json",
+      "destination": "references\\papers\\integrated-boltzmann-sampling_content_list_v2.json",
+      "files": 1,
+      "bytes": 249275
+    },
+    {
+      "source": "gromacs_reference",
+      "destination": "references\\gromacs\\gromacs_reference",
+      "files": 61,
+      "bytes": 318797
+    }
+  ],
+  "edited": [
+    "pytest.ini",
+    "tests\\conftest.py",
+    "tests\\run_offline_tests.sh",
+    "tests\\smoke_test_dexp_baseline.py",
+    "tests\\test_att27_dead_code_removed.py",
+    "tests\\test_audit_protocol_regressions.py",
+    "tests\\test_boresch_anchor_and_pbc_fixes.py",
+    "tests\\test_charging_estimator_protocol.py",
+    "tests\\test_charging_only_mode.py",
+    "tests\\test_import_time_side_effects.py",
+    "tests\\test_input_file_fail_closed.py",
+    "tests\\test_lrc_reporting_honesty.py",
+    "tests\\test_remd_gpu_context_budget.py",
+    "tests\\test_resume_reuse_contracts.py",
+    "tests\\test_stage_diagnostics_persistence.py",
+    "tests\\test_thermodynamic_cycle.py",
+    "tools\\diagnostics\\analyze_window0_real_tmbar_data.py",
+    "tools\\diagnostics\\diagnose_boresch_ensemble_effect.py",
+    "tools\\diagnostics\\diagnose_charging_annihilation_reweight.py",
+    "tools\\diagnostics\\diagnose_charging_linear_response.py",
+    "tools\\diagnostics\\diagnose_endpoint_sigma.py",
+    "tools\\diagnostics\\diagnose_estimator_matrix.py",
+    "tools\\diagnostics\\diagnose_pose_drift.py",
+    "tools\\diagnostics\\diagnose_solvent_box_scan.py",
+    "tools\\diagnostics\\diagnose_split_half_convergence.py",
+    "tools\\diagnostics\\diagnose_window0_converged_gate.py",
+    "tools\\diagnostics\\diagnose_window0_vdw_clash.py",
+    "tools\\diagnostics\\verify_boresch_anchor_convention.py",
+    "tools\\diagnostics\\verify_vanishing_lambda_fix_offline.py",
+    "tools\\plots\\plot_alpha_beta_heatmap.py",
+    "tools\\plots\\plot_alpha_beta_ridge_scan.py",
+    "tools\\plots\\plot_dexp_vs_lj_vs_mace.py",
+    "tools\\plots\\plot_kernel_projection_benchmark.py",
+    "tools\\repairs\\repair_stage2_tail_gap_local.py",
+    "tools\\repairs\\repair_stage2_window0_real_delta_f.py",
+    "tools\\repairs\\repair_stage2_window0_regroup.py",
+    "tools\\repairs\\repair_stage2_window_partition.py"
+  ],
+  "written": [
+    "PROJECT_LAYOUT.md",
+    "tests\\README.md",
+    "tools\\README.md",
+    "reports\\README.md",
+    "archive\\README.md",
+    "scripts\\README.md",
+    "references\\README.md",
+    ".gitignore"
+  ],
+  "deleted_regenerable_items": [
+    {
+      "path": "__pycache__",
+      "files": 83,
+      "bytes": 7669366
+    },
+    {
+      "path": ".pytest_cache",
+      "files": 5,
+      "bytes": 48273
+    }
+  ],
+  "syntax_validated": [
+    "tests\\conftest.py",
+    "tests\\smoke_test_dexp_baseline.py",
+    "tests\\test_att27_dead_code_removed.py",
+    "tests\\test_audit_protocol_regressions.py",
+    "tests\\test_boresch_anchor_and_pbc_fixes.py",
+    "tests\\test_boresch_attachment_leg.py",
+    "tests\\test_boresch_committed_gate.py",
+    "tests\\test_boresch_dihedral_convention.py",
+    "tests\\test_charging_estimator_protocol.py",
+    "tests\\test_charging_only_mode.py",
+    "tests\\test_core_physics_numerics.py",
+    "tests\\test_dexp_new_production.py",
+    "tests\\test_import_time_side_effects.py",
+    "tests\\test_input_file_fail_closed.py",
+    "tests\\test_lrc_interaction_group_compat.py",
+    "tests\\test_lrc_reporting_honesty.py",
+    "tests\\test_non_mutating_policy.py",
+    "tests\\test_remd_gpu_context_budget.py",
+    "tests\\test_resume_reuse_contracts.py",
+    "tests\\test_stage_coverage_fail_closed.py",
+    "tests\\test_stage_diagnostics_persistence.py",
+    "tests\\test_thermodynamic_cycle.py",
+    "tests\\test_todo_verified_fixes.py",
+    "tests\\test_warmup_overlap_protocol.py",
+    "tools\\diagnostics\\analyze_window0_real_tmbar_data.py",
+    "tools\\diagnostics\\diagnose_boresch_ensemble_effect.py",
+    "tools\\diagnostics\\diagnose_charging_annihilation_reweight.py",
+    "tools\\diagnostics\\diagnose_charging_linear_response.py",
+    "tools\\diagnostics\\diagnose_endpoint_sigma.py",
+    "tools\\diagnostics\\diagnose_estimator_matrix.py",
+    "tools\\diagnostics\\diagnose_pose_drift.py",
+    "tools\\diagnostics\\diagnose_solvent_box_scan.py",
+    "tools\\diagnostics\\diagnose_split_half_convergence.py",
+    "tools\\diagnostics\\diagnose_window0_converged_gate.py",
+    "tools\\diagnostics\\diagnose_window0_vdw_clash.py",
+    "tools\\diagnostics\\verify_boresch_anchor_convention.py",
+    "tools\\diagnostics\\verify_vanishing_lambda_fix_offline.py",
+    "tools\\plots\\plot_alpha_beta_heatmap.py",
+    "tools\\plots\\plot_alpha_beta_ridge_scan.py",
+    "tools\\plots\\plot_dexp_vs_lj_vs_mace.py",
+    "tools\\plots\\plot_kernel_projection_benchmark.py",
+    "tools\\repairs\\repair_stage2_tail_gap_local.py",
+    "tools\\repairs\\repair_stage2_window0_real_delta_f.py",
+    "tools\\repairs\\repair_stage2_window0_regroup.py",
+    "tools\\repairs\\repair_stage2_window_partition.py"
+  ]
+}

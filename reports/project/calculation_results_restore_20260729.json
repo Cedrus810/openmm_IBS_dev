@@ -1,0 +1,85 @@
+{
+  "reason": "Calculation inputs and results are outside the approved code/docs/tests cleanup scope.",
+  "restored": [
+    {
+      "restored_from": "reports\\diagnostics\\attachment_final.log",
+      "restored_to": "attachment_final.log"
+    },
+    {
+      "restored_from": "reports\\diagnostics\\attachment_hremd.log",
+      "restored_to": "attachment_hremd.log"
+    },
+    {
+      "restored_from": "reports\\diagnostics\\attachment_leg.log",
+      "restored_to": "attachment_leg.log"
+    },
+    {
+      "restored_from": "reports\\diagnostics\\attachment_split_half.json",
+      "restored_to": "attachment_split_half.json"
+    },
+    {
+      "restored_from": "reports\\diagnostics\\boresch_onoff.log",
+      "restored_to": "boresch_onoff.log"
+    },
+    {
+      "restored_from": "reports\\diagnostics\\boresch_onoff_v2.log",
+      "restored_to": "boresch_onoff_v2.log"
+    },
+    {
+      "restored_from": "reports\\diagnostics\\complex_split_half.json",
+      "restored_to": "complex_split_half.json"
+    },
+    {
+      "restored_from": "reports\\diagnostics\\split_half_both.json",
+      "restored_to": "split_half_both.json"
+    },
+    {
+      "restored_from": "reports\\diagnostics\\split_half_convergence.json",
+      "restored_to": "split_half_convergence.json"
+    },
+    {
+      "restored_from": "reports\\diagnostics\\scan_pad1.5.log",
+      "restored_to": "scan_pad1.5.log"
+    },
+    {
+      "restored_from": "reports\\diagnostics\\scan_pad2.4.log",
+      "restored_to": "scan_pad2.4.log"
+    },
+    {
+      "restored_from": "reports\\diagnostics\\dexp_scan_test.csv",
+      "restored_to": "dexp_scan_test.csv"
+    },
+    {
+      "restored_from": "reports\\diagnostics\\dexp_vs_lj_vs_mace.png",
+      "restored_to": "dexp_vs_lj_vs_mace.png"
+    },
+    {
+      "restored_from": "reports\\diagnostics\\kernel_projection_benchmark_core_figure.png",
+      "restored_to": "kernel_projection_benchmark_core_figure.png"
+    },
+    {
+      "restored_from": "reports\\diagnostics\\boresch_attachment_remd",
+      "restored_to": "boresch_attachment_remd"
+    },
+    {
+      "restored_from": "reports\\diagnostics\\boresch_ensemble_effect",
+      "restored_to": "boresch_ensemble_effect"
+    },
+    {
+      "restored_from": "reports\\diagnostics\\boresch_onoff_v2",
+      "restored_to": "boresch_onoff_v2"
+    },
+    {
+      "restored_from": "reports\\diagnostics\\solvent_box_scan",
+      "restored_to": "solvent_box_scan"
+    },
+    {
+      "restored_from": "reports\\diagnostics\\legacy",
+      "restored_to": "diagnostics"
+    },
+    {
+      "restored_from": "references\\gromacs\\gromacs_reference",
+      "restored_to": "gromacs_reference"
+    }
+  ]
+}

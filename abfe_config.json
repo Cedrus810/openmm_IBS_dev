@@ -14,7 +14,7 @@
   "membrane": null,
   "confirm_soluble_with_lipids": false,
 
-  "_comment_charge_treatment": "净电荷处理路线（memtodolist.md §1.2，B2）。null = 按配体净电荷推导：中性 → \"neutral\"（当前 Atenolol 生产路径，行为不变），带电 → \"co_alchemical_charge_transfer\"。允许值：neutral / co_alchemical_charge_transfer / rocklin_apbs_neutralizing_plasma / co_annihilation_experimental。co-ion 路线与 Rocklin/APBS 是**二选一**，同时用即重复修正、fail closed。⚠️ 带电配体的行为已改变：改动前会静默走 co-annihilation 跑完，现在必须显式声明 co_annihilation_experimental，且该路线只作方法对照、膜体系禁用、数值不得进入 ΔG_bind 汇总（MEM-00a-2/00a-4）。co_alchemical_charge_transfer 的 charging Hamiltonian 属 Phase B3，尚未实现，声明它会 fail closed 而不是静默走别的哈密顿量。",
+  "_comment_charge_treatment": "净电荷处理路线（memtodolist.md §1.2，B2）。null = 按配体净电荷推导：中性 → \"neutral\"（当前 Atenolol 路径，行为不变），带电 → \"co_alchemical_charge_transfer\"。允许值：neutral / co_alchemical_charge_transfer / rocklin_apbs_neutralizing_plasma / co_annihilation_experimental。co-ion 路线与 Rocklin/APBS 二选一，同时用即重复修正、fail closed。charge-transfer Hamiltonian、溶剂腿 builder 与 Stage2 handoff 已实现并通过 C1–C3/MEM-00h；但 C4/C5 尚未完成，因此带电膜路线仍是 experimental，所有结果必须 production_qualified=false。co_annihilation_experimental 只作方法对照、膜体系禁用。",
   "charge_treatment": null,
   "co_alchemical_ion": null,
   "apbs_evidence": null,

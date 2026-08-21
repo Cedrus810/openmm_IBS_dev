@@ -1,0 +1,22 @@
+{
+  "moved_code": {
+    "from": "tmp/diagnose_ess.py",
+    "to": "tools/diagnostics/diagnose_ess.py"
+  },
+  "moved_reference_docs": {
+    "from": "tmp/pdfs",
+    "to": "references/papers/ibs_paper_pages"
+  },
+  "deleted_regenerable_caches": [
+    {
+      "path": "tmp\\codex_pycache",
+      "files": 39,
+      "bytes": 1055391
+    },
+    {
+      "path": "tmp\\pycache_v14",
+      "files": 26,
+      "bytes": 853931
+    }
+  ]
+}

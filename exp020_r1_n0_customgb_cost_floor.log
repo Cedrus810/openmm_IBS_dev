@@ -1,0 +1,12 @@
+{"cutoff_angstrom": 5.0, "mode": "N0_FULL_SYSTEM_CUSTOMGB_COST_FLOOR", "platform": "CUDA", "stage": "start", "system_xml": "/home/ruigengji/ABFE_IBS/Atenolol-rank11/output/system_native.xml"}
+[N0] loaded 73536 atoms; logical unordered pairs=2703734880
+[N0] repeat 1/3: building baseline context
+[N0] repeat 1/3: building candidate context
+[N0] repeat 1: baseline=0.3171 ms/step candidate=0.5349 ms/step ratio=1.6867
+[N0] repeat 2/3: building baseline context
+[N0] repeat 2/3: building candidate context
+[N0] repeat 2: baseline=0.3161 ms/step candidate=0.5362 ms/step ratio=1.6965
+[N0] repeat 3/3: building baseline context
+[N0] repeat 3/3: building candidate context
+[N0] repeat 3: baseline=0.3155 ms/step candidate=0.5367 ms/step ratio=1.7010
+{"conclusion": "STOP_FULL_SYSTEM_CUSTOMGB", "ratio": 1.6964625957376656, "report": "/home/ruigengji/ABFE_IBS/Atenolol-rank11/output/outer_lambda_exp020_softlift_seedfixed001/d3/r1_native_n0_cost_floor_report.json", "status": "COMPLETED_N0_COST_FLOOR"}

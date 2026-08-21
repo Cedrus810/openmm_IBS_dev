@@ -1,0 +1,5 @@
+[N1/N2] loaded frame=0 atoms=73536 ligand_atoms=41
+[N1/N2] candidate pool edges=2575 max_per_anchor=82
+Warning: importing 'simtk.openmm' is deprecated.  Import 'openmm' instead.
+[N1/N2] starting optional baseline cost gates
+{"n1": "PARITY_QUALIFIED", "n2": "PARITY_QUALIFIED", "report": "/home/ruigengji/ABFE_IBS/Atenolol-rank11/output/outer_lambda_exp020_softlift_seedfixed001/d3/r1_n1_n2_local_report.json", "status": "COMPLETED_R1_N1_N2_LOCAL_PROTOTYPE_CHECK"}

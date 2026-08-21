@@ -1941,12 +1941,12 @@ def run_boresch_attachment_leg(
 
     _n_dof = 3 * work.getNumParticles() - work.getNumConstraints()
 
-    def _monitor_row(cumulative_step, k_index, lam_value, phase):
+    def _monitor_row(cumulative_step, k_index, lam_value, phase, simulation_obj=simulation):
         """写一行监控。**崩之前的最后几行就是唯一的现场证据。**"""
         if _monitor is None:
             return
         try:
-            st = simulation.context.getState(getEnergy=True, getForces=True)
+            st = simulation_obj.context.getState(getEnergy=True, getForces=True)
             pe = st.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
             ke = st.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole)
             temp = 2.0 * ke / (_n_dof * 0.008314462618) if _n_dof > 0 else float("nan")
@@ -1956,7 +1956,7 @@ def run_boresch_attachment_leg(
                 axis=1,
             )
             worst = int(np.argmax(fmag)) if fmag.size else -1
-            ub = simulation.context.getState(
+            ub = simulation_obj.context.getState(
                 getEnergy=True, groups={BORESCH_ATTACHMENT_FORCE_GROUP}
             ).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
             _monitor.write(
@@ -2048,8 +2048,6 @@ def run_boresch_attachment_leg(
             _monitor.close()
         except Exception:  # noqa: BLE001
             pass
-
-    del simulation, integrator
 
     n_k = np.full(K, n_samples, dtype=int)
     u_kn = np.zeros((K, K * n_samples), dtype=np.float64)

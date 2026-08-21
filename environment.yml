@@ -15,7 +15,7 @@ dependencies:
   - libcudnn=9.1
   - nccl[version='>=2.20']
   - openmm-ml
-  - pymbar-core
+  - pymbar-core=4.2.0
   - openmm
   - pdbfixer
 prefix: /home/canna/miniforge3/envs/openmm_dev

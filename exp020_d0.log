@@ -1,0 +1,12 @@
+Traceback (most recent call last):
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/scripts/run_exp019_softlift_d0.py", line 151, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/scripts/run_exp019_softlift_d0.py", line 131, in main
+    report = build_dataset_v1(
+             ^^^^^^^^^^^^^^^^^
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/local_residual/softlift_dataset.py", line 599, in build_dataset_v1
+    _atomic_write_npz(output_path, arrays)
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/local_residual/softlift_dataset.py", line 35, in _atomic_write_npz
+    raise SoftLiftDatasetError(f"refusing to overwrite existing dataset: {path}")
+local_residual.softlift_dataset.SoftLiftDatasetError: refusing to overwrite existing dataset: /home/ruigengji/ABFE_IBS/Atenolol-rank11/output/outer_lambda_exp020_softlift/dataset/softlift_dataset_v1.npz
