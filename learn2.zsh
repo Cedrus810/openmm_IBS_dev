@@ -1,6 +1,6 @@
 #!/bin/zsh
 #PBS -q default
-#PBS -l select=1:ncpus=16:ngpus=1:mem=50gb:host=yayoi42
+#PBS -l select=1:ncpus=32:ngpus=1:mem=50gb:host=yayoi37
 #PBS -l walltime=72:00:00
 #PBS -j oe
 #PBS -N training
@@ -13,6 +13,5 @@ export MAMBA_EXE=/home/ruigengji/miniforge3/bin/mamba
 export MAMBA_ROOT_PREFIX=/home/ruigengji/miniforge3
 source /home/ruigengji/miniforge3/etc/profile.d/mamba.sh
 mamba activate openmm_dev
-cd /home/ruigengji/ABFE_IBS/Atenolol-rank11
 
-bash ./scripts/exp030_run_node3_repeat3.sh
+bash scripts/exp030_run_extended_B_window2.sh

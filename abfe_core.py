@@ -422,6 +422,54 @@ def detect_barostats(system) -> List[Tuple[int, str]]:
     return found
 
 
+def _barostat_actual_parameters(force, class_name: str) -> Dict[str, Any]:
+    """Read the parameters that OpenMM will actually use for a barostat."""
+    actual = {
+        "pressure_bar": float(force.getDefaultPressure().value_in_unit(unit.bar)),
+        "temperature_K": float(
+            force.getDefaultTemperature().value_in_unit(unit.kelvin)
+        ),
+        "frequency": int(force.getFrequency()),
+    }
+    if class_name == "MonteCarloMembraneBarostat":
+        actual.update(
+            {
+                "surface_tension_bar_nm": float(
+                    force.getDefaultSurfaceTension().value_in_unit(
+                        unit.bar * unit.nanometer
+                    )
+                ),
+                "xy_mode": force.getXYMode(),
+                "z_mode": force.getZMode(),
+            }
+        )
+    return actual
+
+
+def _barostat_parameters_match(
+    actual: Dict[str, Any], expected: Dict[str, Any]
+) -> Tuple[bool, List[str]]:
+    mismatches: List[str] = []
+    for key in ("pressure_bar", "temperature_K"):
+        if not math.isclose(
+            float(actual[key]), float(expected[key]), rel_tol=1.0e-10, abs_tol=1.0e-8
+        ):
+            mismatches.append(f"{key}: actual={actual[key]!r}, expected={expected[key]!r}")
+    if int(actual["frequency"]) != int(expected["frequency"]):
+        mismatches.append(
+            f"frequency: actual={actual['frequency']!r}, expected={expected['frequency']!r}"
+        )
+    for key in ("surface_tension_bar_nm",):
+        if key in expected and not math.isclose(
+            float(actual[key]), float(expected[key]), rel_tol=1.0e-10, abs_tol=1.0e-8
+        ):
+            mismatches.append(f"{key}: actual={actual[key]!r}, expected={expected[key]!r}")
+    for key in ("xy_mode", "z_mode"):
+        if key in expected and actual[key] != expected[key]:
+            mismatches.append(f"{key}: actual={actual[key]!r}, expected={expected[key]!r}")
+    return not mismatches, mismatches
+
+
 def ensure_barostat_for_protocol(
     system,
     protocol: Dict[str, Any],
@@ -449,6 +497,20 @@ def ensure_barostat_for_protocol(
     )
 
     expected_class = protocol["barostat_class"]
+    expected_parameters: Dict[str, Any] = {
+        "pressure_bar": pressure_bar,
+        "temperature_K": temperature_k,
+        "frequency": int(protocol["barostat_frequency"]),
+    }
+    if expected_class == "MonteCarloMembraneBarostat":
+        membrane = protocol["membrane"]
+        expected_parameters.update(
+            {
+                "surface_tension_bar_nm": float(membrane["surface_tension_bar_nm"]),
+                "xy_mode": _openmm_membrane_xy_mode(membrane["xy_mode"]),
+                "z_mode": _openmm_membrane_z_mode(membrane["z_mode"]),
+            }
+        )
     existing = detect_barostats(system)
 
     if len(existing) > 1:
@@ -466,11 +528,22 @@ def ensure_barostat_for_protocol(
                 "按 memtodolist §3.2 这里 fail closed，而不是再叠加一个——"
                 "叠加会让两个 barostat 同时做体积移动，集合定义错误且不报错。"
             )
+        force = system.getForce(int(existing[0][0]))
+        actual_parameters = _barostat_actual_parameters(force, existing_class)
+        matches, mismatches = _barostat_parameters_match(
+            actual_parameters, expected_parameters
+        )
+        if not matches:
+            raise RuntimeError(
+                f"输入 System 已带同类 {existing_class}，但实际参数与当前协议不一致；"
+                "拒绝把旧参数静默认证为新协议。差异：" + "; ".join(mismatches)
+            )
         return {
             "action": "reused_existing",
             "barostat_class": existing_class,
             "force_index": int(existing[0][0]),
             "protocol": protocol,
+            "actual_parameters": actual_parameters,
         }
 
     if expected_class == "MonteCarloBarostat":
@@ -493,11 +566,13 @@ def ensure_barostat_for_protocol(
         raise RuntimeError(f"未知 barostat_class={expected_class!r}")
 
     force_index = system.addForce(force)
+    actual_parameters = _barostat_actual_parameters(force, expected_class)
     return {
         "action": "added",
         "barostat_class": expected_class,
         "force_index": int(force_index),
         "protocol": protocol,
+        "actual_parameters": actual_parameters,
     }
 
 
@@ -589,6 +664,224 @@ CHARGE_TRANSFER_PRODUCTION_QUALIFICATION_PROTOCOL_VERSION = 1
 CHARGE_TRANSFER_C4_PASSED = False
 CHARGE_TRANSFER_C5_PASSED = False
 
+# A restrained charge carrier is not a free reservoir particle.  The release
+# free energy must therefore be measured in each leg and carried explicitly
+# into the final cycle.  This schema is intentionally separate from the
+# Hamiltonian identity: changing a correction artifact must invalidate the
+# result even when the underlying PME system is unchanged.
+CHARGE_TRANSFER_RESERVOIR_CORRECTION_PROTOCOL_VERSION = 1
+CHARGE_TRANSFER_RESERVOIR_CLOSURE_TOLERANCE_KJ_MOL = 1.0
+CHARGE_TRANSFER_RESERVOIR_REQUIRED_LEG_FIELDS = (
+    "delta_G_release_kJ_mol",
+    "error_kJ_mol",
+    "converged",
+    "restraint_protocol_version",
+    "box_model",
+)
+
+
+def validate_charge_transfer_reservoir_correction(
+    correction: Any,
+    *,
+    temperature_k: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Validate an externally measured co-ion restraint-release correction.
+
+    Charge transfer with a tethered carrier is only a closed cycle after the
+    restrained decoupled endpoint is released in *both* legs.  This helper is
+    deliberately evidence-driven: it accepts no bare scalar and does not
+    infer cancellation from matching force constants.  ``complex`` and
+    ``solvent`` contain the measured ``G_free - G_restrained`` release terms;
+    the net contribution to ``ΔG_bind`` is solvent minus complex.
+
+    The top-level ``temperature_K`` binds the correction to the sampled kT;
+    the pipeline rejects a mismatch.  The ``validation`` block is the
+    machine-readable C4/C5 evidence contract.
+    It must include at least one independent residual/box/anchor/force scan,
+    explicit sample counts, and a non-empty evidence reference.  Numerical
+    residuals are checked against the declared tolerance, so a payload cannot
+    claim closure merely by setting a boolean flag.
+    """
+    if not isinstance(correction, dict):
+        raise ValueError(
+            "charge-transfer reservoir correction 必须是 JSON object，不能是一个裸数"
+        )
+    def _strict_int(value: Any, field: str) -> int:
+        if isinstance(value, bool):
+            raise ValueError(f"reservoir correction {field} 必须是整数，不能是 bool")
+        try:
+            integer = int(value)
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"reservoir correction {field} 必须是整数") from exc
+        if not math.isfinite(numeric) or numeric != integer:
+            raise ValueError(f"reservoir correction {field} 必须是整数")
+        return integer
+
+    protocol_version = correction.get("protocol_version")
+    if _strict_int(protocol_version, "protocol_version") != CHARGE_TRANSFER_RESERVOIR_CORRECTION_PROTOCOL_VERSION:
+        raise ValueError(
+            "charge-transfer reservoir correction protocol_version 不匹配："
+            f"期望 {CHARGE_TRANSFER_RESERVOIR_CORRECTION_PROTOCOL_VERSION}，"
+            f"收到 {protocol_version!r}"
+        )
+    if str(correction.get("charge_treatment", "")).strip().lower() != (
+        CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER
+    ):
+        raise ValueError(
+            "reservoir correction 只能用于 co_alchemical_charge_transfer，"
+            f"收到 {correction.get('charge_treatment')!r}"
+        )
+    if correction.get("box_model") != CO_ALCHEMICAL_ION_RESTRAINT_BOX_MODEL:
+        raise ValueError(
+            "reservoir correction 的 box_model 必须与当前 co-ion restraint 一致："
+            f"{CO_ALCHEMICAL_ION_RESTRAINT_BOX_MODEL!r}"
+        )
+    # Reservoir-release free energies are temperature-dependent.  A correction
+    # without a declared temperature cannot be compared with the pipeline's
+    # kT and is therefore never admissible.  Keep the JSON spelling explicit
+    # (``temperature_K``) so a lower-case typo cannot silently bypass this gate.
+    if "temperature_K" not in correction:
+        raise ValueError("reservoir correction 缺少必需的 temperature_K")
+    try:
+        declared_temp = float(correction["temperature_K"])
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("reservoir correction temperature_K 必须是正有限数") from exc
+    if not math.isfinite(declared_temp) or declared_temp <= 0.0:
+        raise ValueError("reservoir correction temperature_K 必须是正有限数")
+    if temperature_k is not None:
+        try:
+            temp = float(temperature_k)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("temperature_k 必须是正有限数") from exc
+        if not math.isfinite(temp) or temp <= 0.0:
+            raise ValueError("temperature_k 必须是正有限数")
+        if not math.isclose(declared_temp, temp, rel_tol=1.0e-6, abs_tol=1.0e-6):
+            raise ValueError(
+                "reservoir correction temperature_K 与当前 pipeline 温度不一致："
+                f"correction={declared_temp:g} K, pipeline={temp:g} K"
+            )
+
+    normalized: Dict[str, Any] = {
+        "protocol_version": CHARGE_TRANSFER_RESERVOIR_CORRECTION_PROTOCOL_VERSION,
+        "charge_treatment": CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER,
+        "box_model": CO_ALCHEMICAL_ION_RESTRAINT_BOX_MODEL,
+        "temperature_K": declared_temp,
+    }
+    for leg_name in ("complex", "solvent"):
+        leg = correction.get(leg_name)
+        if not isinstance(leg, dict):
+            raise ValueError(
+                f"reservoir correction 缺少 {leg_name} leg 的完整测量对象"
+            )
+        missing = [field for field in CHARGE_TRANSFER_RESERVOIR_REQUIRED_LEG_FIELDS if field not in leg]
+        if missing:
+            raise ValueError(f"reservoir correction {leg_name} 缺少字段 {missing}")
+        try:
+            dg = float(leg["delta_G_release_kJ_mol"])
+            err = float(leg["error_kJ_mol"])
+            restraint_version = _strict_int(
+                leg["restraint_protocol_version"],
+                f"{leg_name}.restraint_protocol_version",
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"reservoir correction {leg_name} 数值字段非法") from exc
+        if not math.isfinite(dg) or not math.isfinite(err) or err < 0.0:
+            raise ValueError(
+                f"reservoir correction {leg_name} 的 ΔG/error 必须有限且 error≥0"
+            )
+        if leg.get("converged") is not True:
+            raise ValueError(
+                f"reservoir correction {leg_name} 必须带 converged=true；"
+                "未收敛的释放腿不能闭合循环"
+            )
+        if restraint_version != CO_ALCHEMICAL_ION_IDENTITY_PROTOCOL_VERSION:
+            raise ValueError(
+                f"reservoir correction {leg_name} restraint_protocol_version={restraint_version}"
+                " 与当前 co-ion identity protocol 不一致"
+            )
+        if leg.get("box_model") != CO_ALCHEMICAL_ION_RESTRAINT_BOX_MODEL:
+            raise ValueError(f"reservoir correction {leg_name} box_model 不一致")
+        normalized[leg_name] = {
+            "delta_G_release_kJ_mol": dg,
+            "error_kJ_mol": err,
+            "converged": True,
+            "restraint_protocol_version": restraint_version,
+            "box_model": leg["box_model"],
+            "sample_count": _strict_int(
+                leg.get("sample_count", 0), f"{leg_name}.sample_count"
+            ),
+        }
+        if normalized[leg_name]["sample_count"] < 2:
+            raise ValueError(f"reservoir correction {leg_name} sample_count 必须至少为 2")
+
+    validation = correction.get("validation")
+    if not isinstance(validation, dict):
+        raise ValueError("reservoir correction 缺少 validation（C4/C5）证据块")
+    if validation.get("c4_passed") is not True or validation.get("c5_passed") is not True:
+        raise ValueError("reservoir correction 必须同时通过 c4_passed=true 与 c5_passed=true")
+    evidence = validation.get("evidence")
+    if not isinstance(evidence, list) or not evidence or not all(
+        isinstance(item, str) and item.strip() for item in evidence
+    ):
+        raise ValueError(
+            "reservoir correction validation.evidence 必须是非空字符串列表"
+        )
+    try:
+        tolerance = float(validation.get("tolerance_kJ_mol", CHARGE_TRANSFER_RESERVOIR_CLOSURE_TOLERANCE_KJ_MOL))
+        residual = float(validation["max_abs_closure_residual_kJ_mol"])
+        box_sensitivity = float(validation["max_abs_box_size_sensitivity_kJ_mol"])
+        anchor_sensitivity = float(validation["max_abs_anchor_sensitivity_kJ_mol"])
+        restraint_sensitivity = float(validation["max_abs_restraint_sensitivity_kJ_mol"])
+        n_box = _strict_int(validation["n_box_sizes"], "validation.n_box_sizes")
+        n_anchor = _strict_int(
+            validation["n_anchor_choices"], "validation.n_anchor_choices"
+        )
+        n_restraint = _strict_int(
+            validation["n_restraint_settings"],
+            "validation.n_restraint_settings",
+        )
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("reservoir correction validation 缺少 C4/C5 数值扫描字段") from exc
+    scan_values = (tolerance, residual, box_sensitivity, anchor_sensitivity, restraint_sensitivity)
+    if not all(math.isfinite(value) for value in scan_values) or tolerance <= 0.0:
+        raise ValueError("reservoir correction validation 数值必须有限且 tolerance>0")
+    if tolerance > CHARGE_TRANSFER_RESERVOIR_CLOSURE_TOLERANCE_KJ_MOL:
+        raise ValueError(
+            "reservoir correction validation tolerance 不能放宽项目闭合门："
+            f"最大 {CHARGE_TRANSFER_RESERVOIR_CLOSURE_TOLERANCE_KJ_MOL:g} kJ/mol"
+        )
+    if any(value < 0.0 or value > tolerance for value in scan_values[1:]):
+        raise ValueError(
+            "reservoir correction C4/C5 扫描残差超过声明 tolerance，拒绝闭合循环"
+        )
+    if min(n_box, n_anchor, n_restraint) < 3:
+        raise ValueError("C4/C5 至少需要 3 个盒尺寸、锚点选择和 restraint 设置")
+    normalized["validation"] = {
+        "c4_passed": True,
+        "c5_passed": True,
+        "evidence": [item.strip() for item in evidence],
+        "tolerance_kJ_mol": tolerance,
+        "max_abs_closure_residual_kJ_mol": residual,
+        "max_abs_box_size_sensitivity_kJ_mol": box_sensitivity,
+        "max_abs_anchor_sensitivity_kJ_mol": anchor_sensitivity,
+        "max_abs_restraint_sensitivity_kJ_mol": restraint_sensitivity,
+        "n_box_sizes": n_box,
+        "n_anchor_choices": n_anchor,
+        "n_restraint_settings": n_restraint,
+    }
+    normalized["delta_G_bind_correction_kJ_mol"] = (
+        normalized["solvent"]["delta_G_release_kJ_mol"]
+        - normalized["complex"]["delta_G_release_kJ_mol"]
+    )
+    normalized["error_kJ_mol"] = float(
+        math.sqrt(
+            normalized["complex"]["error_kJ_mol"] ** 2
+            + normalized["solvent"]["error_kJ_mol"] ** 2
+        )
+    )
+    return normalized
+
 # [Stage2 handoff，2026-08-11] charge-transfer 配体的 charging→vanishing
 # 交接：vanishing 阶段的输入 System 现在会先用
 # `bake_global_parameter_into_fixed_nonbonded_force` 把一份独立的 charging
@@ -646,15 +939,15 @@ def charge_treatment_qualification_payload(charge_treatment: Optional[str]) -> D
 
     Neutral and Rocklin paths keep their legacy result shape. Charged
     charge-transfer is merged as an experimental capability: C4/C5 are not
-    complete, so constructing a closed cycle cannot silently promote the
-    numerical result to production-qualified.
+    complete, so even an externally supplied reservoir correction cannot
+    silently promote the numerical result to production-qualified.
     """
     resolved = str(charge_treatment or "").strip().lower()
     if resolved == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
         c4_passed = bool(CHARGE_TRANSFER_C4_PASSED)
         c5_passed = bool(CHARGE_TRANSFER_C5_PASSED)
         return {
-            "qualification_protocol_version": (
+            "production_qualification_protocol_version": (
                 CHARGE_TRANSFER_PRODUCTION_QUALIFICATION_PROTOCOL_VERSION
             ),
             "feature_status": CHARGE_TRANSFER_FEATURE_STATUS,
@@ -667,7 +960,7 @@ def charge_treatment_qualification_payload(charge_treatment: Optional[str]) -> D
         }
     if resolved == CHARGE_TREATMENT_CO_ANNIHILATION_EXPERIMENTAL:
         return {
-            "qualification_protocol_version": (
+            "production_qualification_protocol_version": (
                 CHARGE_TRANSFER_PRODUCTION_QUALIFICATION_PROTOCOL_VERSION
             ),
             "feature_status": "experimental_method_comparison_only",
@@ -687,12 +980,20 @@ def resolve_charge_treatment(
     require_co_alchemical_ion: bool = False,
     environment_type: Optional[str] = None,
     apbs_evidence: Optional[Dict[str, Any]] = None,
+    charge_transfer_reservoir_correction: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """校验净电荷处理协议，返回可直接进 fingerprint/provenance 的解析结果。
 
     `charge_treatment=None` 时按 §1.2 的生产默认推导：中性配体 → `neutral`，
     带电配体 → `co_alchemical_charge_transfer`。**这不是"猜协议"**——它只看配体
     净电荷这一个客观量，与清单禁止的"根据有没有 APBS 数值猜"是两回事。
+
+    Charge-transfer additionally requires a validated two-leg reservoir-release
+    correction.  Without ``charge_transfer_reservoir_correction`` the protocol
+    is intentionally marked as an open cycle; callers must fail closed before
+    constructing an OpenMM context.  Supplying the evidence-backed object
+    does not by itself promote the route to production qualification (the
+    project-wide C4/C5 flags remain an explicit release decision).
 
     `co_alchemical_ion` 现在只接受一个**可选的兼容性 override**：真正的 B3–B5
     运行身份由 complex/solvent 两条 pipeline 各自选择并冻结，不能靠一个全局
@@ -740,6 +1041,15 @@ def resolve_charge_treatment(
         raise ValueError(
             f"charge_treatment={charge_treatment!r} 不是合法值；"
             f"允许 {list(CHARGE_TREATMENTS)}。"
+        )
+
+    if (
+        charge_transfer_reservoir_correction is not None
+        and resolved != CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER
+    ):
+        raise ValueError(
+            "charge_transfer_reservoir_correction 只能与"
+            " charge_treatment=co_alchemical_charge_transfer 一起使用"
         )
 
     resolved_environment = resolve_environment_type(environment_type)
@@ -861,14 +1171,27 @@ def resolve_charge_treatment(
         payload["charging_hamiltonian_implemented"] = bool(
             CHARGE_TRANSFER_HAMILTONIAN_IMPLEMENTED
         )
-        # B4 状态如实落 provenance：一条 charge-transfer 运行现在能跑复合物腿（pilot），
-        # 但溶剂腿 builder 没落地 ⟹ 循环闭不上 ⟹ 不得报出 ΔG_bind。
+        # B4 的 builder 身份已经落地，但这不等于 tethered carrier 的
+        # reservoir/配分函数项在 complex 与 solvent 两腿严格相消。该项还
+        # 需要完整的双腿 closure 与盒/锚点/力常数扫描（C4/C5）；在此之前
+        # 必须明确标成未闭合，禁止下游把数值写成生产 ΔG_bind。
         payload["solvent_leg_builder_implemented"] = bool(
             CHARGE_TRANSFER_SOLVENT_LEG_IMPLEMENTED
         )
-        payload["closes_thermodynamic_cycle"] = bool(
-            CHARGE_TRANSFER_SOLVENT_LEG_IMPLEMENTED
-        ) or is_experimental
+        payload["closes_thermodynamic_cycle"] = False
+        payload["thermodynamic_cycle_closure_validated"] = False
+        payload["incomplete_cycle_reason"] = (
+            "tethered_charge_carrier_reservoir_correction_not_validated"
+        )
+        if charge_transfer_reservoir_correction is not None:
+            validated_correction = validate_charge_transfer_reservoir_correction(
+                charge_transfer_reservoir_correction,
+                temperature_k=None,
+            )
+            payload["charge_transfer_reservoir_correction"] = validated_correction
+            payload["closes_thermodynamic_cycle"] = True
+            payload["thermodynamic_cycle_closure_validated"] = True
+            payload.pop("incomplete_cycle_reason", None)
         payload.update(charge_treatment_qualification_payload(resolved))
     elif resolved == CHARGE_TREATMENT_ROCKLIN_APBS:
         payload["total_charge_conserved_at_every_lambda"] = False
@@ -1010,8 +1333,10 @@ CO_ALCHEMICAL_ION_IDENTITY_FINGERPRINT_FIELDS = (
 #   2. 参考点在膜半各向异性 NPT 下不随盒缩放 —— Z 方向盒长变而参考点不动，
 #      离子会被系统性地拖向膜。
 #
-# 新形式：**锚点相对**的 flat-bottom。参考点 = 锚点原子当前位置 + 冻结的位移向量 d0，
-# 所以它跟着体系一起被 barostat 缩放（§2.3"可随盒缩放的定义"），而不是钉在盒坐标系里。
+# 新形式：**锚点相对**的 flat-bottom。参考点 = 锚点原子当前位置 + 冻结的位移向量 d0。
+# 这只保证平移/刚体运动不改变井心；d0 本身仍是笛卡尔 per-bond 参数，不能随
+# barostat 的盒矢量缩放。charge-transfer 因而明确限定为固定盒 NVT，NPT/半各向异性
+# 体系在注入 restraint 前 fail closed（见 `_inject_co_alchemical_ion_restraints`）。
 #
 # 为什么用 `CustomCompoundBondForce` + `pointdistance` 而不是别的：
 #   * `periodicdistance` **只存在于 CustomExternalForce**——实测
@@ -1024,11 +1349,11 @@ CO_ALCHEMICAL_ION_IDENTITY_FINGERPRINT_FIELDS = (
 #   * 三斜/各向异性盒都走同一条 minimum-image 逻辑，无需自己写盒矩阵运算。
 #
 # 锚点取**配体重原子中离配体质心最近的那一个**，两条腿用同一条规则：
-#   * 它随体系一起缩放，消掉 MEM-00d 的系统性拖拽；
+#   * 它随锚点平移，消掉绝对坐标井心的系统性拖拽；
 #   * 它让"co-ion ↔ 配体 minimum-image 距离"在结构上被 restraint 本身钉住
 #     （§13.1 的全程下限从"事后诊断"变成"构造时可证"）；
-#   * 两条腿同一个锚点规则、同一个 k/r₀ ⟹ 可用体积相同，restraint 的自由能在
-#     ΔG_solv − ΔG_cplx 里对消（§2.3 末条要求的说明，见 docs 的 MEM-00e 记录）；
+#   * 两条腿同一个锚点规则、同一个 k/r₀ 仍不足以证明 carrier reservoir
+#     配分函数相消；该项在 C4/C5 完成前不计作闭合循环；
 #   * 取"离质心最近"而不是随便一个重原子：配体转动时该原子位移最小，井心抖动最小。
 # ============================================================================
 
@@ -1040,6 +1365,10 @@ CO_ALCHEMICAL_ION_RESTRAINT_EXPRESSION = (
     "0.5*k_ion*max(0, pointdistance(x1,y1,z1, x2+dx0, y2+dy0, z2+dz0) - r0_ion)^2"
 )
 CO_ALCHEMICAL_ION_RESTRAINT_REFERENCE_FRAME = "anchor_atom_relative_displacement"
+# The frozen Cartesian displacement is valid only in a fixed-box (NVT) leg.
+# Keep this marker in every identity spec so a future dynamic fractional-box
+# implementation cannot silently reuse the old Hamiltonian/cache.
+CO_ALCHEMICAL_ION_RESTRAINT_BOX_MODEL = "fixed_cartesian_displacement_nvt_only"
 # restraint 与 Boresch（force group 3）分开，且**逐 λ 完全相同**（§2.3、§6.4）。
 CO_ALCHEMICAL_ION_RESTRAINT_FORCE_GROUP = 6
 # 判"是重原子"的质量下限：H 是 1.008，D 是 2.014，最轻的重原子 C 是 12。
@@ -1073,8 +1402,14 @@ def co_alchemical_ion_restraint_wall_margin_nm(
     )
     if not math.isfinite(k) or k <= 0.0:
         raise ValueError(f"restraint 力常数必须为正有限数，收到 {k_kj_per_mol_nm2!r}")
-    kt = 0.008314462618 * float(temperature_k)
-    return math.sqrt(2.0 * float(margin_kt) * kt / k)
+    temp = float(temperature_k)
+    if not math.isfinite(temp) or temp <= 0.0:
+        raise ValueError(f"温度必须为正有限数，收到 {temperature_k!r}")
+    margin = float(margin_kt)
+    if not math.isfinite(margin) or margin <= 0.0:
+        raise ValueError(f"margin_kt 必须为正有限数，收到 {margin_kt!r}")
+    kt = 0.008314462618 * temp
+    return math.sqrt(2.0 * margin * kt / k)
 
 
 def minimum_image_displacement_nm(displacement, box_vectors) -> np.ndarray:
@@ -1092,9 +1427,66 @@ def minimum_image_displacement_nm(displacement, box_vectors) -> np.ndarray:
     det = float(np.linalg.det(box))
     if not np.isfinite(det) or abs(det) <= 1.0e-12:
         raise ValueError("周期盒向量奇异，无法计算 minimum-image 位移")
+    if delta.shape[-1:] != (3,):
+        raise ValueError("minimum-image 位移的最后一维必须是 3")
+    if not np.all(np.isfinite(delta)):
+        raise ValueError("minimum-image 位移必须全部为有限数")
+    # Empty selections are valid for some diagnostic paths.  Avoid taking a
+    # reduction over an empty array below, while preserving the requested
+    # shape and dtype.
+    if delta.size == 0:
+        return np.array(delta, dtype=np.float64, copy=True)
+    # Component-wise rounding is not exact for a skew triclinic cell. Search
+    # integer lattice points around the Babai/rounded point and expand the
+    # cube until a singular-value lower bound proves that every point outside
+    # it is farther away.  Unlike a fixed 27-neighbour stencil this remains
+    # correct for strongly sheared (but nonsingular) cells.
     fractional = delta @ np.linalg.inv(box)
-    fractional -= np.round(fractional)
-    return fractional @ box
+    base = np.floor(fractional + 0.5).astype(np.int64)
+    sigma_min = float(np.linalg.svd(box, compute_uv=False)[-1])
+    if not np.isfinite(sigma_min) or sigma_min <= 0.0:
+        raise ValueError("周期盒向量最小奇异值非法，无法计算 minimum-image 位移")
+    best_wrapped = None
+    best_norm2 = np.full(delta.shape[:-1], np.inf, dtype=np.float64)
+    radius = 0
+    while True:
+        offsets = np.asarray(
+            [
+                (i, j, k)
+                for i in range(-radius, radius + 1)
+                for j in range(-radius, radius + 1)
+                for k in range(-radius, radius + 1)
+            ],
+            dtype=np.int64,
+        )
+        candidates = (base[..., None, :] + offsets).astype(np.float64)
+        wrapped = delta[..., None, :] - np.einsum("...ni,ij->...nj", candidates, box)
+        norms2 = np.einsum("...ni,...ni->...n", wrapped, wrapped)
+        local_best = np.argmin(norms2, axis=-1)
+        local_norm2 = np.take_along_axis(norms2, local_best[..., None], axis=-1)[..., 0]
+        replace = local_norm2 < best_norm2
+        if best_wrapped is None:
+            best_wrapped = np.take_along_axis(
+                wrapped, local_best[..., None, None], axis=-2
+            )[..., 0, :]
+        else:
+            local_wrapped = np.take_along_axis(
+                wrapped, local_best[..., None, None], axis=-2
+            )[..., 0, :]
+            best_wrapped = np.where(replace[..., None], local_wrapped, best_wrapped)
+        best_norm2 = np.minimum(best_norm2, local_norm2)
+
+        # For an integer point outside [-radius, radius]^3, ||n-f||₂ is at
+        # least radius+1-sqrt(3)/2 because each component of f-base is ≤1/2.
+        outside_lower = sigma_min * max(0.0, radius + 1.0 - math.sqrt(3.0) / 2.0)
+        if outside_lower * outside_lower >= float(np.max(best_norm2)):
+            return best_wrapped
+        radius += 1
+        if radius > 64:
+            raise RuntimeError(
+                "minimum-image closest-lattice 搜索未在 64 层内收敛；"
+                "周期盒过度病态，拒绝猜测周期像。"
+            )
 
 
 def co_alchemical_ion_anchor_atom_index(
@@ -1173,7 +1565,8 @@ def co_alchemical_ion_restraint_spec(
     """MEM-00d 的 restraint 描述（进身份指纹 ⟹ 改形式即作废旧 spec/缓存）。
 
     `reference_displacement_nm` 是"锚点 → co-ion"的 minimum-image 位移，在选择那一刻
-    冻结。井心 = 锚点当前位置 + 该位移，所以它随体系一起被 barostat 缩放。
+    冻结。它是笛卡尔 per-bond 参数，仅适用于固定盒 NVT；NPT/半各向异性 barostat
+    会改变盒矢量而不改变该参数，注入层会明确拒绝。
     """
     radius = (
         COION_FLAT_BOTTOM_RADIUS_NM
@@ -1187,15 +1580,21 @@ def co_alchemical_ion_restraint_spec(
     )
     if not math.isfinite(radius) or radius <= 0.0:
         raise ValueError(f"flat-bottom 半径必须为正有限数，收到 {radius!r}")
-    displacement = [round(float(v), 6) for v in list(reference_displacement_nm)[:3]]
-    if len(displacement) != 3:
+    if not math.isfinite(k) or k <= 0.0:
+        raise ValueError(f"restraint 力常数必须为正有限数，收到 {k!r}")
+    raw_displacement = list(reference_displacement_nm)
+    if len(raw_displacement) != 3:
         raise ValueError(
             f"reference_displacement_nm 需要 3 个分量，收到 {reference_displacement_nm!r}"
         )
+    displacement = [round(float(v), 6) for v in raw_displacement]
+    if not all(math.isfinite(value) for value in displacement):
+        raise ValueError("reference_displacement_nm 必须全部为有限数")
     return {
         "form": CO_ALCHEMICAL_ION_RESTRAINT_FORM_FLAT_BOTTOM,
         "expression": CO_ALCHEMICAL_ION_RESTRAINT_EXPRESSION,
         "reference_frame": CO_ALCHEMICAL_ION_RESTRAINT_REFERENCE_FRAME,
+        "box_model": CO_ALCHEMICAL_ION_RESTRAINT_BOX_MODEL,
         "k_kj_per_mol_nm2": k,
         "flat_bottom_radius_nm": radius,
         "force_group": CO_ALCHEMICAL_ION_RESTRAINT_FORCE_GROUP,
@@ -1723,6 +2122,12 @@ def verify_co_alchemical_ion_identity(
                 "旧的『绝对笛卡尔参考点纯谐振子』已退役，它在膜半各向异性 NPT 下会把"
                 "离子系统性拖向膜）。请重新选择 co-ion 并落盘新 spec。"
             )
+        if restraint.get("box_model") != CO_ALCHEMICAL_ION_RESTRAINT_BOX_MODEL:
+            raise ValueError(
+                f"co-ion restraint box_model 不符{where}：spec 记的是 "
+                f"{restraint.get('box_model')!r}，当前实现仅支持 "
+                f"{CO_ALCHEMICAL_ION_RESTRAINT_BOX_MODEL!r}。"
+            )
         if restraint.get("expression") != CO_ALCHEMICAL_ION_RESTRAINT_EXPRESSION:
             raise ValueError(
                 f"co-ion restraint 表达式不符{where}：spec 记的是 "
@@ -1979,6 +2384,22 @@ def pre_equilibration_frame_interval_ps(
             f"预平衡帧间隔参数非法：timestep_ps={dt!r}, interval_steps={steps!r}"
         )
     return dt * steps
+
+
+# ---- 物理预平衡 block 收敛早停（PLAN 2026-08-26：5M 步地板+block 检查）----
+#
+# 只用于非膜体系（见 `abfe_pipeline.pre_equilibrate` 里的分支）。判的是**相邻
+# block 之间的变化量**是否已经走平，不是绝对精度门——选紧只会少触发早停（退回
+# 跑满 n_steps，与改动前等价，零风险），选松才有"提前停在没真正平衡"的风险，
+# 所以初版数值偏保守，等真机 block 监控 CSV 攒出来再按数据松绑。
+PRE_EQUILIBRATION_CONVERGENCE_MIN_STEPS = 1_000_000  # 2 ns 地板，硬性下限内不判据
+PRE_EQUILIBRATION_CONVERGENCE_BLOCK_STEPS = 250_000  # 每 block 500 ps
+PRE_EQUILIBRATION_CONVERGENCE_STABLE_BLOCKS_REQUIRED = 3  # 连续 3 个 block 都稳定才停
+PRE_EQUILIBRATION_CONVERGENCE_TEMP_DRIFT_TOL_K = 1.5
+PRE_EQUILIBRATION_CONVERGENCE_VOLUME_DRIFT_TOL_PERCENT = 0.5
+PRE_EQUILIBRATION_CONVERGENCE_DENSITY_DRIFT_TOL_PERCENT = 0.5
+PRE_EQUILIBRATION_CONVERGENCE_PE_DRIFT_TOL_KJ_PER_MOL_PER_ATOM = 0.02
+PRE_EQUILIBRATION_CONVERGENCE_RMSD_DRIFT_TOL_NM = 0.02  # block-to-block Δ，非绝对值门
 
 
 # ---- §13.3 膜质量门（判据统一为"末段窗口内线性漂移小于阈值"）----
@@ -2993,6 +3414,52 @@ def load_gromacs_topology_for_openmm(
     return app.GromacsTopFile(resolved, includeDir=includeDir, **kwargs)
 
 
+def load_amber_topology_for_openmm(
+    prmtop_file: str,
+    inpcrd_file: Optional[str] = None,
+    **kwargs,
+):
+    """加载 AMBER 拓扑（`.prmtop`/`.parm7` + 可选 `.inpcrd`/`.rst7`）为 OpenMM 对象。
+
+    ## 范围：最小加载层，不是 GROMACS 路径的对等物
+
+    这里只做"把一个真实 AMBER 拓扑/坐标文件交给 OpenMM 原生的
+    `AmberPrmtopFile`/`AmberInpcrdFile`，让它能被 `createSystem()` 用起来"这一步。
+    不做 `load_gromacs_topology_for_openmm` 那一整套 GROMACS 专属能力：
+
+    - 没有 funct-2 pairs 等价转换——AMBER prmtop 本身就是 OpenMM 原生支持的
+      二进制式段结构，不存在 `.top` 文本格式那种"某个 funct 变体 OpenMM 不认"
+      的可转换性问题。
+    - 没有 `classify_system_composition()` 式的角色分类 / co-ion 插入——这些
+      是围绕 GROMACS `[ moleculetype ]`/`[ molecules ]` 文本结构写的，AMBER
+      侧目前没有对应实现，也没有生产代码路径需要它。
+
+    截至写这个函数时，全仓生产主链（`runabfe.py`/`abfe_pipeline.py`/
+    `ibs_engine.py`）没有任何调用点读取 `.prmtop`/`.inpcrd`——这是为可行性
+    探索新增的能力，尚未接入 CLI/生产流程。
+
+    fail-closed：文件不存在直接抛 `FileNotFoundError`，不像 GROMACS include
+    解析那样允许"找不到就返回 None、后面再报错"。
+
+    Returns
+    -------
+    (prmtop, inpcrd) : tuple[app.AmberPrmtopFile, Optional[app.AmberInpcrdFile]]
+        `prmtop`：`.topology` / `.createSystem(**kwargs)`。
+        `inpcrd`：`.positions` / `.boxVectors`；未传 `inpcrd_file` 时为 `None`。
+    """
+    if not os.path.exists(prmtop_file):
+        raise FileNotFoundError(f"AMBER prmtop 文件不存在: {prmtop_file}")
+    prmtop = app.AmberPrmtopFile(prmtop_file, **kwargs)
+
+    inpcrd = None
+    if inpcrd_file is not None:
+        if not os.path.exists(inpcrd_file):
+            raise FileNotFoundError(f"AMBER inpcrd 文件不存在: {inpcrd_file}")
+        inpcrd = app.AmberInpcrdFile(inpcrd_file)
+
+    return prmtop, inpcrd
+
+
 def _family_from_defaults(defaults: Optional[Dict[str, Any]]) -> Optional[str]:
     if not defaults:
         return None
@@ -3086,11 +3553,15 @@ def detect_forcefield_family_from_top(
 def resolve_forcefield_family(
     top_path: Optional[str] = None,
     explicit_family: Optional[str] = None,
+    gmx_include_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """确定力场族；识别不出即 fail closed，允许显式覆盖但必须留记录（§1.1）。"""
     detection: Dict[str, Any] = {"family": None, "reason": "not_attempted"}
     if top_path:
-        detection = detect_forcefield_family_from_top(top_path)
+        detection = detect_forcefield_family_from_top(top_path, gmx_include_dir)
+    detection["gmx_include_dir"] = (
+        os.path.abspath(gmx_include_dir) if gmx_include_dir else None
+    )
 
     if explicit_family is not None and str(explicit_family).strip():
         override = str(explicit_family).strip().lower()
@@ -4958,7 +5429,34 @@ def membrane_observables_from_trajectory(
     head_indices = np.asarray([idx for _, idx in head_units], dtype=int)
     if head_indices.size == 0:
         raise ValueError("找不到任何脂质头基参考原子，这不是膜体系。")
-    head_coords_frame0 = traj.xyz[0][head_indices][:, axis]
+
+    # A wrapped first frame can straddle the periodic boundary (e.g. one
+    # leaflet at z≈0 and the other at z≈L).  Choosing the arithmetic mean of
+    # those raw coordinates would split a leaflet and can make the quality gate
+    # reject an otherwise healthy bilayer.  Cut the circular coordinate at its
+    # largest empty arc and use that common image for the initial leaflet
+    # labels; the same per-atom image offsets are then applied to the unwrapped
+    # trajectory below.
+    head_z_wrapped = np.asarray(traj.xyz[0][head_indices][:, axis], dtype=float)
+    first_box_length = float(lengths[0, axis])
+    if (
+        head_z_wrapped.ndim != 1
+        or not np.all(np.isfinite(head_z_wrapped))
+        or not np.isfinite(first_box_length)
+        or first_box_length <= 0.0
+    ):
+        raise ValueError("脂质头基首帧法向坐标或盒长非法")
+    z_mod = np.mod(head_z_wrapped, first_box_length)
+    order = np.argsort(z_mod)
+    sorted_z = z_mod[order]
+    gaps = np.diff(np.concatenate([sorted_z, sorted_z[:1] + first_box_length]))
+    cut = float(sorted_z[(int(np.argmax(gaps)) + 1) % sorted_z.size])
+    head_z_cluster = z_mod - cut
+    head_z_cluster[head_z_cluster < 0.0] += first_box_length
+    # Restore the coordinate origin: only integer box-image shifts may be
+    # applied to heads alone. Water/ions/protein retain the trajectory origin.
+    head_z_cluster += cut
+    head_coords_frame0 = head_z_cluster
     midplane0 = float(np.mean(head_coords_frame0))
     upper_mask = head_coords_frame0 > midplane0
     n_upper = int(np.count_nonzero(upper_mask))
@@ -4970,7 +5468,17 @@ def membrane_observables_from_trajectory(
         )
 
     # ---- 逐帧：中面、APL、膜厚 ----
-    head_z_all = traj.xyz[:, head_indices, axis]  # (n_frames, n_heads)
+    # Use a continuous head trajectory.  With wrapped coordinates a rigid
+    # membrane translated through z=0 would split one leaflet across the two
+    # ends of the box and make the arithmetic means/thickness meaningless.
+    head_xyz_unwrapped = _unwrap_trajectory_subset(traj, head_indices)
+    # Align every head's continuous trajectory to the common circular image
+    # selected above.  The offsets are constant per atom and therefore do not
+    # alter any frame-to-frame displacement/MSD.
+    head_xyz_unwrapped[:, :, axis] += (
+        head_z_cluster - head_xyz_unwrapped[0, :, axis]
+    )[None, :]
+    head_z_all = head_xyz_unwrapped[:, :, axis]  # (n_frames, n_heads)
     midplane = head_z_all.mean(axis=1)
     upper_z = head_z_all[:, upper_mask].mean(axis=1)
     lower_z = head_z_all[:, ~upper_mask].mean(axis=1)
@@ -4992,7 +5500,17 @@ def membrane_observables_from_trajectory(
         )
     pair_a = np.asarray([p[0] for p in cc_pairs], dtype=int)
     pair_b = np.asarray([p[1] for p in cc_pairs], dtype=int)
-    vectors = traj.xyz[:, pair_b, :] - traj.xyz[:, pair_a, :]
+    cc_atom_indices = np.unique(np.concatenate([pair_a, pair_b]))
+    cc_unwrapped = _unwrap_trajectory_subset(traj, cc_atom_indices)
+    cc_lookup = {int(atom): i for i, atom in enumerate(cc_atom_indices)}
+    vectors = np.asarray(
+        [
+            cc_unwrapped[:, cc_lookup[int(b)], :]
+            - cc_unwrapped[:, cc_lookup[int(a)], :]
+            for a, b in zip(pair_a, pair_b)
+        ],
+        dtype=np.float64,
+    ).transpose(1, 0, 2)
     norms = np.linalg.norm(vectors, axis=2)
     with np.errstate(invalid="ignore", divide="ignore"):
         cos_theta = vectors[:, :, axis] / norms
@@ -5138,10 +5656,13 @@ def membrane_observables_from_trajectory(
 
     # 跨膜倾角：蛋白骨架坐标的第一主轴与膜法向的夹角（0–90°）。
     tilt_deg = np.empty(traj.n_frames, dtype=float)
+    protein_unwrapped = _unwrap_trajectory_subset(traj, protein_backbone)
     normal_vector = np.zeros(3)
     normal_vector[axis] = 1.0
     for frame in range(traj.n_frames):
-        coords = traj.xyz[frame][protein_backbone]
+        # Build a continuous local protein frame so a whole protein crossing a
+        # periodic boundary cannot spuriously inflate the principal-axis tilt.
+        coords = protein_unwrapped[frame]
         centered = coords - coords.mean(axis=0)
         # 最大奇异值对应的右奇异向量 = 第一主轴。
         _, _, vt = np.linalg.svd(centered, full_matrices=False)
@@ -5256,13 +5777,24 @@ def membrane_observables_from_trajectory(
         0.0, 0.5 * thickness - MEMBRANE_HYDROPHOBIC_CORE_HEADGROUP_MARGIN_NM
     )
     water_z = traj.xyz[:, water_oxygens, axis]
-    inside = np.abs(water_z - midplane[:, None]) < half_core[:, None]
+    normal_lengths = np.asarray(traj.unitcell_lengths, dtype=np.float64)[:, axis]
+    water_relative_z = water_z - midplane[:, None]
+    water_relative_z -= normal_lengths[:, None] * np.floor(
+        water_relative_z / normal_lengths[:, None] + 0.5
+    )
+    inside = np.abs(water_relative_z) < half_core[:, None]
     core_water = inside.sum(axis=1)
 
     # ---- 膜与周期镜像的水层间隙 ----
     # `lipid_atoms` 在上面（APL 蛋白横截面校正处）已经解析过，两处共用同一集合。
     lipid_z = traj.xyz[:, lipid_atoms, axis]
-    water_gap = normal_length - (lipid_z.max(axis=1) - lipid_z.min(axis=1))
+    lipid_relative_z = lipid_z - midplane[:, None]
+    lipid_relative_z -= normal_lengths[:, None] * np.floor(
+        lipid_relative_z / normal_lengths[:, None] + 0.5
+    )
+    water_gap = normal_length - (
+        lipid_relative_z.max(axis=1) - lipid_relative_z.min(axis=1)
+    )
     image_contact_frames = int(np.count_nonzero(water_gap < MEMBRANE_MIN_WATER_SLAB_NM))
 
     # ---- 沿法向的质量密度分布（按组分）----
@@ -5276,10 +5808,14 @@ def membrane_observables_from_trajectory(
     # 从 `head_units` 派生，与 `head_indices` / 叶片 mask 同源。
     # 不要在这里重新按残基名找头基——那正是本函数崩过两次的地方。
     leaflet_composition = {"upper": {}, "lower": {}}
+    head_cluster_by_atom = {
+        int(atom_index): float(head_z_cluster[pos])
+        for pos, (_label, atom_index) in enumerate(head_units)
+    }
     for label, atom_index in head_units:
         bucket = (
             "upper"
-            if traj.xyz[0][atom_index][axis] > midplane0
+            if head_cluster_by_atom[int(atom_index)] > midplane0
             else "lower"
         )
         leaflet_composition[bucket][label] = (
@@ -5494,7 +6030,14 @@ def _protein_leaflet_cross_sections_nm2(
 
 
 def _density_profile_along_normal(traj, axis: int, midplane) -> Dict[str, Any]:
-    """按组分给出沿膜法向的质量密度分布（相对膜中面）。"""
+    """按组分给出沿膜法向的质量密度分布（Da/nm³，相对膜中面）。
+
+    The old implementation accumulated masses and divided only by the number
+    of frames.  That quantity was a per-frame mass histogram, not a density;
+    its value changed with the lateral box area and bin width.  Normalize each
+    frame by its actual slab volume (``A_xy * dz``) before averaging so NPT
+    trajectories and different histogram resolutions remain comparable.
+    """
     top = traj.topology
     groups: Dict[str, List[int]] = {"water": [], "lipid": [], "protein": [], "ion": []}
     # 用与其它地方相同的名表/归一化，避免这里又出现第三套判据
@@ -5515,7 +6058,23 @@ def _density_profile_along_normal(traj, axis: int, midplane) -> Dict[str, Any]:
 
     bins = np.linspace(-5.0, 5.0, 101)
     centers = 0.5 * (bins[:-1] + bins[1:])
-    profile: Dict[str, Any] = {"bin_centers_nm": centers.tolist()}
+    bin_width_nm = float(bins[1] - bins[0])
+    lengths = np.asarray(traj.unitcell_lengths, dtype=np.float64)
+    lateral_axes = [i for i in (0, 1, 2) if i != axis]
+    lateral_area = lengths[:, lateral_axes[0]] * lengths[:, lateral_axes[1]]
+    if (
+        lengths.shape != (traj.n_frames, 3)
+        or not np.all(np.isfinite(lateral_area))
+        or np.any(lateral_area <= 0.0)
+    ):
+        raise ValueError("密度剖面需要每帧正有限的横向盒面积")
+    profile: Dict[str, Any] = {
+        "bin_centers_nm": centers.tolist(),
+        "density_units": "dalton_per_nm3",
+        "bin_width_nm": bin_width_nm,
+        "normalization": "mass / (A_xy * bin_width), averaged over frames",
+    }
+
     for group, indices in groups.items():
         if not indices:
             profile[group] = [0.0] * centers.size
@@ -5525,12 +6084,58 @@ def _density_profile_along_normal(traj, axis: int, midplane) -> Dict[str, Any]:
             [float(getattr(top.atom(int(i)).element, "mass", 0.0) or 0.0) for i in idx]
         )
         relative_z = traj.xyz[:, idx, axis] - midplane[:, None]
+        # Keep atoms in the nearest periodic image of the membrane midplane.
+        # The membrane protocol uses a rectangular cell; for a general cell,
+        # the normal component is still well-defined when the normal axis is a
+        # box edge.  This prevents a water/lipid crossing at +/-L/2 from moving
+        # to the opposite end of the density profile.
+        normal_lengths = lengths[:, axis]
+        relative_z -= normal_lengths[:, None] * np.floor(
+            relative_z / normal_lengths[:, None] + 0.5
+        )
         hist = np.zeros(centers.size, dtype=float)
         for frame in range(traj.n_frames):
             counts, _ = np.histogram(relative_z[frame], bins=bins, weights=masses)
-            hist += counts
+            slab_volume_nm3 = lateral_area[frame] * bin_width_nm
+            hist += counts / slab_volume_nm3
         profile[group] = (hist / max(1, traj.n_frames)).tolist()
     return profile
+
+
+def _unwrap_trajectory_subset(traj, atom_indices: Sequence[int]) -> np.ndarray:
+    """Unwrap selected atoms with the actual per-frame periodic cell.
+
+    MDTraj DCD/XTC coordinates are normally wrapped into the primary cell.  A
+    direct frame-to-frame difference therefore turns a boundary crossing into
+    a box-length jump.  Reconstruct continuous coordinates from consecutive
+    minimum-image increments; the helper also handles triclinic unitcell
+    vectors and falls back to diagonal lengths when a reader did not expose
+    vectors explicitly.
+    """
+    indices = np.asarray(list(atom_indices), dtype=int)
+    wrapped = np.asarray(traj.xyz[:, indices, :], dtype=np.float64)
+    if wrapped.ndim != 3 or wrapped.shape[-1] != 3:
+        raise ValueError("轨迹坐标必须是 (n_frames, n_atoms, 3)")
+    if wrapped.shape[0] == 0 or wrapped.shape[1] == 0:
+        return np.array(wrapped, copy=True)
+    lengths = np.asarray(traj.unitcell_lengths, dtype=np.float64)
+    if lengths.shape != (wrapped.shape[0], 3) or not np.all(np.isfinite(lengths)):
+        raise ValueError("轨迹每帧必须提供有限的 unitcell_lengths")
+    if np.any(lengths <= 0.0):
+        raise ValueError("轨迹 unitcell_lengths 必须为正")
+    vectors = getattr(traj, "unitcell_vectors", None)
+    if vectors is not None:
+        vectors = np.asarray(vectors, dtype=np.float64)
+        if vectors.shape != (wrapped.shape[0], 3, 3):
+            vectors = None
+    out = np.empty_like(wrapped)
+    out[0] = wrapped[0]
+    for frame in range(1, wrapped.shape[0]):
+        box = vectors[frame] if vectors is not None and np.all(np.isfinite(vectors[frame])) else np.diag(lengths[frame])
+        out[frame] = out[frame - 1] + minimum_image_displacement_nm(
+            wrapped[frame] - wrapped[frame - 1], box
+        )
+    return out
 
 
 def _lipid_lateral_relaxation_timescale_ns(
@@ -5593,7 +6198,30 @@ def _lipid_lateral_relaxation_timescale_ns(
         np.linspace(lag_min_frames, lag_max_frames, 30).astype(int)
     )
 
-    lateral = traj.xyz[:, head_indices, :][:, :, lateral_axes].astype(np.float64)
+    # Coordinates in an XTC/DCD are wrapped into the primary cell.  Taking
+    # ``lateral[t+lag] - lateral[t]`` directly therefore turns one ordinary
+    # boundary crossing into an O(box-length) jump and inflates D (or makes a
+    # slowly diffusing membrane appear to relax instantly).  Reconstruct a
+    # continuous trajectory from consecutive minimum-image increments first.
+    wrapped_head = np.asarray(traj.xyz[:, head_indices, :], dtype=np.float64)
+    unwrapped_head = np.empty_like(wrapped_head)
+    unwrapped_head[0] = wrapped_head[0]
+    cell_vectors = getattr(traj, "unitcell_vectors", None)
+    if cell_vectors is not None:
+        cell_vectors = np.asarray(cell_vectors, dtype=np.float64)
+        if cell_vectors.shape != (traj.n_frames, 3, 3):
+            cell_vectors = None
+    cell_lengths = np.asarray(traj.unitcell_lengths, dtype=np.float64)
+    for frame in range(1, traj.n_frames):
+        if cell_vectors is not None and np.all(np.isfinite(cell_vectors[frame])):
+            box = cell_vectors[frame]
+        else:
+            box = np.diag(cell_lengths[frame])
+        step = minimum_image_displacement_nm(
+            wrapped_head[frame] - wrapped_head[frame - 1], box
+        )
+        unwrapped_head[frame] = unwrapped_head[frame - 1] + step
+    lateral = unwrapped_head[:, :, lateral_axes]
     msd = np.empty(lag_frames.size, dtype=float)
     for i, lag in enumerate(lag_frames):
         delta = lateral[int(lag):] - lateral[: -int(lag)]
@@ -5641,15 +6269,34 @@ def _coion_observables_from_trajectory(
     """co-ion 的 §13.1 几何量时间序列。"""
     top = traj.topology
     coion_xyz = traj.xyz[:, coion_index, :]
-    abs_z = np.abs(coion_xyz[:, axis] - midplane)
+    lengths = np.asarray(traj.unitcell_lengths, dtype=np.float64)
+    normal_lengths = lengths[:, axis]
+    coion_dz = coion_xyz[:, axis] - np.asarray(midplane, dtype=np.float64)
+    coion_dz -= normal_lengths * np.floor(coion_dz / normal_lengths + 0.5)
+    abs_z = np.abs(coion_dz)
+
+    cell_vectors = getattr(traj, "unitcell_vectors", None)
+    if cell_vectors is not None:
+        cell_vectors = np.asarray(cell_vectors, dtype=np.float64)
+        if cell_vectors.shape != (traj.n_frames, 3, 3):
+            cell_vectors = None
+
+    def _frame_minimum_image(delta):
+        out = np.empty_like(delta, dtype=np.float64)
+        for frame in range(traj.n_frames):
+            box = (
+                cell_vectors[frame]
+                if cell_vectors is not None and np.all(np.isfinite(cell_vectors[frame]))
+                else np.diag(lengths[frame])
+            )
+            out[frame] = minimum_image_displacement_nm(delta[frame], box)
+        return out
 
     def _min_distance(indices):
         if len(indices) == 0:
             return np.full(traj.n_frames, np.inf)
         delta = traj.xyz[:, np.asarray(indices, dtype=int), :] - coion_xyz[:, None, :]
-        # 逐帧 minimum image（长方体盒；膜体系已强制 rectangular）。
-        lengths = np.asarray(traj.unitcell_lengths, dtype=float)[:, None, :]
-        delta -= lengths * np.round(delta / lengths)
+        delta = _frame_minimum_image(delta)
         return np.min(np.linalg.norm(delta, axis=2), axis=1)
 
     protein_heavy = top.select("protein and not element H")
@@ -5658,8 +6305,7 @@ def _coion_observables_from_trajectory(
 
     if water_oxygens.size:
         delta = traj.xyz[:, water_oxygens, :] - coion_xyz[:, None, :]
-        lengths = np.asarray(traj.unitcell_lengths, dtype=float)[:, None, :]
-        delta -= lengths * np.round(delta / lengths)
+        delta = _frame_minimum_image(delta)
         distances = np.linalg.norm(delta, axis=2)
         first_shell = (distances <= COION_FIRST_SHELL_WATER_CUTOFF_NM).sum(axis=1)
     else:
@@ -5682,7 +6328,10 @@ def _coion_observables_from_trajectory(
 
 def _coion_z_histogram(traj, coion_index: int, axis: int, midplane) -> Dict[str, Any]:
     """§9 末条：co-ion 的 z 分布直方图，不只是瞬时距离。"""
-    relative_z = traj.xyz[:, coion_index, axis] - midplane
+    relative_z = traj.xyz[:, coion_index, axis] - np.asarray(midplane, dtype=float)
+    lengths = np.asarray(traj.unitcell_lengths, dtype=float)
+    normal_length = lengths[:, axis]
+    relative_z -= normal_length * np.floor(relative_z / normal_length + 0.5)
     bins = np.linspace(-6.0, 6.0, 61)
     counts, edges = np.histogram(relative_z, bins=bins)
     return {
@@ -5783,15 +6432,29 @@ def _select_env_indices_from_mdtraj_frame(frame, lig_idx: np.ndarray, env_radius
         return np.asarray(env_idx, dtype=int)
 
     pos_nm = np.asarray(frame.xyz[0], dtype=np.float64)
-    if frame.unitcell_vectors is not None:
-        box_vecs = np.asarray(frame.unitcell_vectors[0], dtype=np.float64)
-        box_lens = np.linalg.norm(box_vecs, axis=1)
-    else:
-        box_lens = None
+    box_vecs = None
+    # MDTraj may expose only lengths for some trajectory formats. Treat that
+    # as an orthorhombic periodic box instead of silently sorting by raw
+    # wrapped coordinates, which can put a boundary-near atom at the wrong end
+    # of the neighbour ranking.
+    try:
+        if frame.unitcell_vectors is not None:
+            candidate = np.asarray(frame.unitcell_vectors[0], dtype=np.float64)
+            if candidate.shape == (3, 3) and np.all(np.isfinite(candidate)):
+                box_vecs = candidate
+    except Exception:
+        box_vecs = None
+    if box_vecs is None:
+        try:
+            lengths = np.asarray(frame.unitcell_lengths[0], dtype=np.float64)
+            if lengths.shape == (3,) and np.all(np.isfinite(lengths)) and np.all(lengths > 0.0):
+                box_vecs = np.diag(lengths)
+        except Exception:
+            box_vecs = None
 
     delta = pos_nm[lig_idx][:, None, :] - pos_nm[env_idx][None, :, :]
-    if box_lens is not None:
-        delta -= box_lens * np.round(delta / box_lens)
+    if box_vecs is not None:
+        delta = minimum_image_displacement_nm(delta, box_vecs)
     dists = np.linalg.norm(delta, axis=-1)
     min_dists = np.min(dists, axis=0)
     keep_order = np.argsort(min_dists)[:max_env_atoms]
@@ -6150,8 +6813,13 @@ class ACESoftcorePotential:
             alpha_lj, alpha_coul = 0.5, (alpha_coul_nm2 or 0.3)
 
         # 无量纲区间：文献常用 alpha_lj=0.5、alpha_coul=0.2~0.3。
-        assert 0.1 < alpha_lj < 2.0, f"alpha_lj 超出安全范围: {alpha_lj} (无量纲，预期 0.1~2.0)"
-        assert 0.05 < alpha_coul < 1.0, f"alpha_coul 超出安全范围: {alpha_coul} (无量纲，预期 0.05~1.0)"
+        # 用 raise 而不是 assert——assert 在 `python -O`/`PYTHONOPTIMIZE` 下会被整段
+        # 剥掉，届时这里就变成对 alpha_coul_nm2 零校验，一个荒谬的调用方传入值
+        # （负数/巨大/NaN）会直接流进软核 Hamiltonian，静默产生错误采样却不报错。
+        if not (0.1 < alpha_lj < 2.0):
+            raise ValueError(f"alpha_lj 超出安全范围: {alpha_lj} (无量纲，预期 0.1~2.0)")
+        if not (0.05 < alpha_coul < 1.0):
+            raise ValueError(f"alpha_coul 超出安全范围: {alpha_coul} (无量纲，预期 0.05~1.0)")
 
         return {
             "alpha_lj": alpha_lj,        # 无量纲，表达式内乘 sigma_ij^6
@@ -6724,6 +7392,160 @@ def assert_cross_leg_conformer_consistency(report: Dict[str, Any]) -> None:
         )
 
 
+# ============================================================================
+# [P1-12] final-result 统一 schema / sanity gate（2026-08-30）
+# ============================================================================
+# 一份"腿级最终结果"缺必需热力学字段、ΔG/误差非有限、误差为负、或自带
+# converged 诊断却不为 True 时，任何消费者都不得把它当成有效结果复用或汇总。
+# 判据只此一份：cache 早退（abfe_pipeline）、两腿汇总与回退分析
+# （runabfe）、热力学循环闭合（combine_binding_free_energy）都走这里，
+# 不许再各自发明"缺了就补 0.0"之类的宽松口径。
+FINAL_LEG_RESULT_REQUIRED_FIELD_SETS = (
+    # 一份合法的腿级最终结果必须**同时**带有以下任一组 (ΔG, 误差) 字段：
+    ("total_delta_G_complex_kJ_mol", "total_error_kJ_mol"),  # dual_lambda / single / 2D 腿
+    ("delta_G_total_kJ_mol", "error_leg_kJ_mol"),            # traditional 两腿汇总
+)
+
+
+class FinalResultValidationError(RuntimeError):
+    """腿级最终结果未通过统一 schema/sanity gate（P1-12）。"""
+
+
+def validate_boresch_attachment_result(payload: Any) -> Tuple[float, float]:
+    """Require a converged, finite A′→A contribution before cache/cycle use."""
+    if not isinstance(payload, dict) or payload.get("converged") is not True:
+        raise FinalResultValidationError("Boresch attachment stage0 必须带 converged=true")
+    values = []
+    for field in ("attachment_delta_G_kJ_mol", "attachment_error_kJ_mol"):
+        try:
+            value = float(payload[field])
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise FinalResultValidationError(f"Boresch attachment stage0 缺少或非法 {field}") from exc
+        if not math.isfinite(value) or value < 0.0:
+            raise FinalResultValidationError(f"Boresch attachment stage0 {field} 非有限或 < 0")
+        values.append(value)
+    return values[0], values[1]
+
+
+def validate_final_leg_result(
+    payload: Any,
+    *,
+    context: str = "final-result",
+    source: str = "memory",
+) -> Dict[str, Any]:
+    """[P1-12] 腿级最终结果的统一 schema/sanity gate。
+
+    拒绝（raise `FinalResultValidationError`）：
+      * payload 不是 dict；
+      * `FINAL_LEG_RESULT_REQUIRED_FIELD_SETS` 里没有任何一组的两个字段**都在**；
+      * ΔG 或误差不是有限数值（NaN/Inf/字符串等）；
+      * 误差为负；
+      * nested traditional stages or Boresch attachment lack explicit convergence;
+      * analytical Boresch release is present without attachment;
+      * payload 自带 ``converged`` 字段且值不是 ``True``（缺席不算 —— 旧版
+        本的生产 writer 本就不写这个字段，不能让所有历史结果失效；但一旦
+        写了，就必须是 True）。
+
+    返回抽出的 ``{"delta_G_field", "delta_G_kJ_mol", "error_field",
+    "error_kJ_mol"}``，方便调用方直接用同一组字段，不必再各取一遍。
+
+    `context`/`source` 只用于报错信息定位（哪条腿、内存还是哪个文件）。
+    """
+    if not isinstance(payload, dict):
+        raise FinalResultValidationError(
+            f"[{context}] ({source}) 最终结果不是 dict，而是 {type(payload).__name__}；拒绝消费"
+        )
+    chosen = None
+    for dg_field, err_field in FINAL_LEG_RESULT_REQUIRED_FIELD_SETS:
+        if dg_field in payload and err_field in payload:
+            chosen = (dg_field, err_field)
+            break
+    if chosen is None:
+        missing = [
+            field
+            for dg_field, err_field in FINAL_LEG_RESULT_REQUIRED_FIELD_SETS
+            for field in (dg_field, err_field)
+            if field not in payload
+        ]
+        raise FinalResultValidationError(
+            f"[{context}] ({source}) 缺少必需热力学字段 {sorted(set(missing))}；"
+            "拒绝把残缺结果当成有效最终结果消费（P1-12）"
+        )
+    dg_field, err_field = chosen
+    try:
+        dg_value = float(payload[dg_field])
+        err_value = float(payload[err_field])
+    except (TypeError, ValueError) as exc:
+        raise FinalResultValidationError(
+            f"[{context}] ({source}) {dg_field}/{err_field} 不是数值"
+            f"（{payload[dg_field]!r}/{payload[err_field]!r}）：{exc}"
+        ) from exc
+    if not (math.isfinite(dg_value) and math.isfinite(err_value)):
+        raise FinalResultValidationError(
+            f"[{context}] ({source}) {dg_field}/{err_field} 含非有限值"
+            f"（{dg_value!r}/{err_value!r}）；拒绝写进或复用最终结果（P1-12）"
+        )
+    if err_value < 0.0:
+        raise FinalResultValidationError(
+            f"[{context}] ({source}) {err_field} 为负数（{err_value!r}）；拒绝消费（P1-12）"
+        )
+    if "converged" in payload and payload.get("converged") is not True:
+        raise FinalResultValidationError(
+            f"[{context}] ({source}) 自带 converged 诊断但值不是 True"
+            f"（converged={payload.get('converged')!r}）；拒绝消费（P1-12）"
+        )
+    for stage_name in ("stage_decharging", "stage_vanishing"):
+        if stage_name in payload:
+            stage = payload[stage_name]
+            if not isinstance(stage, dict) or stage.get("converged") is not True:
+                raise FinalResultValidationError(
+                    f"[{context}] ({source}) {stage_name} 缺少 converged=true；拒绝消费"
+                )
+    attachment = payload.get("boresch_attachment_result")
+    if attachment is not None:
+        validate_boresch_attachment_result(attachment)
+    attachment_summary = payload.get("boresch_attachment") or {}
+    if not isinstance(attachment_summary, dict):
+        raise FinalResultValidationError(f"[{context}] boresch_attachment 不是结果字典")
+    correction_diagnostics = payload.get("boresch_correction_diagnostics") or {}
+    if not isinstance(correction_diagnostics, dict):
+        raise FinalResultValidationError(f"[{context}] boresch_correction_diagnostics 不是字典")
+    requires_attachment = bool(
+        correction_diagnostics.get("uses_analytical_release_formula")
+    )
+    if requires_attachment and attachment_summary.get("present") is not True:
+        raise FinalResultValidationError(f"[{context}] Boresch release 缺少 attachment stage0")
+    if attachment_summary.get("present"):
+        validate_boresch_attachment_result({
+            "converged": attachment_summary.get("converged"),
+            "attachment_delta_G_kJ_mol": attachment_summary.get("delta_G_kJ_mol"),
+            "attachment_error_kJ_mol": attachment_summary.get("error_kJ_mol"),
+        })
+    return {
+        "delta_G_field": dg_field,
+        "delta_G_kJ_mol": dg_value,
+        "error_field": err_field,
+        "error_kJ_mol": err_value,
+    }
+
+
+def _validate_cycle_input_scalar(value: float, name: str) -> float:
+    """combine_binding_free_energy 输入的有限性/误差非负检查（P1-12）。"""
+    try:
+        value_f = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise FinalResultValidationError(
+            f"combine_binding_free_energy: {name} 不是数值（{value!r}）；"
+            "拒绝在热力学循环里汇总损坏输入（P1-12）"
+        ) from exc
+    if not math.isfinite(value_f):
+        raise FinalResultValidationError(
+            f"combine_binding_free_energy: {name} 非有限（{value_f!r}）；"
+            "拒绝在热力学循环里汇总损坏输入（P1-12）"
+        )
+    return value_f
+
+
 def combine_binding_free_energy(
     *,
     dg_complex_kJ_mol: float,
@@ -6733,6 +7555,8 @@ def combine_binding_free_energy(
     dg_boresch_kJ_mol: float = 0.0,
     boresch_already_included_in_complex: bool = True,
     apbs_correction_kJ_mol: float = 0.0,
+    charge_transfer_reservoir_correction_kJ_mol: float = 0.0,
+    charge_transfer_reservoir_error_kJ_mol: float = 0.0,
     complex_conformer_summary: Optional[Dict[str, Any]] = None,
     solvent_conformer_summary: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -6740,7 +7564,7 @@ def combine_binding_free_energy(
 
     上面 `THERMODYNAMIC_CYCLE_DOC` 记的公式：
 
-        ΔG_bind = ΔG_solvent - ΔG_complex + ΔG_APBS
+        ΔG_bind = ΔG_solvent - ΔG_complex + ΔG_APBS + ΔG_reservoir
 
     其中 ΔG_complex **按约定已经包含** Boresch 标准态释放项。若调用方拿到的
     complex 腿还没烘焙这一项（例如 `TraditionalABFEPipeline.run_full` 是用
@@ -6758,25 +7582,47 @@ def combine_binding_free_energy(
     也就是说后两条路径对带电配体会静默漏掉整项有限尺寸静电修正。这不是代码
     整洁问题，是数值错误。统一到这里之后，那两条路径的输出会变——那是修复。
 
-    误差：两腿采样独立，`sqrt(err_c² + err_s²)`。Boresch 解析释放项与 APBS 都是
-    确定性解析量，没有独立采样方差，不并入。
+    误差：两腿采样独立，且 reservoir-release correction 的 complex/solvent 测量
+    误差独立，按平方和开根合并。Boresch 解析释放项与 APBS 都是确定性解析量，
+    没有独立采样方差，不并入。
 
     返回一个自带记账字段的 dict，调用方直接摊进自己的结果 JSON，
     不要再在外面重算任何一项。
     """
-    dg_complex = float(dg_complex_kJ_mol)
-    dg_solvent = float(dg_solvent_kJ_mol)
-    err_complex = float(err_complex_kJ_mol or 0.0)
-    err_solvent = float(err_solvent_kJ_mol or 0.0)
-    dg_boresch = float(dg_boresch_kJ_mol or 0.0)
-    apbs = float(apbs_correction_kJ_mol or 0.0)
+    # 🔑 [P1-12] 唯一循环闭合 helper 自己也要把住输入门：ΔG 非有限、误差非有限
+    # 或为负，一律 raise —— 不能让 NaN/Inf 在公式里静默传播成"看似成功的
+    # ΔG_bind"，更不能把负误差平方加进方差。ΔG 本身允许任意符号。
+    dg_complex = _validate_cycle_input_scalar(dg_complex_kJ_mol, "dg_complex_kJ_mol")
+    dg_solvent = _validate_cycle_input_scalar(dg_solvent_kJ_mol, "dg_solvent_kJ_mol")
+    err_complex = _validate_cycle_input_scalar(err_complex_kJ_mol or 0.0, "err_complex_kJ_mol")
+    err_solvent = _validate_cycle_input_scalar(err_solvent_kJ_mol or 0.0, "err_solvent_kJ_mol")
+    dg_boresch = _validate_cycle_input_scalar(dg_boresch_kJ_mol or 0.0, "dg_boresch_kJ_mol")
+    apbs = _validate_cycle_input_scalar(apbs_correction_kJ_mol or 0.0, "apbs_correction_kJ_mol")
+    reservoir = _validate_cycle_input_scalar(
+        charge_transfer_reservoir_correction_kJ_mol or 0.0,
+        "charge_transfer_reservoir_correction_kJ_mol",
+    )
+    reservoir_err = _validate_cycle_input_scalar(
+        charge_transfer_reservoir_error_kJ_mol or 0.0,
+        "charge_transfer_reservoir_error_kJ_mol",
+    )
+    for _err_name, _err_value in (
+        ("err_complex_kJ_mol", err_complex),
+        ("err_solvent_kJ_mol", err_solvent),
+        ("charge_transfer_reservoir_error_kJ_mol", reservoir_err),
+    ):
+        if _err_value < 0.0:
+            raise FinalResultValidationError(
+                f"combine_binding_free_energy: {_err_name} 为负数（{_err_value!r}）；"
+                "拒绝在热力学循环里汇总（P1-12）"
+            )
 
     # 只有 complex 腿还没烘焙释放项时，公式里才再减一次。
     boresch_term = 0.0 if boresch_already_included_in_complex else dg_boresch
 
     delta_g_bind_uncorrected = dg_solvent - dg_complex - boresch_term
-    delta_g_bind = delta_g_bind_uncorrected + apbs
-    total_err = float(np.sqrt(err_complex ** 2 + err_solvent ** 2))
+    delta_g_bind = delta_g_bind_uncorrected + apbs + reservoir
+    total_err = float(np.sqrt(err_complex ** 2 + err_solvent ** 2 + reservoir_err ** 2))
 
     # [P0-12a / §3.0] 汇总 ΔG_bind 之前先判跨腿构象一致性：不重叠就不许汇总。
     # 门放在这里（热力学循环闭合的唯一实现）而不是各调用点，理由与 ATT-09 相同 ——
@@ -6797,6 +7643,8 @@ def combine_binding_free_energy(
         # 下游据此判断能不能再对 complex_delta_G 二次扣减。
         "boresch_term_subtracted_kJ_mol": boresch_term,
         "apbs_correction_kJ_mol": apbs,
+        "charge_transfer_reservoir_correction_kJ_mol": reservoir,
+        "charge_transfer_reservoir_error_kJ_mol": reservoir_err,
         "delta_G_bind_uncorrected_kJ_mol": delta_g_bind_uncorrected,
         "delta_G_bind_kJ_mol": delta_g_bind,
         "delta_G_bind_kcal_mol": delta_g_bind / 4.184,
@@ -6805,6 +7653,7 @@ def combine_binding_free_energy(
         "cycle_formula": (
             "delta_G_bind = delta_G_solvent - delta_G_complex"
             " - boresch_term_subtracted + delta_G_APBS"
+            " + delta_G_charge_transfer_reservoir"
         ),
         # [P0-12a] 循环闭合的前提是两条腿采的是同一个构象族。判不了门时
         # `evaluated=False` 会如实记录，不会伪装成"通过"。
@@ -6925,6 +7774,71 @@ def calculate_boresch_analytical_correction(eq, fc, T=300.0):
         raise ValueError(f"Boresch 解析修正对数参数异常: {argument}")
 
     return -RT * math.log(argument)
+
+
+def _boresch_cosine_release_reference(eq, fc, T=300.0) -> float:
+    """Numerical release free energy for the *actual* cosine restraint.
+
+    ``calculate_boresch_analytical_correction`` intentionally retains the
+    historical Gaussian expression (and its public numeric contract).  The
+    OpenMM force below, however, uses ``k*(1-cos(delta))`` for angles and
+    dihedrals.  This quadrature evaluates the corresponding six-coordinate
+    configurational integral, including ``r²`` and ``sin(theta)`` Jacobians,
+    so callers can report the harmonic-vs-cosine model discrepancy instead of
+    claiming a zero uncertainty.  It is a deterministic diagnostic, not a
+    replacement for a sampled attachment leg.
+    """
+    T = T.value_in_unit(unit.kelvin) if hasattr(T, "value_in_unit") else float(T)
+    if not math.isfinite(T) or T <= 0.0:
+        raise ValueError("Boresch 数值参考需要正有限温度")
+    R = constants.R / 1000.0
+    RT = R * T
+    r0 = float(eq["r0"])
+    theta_a = float(eq["thetaA0"])
+    theta_b = float(eq["thetaB0"])
+    if not math.isfinite(r0) or r0 <= 0.0:
+        raise ValueError("Boresch r0 必须为正有限 nm")
+    kr = float(fc["kr"])
+    kta = float(fc["kthetaA"])
+    ktb = float(fc["kthetaB"])
+    kphis = [float(fc[k]) for k in ("kphiA", "kphiB", "kphiC")]
+    if any((not math.isfinite(k) or k <= 0.0) for k in [kr, kta, ktb, *kphis]):
+        raise ValueError("Boresch 数值参考需要正有限力常数")
+
+    # Gauss-Legendre quadrature is smooth for all allowed force constants.  A
+    # finite radial upper bound leaves <1e-20 of the harmonic tail, including
+    # the softest accepted kr=50 kJ mol^-1 nm^-2.
+    x, w = np.polynomial.legendre.leggauss(128)
+    radial_sigma = math.sqrt(RT / kr)
+    r_hi = max(r0 + 12.0 * radial_sigma, 12.0 * radial_sigma)
+    r_nodes = 0.5 * r_hi * (x + 1.0)
+    r_weights = 0.5 * r_hi * w
+    radial = np.sum(
+        r_weights * r_nodes**2
+        * np.exp(-0.5 * kr * (r_nodes - r0) ** 2 / RT)
+    )
+
+    def _theta_integral(k, theta0):
+        theta = 0.5 * math.pi * (x + 1.0)
+        weights = 0.5 * math.pi * w
+        return float(
+            np.sum(
+                weights
+                * np.sin(theta)
+                * np.exp(-k * (1.0 - np.cos(theta - theta0)) / RT)
+            )
+        )
+
+    angular = _theta_integral(kta, theta_a) * _theta_integral(ktb, theta_b)
+    # The wrapped dihedral integral is independent of phi0 and has a closed
+    # form; numpy.i0 is stable over the accepted k range.
+    for k in kphis:
+        xk = k / RT
+        angular *= 2.0 * math.pi * math.exp(-xk) * float(np.i0(xk))
+    z_rest = radial * angular
+    if not math.isfinite(z_rest) or z_rest <= 0.0:
+        raise RuntimeError("Boresch cosine 数值积分得到非法配分函数")
+    return -RT * math.log((8.0 * math.pi**2 * 1.6605) / z_rest)
 
 
 
@@ -8747,32 +9661,104 @@ class OnlineConvergenceMonitor:
 #=============================================================================
 def calculate_constraint_jacobian_correction(system, ligand_indices, temperature=300.0):
     """
-    计算配体解耦过程中的约束修正项 (Jacobian Correction)
-    物理原理：当约束键随配体变为 Ghost 时，构象空间体积密度发生变化。
-    公式: ΔG_cons = +0.5 * R * T * Σ ln(μ_bond / μ_ref)
-    μ_ref 取 1.0 Da (OpenMM 质量单位基准)
+    Compatibility shim for the retired constraint-Jacobian correction.
+
+    The present alchemical Hamiltonian keeps constraints, masses and bond
+    lengths identical at both endpoints, so the constrained configurational
+    factor cancels.  The former ``0.5 RT log(mu/1 Da)`` expression was neither
+    a Fixman determinant nor dimensionally tied to a flexible reference and is
+    intentionally not evaluated.
     """
-    R = 0.008314462618  # kJ/(mol·K)
-    T = temperature if isinstance(temperature, float) else temperature.value_in_unit(unit.kelvin)
-    kT = R * T
+    # Deprecated compatibility shim. OpenMM constraints are unchanged across
+    # the endpoint Hamiltonians used by this project, so their configurational
+    # Jacobians cancel exactly. The former mass/reference-mass expression was
+    # dimensionally arbitrary and must never contribute to a production result.
+    return 0.0
 
-    correction_kj = 0.0
-    constrained_bonds = 0
-    lig_set = set(ligand_indices)
 
-    for i in range(system.getNumConstraints()):
-        p1, p2, _ = system.getConstraintParameters(i)
-        if p1 in lig_set and p2 in lig_set:
-            m1 = system.getParticleMass(p1).value_in_unit(unit.dalton)
-            m2 = system.getParticleMass(p2).value_in_unit(unit.dalton)
-            mu = (m1 * m2) / (m1 + m2) if (m1 + m2) > 0 else 1e-6
-            mu_ref = 1.0  # Da (OpenMM 标准参考约化质量)
-            correction_kj += 0.5 * kT * math.log(max(mu, 1e-6) / mu_ref)
-            constrained_bonds += 1
+def constraint_identity_fingerprint(system, ligand_indices) -> Dict[str, Any]:
+    """Describe the ligand constraint/mass identity used by an ABFE leg.
 
-    if constrained_bonds > 0:
-        print(f"  🔍 检测到 {constrained_bonds} 个配体约束键，Jacobian 修正: {correction_kj:.3f} kJ/mol")
-    return correction_kj
+    The current protocol targets the *same constrained Hamiltonian* at both
+    alchemical endpoints, so no standalone Fixman/Jacobian term is added.
+    This helper makes that assumption auditable: a changed ligand HMR mass,
+    constrained bond pair, or constrained distance changes the fingerprint and
+    therefore invalidates cached legs.  Only constraints touching the ligand
+    are included; environment water/protein constraints are intentionally not
+    compared between complex and solvent legs.
+    """
+    # 与本文件其它五处（_*_hash 系列）一致的函数内局部 import：abfe_core 顶层
+    # 没有 import hashlib。缺这一行会让 run_full_pipeline -> _stage_protocol_key
+    # -> 这里在**流程刚启动时**就 NameError，连采样都进不去。
+    import hashlib
+
+    indices = sorted({int(i) for i in ligand_indices})
+    n_particles = int(system.getNumParticles())
+    if any(i < 0 or i >= n_particles for i in indices):
+        raise ValueError("ligand_indices 包含超出 System 粒子范围的约束身份索引")
+    ligand_set = set(indices)
+    masses = []
+    for i in indices:
+        mass = system.getParticleMass(i)
+        value = float(
+            mass.value_in_unit(unit.dalton)
+            if hasattr(mass, "value_in_unit")
+            else mass
+        )
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"配体原子 {i} 的质量非法: {value!r}")
+        masses.append([i, round(value, 12)])
+
+    constraints = []
+    normalized_constraints = []
+    local_index = {global_index: local for local, global_index in enumerate(indices)}
+    for cidx in range(int(system.getNumConstraints())):
+        a, b, distance = system.getConstraintParameters(cidx)
+        a, b = int(a), int(b)
+        if a not in ligand_set and b not in ligand_set:
+            continue
+        distance_nm = float(
+            distance.value_in_unit(unit.nanometer)
+            if hasattr(distance, "value_in_unit")
+            else distance
+        )
+        if not math.isfinite(distance_nm) or distance_nm <= 0.0:
+            raise ValueError(
+                f"配体约束 {a}-{b} 的距离非法: {distance_nm!r} nm"
+            )
+        constraints.append([min(a, b), max(a, b), round(distance_nm, 12)])
+        # A second, leg-comparable representation uses ligand-local ordinals;
+        # complex and solvent systems need not assign the ligand the same
+        # global atom indices.
+        normalized_constraints.append([
+            local_index.get(a, "external"),
+            local_index.get(b, "external"),
+            round(distance_nm, 12),
+        ])
+    constraints.sort()
+    normalized_constraints.sort(key=lambda row: (str(row[0]), str(row[1]), row[2]))
+    payload = {
+        "version": 1,
+        "ligand_indices": indices,
+        "ligand_masses_amu": masses,
+        "ligand_constraints": constraints,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    comparable_payload = {
+        "version": 1,
+        "ligand_masses_amu": [mass for _, mass in masses],
+        "ligand_constraints": normalized_constraints,
+    }
+    comparable_canonical = json.dumps(
+        comparable_payload, sort_keys=True, separators=(",", ":")
+    )
+    return {
+        **payload,
+        "sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "comparison_sha256": hashlib.sha256(
+            comparable_canonical.encode("utf-8")
+        ).hexdigest(),
+    }
 
 
 #=============================================================================
@@ -8791,9 +9777,16 @@ def calc_boresch_from_last_frame(positions, rec_idx, lig_idx):
         pos = np.array([[getattr(p, 'x', p[0]), getattr(p, 'y', p[1]), getattr(p, 'z', p[2])] 
                         for p in positions], dtype=np.float64)
                         
-    # 确保形状为 (N, 3)
-    if pos.shape == (3, 3): pos = pos.T  # 处理传入 box_vectors 类转置误用
-    elif pos.ndim != 2 or pos.shape[1] != 3:
+    # 确保形状为 (N, 3)。
+    #
+    # 之前这里对 (3, 3) 形状做过"猜转置"：假设它一定是误传的 box_vectors
+    # （getPeriodicBoxVectors() 那种需要转置的形状），自动转置了事。但 (3, 3) 本身
+    # 是真正歧义的——它也可能是恰好只有 3 个原子的合法 positions，此时转置反而是
+    # 把 x/y/z 分量在原子间错位互换，产出错误几何却不报错（本文件开头 5.5→98.8
+    # kJ/mol 的那次符号/几何混淆就是这个形状的问题）。生产调用点传的都是全体系
+    # positions（原子数远大于 3），从来不会撞上 (3, 3) 这条分支；真撞上了，
+    # 交给调用方保证方向正确、原样拒绝，比在这里猜一次更安全。
+    if pos.ndim != 2 or pos.shape[1] != 3:
         raise ValueError(f"positions 形状异常: {pos.shape}，期望 (N, 3)")
 
     rec_idx = [int(i) for i in rec_idx]
@@ -9528,6 +10521,10 @@ class SolventLegRunner:
             temperature=pipeline_kwargs.get('temperature', 300.0),
             output_dir=pipeline_kwargs.get('output_dir', './solvent_output'),
             platform_name=self.platform_name,
+            charge_treatment=pipeline_kwargs.get("charge_treatment"),
+            charge_transfer_reservoir_correction=pipeline_kwargs.get(
+                "charge_transfer_reservoir_correction"
+            ),
         )
         # ✅ 移除 decoupling_scheme 硬编码，透传用户配置
         return pipe.run_full_pipeline(**pipeline_kwargs)
@@ -9628,12 +10625,27 @@ class UnitFormatter:
     def format_results_human(cls, results: dict) -> str:
         """格式化最终结果报告"""
         err_kj = results.get("total_error_kJ_mol", results.get("total_error", 0.0))
+        # [P1-19] `total_delta_G_complex_kJ_mol` 这个键名是历史遗留——
+        # abfe_pipeline.compute_final_results 对 complex 腿和 solvent 腿都用
+        # 同一个键存"这条腿自己的总 ΔG"，不分腿。这里原来只看键名存不存在，
+        # 于是 solvent 腿也被打上"复合物总自由能"的标题。现在 results 里若带
+        # `system_type`（2026-08-25 起新写入 final_results.json 的字段）就按
+        # 它判腿别；旧的、没有这个字段的产物保持原样（默认当 complex 处理，
+        # 不改变既有行为）。
+        # 只有两个真实取值（"complex"/"solvent"，见
+        # abfe_pipeline.run_full_pipeline 的 system_type 形参默认值与
+        # run_full_abfe_loop 里对两条腿的显式赋值）；空/缺失按旧行为当
+        # complex 处理，不用枚举去匹配未来可能出现的新腿名。
+        _system_type = str(results.get("system_type") or "complex").lower()
         if "delta_G_bind_kJ_mol" in results:
             dg_kj = results.get("delta_G_bind_kJ_mol", 0.0)
             title = "✅ 结合自由能 ΔG_bind"
-        elif "total_delta_G_complex_kJ_mol" in results:
+        elif "total_delta_G_complex_kJ_mol" in results and _system_type == "complex":
             dg_kj = results.get("total_delta_G_complex_kJ_mol", 0.0)
             title = "✅ 复合物总自由能 ΔG_complex"
+        elif "total_delta_G_complex_kJ_mol" in results:
+            dg_kj = results.get("total_delta_G_complex_kJ_mol", 0.0)
+            title = f"✅ 解耦腿自由能 ΔG_leg（system_type={results.get('system_type')}）"
         elif "decoupling_delta_G_kJ_mol" in results:
             dg_kj = results.get("decoupling_delta_G_kJ_mol", 0.0)
             title = "✅ 解耦腿自由能 ΔG_leg"

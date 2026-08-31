@@ -16,7 +16,7 @@ import sys
 import json
 import argparse
 import logging
-import subprocess
+import shutil
 import hashlib
 import glob
 import re
@@ -35,13 +35,19 @@ from abfe_core import (
     calc_boresch_from_last_frame, GeometricRestraintEstimator, OrbBoreschEstimator,
     DEXPSurrogatePotential, LambdaDependentBoreschForce, ensure_owned_system,
     NumpyEncoder, THERMODYNAMIC_CYCLE_DOC, assess_boresch_harmonicity,  # ✅ 统一从 abfe_core 导入
+    # [P1-12] final-result 统一 schema/sanity gate（三处共用：pipeline cache
+    # 早退、本文件两腿汇总/回退分析、combine_binding_free_energy）。
+    validate_final_leg_result,
+    FinalResultValidationError,
     combine_binding_free_energy,  # [ATT-09] 热力学循环闭合的唯一实现
+    constraint_identity_fingerprint,
     ligand_conformer_fingerprint,  # [P0-12b] 起始构象进溶剂腿缓存身份
     solvent_box_edge_nm, SOLVENT_NONBONDED_CUTOFF_NM,  # 溶剂盒唯一实现，勿在此重复
     resolve_water_model_xml,  # 溶剂腿水模型必须从复合物 .top 反推
     resolve_membrane_protocol,  # 膜体系协议唯一解析实现（B1）
     resolve_environment_type,  # 只看 config 的环境类型规范化（不需要 topology）
     resolve_charge_treatment,  # 净电荷处理协议唯一校验实现（B2）
+    validate_charge_transfer_reservoir_correction,
     CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER,  # 已闭环实验路线；C4/C5 前不生产验收
     CHARGE_TREATMENT_CO_ANNIHILATION_EXPERIMENTAL,
     CHARGE_TRANSFER_SOLVENT_LEG_IMPLEMENTED,  # 溶剂腿能力状态，进 provenance
@@ -62,10 +68,18 @@ from abfe_core import (
     co_alchemical_ion_builder_identity_payload,
     COION_COION_MIN_IMAGE_INITIAL_NM,  # §2.2 多个 reserved co-ion 彼此的安全边距
     charge_treatment_qualification_payload,
+    LIGAND_NET_CHARGE_INTEGER_TOLERANCE_E,
+    WATER_MOLECULE_NAMES,
+    minimum_image_displacement_nm,
+    ensure_barostat_for_protocol,
+    PRE_EQUILIBRATION_TIMESTEP_PS,
 )
 from abfe_pipeline import (
     ABFEPipeline, TraditionalABFEPipeline, _collect_pipeline_provenance, _pme_u_kn_meta_payload,
     _pre_equilibration_fingerprint,
+    # [P1-07] 外层完成判断的严格校验 helper：真实 DCD parser + 目标 Simulation
+    # loadCheckpoint。与 pipeline 内部 resume 用同一套判据，见 equilibrium_is_done。
+    _is_checkpoint_valid, _is_traj_valid, _build_platform_props,
 )
 from ibs_engine import (
     solve_stage_integrated,
@@ -75,11 +89,22 @@ from ibs_engine import (
     lambda_endpoint_diagnostics,
     synthetic_mbar_u_kn,
     TraditionalMBARAnalyzer,
+    # [P1-04] analyze-only 回退路径与生产 loader 共用的窗口完整性 helper。
+    _assert_expected_windows_all_loaded,
+    IBSIncompleteStageCoverageError,
     # 配体净电荷的**唯一**实现。B2 的校验层刻意只吃一个 float，不自己再数一遍
     # 电荷，避免出现第二套净电荷判据（abfe_core 在 ibs_engine 下层，不能反向 import）。
     _compute_ligand_net_charge,
 ) # ✅ 保持从 ibs_engine 导入
 from abfe_preoptimizer import DualLambdaPreOptimizer, build_aces_probe_system_dual_lambda
+from local_residual.openmm_plugin import (
+    FEATURE_NAME as OUTER_LAMBDA_RESIDUAL_FEATURE_NAME,
+    build_outer_lambda_local_residual_runtime,
+)
+from local_residual.em_no_residual import (
+    install as install_outer_lambda_em_policy,
+    uninstall as uninstall_outer_lambda_em_policy,
+)
 
 # ---------------------------------------------------------------------------
 # 日志配置
@@ -90,6 +115,71 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("runabfe")
+
+
+def _assert_matching_ligand_constraint_identity(
+    complex_system,
+    complex_ligand_indices,
+    solvent_system,
+    solvent_ligand_indices,
+    *,
+    context: str = "ABFE two-leg cycle",
+):
+    """Require both legs to use the same ligand constrained Hamiltonian.
+
+    The global atom numbering can differ between complex and solvent systems,
+    so comparison uses the ligand-local ``comparison_sha256`` emitted by
+    :func:`constraint_identity_fingerprint`.  A mismatch means that the
+    nominally cancelling constrained configurational factor (including HMR
+    masses) is not the same on both legs; no pseudo-Jacobian constant may be
+    guessed in its place.
+    """
+    complex_identity = constraint_identity_fingerprint(
+        complex_system, complex_ligand_indices
+    )
+    solvent_identity = constraint_identity_fingerprint(
+        solvent_system, solvent_ligand_indices
+    )
+    if (
+        complex_identity.get("comparison_sha256")
+        != solvent_identity.get("comparison_sha256")
+    ):
+        raise RuntimeError(
+            f"{context} 的配体约束/HMR 身份不一致；拒绝用伪 Jacobian 修正掩盖差异。"
+            f" complex={complex_identity.get('comparison_sha256')},"
+            f" solvent={solvent_identity.get('comparison_sha256')}"
+        )
+    return complex_identity
+
+
+def _assert_matching_result_constraint_identity(
+    complex_result: Dict,
+    solvent_result: Dict,
+    *,
+    context: str,
+) -> Dict:
+    """Validate the persisted constraint identity before post-processing.
+
+    A result written before the identity field was introduced cannot prove
+    that its constrained Hamiltonian matches the other leg.  Treat that as an
+    invalid/legacy artifact instead of silently applying the retired
+    mass-based Jacobian correction.
+    """
+    complex_identity = complex_result.get("constraint_identity")
+    solvent_identity = solvent_result.get("constraint_identity")
+    if not isinstance(complex_identity, dict) or not isinstance(solvent_identity, dict):
+        raise RuntimeError(
+            f"{context} 缺少 constraint_identity；旧结果无法证明两条腿的约束/HMR 身份一致，"
+            "拒绝继续汇总。"
+        )
+    c_hash = complex_identity.get("comparison_sha256")
+    s_hash = solvent_identity.get("comparison_sha256")
+    if not c_hash or c_hash != s_hash:
+        raise RuntimeError(
+            f"{context} 的持久化配体约束/HMR 身份不一致；拒绝汇总。"
+            f" complex={c_hash!r}, solvent={s_hash!r}"
+        )
+    return complex_identity
 
 # ---------------------------------------------------------------------------
 # 常量与预设
@@ -327,21 +417,42 @@ def _ligand_parameter_identity(
 # 工具函数：GROMACS 力场路径探测
 # ---------------------------------------------------------------------------
 def find_gmx_include_dir(user_path: Optional[str] = None) -> Optional[str]:
-    """智能查找 GROMACS 力场 include 目录"""
+    """智能查找 GROMACS 力场 include 目录。
+
+    查找顺序（先到先得，全部失败才返回 None）：
+    1. `user_path`——显式传入的 `--gmx-path`/`config.gmx_path`，用户指定优先于任何猜测。
+    2. `$GMXLIB`——gmx 官方约定的力场搜索路径env var，值本身就是力场目录（不拼 "top"）。
+    3. `$GMXDATA`——gmx 安装数据前缀，力场在其 `top/` 子目录下。
+    4. `shutil.which("gmx")` 反推出的安装目录下的 `share/gromacs/top`。
+    5. 几个通用发行版安装路径 + 本机历史上一直在用的两条个人路径。
+
+    2026-08-24 曾经删掉第 5 步里 `/home/ruigengji/gmx25.1/...`、
+    `/home/ruigengji/gmx26.1_avx2/...` 这两条个人路径（理由：这个开发沙盒机器上
+    它们不存在，看起来像死代码）——但沙盒机器不等于真正跑生产 GPU 计算的节点，
+    那台机器上 `GMXDATA`/`GMXLIB` 是否设置、`gmx` 是否在 PATH 里完全不知道，
+    如果生产节点恰好一直是靠这两条硬编码路径落地的，删掉会让 include_dir
+    解析结果变化，进而可能真的改变 GROMACS 拓扑解析出来的力场文件、改变
+    `system_xml_sha256`/`topology_sha256`——这些哈希是会正常参与协议指纹比较的，
+    跟 2026-08-24 那次 code_sha256 事故是同一类"不确定会不会影响真实节点结果，
+    就不该冒险改"的风险。已恢复，不再删除这两条路径；真的要允许用户覆盖它们，
+    用 `--gmx-path`/`GMXLIB`/`GMXDATA` 就够了，不需要靠删掉兜底路径来"逼"人用。
+    """
     if user_path and os.path.exists(user_path):
         return user_path
 
-    env_path = os.environ.get("GMXDATA")
-    if env_path and os.path.exists(env_path):
-        top_path = os.path.join(env_path, "top")
-        return top_path if os.path.exists(top_path) else env_path
+    gmxlib_path = os.environ.get("GMXLIB")
+    if gmxlib_path and os.path.exists(gmxlib_path):
+        return gmxlib_path
+
+    gmxdata_path = os.environ.get("GMXDATA")
+    if gmxdata_path and os.path.exists(gmxdata_path):
+        top_path = os.path.join(gmxdata_path, "top")
+        return top_path if os.path.exists(top_path) else gmxdata_path
 
     try:
-        gmx_bin = (
-            subprocess.check_output(["which", "gmx"], stderr=subprocess.DEVNULL)
-            .decode()
-            .strip()
-        )
+        gmx_bin = shutil.which("gmx")
+        if not gmx_bin:
+            raise FileNotFoundError("gmx executable not found on PATH")
         gmx_root = os.path.abspath(os.path.join(os.path.dirname(gmx_bin), ".."))
         ff_path = os.path.join(gmx_root, "share/gromacs/top")
         if os.path.exists(ff_path):
@@ -350,14 +461,19 @@ def find_gmx_include_dir(user_path: Optional[str] = None) -> Optional[str]:
         pass
 
     for path in [
-        "/home/ruigengji/gmx25.1/share/gromacs/top",  
-        "/home/ruigengji/gmx26.1_avx2/share/gromacs/top",      
         "/usr/local/gromacs/share/gromacs/top",
         "/usr/share/gromacs/top",
         "/opt/gromacs/share/gromacs/top",
     ]:
         if os.path.exists(path):
             return path
+
+    log.warning(
+        "find_gmx_include_dir: 找不到 GROMACS 力场 include 目录"
+        "（--gmx-path 未给 / 未命中，GMXLIB、GMXDATA 未设置，PATH 里也没有 gmx）。"
+        "如果拓扑里有需要它才能解析的 #include，请用 --gmx-path 显式指定，"
+        "或设置 GMXLIB/GMXDATA 环境变量。"
+    )
     return None
 
 
@@ -388,8 +504,10 @@ def _recompute_cached_builder_identity(
         with open(ligand_indices_path, "r", encoding="utf-8") as handle:
             ligand_indices = [int(i) for i in json.load(handle)["ligand_indices"]]
         raw_q = _compute_ligand_net_charge(cached_system, ligand_indices)
+        if not np.isfinite(float(raw_q)):
+            raise ValueError(f"cached ligand net charge {raw_q!r} is not finite")
         q_l = int(round(float(raw_q)))
-        if abs(float(raw_q) - q_l) > 1.0e-3:
+        if abs(float(raw_q) - q_l) > LIGAND_NET_CHARGE_INTEGER_TOLERANCE_E:
             raise ValueError(
                 f"cached ligand net charge {raw_q:+.6f} e is not integral"
             )
@@ -578,22 +696,95 @@ def solvent_cache_exists(
     return bool(matches)
 
 
-def equilibrium_is_done(output_dir: str, expected_fingerprint: Optional[str] = None) -> bool:
-    """判断预平衡是否完成（存在轨迹和 checkpoint）。
+_CHECKPOINT_PROBE_CACHE_ATTR = "_p1_07_checkpoint_probe_simulation"
+# 严格校验结果按 (path, size, mtime_ns) 记忆化：equilibrium_is_done 在一次
+# 运行里会被多处以同一份文件调用，而真实 DCD parser 要逐帧读到 EOF（膜体系
+# 轨迹在 NFS 上是几十 GB 量级），没必要重复付这个 I/O。文件一旦变化
+# （size/mtime），缓存自动失效。
+_TRAJ_STRICT_VALIDITY_CACHE: Dict[Tuple[str, int, float], bool] = {}
 
-    expected_fingerprint（可选）：由
-    abfe_pipeline._pre_equilibration_fingerprint(system, ligand_indices,
-    temperature, pressure) 算出的当前 system/config 指纹。此前这里只按文件
-    存在与否判断，同一个 --output 目录换了 gro/top/ligand/温度/压力再跑
-    （没有 --reset）时，会把上一次配置留下的旧轨迹静默当作"已完成"复用。
-    传入这个参数后，还会核对 pre_equilibration_fingerprint.json（由
-    pre_equilibrate() 写出）里记录的指纹是否与当前配置一致；不传时保持旧的
-    纯文件存在性判断（向后兼容，供尚未持有 system/ligand_indices 的调用点
-    使用）。
+
+def _checkpoint_probe_simulation(pipeline: "ABFEPipeline"):
+    """为 checkpoint 校验建一个一次性目标 Simulation（P1-07）。
+
+    OpenMM checkpoint 是 platform/version 相关的不透明二进制，只有"目标
+    Simulation 真的 loadCheckpoint 成功"才算数。这里按 pipeline 将要使用的
+    同一个 platform 建 Context——它能否加载，与下游 pre_equilibrate(resume)
+    的行为一致：probe 加载失败的 checkpoint，真正的消费方同样加载不了。
+    建不出来（platform 不可用等）时返回 None，调用方 fail closed。
+    """
+    cached = getattr(pipeline, _CHECKPOINT_PROBE_CACHE_ATTR, None)
+    if cached is not None:
+        return cached
+    import openmm.app as _app
+
+    try:
+        # Match the consumer's System and Integrator, including the barostat
+        # added by pre_equilibrate (checkpoint state depends on both).
+        probe_system = XmlSerializer.deserialize(XmlSerializer.serialize(pipeline.system))
+        ensure_barostat_for_protocol(
+            probe_system, pipeline.barostat_protocol,
+            temperature=pipeline.temperature, pressure=pipeline.pressure,
+        )
+        integrator = openmm.LangevinMiddleIntegrator(
+            pipeline.temperature, 1.0 / unit.picosecond,
+            PRE_EQUILIBRATION_TIMESTEP_PS * unit.picosecond,
+        )
+        platform_name, props = _build_platform_props(getattr(pipeline, "platform_name", None) or "CPU")
+        platform = openmm.Platform.getPlatformByName(platform_name)
+        probe = _app.Simulation(pipeline.topology, probe_system, integrator, platform, props)
+    except Exception as exc:
+        log.warning("⚠️ 无法为目标 platform 构建 checkpoint 校验 Simulation (%s)", exc)
+        return None
+    setattr(pipeline, _CHECKPOINT_PROBE_CACHE_ATTR, probe)
+    return probe
+
+
+def equilibrium_is_done(
+    output_dir: str,
+    expected_fingerprint: Optional[str] = None,
+    simulation=None,
+) -> bool:
+    """Only completed, identity-matching DCD/checkpoint pairs may be reused.
+
+    A target Simulation is mandatory: missing/unavailable probes fail closed.
+    DCDs must parse to EOF and checkpoints must load into the target Context.
+    With expected_fingerprint, require matching metadata and a completed state
+    with sufficient steps (or a documented convergence early stop).
     """
     traj = os.path.join(output_dir, "pre_equilibration.dcd")
     chk = os.path.join(output_dir, "checkpoints", "pre_equil.chk")
+    # [P1-07] 弱判据（大小阈值/文件存在）只保留为快速短路：连弱判据都不过
+    # 直接 False；过了弱判据还必须过下面的严格校验。
     if not (os.path.isfile(traj) and os.path.getsize(traj) > 10000 and os.path.isfile(chk)):
+        return False
+    try:
+        traj_cache_key = (traj, os.path.getsize(traj), os.stat(traj).st_mtime_ns)
+    except OSError:
+        traj_cache_key = None
+    if traj_cache_key is not None and traj_cache_key in _TRAJ_STRICT_VALIDITY_CACHE:
+        traj_is_valid = _TRAJ_STRICT_VALIDITY_CACHE[traj_cache_key]
+    else:
+        traj_is_valid = _is_traj_valid(traj, min_frames=1)
+        if traj_cache_key is not None:
+            _TRAJ_STRICT_VALIDITY_CACHE[traj_cache_key] = traj_is_valid
+    if not traj_is_valid:
+        log.warning(
+            "⚠️ %s 未通过真实 DCD parser 校验（截断/损坏/0 帧）。拒绝把它当成"
+            "已完成的预平衡复用，将重新执行预平衡。",
+            traj,
+        )
+        return False
+    if simulation is not None:
+        if not _is_checkpoint_valid(chk, simulation=simulation):
+            log.warning(
+                "⚠️ %s 无法被目标 Simulation loadCheckpoint（损坏/不属于当前 "
+                "System/Platform）。拒绝复用该预平衡，将重新执行。",
+                chk,
+            )
+            return False
+    else:
+        log.warning("⚠️ 缺少目标 Simulation，无法严格校验预平衡 checkpoint；拒绝判定完成")
         return False
     if expected_fingerprint is None:
         return True
@@ -695,6 +886,123 @@ def _cache_paths(output_dir: str, phase: str = "complex") -> Dict[str, str]:
     }
 
 
+def validate_openmm_cache_only(output_dir: str, phase: str = "complex") -> Dict:
+    """Fail closed on a migrated native OpenMM cache without GROMACS inputs.
+
+    This mode deliberately authenticates the serialized artifacts against the
+    manifest that travelled with them.  It does not claim that the unavailable
+    GROMACS dependency tree was revalidated on the new host; that limitation is
+    recorded explicitly in the returned audit payload.
+    """
+    if phase not in {"complex", "solvent"}:
+        raise ValueError(f"unsupported cache-only phase: {phase}")
+    paths = _cache_paths(output_dir, phase=phase)
+    manifest_path = os.path.join(
+        output_dir,
+        "system_cache_manifest.json" if phase == "complex" else "solvent_cache_manifest.json",
+    )
+    required = {
+        "system_xml": paths["xml"],
+        "topology": paths["top"],
+        "ligand_indices": paths["idx"],
+        "box_vectors": paths["box"],
+        "manifest": manifest_path,
+    }
+    missing = [path for path in required.values() if not os.path.isfile(path)]
+    if missing:
+        raise RuntimeError(
+            "--openmm-cache-only requires a complete migrated cache; missing: "
+            f"{missing}"
+        )
+    with open(manifest_path, encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    manifest_identity = manifest.get("identity")
+    manifest_identity_sha = manifest.get("identity_sha256")
+    if isinstance(manifest_identity, dict) and isinstance(manifest_identity_sha, str):
+        encoded_identity = json.dumps(
+            manifest_identity, sort_keys=True, separators=(",", ":")
+        ).encode()
+        if hashlib.sha256(encoded_identity).hexdigest() != manifest_identity_sha:
+            raise RuntimeError(
+                f"--openmm-cache-only {phase} manifest identity is not self-consistent"
+            )
+    actual_hashes = {
+        "system_xml_sha256": _sha256_file(paths["xml"]),
+        "topology_sha256": _sha256_file(paths["top"]),
+        "ligand_indices_sha256": _sha256_file(paths["idx"]),
+        "box_vectors_sha256": _sha256_file(paths["box"]),
+    }
+    for field in ("system_xml_sha256", "topology_sha256", "ligand_indices_sha256"):
+        recorded = manifest.get(field)
+        if not isinstance(recorded, str) or recorded != actual_hashes[field]:
+            raise RuntimeError(
+                f"--openmm-cache-only {phase} cache hash mismatch: {field}"
+            )
+    # Old solvent manifests did not bind box_vectors_solvent.npy.  We still
+    # validate its shape/finiteness below and record its current digest, while
+    # making the absent historical binding explicit in the audit.
+    recorded_box_hash = manifest.get("box_vectors_sha256")
+    if recorded_box_hash is not None and recorded_box_hash != actual_hashes["box_vectors_sha256"]:
+        raise RuntimeError(
+            f"--openmm-cache-only {phase} cache hash mismatch: box_vectors_sha256"
+        )
+
+    with open(paths["xml"], encoding="utf-8") as handle:
+        cached_system = XmlSerializer.deserialize(handle.read())
+    cached_cif = app.PDBxFile(paths["top"])
+    with open(paths["idx"], encoding="utf-8") as handle:
+        ligand_indices = [int(value) for value in json.load(handle)["ligand_indices"]]
+    positions_nm = np.asarray(
+        cached_cif.positions.value_in_unit(unit.nanometer), dtype=np.float64
+    )
+    box_nm = np.asarray(np.load(paths["box"]), dtype=np.float64)
+    n_particles = int(cached_system.getNumParticles())
+    n_topology_atoms = int(cached_cif.topology.getNumAtoms())
+    if (
+        positions_nm.shape != (n_particles, 3)
+        or n_topology_atoms != n_particles
+        or not np.all(np.isfinite(positions_nm))
+    ):
+        raise RuntimeError(
+            f"--openmm-cache-only {phase} System/topology/positions are not atomic"
+        )
+    if box_nm.shape != (3, 3) or not np.all(np.isfinite(box_nm)):
+        raise RuntimeError(f"--openmm-cache-only {phase} box is not a finite 3x3 matrix")
+    cif_box = cached_cif.topology.getPeriodicBoxVectors()
+    if cif_box is not None:
+        cif_box_nm = np.asarray(
+            cif_box.value_in_unit(unit.nanometer), dtype=np.float64
+        )
+        if not np.allclose(cif_box_nm, box_nm, rtol=0.0, atol=1.0e-6):
+            raise RuntimeError(
+                f"--openmm-cache-only {phase} CIF cell and box_vectors.npy differ"
+            )
+    if (
+        not ligand_indices
+        or len(set(ligand_indices)) != len(ligand_indices)
+        or min(ligand_indices) < 0
+        or max(ligand_indices) >= n_particles
+    ):
+        raise RuntimeError(f"--openmm-cache-only {phase} ligand indices are invalid")
+    audit = {
+        "protocol": "openmm-migrated-cache-only-v1",
+        "phase": phase,
+        "output_dir": os.path.abspath(output_dir),
+        "gromacs_dependency_tree_revalidated": False,
+        "manifest_path": os.path.abspath(manifest_path),
+        "manifest_sha256": _sha256_file(manifest_path),
+        "manifest_protocol_version": manifest.get("protocol_version"),
+        "manifest_identity_sha256": manifest.get("identity_sha256"),
+        "box_hash_was_bound_by_manifest": recorded_box_hash is not None,
+        "bonded_topology_reconstruction": "harmonic_bond_force_plus_constraints",
+        "artifact_hashes": actual_hashes,
+        "n_particles": n_particles,
+        "n_ligand_atoms": len(ligand_indices),
+    }
+    encoded = json.dumps(audit, sort_keys=True, separators=(",", ":"))
+    return {**audit, "audit_sha256": hashlib.sha256(encoded.encode()).hexdigest()}
+
+
 def _get_residue_name_by_atom_index(topology: app.Topology, atom_index: int) -> str:
     atoms = list(topology.atoms())
     if atom_index < 0 or atom_index >= len(atoms):
@@ -752,6 +1060,63 @@ def _resolve_mdtraj_topology_input(output_dir: str, gro_file: Optional[str], top
     raise FileNotFoundError(
         "无法为轨迹加载解析拓扑：未找到 topology.cif 缓存，也未提供有效的 --gro/--top。"
     )
+
+
+def _boresch_mdtraj_topology(pipeline, top_file=None, include_dir=None):
+    """Build a trajectory topology with authoritative ligand bonds, without moving atoms."""
+    import mdtraj as md
+
+    target_atoms = list(pipeline.topology.atoms())
+    ligand = set(int(i) for i in pipeline.ligand_indices)
+    if not ligand or min(ligand) < 0 or max(ligand) >= len(target_atoms):
+        raise ValueError("Boresch ligand indices 与拓扑不一致")
+    if top_file:
+        if not os.path.isfile(top_file):
+            raise FileNotFoundError(f"Boresch GROMACS 拓扑不存在: {top_file}")
+        source = load_gromacs_topology_for_openmm(
+            top_file, includeDir=include_dir,
+            periodicBoxVectors=pipeline.box_vectors,
+        ).topology
+        source_atoms = list(source.atoms())
+        if len(source_atoms) > len(target_atoms) or max(ligand) >= len(source_atoms):
+            raise ValueError("GROMACS 与轨迹拓扑原子数/配体索引不匹配")
+        for a, b in zip(source_atoms, target_atoms):
+            if (a.name, a.residue.name, a.element) != (b.name, b.residue.name, b.element):
+                raise ValueError(f"GROMACS 与轨迹拓扑原子顺序不一致: index={a.index}")
+        pairs = [(int(a.index), int(b.index)) for a, b in source.bonds()]
+        source_name = "gromacs_topology"
+    else:
+        # Cache-only runs still have real force-field bonds/constraints in the
+        # System. mmCIF's inferred ligand links are never authoritative.
+        pairs = []
+        for force in pipeline.system.getForces():
+            if isinstance(force, openmm.HarmonicBondForce):
+                pairs.extend(tuple(map(int, force.getBondParameters(i)[:2]))
+                             for i in range(force.getNumBonds()))
+        pairs.extend(tuple(map(int, pipeline.system.getConstraintParameters(i)[:2]))
+                     for i in range(pipeline.system.getNumConstraints()))
+        source_name = "system_bonds_and_constraints"
+    real_ligand_pairs = {tuple(sorted((a, b))) for a, b in pairs if a in ligand and b in ligand}
+    if not real_ligand_pairs:
+        raise ValueError("Boresch 缺少真实配体键；拒绝距离猜键")
+    # Build a copy and replace all ligand-internal bonds, including any mmCIF
+    # guesses, with the force-field graph. Keep appended co-ions and atom order.
+    fixed = app.Topology()
+    copied = {}
+    for chain in pipeline.topology.chains():
+        new_chain = fixed.addChain(chain.id)
+        for residue in chain.residues():
+            new_residue = fixed.addResidue(residue.name, new_chain, residue.id, residue.insertionCode)
+            for atom in residue.atoms():
+                copied[atom.index] = fixed.addAtom(atom.name, atom.element, new_residue, atom.id)
+    for a, b in pipeline.topology.bonds():
+        if not (a.index in ligand and b.index in ligand):
+            fixed.addBond(copied[a.index], copied[b.index])
+    for a, b in sorted(real_ligand_pairs):
+        fixed.addBond(copied[a], copied[b])
+    result = md.Topology.from_openmm(fixed)
+    log.info("Boresch 使用 %s 的 %d 条真实配体键", source_name, len(real_ligand_pairs))
+    return result
 
 
 def generate_ligand_xml_from_top(
@@ -1108,14 +1473,20 @@ def _insert_reserved_coalchemical_ion_dummies(
     box_nm = np.array(
         [v.value_in_unit(unit.nanometer) for v in box_vecs], dtype=np.float64
     )
-    inv_box = np.linalg.inv(box_nm)
-    lig_centroid_nm = pos_nm[list(ligand_atom_indices)].mean(axis=0)
+    # A raw arithmetic centroid is wrong when a ligand straddles a periodic
+    # boundary (it can land in the opposite side of the box).  Reconstruct the
+    # centroid in the same local image used by the co-ion geometry checks.
+    lig_indices = [int(i) for i in ligand_atom_indices]
+    if not lig_indices:
+        raise ValueError("插入 reserved co-ion 需要非空 ligand_atom_indices")
+    lig_origin = pos_nm[lig_indices[0]]
+    lig_offsets = minimum_image_displacement_nm(
+        pos_nm[lig_indices] - lig_origin, box_nm
+    )
+    lig_centroid_nm = lig_origin + lig_offsets.mean(axis=0)
 
     def _mic_delta(p: np.ndarray, q: np.ndarray) -> np.ndarray:
-        delta = p - q
-        frac = delta @ inv_box
-        frac -= np.round(frac)
-        return frac @ box_nm
+        return minimum_image_displacement_nm(p - q, box_nm)
 
     def _mic_distance(p: np.ndarray) -> float:
         return float(np.linalg.norm(_mic_delta(p, lig_centroid_nm)))
@@ -1124,7 +1495,9 @@ def _insert_reserved_coalchemical_ion_dummies(
         return float(np.linalg.norm(_mic_delta(p, q)))
 
     water_residues = [
-        res for res in modeller.topology.residues() if res.name in ("HOH", "WAT")
+        res
+        for res in modeller.topology.residues()
+        if str(res.name).strip().upper() in WATER_MOLECULE_NAMES
     ]
     if len(water_residues) < count:
         raise RuntimeError(
@@ -1381,8 +1754,12 @@ def build_and_cache_solvent_leg(
                 )
                 for i in probe_lig_indices
             )
+            if not np.isfinite(float(raw_q)):
+                raise RuntimeError(
+                    f"配体净电荷为 NaN/Inf ({raw_q!r})，拒绝确定 reserved co-ion 数量"
+                )
             lig_net_charge = int(round(raw_q))
-            if abs(raw_q - lig_net_charge) > 1.0e-3:
+            if abs(raw_q - lig_net_charge) > LIGAND_NET_CHARGE_INTEGER_TOLERANCE_E:
                 raise RuntimeError(
                     f"配体净电荷 {raw_q:+.6f} e 不接近整数（容差 1e-3 e），"
                     "无法确定需要几个 reserved co-ion dummy（§2.2）。"
@@ -1553,6 +1930,7 @@ def load_native_system(
     prefer_equilibrated: bool = True,
     expected_pre_equilibration_fingerprint: Optional[str] = None,
     require_bonded_topology: bool = False,
+    reconstruct_bonds_from_system: bool = False,
 ):
     """从 output_dir 的缓存文件加载系统（跳过 GROMACS 解析）
 
@@ -1646,6 +2024,28 @@ def load_native_system(
                 log.warning("  ⚠️ mmCIF 拓扑原子数 (%d) 与 System (%d) 不匹配，已丢弃缓存", n_cif, n_sys)
                 topology = None
             else:
+                if reconstruct_bonds_from_system:
+                    atoms = list(topology.atoms())
+                    existing_pairs = {
+                        tuple(sorted((int(bond.atom1.index), int(bond.atom2.index))))
+                        for bond in topology.bonds()
+                    }
+                    recovered_pairs = set()
+                    for force in system.getForces():
+                        if not isinstance(force, openmm.HarmonicBondForce):
+                            continue
+                        for bond_index in range(force.getNumBonds()):
+                            i, j, _length, _k = force.getBondParameters(bond_index)
+                            recovered_pairs.add(tuple(sorted((int(i), int(j)))))
+                    for constraint_index in range(system.getNumConstraints()):
+                        i, j, _distance = system.getConstraintParameters(constraint_index)
+                        recovered_pairs.add(tuple(sorted((int(i), int(j)))))
+                    for i, j in sorted(recovered_pairs - existing_pairs):
+                        topology.addBond(atoms[i], atoms[j])
+                    log.info(
+                        "  ✓ 从 System HarmonicBondForce/constraints 恢复 %d 条缺失拓扑连接",
+                        len(recovered_pairs - existing_pairs),
+                    )
                 # 🔑 键数校验：只校验原子数是不够的。mmCIF 不保存非标准残基的键，
                 # 读回时只有 createStandardBonds() 能补标准残基，脂质/配体/离子的键
                 # 会静默丢失，而 PBC 分子完整性修复正是靠键判断分子边界。
@@ -1956,6 +2356,11 @@ class RunConfig:
         preset = PRESET_CONFIGS.get(args.preset, PRESET_CONFIGS["production"]).copy()
 
         # 2. 合并配置文件（支持 .json / .yaml / .yml）
+        #
+        # 2026-08-24：这里曾经加过一个 unknown-key 校验（不认识的字段直接
+        # raise ValueError），本意是抓 typo；已撤掉——它是一个新增的、会在启动期
+        # 直接炸掉 resume 的硬门，用户明确要求关掉，不要让任何新加的校验有阻断
+        # resume 的风险。恢复成最简单的直接合并，不做字段名校验。
         if hasattr(args, "config") and args.config:
             file_conf = _load_config(args.config)
             for k, v in file_conf.items():
@@ -1973,6 +2378,8 @@ class RunConfig:
             preset["n_steps_per_window"] = args.n_steps_per_window
         if _flag_present("--steps-per-update"):
             preset["steps_per_update"] = args.steps_per_update
+        if _flag_present("--n-equil-steps"):
+            preset["n_equil_steps"] = args.n_equil_steps
         if _flag_present("--n-states-per-stage"):
             preset["stage1_n_states"] = args.n_states_per_stage
             preset["stage2_n_states"] = args.n_states_per_stage
@@ -1981,6 +2388,17 @@ class RunConfig:
             preset["stage1_n_states"] = args.stage1_n_states
         if _flag_present("--stage2-n-states"):
             preset["stage2_n_states"] = args.stage2_n_states
+        # 独立于探针网格密度——最终生产窗口数，见 abfe_preoptimizer 里
+        # VANISHING_FINAL_STATE_COUNT 的说明；不传就是 None，pipeline 内部用
+        # optimize_stage2_vanishing 自己的默认值（23），行为不变。
+        if _flag_present("--stage2-final-n-states"):
+            preset["stage2_final_n_states"] = args.stage2_final_n_states
+        if _flag_present("--stage2-refine-extra-points"):
+            preset["stage2_refine_extra_points_per_segment"] = args.stage2_refine_extra_points
+        if _flag_present("--stage2-window-min-states"):
+            preset["stage2_window_min_states"] = args.stage2_window_min_states
+        if _flag_present("--stage2-window-max-states"):
+            preset["stage2_window_max_states"] = args.stage2_window_max_states
         if _flag_present("--temperature"):
             preset["temperature"] = args.temperature
         if _flag_present("--solvent-ionic-strength-molar"):
@@ -2070,11 +2488,27 @@ class RunConfig:
         if _flag_present("--only-boresch-attachment"):
             preset["only_boresch_attachment"] = bool(args.only_boresch_attachment)
 
+        # The formal product has one user-facing boolean.  Keep the temporary
+        # EXP-030 key as a read-only compatibility alias for old config files,
+        # but never expose it as a second runtime switch.  If both spellings
+        # are present, an actual disagreement is a hard configuration error.
+        if _flag_present(
+            "--outer-lambda-local-residual-ibs",
+            "--no-outer-lambda-local-residual-ibs",
+        ):
+            preset["outer_lambda_local_residual_ibs"] = bool(
+                args.outer_lambda_local_residual_ibs
+            )
+
         # ---- 膜体系（B1）。配置键按 memtodolist §3.1：顶层 system_type + 嵌套 membrane.* ----
         if _flag_present("--system-type"):
             preset["system_type"] = args.system_type
         if _flag_present("--charge-treatment"):
             preset["charge_treatment"] = args.charge_treatment
+        if _flag_present("--charge-transfer-reservoir-correction"):
+            preset["charge_transfer_reservoir_correction"] = (
+                args.charge_transfer_reservoir_correction
+            )
         if _flag_present("--co-alchemical-ion"):
             preset["co_alchemical_ion"] = args.co_alchemical_ion
         if _flag_present("--apbs-evidence"):
@@ -2102,6 +2536,7 @@ class RunConfig:
             merged_membrane.update(_membrane_overrides)
             preset["membrane"] = merged_membrane
 
+        _product_key_explicit = "outer_lambda_local_residual_ibs" in preset
         defaults = {
             "resume": False,
             "reset": False,
@@ -2144,6 +2579,7 @@ class RunConfig:
             "membrane_quality_gate": None,
             # 净电荷协议默认由配体净电荷推导（§1.2 生产默认值）。
             "charge_treatment": None,
+            "charge_transfer_reservoir_correction": None,
             "co_alchemical_ion": None,
             "apbs_evidence": None,
             # LJ/色散：soluble 不声明 = legacy_uniform_density_lrc（行为不变）。
@@ -2151,9 +2587,36 @@ class RunConfig:
             "forcefield_family": None,
             "force_switch_deviation_evidence": None,
             "membrane_input_declaration": None,
+            # Product switch: the legacy path remains byte-for-byte disabled.
+            "outer_lambda_local_residual_ibs": False,
         }
         for key, value in defaults.items():
             preset.setdefault(key, value)
+
+        residual_key = "residual_sampling_enabled"
+        product_key = "outer_lambda_local_residual_ibs"
+        legacy_present = residual_key in preset
+        product_present = _product_key_explicit
+        if legacy_present:
+            legacy_value = preset[residual_key]
+            if not isinstance(legacy_value, bool):
+                raise TypeError(f"{residual_key} 必须是 bool")
+        if product_present:
+            product_value = preset[product_key]
+            if not isinstance(product_value, bool):
+                raise TypeError(f"{product_key} 必须是 bool")
+        if legacy_present and product_present and bool(preset[residual_key]) != bool(
+            preset[product_key]
+        ):
+            raise ValueError(
+                "outer_lambda_local_residual_ibs 与旧版 residual_sampling_enabled "
+                "同时存在但取值冲突；拒绝继续"
+            )
+        if legacy_present and not product_present:
+            preset[product_key] = bool(preset[residual_key])
+        # Do not let the temporary name become a second user-visible config
+        # field or be consumed by downstream code.
+        preset.pop(residual_key, None)
 
         # 复合物腿默认启用 Boresch；若用户未显式指定来源，则默认走自动估算。
         if preset.get("boresch") is None:
@@ -2262,7 +2725,7 @@ def _write_run_provenance(
             provenance["closes_thermodynamic_cycle"] = False
             provenance["must_not_report_delta_g_bind"] = True
             provenance["incomplete_cycle_reason"] = (
-                "charge_transfer_solvent_leg_builder_not_implemented_phase_b4"
+                "charge_transfer_tethered_carrier_reservoir_correction_not_validated"
             )
     if co_alchemical_ions is not None:
         provenance["co_alchemical_ions"] = co_alchemical_ions
@@ -2419,6 +2882,7 @@ def _coion_leg_protocol_signature(spec: Dict) -> Dict:
                         "form",
                         "expression",
                         "reference_frame",
+                        "box_model",
                         "k_kj_per_mol_nm2",
                         "flat_bottom_radius_nm",
                         "force_group",
@@ -2582,6 +3046,7 @@ def _sanitize_boresch_params(params: Dict) -> Dict:
         "force_constant_clip_ranges",
         "force_constant_clipped",
         "equilibrium_update_error",
+        "real_bond_protocol_version",
     ):
         if isinstance(params, dict) and key in params:
             cleaned[key] = params[key]
@@ -2631,6 +3096,7 @@ def _sanitize_boresch_params_strict(params: Dict) -> Dict:
 
 
 BORESCH_GEOMETRY_CONVENTION_VERSION = 2
+BORESCH_REAL_BOND_PROTOCOL_VERSION = 1
 
 
 def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Optional[Dict]:
@@ -2661,7 +3127,13 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
         requested_steps=_n_equil_steps,
         barostat_protocol=pipeline.barostat_protocol,
     )
-    if not config.reset and equilibrium_is_done(output_dir, expected_fingerprint=_equil_fingerprint):
+    if not config.reset and equilibrium_is_done(
+        output_dir,
+        expected_fingerprint=_equil_fingerprint,
+        # [P1-07] 用 pipeline 自己的 platform 建一次性目标 Simulation，
+        # checkpoint 以真实 loadCheckpoint 成功为准。
+        simulation=_checkpoint_probe_simulation(pipeline),
+    ):
         log.info("♻️ 基线预平衡已完成，复用已有轨迹")
     else:
         log.info("▶️ 执行基线预平衡")
@@ -2706,13 +3178,17 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
                 cache_convention,
                 BORESCH_GEOMETRY_CONVENTION_VERSION,
             )
+        elif source in ("simple", "fluctuation") and params.get("real_bond_protocol_version") != BORESCH_REAL_BOND_PROTOCOL_VERSION:
+            log.warning("Boresch 缓存没有真实配体键来源，将使用力场键图重新估计锚点。")
         else:
             return _sanitize_boresch_params_strict(params)
 
     traj_file = os.path.join(output_dir, "pre_equilibration.dcd")
     if not os.path.exists(traj_file):
         raise RuntimeError("预平衡轨迹不存在，无法估算 Boresch 参数")
-    traj_top = _resolve_mdtraj_topology_input(output_dir, config.gro, config.top)
+    traj_top = _boresch_mdtraj_topology(
+        pipeline, config.top, getattr(config, "gmx_include_dir", None) or find_gmx_include_dir(getattr(config, "gmx_path", None))
+    )
 
     # 根据来源调用不同估算器
     if source == "auto":
@@ -2747,11 +3223,14 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
     elif source in ("simple", "fluctuation"):
         # ✅ 传统方法：纯几何涨落估算 (mdtraj 距离/角度/二面角方差 + 等配分定理)，
         # 不加载任何力场/ML 势，不需要 MACE-OFF 许可证。"simple" 是 "fluctuation" 的别名。
-        estimator = GeometricRestraintEstimator(temperature=config.temperature)
+        estimator = GeometricRestraintEstimator(
+            temperature=config.temperature, allow_geometric_bond_fallback=False
+        )
         import mdtraj as md
         traj = md.load(traj_file, top=traj_top)
         boresch = estimator.estimate_from_trajectory(traj, config.ligand, output_path=boresch_file)
         boresch["geometry_convention_version"] = BORESCH_GEOMETRY_CONVENTION_VERSION
+        boresch["real_bond_protocol_version"] = BORESCH_REAL_BOND_PROTOCOL_VERSION
     else:
         raise ValueError(f"未识别的 Boresch 来源: {source}")
 
@@ -2917,6 +3396,12 @@ def parse_arguments():
     # 运行模式
     parser.add_argument("--resume", action="store_true", help="从 Checkpoint 恢复运行")
     parser.add_argument("--reset", action="store_true", help="忽略所有缓存，强制重新开始")
+    parser.add_argument(
+        "--openmm-cache-only",
+        action="store_true",
+        help="迁移服务器专用：验证并复用 output 中现有 OpenMM XML/CIF/index/box 缓存，"
+             "不解析已不可用的 GROMACS include 树；--reset 仍会重置后续采样",
+    )
 
     # 策略选择
     parser.add_argument("--mode", default="ibs", choices=["ibs", "traditional"],
@@ -2928,6 +3413,16 @@ def parse_arguments():
     )
     parser.add_argument("--potential", default="softcore", choices=["softcore", "dexp"])
     parser.add_argument("--dexp-params", default=None, help="DEXP 参数文件 (JSON)")
+    parser.add_argument(
+        "--outer-lambda-local-residual-ibs",
+        dest="outer_lambda_local_residual_ibs",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            f"启用 {OUTER_LAMBDA_RESIDUAL_FEATURE_NAME}；默认关闭。"
+            "启用后仅接入 dual_lambda 的 Stage-2 VDW，并自动采用残差-free twin EM。"
+        ),
+    )
     # 仅影响 --decoupling=dual_lambda 的 Stage 1 (去电荷)；Stage 2 (去VDW)/
     # single_lambda/2d_diagonal/2d_geodesic 不受影响，接口保持原样。
     #   - "pme"（默认，原有接口/行为不变）：IBS-CustomNonbondedForce 对
@@ -2974,15 +3469,27 @@ def parse_arguments():
     parser.add_argument("--steps-per-update", type=int, default=None)
     parser.add_argument("--n-states-per-stage", type=int, default=None, help="每阶段 λ 状态数（同时设置两阶段）")
     parser.add_argument("--stage1-n-states", type=int, default=None, help="去电荷阶段 λ 状态数，优先级高于 --n-states-per-stage")
-    parser.add_argument("--stage2-n-states", type=int, default=None, help="去VDW阶段 λ 状态数，优先级高于 --n-states-per-stage")
+    parser.add_argument("--stage2-n-states", type=int, default=None, help="去VDW阶段 Fisher 探针网格点数（不是最终生产窗口数），优先级高于 --n-states-per-stage")
+    parser.add_argument("--stage2-final-n-states", type=int, default=None, help="去VDW阶段最终生产窗口数，独立于 --stage2-n-states；默认 23（走手工验证过的窗口分组）。传别的值会用新的通用分组算法，2026-08-27 添加，尚未在真机验证过——第一次用时请检查 window 0 的 ESS")
+    parser.add_argument("--stage2-refine-extra-points", type=int, default=None, help="去VDW阶段 Fisher 探针在陡峭段自动加密时每段插入的额外探针点数；默认 4")
+    parser.add_argument("--stage2-window-min-states", type=int, default=None, help="去VDW阶段每个窗口最少多少态（仅在 --stage2-final-n-states 设成非 23 时生效）；默认 4")
+    parser.add_argument("--stage2-window-max-states", type=int, default=None, help="去VDW阶段每个窗口最多多少态（仅在 --stage2-final-n-states 设成非 23 时生效）；默认 6")
     parser.add_argument("--temperature", type=float, default=300.0)
+    parser.add_argument(
+        "--n-equil-steps",
+        type=int,
+        default=None,
+        help="预平衡步数；覆盖配置文件中的 n_equil_steps",
+    )
     parser.add_argument(
         "--solvent-ionic-strength-molar",
         type=float,
         default=None,
         help="溶剂腿 NaCl 浓度 (M)，默认 0.15；另加必要反离子保持中性",
     )
-    parser.add_argument("--platform", default="CUDA", choices=["CUDA", "OpenCL", "CPU"])
+    # Accept explicit OpenMM device specifications such as CUDA:1/OpenCL:0.
+    # The base platform and DeviceIndex are validated by _build_platform_props.
+    parser.add_argument("--platform", default="CUDA")
 
     # ---- 膜受体体系（memtodolist §3.1/§3.2，B1）。默认 soluble，不传等于关闭 ----
     # ⚠️ 这里的 --system-type 是**环境类型**（soluble/membrane），决定用哪种
@@ -3057,6 +3564,14 @@ def parse_arguments():
         ),
     )
     parser.add_argument(
+        "--charge-transfer-reservoir-correction",
+        default=None,
+        help=(
+            "charge-transfer 双腿 carrier reservoir-release correction JSON 路径；"
+            "必须包含 temperature_K、两腿收敛释放自由能及 C4/C5 扫描证据"
+        ),
+    )
+    parser.add_argument(
         "--co-alchemical-ion",
         default=None,
         help=(
@@ -3118,7 +3633,11 @@ def parse_arguments():
     parser.add_argument("--enable-gradual-warmup", action="store_true")
     parser.add_argument("--disable-warmup", action="store_true")
     parser.add_argument("--warmup-steps", type=int, default=500000)
-    parser.add_argument("--n-workers", type=int, default=None)
+    parser.add_argument(
+        "--n-workers", type=int, default=None,
+        help="⚠️ 当前无效：从未被 run_full_pipeline/_run_dual_lambda_stage 消费，"
+        "设置非默认值只会在运行时打印一条忽略警告，不会产生任何并行。",
+    )
     parser.add_argument("--analyze-only", action="store_true", help="仅分析已有 .npy")
     parser.add_argument("--parallel-stages", action="store_true", help="并行执行去电荷和去VDW阶段")
     parser.add_argument(
@@ -3279,6 +3798,152 @@ def _resolve_production_qualification_from_sources(*sources: Dict) -> Dict:
     return dict(expected)
 
 
+def _analyze_dual_leg_artifacts(base_dir, temperature, *, expected_context=None):
+    """Read-only recovery through the same stage/window contracts as production."""
+    import inspect
+    import abfe_pipeline as pipeline_module
+    import ibs_engine as engine
+
+    temperature_K = float(temperature.value_in_unit(unit.kelvin) if hasattr(temperature, "value_in_unit") else temperature)
+    kt = float((unit.MOLAR_GAS_CONSTANT_R * temperature_K * unit.kelvin).value_in_unit(unit.kilojoule_per_mole))
+    context_path = os.path.join(base_dir, "checkpoints", "analysis_context.json")
+    if expected_context is None:
+        with open(context_path, encoding="utf-8") as handle:
+            context_doc = json.load(handle)
+        if context_doc != pipeline_module._protocol_fingerprint(context_doc.get("payload")):
+            raise ValueError("analysis_context fingerprint 不匹配")
+        expected_context = context_doc["payload"]
+    stage_protocols = expected_context["stage_protocol_keys"]
+    validator = ABFEPipeline.__new__(ABFEPipeline)
+    total_dg, total_var = 0.0, 0.0
+    stages = {}
+    for number, (name, kind) in enumerate((("decharging", "coul"), ("vanishing", "vdw")), 1):
+        expected_key = stage_protocols[name]
+        if expected_key != pipeline_module._protocol_fingerprint(expected_key.get("payload")):
+            raise ValueError(f"{name} 预期 protocol_key fingerprint 不匹配")
+        protocol = expected_key["payload"]
+        for key, value in pipeline_module._stage_analysis_protocol_versions(name).items():
+            if protocol.get(key) != value:
+                raise ValueError(f"{name} 当前协议 {key} 不匹配，拒绝旧 Hamiltonian/分析结果")
+        if float(protocol["temperature_K"]) != temperature_K:
+            raise ValueError(f"{name} 分析温度与采样协议不匹配")
+        for field in ("constraint_identity", "co_alchemical_ion_runtime_identity", "charge_transfer_reservoir_correction"):
+            if protocol.get(field) != expected_context.get(field):
+                raise ValueError(f"{name} {field} 身份与本腿不匹配")
+        if protocol.get("boresch_params") != stage_protocols["decharging"]["payload"].get("boresch_params"):
+            raise ValueError("两阶段 Boresch 采样身份不一致")
+        checkpoint_dir = os.path.join(base_dir, "checkpoints")
+        with open(os.path.join(checkpoint_dir, f"preopt_dual_{name}.json"), encoding="utf-8") as handle:
+            path = json.load(handle)
+        lambdas = path["lambdas_var"]
+        ranges = path["window_ranges"]
+        n_states = len(lambdas)
+        if (n_states < 2 or not ranges or lambdas[0] != 1.0 or lambdas[-1] != 0.0
+                or not np.all(np.isfinite(lambdas)) or np.any(np.diff(lambdas) >= 0)):
+            raise ValueError(f"{name} 预期 lambda 路径/窗口覆盖非法")
+        covered = set()
+        for start, end in ranges:
+            if not 0 <= start < end <= n_states:
+                raise ValueError(f"{name} window_ranges 越界")
+            covered.update(range(start, end))
+        if covered != set(range(n_states)):
+            raise ValueError(f"{name} window_ranges 未覆盖全部 lambda 态")
+        stage_path = os.path.join(checkpoint_dir, f"stage{number}_{name}.json")
+        cached = None
+        if os.path.isfile(stage_path):
+            with open(stage_path, encoding="utf-8") as handle:
+                cached = validator._validate_stage_checkpoint(json.load(handle), name, expected_key, lambdas, ranges)
+        stage_dir = os.path.join(base_dir, name)
+        is_ibs = kind == "vdw" or protocol.get("decharge_method") != "pme"
+        window_kind = "shadow_coul" if protocol.get("decharge_method") == "shadow_ibs" else kind
+        if is_ibs:
+            config = protocol["run_config"]
+            kwargs = {} if window_kind == "shadow_coul" else (config.get("kwargs") or {})
+            defaults = inspect.signature(engine.IBSWindowManagerDualLambda.run_all_windows).parameters
+            def setting(key):
+                return kwargs.get(key, defaults[key].default)
+            early_keys = ("min_steps", "check_interval_steps", "required_consecutive_passes", "min_ess_ratio",
+                          "min_absolute_ess", "min_decorrelated_samples", "max_delta_g_drift_kJ_mol", "max_uncertainty_kJ_mol")
+            expected_window_protocol = dict(
+                repair_policy=protocol["sampling_repair_policy"],
+                lse_log_residual_tolerance=kwargs.get("ibs_lse_log_residual_tolerance", defaults["lse_log_residual_tolerance"].default),
+                enable_early_stop=window_kind != "shadow_coul" and bool(config.get("enable_early_stop", False)),
+                current_early_stop_config={key: setting("early_stop_" + key) for key in early_keys},
+                effective_target_steps=int(config["n_steps_per_window"]),
+                current_coion_identity=expected_context.get("co_alchemical_ion_runtime_identity"),
+                current_stage_protocol_key=expected_key,
+            )
+            # The production route replaces the final vdW window with a
+            # separately sampled endpoint segment. Never invent its frames.
+            excluded = {len(ranges)-1} if kind == "vdw" else set()
+            windows = engine.load_ibs_window_outputs_from_dir(
+                stage_dir, ranges, lambdas if kind == "coul" else [0.0]*n_states,
+                [1.0]*n_states if kind == "coul" else lambdas,
+                checkpoint_dir=checkpoint_dir, stage_type=window_kind,
+                excluded_local_windows=excluded,
+                expected_window_protocol=expected_window_protocol,
+                current_sampling_score_sha256=((protocol.get("run_config") or {}).get("residual_sampling") or {}).get("sampling_score_sha256") if kind == "vdw" else None,
+            )
+            endpoint = None
+            if kind == "vdw":
+                try:
+                    endpoint = pipeline_module._endpoint_analysis_artifact(
+                        checkpoint_dir, stage_protocol_key=expected_key,
+                        lambda_path_fingerprint=validator._lambda_path_fingerprint(lambdas, ranges),
+                    )
+                except FileNotFoundError as exc:
+                    raise RuntimeError("回退分析拒绝用纯 IBS 窗口产出 vanishing 主值；缺少已验证的独立端点拼接结果") from exc
+            if cached is None:
+                if protocol.get("decharge_method") == "shadow_ibs":
+                    raise RuntimeError("Shadow-IBS 回退缺少已验证的 bridge + IBS 阶段结果，不能只累计 IBS 段")
+                gates = dict(protocol.get("final_gate_thresholds") or {})
+                gates.pop("target_support_gate_protocol_version", None)
+                cached = engine.solve_stage_integrated(windows, kt, **gates)
+                if endpoint is not None:
+                    cached = engine.combine_ibs_and_independent_endpoint(
+                        cached, endpoint["solve_all"], endpoint["wet_dry_gate"], n_states=n_states,
+                        target_support_min_absolute_ess=gates.get("final_min_target_absolute_ess"),
+                    )
+                    cached["independent_endpoint_diagnostics"] = endpoint["diagnostics"]
+                cached["stage"] = name
+                cached["lambda_endpoint_diagnostics"] = pipeline_module._stage_lambda_endpoint_diagnostics(
+                    name, lambdas if kind == "coul" else [0.0]*n_states,
+                    [1.0]*n_states if kind == "coul" else lambdas,
+                )
+                validator._populate_stage_diagnostics(cached)
+                validator._assert_stage_result_sane(name, cached)
+                pipeline_module._assert_sampling_result_converged(cached, context=name)
+        elif cached is None:
+            raise RuntimeError("PME decharging 缺少协议验证后的 stage checkpoint；不能用 IBS 回退")
+        stages[name] = cached
+        total_dg += float(cached["total_delta_G"])
+        total_var += float(cached["total_error"])**2
+    if stage_protocols["decharging"]["payload"].get("boresch_params"):
+        with open(os.path.join(base_dir, "checkpoints", "stage0_attachment.json"), encoding="utf-8") as handle:
+            attachment_doc = json.load(handle)
+        restraint = pipeline_module._preopt_boresch_protocol_payload(stage_protocols["decharging"]["payload"]["boresch_params"])
+        attachment_key = attachment_doc.get("protocol_key", {})
+        if pipeline_module._protocol_fingerprint_ignoring_code_hash(attachment_key) != pipeline_module._protocol_fingerprint_ignoring_code_hash(expected_context.get("attachment_protocol_key")):
+            raise ValueError("Boresch attachment 与当前 attachment 协议不匹配")
+        if attachment_key != pipeline_module._protocol_fingerprint(attachment_key.get("payload")) or attachment_key["payload"].get("boresch_params") != restraint:
+            raise ValueError("Boresch attachment protocol_key 不匹配")
+        for field in ("temperature_K", "system_xml_sha256", "topology_sha256", "ligand_indices", "constraint_identity"):
+            if attachment_key["payload"].get(field) != stage_protocols["decharging"]["payload"].get(field):
+                raise ValueError(f"Boresch attachment {field} 与采样协议不匹配")
+        dg, error = pipeline_module.validate_boresch_attachment_result(attachment_doc["result"])
+        total_dg += dg
+        total_var += error**2
+    return dict(
+        decoupling_delta_G_kJ_mol=total_dg, total_error_kJ_mol=float(np.sqrt(total_var)),
+        constraint_identity=expected_context["constraint_identity"],
+        charge_treatment=expected_context.get("charge_treatment"),
+        charge_transfer_reservoir_correction=expected_context.get("charge_transfer_reservoir_correction"),
+        co_alchemical_ion_runtime_identity=expected_context.get("co_alchemical_ion_runtime_identity"),
+        ligand_conformer_diagnostics=expected_context.get("ligand_conformer_diagnostics"),
+        stage_results=stages, analysis_context=expected_context,
+    )
+
+
 def run_post_analysis(args):
     output_dir = args.output
     if not os.path.exists(output_dir):
@@ -3294,6 +3959,43 @@ def run_post_analysis(args):
             raise RuntimeError(
                 f"run provenance {_run_provenance_path} is not a JSON object"
             )
+    else:
+        log.warning(
+            "⚠️ analyze-only：找不到 %s，无法恢复原运行的协议身份"
+            "（temperature/mode/decoupling 取自本次命令/预设默认值）。",
+            _run_provenance_path,
+        )
+
+    # 🔑 [P1-04] 协议身份恢复：原运行是 310 K / 非 default 路线时，analyze-only
+    # 若直接用本次命令的默认值，会算出错误的 kT/Boresch 修正或走错分析分支。
+    # 规则：默认从 run_provenance.json 恢复原运行值；只有本次命令行**显式**
+    # 传了对应 flag 才允许覆盖，且覆盖行为必须留审计记录。
+    _provenance_cfg = _run_provenance.get("config") or {}
+    _explicit_cli_flags = {
+        token[2:].split("=", 1)[0]
+        for token in sys.argv[1:]
+        if token.startswith("--")
+    }
+    for _key in ("temperature", "mode", "decoupling"):
+        _prov_value = _provenance_cfg.get(_key)
+        _current_value = getattr(args, _key, None)
+        if _key in _explicit_cli_flags:
+            if _prov_value is not None and str(_prov_value) != str(_current_value):
+                log.warning(
+                    "📋 [analyze-only 审计] 显式覆盖原运行的 %s：%s → %s"
+                    "（原值来自 run_provenance.json）",
+                    _key, _prov_value, _current_value,
+                )
+            continue
+        if _prov_value is None or str(_prov_value) == str(_current_value):
+            continue
+        log.info(
+            "♻️ [analyze-only] 从 run_provenance.json 恢复原运行的 %s=%s"
+            "（本次命令默认 %s，未显式覆盖；如需覆盖请显式传 --%s）",
+            _key, _prov_value, _current_value, _key,
+        )
+        setattr(args, _key, _prov_value)
+
     temp = args.temperature * unit.kelvin
     kt = (unit.MOLAR_GAS_CONSTANT_R * temp).value_in_unit(unit.kilojoule_per_mole)
     def _load_boresch_params(base_dir: str):
@@ -3310,143 +4012,21 @@ def run_post_analysis(args):
         return None
 
     def _analyze_dual_leg(base_dir: str) -> Dict:
-        stages = ["coul", "vdw"]
-        stage_name_map = {"coul": "decharging", "vdw": "vanishing"}
-        total_dg = 0.0
-        total_err_sq = 0.0
-        for stage in stages:
-            stage_name = stage_name_map[stage]
-            stage_dir = os.path.join(base_dir, stage_name)
-            if not os.path.exists(stage_dir):
-                raise FileNotFoundError(f"缺少阶段目录: {stage_dir}")
-            window_data = []
-
-            stage_checkpoint = os.path.join(
-                base_dir,
-                "checkpoints",
-                "stage1_decharging.json" if stage == "coul" else "stage2_vanishing.json",
-            )
-            if os.path.exists(stage_checkpoint):
-                with open(stage_checkpoint) as f:
-                    cached_stage = json.load(f)
-                # 🔑 之前用 .get("total_delta_G", 0.0)/.get("total_error", 0.0)
-                # 静默补 0——一份损坏或旧格式（缺字段）的 checkpoint 会让整段腿
-                # 被悄悄算成 0 kJ/mol 而不是报错，且没有下游门槛会发现这个 0 是
-                # 假的。这里要求两个字段都必须存在、是数值类型、且有限，否则
-                # fail closed；同时校验落盘时记录的 stage 名与当前正在分析的
-                # stage_name 一致，防止一份属于另一阶段的 checkpoint 被张冠李戴
-                # 读取（例如目录被手动拷贝/合并过）。
-                if cached_stage.get("stage") not in (None, stage_name):
-                    raise RuntimeError(
-                        f"阶段 checkpoint {stage_checkpoint} 记录的 stage="
-                        f"{cached_stage.get('stage')!r} 与当前分析的阶段 "
-                        f"{stage_name!r} 不一致，拒绝把它当作本阶段结果使用。"
-                    )
-                dg_raw = cached_stage.get("total_delta_G")
-                err_raw = cached_stage.get("total_error")
-                if not isinstance(dg_raw, (int, float)) or not isinstance(err_raw, (int, float)):
-                    raise RuntimeError(
-                        f"阶段 checkpoint {stage_checkpoint} 缺少或类型错误的 "
-                        f"total_delta_G/total_error（{dg_raw!r}/{err_raw!r}）；拒绝"
-                        "用默认值 0.0 静默把这段腿算成 0，请检查该 checkpoint 是否"
-                        "损坏或来自旧格式。"
-                    )
-                dg_raw = float(dg_raw)
-                err_raw = float(err_raw)
-                if not (np.isfinite(dg_raw) and np.isfinite(err_raw) and err_raw >= 0.0):
-                    raise RuntimeError(
-                        f"阶段 checkpoint {stage_checkpoint} 的 total_delta_G/total_error "
-                        f"非有限或不确定度为负（{dg_raw}/{err_raw}）；拒绝静默使用。"
-                    )
-                total_dg += dg_raw
-                total_err_sq += err_raw ** 2
-                continue
-
-            preopt_file = os.path.join(base_dir, "checkpoints", f"preopt_dual_{stage_name}.json")
-            window_ranges = []
-            if os.path.exists(preopt_file):
-                try:
-                    with open(preopt_file) as f:
-                        window_ranges = json.load(f).get("window_ranges", [])
-                except Exception as e:
-                    log.warning("读取 preopt 缓存失败 (%s): %s", preopt_file, e)
-
-            e_files_raw = glob.glob(os.path.join(stage_dir, f"dual_window_*_{stage}_energies.npy"))
-            if not e_files_raw and not os.path.exists(stage_checkpoint):
-                raise FileNotFoundError(f"阶段 {stage_name} 缺少可分析的能量文件: {stage_dir}")
-            # 🔑 之前这里对 glob 结果做普通字符串排序、再用 enumerate 的位置索引当
-            # window_idx——窗口数达到两位数时 window_10/window_11 会排到
-            # window_1/window_2 前面，中间缺一个文件时后续全部错位。改为从文件名
-            # 正则解析真实窗口编号（跟 abfe_pipeline.py 里清理窗口产物时用的同一
-            # 套正则 dual_window_(\d+)_{stage_type}_energies\.npy$ 一致），按数值
-            # 排序，并要求编号从 0 连续到 N-1，缺一个都拒绝继续（不能悄悄错配）。
-            _window_idx_re = re.compile(rf"dual_window_(\d+)_{stage}_energies\.npy$")
-            indexed_e_files = []
-            for e_file in e_files_raw:
-                m = _window_idx_re.search(os.path.basename(e_file))
-                if not m:
-                    raise RuntimeError(f"无法从文件名解析窗口编号: {e_file}")
-                indexed_e_files.append((int(m.group(1)), e_file))
-            indexed_e_files.sort(key=lambda pair: pair[0])
-            parsed_indices = [idx for idx, _ in indexed_e_files]
-            if parsed_indices and parsed_indices != list(range(len(parsed_indices))):
-                raise RuntimeError(
-                    f"阶段 {stage_name} 的窗口能量文件编号不连续或有缺失"
-                    f"（解析得到 {parsed_indices}），拒绝在窗口缺失/错位的情况下"
-                    "继续分析（此前会静默按字符串排序位置错配窗口）。"
-                )
-            for w_idx, e_file in indexed_e_files:
-                u_kn = np.load(e_file)
-                bias_path = e_file.replace("_energies.npy", "_bias.npy")
-                base_path = e_file.replace("_energies.npy", "_base.npy")
-                if not os.path.exists(bias_path):
-                    raise RuntimeError(f"缺少 IBS bias 能量文件: {bias_path}")
-                if not os.path.exists(base_path):
-                    raise RuntimeError(f"缺少 base 能量文件: {base_path}")
-                if w_idx < len(window_ranges):
-                    start, end = window_ranges[w_idx]
-                    real_indices = list(range(start, end))
-                else:
-                    real_indices = list(range(u_kn.shape[0]))
-                window_data.append(
-                    {
-                        "u_kn": u_kn,
-                        "bias_energies": np.load(bias_path),
-                        "base_energies": np.load(base_path),
-                        "lambda_indices": real_indices,
-                    }
-                )
-            if window_data:
-                res = solve_stage_integrated(window_data, kt, stage_name=stage)
-                # 🔑 之前这里不管 solve_stage_integrated 是否报告 error 或
-                # converged is not True，都直接用 total_delta_G 的默认值 0.0
-                # 继续拼装并写出 final_results_postprocess.json——一个失败或
-                # 只解出部分窗口的求解结果会被静默当成真实答案。回退路径本身
-                # 就是"缺正式结果时的粗略核查"，更不能再放行一个明确失败的解。
-                if res.get("error"):
-                    raise RuntimeError(
-                        f"阶段 {stage_name} 的 solve_stage_integrated 报告错误: "
-                        f"{res.get('error')!r}；拒绝在回退分析路径下静默产出结果。"
-                    )
-                if res.get("converged") is not True:
-                    raise RuntimeError(
-                        f"阶段 {stage_name} 的 solve_stage_integrated 未收敛"
-                        f"（converged={res.get('converged')!r}）；拒绝在回退分析"
-                        "路径下静默产出部分/不可信结果。"
-                    )
-                total_dg += float(res.get("total_delta_G", 0.0))
-                total_err_sq += float(res.get("total_error", 999.0)) ** 2
-        return {
-            "decoupling_delta_G_kJ_mol": float(total_dg),
-            "total_error_kJ_mol": float(np.sqrt(total_err_sq)),
-        }
+        return _analyze_dual_leg_artifacts(base_dir, temp)
 
     def _load_leg_result(base_dir: str) -> Dict:
         result_path = os.path.join(base_dir, "final_results.json")
         if not os.path.exists(result_path):
             raise FileNotFoundError(f"缺少腿结果文件: {result_path}")
         with open(result_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            payload = json.load(f)
+        # 🔑 [P1-12] 缺必需热力学字段/非有限/负误差/converged 不为 True 的腿结果
+        # 一律拒绝汇总——统一 gate 与 abfe_pipeline cache 早退、
+        # combine_binding_free_energy 共用，见 abfe_core.validate_final_leg_result。
+        validate_final_leg_result(
+            payload, context=f"leg result {base_dir}", source=result_path
+        )
+        return payload
 
     complex_boresch = _load_boresch_params(output_dir)
     dg_boresch = 0.0
@@ -3508,6 +4088,10 @@ def run_post_analysis(args):
             )
             complex_leg = _analyze_dual_leg(output_dir)
             solvent_leg = _analyze_dual_leg(os.path.join(output_dir, "solvent_leg"))
+            recovered_boresch = complex_leg["analysis_context"]["stage_protocol_keys"]["decharging"]["payload"].get("boresch_params")
+            from abfe_pipeline import _preopt_boresch_protocol_payload
+            if _preopt_boresch_protocol_payload(complex_boresch) != _preopt_boresch_protocol_payload(recovered_boresch):
+                raise ValueError("analyze-only Boresch release 参数与采样协议不匹配")
             dg_complex = float(complex_leg["decoupling_delta_G_kJ_mol"])
             dg_solvent = float(solvent_leg["decoupling_delta_G_kJ_mol"])
             err_complex = float(complex_leg["total_error_kJ_mol"])
@@ -3558,6 +4142,90 @@ def run_post_analysis(args):
     _production_qualification = _resolve_production_qualification_from_sources(
         complex_leg, solvent_leg, _run_provenance
     )
+    # Charge-transfer is only analyzable when both legs carry the same,
+    # evidence-backed reservoir-release correction.  Do not reconstruct it
+    # from a scalar in config or infer cancellation from matching restraints.
+    _reservoir_candidates = []
+    _configured_reservoir = args.get("charge_transfer_reservoir_correction")
+    if isinstance(_configured_reservoir, (str, os.PathLike)):
+        _configured_reservoir = _load_json_object_file(
+            str(_configured_reservoir), "charge-transfer reservoir correction"
+        )
+    if _configured_reservoir is not None:
+        _reservoir_candidates.append(
+            validate_charge_transfer_reservoir_correction(
+                _configured_reservoir,
+                temperature_k=float(args.temperature),
+            )
+        )
+    for _source in (complex_leg, solvent_leg, _run_provenance):
+        if not isinstance(_source, dict):
+            continue
+        _candidate = _source.get("charge_transfer_reservoir_correction")
+        if _candidate is None and isinstance(_source.get("charge_protocol"), dict):
+            _candidate = _source["charge_protocol"].get(
+                "charge_transfer_reservoir_correction"
+            )
+        if _candidate is None and isinstance(_source.get("provenance"), dict):
+            _candidate = _source["provenance"].get(
+                "charge_transfer_reservoir_correction"
+            )
+        if _candidate is not None:
+            _reservoir_candidates.append(
+                validate_charge_transfer_reservoir_correction(
+                    _candidate,
+                    temperature_k=float(args.temperature),
+                )
+            )
+    _reservoir_payload = None
+    if _reservoir_candidates:
+        _reservoir_payload = _reservoir_candidates[0]
+        _canonical_reservoir = json.dumps(
+            _reservoir_payload, sort_keys=True, separators=(",", ":")
+        )
+        if any(
+            json.dumps(item, sort_keys=True, separators=(",", ":"))
+            != _canonical_reservoir
+            for item in _reservoir_candidates[1:]
+        ):
+            raise RuntimeError(
+                "analyze-only 的 charge-transfer reservoir correction 在腿/"
+                "provenance 之间不一致；拒绝混合 artifact"
+            )
+    _treatment_values = []
+    for _source in (complex_leg, solvent_leg, _run_provenance):
+        if not isinstance(_source, dict):
+            continue
+        _treatment_values.append(_source.get("charge_treatment"))
+        if isinstance(_source.get("charge_protocol"), dict):
+            _treatment_values.append(_source["charge_protocol"].get("charge_treatment"))
+        if isinstance(_source.get("provenance"), dict):
+            _treatment_values.append(_source["provenance"].get("charge_treatment"))
+    _is_charge_transfer = any(
+        str(value or "").strip().lower()
+        == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER
+        for value in _treatment_values
+    )
+    if _is_charge_transfer and _reservoir_payload is None:
+        raise RuntimeError(
+            "analyze-only 的 charge-transfer 结果缺少已验证的双腿 reservoir correction；"
+            "拒绝把 tethered-carrier endpoint 当作闭合 ABFE"
+        )
+    _reservoir_delta = (
+        float(_reservoir_payload["delta_G_bind_correction_kJ_mol"])
+        if _reservoir_payload is not None
+        else 0.0
+    )
+    _reservoir_error = (
+        float(_reservoir_payload["error_kJ_mol"])
+        if _reservoir_payload is not None
+        else 0.0
+    )
+    _assert_matching_result_constraint_identity(
+        complex_leg,
+        solvent_leg,
+        context="analyze-only ABFE 热力学循环",
+    )
     cycle = combine_binding_free_energy(
         dg_complex_kJ_mol=dg_complex,
         dg_solvent_kJ_mol=dg_solvent,
@@ -3566,6 +4234,10 @@ def run_post_analysis(args):
         dg_boresch_kJ_mol=dg_boresch,
         boresch_already_included_in_complex=bool(boresch_included_in_complex_dg),
         apbs_correction_kJ_mol=apbs_correction,
+        charge_transfer_reservoir_correction_kJ_mol=_reservoir_delta,
+        charge_transfer_reservoir_error_kJ_mol=_reservoir_error,
+        complex_conformer_summary=complex_leg.get("ligand_conformer_diagnostics"),
+        solvent_conformer_summary=solvent_leg.get("ligand_conformer_diagnostics"),
     )
     delta_g_bind_uncorrected = cycle["delta_G_bind_uncorrected_kJ_mol"]
     final_dg = cycle["delta_G_bind_kJ_mol"]
@@ -3580,6 +4252,8 @@ def run_post_analysis(args):
         # 同时显式标记它是否已经烘焙进 complex_leg_delta_G_kJ_mol，避免下游
         # 消费者误以为这里恒为独立可加项而对 complex_delta_G 二次扣减。
         "boresch_correction_kJ_mol": float(dg_boresch),
+        "constraint_identity": complex_leg.get("constraint_identity"),
+        "charge_transfer_reservoir_correction": _reservoir_payload,
         "boresch_correction_already_included_in_complex_delta_G": bool(boresch_included_in_complex_dg),
         "boresch_correction_note": (
             "boresch_correction_kJ_mol 已经烘焙进 complex_leg_delta_G_kJ_mol，"
@@ -3683,8 +4357,10 @@ def run_prepare_command(args):
     # 6. Boresch 估算（默认 fluctuation 模式）
     if args.save_boresch:
         import mdtraj as md
-        traj = md.load(traj_file, top=args.gro)
-        estimator = GeometricRestraintEstimator(temperature=args.temperature)
+        traj = md.load(traj_file, top=_boresch_mdtraj_topology(pipeline, args.top, include_dir))
+        estimator = GeometricRestraintEstimator(
+            temperature=args.temperature, allow_geometric_bond_fallback=False
+        )
         boresch = estimator.estimate_from_trajectory(
             traj, args.ligand,
             output_path=os.path.join(output_dir, args.save_boresch)
@@ -3696,6 +4372,37 @@ def run_prepare_command(args):
 # ---------------------------------------------------------------------------
 # 传统 ABFE-REMD 模式
 # ---------------------------------------------------------------------------
+def _assert_traditional_protocol_supported(config: RunConfig) -> None:
+    """[P1-14] traditional 模式的协议声明检查（建任何 OpenMM Context 之前调用）。
+
+    膜 barostat/色散协议/力场族这些配置此前只会进入临时 Boresch ABFEPipeline，
+    真正的 TraditionalABFEPipeline 从不消费它们——用户声明的协议被静默忽略、
+    按默认路线跑。这里把"traditional 不支持的声明"明确拒绝，只放行默认
+    （不声明 = soluble / legacy_uniform_density_lrc / auto 力场族）路线。
+    """
+    unsupported = []
+    system_type = config.get("system_type")
+    membrane = config.get("membrane")
+    dispersion = config.get("dispersion_protocol")
+    forcefield = config.get("forcefield_family")
+    if system_type is not None and str(system_type) != "soluble":
+        unsupported.append(f"system_type={system_type!r}")
+    if membrane:
+        unsupported.append(f"membrane={membrane!r}")
+    if dispersion is not None and str(dispersion) != "legacy_uniform_density_lrc":
+        unsupported.append(f"dispersion_protocol={dispersion!r}")
+    if forcefield is not None and str(forcefield).strip().lower() not in ("", "auto"):
+        unsupported.append(f"forcefield_family={forcefield!r}")
+    if unsupported:
+        raise RuntimeError(
+            "traditional 模式不支持以下协议声明（它们会被静默忽略并按默认路线"
+            "运行，这比报错更糟）：\n    - " + "\n    - ".join(unsupported)
+            + "\n传统 PME-REMD 路径只实现默认（soluble / legacy_uniform_density_lrc /"
+            " auto 力场族）协议。需要膜/非默认色散/显式力场族请使用 IBS dual_lambda，"
+            "或从配置/命令行里去掉这些声明。"
+        )
+
+
 def run_traditional_mode(config: RunConfig):
     """传统双阶段 λ-REMD：分别计算复合物腿与溶剂腿并汇总结合自由能。"""
     log.info("🔧 启动传统 ABFE-REMD 模式")
@@ -3711,6 +4418,29 @@ def run_traditional_mode(config: RunConfig):
         config.ligand,
         find_gmx_include_dir(config.gmx_path),
     )
+    _traditional_raw_charge = float(_compute_ligand_net_charge(system, ligand_indices))
+    if not np.isfinite(_traditional_raw_charge):
+        raise ValueError(
+            f"traditional 配体净电荷不是有限数：{_traditional_raw_charge!r}"
+        )
+    _traditional_integer_charge = int(round(_traditional_raw_charge))
+    if (
+        abs(_traditional_raw_charge - _traditional_integer_charge)
+        > LIGAND_NET_CHARGE_INTEGER_TOLERANCE_E
+    ):
+        raise ValueError(
+            f"traditional 配体净电荷 {_traditional_raw_charge:+.8f} e 不接近整数"
+        )
+    if _traditional_integer_charge != 0:
+        raise RuntimeError(
+            "traditional PME-REMD 当前只支持中性配体；检测到配体净电荷 "
+            f"{_traditional_integer_charge:+d} e。该路径尚未实现 co-alchemical ion，"
+            "已在创建任何 OpenMM Context 前拒绝运行。请使用 IBS dual_lambda。"
+        )
+
+    # 🔑 [P1-14] traditional 接入协议声明检查：见 _assert_traditional_protocol_supported。
+    # 必须在建任何 OpenMM Context（预平衡/REMD）之前 fail closed。
+    _assert_traditional_protocol_supported(config)
     diagnose_14_scaling(system)
 
     if hasattr(positions, "value_in_unit"):
@@ -3756,37 +4486,95 @@ def run_traditional_mode(config: RunConfig):
         ):
             raise RuntimeError("traditional 模式自动构建溶剂腿缓存失败。")
 
-    dg_boresch = 0.0
-    boresch_restraint = None
-    if config.boresch:
-        boresch_pipeline = ABFEPipeline(
-            system=system,
-            topology=topology,
-            positions=positions,
-            box_vectors=box_vectors,
-            ligand_indices=ligand_indices,
-            temperature=config.temperature,
-            output_dir=output_dir,
-            checkpoint_dir=os.path.join(output_dir, "checkpoints"),
-            platform_name=config.platform,
-            # 复合物腿 → 走膜协议（Boresch 估算会触发预平衡）。
-            environment_type=config.get("system_type"),
-            membrane=config.get("membrane"),
-            confirm_soluble_with_lipids=bool(
-                config.get("confirm_soluble_with_lipids", False)
-            ),
-            dispersion_protocol=config.get("dispersion_protocol"),
-            forcefield_family=config.get("forcefield_family"),
-            charge_treatment=config.get("charge_treatment"),
+    # 🔑 [P1-13] 基线预平衡独立于 Boresch。此前预平衡只发生在 `if config.boresch:`
+    # 里（借道 resolve_boresch_restraint 的"无条件先跑一次基线预平衡"），显式
+    # 关闭 Boresch 后两条腿直接 setPositions/setVelocities 进 REMD——原始或仅
+    # 居中的坐标直接进入生产采样。现在无条件先建统一 ABFEPipeline、按统一
+    # fingerprint/checkpoint/完成门做（或复用）基线预平衡；Boresch 阶段
+    # （resolve_boresch_restraint）会通过 equilibrium_is_done 自然复用它，
+    # 不会跑两遍。
+    traditional_baseline = ABFEPipeline(
+        system=system,
+        topology=topology,
+        positions=positions,
+        box_vectors=box_vectors,
+        ligand_indices=ligand_indices,
+        temperature=config.temperature,
+        output_dir=output_dir,
+        checkpoint_dir=os.path.join(output_dir, "checkpoints"),
+        platform_name=config.platform,
+        # 复合物腿环境 → 走与主流程同一份膜协议声明（P1-14 已把非默认声明
+        # 在这里之前拒绝，所以能走到这里的只有默认 soluble）。
+        environment_type=config.get("system_type"),
+        membrane=config.get("membrane"),
+        confirm_soluble_with_lipids=bool(
+            config.get("confirm_soluble_with_lipids", False)
+        ),
+        dispersion_protocol=config.get("dispersion_protocol"),
+        forcefield_family=config.get("forcefield_family"),
+        charge_treatment=config.get("charge_treatment"),
+    )
+    _trad_n_equil_steps = config.get("n_equil_steps", 5_000_000)
+    _trad_equil_fingerprint = _pre_equilibration_fingerprint(
+        traditional_baseline.system,
+        traditional_baseline.ligand_indices,
+        traditional_baseline.temperature,
+        traditional_baseline.pressure,
+        positions=traditional_baseline.positions,
+        box_vectors=traditional_baseline.box_vectors,
+        requested_steps=_trad_n_equil_steps,
+        barostat_protocol=traditional_baseline.barostat_protocol,
+    )
+    if not config.reset and equilibrium_is_done(
+        output_dir,
+        expected_fingerprint=_trad_equil_fingerprint,
+        # [P1-07] checkpoint 以目标 Simulation 的真实 loadCheckpoint 成功为准。
+        simulation=_checkpoint_probe_simulation(traditional_baseline),
+    ):
+        log.info("♻️ traditional 基线预平衡已完成，复用已有轨迹")
+    else:
+        log.info("▶️ 执行 traditional 基线预平衡")
+        traditional_baseline.pre_equilibrate(
+            n_steps=_trad_n_equil_steps,
+            save_traj=True,
+            resume=config.resume and not config.reset,
         )
-        boresch_restraint = resolve_boresch_restraint(config, boresch_pipeline)
+    positions = traditional_baseline.positions
+    box_vectors = traditional_baseline.box_vectors
+
+    dg_boresch = 0.0
+    err_boresch = 0.0
+    boresch_restraint = None
+    boresch_attachment_result = None
+    if config.boresch:
+        boresch_restraint = resolve_boresch_restraint(config, traditional_baseline)
         if boresch_restraint:
-            dg_boresch = boresch_pipeline.apply_boresch_correction(
+            boresch_correction_result = traditional_baseline.apply_boresch_correction(
                 boresch_restraint,
                 autoload_from_disk=False,
-            ).get("delta_g_rest", 0.0)
-            positions = boresch_pipeline.positions
-            box_vectors = boresch_pipeline.box_vectors
+            )
+            dg_boresch = float(boresch_correction_result.get("delta_g_rest", 0.0))
+            err_boresch = float(boresch_correction_result.get("error", 0.0))
+            positions = traditional_baseline.positions
+            box_vectors = traditional_baseline.box_vectors
+            from ibs_engine import run_boresch_attachment_leg
+            boresch_attachment_result = run_boresch_attachment_leg(
+                system,
+                topology,
+                positions,
+                box_vectors,
+                boresch_restraint,
+                temperature_k=float(config.temperature),
+                lambdas=config.get("attachment_lambdas"),
+                n_steps_per_state=int(config.get("attachment_n_steps_per_state", 250_000)),
+                equil_steps_per_state=int(config.get("attachment_equil_steps_per_state", 50_000)),
+                steps_per_sample=int(config.get("attachment_steps_per_sample", 1_000)),
+                platform_name=config.platform,
+                seed=int(config.get("attachment_seed", 20260728)),
+                n_seeds=int(config.get("attachment_n_seeds", 1)),
+                output_dir=os.path.join(output_dir, "traditional_attachment"),
+                log=log.info,
+            )
 
     complex_pipeline = TraditionalABFEPipeline(
         system=system,
@@ -3797,6 +4585,8 @@ def run_traditional_mode(config: RunConfig):
         temperature=config.temperature,
         platform_name=config.platform,
         output_dir=os.path.join(output_dir, "traditional_complex"),
+        repeat_seed=config.get("repeat_seed"),
+        leg_name="complex",
     )
 
     log.info("🔄 开始传统复合物腿 REMD + MBAR (n_lambda=%d, n_steps=%d)",
@@ -3806,6 +4596,7 @@ def run_traditional_mode(config: RunConfig):
         n_steps_per_leg=config.n_steps_per_window or 500000,
         boresch_correction=0.0,
         boresch_params=boresch_restraint,
+        attachment_result=boresch_attachment_result,
         potential_type=config.potential,
         resume=config.resume and not config.reset,
     )
@@ -3816,6 +4607,60 @@ def run_traditional_mode(config: RunConfig):
         prefer_equilibrated=not config.reset,
     )
     pos_solv, box_solv = center_system_rigidly(pos_solv, box_solv, lig_idx_solv)
+
+    # 🔑 [P1-13] 溶剂腿同样要有基线预平衡（"两条腿预平衡"）：此前溶剂腿直接从
+    # 缓存/居中坐标进 REMD。runtime_dir 与主流程一致（output_dir/solvent_leg），
+    # 这样 load_native_system 的 prefer_equilibrated 读的就是同一份严格校验过
+    # 的预平衡轨迹，两种模式共享同一布局与完成门。
+    _solv_runtime_dir = os.path.join(output_dir, "solvent_leg")
+    solvent_baseline = ABFEPipeline(
+        system=sys_solv,
+        topology=top_solv,
+        positions=pos_solv,
+        box_vectors=box_solv,
+        ligand_indices=lig_idx_solv,
+        temperature=config.temperature,
+        output_dir=_solv_runtime_dir,
+        checkpoint_dir=os.path.join(_solv_runtime_dir, "checkpoints"),
+        platform_name=config.platform,
+        # 与 complex 侧 baseline 完全同一组协议声明（P1-14 已把膜/非默认色散
+        # 声明在更早处拒绝，能走到这里的只有默认 soluble 路线）；审计测试要求
+        # 每个 pipeline 构造都显式做出膜/色散决定，不许留默认隐式值。
+        environment_type=config.get("system_type"),
+        membrane=config.get("membrane"),
+        confirm_soluble_with_lipids=bool(
+            config.get("confirm_soluble_with_lipids", False)
+        ),
+        dispersion_protocol=config.get("dispersion_protocol"),
+        forcefield_family=config.get("forcefield_family"),
+        charge_treatment=config.get("charge_treatment"),
+    )
+    _solv_equil_fingerprint = _pre_equilibration_fingerprint(
+        solvent_baseline.system,
+        solvent_baseline.ligand_indices,
+        solvent_baseline.temperature,
+        solvent_baseline.pressure,
+        positions=solvent_baseline.positions,
+        box_vectors=solvent_baseline.box_vectors,
+        requested_steps=_trad_n_equil_steps,
+        barostat_protocol=solvent_baseline.barostat_protocol,
+    )
+    if not config.reset and equilibrium_is_done(
+        _solv_runtime_dir,
+        expected_fingerprint=_solv_equil_fingerprint,
+        simulation=_checkpoint_probe_simulation(solvent_baseline),
+    ):
+        log.info("♻️ traditional 溶剂腿基线预平衡已完成，复用已有轨迹")
+    else:
+        log.info("▶️ 执行 traditional 溶剂腿基线预平衡")
+        solvent_baseline.pre_equilibrate(
+            n_steps=_trad_n_equil_steps,
+            save_traj=True,
+            resume=config.resume and not config.reset,
+        )
+    pos_solv = solvent_baseline.positions
+    box_solv = solvent_baseline.box_vectors
+
     solvent_pipeline = TraditionalABFEPipeline(
         system=sys_solv,
         topology=top_solv,
@@ -3825,6 +4670,8 @@ def run_traditional_mode(config: RunConfig):
         temperature=config.temperature,
         platform_name=config.platform,
         output_dir=os.path.join(output_dir, "traditional_solvent"),
+        repeat_seed=config.get("repeat_seed"),
+        leg_name="solvent",
     )
     log.info("🔄 开始传统溶剂腿 REMD + MBAR (n_lambda=%d, n_steps=%d)",
              config.n_lambda, config.n_steps_per_window or 500000)
@@ -3841,6 +4688,13 @@ def run_traditional_mode(config: RunConfig):
     dg_solvent = float(solvent_results["delta_G_total_kJ_mol"])
     err_complex = float(complex_results["error_leg_kJ_mol"])
     err_solvent = float(solvent_results["error_leg_kJ_mol"])
+    _constraint_identity = _assert_matching_ligand_constraint_identity(
+        system,
+        ligand_indices,
+        sys_solv,
+        lig_idx_solv,
+        context="traditional ABFE 热力学循环",
+    )
     # 🔑 [ATT-09] 循环闭合统一走 abfe_core.combine_binding_free_energy。
     # 这条路径 `TraditionalABFEPipeline.run_full` 是以 boresch_correction=0.0 调的，
     # 所以 complex 腿**不含**释放项，already_included=False，由 helper 减一次。
@@ -3861,7 +4715,9 @@ def run_traditional_mode(config: RunConfig):
         apbs_correction_kJ_mol=apbs_correction,
     )
     delta_g_bind = cycle["delta_G_bind_kJ_mol"]
-    total_err_bind = cycle["total_error_kJ_mol"]
+    total_err_bind = float(
+        np.sqrt(float(cycle["total_error_kJ_mol"]) ** 2 + err_boresch**2)
+    )
 
     final = {
         "complex_leg": complex_results,
@@ -3869,6 +4725,8 @@ def run_traditional_mode(config: RunConfig):
         "complex_delta_G_kJ_mol": dg_complex,
         "solvent_delta_G_kJ_mol": dg_solvent,
         "boresch_correction_kJ_mol": float(dg_boresch),
+        "boresch_correction_error_kJ_mol": float(err_boresch),
+        "constraint_identity": _constraint_identity,
         # ✅ TraditionalABFEPipeline.run_full 是以 boresch_correction=0.0 调用的，
         # 因此 complex_delta_G_kJ_mol 不含 Boresch 释放修正；该修正只作为独立项
         # 已经减到 delta_G_bind_kJ_mol 里（见上方 delta_g_bind 公式），下游不要
@@ -4548,6 +5406,33 @@ def _run_complex_charging_only(
 
 # 主入口
 # ---------------------------------------------------------------------------
+def _scope_pipeline_with_optional_outer_lambda_em(
+    pipeline: ABFEPipeline,
+    em_enabled: bool,
+):
+    """Scope the candidate-only twin EM policy to the next leg call.
+
+    The context is deliberately scoped to the complete leg, because Stage 2
+    also builds fixed-endpoint/overlap probe Systems.  Baseline runs never
+    install the monkeypatch and therefore retain native OpenMM EM exactly.
+    """
+    if not em_enabled:
+        return
+    original_run = pipeline.run_full_pipeline
+
+    def scoped_run(*args, **kwargs):
+        install_outer_lambda_em_policy()
+        try:
+            return original_run(*args, **kwargs)
+        finally:
+            uninstall_outer_lambda_em_policy()
+            pipeline.run_full_pipeline = original_run
+
+    # An instance-level wrapper keeps the public source-level call and its
+    # explicit keyword contract intact while guaranteeing cleanup on errors.
+    pipeline.run_full_pipeline = scoped_run
+
+
 def main():
     args = parse_arguments()
 
@@ -4578,6 +5463,15 @@ def main():
 
     # 创建配置对象
     config = RunConfig(args)
+
+    # 🔑 [P1-04] analyze-only 必须最先分流：此前它在加载 DEXP 参数、要求
+    # --ligand 等模拟输入**之后**才分流，纯分析现有结果会被与模拟无关的
+    # 前置校验提前阻断（比如 --potential=dexp 但没给 dexp 参数文件的运行
+    # 根本进不了 analyze-only）。
+    if args.analyze_only:
+        run_post_analysis(config)
+        return
+
     _repeat_seed_raw = os.environ.get("ABFE_RANDOM_SEED")
     _repeat_seed = None
     if _repeat_seed_raw not in (None, ""):
@@ -4623,10 +5517,21 @@ def main():
             "--only-boresch-attachment 必须与 --resume 同用，以只读加载现有 committed "
             "Boresch、stage1/stage2 和 solvent 结果"
         )
-    # 分析模式单独处理
-    if args.analyze_only:
-        run_post_analysis(config)
-        return
+    if config.outer_lambda_local_residual_ibs and (
+        config.mode != "ibs" or config.decoupling != "dual_lambda"
+    ):
+        raise RuntimeError(
+            f"{OUTER_LAMBDA_RESIDUAL_FEATURE_NAME} 只支持 IBS + dual_lambda 的 Stage-2 VDW；"
+            "当前组合已 fail closed"
+        )
+    if config.outer_lambda_local_residual_ibs and (
+        config.only_complex_charging or config.only_boresch_attachment
+    ):
+        raise RuntimeError(
+            f"{OUTER_LAMBDA_RESIDUAL_FEATURE_NAME} 不能用于只跑 charging/attachment 的入口；"
+            "该开关要求完整 dual_lambda 两腿流程"
+        )
+    # 分析模式已在 main 开头分流（[P1-04]：不被模拟输入校验阻断）
     # 传统模式单独处理
     if config.mode == "traditional":
         run_traditional_mode(config)
@@ -4646,17 +5551,40 @@ def main():
     _require_bonded_topology = _environment_type == "membrane"
 
     include_dir = find_gmx_include_dir(config.gmx_path)
-    main_cache_identity = _main_cache_identity(
-        config.gro, config.top, config.ligand, include_dir
-    )
-    if not config.reset and system_cache_exists(
+    _cache_only_audits = {}
+    if args.openmm_cache_only:
+        if _require_bonded_topology:
+            raise RuntimeError(
+                "--openmm-cache-only does not support membrane systems because topology.cif "
+                "does not preserve the bonded topology required for PBC repair"
+            )
+        _cache_only_audits["complex"] = validate_openmm_cache_only(
+            output_dir, phase="complex"
+        )
+        main_cache_identity = {
+            "identity": _cache_only_audits["complex"],
+            "identity_sha256": _cache_only_audits["complex"]["audit_sha256"],
+        }
+        config.data["openmm_cache_only"] = True
+        config.data["openmm_cache_only_complex_audit_sha256"] = (
+            _cache_only_audits["complex"]["audit_sha256"]
+        )
+        log.warning(
+            "⚠️ OpenMM-cache-only：已验证迁移缓存自身哈希/形状；"
+            "本机未重验 GROMACS dependency tree"
+        )
+    else:
+        main_cache_identity = _main_cache_identity(
+            config.gro, config.top, config.ligand, include_dir
+        )
+    if args.openmm_cache_only or (not config.reset and system_cache_exists(
         output_dir,
         config.gro,
         config.top,
         config.ligand,
         include_dir,
         charge_treatment=config.get("charge_treatment"),
-    ):
+    )):
         system, topology, positions, box_vectors, ligand_indices = load_native_system(
             output_dir, 
             gro_file=config.gro, 
@@ -4665,6 +5593,7 @@ def main():
             # 膜体系必须拿**带键**的拓扑：mmCIF 不保存脂质/配体的键，而
             # PBC 分子完整性修复靠键判断分子边界，键丢了会把跨边界脂质撕开。
             require_bonded_topology=_require_bonded_topology,
+            reconstruct_bonds_from_system=args.openmm_cache_only,
         )
         log.info("♻️ 从缓存加载 System 完成")
         # 缓存命中时不需要再转换（缓存里存的是转换后构建出来的 System）。
@@ -4702,17 +5631,23 @@ def main():
         )
         diagnose_14_scaling(system)
         _raw_ligand_net_charge = _compute_ligand_net_charge(system, ligand_indices)
+        _rounded_ligand_charge = int(round(float(_raw_ligand_net_charge)))
+        if abs(float(_raw_ligand_net_charge) - _rounded_ligand_charge) > LIGAND_NET_CHARGE_INTEGER_TOLERANCE_E:
+            raise RuntimeError(
+                f"配体净电荷 {_raw_ligand_net_charge:+.6f} e 不接近整数；"
+                "拒绝在协议解析前用 round() 猜测 charge_treatment"
+            )
         _resolved_builder_treatment = config.get("charge_treatment")
         if not _resolved_builder_treatment:
             _resolved_builder_treatment = (
-                "neutral" if int(round(_raw_ligand_net_charge)) == 0
+                "neutral" if _rounded_ligand_charge == 0
                 else CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER
             )
         _builder_identity = co_alchemical_ion_builder_identity_payload(
             system=system,
             topology=topology,
             charge_treatment=_resolved_builder_treatment,
-            ligand_net_charge_e=int(round(_raw_ligand_net_charge)),
+            ligand_net_charge_e=_rounded_ligand_charge,
         )
         # 立即保存为原生缓存
         save_native_system(
@@ -4794,6 +5729,14 @@ def main():
     # 且**自动计算配体净电荷并与配置交叉核对**（§6.1）。
     # 净电荷用 ibs_engine 里既有的唯一实现算，不另造一套判据。
     _ligand_net_charge_e = _compute_ligand_net_charge(system, ligand_indices)
+    _reservoir_correction_input = config.get(
+        "charge_transfer_reservoir_correction"
+    )
+    if isinstance(_reservoir_correction_input, (str, os.PathLike)):
+        _reservoir_correction_input = _load_json_object_file(
+            str(_reservoir_correction_input),
+            "charge-transfer reservoir correction",
+        )
     _charge_protocol = resolve_charge_treatment(
         config.get("charge_treatment"),
         ligand_net_charge_e=_ligand_net_charge_e,
@@ -4804,6 +5747,7 @@ def main():
             if config.get("apbs_evidence")
             else None
         ),
+        charge_transfer_reservoir_correction=_reservoir_correction_input,
     )
     if config.get("co_alchemical_ion"):
         log.warning(
@@ -4826,14 +5770,16 @@ def main():
         if (
             _charge_protocol["charge_treatment"]
             == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER
-            and not CHARGE_TRANSFER_SOLVENT_LEG_IMPLEMENTED
+            and _charge_protocol.get("closes_thermodynamic_cycle") is not True
         ):
-            # 开跑前就说清楚，而不是让人烧几小时复合物腿再在溶剂腿撞墙。
-            # 真正的门在 `build_and_cache_solvent_leg`（唯一一处），这里只负责告知。
-            log.warning(
-                "⚠️ charge-transfer 的**溶剂腿 builder 尚未落地（B4）**：本次运行可以跑"
-                "复合物腿（B3 的 charging 哈密顿量已实现，适合做 pilot / λ 阶梯重估），"
-                "但热力学循环闭不上 —— **不得报出 ΔG_bind**。到溶剂腿会 fail closed。"
+            # The charging builder exists, but the tethered carrier's
+            # reservoir/standard-state correction has not been validated.
+            # Refuse before creating any Context; a finite two-leg number would
+            # otherwise be mistaken for a closed ABFE result.
+            raise RuntimeError(
+                "charge-transfer 当前未通过 carrier reservoir/C4-C5 closure 验证，"
+                "禁止运行并报告 ΔG_bind。请完成双腿 restraint/盒缩放 closure 后再启用；"
+                "本实现仅保留底层 Hamiltonian 作为实验诊断。"
             )
 
     # 力场族与 LJ/色散路线（memtodolist §1.1 / §1.3，B6）。同样在建 Context 之前判死。
@@ -4849,6 +5795,7 @@ def main():
         _forcefield_family_info = resolve_forcefield_family(
             top_path=config.get("top"),
             explicit_family=config.get("forcefield_family"),
+            gmx_include_dir=include_dir,
         )
         log.info(
             "🧬 力场族=%s（来源 %s）",
@@ -4979,6 +5926,32 @@ def main():
                 _total_equil_ns, MEMBRANE_MIN_EQUILIBRATION_NS, _shortfall_note,
             )
 
+    outer_lambda_runtime = None
+    if config.outer_lambda_local_residual_ibs:
+        # This is the sole mainline plugin entry point.  It validates the
+        # frozen source/model artifacts and loads all plugin libraries before
+        # any residual XML Force can be deserialized by a window builder.
+        outer_lambda_runtime = build_outer_lambda_local_residual_runtime(
+            topology=topology,
+            ligand_indices=ligand_indices,
+            system=system,
+            temperature_kelvin=float(config.temperature),
+            potential_type=str(config.potential),
+            output_dir=output_dir,
+            ligand_indices_path=os.path.join(output_dir, "ligand_indices.json"),
+            leg_name="complex",
+            platform_name=config.platform,
+        )
+        config.data["outer_lambda_local_residual_ibs_identity"] = (
+            outer_lambda_runtime.provenance_payload()
+        )
+        log.info(
+            "🧬 %s 已加载 | score=%s | em_policy=%s",
+            OUTER_LAMBDA_RESIDUAL_FEATURE_NAME,
+            outer_lambda_runtime.sampling_score_sha256,
+            outer_lambda_runtime.em_policy,
+        )
+
     run_provenance = None
     coion_identities = {}
     if not config.only_complex_charging:
@@ -5005,46 +5978,64 @@ def main():
     if config.only_complex_charging:
         log.info("⏭️ charging-only：跳过溶剂腿缓存构建与校验")
     else:
-        ligand_resname = _get_residue_name_by_atom_index(
-            topology, ligand_indices[0]
-        )
-        solvent_identity = _ligand_parameter_identity(
-            system,
-            topology,
-            ligand_indices,
-            ligand_resname,
-            config.top,
-            getattr(config, "ligand_xml", None),
-            include_dir,
-            positions=positions,
-        )
-        if config.reset or not solvent_cache_exists(
-            output_dir,
-            config.solvent_ionic_strength_molar,
-            solvent_identity,
-            charge_treatment=_charge_protocol["charge_treatment"],
-        ):
-            log.info(
-                "💧 溶剂腿缓存缺失或盐协议不匹配，开始构建 %.3f M NaCl 配体体系...",
-                config.solvent_ionic_strength_molar,
+        if args.openmm_cache_only:
+            _cache_only_audits["solvent"] = validate_openmm_cache_only(
+                output_dir, phase="solvent"
             )
-            if not build_and_cache_solvent_leg(
-                output_dir,
+            config.data["openmm_cache_only_solvent_audit_sha256"] = (
+                _cache_only_audits["solvent"]["audit_sha256"]
+            )
+            audit_path = os.path.join(output_dir, "openmm_cache_only_audit.json")
+            temporary = f"{audit_path}.{os.getpid()}.tmp"
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump(_cache_only_audits, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+            os.replace(temporary, audit_path)
+            log.warning(
+                "⚠️ OpenMM-cache-only：复合物与溶剂缓存通过自洽校验；审计写入 %s",
+                audit_path,
+            )
+        else:
+            ligand_resname = _get_residue_name_by_atom_index(
+                topology, ligand_indices[0]
+            )
+            solvent_identity = _ligand_parameter_identity(
+                system,
                 topology,
-                positions,
                 ligand_indices,
                 ligand_resname,
-                ligand_ffxml=getattr(config, "ligand_xml", None),
-                top_file=config.top,
-                gmx_include_dir=include_dir,
-                ionic_strength_molar=config.solvent_ionic_strength_molar,
-                cache_identity=solvent_identity,
+                config.top,
+                getattr(config, "ligand_xml", None),
+                include_dir,
+                positions=positions,
+            )
+            if config.reset or not solvent_cache_exists(
+                output_dir,
+                config.solvent_ionic_strength_molar,
+                solvent_identity,
                 charge_treatment=_charge_protocol["charge_treatment"],
             ):
-                log.error("❌ 自动构建溶剂腿失败，无法继续一键 ABFE")
-                sys.exit(1)
-        else:
-            log.info("♻️ 检测到已有溶剂腿缓存，跳过重建")
+                log.info(
+                    "💧 溶剂腿缓存缺失或盐协议不匹配，开始构建 %.3f M NaCl 配体体系...",
+                    config.solvent_ionic_strength_molar,
+                )
+                if not build_and_cache_solvent_leg(
+                    output_dir,
+                    topology,
+                    positions,
+                    ligand_indices,
+                    ligand_resname,
+                    ligand_ffxml=getattr(config, "ligand_xml", None),
+                    top_file=config.top,
+                    gmx_include_dir=include_dir,
+                    ionic_strength_molar=config.solvent_ionic_strength_molar,
+                    cache_identity=solvent_identity,
+                    charge_treatment=_charge_protocol["charge_treatment"],
+                ):
+                    log.error("❌ 自动构建溶剂腿失败，无法继续一键 ABFE")
+                    sys.exit(1)
+            else:
+                log.info("♻️ 检测到已有溶剂腿缓存，跳过重建")
 
     # ----- 2. 初始化 Pipeline -----
     pipeline = ABFEPipeline(
@@ -5067,6 +6058,9 @@ def main():
         dispersion_protocol=_dispersion_protocol["dispersion_protocol"],
         forcefield_family=_dispersion_protocol["forcefield_family"],
         charge_treatment=_charge_protocol["charge_treatment"],
+        charge_transfer_reservoir_correction=_charge_protocol.get(
+            "charge_transfer_reservoir_correction"
+        ),
         # §9 质量门需要的显式输入，从膜输入声明里取（可溶体系为空 dict，不进该分支）。
         membrane_quality_inputs=(
             {
@@ -5101,6 +6095,41 @@ def main():
         membrane_quality_gate_mode=config.get("membrane_quality_gate"),
         repeat_seed=_repeat_seed,
         leg_name="complex",
+        residual_sampling_enabled=outer_lambda_runtime is not None,
+        residual_basis_force_factory=(
+            outer_lambda_runtime.force_factory if outer_lambda_runtime is not None else None
+        ),
+        residual_state_coefficients_factory=(
+            outer_lambda_runtime.state_coefficients_factory
+            if outer_lambda_runtime is not None
+            else None
+        ),
+        residual_energy_offset_kj_mol=(
+            outer_lambda_runtime.energy_offset_kj_mol
+            if outer_lambda_runtime is not None
+            else 0.0
+        ),
+        sampling_score_sha256=(
+            outer_lambda_runtime.sampling_score_sha256
+            if outer_lambda_runtime is not None
+            else None
+        ),
+        residual_plugin_identity=(
+            outer_lambda_runtime.provenance_payload()
+            if outer_lambda_runtime is not None
+            else None
+        ),
+        residual_em_policy=(
+            outer_lambda_runtime.em_policy
+            if outer_lambda_runtime is not None
+            else "no_residual_twin"
+        ),
+        residual_feature_name=OUTER_LAMBDA_RESIDUAL_FEATURE_NAME,
+    )
+    # 预平衡 block 收敛早停开关（PLAN 2026-08-26）。不设配置键时默认开；
+    # 膜体系/无配体重原子时 `pre_equilibrate()` 内部仍会强制不生效（fail-closed）。
+    pipeline.enable_equilibration_convergence_stop = bool(
+        config.get("enable_equilibration_convergence_stop", True)
     )
 
     # ----- 3. 加载可选参数 -----
@@ -5200,12 +6229,16 @@ def main():
 
     # ----- 6. 运行复合物腿主流程 -----
     log.info("🔄 启动复合物腿主采样流程 (%s)", config.decoupling)
+    _scope_pipeline_with_optional_outer_lambda_em(
+        pipeline, outer_lambda_runtime is not None
+    )
     complex_results = pipeline.run_full_pipeline(
         decoupling_scheme=config.decoupling,
         potential_type=config.potential,
         dexp_params=dexp_params,
         boresch_params=boresch_restraint,
         torsion_params=torsion_params,
+        n_equil_steps=config.get("n_equil_steps", 5_000_000),
         resume=config.resume and not config.reset,
         run_equilibration=not equilibrium_is_done(
             output_dir,
@@ -5216,6 +6249,8 @@ def main():
                 requested_steps=config.get("n_equil_steps", 5_000_000),
                 barostat_protocol=pipeline.barostat_protocol,
             ),
+            # [P1-07] checkpoint 以目标 Simulation 的真实 loadCheckpoint 成功为准。
+            simulation=_checkpoint_probe_simulation(pipeline),
         ) or config.reset,
         # 注意：这个 system_type 是**腿身份**（complex/solvent），与膜协议的
         # 环境类型（soluble/membrane）是两个不同的轴，后者走
@@ -5226,6 +6261,13 @@ def main():
         n_states_per_stage=config.get("stage1_n_states", 16),
         stage1_n_states=config.get("stage1_n_states", 16),
         stage2_n_states=config.get("stage2_n_states", config.get("stage1_n_states", 16)),
+        # None 时不改变行为（optimize_stage2_vanishing 自己的默认 23 生效）。
+        stage2_final_n_states=config.get("stage2_final_n_states"),
+        stage2_refine_extra_points_per_segment=config.get(
+            "stage2_refine_extra_points_per_segment"
+        ),
+        stage2_window_min_states=config.get("stage2_window_min_states"),
+        stage2_window_max_states=config.get("stage2_window_max_states"),
         enable_early_stop=config.enable_early_stop,
         enable_gradual_warmup=config.enable_gradual_warmup,
         warmup_steps=config.warmup_steps,
@@ -5261,8 +6303,14 @@ def main():
         attachment_n_seeds=config.get("attachment_n_seeds", 1),
     )
     
-    dg_complex = complex_results.get("total_delta_G_complex_kJ_mol", complex_results.get("decoupling_delta_G_kJ_mol", 0.0))
-    err_complex = complex_results.get("total_error_kJ_mol", 0.0)
+    # 🔑 [P1-12] 之前这里 .get(..., 0.0) 会把缺字段静默补成 0：一条损坏/部分
+    # 失败的腿会被汇总成"看似成功"的 ΔG_bind。统一 sanity gate 缺字段/非有限/
+    # 负误差/converged 不为 True 一律 fail closed。
+    _complex_leg_gate = validate_final_leg_result(
+        complex_results, context="complex leg (in-memory)", source="run_full_pipeline"
+    )
+    dg_complex = _complex_leg_gate["delta_G_kJ_mol"]
+    err_complex = _complex_leg_gate["error_kJ_mol"]
     if _repeat_seed is not None:
         run_provenance = _update_run_provenance_seed_contract(
             output_dir,
@@ -5282,13 +6330,31 @@ def main():
             output_dir,
             phase="solvent",
             prefer_equilibrated=not config.reset,
+            reconstruct_bonds_from_system=args.openmm_cache_only,
         )
     except FileNotFoundError:
         log.error("❌ 未找到溶剂相缓存，自动构建步骤未成功完成")
         sys.exit(1)
         
     pos_solv, box_solv = center_system_rigidly(pos_solv, box_solv, lig_idx_solv)
-    
+
+    outer_lambda_runtime_solv = None
+    if outer_lambda_runtime is not None:
+        # The loader/factory contract is shared, but the plugin Force is bound
+        # to each leg's concrete topology.  Do not reuse a Force or silently
+        # reuse complex atom-type indices in the solvent System.
+        outer_lambda_runtime_solv = build_outer_lambda_local_residual_runtime(
+            topology=top_solv,
+            ligand_indices=lig_idx_solv,
+            system=sys_solv,
+            temperature_kelvin=float(config.temperature),
+            potential_type=str(config.potential),
+            output_dir=output_dir,
+            ligand_indices_path=os.path.join(output_dir, "ligand_indices_solvent.json"),
+            leg_name="solvent",
+            platform_name=config.platform,
+        )
+
     solvent_out_dir = os.path.join(output_dir, "solvent_leg")
     # 🔑 溶剂腿有两条**方向相反**的规矩，别搞混：
     #
@@ -5310,8 +6376,47 @@ def main():
         # ⚠️ 与恒压器方向相反：色散路线与净电荷路线**必须**两腿相同（§1.3 路线 A / §6.1），
         # 只有 environment_type/membrane 是溶剂腿刻意不接的。
         charge_treatment=_charge_protocol["charge_treatment"],
+        charge_transfer_reservoir_correction=_charge_protocol.get(
+            "charge_transfer_reservoir_correction"
+        ),
         repeat_seed=_repeat_seed,
         leg_name="solvent",
+        residual_sampling_enabled=outer_lambda_runtime_solv is not None,
+        residual_basis_force_factory=(
+            outer_lambda_runtime_solv.force_factory
+            if outer_lambda_runtime_solv is not None
+            else None
+        ),
+        residual_state_coefficients_factory=(
+            outer_lambda_runtime_solv.state_coefficients_factory
+            if outer_lambda_runtime_solv is not None
+            else None
+        ),
+        residual_energy_offset_kj_mol=(
+            outer_lambda_runtime_solv.energy_offset_kj_mol
+            if outer_lambda_runtime_solv is not None
+            else 0.0
+        ),
+        sampling_score_sha256=(
+            outer_lambda_runtime_solv.sampling_score_sha256
+            if outer_lambda_runtime_solv is not None
+            else None
+        ),
+        residual_plugin_identity=(
+            outer_lambda_runtime_solv.provenance_payload()
+            if outer_lambda_runtime_solv is not None
+            else None
+        ),
+        residual_em_policy=(
+            outer_lambda_runtime_solv.em_policy
+            if outer_lambda_runtime_solv is not None
+            else "no_residual_twin"
+        ),
+        residual_feature_name=OUTER_LAMBDA_RESIDUAL_FEATURE_NAME,
+    )
+    # 与复合物腿同一个开关（PLAN 2026-08-26）。
+    pipeline_solv.enable_equilibration_convergence_stop = bool(
+        config.get("enable_equilibration_convergence_stop", True)
     )
 
     # [B5] Use a path relative to the run root so complex and solvent records
@@ -5347,12 +6452,16 @@ def main():
     )
     
     # 运行溶剂腿 (🔑 强制关闭 Boresch)
+    _scope_pipeline_with_optional_outer_lambda_em(
+        pipeline_solv, outer_lambda_runtime_solv is not None
+    )
     solv_results = pipeline_solv.run_full_pipeline(
         decoupling_scheme=config.decoupling,
         potential_type=config.potential,
         dexp_params=dexp_params,
         boresch_params=None,  # 绝对不加 Boresch
         torsion_params=torsion_params,
+        n_equil_steps=config.get("n_equil_steps", 5_000_000),
         resume=config.resume and not config.reset,
         run_equilibration=not equilibrium_is_done(
             solvent_out_dir,
@@ -5366,6 +6475,8 @@ def main():
                 # 所以这里的 payload 恒为 None，指纹与改动前一致。
                 barostat_protocol=pipeline_solv.barostat_protocol,
             ),
+            # [P1-07] checkpoint 以目标 Simulation 的真实 loadCheckpoint 成功为准。
+            simulation=_checkpoint_probe_simulation(pipeline_solv),
         ) or config.reset,
         system_type="solvent",
         n_steps_per_window=config.n_steps_per_window,
@@ -5373,6 +6484,13 @@ def main():
         n_states_per_stage=config.get("stage1_n_states", 16),
         stage1_n_states=config.get("stage1_n_states", 16),
         stage2_n_states=config.get("stage2_n_states", config.get("stage1_n_states", 16)),
+        # None 时不改变行为（optimize_stage2_vanishing 自己的默认 23 生效）。
+        stage2_final_n_states=config.get("stage2_final_n_states"),
+        stage2_refine_extra_points_per_segment=config.get(
+            "stage2_refine_extra_points_per_segment"
+        ),
+        stage2_window_min_states=config.get("stage2_window_min_states"),
+        stage2_window_max_states=config.get("stage2_window_max_states"),
         enable_early_stop=config.enable_early_stop,
         enable_gradual_warmup=config.enable_gradual_warmup,
         warmup_steps=config.warmup_steps,
@@ -5398,8 +6516,12 @@ def main():
         charging_max_resident_contexts=config.get("charging_max_resident_contexts"),
     )
     
-    dg_solvent = solv_results.get("total_delta_G_complex_kJ_mol", solv_results.get("decoupling_delta_G_kJ_mol", 0.0))
-    err_solvent = solv_results.get("total_error_kJ_mol", 0.0)
+    # 🔑 [P1-12] 同 complex 腿：缺字段不再静默补 0，统一 sanity gate fail closed。
+    _solvent_leg_gate = validate_final_leg_result(
+        solv_results, context="solvent leg (in-memory)", source="run_full_pipeline"
+    )
+    dg_solvent = _solvent_leg_gate["delta_G_kJ_mol"]
+    err_solvent = _solvent_leg_gate["error_kJ_mol"]
     if _repeat_seed is not None:
         run_provenance = _update_run_provenance_seed_contract(
             output_dir,
@@ -5449,7 +6571,56 @@ def main():
     # 不再在这里手写公式。这里 dg_complex 取自 total_delta_G_complex_kJ_mol，
     # Boresch 释放项已经烘焙在里面（abfe_pipeline: total_dg = dg_phys +
     # cons_correction + dg_boresch），所以 already_included=True，不再减第二次。
+    _constraint_identity = _assert_matching_ligand_constraint_identity(
+        pipeline.system,
+        pipeline.ligand_indices,
+        pipeline_solv.system,
+        pipeline_solv.ligand_indices,
+        context="dual_lambda ABFE 热力学循环",
+    )
     apbs_correction = float(config.get("apbs_correction_kJ_mol", 0.0) or 0.0)
+    _reservoir_payload = _charge_protocol.get(
+        "charge_transfer_reservoir_correction"
+    )
+    if _charge_protocol["charge_treatment"] == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
+        if not isinstance(_reservoir_payload, dict):
+            raise RuntimeError(
+                "charge-transfer 已通过预检但缺少已验证的双腿 reservoir correction；"
+                "拒绝汇总"
+            )
+        _reservoir_canonical = json.dumps(
+            _reservoir_payload, sort_keys=True, separators=(",", ":")
+        )
+        for _leg_name, _leg_result in (
+            ("complex", complex_results),
+            ("solvent", solv_results),
+        ):
+            _leg_correction = (
+                _leg_result.get("charge_transfer_reservoir_correction")
+                if isinstance(_leg_result, dict)
+                else None
+            )
+            if not isinstance(_leg_correction, dict):
+                raise RuntimeError(
+                    f"charge-transfer {_leg_name} leg 缺少 reservoir correction；"
+                    "拒绝混合未闭合或旧缓存"
+                )
+            _leg_correction = validate_charge_transfer_reservoir_correction(
+                _leg_correction,
+                temperature_k=float(config.temperature),
+            )
+            if json.dumps(_leg_correction, sort_keys=True, separators=(",", ":")) != _reservoir_canonical:
+                raise RuntimeError(
+                    f"charge-transfer {_leg_name} leg 的 reservoir correction 与主协议不一致；"
+                    "拒绝混合不同温度/不同 C4-C5 证据的 artifact"
+                )
+        _reservoir_delta = float(
+            _reservoir_payload["delta_G_bind_correction_kJ_mol"]
+        )
+        _reservoir_error = float(_reservoir_payload["error_kJ_mol"])
+    else:
+        _reservoir_delta = 0.0
+        _reservoir_error = 0.0
     cycle = combine_binding_free_energy(
         dg_complex_kJ_mol=dg_complex,
         dg_solvent_kJ_mol=dg_solvent,
@@ -5458,6 +6629,8 @@ def main():
         dg_boresch_kJ_mol=dg_boresch,
         boresch_already_included_in_complex=True,
         apbs_correction_kJ_mol=apbs_correction,
+        charge_transfer_reservoir_correction_kJ_mol=_reservoir_delta,
+        charge_transfer_reservoir_error_kJ_mol=_reservoir_error,
         # [P0-12a / §3.0] 两条腿的配体构象系综必须重叠，否则这个减法没有意义。
         # 门在 combine_binding_free_energy 里（唯一一处），这里只负责把两侧的
         # 自报 summary 交上去；缺哪一侧就记 not_evaluated，不会伪装成通过。
@@ -5491,6 +6664,8 @@ def main():
         "solvent_delta_G_kJ_mol": float(dg_solvent),
         "boresch_correction_kJ_mol": float(dg_boresch),
         "boresch_attachment": attachment_result,
+        "constraint_identity": _constraint_identity,
+        "charge_transfer_reservoir_correction": _reservoir_payload,
         # ✅ complex_delta_G_kJ_mol 来自 total_delta_G_complex_kJ_mol，已经在
         # abfe_pipeline.py 里把 Boresch 释放修正烘焙进去 (total_dg = dg_phys +
         # cons_correction + dg_boresch)；下面 delta_g_bind_uncorrected 没有再单独
@@ -5518,7 +6693,26 @@ def main():
                     "APBS correction is treated as an explicit external final term. "
                     "Use only when the generated APBS cycle matches the intended thermodynamic correction."
                 ),
-            }
+            },
+            "charge_transfer_reservoir": (
+                {
+                    "delta_G_kJ_mol": float(_reservoir_delta),
+                    "error_kJ_mol": float(_reservoir_error),
+                    "status": "applied" if _reservoir_payload is not None else "not_applicable",
+                    "protocol_version": (
+                        _reservoir_payload.get("protocol_version")
+                        if isinstance(_reservoir_payload, dict)
+                        else None
+                    ),
+                }
+                if _reservoir_payload is not None
+                else {
+                    "delta_G_kJ_mol": 0.0,
+                    "error_kJ_mol": 0.0,
+                    "status": "not_applicable",
+                    "protocol_version": None,
+                }
+            ),
         },
         "diagnostics": {
             "complex": complex_results.get("diagnostics", {}),

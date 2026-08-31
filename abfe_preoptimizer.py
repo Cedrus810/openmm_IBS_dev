@@ -16,7 +16,9 @@ import numpy as np
 import os
 import glob
 import json
+import re
 import shutil
+import time
 from typing import Any, Dict, List, Tuple, Optional
 from abfe_core import (
     ACESoftcorePotential,
@@ -27,6 +29,8 @@ from ibs_engine import (
     generate_overlapping_windows,
     configure_charge_transfer_decharging,
     configure_coalchemical_neutral_decharging,
+    _build_platform_properties,
+    _timed,
 )
 try:
     from scipy.interpolate import PchipInterpolator
@@ -425,19 +429,47 @@ def validate_single_shared_boundary_ranges(
 
 
 def human_vanishing_initial_lambdas(requested_base_n_states: int) -> np.ndarray:
-    """Return the 17-point conventional *probe* input grid.
+    """Return the conventional *probe* input grid (default: 17 points).
 
     This is the grid the Fisher pilot measures on (before
     _refine_pilot_grid_in_steep_segments adds probes); the production path is
     placed separately by blended_metric_vanishing_lambdas at
     VANISHING_FINAL_STATE_COUNT nodes.
+
+    🔑 [2026-08-27] Before this, ``requested_base_n_states`` had to be exactly
+    ``VANISHING_PROBE_BASE_STATE_COUNT`` (17) or this raised — meaning
+    ``--stage2-n-states``/``stage2_n_states`` in runabfe.py's CLI/presets was
+    a lie for any other value: it parsed fine and then crashed here. The
+    linspace construction below never assumed exactly 17 points; the
+    hard-equality check was gatekeeping a value nothing downstream in *this*
+    function actually depended on. Widened to any n>=2 probe grid — the probe
+    density only affects how finely the Fisher metric g(lambda) is sampled
+    before placement, not the production window layout (see
+    VANISHING_FINAL_STATE_COUNT / vanishing_subdomain_ranges_from_lambdas,
+    which remain their own, separately-gated contract).
+
+    🔑 [2026-08-28] The 2026-08-27 widening above removed the fail-fast: a
+    stray/wrong ``n_states`` (e.g. a stale config value) used to crash here
+    before any GPU work happened, now it silently runs to completion instead
+    — real incident: a 4W53 production run sat at ``stage2_n_states=8`` from
+    a leftover config, burned real GPU integration steps, and only got
+    noticed when the user manually interrupted it. Not re-adding the hard
+    equality check (``--stage2-n-states`` must stay configurable to any
+    n>=2); instead, warn loudly whenever the value is non-default so it's
+    visible in the log before compute is spent, not just from an
+    unexplained slow run.
     """
-    if int(requested_base_n_states) != VANISHING_PROBE_BASE_STATE_COUNT:
-        raise ValueError(
-            f"vanishing pilot 探针网格固定为 {VANISHING_PROBE_BASE_STATE_COUNT} 个"
-            f"常规态；收到 base_n_states={requested_base_n_states}"
+    n = int(requested_base_n_states)
+    if n < 2:
+        raise ValueError(f"vanishing pilot 探针网格至少需要 2 个点；收到 base_n_states={n}")
+    if n != VANISHING_PROBE_BASE_STATE_COUNT:
+        print(
+            f"  ⚠️ [vanishing pilot 探针网格] 探针密度 base_n_states={n}，"
+            f"偏离常规默认值 {VANISHING_PROBE_BASE_STATE_COUNT}——如果这不是故意"
+            f"传的，请检查 --stage2-n-states / config 里的 stage2_n_states 是不是"
+            f"设错了，再决定要不要现在就烧 GPU 时间跑下去。"
         )
-    return np.linspace(1.0, 0.0, VANISHING_PROBE_BASE_STATE_COUNT)
+    return np.linspace(1.0, 0.0, n)
 
 
 def quadratic_vanishing_base_lambdas(
@@ -589,12 +621,121 @@ def validate_vanishing_lambda_path_invariants(
         )
 
 
+def _greedy_vanishing_window_ranges(
+    n_states: int,
+    min_states_per_window: int,
+    max_states_per_window: int,
+) -> List[Tuple[int, int]]:
+    """Group ``n_states`` states into windows of
+    ``min_states_per_window``..``max_states_per_window`` states each, EVERY
+    window within bounds (not just avoiding a too-short trailing one).
+
+    Picks the number of windows ``W`` first (the smallest ``W`` for which an
+    even split can keep every window's size within bounds), then distributes
+    states across those ``W`` windows. This two-pass approach is deliberate: a
+    pure left-to-right greedy fill (take max_states_per_window every time) can
+    strand a remainder smaller than min_states_per_window that no single merge
+    fixes -- verified this the hard way, see the fix note. One boundary state is
+    shared between adjacent windows, same convention as the hand-tuned
+    23-state table (e.g. ``(0,5),(4,8)`` share state 4).
+
+    🔑 [2026-08-28] WINDOW 0 IS THE SMALLEST WINDOW, by explicit user request.
+    The previous distribution handed the leftover states to the FRONT
+    (``[base+1]*extra + [base]*(W-extra)``), so window 0 was tied-largest -- on
+    the real 4W53 12-state path that made window 0 carry +33.5 kJ/mol, 54.7% of
+    the whole path's total variation, in the same 5 states the flat middle got.
+    The cause is that lambda placement follows the Fisher metric
+    beta**2 Var[dU/dlambda], which is *smallest* at lambda=1 (24.2 there vs 1590
+    at lambda~0.34) exactly where the *mean* gradient is largest (-145.8 kJ/mol).
+    Equal-thermodynamic-length spacing is still the right overlap criterion, so
+    this does not move a single lambda node -- it only regroups them, giving
+    window 0 ``min_states_per_window`` and spreading the rest evenly, sizes
+    non-decreasing. Every window still lands inside [min, max].
+
+    This does NOT touch the 23-state path (that returns the hand-tuned table
+    before ever reaching this function) and does not change the number of
+    windows ``W`` for any input -- only how many states each one gets.
+    """
+    n_states = int(n_states)
+    min_states_per_window = int(min_states_per_window)
+    max_states_per_window = int(max_states_per_window)
+    if min_states_per_window < 2:
+        raise ValueError(f"min_states_per_window 至少为 2：收到 {min_states_per_window}")
+    if max_states_per_window < min_states_per_window:
+        raise ValueError(
+            f"max_states_per_window ({max_states_per_window}) 不能小于 "
+            f"min_states_per_window ({min_states_per_window})"
+        )
+    total_intervals = n_states - 1
+    if total_intervals < 1:
+        raise ValueError(f"n_states 至少为 2：收到 {n_states}")
+
+    # sum(sizes) = n_states + W - 1 (W-1 shared boundary states double-counted).
+    # A legal window count must satisfy
+    # W*(min-1) <= total_intervals <= W*(max-1).  Determine feasibility before
+    # constructing anything; the previous best-effort decrement could collapse
+    # an infeasible two-window request to one oversized window (7 states with
+    # min=max=6).
+    max_interval_span = max_states_per_window - 1
+    min_interval_span = min_states_per_window - 1
+    min_windows = -(-total_intervals // max_interval_span)  # ceil division
+    max_windows = total_intervals // min_interval_span
+    if min_windows > max_windows:
+        raise ValueError(
+            "不存在满足 vanishing 分窗约束的窗口数："
+            f"n_states={n_states}, min_states_per_window={min_states_per_window}, "
+            f"max_states_per_window={max_states_per_window}"
+        )
+    n_windows = min_windows
+
+    # Distribute interval spans evenly, with smaller windows first.  Adding one
+    # shared boundary node converts each span to its window size.
+    base_span, extra = divmod(total_intervals, n_windows)
+    spans = [base_span] * (n_windows - extra) + [base_span + 1] * extra
+    sizes = [span + 1 for span in spans]
+
+    ranges: List[Tuple[int, int]] = []
+    start = 0
+    for size in sizes:
+        ranges.append((start, start + size))
+        start += size - 1
+
+    # Final construction audit: bounds, complete coverage, and exactly one
+    # shared boundary state between adjacent windows are all part of the public
+    # contract, not assumptions of the allocator above.
+    if any(
+        not (min_states_per_window <= end - begin <= max_states_per_window)
+        for begin, end in ranges
+    ):
+        raise RuntimeError(f"内部错误：vanishing 分窗尺寸越界：{ranges}")
+    if not ranges or ranges[0][0] != 0 or ranges[-1][1] != n_states:
+        raise RuntimeError(f"内部错误：vanishing 分窗未覆盖完整端点：{ranges}")
+    for left, right in zip(ranges, ranges[1:]):
+        if left[1] - 1 != right[0]:
+            raise RuntimeError(f"内部错误：相邻 vanishing 分窗必须只共享一个边界：{ranges}")
+    for left_index, left in enumerate(ranges):
+        for right in ranges[left_index + 2:]:
+            if right[0] < left[1]:
+                raise RuntimeError(f"内部错误：非相邻 vanishing 分窗发生重叠：{ranges}")
+    covered = {state for begin, end in ranges for state in range(begin, end)}
+    if covered != set(range(n_states)):
+        raise RuntimeError(f"内部错误：vanishing 分窗覆盖不完整：{ranges}")
+    return ranges
+
+
 def vanishing_subdomain_ranges_from_lambdas(
     lambdas_vdw,
     target_intervals_per_ensemble: int = VANISHING_TARGET_INTERVALS_PER_ENSEMBLE,
     min_intervals_per_ensemble: int = VANISHING_MIN_INTERVALS_PER_ENSEMBLE,
     max_states_per_ensemble: int = VANISHING_MAX_STATES_PER_IBS_ENSEMBLE,
     first_ensemble_target_intervals: Optional[int] = None,
+    # 🔑 [2026-08-27] Only consumed on the != 23 (greedy) path below. The four
+    # params above are the *frozen* 23-state contract (validated to equal
+    # their defaults, unused for computation once lambdas.size==23 since that
+    # path just returns the hand-tuned table). These two are in STATES, not
+    # intervals -- ask was literally "每个窗口最少4最多6[态]".
+    min_states_per_window: int = 4,
+    max_states_per_window: int = 6,
 ) -> List[Tuple[int, int]]:
     """Partition an adaptive lambda path into few-state IBS subintervals.
 
@@ -622,17 +763,28 @@ def vanishing_subdomain_ranges_from_lambdas(
     lambdas = np.asarray(lambdas_vdw, dtype=float).ravel()
     if lambdas.size < 2 or not np.all(np.diff(lambdas) < 0.0):
         raise ValueError("vanishing lambda 路径必须至少 2 态且严格递减")
-    if lambdas.size != VANISHING_FINAL_STATE_COUNT:
-        raise ValueError(
-            "当前 vanishing 窗口画线固定覆盖 lambda_0..lambda_22；"
-            f"收到 {lambdas.size} 个状态"
+    if lambdas.size == VANISHING_FINAL_STATE_COUNT:
+        # 23 态：仍然走原来手工调出来的固定 6 窗表——含 window0 ESS 塌缩修复，
+        # 逐字节不变。
+        if first_ensemble_target_intervals not in (
+            None,
+            VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS,
+        ):
+            raise ValueError("第一窗口固定为闭区间 [0,4]，即 4 条 lambda 边")
+        ranges = [tuple(r) for r in VANISHING_FIXED_WINDOW_RANGES]
+    else:
+        # 🔑 [2026-08-27] 别的态数：每个窗口 min_states_per_window..
+        # max_states_per_window 态，贪心从头填满，尾窗不够 min 就并进前一个窗口
+        # （见 _greedy_vanishing_window_ranges）。不是把上面 23 态那张表反推
+        # 出来的——两者给出的分组本来就不一样（上表是手工调过的，含 window0
+        # ESS 塌缩修复的特殊收窄，这条路径目前没有）。只对 n_states=23 之外的
+        # 态数生效，23 态路径完全不受影响。这条新路径的 window0 行为还没在
+        # 真机上验证过。
+        ranges = _greedy_vanishing_window_ranges(
+            int(lambdas.size),
+            min_states_per_window=int(min_states_per_window),
+            max_states_per_window=int(max_states_per_window),
         )
-    if first_ensemble_target_intervals not in (
-        None,
-        VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS,
-    ):
-        raise ValueError("第一窗口固定为闭区间 [0,4]，即 4 条 lambda 边")
-    ranges = [tuple(r) for r in VANISHING_FIXED_WINDOW_RANGES]
     validate_single_shared_boundary_ranges(ranges, int(lambdas.size))
     return ranges
 
@@ -687,6 +839,13 @@ def redistribute_vanishing_lambda_subdomains(
     min_intervals_per_ensemble: int = VANISHING_MIN_INTERVALS_PER_ENSEMBLE,
     max_states_per_ensemble: int = VANISHING_MAX_STATES_PER_IBS_ENSEMBLE,
     first_ensemble_target_intervals: Optional[int] = None,
+    final_state_count: int = VANISHING_FINAL_STATE_COUNT,
+    # 只在 final_state_count != VANISHING_FINAL_STATE_COUNT 时生效，见
+    # vanishing_subdomain_ranges_from_lambdas。默认不传等于什么都不变——
+    # final_state_count 留默认(23) 就还是走老的固定表，这两个参数根本不会
+    # 被用到。
+    min_states_per_window: int = 4,
+    max_states_per_window: int = 6,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Tuple[int, int]], Dict]:
     """Place the production vanishing lambdas from the measured Fisher metric.
 
@@ -695,6 +854,32 @@ def redistribute_vanishing_lambda_subdomains(
     equal-thermodynamic-length solution here and then threw it away in favour
     of a fixed quadratic schedule + 4 hand-picked + 2 bridge nodes.  See the
     version history at the top of this module for why both extremes failed.
+
+    🔑 [2026-08-27] ``n_states`` used to have to equal the module constant
+    ``VANISHING_PROBE_BASE_STATE_COUNT`` (17) or this raised — a check against
+    a fixed global that had nothing to do with what was actually probed.
+    Replaced with a minimal sanity check (``n_states >= 2``) instead of a
+    magic-number lock. Note ``n_states`` is the caller's *original* probe
+    count and is deliberately NOT compared against ``len(pilot_lambdas)``:
+    ``_refine_pilot_grid_in_steep_segments`` adds extra points inside steep
+    segments before this is called (that's the real window0 ESS-collapse
+    fix, protocol version 15), so ``pilot_lambdas`` legitimately grows past
+    ``n_states`` in the normal/expected path. This is what let
+    ``human_vanishing_initial_lambdas`` widen to any probe density.
+
+    ``final_state_count`` is new and *not* the same knob as ``n_states``: it is
+    the number of production windows the metric gets placed onto, i.e. how
+    many actual λ states you end up with. Default (23) still goes through
+    ``VANISHING_FIXED_WINDOW_RANGES``, the hand-tuned 6-window partition
+    (first window pinned to the closed interval [0,4]) built specifically
+    because a real GPU run showed window 0 collapse to min_absolute_ess~1.0 —
+    byte-for-byte unchanged. Anything else goes through
+    ``_greedy_vanishing_window_ranges`` instead: windows of
+    ``min_states_per_window``..``max_states_per_window`` states each, greedily
+    filled front-to-back. This is a genuinely different (simpler, no
+    window0-specific narrowing) algorithm from the 23-state table, added
+    2026-08-27, not yet checked against a real GPU run — the thing to look at
+    first is whether window 0 still shows the same occupancy collapse.
     """
     if int(target_intervals_per_ensemble) != VANISHING_TARGET_INTERVALS_PER_ENSEMBLE:
         raise ValueError("人工 vanishing 窗口契约禁止覆盖 target_intervals_per_ensemble")
@@ -708,23 +893,40 @@ def redistribute_vanishing_lambda_subdomains(
     ):
         raise ValueError("人工 vanishing 窗口契约禁止覆盖第一窗口区间数")
 
-    if int(n_states) != VANISHING_PROBE_BASE_STATE_COUNT:
-        raise ValueError("vanishing 探针常规态数固定为 17")
+    pilot_lambdas = np.asarray(pilot_lambdas, dtype=float)
+    # 🔑 [2026-08-27] `n_states` 是调用方原始探针网格点数，不是 `pilot_lambdas`
+    # 当前长度——`_refine_pilot_grid_in_steep_segments` 会在陡峭区间插点，实测
+    # 真机跑法里 `pilot_lambdas` 之后通常比 `n_states` 更长（见该函数文档串，
+    # 就是靠这个才修好 window0 ESS 塌缩）。这里不拿它俩比对，只做基本合法性
+    # 检查；下面实际用来布点的是 `pilot_lambdas`/`metric_g` 本身的长度。
+    if int(n_states) < 2:
+        raise ValueError(f"n_states 必须至少为 2：收到 {int(n_states)}")
+    if pilot_lambdas.size < 2:
+        raise ValueError(f"pilot_lambdas 必须至少有 2 个点：收到 {pilot_lambdas.size}")
+    final_state_count = int(final_state_count)
+    if final_state_count < 2:
+        raise ValueError(f"final_state_count 必须至少为 2：收到 {final_state_count}")
+    # 🔑 [2026-08-27] 之前这里对任何非 23 的 final_state_count 都硬拒绝。现在
+    # 真正生效：!= 23 时 vanishing_subdomain_ranges_from_lambdas 走
+    # _greedy_vanishing_window_ranges（见该函数），23 时逐字节走原来那张手工
+    # 表，两条路径互不影响。新路径的 window0 行为还没在真机上跑过。
     optimized_lambdas, cumulative, optimized_edge_lengths = (
         blended_metric_vanishing_lambdas(
-            np.asarray(pilot_lambdas, dtype=float),
+            pilot_lambdas,
             np.asarray(metric_g, dtype=float),
-            VANISHING_FINAL_STATE_COUNT,
+            final_state_count,
             VANISHING_GEOMETRIC_FLOOR_WEIGHT,
         )
     )
-    validate_vanishing_lambda_path_invariants(optimized_lambdas)
+    validate_vanishing_lambda_path_invariants(optimized_lambdas, n_states=final_state_count)
     window_ranges = vanishing_subdomain_ranges_from_lambdas(
         optimized_lambdas,
         target_intervals_per_ensemble=target_intervals_per_ensemble,
         min_intervals_per_ensemble=min_intervals_per_ensemble,
         max_states_per_ensemble=max_states_per_ensemble,
         first_ensemble_target_intervals=first_ensemble_target_intervals,
+        min_states_per_window=min_states_per_window,
+        max_states_per_window=max_states_per_window,
     )
     validate_single_shared_boundary_ranges(window_ranges, len(optimized_lambdas))
     interval_counts = [end - start - 1 for start, end in window_ranges]
@@ -732,7 +934,7 @@ def redistribute_vanishing_lambda_subdomains(
         "base_lambda_placement": "fisher_metric_blended_with_geometric_floor_v21",
         "geometric_floor_weight": float(VANISHING_GEOMETRIC_FLOOR_WEIGHT),
         "max_lambda_gap_bound": float(
-            vanishing_max_lambda_gap_bound(VANISHING_FINAL_STATE_COUNT)
+            vanishing_max_lambda_gap_bound(final_state_count)
         ),
         "realized_max_lambda_gap": float(
             np.max(np.abs(np.diff(optimized_lambdas)))
@@ -1478,6 +1680,140 @@ def estimate_f_k_from_pilot_ti(
     return f_at_target
 
 
+def pilot_ti_seed_trust_diagnostics(
+    pilot_lambdas: Optional[List[float]],
+    pilot_mean_dU_dlambda: Optional[List[float]],
+    pilot_std_dU_dlambda: Optional[List[float]],
+    pilot_n_dU_dlambda_samples: Optional[List[int]],
+    target_lambdas: List[float],
+    max_sem_kJ_mol: float = 2.0,
+    max_propagated_uncertainty_kJ_mol: float = 5.0,
+) -> Dict[str, Any]:
+    """评估 `estimate_f_k_from_pilot_ti()` 给出的 pilot TI 种子，对某个具体
+    窗口（`target_lambdas`）是否**精度**足够，可以被上游当作"跳过在线学习、
+    直接尝试冻结验证"（pilot-first）的候选。
+
+    ⚠️ 这只是精度判断（pilot 网格自己的 TI 积分测得多准），不是准确性判断
+    （pilot 探针系统的物理环境——通常跟真实窗口环境不完全一样——测到的
+    dU/dlambda 是否真的能代表这个窗口）。后一半必须由调用方另外用同一个
+    窗口的独立自举 TI 估计（真实 Hamiltonian 下采样）做交叉验证；这个函数
+    单独返回 `trustworthy=True` **不足以**允许 pilot-first，只是必要条件
+    之一。见 memtodolist 里"窗口预热状态机重构"计划的风险复核结论。
+
+    纯 Python，不依赖 OpenMM，可离线单元测试。永不抛异常——精度数据缺失、
+    形状不对、含非有限值时一律 `trustworthy=False`，不当作调用方的 bug，
+    也不当作"数据没问题只是精度不够"（旧的、本次改动之前生成的 preopt
+    cache 就没有 `std_dU_dlambda_kJ_mol`/`n_derivative_samples` 这两个字段，
+    必须能安全地退化成"不可信"而不是报错）。
+
+    Returns
+    -------
+    dict，键固定为：
+      - ``trustworthy``: bool，下面全部检查通过才是 True。
+      - ``reason``: str，第一个未通过的检查名；`trustworthy=True` 时是 "ok"。
+      - ``propagated_uncertainty_kJ_mol``: float，覆盖这个窗口 λ 跨度的
+        pilot 点子集上，对 F(target_hi)-F(target_lo) 做的粗略 trapezoidal
+        误差传播估计（`sqrt(sum((0.5*dlambda)^2 * (sem_i^2+sem_{i+1}^2)))`）。
+        更早的检查失败时是 ``nan``。
+      - ``max_sem_kJ_mol``: float，同一个局部子集里最差的标准误
+        （`std_dU_dlambda_kJ_mol / sqrt(n_derivative_samples)`）。同样，
+        更早失败时是 ``nan``。
+    """
+    nan = float("nan")
+
+    def _fail(reason: str) -> Dict[str, Any]:
+        return {
+            "trustworthy": False,
+            "reason": reason,
+            "propagated_uncertainty_kJ_mol": nan,
+            "max_sem_kJ_mol": nan,
+        }
+
+    if not pilot_lambdas or not pilot_mean_dU_dlambda:
+        return _fail("missing_pilot_data")
+    if not pilot_std_dU_dlambda or not pilot_n_dU_dlambda_samples:
+        return _fail("missing_pilot_precision_fields")
+
+    try:
+        lam = np.asarray(pilot_lambdas, dtype=float).ravel()
+        grad = np.asarray(pilot_mean_dU_dlambda, dtype=float).ravel()
+        std = np.asarray(pilot_std_dU_dlambda, dtype=float).ravel()
+        n_samples = np.asarray(pilot_n_dU_dlambda_samples, dtype=float).ravel()
+    except (TypeError, ValueError):
+        return _fail("non_numeric_pilot_data")
+
+    if not (lam.size == grad.size == std.size == n_samples.size) or lam.size < 2:
+        return _fail("shape_mismatch_or_too_few_points")
+    if not (
+        np.all(np.isfinite(lam))
+        and np.all(np.isfinite(grad))
+        and np.all(np.isfinite(std))
+        and np.all(np.isfinite(n_samples))
+    ):
+        return _fail("non_finite_pilot_data")
+    if np.any(n_samples < 1):
+        return _fail("zero_sample_pilot_point")
+
+    order = np.argsort(lam)
+    lam_sorted = lam[order]
+    std_sorted = std[order]
+    n_sorted = n_samples[order]
+
+    target = np.asarray(target_lambdas, dtype=float).ravel()
+    if target.size == 0 or not np.all(np.isfinite(target)):
+        return _fail("invalid_target_lambdas")
+
+    lo, hi = float(lam_sorted[0]), float(lam_sorted[-1])
+    target_lo, target_hi = float(np.min(target)), float(np.max(target))
+    if target_lo < lo or target_hi > hi:
+        # estimate_f_k_from_pilot_ti() 在这种情况下会钳位到边界值当近似——
+        # 对"热启动初值"这种用途足够了；但对"直接当冻结候选"，钳位意味着
+        # 这段窗口跨度里根本没有真实 pilot 测量，不能算可信。
+        return _fail("target_lambdas_require_extrapolation")
+
+    sem = std_sorted / np.sqrt(n_sorted)
+
+    # 取覆盖这个窗口 λ 跨度的最小 pilot 点子集（跨度两端之外各留一个相邻
+    # 点，保证跨度边界所在的那一段梯形也被计入），只在这个局部子集上做
+    # 误差传播——关心的是这一个窗口自己的 F(target_hi)-F(target_lo) 有多
+    # 不确定，不是整条 pilot 曲线的全局不确定度。
+    lo_idx = max(0, int(np.searchsorted(lam_sorted, target_lo, side="right")) - 1)
+    hi_idx = min(lam_sorted.size - 1, int(np.searchsorted(lam_sorted, target_hi, side="left")))
+    if hi_idx <= lo_idx:
+        hi_idx = min(lam_sorted.size - 1, lo_idx + 1)
+
+    local_sem = sem[lo_idx : hi_idx + 1]
+    d_lam = np.diff(lam_sorted[lo_idx : hi_idx + 1])
+    if local_sem.size < 2:
+        return _fail("insufficient_local_pilot_coverage")
+
+    max_local_sem = float(np.max(local_sem))
+    variance_terms = (0.5 * d_lam) ** 2 * (local_sem[:-1] ** 2 + local_sem[1:] ** 2)
+    propagated_uncertainty = float(np.sqrt(np.sum(variance_terms)))
+
+    if max_local_sem > float(max_sem_kJ_mol):
+        return {
+            "trustworthy": False,
+            "reason": "pilot_sem_too_large",
+            "propagated_uncertainty_kJ_mol": propagated_uncertainty,
+            "max_sem_kJ_mol": max_local_sem,
+        }
+    if propagated_uncertainty > float(max_propagated_uncertainty_kJ_mol):
+        return {
+            "trustworthy": False,
+            "reason": "propagated_uncertainty_too_large",
+            "propagated_uncertainty_kJ_mol": propagated_uncertainty,
+            "max_sem_kJ_mol": max_local_sem,
+        }
+
+    return {
+        "trustworthy": True,
+        "reason": "ok",
+        "propagated_uncertainty_kJ_mol": propagated_uncertainty,
+        "max_sem_kJ_mol": max_local_sem,
+    }
+
+
 def partition_windows_by_delta_f_budget(
     f_k_in_order: np.ndarray,
     max_window_span_kJ: float,
@@ -1653,17 +1989,36 @@ def refine_stage_lambda_path_from_data(
     lambdas_var = preopt["lambdas_var"]
     window_ranges = preopt["window_ranges"]
 
-    e_files = sorted(glob.glob(os.path.join(stage_dir, f"dual_window_*_{stage_type}_energies.npy")))
-    if len(e_files) != len(window_ranges):
+    # 🔑 [P1-15] 从文件名解析**真实**窗口编号，按数值排序——此前
+    # `sorted(glob.glob(...))` 是字典序，窗口数达到两位数时 window_10/window_11
+    # 会排在 window_2 之前，再用 enumerate 的位置当窗口编号就会把 u_kn/bias/
+    # base 与 window_ranges 错配，写出错误的新 λ 路径。与
+    # runabfe._analyze_dual_leg / abfe_pipeline 清理窗口产物用的是同一套正则
+    # `dual_window_(\d+)_{stage_type}_energies\.npy`；编号必须从 0 连续到 N-1，
+    # 重复或缺失一律拒绝（不能悄悄错配）。
+    _window_idx_re = re.compile(rf"dual_window_(\d+)_{stage_type}_energies\.npy$")
+    indexed_e_files = []
+    for e_file in glob.glob(os.path.join(stage_dir, f"dual_window_*_{stage_type}_energies.npy")):
+        match = _window_idx_re.search(os.path.basename(e_file))
+        if not match:
+            raise RuntimeError(
+                f"无法从文件名解析窗口编号（期望 dual_window_<int>_{stage_type}_energies.npy）: "
+                f"{e_file}"
+            )
+        indexed_e_files.append((int(match.group(1)), e_file))
+    indexed_e_files.sort(key=lambda pair: pair[0])
+    parsed_indices = [idx for idx, _ in indexed_e_files]
+    if parsed_indices != list(range(len(window_ranges))):
         raise RuntimeError(
-            f"窗口能量文件数 ({len(e_files)}) 与 preopt 缓存里的 window_ranges 数 "
-            f"({len(window_ranges)}) 不一致，无法基于现有数据重新设计路径；"
+            f"窗口能量文件编号（解析得到 {parsed_indices}）与 preopt 缓存里的 "
+            f"window_ranges 数 ({len(window_ranges)}) 不一致（要求从 0 连续编号），"
+            "无法基于现有数据重新设计路径；"
             "请先确认该 stage 的采样已经完整跑完（每个窗口都有对应的 "
-            f"dual_window_*_{stage_type}_energies.npy）。"
+            f"dual_window_<int>_{stage_type}_energies.npy，且没有重复/缺失编号）。"
         )
 
     window_data = []
-    for w_idx, e_file in enumerate(e_files):
+    for w_idx, (_parsed_idx, e_file) in enumerate(indexed_e_files):
         u_kn = np.load(e_file)
         bias = np.load(e_file.replace("_energies.npy", "_bias.npy"))
         base = np.load(e_file.replace("_energies.npy", "_base.npy"))
@@ -2268,6 +2623,199 @@ class ABFEPreOptimizer:
 
 
 # =============================================================================
+# λ 路径 pilot 探针 shadow early-stop 诊断（Phase A，2026-08-26）
+# =============================================================================
+# 下面这组是纯 Python/numpy 函数，不依赖 OpenMM Context，可离线单测。目的是
+# 回答"Stage2 vanishing pilot 的 n_steps_per_state=30000 是不是处处都要跑
+# 满"——但本阶段（Phase A）只做诊断/记录，不改变任何真实采样长度：
+# `_sample_scalar_metric`/`optimize_stage2_vanishing`/
+# `_refine_pilot_grid_in_steep_segments` 在 shadow_checkpoint_steps /
+# shadow_checkpoint_interval 为 None（默认值）时逐字节保持原行为不变。
+#
+# 背景（详见 abfe_pipeline.py 里 "vanishing" 分支调用 _run_dual_lambda_
+# optimization 处 2026-07-19 的原地注释）：那次真实 GPU 回归发现 10000 步的
+# 短 pilot 会系统性低估 λ≈1 端点由稀有/发作性事件主导的
+# beta^2*Var[dU/dlambda]，才把预算拉长到当前生产用的 30000。任何缩短 pilot
+# 预算的方案都必须先证明不会重新踩这个坑——这组函数只是用来在真机上收集
+# "如果提前停会怎样"的影子数据供之后离线验证，本身不做任何提前停的决定。
+
+
+def _pilot_segment_lengths(pilot_lambdas, metric_g) -> np.ndarray:
+    """相邻 pilot 点之间的热力学长度 ``0.5*(sqrt(g_i)+sqrt(g_{i+1}))*|dλ|``。
+
+    从 `_refine_pilot_grid_in_steep_segments` 里抽出来的共享实现（原来那里
+    是内联重复代码），数值行为不变；`classify_pilot_point_risk_zone` 也用它
+    判断"当前最长热力学区间"。
+    """
+    sqrt_g = np.sqrt(np.clip(np.asarray(metric_g, dtype=float), 1.0e-12, None))
+    lam = np.asarray(pilot_lambdas, dtype=float)
+    if lam.size < 2:
+        return np.zeros(0, dtype=float)
+    return 0.5 * (sqrt_g[:-1] + sqrt_g[1:]) * np.abs(np.diff(lam))
+
+
+def pilot_block_running_diagnostics(
+    values: np.ndarray, temperature_K: float
+) -> Dict[str, Any]:
+    """给定某个 pilot 点截至目前采到的 dU/dlambda 样本，算一组"假想现在停
+    下"的诊断量。纯数值，不抛异常——样本太少时相应字段退化成 NaN，由调用方
+    按 ``n_samples`` 自己决定要不要信。
+
+    Returns
+    -------
+    dict：``n_samples``、``mean_dU_dlambda_kJ_mol``、``std_dU_dlambda_kJ_mol``、
+    ``sem_kJ_mol``、``metric_g``（beta^2*Var）、``excess_kurtosis``（超额峰
+    度，>0 说明比正态分布更厚尾，可能是还没等到的稀有事件的早期信号）、
+    ``max_abs_robust_zscore``（基于 MAD 的稳健 z 分数最大绝对值，抓单个突发
+    异常值，不像普通 z 分数那样会被该值自己拉高的标准差稀释）。
+    """
+    values = np.asarray(values, dtype=float).ravel()
+    n = int(values.size)
+    out: Dict[str, Any] = {"n_samples": n}
+    if n < 2:
+        out.update(
+            mean_dU_dlambda_kJ_mol=float("nan"),
+            std_dU_dlambda_kJ_mol=float("nan"),
+            sem_kJ_mol=float("nan"),
+            metric_g=float("nan"),
+            excess_kurtosis=float("nan"),
+            max_abs_robust_zscore=float("nan"),
+        )
+        return out
+
+    mean = float(np.mean(values))
+    std = float(np.std(values, ddof=1))
+    beta = 1.0 / (0.008314462618 * float(temperature_K))
+    out["mean_dU_dlambda_kJ_mol"] = mean
+    out["std_dU_dlambda_kJ_mol"] = std
+    out["sem_kJ_mol"] = float(std / np.sqrt(n))
+    out["metric_g"] = float(beta * beta * std * std)
+
+    if n >= 4 and std > 0.0:
+        out["excess_kurtosis"] = float(np.mean((values - mean) ** 4) / std**4 - 3.0)
+    else:
+        out["excess_kurtosis"] = float("nan")
+
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+    if mad > 0.0:
+        robust_z = 0.6745 * (values - median) / mad
+        out["max_abs_robust_zscore"] = float(np.max(np.abs(robust_z)))
+    else:
+        out["max_abs_robust_zscore"] = 0.0
+    return out
+
+
+def classify_pilot_point_risk_zone(
+    pilot_lambdas,
+    metric_g,
+    is_refinement_point,
+    lambda_near_one_floor: float = 0.875,
+) -> List[str]:
+    """对每个 pilot 点标 "risk" / "easy"，纯事后打标签，不影响任何真实采样。
+
+    风险判据（跟用户敲定的设计一一对应）：
+      - 加密点（``is_refinement_point[i]`` 为 True，来自
+        `_refine_pilot_grid_in_steep_segments`）——插入的理由本来就是父区间
+        空间信息不足，继承父区间风险，不因为是"额外点"缩短预算。
+      - λ ≥ ``lambda_near_one_floor``（默认 0.875，覆盖
+        `human_vanishing_initial_lambdas` 17 点网格里 λ=1.0 起最前两段）——
+        07-19 那次真实回归的端点区域。
+      - 当前最长热力学区间（`_pilot_segment_lengths` 最大值，允许并列）的两
+        个端点。
+
+    其余点标 "easy"。数组长度不一致时整体退化成全 "risk"（宁可保守，不猜）。
+    """
+    lam = np.asarray(pilot_lambdas, dtype=float).ravel()
+    g = np.asarray(metric_g, dtype=float).ravel()
+    refine_flags = list(is_refinement_point)
+    n = int(lam.size)
+    if not (n == g.size == len(refine_flags)) or n < 2:
+        return ["risk"] * max(n, 0)
+
+    tags = ["easy"] * n
+    for i in range(n):
+        if bool(refine_flags[i]):
+            tags[i] = "risk"
+        elif lam[i] >= float(lambda_near_one_floor):
+            tags[i] = "risk"
+
+    seg_lengths = _pilot_segment_lengths(lam, g)
+    if seg_lengths.size:
+        worst = float(np.max(seg_lengths))
+        for i, length in enumerate(seg_lengths):
+            if length >= worst - 1.0e-12 * max(worst, 1.0):
+                tags[i] = "risk"
+                tags[i + 1] = "risk"
+    return tags
+
+
+def pilot_early_stop_pressure_test(
+    pilot_lambdas,
+    final_metric_g,
+    point_index: int,
+    checkpoint_metric_g: float,
+    worst_case_inflation_ratio: float = 3.0,
+    max_allowed_lambda_shift: float = 0.01,
+    first_ensemble_target_intervals: Optional[int] = VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS,
+) -> Dict[str, Any]:
+    """压力测试：如果 ``point_index`` 这个点在某个 checkpoint 就已经拿到了
+    ``checkpoint_metric_g``（而不是跑满 30000 步后的真实
+    ``final_metric_g[point_index]``），production λ 布点会挪动多少；再把这
+    个 checkpoint 估计按 ``worst_case_inflation_ratio`` 向上膨胀重算一次，两
+    次位移都要低于 ``max_allowed_lambda_shift`` 才算通过压力测试。
+
+    🔑 ``worst_case_inflation_ratio`` 默认值 3.0 是占位符，不是已验证的数
+    字——本函数落地时仓库里还没有真实的 shadow 数据；Phase B 拿到真机 30000
+    步的 checkpoint 序列、反推出真实的"部分估计 vs 最终估计"比值分布之后，
+    必须回填一个有实测依据的值，调用方不应该信任这个默认值本身代表任何安全
+    边际。
+
+    永不抛异常：`redistribute_vanishing_lambda_subdomains` 失败（输入不满足
+    不变量等）时返回 ``{"valid": False, "reason": ...}``——这是离线诊断函
+    数，不能让分析脚本因为一次异常输入就整体崩溃。
+    """
+    try:
+        lam = np.asarray(pilot_lambdas, dtype=float)
+        g_final = np.asarray(final_metric_g, dtype=float)
+        if not (0 <= int(point_index) < lam.size) or lam.size != g_final.size:
+            return {"valid": False, "reason": "bad_point_index_or_shape_mismatch"}
+
+        baseline_lambdas, *_ = redistribute_vanishing_lambda_subdomains(
+            lam, g_final, VANISHING_PROBE_BASE_STATE_COUNT,
+            first_ensemble_target_intervals=first_ensemble_target_intervals,
+        )
+
+        def _shift_for(substitute_metric_g: float) -> float:
+            g_mod = g_final.copy()
+            g_mod[int(point_index)] = float(substitute_metric_g)
+            candidate_lambdas, *_ = redistribute_vanishing_lambda_subdomains(
+                lam, g_mod, VANISHING_PROBE_BASE_STATE_COUNT,
+                first_ensemble_target_intervals=first_ensemble_target_intervals,
+            )
+            return float(np.max(np.abs(candidate_lambdas - baseline_lambdas)))
+
+        raw_shift = _shift_for(checkpoint_metric_g)
+        inflated_shift = _shift_for(
+            float(checkpoint_metric_g) * float(worst_case_inflation_ratio)
+        )
+        passes = (
+            raw_shift <= max_allowed_lambda_shift
+            and inflated_shift <= max_allowed_lambda_shift
+        )
+        return {
+            "valid": True,
+            "raw_lambda_shift": raw_shift,
+            "inflated_lambda_shift": inflated_shift,
+            "max_allowed_lambda_shift": float(max_allowed_lambda_shift),
+            "worst_case_inflation_ratio": float(worst_case_inflation_ratio),
+            "would_pass_pressure_test": bool(passes),
+        }
+    except Exception as e:  # noqa: BLE001 -- 离线诊断，fail-closed 不能崩调用方
+        return {"valid": False, "reason": f"redistribute_failed: {e}"}
+
+
+# =============================================================================
 # 添加双λ路径优化类
 # =============================================================================
 # 修复 DualLambdaPreOptimizer 类
@@ -2362,20 +2910,52 @@ class DualLambdaPreOptimizer:
         n_steps: int,
         delta: float,
         sample_interval: int = 50,
+        shadow_checkpoint_steps: Optional[List[int]] = None,
     ) -> Tuple[float, Dict]:
         """Short-pilot estimate of beta**2 Var[dU/dlambda]."""
+        # 🔑 [性能计时] 只加计时，不改任何积分/有限差分逻辑或默认参数——
+        # sample_interval/n_steps 直接影响 λ 路径优化结果，这次不动，见
+        # optimize_stage2_vanishing 调用处的说明。目的是把"这个 λ 点到底
+        # 花在积分 vs 有限差分能量读取上多少时间"变成可测量的数字。
+        point_timers: Dict[str, float] = {}
         derivative_samples = []
+        # 🔑 [shadow early-stop 插桩，Phase A，2026-08-26] shadow_checkpoint_
+        # steps 为 None（默认）时下面这段完全不产生任何额外计算/字段——循环
+        # 仍然无条件跑满传入的 n_steps，真实采样长度、返回值形状逐字节不变。
+        # 传入时也不改变真实采样长度：batches 仍然全部跑完；只是在累积步数
+        # 跨过每个请求的 checkpoint 时，用当时已经采到的 derivative_samples
+        # 多算一次"假想现在停下会怎样"的诊断，写进 shadow_trace，不参与任何
+        # 真实判断分支（是否继续采样、metric_g 怎么算，都跟今天完全一样）。
+        pending_checkpoints = (
+            sorted({int(s) for s in shadow_checkpoint_steps})
+            if shadow_checkpoint_steps
+            else []
+        )
+        shadow_trace: List[Dict[str, Any]] = []
+        cumulative_steps = 0
         full_batches, remainder = divmod(int(n_steps), int(sample_interval))
         batches = [int(sample_interval)] * full_batches
         if remainder:
             batches.append(remainder)
         for batch_steps in batches:
-            self.context.getIntegrator().step(batch_steps)
-            derivative = self._finite_difference_derivative_1d(
-                parameter_name, lam, delta
-            )
+            with _timed(point_timers, "integration_s"):
+                self.context.getIntegrator().step(batch_steps)
+            with _timed(point_timers, "finite_difference_s"):
+                derivative = self._finite_difference_derivative_1d(
+                    parameter_name, lam, delta
+                )
             if np.isfinite(derivative):
                 derivative_samples.append(float(derivative))
+            cumulative_steps += int(batch_steps)
+            while pending_checkpoints and cumulative_steps >= pending_checkpoints[0]:
+                checkpoint_step = pending_checkpoints.pop(0)
+                snapshot = pilot_block_running_diagnostics(
+                    np.asarray(derivative_samples, dtype=float),
+                    float(self.temperature),
+                )
+                snapshot["cumulative_steps"] = int(cumulative_steps)
+                snapshot["requested_checkpoint_steps"] = int(checkpoint_step)
+                shadow_trace.append(snapshot)
 
         if len(derivative_samples) < 10:
             raise RuntimeError(
@@ -2385,15 +2965,30 @@ class DualLambdaPreOptimizer:
         values = np.asarray(derivative_samples, dtype=float)
         beta = 1.0 / (0.008314462618 * float(self.temperature))
         metric_g = float(beta * beta * np.var(values, ddof=1))
-        return metric_g, {
+        diag = {
             "lambda": float(lam),
             "n_derivative_samples": int(values.size),
             "mean_dU_dlambda_kJ_mol": float(np.mean(values)),
             "std_dU_dlambda_kJ_mol": float(np.std(values, ddof=1)),
             "metric_g": metric_g,
+            "timing_s": dict(point_timers),
         }
+        if shadow_checkpoint_steps:
+            diag["shadow_trace"] = shadow_trace
+        return metric_g, diag
 
     def optimize_stage1_decharging(self, n_states=12, n_steps_per_state=2000):
+        # This legacy entry point samples ``Var(U_group1)`` from a cutoff
+        # probe.  That is not the Fisher metric of the production PME
+        # Hamiltonian (which requires beta² Var[dU/dlambda]), and it can also
+        # include lambda-independent environment noise.  The production
+        # pipeline already uses a validated linear Stage-1 path; keep this
+        # public API fail-closed until a PME derivative sampler is implemented.
+        raise RuntimeError(
+            "Stage 1 自适应去电荷预优化已禁用：旧实现使用 Var(U) 而非生产 PME 的 "
+            "beta² Var[dU/dlambda]，其路径不能用于热力学采样。请使用 pipeline 的线性路径。"
+        )
+
         print(f"\n[STAGE1] 开始去电荷路径优化 (n_states={n_states})...")
         print(f"[STAGE1] 当前 param_coul='{self.param_coul}', param_vdw='{self.param_vdw}'")
         
@@ -2463,6 +3058,7 @@ class DualLambdaPreOptimizer:
         max_segment_length_fraction: float = 0.2,
         extra_points_per_segment: int = 4,
         max_rounds: int = 2,
+        shadow_checkpoint_steps: Optional[List[int]] = None,
     ):
         """[THERMODYNAMIC_PATH_PROTOCOL_VERSION=15] Probe additional points
         strictly inside whichever single coarse pilot segment dominates the
@@ -2494,11 +3090,9 @@ class DualLambdaPreOptimizer:
         current_params = dict(self.context.getParameters())
 
         for _round in range(int(max_rounds)):
-            sqrt_g = [float(np.sqrt(max(g, 1.0e-12))) for g in metric_g]
-            seg_lengths = [
-                0.5 * (sqrt_g[i] + sqrt_g[i + 1]) * abs(pilot_lambdas[i + 1] - pilot_lambdas[i])
-                for i in range(len(pilot_lambdas) - 1)
-            ]
+            # 🔑 [重用] 跟 classify_pilot_point_risk_zone 用同一份共享实现
+            # （原来这里是内联重复代码），数值行为不变。
+            seg_lengths = _pilot_segment_lengths(pilot_lambdas, metric_g).tolist()
             total_length = float(sum(seg_lengths))
             if total_length <= 0.0 or not seg_lengths:
                 break
@@ -2527,6 +3121,16 @@ class DualLambdaPreOptimizer:
                     float(lam),
                     n_steps=int(n_steps_per_state),
                     delta=float(finite_difference_delta),
+                    shadow_checkpoint_steps=shadow_checkpoint_steps,
+                )
+                # 🔑 加密点永远标记为风险点（classify_pilot_point_risk_zone
+                # 消费这个字段）——插入的理由本来就是父区间空间信息不足，不
+                # 因为是"额外点"缩短预算判断。
+                point_diag["is_refinement_point"] = True
+                _timing = point_diag.get("timing_s", {})
+                print(
+                    f"    ⏱️ [preopt 加密 λ={float(lam):.4f}] "
+                    + ", ".join(f"{k}={v:.1f}s" for k, v in _timing.items())
                 )
                 pilot_lambdas.insert(insert_at, float(lam))
                 metric_g.insert(insert_at, g_lam)
@@ -2540,15 +3144,41 @@ class DualLambdaPreOptimizer:
         n_states=VANISHING_PROBE_BASE_STATE_COUNT,
         n_steps_per_state=2000,
         finite_difference_delta=0.01,
+        shadow_checkpoint_interval: Optional[int] = None,
+        final_state_count: int = VANISHING_FINAL_STATE_COUNT,
+        # 🔑 [2026-08-27] 之前硬编码在 _refine_pilot_grid_in_steep_segments 的
+        # 默认参数里（这里没暴露），现在做成真正能传的参数，默认值不变。
+        refine_extra_points_per_segment: int = 4,
+        # 🔑 [2026-08-27] 只在 final_state_count != VANISHING_FINAL_STATE_COUNT
+        # 时生效，见 redistribute_vanishing_lambda_subdomains。
+        min_states_per_window: int = 4,
+        max_states_per_window: int = 6,
     ):
         print(
             f"\n→ Stage 2: 去 VDW 路径优化 "
-            f"({n_states} 点 Fisher 探针网格 → {VANISHING_FINAL_STATE_COUNT} 态"
+            f"({n_states} 点 Fisher 探针网格 → {final_state_count} 态"
             f"度规布点，几何覆盖下限 beta={VANISHING_GEOMETRIC_FLOOR_WEIGHT})..."
         )
         current_params = dict(self.context.getParameters())
         if self.param_vdw is None or self.param_vdw not in current_params:
             raise RuntimeError(f"探针系统未注册 VdW λ 参数，无法执行自适应优化")
+
+        # 🔑 [shadow early-stop 插桩，Phase A，2026-08-26] shadow_checkpoint_
+        # interval 默认 None——下面这行给出 None，_sample_scalar_metric 里
+        # pending_checkpoints 恒为空列表，真实采样长度/返回值形状逐字节不
+        # 变。显式传入正整数时才会在每跑够这么多步就多记一次"假想提前停"的
+        # 诊断，不改变任何一次真实采样的步数或判断分支。
+        shadow_checkpoint_steps = (
+            list(
+                range(
+                    int(shadow_checkpoint_interval),
+                    int(n_steps_per_state) + 1,
+                    int(shadow_checkpoint_interval),
+                )
+            )
+            if shadow_checkpoint_interval
+            else None
+        )
 
         if self.param_coul is not None and self.param_coul in current_params:
             self.context.setParameter(self.param_coul, 0.0)
@@ -2572,9 +3202,16 @@ class DualLambdaPreOptimizer:
                 float(lam),
                 n_steps=int(n_steps_per_state),
                 delta=float(finite_difference_delta),
+                shadow_checkpoint_steps=shadow_checkpoint_steps,
             )
+            point_diag["is_refinement_point"] = False
             metric_g.append(g_lam)
             pilot_points.append(point_diag)
+            _timing = point_diag.get("timing_s", {})
+            print(
+                f"    ⏱️ [preopt λ={float(lam):.4f}] "
+                + ", ".join(f"{k}={v:.1f}s" for k, v in _timing.items())
+            )
 
         pilot_lambdas, metric_g, pilot_points = self._refine_pilot_grid_in_steep_segments(
             pilot_lambdas,
@@ -2582,6 +3219,8 @@ class DualLambdaPreOptimizer:
             pilot_points,
             n_steps_per_state=n_steps_per_state,
             finite_difference_delta=finite_difference_delta,
+            shadow_checkpoint_steps=shadow_checkpoint_steps,
+            extra_points_per_segment=int(refine_extra_points_per_segment),
         )
 
         (
@@ -2595,6 +3234,9 @@ class DualLambdaPreOptimizer:
                 np.asarray(metric_g, dtype=float),
                 int(n_states),
                 first_ensemble_target_intervals=VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS,
+                final_state_count=int(final_state_count),
+                min_states_per_window=int(min_states_per_window),
+                max_states_per_window=int(max_states_per_window),
         )
         optimized_lambdas = np.asarray(optimized_lambdas, dtype=float).ravel()
         optimized_lambdas = np.clip(optimized_lambdas, 0.0, 1.0)
@@ -2604,6 +3246,18 @@ class DualLambdaPreOptimizer:
         # and no legacy overlap=2 construction that duplicates an interval are
         # used; one boundary node is still shared as the ensemble reference.
         
+        # 🔑 [shadow early-stop 插桩，Phase A] 纯事后打标签，只读 pilot_points
+        # 里已经落盘的 is_refinement_point，不影响上面任何一次真实采样/布点
+        # 决定。shadow_checkpoint_steps 为 None 时 risk_zone_tags 也是 None，
+        # 诊断字典形状对未启用 shadow 模式的调用完全不变。
+        risk_zone_tags = None
+        if shadow_checkpoint_steps:
+            risk_zone_tags = classify_pilot_point_risk_zone(
+                pilot_lambdas,
+                metric_g,
+                [bool(p.get("is_refinement_point", False)) for p in pilot_points],
+            )
+
         diagnostics = {
             "estimator": "beta^2_var_dU_dlambda_finite_difference",
             "lambda_placement_method": (
@@ -2633,7 +3287,10 @@ class DualLambdaPreOptimizer:
             "sliding_overlap_states": 0,
             "common_boundary_state_count": 1,
             "pilot_points": pilot_points,
+            "shadow_mode_enabled": bool(shadow_checkpoint_steps is not None),
         }
+        if risk_zone_tags is not None:
+            diagnostics["risk_zone_tags"] = risk_zone_tags
         print(
             f"  ✓ Stage 2 热力学长度路径完成：L={cumulative_length[-1]:.3f}, "
             f"{len(optimized_lambdas)} 态, {len(window_ranges)} 个 IBS 子区间"
@@ -2868,6 +3525,17 @@ def build_aces_probe_system_dual_lambda(
         ll_14_f.setForceGroup(2)
         new_sys.addForce(ll_14_f)
 
+    # The custom Group 2 force now owns ligand 1-4 interactions. Particle
+    # parameters do not disable NonbondedForce exceptions; clear those only
+    # after create_ligand_internal_force has copied their original parameters.
+    perturbed_set = set(perturbed_indices)
+    for exception_index in range(nb.getNumExceptions()):
+        p1, p2, charge_product, sigma, epsilon = nb.getExceptionParameters(exception_index)
+        if int(p1) in perturbed_set and int(p2) in perturbed_set:
+            nb.setExceptionParameters(
+                exception_index, p1, p2, 0.0 * charge_product, sigma, 0.0 * epsilon
+            )
+
     # Group 1: 双λ软核力
     aces_particle_params = all_p
     if charge_offsets_active:
@@ -2981,13 +3649,35 @@ def compute_2d_metric_grid(
     return_diagnostics: bool = False,
 ):
     """采集 2D 度量张量场 g_cc, g_vv, g_cv 用于黎曼几何路径规划"""
-    beta = 1.0 / (0.00831446 * temperature)
+    if int(len(lam_c_grid)) < 2 or int(len(lam_v_grid)) < 2:
+        raise ValueError("2D metric grid 每个维度至少需要 2 个 lambda 点")
+    if int(n_steps) < 2:
+        raise ValueError("2D metric grid 的 n_steps 至少为 2，才能估计协方差")
+    if not np.isfinite(float(delta)) or float(delta) <= 0.0:
+        raise ValueError("finite-difference delta 必须为正有限数")
+    # ``compute_2d_metric_grid`` is also a public low-level entry point (not
+    # only called through ``optimize_2d_geodesic_path``), so validate the
+    # temperature here as well.  Letting NaN/zero reach beta would silently
+    # turn the Fisher metric into NaNs/Infs and make Dijkstra choose a bogus
+    # path.
+    try:
+        temperature_value = float(
+            temperature.value_in_unit(unit.kelvin)
+            if hasattr(temperature, "value_in_unit")
+            else temperature
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("metric temperature 必须是正有限值") from exc
+    if not np.isfinite(temperature_value) or temperature_value <= 0.0:
+        raise ValueError("metric temperature 必须是正有限值")
+    beta = 1.0 / (0.00831446 * temperature_value)
     G = np.zeros((len(lam_c_grid), len(lam_v_grid), 2, 2))
     diagnostics = {
         "n_grid_coul": int(len(lam_c_grid)),
         "n_grid_vdw": int(len(lam_v_grid)),
         "requested_steps_per_point": int(n_steps),
         "finite_difference_delta": float(delta),
+        "temperature_K": temperature_value,
         "valid_points": 0,
         "unsafe_points": 0,
         "failed_points": 0,
@@ -3084,6 +3774,37 @@ def optimize_2d_geodesic_path(
 
     返回从 (1.0, 1.0) 到 (0.0, 0.0) 的最优 (λ_coul, λ_vdw) 路径
     """
+    try:
+        n_grid_float = float(n_grid)
+        n_grid_int = int(n_grid)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"2D geodesic n_grid 必须是整数，收到 {n_grid!r}") from exc
+    if not np.isfinite(n_grid_float) or n_grid_float != n_grid_int:
+        raise ValueError(f"2D geodesic n_grid 必须是整数，收到 {n_grid!r}")
+    if n_grid_int < 2:
+        raise ValueError("2D geodesic n_grid 至少为 2（必须包含两个端点）")
+    try:
+        n_steps_float = float(n_steps_per_point)
+        n_steps_int = int(n_steps_per_point)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"2D geodesic n_steps_per_point 必须是整数，收到 {n_steps_per_point!r}"
+        ) from exc
+    if not np.isfinite(n_steps_float) or n_steps_float != n_steps_int:
+        raise ValueError(
+            f"2D geodesic n_steps_per_point 必须是整数，收到 {n_steps_per_point!r}"
+        )
+    if n_steps_int < 2:
+        raise ValueError("2D geodesic n_steps_per_point 至少为 2")
+    try:
+        temperature_float = float(temperature)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"2D geodesic temperature 必须是正有限值，收到 {temperature!r}") from exc
+    if not np.isfinite(temperature_float) or temperature_float <= 0.0:
+        raise ValueError(f"2D geodesic temperature 必须是正有限值，收到 {temperature!r}")
+    n_grid = n_grid_int
+    n_steps_per_point = n_steps_int
+    temperature = temperature_float
     import gc as _gc
     softcore_params = ACESoftcorePotential.optimize_alpha(len(ligand_indices))
     sc_obj = ACESoftcorePotential.from_dict(softcore_params)
@@ -3097,8 +3818,8 @@ def optimize_2d_geodesic_path(
         co_alchemical_ion_spec=co_alchemical_ion_spec,
     )
 
-    platform = openmm.Platform.getPlatformByName(platform_name)
-    props = {"Precision": "mixed", "DeviceIndex": "0"} if platform_name.upper() == "CUDA" else {}
+    resolved_platform_name, props = _build_platform_properties(platform_name)
+    platform = openmm.Platform.getPlatformByName(resolved_platform_name)
     integ = openmm.LangevinMiddleIntegrator(temperature, 1.0/unit.picosecond, 0.002*unit.picosecond)
     ctx = openmm.Context(probe_sys, integ, platform, props)
     ctx.setPositions(positions)

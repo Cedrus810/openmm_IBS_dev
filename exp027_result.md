@@ -22,8 +22,12 @@ EXP-028-U3-CONFIRMATION       = EXP027_U3_WINDOW0_UTILITY_PASS ✅ —— 但需
 EXP027_U4（真实 216 万步跑完） = INVALID_FOR_PROMOTION_BASELINE_FK_REUSED_FOR_CANDIDATE
                                   —— 根因不是插件/采样步数，是 candidate 从未做过专属
                                   IBS f_k 校准（见 §5），回答不了真实生产 utility 问题
-EXP-029（完整生产 A/B，两臂    = AUTHORIZED_NOT_STARTED（取代原定的 U3.5 window_2 小试点，
-  各自独立校准+冻结 f_k）        见 §6，用户 2026-08-14 决定直接上生产规模）
+EXP-029（完整生产 A/B，两臂    = AUTHORIZED_WIRED_NOT_RUN（2026-08-24 harness 接线完成；
+  各自独立校准+冻结 f_k）        smoke 与正式 6×3×2 production 均待用户运行，见 §6）；
+                                  2026-08-24 同日 smoke 排查另发现一个独立问题——
+                                  window_1 在阶段1 EM 会把局部密度拉穿残差力模型
+                                  支持域上限，根因与候选修复（跳过 EM）见
+                                  `exp029_result.md`（中间记录，未合并主线）
 ```
 
 **当前结论（2026-08-14 更新）：EXP-028 修复本身仍然有效、已验证。但 U4 全部 6 窗口
@@ -325,8 +329,10 @@ $$\eta_{\text{ITT}} = \frac{N_{\text{eff}}^{\text{mixture}}}{\text{全部 GPU-ho
 跑得通、不崩、状态机不卡死），不替代 EXP-029 的科学结论，只排除"接线本身
 有 bug、真跑起来才发现"的风险——这条项目线里每一步都是这么做的。
 
-**尚未开始**：需要先深入读 `run_all_windows`（校准/冻结验证/rescue 那一整套
-状态机）的真实调用方式，才能设计 EXP-029 的 harness。
+**2026-08-24 接线状态**：EXP-029 harness、冻结预注册、AB/BA 调度、逐窗独立
+`f_k` 校准/冻结、resume 身份门、五账本落盘及 ITT/TMBAR 汇总均已接好；当前状态是
+`AUTHORIZED_WIRED_NOT_RUN`。smoke 和正式 production 都尚未运行，不能登记任何
+EXP-029 科学结论。实现与运行命令见 `EXP-029_WIRING_HANDOFF_2026-08-24.md`。
 
 - EXP-028 修复本身（addArg→setArg）不需要撤回，仍然有效——这次发现的是
   一个独立的、更早存在的方法论缺口（IBS f_k 校准范围），跟插件性能修复
