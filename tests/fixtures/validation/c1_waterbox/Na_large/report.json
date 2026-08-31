@@ -1,0 +1,201 @@
+{
+  "case": "Na_large",
+  "ion": "Na",
+  "ligand_net_charge_e": 1,
+  "box_size_label": "large",
+  "box_edge_nm": 4.2,
+  "build_manifest": {
+    "protocol_version": 1,
+    "case": "Na_large",
+    "ion": "Na",
+    "ligand_net_charge_e": 1,
+    "box_size_label": "large",
+    "box_edge_nm": 4.2,
+    "nonbonded_cutoff_nm": 1.0,
+    "ionic_strength_molar": 0.15,
+    "forcefield_xml": [
+      "amber14-all.xml",
+      "amber14/tip3p.xml"
+    ],
+    "n_atoms": 7178,
+    "n_water": 2387,
+    "na_count_total": 9,
+    "cl_count_total": 8,
+    "ordinary_na_count": 7,
+    "ordinary_cl_count": 8,
+    "reserved_coion_indices": [
+      7177
+    ],
+    "reserved_coion_cation": true,
+    "ligand_indices": [
+      0
+    ],
+    "co_ion_indices": [
+      7177
+    ],
+    "ligand_coion_min_image_distances_nm": [
+      3.594917925349618
+    ],
+    "charge_treatment": "co_alchemical_charge_transfer",
+    "coalchemical_ion_fingerprint": "5d31a61f2b31a32c9e973a4ea275762100061f1ce557a00baeb31fff04e7f1d7",
+    "system_xml_sha256": "89bc3e953cc2e6b735891ad7f76e64092d64120cb7e8e23ae3efd3b693279216",
+    "topology_cif_sha256": "6d95e3b8338723dc548da3d8617e92da3086a7efc78de41fd6d159213436069c"
+  },
+  "static_check_report": {
+    "case": "Na_large",
+    "identity_fingerprint": [
+      7177
+    ],
+    "charge_conservation_report": {
+      "lambda_name": "lambda_coul",
+      "n_particle_offsets": 2,
+      "base_sum_e": 3.3306690738754696e-16,
+      "scale_sum_e": 0.0,
+      "total_charge_by_lambda_e": {
+        "1": 3.3306690738754696e-16,
+        "0.9": 3.3306690738754696e-16,
+        "0.8": 3.3306690738754696e-16,
+        "0.7": 3.3306690738754696e-16,
+        "0.6": 3.3306690738754696e-16,
+        "0.5": 3.3306690738754696e-16,
+        "0.4": 3.3306690738754696e-16,
+        "0.3": 3.3306690738754696e-16,
+        "0.2": 3.3306690738754696e-16,
+        "0.1": 3.3306690738754696e-16,
+        "0": 3.3306690738754696e-16
+      },
+      "total_charge_is_lambda_independent": true,
+      "tolerance_e": 1e-06,
+      "ligand_charge_by_lambda_e": {
+        "1": 1.0,
+        "0.9": 0.9,
+        "0.8": 0.8,
+        "0.7": 0.7,
+        "0.6": 0.6,
+        "0.5": 0.5,
+        "0.4": 0.4,
+        "0.3": 0.3,
+        "0.2": 0.2,
+        "0.1": 0.1,
+        "0": 0.0
+      },
+      "ligand_charge_matches_lambda_times_qL": true,
+      "co_ion_charge_by_lambda_e": {
+        "1": 0.0,
+        "0.9": 0.09999999999999998,
+        "0.8": 0.19999999999999996,
+        "0.7": 0.30000000000000004,
+        "0.6": 0.4,
+        "0.5": 0.5,
+        "0.4": 0.6,
+        "0.3": 0.7,
+        "0.2": 0.8,
+        "0.1": 0.9,
+        "0": 1.0
+      }
+    },
+    "endpoint_single_point_energies_cpu": {
+      "1.0": {
+        "potential_kj_mol": -45263.972982535764,
+        "max_force_kj_mol_nm": 174721.76038856638
+      },
+      "0.5": {
+        "potential_kj_mol": -45145.30757113254,
+        "max_force_kj_mol_nm": 174708.65456695406
+      },
+      "0.0": {
+        "potential_kj_mol": -45060.3055392602,
+        "max_force_kj_mol_nm": 174695.52543083127
+      }
+    },
+    "ligand_coion_min_image_distances_nm": [
+      3.594917925349618
+    ],
+    "passed": true
+  },
+  "dynamics_manifest": {
+    "protocol_version": 1,
+    "case": "Na_large",
+    "lambdas_coul": [
+      1.0,
+      0.9,
+      0.8,
+      0.7,
+      0.6,
+      0.5,
+      0.4,
+      0.3,
+      0.2,
+      0.1,
+      0.0
+    ],
+    "platform_requested": "CUDA",
+    "platform_used": "CUDA",
+    "platform_fallback_reason": null,
+    "seed": 2026,
+    "temperature_kelvin": 300.0,
+    "pressure_bar": 1.0,
+    "barostat_frequency": 25,
+    "timestep_ps": 0.002,
+    "friction_per_ps": 1.0,
+    "n_steps_minimize": 5000,
+    "n_steps_equil_per_state": 20000,
+    "n_steps_sample_per_state": 50000,
+    "save_interval_steps": 500,
+    "post_minimization_potential_kJ_mol": -124165.87468256881,
+    "dcd_paths": [
+      "validation/c1_waterbox/Na_large/dynamics/traj_state00_lam1.00.dcd",
+      "validation/c1_waterbox/Na_large/dynamics/traj_state01_lam0.90.dcd",
+      "validation/c1_waterbox/Na_large/dynamics/traj_state02_lam0.80.dcd",
+      "validation/c1_waterbox/Na_large/dynamics/traj_state03_lam0.70.dcd",
+      "validation/c1_waterbox/Na_large/dynamics/traj_state04_lam0.60.dcd",
+      "validation/c1_waterbox/Na_large/dynamics/traj_state05_lam0.50.dcd",
+      "validation/c1_waterbox/Na_large/dynamics/traj_state06_lam0.40.dcd",
+      "validation/c1_waterbox/Na_large/dynamics/traj_state07_lam0.30.dcd",
+      "validation/c1_waterbox/Na_large/dynamics/traj_state08_lam0.20.dcd",
+      "validation/c1_waterbox/Na_large/dynamics/traj_state09_lam0.10.dcd",
+      "validation/c1_waterbox/Na_large/dynamics/traj_state10_lam0.00.dcd"
+    ],
+    "timeseries_csv": "validation/c1_waterbox/Na_large/dynamics/timeseries.csv",
+    "system_prepared_xml": "validation/c1_waterbox/Na_large/system_prepared.xml",
+    "system_prepared_xml_sha256": "019966df96f6c17ac6e20fee0aa4d24b56d5ff07e5072667043b75fadaaf3d1b",
+    "wall_clock_seconds_by_state": [
+      11.781124591827393,
+      11.710088014602661,
+      11.8171546459198,
+      11.744516372680664,
+      11.740784406661987,
+      11.775068283081055,
+      11.810686111450195,
+      11.831873893737793,
+      11.763336658477783,
+      11.847074270248413,
+      11.844129085540771
+    ],
+    "wall_clock_seconds_total": 129.66583633422852
+  },
+  "charging_delta_G": {
+    "case": "Na_large",
+    "delta_G_charging_kJ_mol": 0.5881812007280282,
+    "uncertainty_kJ_mol": 3.7874589140426895,
+    "delta_G_charging_kcal_mol": 0.1405786808623394,
+    "uncertainty_kcal_mol": 0.905224405841943,
+    "method": "MBAR-default",
+    "converged": true,
+    "min_overlap": 0.06797810756217852,
+    "n_states": 11,
+    "n_frames": 376,
+    "u_kn_path": "validation/c1_waterbox/Na_large/u_kn.npz"
+  },
+  "checks": {
+    "charge_conservation_passed": true,
+    "finite_energy_force_passed": true,
+    "coion_geometry_initial_passed": true,
+    "restraint_force_group_passed": true,
+    "endpoint_charge_passed": true,
+    "dynamics_completed": true,
+    "ukn_completed": true
+  },
+  "passed": true,
+  "failure_reasons": []
+}

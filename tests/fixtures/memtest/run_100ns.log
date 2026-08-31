@@ -1,0 +1,679 @@
+Warning on use of the timeseries module: If the inherent timescales of the system are long compared to those being analyzed, this statistical inefficiency may be an underestimate.  The estimate presumes the use of many statistically independent samples.  Tests should be performed to assess whether this condition is satisfied.   Be cautious in the interpretation of the data.
+
+****** PyMBAR will use 64-bit JAX! *******
+* JAX is currently set to 32-bit bitsize *
+* which is its default.                  *
+*                                        *
+* PyMBAR requires 64-bit mode and WILL   *
+* enable JAX's 64-bit mode when called.  *
+*                                        *
+* This MAY cause problems with other     *
+* Uses of JAX in the same code.          *
+******************************************
+
+2026-08-02 18:19:53 | INFO    | 📄 已合并配置文件: abfe_config.json
+2026-08-02 18:19:53 | INFO    | 🔧 [ pairs ] funct 2（OpenMM 不支持）已等价转换 → ./output_membrane_100ns/gromacs_openmm_compat/topol.top（21 条；原始输入未修改）
+2026-08-02 18:19:53 | INFO    | 📥 读取 GROMACS 文件: step7_production.gro | ./output_membrane_100ns/gromacs_openmm_compat/topol.top
+2026-08-02 18:19:53 | INFO    |   🔍 使用 GROMACS include 目录: /home/ruigengji/gmx26.0C
+2026-08-02 18:19:54 | INFO    |   ⚙️ 构建 OpenMM System (保留自定义 RESP/Hessian 参数)...
+2026-08-02 18:19:54 | INFO    |   ✅ 系统构建完成 | 原子数: 45354 | 配体: 41 原子
+2026-08-02 18:19:55 | INFO    |   🔍 1-4 缩放诊断: fudgeQQ=0.3044 (应 ~0.8333), fudgeLJ=0.2324 (应 ~0.5)
+2026-08-02 18:19:56 | INFO    |   [缓存] System XML 已保存: ./output_membrane_100ns/system_native.xml
+2026-08-02 18:19:56 | INFO    |   [缓存] 配体索引已保存: ./output_membrane_100ns/ligand_indices.json
+2026-08-02 18:19:56 | INFO    |   [缓存] 盒子向量已保存: ./output_membrane_100ns/box_vectors.npy
+2026-08-02 18:19:56 | INFO    |   [缓存] 参考拓扑已保存 (mmCIF): ./output_membrane_100ns/topology.cif
+2026-08-02 18:19:57 | INFO    |   [缓存] 输入身份 manifest 已保存: ./output_membrane_100ns/system_cache_manifest.json
+2026-08-02 18:19:57 | INFO    | ✅ 原生缓存已生成
+2026-08-02 18:19:57 | INFO    | ♻️ 从原生缓存加载系统 (complex): ./output_membrane_100ns
+2026-08-02 18:19:57 | INFO    |   ✓ System 恢复 | 原子数: 45354
+2026-08-02 18:19:57 | INFO    |   ✓ 配体索引恢复: 41 原子
+2026-08-02 18:19:57 | INFO    |   ✓ 盒子向量恢复
+2026-08-02 18:19:57 | INFO    |   ✓ 拓扑从原始 TOP 重建（45354 原子, 16635 键）—— 膜体系不用 mmCIF，因为它不保存非标准残基的键
+2026-08-02 18:19:58 | INFO    |   ⚠️ 坐标回退到 GRO 初始值
+2026-08-02 18:19:58 | INFO    | ✅ 原生缓存加载完成
+2026-08-02 18:19:58 | INFO    | 🔄 已从缓存重新加载 System (使用落盘后对象)
+2026-08-02 18:19:58 | INFO    |   🔒 体系已刚性锁定至盒子中心 (No-Wrap, 仅整体平移)
+2026-08-02 18:19:58 | INFO    |   ✅ 配体已居中（仅整体质心平移；整分子 PBC 修复在 pre_equilibrate 之前执行）
+2026-08-02 18:19:58 | INFO    | 🧫 环境类型=membrane，复合物腿将使用 MonteCarloMembraneBarostat
+2026-08-02 18:19:58 | INFO    | 🧬 力场族=amber（来源 auto_detected）
+2026-08-02 18:19:58 | INFO    | 🧪 色散路线=ff_native_isotropic_lrc（均匀密度 LRC 关闭）
+2026-08-02 18:19:58 | INFO    | 🧾 体系组成（来自 .top）：{'Atenolol-rank11': 'ligand×1', 'PROA': 'protein×1', 'POPC': 'lipid×90', 'Na+': 'ion×25', 'Cl-': 'ion×36', 'TP3': 'water×9542'}
+2026-08-02 18:19:58 | WARNING | ⚠️ conformational_state='unspecified'：构象态未声明，已如实记入 provenance。§1.1 的本意是防止跨构象态混用——本次运行的构象由输入文件指纹唯一确定，但若日后要与其它构象态的结果比较，这一项必须补上。
+2026-08-02 18:19:58 | INFO    | 🧫 膜法向实测确认为 z（90 个头基原子；上下叶 45/45，簇心间距 3.840 nm）
+2026-08-02 18:19:58 | INFO    | 🧫 膜输入核对通过：45354 原子，上叶 45 / 下叶 45 脂质（不平衡 0.0%），水 9542，离子 {'CL-': 36, 'NA+': 25}
+2026-08-02 18:19:58 | INFO    | 🧫 上游平衡：completed_length_unrecorded（证据 CHARMM-GUI step6.1-6.6 restrained equilibration + step7 production; step7_production.gro 为该生产运行的末帧（请补作业 ID/路径以便追溯））→ 标称时长预检不适用；本流程再平衡 100.0 ns。§9 实测质量门仍为硬门。
+2026-08-02 18:19:58 | INFO    | 🧾 运行 provenance 已保存: ./output_membrane_100ns/run_provenance.json
+2026-08-02 18:19:59 | INFO    | 💧 水模型按参数识别为 amber14/tip3p.xml（moleculetype=TP3, 3 位点, q_O=-0.834000, q_H=+0.417000, σ_O=0.315075241 nm, ε_O=0.635968 kJ/mol）——`#include` 文件名词干认不出，故用参数判定。
+2026-08-02 18:19:59 | INFO    | 💧 溶剂腿缓存缺失或盐协议不匹配，开始构建 0.150 M NaCl 配体体系...
+2026-08-02 18:19:59 | INFO    | 💧 正在构建溶剂相 (配体腿) 系统并生成缓存...
+2026-08-02 18:19:59 | INFO    |   🧬 彻底抛弃 mmCIF，从原始 .top 重建 100% 纯净配体拓扑...
+2026-08-02 18:19:59 | INFO    |   ✅ 纯净配体拓扑构建完成 (键连接 100% 忠于 .top，无假键)
+2026-08-02 18:19:59 | INFO    |   ✅ 配体原子名已按 .top 稳定映射重命名并对齐 XML
+2026-08-02 18:19:59 | INFO    | 🔹 从 GROMACS 拓扑抽取配体参数: 生成 ligand_only.xml
+2026-08-02 18:20:00 | INFO    | ✅ 已生成配体 XML: ./output_membrane_100ns/ligand_only.xml
+2026-08-02 18:20:00 | INFO    | 💧 水模型按参数识别为 amber14/tip3p.xml（moleculetype=TP3, 3 位点, q_O=-0.834000, q_H=+0.417000, σ_O=0.315075241 nm, ε_O=0.635968 kJ/mol）——`#include` 文件名词干认不出，故用参数判定。
+2026-08-02 18:20:00 | INFO    |   🔍 使用 Amber14 + amber14/tip3p.xml (继承自 parameter_match:TP3) + 配体 XML 构建溶剂相: ./output_membrane_100ns/ligand_only.xml
+2026-08-02 18:20:00 | INFO    |   📦 溶剂盒: 配体最长轴 1.0520 nm + 2×1.50 nm padding → 立方盒 4.0520 nm
+2026-08-02 18:20:01 | INFO    | ✅ 溶剂相缓存已保存 (padding 1.50 nm, 盒长 [4.052, 4.052, 4.052] nm, 原子数 6398, Na=6, Cl=6, 0.150 M)
+2026-08-02 18:20:01 | INFO    | 🧷 复合物腿 Boresch 已启用 | source=simple
+2026-08-02 18:20:01 | INFO    | ▶️ 执行基线预平衡
+Warning on use of the timeseries module: If the inherent timescales of the system are long compared to those being analyzed, this statistical inefficiency may be an underestimate.  The estimate presumes the use of many statistically independent samples.  Tests should be performed to assess whether this condition is satisfied.   Be cautious in the interpretation of the data.
+
+****** PyMBAR will use 64-bit JAX! *******
+* JAX is currently set to 32-bit bitsize *
+* which is its default.                  *
+*                                        *
+* PyMBAR requires 64-bit mode and WILL   *
+* enable JAX's 64-bit mode when called.  *
+*                                        *
+* This MAY cause problems with other     *
+* Uses of JAX in the same code.          *
+******************************************
+
+2026-08-02 23:17:17 | INFO    | 📄 已合并配置文件: abfe_config.json
+2026-08-02 23:17:18 | INFO    | ♻️ 从原生缓存加载系统 (complex): ./output_membrane_100ns
+2026-08-02 23:17:18 | INFO    |   ✓ System 恢复 | 原子数: 45354
+2026-08-02 23:17:18 | INFO    |   ✓ 配体索引恢复: 41 原子
+2026-08-02 23:17:18 | INFO    |   ✓ 盒子向量恢复
+2026-08-02 23:17:18 | INFO    |   ✓ 拓扑从原始 TOP 重建（45354 原子, 16635 键）—— 膜体系不用 mmCIF，因为它不保存非标准残基的键
+2026-08-02 23:17:18 | INFO    |   ℹ️ 未提供完整预平衡 fingerprint，不自动读取 DCD；先恢复身份绑定的初始坐标，由 pipeline 决定是否续用预平衡
+2026-08-02 23:17:18 | INFO    |   ⚠️ 坐标回退到 GRO 初始值
+2026-08-02 23:17:18 | INFO    | ✅ 原生缓存加载完成
+2026-08-02 23:17:18 | INFO    | ♻️ 从缓存加载 System 完成
+2026-08-02 23:17:19 | INFO    |   🔒 体系已刚性锁定至盒子中心 (No-Wrap, 仅整体平移)
+2026-08-02 23:17:19 | INFO    |   ✅ 配体已居中（仅整体质心平移；整分子 PBC 修复在 pre_equilibrate 之前执行）
+2026-08-02 23:17:19 | INFO    | 🧫 环境类型=membrane，复合物腿将使用 MonteCarloMembraneBarostat
+2026-08-02 23:17:19 | INFO    | 🧬 力场族=amber（来源 auto_detected）
+2026-08-02 23:17:19 | INFO    | 🧪 色散路线=ff_native_isotropic_lrc（均匀密度 LRC 关闭）
+2026-08-02 23:17:19 | INFO    | 🧾 体系组成（来自 .top）：{'Atenolol-rank11': 'ligand×1', 'PROA': 'protein×1', 'POPC': 'lipid×90', 'Na+': 'ion×25', 'Cl-': 'ion×36', 'TP3': 'water×9542'}
+2026-08-02 23:17:19 | WARNING | ⚠️ conformational_state='unspecified'：构象态未声明，已如实记入 provenance。§1.1 的本意是防止跨构象态混用——本次运行的构象由输入文件指纹唯一确定，但若日后要与其它构象态的结果比较，这一项必须补上。
+2026-08-02 23:17:19 | INFO    | 🧫 膜法向实测确认为 z（90 个头基原子；上下叶 45/45，簇心间距 3.840 nm）
+2026-08-02 23:17:19 | INFO    | 🧫 膜输入核对通过：45354 原子，上叶 45 / 下叶 45 脂质（不平衡 0.0%），水 9542，离子 {'CL-': 36, 'NA+': 25}
+2026-08-02 23:17:19 | INFO    | 🧫 上游平衡：completed_length_unrecorded（证据 CHARMM-GUI step6.1-6.6 restrained equilibration + step7 production; step7_production.gro 为该生产运行的末帧（请补作业 ID/路径以便追溯））→ 标称时长预检不适用；本流程再平衡 100.0 ns。§9 实测质量门仍为硬门。
+2026-08-02 23:17:19 | INFO    | 🧾 运行 provenance 已保存: ./output_membrane_100ns/run_provenance.json
+2026-08-02 23:17:20 | INFO    | 💧 水模型按参数识别为 amber14/tip3p.xml（moleculetype=TP3, 3 位点, q_O=-0.834000, q_H=+0.417000, σ_O=0.315075241 nm, ε_O=0.635968 kJ/mol）——`#include` 文件名词干认不出，故用参数判定。
+2026-08-02 23:17:20 | INFO    | ♻️ 检测到已有溶剂腿缓存，跳过重建
+2026-08-02 23:17:20 | INFO    | 🧷 复合物腿 Boresch 已启用 | source=simple
+2026-08-02 23:17:20 | WARNING | ⚠️ 已有预平衡轨迹的指纹与当前 system/config 不匹配（可能是换了 gro/top/ligand/温度或目标步数但复用了同一个 --output 目录），拒绝复用，将重新执行预平衡。
+2026-08-02 23:17:20 | INFO    | ▶️ 执行基线预平衡
+============================================================
+ABFE Pipeline v4.0 初始化完成 | 2026-08-02T23:17:20.402967
+输出目录: /home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/output_membrane_100ns
+配体原子数: 41 | 温度: 303.15 K | 压力: 1.0 bar
+============================================================
+  📦 正在执行 PBC 分子完整性修复与配体居中（pre_equilibrate 之前）...
+  ✓ PBC 分子完整性已修复，体系已居中至主周期
+
+[阶段 0] 启动物理预平衡 (目标: 50000000 步 | Platform: CUDA)...
+  🧊 已添加 MonteCarloMembraneBarostat（environment_type=membrane，频率=25）
+  🧫 膜恒压协议: 法向=z, 表面张力=0.0 bar·nm, XY=isotropic, Z=free
+  ♻️ 从 Checkpoint 恢复 | 已完成: 33500000 | 剩余: 16500000
+  📈 膜体系监控已启用（每 5000 步）: /home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/output_membrane_100ns/pre_equilibration_monitor.csv
+  → 运行 16500000 步 (CUDA)...
+  ✓ CUDA 上下文已清理，后续采样可安全复用 GPU
+  ✓ 预平衡完成 | 最终势能: -507350.22 kJ/mol
+  📝 状态更新: equilibration = completed
+
+[膜质量门 · enforce] 读取预平衡轨迹并计算 §9 观测量...
+  ✓ 膜质量门摘要已保存: /home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/output_membrane_100ns/membrane_quality_gate.json
+    ✓ apl_nm2 [tail_drift_percent_per_ns] 0.0514709 vs 阈值 0.2
+    ✓ bilayer_thickness_nm [tail_drift_nm_per_window] 0.0144305 vs 阈值 0.05
+    ✓ transmembrane_tilt_deg [tail_drift_deg_per_window] 0.477207 vs 阈值 5
+    ✓ protein_backbone_rmsd_nm [tail_mean_nm] 0.133067 vs 阈值 0.3
+    ✓ pocket_rmsd_nm [tail_mean_nm] 0.0759506 vs 阈值 0.2
+    ✓ ligand_heavy_atom_rmsd_nm [tail_mean_nm] 0.0492899 vs 阈值 0.25
+    ✗ equilibration_length_ns [at_least_one_lipid_lateral_relaxation_time] 100.04 vs 阈值 139.362
+    ✓ membrane_periodic_image_contacts [must_be_zero] 0 vs 阈值 0
+Traceback (most recent call last):
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/../runabfe.py", line 4574, in <module>
+    main()
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/../runabfe.py", line 4256, in main
+    boresch_restraint = resolve_boresch_restraint(config, pipeline)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/../runabfe.py", line 1955, in resolve_boresch_restraint
+    pipeline.pre_equilibrate(
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/abfe_pipeline.py", line 1774, in pre_equilibrate
+    self._evaluate_membrane_quality_gate_after_equilibration(
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/abfe_pipeline.py", line 1426, in _evaluate_membrane_quality_gate_after_equilibration
+    return run_membrane_quality_gate(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/abfe_core.py", line 2728, in run_membrane_quality_gate
+    raise RuntimeError(message)
+RuntimeError: 膜质量门未通过，失败项：['equilibration_length_ns']。质量门失败时回到膜体系平衡（延长预平衡 / 检查建系组成与叶片数），不允许靠增加 ABFE 窗口、放宽阈值或缩短末段窗口掩盖（§9 末句）。 详情见 /home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/output_membrane_100ns/membrane_quality_gate.json。
+Warning on use of the timeseries module: If the inherent timescales of the system are long compared to those being analyzed, this statistical inefficiency may be an underestimate.  The estimate presumes the use of many statistically independent samples.  Tests should be performed to assess whether this condition is satisfied.   Be cautious in the interpretation of the data.
+
+****** PyMBAR will use 64-bit JAX! *******
+* JAX is currently set to 32-bit bitsize *
+* which is its default.                  *
+*                                        *
+* PyMBAR requires 64-bit mode and WILL   *
+* enable JAX's 64-bit mode when called.  *
+*                                        *
+* This MAY cause problems with other     *
+* Uses of JAX in the same code.          *
+******************************************
+
+2026-08-03 14:06:22 | INFO    | 📄 已合并配置文件: abfe_config.json
+2026-08-03 14:06:22 | INFO    | ♻️ 从原生缓存加载系统 (complex): ./output_membrane_100ns
+2026-08-03 14:06:23 | INFO    |   ✓ System 恢复 | 原子数: 45354
+2026-08-03 14:06:23 | INFO    |   ✓ 配体索引恢复: 41 原子
+2026-08-03 14:06:23 | INFO    |   ✓ 盒子向量恢复
+2026-08-03 14:06:23 | INFO    |   ✓ 拓扑从原始 TOP 重建（45354 原子, 16635 键）—— 膜体系不用 mmCIF，因为它不保存非标准残基的键
+2026-08-03 14:06:23 | INFO    |   ℹ️ 未提供完整预平衡 fingerprint，不自动读取 DCD；先恢复身份绑定的初始坐标，由 pipeline 决定是否续用预平衡
+2026-08-03 14:06:23 | INFO    |   ⚠️ 坐标回退到 GRO 初始值
+2026-08-03 14:06:23 | INFO    | ✅ 原生缓存加载完成
+2026-08-03 14:06:23 | INFO    | ♻️ 从缓存加载 System 完成
+2026-08-03 14:06:23 | INFO    |   🔒 体系已刚性锁定至盒子中心 (No-Wrap, 仅整体平移)
+2026-08-03 14:06:23 | INFO    |   ✅ 配体已居中（仅整体质心平移；整分子 PBC 修复在 pre_equilibrate 之前执行）
+2026-08-03 14:06:23 | INFO    | 🧫 环境类型=membrane，复合物腿将使用 MonteCarloMembraneBarostat
+2026-08-03 14:06:23 | INFO    | 🧬 力场族=amber（来源 auto_detected）
+2026-08-03 14:06:23 | INFO    | 🧪 色散路线=ff_native_isotropic_lrc（均匀密度 LRC 关闭）
+2026-08-03 14:06:24 | INFO    | 🧾 体系组成（来自 .top）：{'Atenolol-rank11': 'ligand×1', 'PROA': 'protein×1', 'POPC': 'lipid×90', 'Na+': 'ion×25', 'Cl-': 'ion×36', 'TP3': 'water×9542'}
+2026-08-03 14:06:24 | WARNING | ⚠️ conformational_state='unspecified'：构象态未声明，已如实记入 provenance。§1.1 的本意是防止跨构象态混用——本次运行的构象由输入文件指纹唯一确定，但若日后要与其它构象态的结果比较，这一项必须补上。
+2026-08-03 14:06:24 | INFO    | 🧫 膜法向实测确认为 z（90 个头基原子；上下叶 45/45，簇心间距 3.840 nm）
+2026-08-03 14:06:24 | INFO    | 🧫 膜输入核对通过：45354 原子，上叶 45 / 下叶 45 脂质（不平衡 0.0%），水 9542，离子 {'CL-': 36, 'NA+': 25}
+2026-08-03 14:06:24 | INFO    | 🧫 上游平衡：completed_length_unrecorded（证据 CHARMM-GUI step6.1-6.6 restrained equilibration + step7 production; step7_production.gro 为该生产运行的末帧（请补作业 ID/路径以便追溯））→ 标称时长预检不适用；本流程再平衡 100.0 ns。§9 实测质量门仍为硬门。
+2026-08-03 14:06:24 | INFO    | 🧾 运行 provenance 已保存: ./output_membrane_100ns/run_provenance.json
+2026-08-03 14:06:25 | INFO    | 💧 水模型按参数识别为 amber14/tip3p.xml（moleculetype=TP3, 3 位点, q_O=-0.834000, q_H=+0.417000, σ_O=0.315075241 nm, ε_O=0.635968 kJ/mol）——`#include` 文件名词干认不出，故用参数判定。
+2026-08-03 14:06:25 | INFO    | ♻️ 检测到已有溶剂腿缓存，跳过重建
+2026-08-03 14:06:25 | INFO    | 🧷 复合物腿 Boresch 已启用 | source=simple
+2026-08-03 14:06:25 | WARNING | ⚠️ 已有预平衡轨迹的指纹与当前 system/config 不匹配（可能是换了 gro/top/ligand/温度或目标步数但复用了同一个 --output 目录），拒绝复用，将重新执行预平衡。
+2026-08-03 14:06:25 | INFO    | ▶️ 执行基线预平衡
+2026-08-03 14:08:43 | INFO    | ✅ Boresch 平衡值保留无约束预平衡轨迹系综均值（geometry convention v2；不做末帧重锚）
+2026-08-03 14:08:43 | INFO    | 💾 Boresch 参数已保存: ./output_membrane_100ns/boresch_simple.json
+2026-08-03 14:08:43 | INFO    | 🔧 执行带 Boresch 限制力的再平衡...
+2026-08-03 14:09:02 | INFO    | ✓ 再平衡完成，坐标已更新
+2026-08-03 14:09:02 | INFO    | 🔄 启动复合物腿主采样流程 (dual_lambda)
+2026-08-03 14:09:03 | WARNING | ⚠️ 已有预平衡轨迹的指纹与当前 system/config 不匹配（可能是换了 gro/top/ligand/温度或目标步数但复用了同一个 --output 目录），拒绝复用，将重新执行预平衡。
+============================================================
+ABFE Pipeline v4.0 初始化完成 | 2026-08-03T14:06:25.146299
+输出目录: /home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/output_membrane_100ns
+配体原子数: 41 | 温度: 303.15 K | 压力: 1.0 bar
+============================================================
+  📦 正在执行 PBC 分子完整性修复与配体居中（pre_equilibrate 之前）...
+  ✓ PBC 分子完整性已修复，体系已居中至主周期
+
+[阶段 0] 启动物理预平衡 (目标: 50000000 步 | Platform: CUDA)...
+  🧊 已添加 MonteCarloMembraneBarostat（environment_type=membrane，频率=25）
+  🧫 膜恒压协议: 法向=z, 表面张力=0.0 bar·nm, XY=isotropic, Z=free
+  ♻️ 从 Checkpoint 恢复 | 已完成: 50000000 | 剩余: 0
+  ✓ CUDA 上下文已清理，后续采样可安全复用 GPU
+  ✓ 预平衡完成 | 最终势能: -507350.22 kJ/mol
+  📝 状态更新: equilibration = completed
+
+[膜质量门 · enforce] 读取预平衡轨迹并计算 §9 观测量...
+  ✓ 膜质量门摘要已保存: /home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/output_membrane_100ns/membrane_quality_gate.json
+    ✓ apl_nm2 [tail_drift_percent_per_ns] 0.0514709 vs 阈值 0.2
+    ✓ bilayer_thickness_nm [tail_drift_nm_per_window] 0.0144305 vs 阈值 0.05
+    ✓ transmembrane_tilt_deg [tail_drift_deg_per_window] 1.27396 vs 阈值 5
+    ✓ protein_backbone_rmsd_nm [tail_mean_nm] 0.133067 vs 阈值 0.3
+    ✓ pocket_rmsd_nm [tail_mean_nm] 0.0856743 vs 阈值 0.2
+    ✓ ligand_heavy_atom_rmsd_nm [tail_mean_nm] 0.0833366 vs 阈值 0.25
+    ✓ membrane_periodic_image_contacts [must_be_zero] 0 vs 阈值 0
+  ✅ 膜质量门通过（模式 enforce）
+  ✓ [Boresch 锚点] 受体锚点侧使用拓扑真实键（2 深链起点 1388/1388 = 100%）
+  ✓ [Boresch 锚点] 配体侧使用拓扑真实键（2 深链起点 19/19 = 100%）
+  🔗 化学连通候选组合数: 474
+  🏆 最优锚点: 受体 [np.int64(1280), 1278, 1276] | 配体 [np.int64(45320), 45322, 45321]
+     r0=4.81 Å, θA=114.7°, θB=108.8°
+     kr=2000.0 kJ/mol/nm², kθA=442.4 kJ/mol/rad²
+  ⚠️ fluctuation Boresch 有 1 个力常数被裁剪；raw 值已写入结果 JSON。
+🔄 启动带 Boresch 限制力的再平衡 (50000 步)...
+  📦 检测到配体偏离主周期，已自动执行 PBC 居中
+  [Boresch] kr=2000.0 kJ/mol/nm², r0=0.481 nm, θA=114.7°
+  ✓ Boresch 限制力已注入 (Group 3)
+  → 能量最小化...
+  → 运行 50000 步再平衡...
+  ✓ 再平衡完成 | 坐标已更新
+
+############################################################
+# 启动完整 ABFE 流程 | 方案: dual_lambda | 势能: softcore | Resume: True
+############################################################
+🖥️ GPU 策略: single_gpu | 分配设备: [0]
+  ⏭️ 本进程已完成 Boresch 限制力再平衡，跳过 run_full_pipeline 内部的预平衡块（避免用无约束预平衡覆盖刚完成的 Boresch 平衡坐标）。
+  📦 正在执行 PBC 分子完整性修复与配体居中（run_full_pipeline 第 2 节）...
+  ✓ PBC 分子完整性已修复，体系已居中至主周期
+  🔧 正在用当前坐标更新 Boresch 平衡几何量...
+  ✅ 已用最后一帧安全更新 Boresch 平衡值: r0=4.48Å, θA=119.5°, θB=113.4°
+  ✓ Boresch 平衡值已更新: r0=4.48 Å
+  📌 Boresch 平衡值已提交落盘，本腿后续 resume 将强制复用: ./output_membrane_100ns/checkpoints/boresch_equilibrium_committed.json
+
+[双λ] Stage 0: Boresch attachment (A′→A)
+  [Boresch] kr=2000.0 kJ/mol/nm², r0=0.448 nm, θA=119.5°
+  ✓ 锚点几何: r0=0.4484 nm  θA=119.46°  θB=113.41°
+  attachment 腿：4 个 λ 态 [0.0, 0.1, 0.35, 1.0]
+  ⚠️ 扫描顺序是**从全强度端往下**：第一个实际跑的态是 λ=1.0000，不是列表里的第一个 λ。
+  每态 平衡 50000 步 + 生产 250000 步 → 250 帧
+  🔎 Boresch 力常数: kr=2000, kthetaA=442.4, kthetaB=108.3, kphiA=238, kphiB=134, kphiC=155.1
+  🔎 起点实测几何 vs 已提交平衡值: r0: 0.4484 / 0.4484, thetaA0: 2.0850 / 2.0850, thetaB0: 1.9794 / 1.9794, phiA0: 2.9359 / 2.9359, phiB0: -1.6240 / -1.6240, phiC0: -0.7894 / -0.7894
+  🔎 逐 force group 能量 (kJ/mol): g0=-539566, g3=1.42109e-11
+  📐 attachment 腿起点 λ=1.0000: PE = -539566 kJ/mol, max|F| = 5292 kJ/mol/nm (idx=3353 GLU208/C), 中位数 802.7
+Traceback (most recent call last):
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/../runabfe.py", line 4584, in <module>
+    main()
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/../runabfe.py", line 4306, in main
+    complex_results = pipeline.run_full_pipeline(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/abfe_pipeline.py", line 6250, in run_full_pipeline
+    stage0 = run_boresch_attachment_leg(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/ibs_engine.py", line 1505, in run_boresch_attachment_leg
+    simulation.step(int(equil_steps_per_state))
+  File "/home/ruigengji/mambaforge/envs/openmm_dev/lib/python3.12/site-packages/openmm/app/simulation.py", line 149, in step
+    self._simulate(endStep=self.currentStep+steps)
+  File "/home/ruigengji/mambaforge/envs/openmm_dev/lib/python3.12/site-packages/openmm/app/simulation.py", line 228, in _simulate
+    self.integrator.step(10) # Only take 10 steps at a time, to give Python more chances to respond to a control-c.
+    ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ruigengji/mambaforge/envs/openmm_dev/lib/python3.12/site-packages/openmm/openmm.py", line 16460, in step
+    return _openmm.LangevinMiddleIntegrator_step(self, steps)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+openmm.OpenMMException: Particle coordinate is NaN.  For more information, see https://github.com/openmm/openmm/wiki/Frequently-Asked-Questions#nan
+Warning on use of the timeseries module: If the inherent timescales of the system are long compared to those being analyzed, this statistical inefficiency may be an underestimate.  The estimate presumes the use of many statistically independent samples.  Tests should be performed to assess whether this condition is satisfied.   Be cautious in the interpretation of the data.
+
+****** PyMBAR will use 64-bit JAX! *******
+* JAX is currently set to 32-bit bitsize *
+* which is its default.                  *
+*                                        *
+* PyMBAR requires 64-bit mode and WILL   *
+* enable JAX's 64-bit mode when called.  *
+*                                        *
+* This MAY cause problems with other     *
+* Uses of JAX in the same code.          *
+******************************************
+
+2026-08-03 14:50:51 | INFO    | 📄 已合并配置文件: abfe_config.json
+2026-08-03 14:50:51 | INFO    | ♻️ 从原生缓存加载系统 (complex): ./output_membrane_100ns
+2026-08-03 14:50:51 | INFO    |   ✓ System 恢复 | 原子数: 45354
+2026-08-03 14:50:51 | INFO    |   ✓ 配体索引恢复: 41 原子
+2026-08-03 14:50:51 | INFO    |   ✓ 盒子向量恢复
+2026-08-03 14:50:52 | INFO    |   ✓ 拓扑从原始 TOP 重建（45354 原子, 16635 键）—— 膜体系不用 mmCIF，因为它不保存非标准残基的键
+2026-08-03 14:50:52 | INFO    |   ℹ️ 未提供完整预平衡 fingerprint，不自动读取 DCD；先恢复身份绑定的初始坐标，由 pipeline 决定是否续用预平衡
+2026-08-03 14:50:52 | INFO    |   ⚠️ 坐标回退到 GRO 初始值
+2026-08-03 14:50:52 | INFO    | ✅ 原生缓存加载完成
+2026-08-03 14:50:52 | INFO    | ♻️ 从缓存加载 System 完成
+2026-08-03 14:50:52 | INFO    |   🔒 体系已刚性锁定至盒子中心 (No-Wrap, 仅整体平移)
+2026-08-03 14:50:52 | INFO    |   ✅ 配体已居中（仅整体质心平移；整分子 PBC 修复在 pre_equilibrate 之前执行）
+2026-08-03 14:50:52 | INFO    | 🧫 环境类型=membrane，复合物腿将使用 MonteCarloMembraneBarostat
+2026-08-03 14:50:52 | INFO    | 🧬 力场族=amber（来源 auto_detected）
+2026-08-03 14:50:52 | INFO    | 🧪 色散路线=ff_native_isotropic_lrc（均匀密度 LRC 关闭）
+2026-08-03 14:50:52 | INFO    | 🧾 体系组成（来自 .top）：{'Atenolol-rank11': 'ligand×1', 'PROA': 'protein×1', 'POPC': 'lipid×90', 'Na+': 'ion×25', 'Cl-': 'ion×36', 'TP3': 'water×9542'}
+2026-08-03 14:50:52 | WARNING | ⚠️ conformational_state='unspecified'：构象态未声明，已如实记入 provenance。§1.1 的本意是防止跨构象态混用——本次运行的构象由输入文件指纹唯一确定，但若日后要与其它构象态的结果比较，这一项必须补上。
+2026-08-03 14:50:52 | INFO    | 🧫 膜法向实测确认为 z（90 个头基原子；上下叶 45/45，簇心间距 3.840 nm）
+2026-08-03 14:50:52 | INFO    | 🧫 膜输入核对通过：45354 原子，上叶 45 / 下叶 45 脂质（不平衡 0.0%），水 9542，离子 {'CL-': 36, 'NA+': 25}
+2026-08-03 14:50:52 | INFO    | 🧫 上游平衡：completed_length_unrecorded（证据 CHARMM-GUI step6.1-6.6 restrained equilibration + step7 production; step7_production.gro 为该生产运行的末帧（请补作业 ID/路径以便追溯））→ 标称时长预检不适用；本流程再平衡 100.0 ns。§9 实测质量门仍为硬门。
+2026-08-03 14:50:53 | INFO    | 🧾 运行 provenance 已保存: ./output_membrane_100ns/run_provenance.json
+2026-08-03 14:50:53 | INFO    | 💧 水模型按参数识别为 amber14/tip3p.xml（moleculetype=TP3, 3 位点, q_O=-0.834000, q_H=+0.417000, σ_O=0.315075241 nm, ε_O=0.635968 kJ/mol）——`#include` 文件名词干认不出，故用参数判定。
+2026-08-03 14:50:53 | INFO    | ♻️ 检测到已有溶剂腿缓存，跳过重建
+2026-08-03 14:50:53 | INFO    | 🧷 复合物腿 Boresch 已启用 | source=simple
+2026-08-03 14:50:53 | WARNING | ⚠️ 已有预平衡轨迹的指纹与当前 system/config 不匹配（可能是换了 gro/top/ligand/温度或目标步数但复用了同一个 --output 目录），拒绝复用，将重新执行预平衡。
+2026-08-03 14:50:53 | INFO    | ▶️ 执行基线预平衡
+2026-08-03 14:52:11 | INFO    | ♻️ 从缓存加载 Boresch 参数: ./output_membrane_100ns/boresch_simple.json
+2026-08-03 14:52:11 | INFO    | 🔧 执行带 Boresch 限制力的再平衡...
+2026-08-03 14:52:12 | INFO    | ✓ 再平衡完成，坐标已更新
+2026-08-03 14:52:12 | INFO    | 🔄 启动复合物腿主采样流程 (dual_lambda)
+2026-08-03 14:52:13 | WARNING | ⚠️ 已有预平衡轨迹的指纹与当前 system/config 不匹配（可能是换了 gro/top/ligand/温度或目标步数但复用了同一个 --output 目录），拒绝复用，将重新执行预平衡。
+============================================================
+ABFE Pipeline v4.0 初始化完成 | 2026-08-03T14:50:53.542855
+输出目录: /home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/output_membrane_100ns
+配体原子数: 41 | 温度: 303.15 K | 压力: 1.0 bar
+============================================================
+  📦 正在执行 PBC 分子完整性修复与配体居中（pre_equilibrate 之前）...
+  ✓ PBC 分子完整性已修复，体系已居中至主周期
+
+[阶段 0] 启动物理预平衡 (目标: 50000000 步 | Platform: CUDA)...
+  🧊 已添加 MonteCarloMembraneBarostat（environment_type=membrane，频率=25）
+  🧫 膜恒压协议: 法向=z, 表面张力=0.0 bar·nm, XY=isotropic, Z=free
+  ♻️ 从 Checkpoint 恢复 | 已完成: 50000000 | 剩余: 0
+  ✓ CUDA 上下文已清理，后续采样可安全复用 GPU
+  ✓ 预平衡完成 | 最终势能: -507350.22 kJ/mol
+  📝 状态更新: equilibration = completed
+
+[膜质量门 · enforce] 读取预平衡轨迹并计算 §9 观测量...
+  ✓ 膜质量门摘要已保存: /home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/output_membrane_100ns/membrane_quality_gate.json
+    ✓ apl_nm2 [tail_drift_percent_per_ns] 0.0514709 vs 阈值 0.2
+    ✓ bilayer_thickness_nm [tail_drift_nm_per_window] 0.0144305 vs 阈值 0.05
+    ✓ transmembrane_tilt_deg [tail_drift_deg_per_window] 1.27396 vs 阈值 5
+    ✓ protein_backbone_rmsd_nm [tail_mean_nm] 0.133067 vs 阈值 0.3
+    ✓ pocket_rmsd_nm [tail_mean_nm] 0.0856743 vs 阈值 0.2
+    ✓ ligand_heavy_atom_rmsd_nm [tail_mean_nm] 0.0833366 vs 阈值 0.25
+    ✓ membrane_periodic_image_contacts [must_be_zero] 0 vs 阈值 0
+  ✅ 膜质量门通过（模式 enforce）
+🔄 启动带 Boresch 限制力的再平衡 (50000 步)...
+  📦 检测到配体偏离主周期，已自动执行 PBC 居中
+  ♻️ 再平衡状态已完成，Checkpoint/轨迹有效，将从 Checkpoint 加载真实再平衡坐标（不重新步进）。
+  [Boresch] kr=2000.0 kJ/mol/nm², r0=0.481 nm, θA=114.7°
+  ✓ Boresch 限制力已注入 (Group 3)
+  ♻️ 检测到再平衡 Checkpoint (/home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/output_membrane_100ns/rebalance.chk)，恢复状态...
+  ✓ 再平衡完成 | 坐标已更新
+
+############################################################
+# 启动完整 ABFE 流程 | 方案: dual_lambda | 势能: softcore | Resume: True
+############################################################
+🖥️ GPU 策略: single_gpu | 分配设备: [0]
+  ⏭️ 本进程已完成 Boresch 限制力再平衡，跳过 run_full_pipeline 内部的预平衡块（避免用无约束预平衡覆盖刚完成的 Boresch 平衡坐标）。
+  📦 正在执行 PBC 分子完整性修复与配体居中（run_full_pipeline 第 2 节）...
+  ✓ PBC 分子完整性已修复，体系已居中至主周期
+  ✓ 已提交 Boresch 平衡值与当前坐标一致（最大偏离 0.00 σ @ r0，阈值 4.0 σ）
+  ♻️ 本腿此前已提交过 Boresch 平衡值 (resume)，复用缓存值 (r0=4.48 Å)，不再从当前坐标重新锚定。（已校验其与当前坐标的几何一致性）
+
+[双λ] Stage 0: Boresch attachment (A′→A)
+  [Boresch] kr=2000.0 kJ/mol/nm², r0=0.448 nm, θA=119.5°
+  ✓ 锚点几何: r0=0.4484 nm  θA=119.46°  θB=113.41°
+  attachment 腿：4 个 λ 态 [0.0, 0.1, 0.35, 1.0]
+  ⚠️ 扫描顺序是**从全强度端往下**：第一个实际跑的态是 λ=1.0000，不是列表里的第一个 λ。
+  每态 平衡 50000 步 + 生产 250000 步 → 250 帧
+  🔎 Boresch 力常数: kr=2000, kthetaA=442.4, kthetaB=108.3, kphiA=238, kphiB=134, kphiC=155.1
+  🔎 起点实测几何 vs 已提交平衡值: r0: 0.4484 / 0.4484, thetaA0: 2.0850 / 2.0850, thetaB0: 1.9794 / 1.9794, phiA0: 2.9359 / 2.9359, phiB0: -1.6240 / -1.6240, phiC0: -0.7894 / -0.7894
+  🔎 逐 force group 能量 (kJ/mol): g0=-539566, g3=1.42109e-11
+  🧾 attachment 腿入口快照已落盘: /home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/output_membrane_100ns/attachment/stage0_attachment_inputs.json
+  📈 attachment 腿监控已启用（每 500 步）: /home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/output_membrane_100ns/attachment/stage0_attachment_monitor.csv
+  📐 attachment 腿起点 λ=1.0000: PE = -539566 kJ/mol, max|F| = 5292 kJ/mol/nm (idx=3353 GLU208/C), 中位数 802.7
+Traceback (most recent call last):
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/../runabfe.py", line 4584, in <module>
+    main()
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/../runabfe.py", line 4306, in main
+    complex_results = pipeline.run_full_pipeline(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/abfe_pipeline.py", line 6250, in run_full_pipeline
+    stage0 = run_boresch_attachment_leg(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/ibs_engine.py", line 1656, in run_boresch_attachment_leg
+    simulation.step(_chunk)
+  File "/home/ruigengji/mambaforge/envs/openmm_dev/lib/python3.12/site-packages/openmm/app/simulation.py", line 149, in step
+    self._simulate(endStep=self.currentStep+steps)
+  File "/home/ruigengji/mambaforge/envs/openmm_dev/lib/python3.12/site-packages/openmm/app/simulation.py", line 228, in _simulate
+    self.integrator.step(10) # Only take 10 steps at a time, to give Python more chances to respond to a control-c.
+    ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ruigengji/mambaforge/envs/openmm_dev/lib/python3.12/site-packages/openmm/openmm.py", line 16460, in step
+    return _openmm.LangevinMiddleIntegrator_step(self, steps)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+openmm.OpenMMException: Particle coordinate is NaN.  For more information, see https://github.com/openmm/openmm/wiki/Frequently-Asked-Questions#nan
+Warning on use of the timeseries module: If the inherent timescales of the system are long compared to those being analyzed, this statistical inefficiency may be an underestimate.  The estimate presumes the use of many statistically independent samples.  Tests should be performed to assess whether this condition is satisfied.   Be cautious in the interpretation of the data.
+
+****** PyMBAR will use 64-bit JAX! *******
+* JAX is currently set to 32-bit bitsize *
+* which is its default.                  *
+*                                        *
+* PyMBAR requires 64-bit mode and WILL   *
+* enable JAX's 64-bit mode when called.  *
+*                                        *
+* This MAY cause problems with other     *
+* Uses of JAX in the same code.          *
+******************************************
+
+2026-08-03 15:00:06 | INFO    | 📄 已合并配置文件: abfe_config.json
+2026-08-03 15:00:06 | INFO    | ♻️ 从原生缓存加载系统 (complex): ./output_membrane_100ns
+2026-08-03 15:00:07 | INFO    |   ✓ System 恢复 | 原子数: 45354
+2026-08-03 15:00:07 | INFO    |   ✓ 配体索引恢复: 41 原子
+2026-08-03 15:00:07 | INFO    |   ✓ 盒子向量恢复
+2026-08-03 15:00:07 | INFO    |   ✓ 拓扑从原始 TOP 重建（45354 原子, 16635 键）—— 膜体系不用 mmCIF，因为它不保存非标准残基的键
+2026-08-03 15:00:07 | INFO    |   ℹ️ 未提供完整预平衡 fingerprint，不自动读取 DCD；先恢复身份绑定的初始坐标，由 pipeline 决定是否续用预平衡
+2026-08-03 15:00:07 | INFO    |   ⚠️ 坐标回退到 GRO 初始值
+2026-08-03 15:00:07 | INFO    | ✅ 原生缓存加载完成
+2026-08-03 15:00:07 | INFO    | ♻️ 从缓存加载 System 完成
+2026-08-03 15:00:07 | INFO    |   🔒 体系已刚性锁定至盒子中心 (No-Wrap, 仅整体平移)
+2026-08-03 15:00:07 | INFO    |   ✅ 配体已居中（仅整体质心平移；整分子 PBC 修复在 pre_equilibrate 之前执行）
+2026-08-03 15:00:07 | INFO    | 🧫 环境类型=membrane，复合物腿将使用 MonteCarloMembraneBarostat
+2026-08-03 15:00:07 | INFO    | 🧬 力场族=amber（来源 auto_detected）
+2026-08-03 15:00:07 | INFO    | 🧪 色散路线=ff_native_isotropic_lrc（均匀密度 LRC 关闭）
+2026-08-03 15:00:07 | INFO    | 🧾 体系组成（来自 .top）：{'Atenolol-rank11': 'ligand×1', 'PROA': 'protein×1', 'POPC': 'lipid×90', 'Na+': 'ion×25', 'Cl-': 'ion×36', 'TP3': 'water×9542'}
+2026-08-03 15:00:07 | WARNING | ⚠️ conformational_state='unspecified'：构象态未声明，已如实记入 provenance。§1.1 的本意是防止跨构象态混用——本次运行的构象由输入文件指纹唯一确定，但若日后要与其它构象态的结果比较，这一项必须补上。
+2026-08-03 15:00:07 | INFO    | 🧫 膜法向实测确认为 z（90 个头基原子；上下叶 45/45，簇心间距 3.840 nm）
+2026-08-03 15:00:07 | INFO    | 🧫 膜输入核对通过：45354 原子，上叶 45 / 下叶 45 脂质（不平衡 0.0%），水 9542，离子 {'CL-': 36, 'NA+': 25}
+2026-08-03 15:00:07 | INFO    | 🧫 上游平衡：completed_length_unrecorded（证据 CHARMM-GUI step6.1-6.6 restrained equilibration + step7 production; step7_production.gro 为该生产运行的末帧（请补作业 ID/路径以便追溯））→ 标称时长预检不适用；本流程再平衡 100.0 ns。§9 实测质量门仍为硬门。
+2026-08-03 15:00:08 | INFO    | 🧾 运行 provenance 已保存: ./output_membrane_100ns/run_provenance.json
+2026-08-03 15:00:08 | INFO    | 💧 水模型按参数识别为 amber14/tip3p.xml（moleculetype=TP3, 3 位点, q_O=-0.834000, q_H=+0.417000, σ_O=0.315075241 nm, ε_O=0.635968 kJ/mol）——`#include` 文件名词干认不出，故用参数判定。
+2026-08-03 15:00:08 | INFO    | ♻️ 检测到已有溶剂腿缓存，跳过重建
+2026-08-03 15:00:08 | INFO    | 🧷 复合物腿 Boresch 已启用 | source=simple
+2026-08-03 15:00:09 | WARNING | ⚠️ 已有预平衡轨迹的指纹与当前 system/config 不匹配（可能是换了 gro/top/ligand/温度或目标步数但复用了同一个 --output 目录），拒绝复用，将重新执行预平衡。
+2026-08-03 15:00:09 | INFO    | ▶️ 执行基线预平衡
+2026-08-03 15:01:27 | INFO    | ♻️ 从缓存加载 Boresch 参数: ./output_membrane_100ns/boresch_simple.json
+2026-08-03 15:01:27 | INFO    | 🔧 执行带 Boresch 限制力的再平衡...
+2026-08-03 15:01:28 | INFO    | ✓ 再平衡完成，坐标已更新
+2026-08-03 15:01:28 | INFO    | 🔄 启动复合物腿主采样流程 (dual_lambda)
+2026-08-03 15:01:28 | WARNING | ⚠️ 已有预平衡轨迹的指纹与当前 system/config 不匹配（可能是换了 gro/top/ligand/温度或目标步数但复用了同一个 --output 目录），拒绝复用，将重新执行预平衡。
+============================================================
+ABFE Pipeline v4.0 初始化完成 | 2026-08-03T15:00:08.593918
+输出目录: /home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/output_membrane_100ns
+配体原子数: 41 | 温度: 303.15 K | 压力: 1.0 bar
+============================================================
+  📦 正在执行 PBC 分子完整性修复与配体居中（pre_equilibrate 之前）...
+  ✓ PBC 分子完整性已修复，体系已居中至主周期
+
+[阶段 0] 启动物理预平衡 (目标: 50000000 步 | Platform: CUDA)...
+  🧊 已添加 MonteCarloMembraneBarostat（environment_type=membrane，频率=25）
+  🧫 膜恒压协议: 法向=z, 表面张力=0.0 bar·nm, XY=isotropic, Z=free
+  ♻️ 从 Checkpoint 恢复 | 已完成: 50000000 | 剩余: 0
+  ✓ CUDA 上下文已清理，后续采样可安全复用 GPU
+  ✓ 预平衡完成 | 最终势能: -507350.22 kJ/mol
+  📝 状态更新: equilibration = completed
+
+[膜质量门 · enforce] 读取预平衡轨迹并计算 §9 观测量...
+  ✓ 膜质量门摘要已保存: /home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/output_membrane_100ns/membrane_quality_gate.json
+    ✓ apl_nm2 [tail_drift_percent_per_ns] 0.0514709 vs 阈值 0.2
+    ✓ bilayer_thickness_nm [tail_drift_nm_per_window] 0.0144305 vs 阈值 0.05
+    ✓ transmembrane_tilt_deg [tail_drift_deg_per_window] 1.27396 vs 阈值 5
+    ✓ protein_backbone_rmsd_nm [tail_mean_nm] 0.133067 vs 阈值 0.3
+    ✓ pocket_rmsd_nm [tail_mean_nm] 0.0856743 vs 阈值 0.2
+    ✓ ligand_heavy_atom_rmsd_nm [tail_mean_nm] 0.0833366 vs 阈值 0.25
+    ✓ membrane_periodic_image_contacts [must_be_zero] 0 vs 阈值 0
+  ✅ 膜质量门通过（模式 enforce）
+🔄 启动带 Boresch 限制力的再平衡 (50000 步)...
+  📦 检测到配体偏离主周期，已自动执行 PBC 居中
+  ♻️ 再平衡状态已完成，Checkpoint/轨迹有效，将从 Checkpoint 加载真实再平衡坐标（不重新步进）。
+  [Boresch] kr=2000.0 kJ/mol/nm², r0=0.481 nm, θA=114.7°
+  ✓ Boresch 限制力已注入 (Group 3)
+  ♻️ 检测到再平衡 Checkpoint (/home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/output_membrane_100ns/rebalance.chk)，恢复状态...
+  ✓ 再平衡完成 | 坐标已更新
+
+############################################################
+# 启动完整 ABFE 流程 | 方案: dual_lambda | 势能: softcore | Resume: True
+############################################################
+🖥️ GPU 策略: single_gpu | 分配设备: [0]
+  ⏭️ 本进程已完成 Boresch 限制力再平衡，跳过 run_full_pipeline 内部的预平衡块（避免用无约束预平衡覆盖刚完成的 Boresch 平衡坐标）。
+  📦 正在执行 PBC 分子完整性修复与配体居中（run_full_pipeline 第 2 节）...
+  ✓ PBC 分子完整性已修复，体系已居中至主周期
+  ✓ 已提交 Boresch 平衡值与当前坐标一致（最大偏离 0.00 σ @ r0，阈值 4.0 σ）
+  ♻️ 本腿此前已提交过 Boresch 平衡值 (resume)，复用缓存值 (r0=4.48 Å)，不再从当前坐标重新锚定。（已校验其与当前坐标的几何一致性）
+
+[双λ] Stage 0: Boresch attachment (A′→A)
+  [Boresch] kr=2000.0 kJ/mol/nm², r0=0.448 nm, θA=119.5°
+  ✓ 锚点几何: r0=0.4484 nm  θA=119.46°  θB=113.41°
+  attachment 腿：4 个 λ 态 [0.0, 0.1, 0.35, 1.0]
+  ⚠️ 扫描顺序是**从全强度端往下**：第一个实际跑的态是 λ=1.0000，不是列表里的第一个 λ。
+  每态 平衡 50000 步 + 生产 250000 步 → 250 帧
+  🔎 Boresch 力常数: kr=2000, kthetaA=442.4, kthetaB=108.3, kphiA=238, kphiB=134, kphiC=155.1
+  🔎 起点实测几何 vs 已提交平衡值: r0: 0.4484 / 0.4484, thetaA0: 2.0850 / 2.0850, thetaB0: 1.9794 / 1.9794, phiA0: 2.9359 / 2.9359, phiB0: -1.6240 / -1.6240, phiC0: -0.7894 / -0.7894
+  🔎 逐 force group 能量 (kJ/mol): g0=-539566, g3=1.42109e-11
+  🧾 attachment 腿入口快照已落盘: /home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/output_membrane_100ns/attachment/stage0_attachment_inputs.json
+  🧾 attachment 腿起点坐标已落盘（可离线复现）: /home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/output_membrane_100ns/attachment/stage0_attachment_start.npz
+  📈 attachment 腿监控已启用（每 500 步）: /home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/output_membrane_100ns/attachment/stage0_attachment_monitor.csv
+  📐 attachment 腿起点 λ=1.0000: PE = -539566 kJ/mol, max|F| = 5292 kJ/mol/nm (idx=3353 GLU208/C), 中位数 802.7
+Traceback (most recent call last):
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/../runabfe.py", line 4584, in <module>
+    main()
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/../runabfe.py", line 4306, in main
+    complex_results = pipeline.run_full_pipeline(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/abfe_pipeline.py", line 6250, in run_full_pipeline
+    stage0 = run_boresch_attachment_leg(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/ibs_engine.py", line 1679, in run_boresch_attachment_leg
+    simulation.step(_chunk)
+  File "/home/ruigengji/mambaforge/envs/openmm_dev/lib/python3.12/site-packages/openmm/app/simulation.py", line 149, in step
+    self._simulate(endStep=self.currentStep+steps)
+  File "/home/ruigengji/mambaforge/envs/openmm_dev/lib/python3.12/site-packages/openmm/app/simulation.py", line 232, in _simulate
+    self.integrator.step(stepsToGo)
+  File "/home/ruigengji/mambaforge/envs/openmm_dev/lib/python3.12/site-packages/openmm/openmm.py", line 16460, in step
+    return _openmm.LangevinMiddleIntegrator_step(self, steps)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+openmm.OpenMMException: Particle coordinate is NaN.  For more information, see https://github.com/openmm/openmm/wiki/Frequently-Asked-Questions#nan
+Warning on use of the timeseries module: If the inherent timescales of the system are long compared to those being analyzed, this statistical inefficiency may be an underestimate.  The estimate presumes the use of many statistically independent samples.  Tests should be performed to assess whether this condition is satisfied.   Be cautious in the interpretation of the data.
+
+****** PyMBAR will use 64-bit JAX! *******
+* JAX is currently set to 32-bit bitsize *
+* which is its default.                  *
+*                                        *
+* PyMBAR requires 64-bit mode and WILL   *
+* enable JAX's 64-bit mode when called.  *
+*                                        *
+* This MAY cause problems with other     *
+* Uses of JAX in the same code.          *
+******************************************
+
+2026-08-03 15:22:12 | INFO    | 📄 已合并配置文件: abfe_config.json
+2026-08-03 15:22:12 | INFO    | ♻️ 从原生缓存加载系统 (complex): ./output_membrane_100ns
+2026-08-03 15:22:12 | INFO    |   ✓ System 恢复 | 原子数: 45354
+2026-08-03 15:22:12 | INFO    |   ✓ 配体索引恢复: 41 原子
+2026-08-03 15:22:12 | INFO    |   ✓ 盒子向量恢复
+2026-08-03 15:22:12 | INFO    |   ✓ 拓扑从原始 TOP 重建（45354 原子, 16635 键）—— 膜体系不用 mmCIF，因为它不保存非标准残基的键
+2026-08-03 15:22:12 | INFO    |   ℹ️ 未提供完整预平衡 fingerprint，不自动读取 DCD；先恢复身份绑定的初始坐标，由 pipeline 决定是否续用预平衡
+2026-08-03 15:22:12 | INFO    |   ⚠️ 坐标回退到 GRO 初始值
+2026-08-03 15:22:12 | INFO    | ✅ 原生缓存加载完成
+2026-08-03 15:22:12 | INFO    | ♻️ 从缓存加载 System 完成
+2026-08-03 15:22:12 | INFO    |   🔒 体系已刚性锁定至盒子中心 (No-Wrap, 仅整体平移)
+2026-08-03 15:22:12 | INFO    |   ✅ 配体已居中（仅整体质心平移；整分子 PBC 修复在 pre_equilibrate 之前执行）
+2026-08-03 15:22:12 | INFO    | 🧫 环境类型=membrane，复合物腿将使用 MonteCarloMembraneBarostat
+2026-08-03 15:22:12 | INFO    | 🧬 力场族=amber（来源 auto_detected）
+2026-08-03 15:22:12 | INFO    | 🧪 色散路线=ff_native_isotropic_lrc（均匀密度 LRC 关闭）
+2026-08-03 15:22:12 | INFO    | 🧾 体系组成（来自 .top）：{'Atenolol-rank11': 'ligand×1', 'PROA': 'protein×1', 'POPC': 'lipid×90', 'Na+': 'ion×25', 'Cl-': 'ion×36', 'TP3': 'water×9542'}
+2026-08-03 15:22:12 | WARNING | ⚠️ conformational_state='unspecified'：构象态未声明，已如实记入 provenance。§1.1 的本意是防止跨构象态混用——本次运行的构象由输入文件指纹唯一确定，但若日后要与其它构象态的结果比较，这一项必须补上。
+2026-08-03 15:22:13 | INFO    | 🧫 膜法向实测确认为 z（90 个头基原子；上下叶 45/45，簇心间距 3.840 nm）
+2026-08-03 15:22:13 | INFO    | 🧫 膜输入核对通过：45354 原子，上叶 45 / 下叶 45 脂质（不平衡 0.0%），水 9542，离子 {'CL-': 36, 'NA+': 25}
+2026-08-03 15:22:13 | INFO    | 🧫 上游平衡：completed_length_unrecorded（证据 CHARMM-GUI step6.1-6.6 restrained equilibration + step7 production; step7_production.gro 为该生产运行的末帧（请补作业 ID/路径以便追溯））→ 标称时长预检不适用；本流程再平衡 100.0 ns。§9 实测质量门仍为硬门。
+2026-08-03 15:22:13 | INFO    | 🧾 运行 provenance 已保存: ./output_membrane_100ns/run_provenance.json
+2026-08-03 15:22:13 | INFO    | 💧 水模型按参数识别为 amber14/tip3p.xml（moleculetype=TP3, 3 位点, q_O=-0.834000, q_H=+0.417000, σ_O=0.315075241 nm, ε_O=0.635968 kJ/mol）——`#include` 文件名词干认不出，故用参数判定。
+2026-08-03 15:22:13 | INFO    | ♻️ 检测到已有溶剂腿缓存，跳过重建
+2026-08-03 15:22:13 | INFO    | 🧷 复合物腿 Boresch 已启用 | source=simple
+2026-08-03 15:22:14 | WARNING | ⚠️ 已有预平衡轨迹的指纹与当前 system/config 不匹配（可能是换了 gro/top/ligand/温度或目标步数但复用了同一个 --output 目录），拒绝复用，将重新执行预平衡。
+2026-08-03 15:22:14 | INFO    | ▶️ 执行基线预平衡
+Warning on use of the timeseries module: If the inherent timescales of the system are long compared to those being analyzed, this statistical inefficiency may be an underestimate.  The estimate presumes the use of many statistically independent samples.  Tests should be performed to assess whether this condition is satisfied.   Be cautious in the interpretation of the data.
+
+****** PyMBAR will use 64-bit JAX! *******
+* JAX is currently set to 32-bit bitsize *
+* which is its default.                  *
+*                                        *
+* PyMBAR requires 64-bit mode and WILL   *
+* enable JAX's 64-bit mode when called.  *
+*                                        *
+* This MAY cause problems with other     *
+* Uses of JAX in the same code.          *
+******************************************
+
+2026-08-03 19:18:30 | INFO    | 📄 已合并配置文件: abfe_config.json
+2026-08-03 19:18:30 | INFO    | ♻️ 从原生缓存加载系统 (complex): ./output_membrane_100ns
+2026-08-03 19:18:30 | INFO    |   ✓ System 恢复 | 原子数: 45354
+2026-08-03 19:18:30 | INFO    |   ✓ 配体索引恢复: 41 原子
+2026-08-03 19:18:30 | INFO    |   ✓ 盒子向量恢复
+2026-08-03 19:18:31 | INFO    |   ✓ 拓扑从原始 TOP 重建（45354 原子, 16635 键）—— 膜体系不用 mmCIF，因为它不保存非标准残基的键
+2026-08-03 19:18:31 | INFO    |   ℹ️ 未提供完整预平衡 fingerprint，不自动读取 DCD；先恢复身份绑定的初始坐标，由 pipeline 决定是否续用预平衡
+2026-08-03 19:18:31 | INFO    |   ⚠️ 坐标回退到 GRO 初始值
+2026-08-03 19:18:31 | INFO    | ✅ 原生缓存加载完成
+2026-08-03 19:18:31 | INFO    | ♻️ 从缓存加载 System 完成
+2026-08-03 19:18:31 | INFO    |   🔒 体系已刚性锁定至盒子中心 (No-Wrap, 仅整体平移)
+2026-08-03 19:18:31 | INFO    |   ✅ 配体已居中（仅整体质心平移；整分子 PBC 修复在 pre_equilibrate 之前执行）
+2026-08-03 19:18:31 | INFO    | 🧫 环境类型=membrane，复合物腿将使用 MonteCarloMembraneBarostat
+2026-08-03 19:18:31 | INFO    | 🧬 力场族=amber（来源 auto_detected）
+2026-08-03 19:18:31 | INFO    | 🧪 色散路线=ff_native_isotropic_lrc（均匀密度 LRC 关闭）
+2026-08-03 19:18:31 | INFO    | 🧾 体系组成（来自 .top）：{'Atenolol-rank11': 'ligand×1', 'PROA': 'protein×1', 'POPC': 'lipid×90', 'Na+': 'ion×25', 'Cl-': 'ion×36', 'TP3': 'water×9542'}
+2026-08-03 19:18:31 | WARNING | ⚠️ conformational_state='unspecified'：构象态未声明，已如实记入 provenance。§1.1 的本意是防止跨构象态混用——本次运行的构象由输入文件指纹唯一确定，但若日后要与其它构象态的结果比较，这一项必须补上。
+2026-08-03 19:18:31 | INFO    | 🧫 膜法向实测确认为 z（90 个头基原子；上下叶 45/45，簇心间距 3.840 nm）
+2026-08-03 19:18:31 | INFO    | 🧫 膜输入核对通过：45354 原子，上叶 45 / 下叶 45 脂质（不平衡 0.0%），水 9542，离子 {'CL-': 36, 'NA+': 25}
+2026-08-03 19:18:31 | INFO    | 🧫 上游平衡：completed_length_unrecorded（证据 CHARMM-GUI step6.1-6.6 restrained equilibration + step7 production; step7_production.gro 为该生产运行的末帧（请补作业 ID/路径以便追溯））→ 标称时长预检不适用；本流程再平衡 100.0 ns。§9 实测质量门仍为硬门。
+2026-08-03 19:18:32 | INFO    | 🧾 运行 provenance 已保存: ./output_membrane_100ns/run_provenance.json
+2026-08-03 19:18:32 | INFO    | 💧 水模型按参数识别为 amber14/tip3p.xml（moleculetype=TP3, 3 位点, q_O=-0.834000, q_H=+0.417000, σ_O=0.315075241 nm, ε_O=0.635968 kJ/mol）——`#include` 文件名词干认不出，故用参数判定。
+2026-08-03 19:18:32 | INFO    | ♻️ 检测到已有溶剂腿缓存，跳过重建
+2026-08-03 19:18:32 | INFO    | 🧷 复合物腿 Boresch 已启用 | source=simple
+2026-08-03 19:18:32 | WARNING | ⚠️ 已有预平衡轨迹的指纹与当前 system/config 不匹配（可能是换了 gro/top/ligand/温度或目标步数但复用了同一个 --output 目录），拒绝复用，将重新执行预平衡。
+2026-08-03 19:18:32 | INFO    | ▶️ 执行基线预平衡
+Warning on use of the timeseries module: If the inherent timescales of the system are long compared to those being analyzed, this statistical inefficiency may be an underestimate.  The estimate presumes the use of many statistically independent samples.  Tests should be performed to assess whether this condition is satisfied.   Be cautious in the interpretation of the data.
+
+****** PyMBAR will use 64-bit JAX! *******
+* JAX is currently set to 32-bit bitsize *
+* which is its default.                  *
+*                                        *
+* PyMBAR requires 64-bit mode and WILL   *
+* enable JAX's 64-bit mode when called.  *
+*                                        *
+* This MAY cause problems with other     *
+* Uses of JAX in the same code.          *
+******************************************
+
+2026-08-03 22:26:25 | INFO    | 📄 已合并配置文件: abfe_config.json
+2026-08-03 22:26:25 | INFO    | ♻️ 从原生缓存加载系统 (complex): ./output_membrane_100ns
+2026-08-03 22:26:25 | INFO    |   ✓ System 恢复 | 原子数: 45354
+2026-08-03 22:26:25 | INFO    |   ✓ 配体索引恢复: 41 原子
+2026-08-03 22:26:25 | INFO    |   ✓ 盒子向量恢复
+2026-08-03 22:26:26 | INFO    |   ✓ 拓扑从原始 TOP 重建（45354 原子, 16635 键）—— 膜体系不用 mmCIF，因为它不保存非标准残基的键
+2026-08-03 22:26:26 | INFO    |   ℹ️ 未提供完整预平衡 fingerprint，不自动读取 DCD；先恢复身份绑定的初始坐标，由 pipeline 决定是否续用预平衡
+2026-08-03 22:26:26 | INFO    |   ⚠️ 坐标回退到 GRO 初始值
+2026-08-03 22:26:26 | INFO    | ✅ 原生缓存加载完成
+2026-08-03 22:26:26 | INFO    | ♻️ 从缓存加载 System 完成
+2026-08-03 22:26:26 | INFO    |   🔒 体系已刚性锁定至盒子中心 (No-Wrap, 仅整体平移)
+2026-08-03 22:26:26 | INFO    |   ✅ 配体已居中（仅整体质心平移；整分子 PBC 修复在 pre_equilibrate 之前执行）
+2026-08-03 22:26:26 | INFO    | 🧫 环境类型=membrane，复合物腿将使用 MonteCarloMembraneBarostat
+2026-08-03 22:26:26 | INFO    | 🧬 力场族=amber（来源 auto_detected）
+2026-08-03 22:26:26 | INFO    | 🧪 色散路线=ff_native_isotropic_lrc（均匀密度 LRC 关闭）
+2026-08-03 22:26:26 | INFO    | 🧾 体系组成（来自 .top）：{'Atenolol-rank11': 'ligand×1', 'PROA': 'protein×1', 'POPC': 'lipid×90', 'Na+': 'ion×25', 'Cl-': 'ion×36', 'TP3': 'water×9542'}
+2026-08-03 22:26:26 | WARNING | ⚠️ conformational_state='unspecified'：构象态未声明，已如实记入 provenance。§1.1 的本意是防止跨构象态混用——本次运行的构象由输入文件指纹唯一确定，但若日后要与其它构象态的结果比较，这一项必须补上。
+2026-08-03 22:26:26 | INFO    | 🧫 膜法向实测确认为 z（90 个头基原子；上下叶 45/45，簇心间距 3.840 nm）
+2026-08-03 22:26:26 | INFO    | 🧫 膜输入核对通过：45354 原子，上叶 45 / 下叶 45 脂质（不平衡 0.0%），水 9542，离子 {'CL-': 36, 'NA+': 25}
+2026-08-03 22:26:26 | INFO    | 🧫 上游平衡：completed_length_unrecorded（证据 CHARMM-GUI step6.1-6.6 restrained equilibration + step7 production; step7_production.gro 为该生产运行的末帧（请补作业 ID/路径以便追溯））→ 标称时长预检不适用；本流程再平衡 100.0 ns。§9 实测质量门仍为硬门。
+2026-08-03 22:26:27 | INFO    | 🧾 运行 provenance 已保存: ./output_membrane_100ns/run_provenance.json
+2026-08-03 22:26:27 | INFO    | 💧 水模型按参数识别为 amber14/tip3p.xml（moleculetype=TP3, 3 位点, q_O=-0.834000, q_H=+0.417000, σ_O=0.315075241 nm, ε_O=0.635968 kJ/mol）——`#include` 文件名词干认不出，故用参数判定。
+2026-08-03 22:26:27 | INFO    | ♻️ 检测到已有溶剂腿缓存，跳过重建
+2026-08-03 22:26:27 | INFO    | 🧷 复合物腿 Boresch 已启用 | source=simple
+2026-08-03 22:26:28 | WARNING | ⚠️ 已有预平衡轨迹的指纹与当前 system/config 不匹配（可能是换了 gro/top/ligand/温度或目标步数但复用了同一个 --output 目录），拒绝复用，将重新执行预平衡。
+2026-08-03 22:26:28 | INFO    | ▶️ 执行基线预平衡
+============================================================
+ABFE Pipeline v4.0 初始化完成 | 2026-08-03T22:26:27.769507
+输出目录: /home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/output_membrane_100ns
+配体原子数: 41 | 温度: 303.15 K | 压力: 1.0 bar
+============================================================
+  📦 正在执行 PBC 分子完整性修复与配体居中（pre_equilibrate 之前）...
+  🔗 已把 28626 个约束补成键用于分子归组（刚性水的 O–H 只以约束存在，否则会被逐原子回卷撕开）
+  ✓ PBC 分子完整性已修复，体系已居中至主周期
+
+[阶段 0] 启动物理预平衡 (目标: 50000000 步 | Platform: CUDA)...
+  🧊 已添加 MonteCarloMembraneBarostat（environment_type=membrane，频率=25）
+  🧫 膜恒压协议: 法向=z, 表面张力=0.0 bar·nm, XY=isotropic, Z=free
+  ♻️ 从 Checkpoint 恢复 | 已完成: 40500000 | 剩余: 9500000
+  📈 膜体系监控已启用（每 5000 步）: /home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/output_membrane_100ns/pre_equilibration_monitor.csv
+  → 运行 9500000 步 (CUDA)...
+  ✓ CUDA 上下文已清理，后续采样可安全复用 GPU
+  ✓ 预平衡完成 | 最终势能: -508889.32 kJ/mol
+  📝 状态更新: equilibration = completed
+
+[膜质量门 · enforce] 读取预平衡轨迹并计算 §9 观测量...
+Traceback (most recent call last):
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/abfe_core.py", line 2787, in run_membrane_quality_gate
+    raise ValueError(
+ValueError: 预平衡轨迹有 5001 帧，但按目标步数应当是 5000 帧。
+    多了 ⇒ 这条轨迹被 resume 追加过**重复帧**（checkpoint 每 200 ps、DCD 每 20 ps，中断点与 checkpoint 之间那几帧会写两次）。§9 的时间轴按「帧号 × 每帧 ps」重建，重复帧会让时间轴偏长、末段窗口取错，**且不会有任何异常现象**。
+    少了 ⇒ 轨迹被截断（预平衡没跑完，或写盘中断）。
+    正解是重跑这段预平衡到完整步数；**不要**缩短判据窗口或忽略这条来让门变绿。
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/../runabfe.py", line 4592, in <module>
+    main()
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/../runabfe.py", line 4274, in main
+    boresch_restraint = resolve_boresch_restraint(config, pipeline)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/memtest/../runabfe.py", line 1957, in resolve_boresch_restraint
+    pipeline.pre_equilibrate(
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/abfe_pipeline.py", line 1854, in pre_equilibrate
+    self._evaluate_membrane_quality_gate_after_equilibration(
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/abfe_pipeline.py", line 1505, in _evaluate_membrane_quality_gate_after_equilibration
+    self._membrane_quality_gate_report = report = run_membrane_quality_gate(
+                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/abfe_core.py", line 2817, in run_membrane_quality_gate
+    return _blocked(f"{type(exc).__name__}: {exc}")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ruigengji/ABFE_IBS/Atenolol-rank11/abfe_core.py", line 2737, in _blocked
+    raise RuntimeError(message)
+RuntimeError: ValueError: 预平衡轨迹有 5001 帧，但按目标步数应当是 5000 帧。
+    多了 ⇒ 这条轨迹被 resume 追加过**重复帧**（checkpoint 每 200 ps、DCD 每 20 ps，中断点与 checkpoint 之间那几帧会写两次）。§9 的时间轴按「帧号 × 每帧 ps」重建，重复帧会让时间轴偏长、末段窗口取错，**且不会有任何异常现象**。
+    少了 ⇒ 轨迹被截断（预平衡没跑完，或写盘中断）。
+    正解是重跑这段预平衡到完整步数；**不要**缩短判据窗口或忽略这条来让门变绿。

@@ -1,0 +1,13 @@
+{
+  "case": "Ca_large",
+  "delta_G_charging_kJ_mol": 663.4408696483575,
+  "uncertainty_kJ_mol": 8.42897871153599,
+  "delta_G_charging_kcal_mol": 158.56617343411986,
+  "uncertainty_kcal_mol": 2.014574261839386,
+  "method": "MBAR-default",
+  "converged": false,
+  "min_overlap": 0.009670773651677596,
+  "n_states": 11,
+  "n_frames": 402,
+  "u_kn_path": "validation/c1_waterbox/Ca_large/u_kn.npz"
+}

@@ -1,0 +1,134 @@
+{
+  "protocol_version": 2,
+  "ab": {
+    "n_frames": 100,
+    "n_failed": 0,
+    "passed": true,
+    "cases": [
+      {
+        "case": "C1_Na_large",
+        "file": "validation/c3_real_endpoints_v2/c1_na_large_v2.json",
+        "sha256": "662c3c86c57ebbc4b559ac5f85934b05d8e30a509fe414a65f833ef178763db9",
+        "protocol_version": 2,
+        "n_frames": 20,
+        "n_failed": 0,
+        "passed": true
+      },
+      {
+        "case": "Na_thin_pos0",
+        "file": "validation/c3_real_endpoints_v2/c2_Na_thin_pos0_v2.json",
+        "sha256": "39fed80cee77102fbf3d773ef1b83ff6e949c97ca03256854b2063a72be1bac8",
+        "protocol_version": 2,
+        "n_frames": 20,
+        "n_failed": 0,
+        "passed": true
+      },
+      {
+        "case": "Na_thin_pos1",
+        "file": "validation/c3_real_endpoints_v2/c2_Na_thin_pos1_v2.json",
+        "sha256": "d5a1ebae943c94fa559b42848201e3b856aac4f891b6bf41d792ae3f2dab826e",
+        "protocol_version": 2,
+        "n_frames": 20,
+        "n_failed": 0,
+        "passed": true
+      },
+      {
+        "case": "Na_thick_pos0",
+        "file": "validation/c3_real_endpoints_v2/c2_Na_thick_pos0_v2.json",
+        "sha256": "ef293d90d44d4610d5ce88257eb049a89d6de031ab9a01b379892b7248a893ba",
+        "protocol_version": 2,
+        "n_frames": 20,
+        "n_failed": 0,
+        "passed": true
+      },
+      {
+        "case": "Na_thick_pos1",
+        "file": "validation/c3_real_endpoints_v2/c2_Na_thick_pos1_v2.json",
+        "sha256": "8b5f85d36f0ebce814e9deecc1636763e7b85f176e1b2e3b6c8beba1d0582705",
+        "protocol_version": 2,
+        "n_frames": 20,
+        "n_failed": 0,
+        "passed": true
+      }
+    ]
+  },
+  "cd": {
+    "n_frames": 50,
+    "n_failed": 0,
+    "passed": true,
+    "cases": [
+      {
+        "case": "C1_Na_large",
+        "file": "validation/c3_real_endpoints_v2/cd_c1_na_large_v2.json",
+        "sha256": "4867ce9771640365981b217eb3f066524a452052f669cf745658635ae0c9fd5f",
+        "protocol_version": 2,
+        "n_frames": 10,
+        "n_failed": 0,
+        "passed": true,
+        "c_seam_passed": true,
+        "d_passed": true,
+        "d_strict_zero_passed": true
+      },
+      {
+        "case": "Na_thin_pos0",
+        "file": "validation/c3_real_endpoints_v2/cd_c2_Na_thin_pos0_v2.json",
+        "sha256": "9727eb62c135f9eafe5ca1f871dd4bfbe116910b13b3ace68a5cb58da526fec0",
+        "protocol_version": 2,
+        "n_frames": 10,
+        "n_failed": 0,
+        "passed": true,
+        "c_seam_passed": true,
+        "d_passed": true,
+        "d_strict_zero_passed": true
+      },
+      {
+        "case": "Na_thin_pos1",
+        "file": "validation/c3_real_endpoints_v2/cd_c2_Na_thin_pos1_v2.json",
+        "sha256": "621f16e73f7756b008885113a74ec3444ffbacdbc8b4bf89e4cfca1965e3ba41",
+        "protocol_version": 2,
+        "n_frames": 10,
+        "n_failed": 0,
+        "passed": true,
+        "c_seam_passed": true,
+        "d_passed": true,
+        "d_strict_zero_passed": true
+      },
+      {
+        "case": "Na_thick_pos0",
+        "file": "validation/c3_real_endpoints_v2/cd_c2_Na_thick_pos0_v2.json",
+        "sha256": "cafd75927556877e146dc6f8c4b1d52047effac2538429dec80662dfb7c6060d",
+        "protocol_version": 2,
+        "n_frames": 10,
+        "n_failed": 0,
+        "passed": true,
+        "c_seam_passed": true,
+        "d_passed": true,
+        "d_strict_zero_passed": true
+      },
+      {
+        "case": "Na_thick_pos1",
+        "file": "validation/c3_real_endpoints_v2/cd_c2_Na_thick_pos1_v2.json",
+        "sha256": "a57e7d7a789a9dbc12935ab0f00bd374634f752a8f08bcae9e2f5cd3c6d50aa2",
+        "protocol_version": 2,
+        "n_frames": 10,
+        "n_failed": 0,
+        "passed": true,
+        "c_seam_passed": true,
+        "d_passed": true,
+        "d_strict_zero_passed": true
+      }
+    ]
+  },
+  "endpoints": {
+    "A": true,
+    "B": true,
+    "C": true,
+    "D": true,
+    "all_passed": true
+  },
+  "n_frames_total": 150,
+  "n_failed_total": 0,
+  "input_case_files_verified": true,
+  "status": "complete",
+  "passed": true
+}

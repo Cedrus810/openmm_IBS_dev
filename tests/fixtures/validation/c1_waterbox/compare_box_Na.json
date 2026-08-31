@@ -1,0 +1,15 @@
+{
+  "small_case": "Na_small",
+  "large_case": "Na_large",
+  "small_box_edge_nm": 3.2,
+  "large_box_edge_nm": 4.2,
+  "delta_G_small_kcal_mol": 0.003769205848984305,
+  "uncertainty_small_kcal_mol": 0.8136270145940493,
+  "delta_G_large_kcal_mol": 0.1405786808623394,
+  "uncertainty_large_kcal_mol": 0.905224405841943,
+  "delta_delta_G_kcal_mol": 0.1368094750133551,
+  "combined_sigma_kcal_mol": 1.217136041619475,
+  "threshold_2sigma_kcal_mol": 2.43427208323895,
+  "threshold_abs_kcal_mol": 1.0,
+  "passed": true
+}

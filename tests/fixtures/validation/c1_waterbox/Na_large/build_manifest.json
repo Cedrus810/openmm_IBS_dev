@@ -1,0 +1,37 @@
+{
+  "protocol_version": 1,
+  "case": "Na_large",
+  "ion": "Na",
+  "ligand_net_charge_e": 1,
+  "box_size_label": "large",
+  "box_edge_nm": 4.2,
+  "nonbonded_cutoff_nm": 1.0,
+  "ionic_strength_molar": 0.15,
+  "forcefield_xml": [
+    "amber14-all.xml",
+    "amber14/tip3p.xml"
+  ],
+  "n_atoms": 7178,
+  "n_water": 2387,
+  "na_count_total": 9,
+  "cl_count_total": 8,
+  "ordinary_na_count": 7,
+  "ordinary_cl_count": 8,
+  "reserved_coion_indices": [
+    7177
+  ],
+  "reserved_coion_cation": true,
+  "ligand_indices": [
+    0
+  ],
+  "co_ion_indices": [
+    7177
+  ],
+  "ligand_coion_min_image_distances_nm": [
+    3.594917925349618
+  ],
+  "charge_treatment": "co_alchemical_charge_transfer",
+  "coalchemical_ion_fingerprint": "5d31a61f2b31a32c9e973a4ea275762100061f1ce557a00baeb31fff04e7f1d7",
+  "system_xml_sha256": "89bc3e953cc2e6b735891ad7f76e64092d64120cb7e8e23ae3efd3b693279216",
+  "topology_cif_sha256": "6d95e3b8338723dc548da3d8617e92da3086a7efc78de41fd6d159213436069c"
+}

@@ -1,0 +1,40 @@
+{
+  "protocol_version": 1,
+  "case": "Ca_small",
+  "ion": "Ca",
+  "ligand_net_charge_e": 2,
+  "box_size_label": "small",
+  "box_edge_nm": 3.2,
+  "nonbonded_cutoff_nm": 1.0,
+  "ionic_strength_molar": 0.15,
+  "forcefield_xml": [
+    "amber14-all.xml",
+    "amber14/tip3p.xml"
+  ],
+  "n_atoms": 3188,
+  "n_water": 1059,
+  "na_count_total": 5,
+  "cl_count_total": 5,
+  "ordinary_na_count": 3,
+  "ordinary_cl_count": 5,
+  "reserved_coion_indices": [
+    3186,
+    3187
+  ],
+  "reserved_coion_cation": true,
+  "ligand_indices": [
+    0
+  ],
+  "co_ion_indices": [
+    3186,
+    3187
+  ],
+  "ligand_coion_min_image_distances_nm": [
+    2.554513333298537,
+    2.515336522217256
+  ],
+  "charge_treatment": "co_alchemical_charge_transfer",
+  "coalchemical_ion_fingerprint": "4ecb71634736c6f08083cdc567d8b09eda8b057cc5bdc27771b129f2ba1b5c38",
+  "system_xml_sha256": "3c3c9bb12da9ca84427d07e402d648ce0994aac202883b28b5c64175d411f740",
+  "topology_cif_sha256": "30f7b50b7a670fb8c73975332dc4a0c82f8b69cd587348c03ee56ab54585477d"
+}

@@ -1,0 +1,13 @@
+{
+  "case": "Cl_small",
+  "delta_G_charging_kJ_mol": 1.5156939364721518,
+  "uncertainty_kJ_mol": 3.2128629513105387,
+  "delta_G_charging_kcal_mol": 0.3622595450459254,
+  "uncertainty_kcal_mol": 0.7678926747874136,
+  "method": "MBAR-default",
+  "converged": true,
+  "min_overlap": 0.09907992103360129,
+  "n_states": 11,
+  "n_frames": 373,
+  "u_kn_path": "validation/c1_waterbox/Cl_small/u_kn.npz"
+}

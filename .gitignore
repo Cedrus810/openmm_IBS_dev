@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pycache_check/
+.rocklin_review_check/
+.rocklin_smoke/
+
+# Editor and manual backup files never belong beside live source.
+# 旧源码副本留在 Atenolol-rank11 工作区，不进本工程区分支。
+\#*\#
+*.bak
+*.pre_*
+* - 副本.py
+
+# 原生插件的构建产物（可由 plugins/LocalManyBodyResidual/g0_build.sh 重建）
+*.o
+*.so
+*.a
+plugins/*/build/
+plugins/*/build_*/

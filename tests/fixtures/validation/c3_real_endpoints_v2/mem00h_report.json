@@ -1,0 +1,84 @@
+{
+  "evaluation_cutoff_nm": 1.0,
+  "evaluation_switching_enabled": false,
+  "normalization": {
+    "mechanism": "compare_charge_transfer_endpoints.mem00h_normalized_raw_system() + assert_mem00h_switching_convention()",
+    "scope": "仅作用于 C3 评估工具内部的一份内存 clone；不修改任何 case 目录下的 raw system.xml/轨迹文件本身",
+    "applied_in": [
+      "run_protocol_v2_matrix (A/B)",
+      "run_protocol_v2_matrix_cd (C/D)"
+    ],
+    "per_case": [
+      {
+        "case": "C1_Na_large",
+        "raw_cutoff_nm": 1.0,
+        "raw_switching_enabled": false,
+        "raw_switch_distance_nm": null,
+        "normalization_applied": true,
+        "normalization_changed_switching": false,
+        "normalized_evaluation_cutoff_nm": 1.0,
+        "normalized_evaluation_switching_enabled": false,
+        "normalized_conforms_to_mem00h": true
+      },
+      {
+        "case": "Na_thin_pos0",
+        "raw_cutoff_nm": 1.0,
+        "raw_switching_enabled": true,
+        "raw_switch_distance_nm": 0.995,
+        "normalization_applied": true,
+        "normalization_changed_switching": true,
+        "normalized_evaluation_cutoff_nm": 1.0,
+        "normalized_evaluation_switching_enabled": false,
+        "normalized_conforms_to_mem00h": true
+      },
+      {
+        "case": "Na_thin_pos1",
+        "raw_cutoff_nm": 1.0,
+        "raw_switching_enabled": true,
+        "raw_switch_distance_nm": 0.995,
+        "normalization_applied": true,
+        "normalization_changed_switching": true,
+        "normalized_evaluation_cutoff_nm": 1.0,
+        "normalized_evaluation_switching_enabled": false,
+        "normalized_conforms_to_mem00h": true
+      },
+      {
+        "case": "Na_thick_pos0",
+        "raw_cutoff_nm": 1.0,
+        "raw_switching_enabled": true,
+        "raw_switch_distance_nm": 0.995,
+        "normalization_applied": true,
+        "normalization_changed_switching": true,
+        "normalized_evaluation_cutoff_nm": 1.0,
+        "normalized_evaluation_switching_enabled": false,
+        "normalized_conforms_to_mem00h": true
+      },
+      {
+        "case": "Na_thick_pos1",
+        "raw_cutoff_nm": 1.0,
+        "raw_switching_enabled": true,
+        "raw_switch_distance_nm": 0.995,
+        "normalization_applied": true,
+        "normalization_changed_switching": true,
+        "normalized_evaluation_cutoff_nm": 1.0,
+        "normalized_evaluation_switching_enabled": false,
+        "normalized_conforms_to_mem00h": true
+      }
+    ],
+    "c2_raw_switch_confirmed_present": true,
+    "c1_raw_already_mem00h_compliant_noop": true,
+    "all_cases_conform_after_normalization": true
+  },
+  "production_reference_convention_consistent": true,
+  "lrc_vdw_protocol": {
+    "vdw_nonbonded_protocol_version": 1,
+    "traditional_lj_lrc_protocol_version": 3,
+    "lj_tail_lrc_r_switch_nm": 1.0,
+    "lj_tail_lrc_r_cutoff_nm": 1.0,
+    "note": "全局 ibs_engine 常量，同一进程内对所有 case 一致适用，不是逐 case 可配置的值——因此天然一致，这里如实记录具体数值供审计。"
+  },
+  "c_seam_passed": true,
+  "d_strict_zero_passed": true,
+  "status": "complete",
+  "passed": true
+}

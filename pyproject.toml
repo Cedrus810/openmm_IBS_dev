@@ -1,0 +1,28 @@
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# 2026-08-31 发布整理：archive/、curated_project/、gromacs_reference/ 都已不在
+# 本工程区分支，对应的排除项一并移除（ruff 对不存在的路径不会报错，但留着会让
+# 下一个人以为这些目录还在）。
+exclude = [
+    "tests/fixtures/charmm-gui-8600905442",
+]
+
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+follow_imports = "skip"
+check_untyped_defs = true
+warn_unused_ignores = true
+show_error_codes = true

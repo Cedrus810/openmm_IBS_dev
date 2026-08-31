@@ -1,0 +1,2356 @@
+{
+  "case_dir": "validation/c2_lipid_slab_v11/Na_thin_pos0",
+  "protocol_version": 2,
+  "lambda_name": "lambda_coul",
+  "reference_platform_name": "Reference",
+  "mixed_platform_name": "CUDA",
+  "mixed_platform_properties": {
+    "Precision": "mixed"
+  },
+  "n_frames": 10,
+  "n_failed": 0,
+  "failed_frames": [],
+  "frames": [
+    {
+      "lambda_coul": 0.0,
+      "dcd": "traj_state10_lam0.00.dcd",
+      "frame_index": 20,
+      "C": {
+        "gate1_reference_identity": {
+          "label": "C_seam_gate1_reference_frame20",
+          "e_production_kj_mol": -223495.04704082894,
+          "e_reference_kj_mol": -223495.21618550186,
+          "abs_delta_e_kj_mol": 0.16914467292372137,
+          "rel_delta_e": 7.568156303772098e-07,
+          "max_abs_force_component_diff_kj_mol_nm": 2.2737367544323206e-13,
+          "worst_atom_index": 11445,
+          "worst_component": "x",
+          "worst_atom_force_production_kj_mol_nm": [
+            1959.5283951697877,
+            1818.332444759244,
+            239.97202333009662
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            1959.528395169788,
+            1818.332444759244,
+            239.97202333009665
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "hard",
+          "forces_finite": true,
+          "force_within_tolerance": true,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "reference_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "gate2_mixed_live_vs_baked": {
+          "applicable": false,
+          "reason": "vanishing 侧每个 λ_vdw 态的 CV 是固定构造（不是运行时可设的 GlobalParameter），charging 侧在喂给 vanishing 前已被结构性烘焙——没有可比较的 live-vs-baked 对象。",
+          "passed": true
+        },
+        "gate3_mixed_production_vs_reference": {
+          "label": "C_seam_gate3_mixed_production_vs_reference_frame20",
+          "e_production_kj_mol": -223495.03055735212,
+          "e_reference_kj_mol": -223495.19923278864,
+          "abs_delta_e_kj_mol": 0.16867543652188033,
+          "rel_delta_e": 7.547161509549517e-07,
+          "max_abs_force_component_diff_kj_mol_nm": 0.01433559786528349,
+          "worst_atom_index": 16551,
+          "worst_component": "y",
+          "worst_atom_force_production_kj_mol_nm": [
+            -80.27526625827886,
+            1305.3032291757409,
+            1506.3924970598891
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            -80.27543899440207,
+            1305.2888935778756,
+            1506.3819487374276
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "diagnostic",
+          "forces_finite": true,
+          "force_within_tolerance": false,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "reference_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "passed": true
+      },
+      "D": {
+        "gate1_reference_identity": {
+          "label": "D_vs_reference_gate1_reference_frame20",
+          "e_production_kj_mol": -223491.79583971816,
+          "e_reference_kj_mol": -223491.79583971814,
+          "abs_delta_e_kj_mol": 2.9103830456733704e-11,
+          "rel_delta_e": 1.302232609809361e-16,
+          "max_abs_force_component_diff_kj_mol_nm": 8.640199666842818e-12,
+          "worst_atom_index": 1231,
+          "worst_component": "z",
+          "worst_atom_force_production_kj_mol_nm": [
+            -875.6342391349825,
+            -1480.3987059008407,
+            2126.2033898116624
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            -875.634239134982,
+            -1480.398705900841,
+            2126.203389811671
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "hard",
+          "forces_finite": true,
+          "force_within_tolerance": true,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "reference_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "gate2_mixed_live_vs_baked": {
+          "applicable": false,
+          "reason": "vanishing 侧每个 λ_vdw 态的 CV 是固定构造（不是运行时可设的 GlobalParameter），charging 侧在喂给 vanishing 前已被结构性烘焙——没有可比较的 live-vs-baked 对象。",
+          "passed": true
+        },
+        "gate3_mixed_production_vs_reference": {
+          "label": "D_vs_reference_gate3_mixed_production_vs_reference_frame20",
+          "e_production_kj_mol": -223491.77932673646,
+          "e_reference_kj_mol": -223491.77889735764,
+          "abs_delta_e_kj_mol": 0.00042937882244586945,
+          "rel_delta_e": 1.9212287116971263e-09,
+          "max_abs_force_component_diff_kj_mol_nm": 0.014451946131885052,
+          "worst_atom_index": 16551,
+          "worst_component": "y",
+          "worst_atom_force_production_kj_mol_nm": [
+            -80.27526053623296,
+            1305.3032196389977,
+            1506.3924531908706
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            -80.27542659663595,
+            1305.2887676928658,
+            1506.3819525521249
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "diagnostic",
+          "forces_finite": true,
+          "force_within_tolerance": false,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "reference_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "strict_zero_reference": {
+          "label": "D_ligand_environment_strict_zero",
+          "e_ligand_environment_kj_mol": 0.0,
+          "max_abs_force_ligand_environment_kj_mol_nm": 0.0,
+          "abs_tol_kj_mol": 1e-06,
+          "force_abs_tol": 0.001,
+          "platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": [],
+          "passed": true
+        },
+        "strict_zero_mixed": {
+          "label": "D_ligand_environment_strict_zero",
+          "e_ligand_environment_kj_mol": 0.0,
+          "max_abs_force_ligand_environment_kj_mol_nm": 0.0,
+          "abs_tol_kj_mol": 1e-06,
+          "force_abs_tol": 0.001,
+          "platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": [],
+          "passed": true
+        },
+        "passed": true
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 0.0,
+      "dcd": "traj_state10_lam0.00.dcd",
+      "frame_index": 40,
+      "C": {
+        "gate1_reference_identity": {
+          "label": "C_seam_gate1_reference_frame40",
+          "e_production_kj_mol": -223351.3809598963,
+          "e_reference_kj_mol": -223351.55029966007,
+          "abs_delta_e_kj_mol": 0.16933976375730708,
+          "rel_delta_e": 7.581759048912445e-07,
+          "max_abs_force_component_diff_kj_mol_nm": 5.968558980384842e-13,
+          "worst_atom_index": 21517,
+          "worst_component": "x",
+          "worst_atom_force_production_kj_mol_nm": [
+            -230.9879988506839,
+            47.37937055576361,
+            -20.205166325113108
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            -230.9879988506845,
+            47.37937055576363,
+            -20.205166325113225
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "hard",
+          "forces_finite": true,
+          "force_within_tolerance": true,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "reference_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "gate2_mixed_live_vs_baked": {
+          "applicable": false,
+          "reason": "vanishing 侧每个 λ_vdw 态的 CV 是固定构造（不是运行时可设的 GlobalParameter），charging 侧在喂给 vanishing 前已被结构性烘焙——没有可比较的 live-vs-baked 对象。",
+          "passed": true
+        },
+        "gate3_mixed_production_vs_reference": {
+          "label": "C_seam_gate3_mixed_production_vs_reference_frame40",
+          "e_production_kj_mol": -223351.43935745943,
+          "e_reference_kj_mol": -223351.60889583128,
+          "abs_delta_e_kj_mol": 0.16953837184701115,
+          "rel_delta_e": 7.590649231726913e-07,
+          "max_abs_force_component_diff_kj_mol_nm": 0.017196932807564735,
+          "worst_atom_index": 12777,
+          "worst_component": "z",
+          "worst_atom_force_production_kj_mol_nm": [
+            216.39725606050342,
+            91.93606326729059,
+            -1017.3794895000756
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            216.40458396356553,
+            91.93455686140805,
+            -1017.3966864328831
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "diagnostic",
+          "forces_finite": true,
+          "force_within_tolerance": false,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "reference_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "passed": true
+      },
+      "D": {
+        "gate1_reference_identity": {
+          "label": "D_vs_reference_gate1_reference_frame40",
+          "e_production_kj_mol": -223350.17161590088,
+          "e_reference_kj_mol": -223350.17161590088,
+          "abs_delta_e_kj_mol": 0.0,
+          "rel_delta_e": 0.0,
+          "max_abs_force_component_diff_kj_mol_nm": 1.2732925824820995e-11,
+          "worst_atom_index": 7160,
+          "worst_component": "y",
+          "worst_atom_force_production_kj_mol_nm": [
+            -124.21208364958082,
+            -4182.022986781071,
+            -900.0104935794224
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            -124.21208364958136,
+            -4182.022986781084,
+            -900.0104935794227
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "hard",
+          "forces_finite": true,
+          "force_within_tolerance": true,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "reference_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "gate2_mixed_live_vs_baked": {
+          "applicable": false,
+          "reason": "vanishing 侧每个 λ_vdw 态的 CV 是固定构造（不是运行时可设的 GlobalParameter），charging 侧在喂给 vanishing 前已被结构性烘焙——没有可比较的 live-vs-baked 对象。",
+          "passed": true
+        },
+        "gate3_mixed_production_vs_reference": {
+          "label": "D_vs_reference_gate3_mixed_production_vs_reference_frame40",
+          "e_production_kj_mol": -223350.23008325323,
+          "e_reference_kj_mol": -223350.2301887687,
+          "abs_delta_e_kj_mol": 0.00010551547165960073,
+          "rel_delta_e": 4.724215935234198e-10,
+          "max_abs_force_component_diff_kj_mol_nm": 0.017181674018502235,
+          "worst_atom_index": 12777,
+          "worst_component": "z",
+          "worst_atom_force_production_kj_mol_nm": [
+            216.39715687837452,
+            91.93608043342829,
+            -1017.379481870681
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            216.40459159296006,
+            91.93456830549985,
+            -1017.3966635446995
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "diagnostic",
+          "forces_finite": true,
+          "force_within_tolerance": false,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "reference_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "strict_zero_reference": {
+          "label": "D_ligand_environment_strict_zero",
+          "e_ligand_environment_kj_mol": 0.0,
+          "max_abs_force_ligand_environment_kj_mol_nm": 0.0,
+          "abs_tol_kj_mol": 1e-06,
+          "force_abs_tol": 0.001,
+          "platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": [],
+          "passed": true
+        },
+        "strict_zero_mixed": {
+          "label": "D_ligand_environment_strict_zero",
+          "e_ligand_environment_kj_mol": 0.0,
+          "max_abs_force_ligand_environment_kj_mol_nm": 0.0,
+          "abs_tol_kj_mol": 1e-06,
+          "force_abs_tol": 0.001,
+          "platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": [],
+          "passed": true
+        },
+        "passed": true
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 0.0,
+      "dcd": "traj_state10_lam0.00.dcd",
+      "frame_index": 60,
+      "C": {
+        "gate1_reference_identity": {
+          "label": "C_seam_gate1_reference_frame60",
+          "e_production_kj_mol": -224210.420640288,
+          "e_reference_kj_mol": -224210.5899137762,
+          "abs_delta_e_kj_mol": 0.16927348819444887,
+          "rel_delta_e": 7.549754374204436e-07,
+          "max_abs_force_component_diff_kj_mol_nm": 2.2737367544323206e-13,
+          "worst_atom_index": 12549,
+          "worst_component": "z",
+          "worst_atom_force_production_kj_mol_nm": [
+            776.4459875746145,
+            815.5738119508878,
+            -1033.190270055022
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            776.4459875746145,
+            815.5738119508878,
+            -1033.1902700550222
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "hard",
+          "forces_finite": true,
+          "force_within_tolerance": true,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "reference_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "gate2_mixed_live_vs_baked": {
+          "applicable": false,
+          "reason": "vanishing 侧每个 λ_vdw 态的 CV 是固定构造（不是运行时可设的 GlobalParameter），charging 侧在喂给 vanishing 前已被结构性烘焙——没有可比较的 live-vs-baked 对象。",
+          "passed": true
+        },
+        "gate3_mixed_production_vs_reference": {
+          "label": "C_seam_gate3_mixed_production_vs_reference_frame60",
+          "e_production_kj_mol": -224210.40647896612,
+          "e_reference_kj_mol": -224210.57629073318,
+          "abs_delta_e_kj_mol": 0.16981176706030965,
+          "rel_delta_e": 7.573762570420195e-07,
+          "max_abs_force_component_diff_kj_mol_nm": 0.017016930505633354,
+          "worst_atom_index": 20259,
+          "worst_component": "z",
+          "worst_atom_force_production_kj_mol_nm": [
+            -521.4635337213986,
+            -920.0682469615713,
+            -798.2709111177828
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            -521.45667546615,
+            -920.0663984436542,
+            -798.2879280482884
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "diagnostic",
+          "forces_finite": true,
+          "force_within_tolerance": false,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "reference_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "passed": true
+      },
+      "D": {
+        "gate1_reference_identity": {
+          "label": "D_vs_reference_gate1_reference_frame60",
+          "e_production_kj_mol": -224206.75548604602,
+          "e_reference_kj_mol": -224206.75548604605,
+          "abs_delta_e_kj_mol": 2.9103830456733704e-11,
+          "rel_delta_e": 1.298079997350706e-16,
+          "max_abs_force_component_diff_kj_mol_nm": 9.094947017729282e-12,
+          "worst_atom_index": 3634,
+          "worst_component": "x",
+          "worst_atom_force_production_kj_mol_nm": [
+            -4310.264477009078,
+            1283.4892921591722,
+            -696.2000676818275
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            -4310.264477009087,
+            1283.4892921591706,
+            -696.2000676818274
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "hard",
+          "forces_finite": true,
+          "force_within_tolerance": true,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "reference_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "gate2_mixed_live_vs_baked": {
+          "applicable": false,
+          "reason": "vanishing 侧每个 λ_vdw 态的 CV 是固定构造（不是运行时可设的 GlobalParameter），charging 侧在喂给 vanishing 前已被结构性烘焙——没有可比较的 live-vs-baked 对象。",
+          "passed": true
+        },
+        "gate3_mixed_production_vs_reference": {
+          "label": "D_vs_reference_gate3_mixed_production_vs_reference_frame60",
+          "e_production_kj_mol": -224206.74131025234,
+          "e_reference_kj_mol": -224206.74168762367,
+          "abs_delta_e_kj_mol": 0.00037737132515758276,
+          "rel_delta_e": 1.6831399551908026e-09,
+          "max_abs_force_component_diff_kj_mol_nm": 0.01855027722194791,
+          "worst_atom_index": 21518,
+          "worst_component": "x",
+          "worst_atom_force_production_kj_mol_nm": [
+            -218.4474788927473,
+            -80.40230248169973,
+            -348.77186207892373
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            -218.46602916996926,
+            -80.39913816936314,
+            -348.7751646437682
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "diagnostic",
+          "forces_finite": true,
+          "force_within_tolerance": false,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "reference_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "strict_zero_reference": {
+          "label": "D_ligand_environment_strict_zero",
+          "e_ligand_environment_kj_mol": 0.0,
+          "max_abs_force_ligand_environment_kj_mol_nm": 0.0,
+          "abs_tol_kj_mol": 1e-06,
+          "force_abs_tol": 0.001,
+          "platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": [],
+          "passed": true
+        },
+        "strict_zero_mixed": {
+          "label": "D_ligand_environment_strict_zero",
+          "e_ligand_environment_kj_mol": 0.0,
+          "max_abs_force_ligand_environment_kj_mol_nm": 0.0,
+          "abs_tol_kj_mol": 1e-06,
+          "force_abs_tol": 0.001,
+          "platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": [],
+          "passed": true
+        },
+        "passed": true
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 0.0,
+      "dcd": "traj_state10_lam0.00.dcd",
+      "frame_index": 80,
+      "C": {
+        "gate1_reference_identity": {
+          "label": "C_seam_gate1_reference_frame80",
+          "e_production_kj_mol": -223548.23952132688,
+          "e_reference_kj_mol": -223548.40811422645,
+          "abs_delta_e_kj_mol": 0.16859289957210422,
+          "rel_delta_e": 7.541673009183692e-07,
+          "max_abs_force_component_diff_kj_mol_nm": 2.2737367544323206e-13,
+          "worst_atom_index": 11424,
+          "worst_component": "z",
+          "worst_atom_force_production_kj_mol_nm": [
+            -35.07007838675459,
+            350.7321723653699,
+            1742.0412523100151
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            -35.07007838675459,
+            350.7321723653699,
+            1742.0412523100154
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "hard",
+          "forces_finite": true,
+          "force_within_tolerance": true,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "reference_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "gate2_mixed_live_vs_baked": {
+          "applicable": false,
+          "reason": "vanishing 侧每个 λ_vdw 态的 CV 是固定构造（不是运行时可设的 GlobalParameter），charging 侧在喂给 vanishing 前已被结构性烘焙——没有可比较的 live-vs-baked 对象。",
+          "passed": true
+        },
+        "gate3_mixed_production_vs_reference": {
+          "label": "C_seam_gate3_mixed_production_vs_reference_frame80",
+          "e_production_kj_mol": -223548.29162246909,
+          "e_reference_kj_mol": -223548.4599638572,
+          "abs_delta_e_kj_mol": 0.16834138811100274,
+          "rel_delta_e": 7.53042039020174e-07,
+          "max_abs_force_component_diff_kj_mol_nm": 0.022411422803997993,
+          "worst_atom_index": 15390,
+          "worst_component": "z",
+          "worst_atom_force_production_kj_mol_nm": [
+            -109.69335862598382,
+            -698.5120485471562,
+            -1613.6807857900858
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            -109.69591499236412,
+            -698.5034322338179,
+            -1613.7031972128898
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "diagnostic",
+          "forces_finite": true,
+          "force_within_tolerance": false,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "reference_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "passed": true
+      },
+      "D": {
+        "gate1_reference_identity": {
+          "label": "D_vs_reference_gate1_reference_frame80",
+          "e_production_kj_mol": -223542.89334663507,
+          "e_reference_kj_mol": -223542.89334663507,
+          "abs_delta_e_kj_mol": 0.0,
+          "rel_delta_e": 0.0,
+          "max_abs_force_component_diff_kj_mol_nm": 9.549694368615746e-12,
+          "worst_atom_index": 546,
+          "worst_component": "z",
+          "worst_atom_force_production_kj_mol_nm": [
+            504.2119280528558,
+            -366.91257097319635,
+            2079.81313022434
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            504.21192805285654,
+            -366.91257097319635,
+            2079.8131302243496
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "hard",
+          "forces_finite": true,
+          "force_within_tolerance": true,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "reference_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "gate2_mixed_live_vs_baked": {
+          "applicable": false,
+          "reason": "vanishing 侧每个 λ_vdw 态的 CV 是固定构造（不是运行时可设的 GlobalParameter），charging 侧在喂给 vanishing 前已被结构性烘焙——没有可比较的 live-vs-baked 对象。",
+          "passed": true
+        },
+        "gate3_mixed_production_vs_reference": {
+          "label": "D_vs_reference_gate3_mixed_production_vs_reference_frame80",
+          "e_production_kj_mol": -223542.9452876841,
+          "e_reference_kj_mol": -223542.94502144656,
+          "abs_delta_e_kj_mol": 0.0002662375336512923,
+          "rel_delta_e": 1.190990543789023e-09,
+          "max_abs_force_component_diff_kj_mol_nm": 0.022510604932904243,
+          "worst_atom_index": 15390,
+          "worst_component": "z",
+          "worst_atom_force_production_kj_mol_nm": [
+            -109.69331284961663,
+            -698.5119875119999,
+            -1613.6807285696268
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            -109.69585395720787,
+            -698.5034093456343,
+            -1613.7032391745597
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "diagnostic",
+          "forces_finite": true,
+          "force_within_tolerance": false,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "reference_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "strict_zero_reference": {
+          "label": "D_ligand_environment_strict_zero",
+          "e_ligand_environment_kj_mol": 0.0,
+          "max_abs_force_ligand_environment_kj_mol_nm": 0.0,
+          "abs_tol_kj_mol": 1e-06,
+          "force_abs_tol": 0.001,
+          "platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": [],
+          "passed": true
+        },
+        "strict_zero_mixed": {
+          "label": "D_ligand_environment_strict_zero",
+          "e_ligand_environment_kj_mol": 0.0,
+          "max_abs_force_ligand_environment_kj_mol_nm": 0.0,
+          "abs_tol_kj_mol": 1e-06,
+          "force_abs_tol": 0.001,
+          "platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": [],
+          "passed": true
+        },
+        "passed": true
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 0.0,
+      "dcd": "traj_state10_lam0.00.dcd",
+      "frame_index": 100,
+      "C": {
+        "gate1_reference_identity": {
+          "label": "C_seam_gate1_reference_frame100",
+          "e_production_kj_mol": -223690.2331156135,
+          "e_reference_kj_mol": -223690.40243483413,
+          "abs_delta_e_kj_mol": 0.16931922064395621,
+          "rel_delta_e": 7.569355627284124e-07,
+          "max_abs_force_component_diff_kj_mol_nm": 4.547473508864641e-13,
+          "worst_atom_index": 13476,
+          "worst_component": "z",
+          "worst_atom_force_production_kj_mol_nm": [
+            -51.67536224628545,
+            543.8481925382704,
+            1067.4279223722492
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            -51.67536224628545,
+            543.8481925382704,
+            1067.4279223722488
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "hard",
+          "forces_finite": true,
+          "force_within_tolerance": true,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "reference_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "gate2_mixed_live_vs_baked": {
+          "applicable": false,
+          "reason": "vanishing 侧每个 λ_vdw 态的 CV 是固定构造（不是运行时可设的 GlobalParameter），charging 侧在喂给 vanishing 前已被结构性烘焙——没有可比较的 live-vs-baked 对象。",
+          "passed": true
+        },
+        "gate3_mixed_production_vs_reference": {
+          "label": "C_seam_gate3_mixed_production_vs_reference_frame100",
+          "e_production_kj_mol": -223690.2221474636,
+          "e_reference_kj_mol": -223690.3916767448,
+          "abs_delta_e_kj_mol": 0.16952928120736033,
+          "rel_delta_e": 7.57874667466036e-07,
+          "max_abs_force_component_diff_kj_mol_nm": 0.0069321393966674805,
+          "worst_atom_index": 20190,
+          "worst_component": "y",
+          "worst_atom_force_production_kj_mol_nm": [
+            469.90562334423885,
+            1215.362558271736,
+            121.2885633520782
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            469.90595466503873,
+            1215.3694904111326,
+            121.28490940644406
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "diagnostic",
+          "forces_finite": true,
+          "force_within_tolerance": false,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "reference_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "passed": true
+      },
+      "D": {
+        "gate1_reference_identity": {
+          "label": "D_vs_reference_gate1_reference_frame100",
+          "e_production_kj_mol": -223687.14490920593,
+          "e_reference_kj_mol": -223687.14490920596,
+          "abs_delta_e_kj_mol": 2.9103830456733704e-11,
+          "rel_delta_e": 1.3010953521064821e-16,
+          "max_abs_force_component_diff_kj_mol_nm": 1.0459189070388675e-11,
+          "worst_atom_index": 6939,
+          "worst_component": "z",
+          "worst_atom_force_production_kj_mol_nm": [
+            623.7670925201802,
+            657.19489887485,
+            -2295.660470589914
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            623.7670925201803,
+            657.1948988748507,
+            -2295.6604705899035
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "hard",
+          "forces_finite": true,
+          "force_within_tolerance": true,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "reference_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "gate2_mixed_live_vs_baked": {
+          "applicable": false,
+          "reason": "vanishing 侧每个 λ_vdw 态的 CV 是固定构造（不是运行时可设的 GlobalParameter），charging 侧在喂给 vanishing 前已被结构性烘焙——没有可比较的 live-vs-baked 对象。",
+          "passed": true
+        },
+        "gate3_mixed_production_vs_reference": {
+          "label": "D_vs_reference_gate3_mixed_production_vs_reference_frame100",
+          "e_production_kj_mol": -223687.13389050227,
+          "e_reference_kj_mol": -223687.134106445,
+          "abs_delta_e_kj_mol": 0.0002159427385777235,
+          "rel_delta_e": 9.653784489677613e-10,
+          "max_abs_force_component_diff_kj_mol_nm": 0.023185298778116703,
+          "worst_atom_index": 21518,
+          "worst_component": "x",
+          "worst_atom_force_production_kj_mol_nm": [
+            286.5135298669338,
+            -226.77867389842868,
+            123.89543925784528
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            286.53671516571194,
+            -226.77702332288027,
+            123.89156102761626
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "diagnostic",
+          "forces_finite": true,
+          "force_within_tolerance": false,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "reference_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "strict_zero_reference": {
+          "label": "D_ligand_environment_strict_zero",
+          "e_ligand_environment_kj_mol": 0.0,
+          "max_abs_force_ligand_environment_kj_mol_nm": 0.0,
+          "abs_tol_kj_mol": 1e-06,
+          "force_abs_tol": 0.001,
+          "platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": [],
+          "passed": true
+        },
+        "strict_zero_mixed": {
+          "label": "D_ligand_environment_strict_zero",
+          "e_ligand_environment_kj_mol": 0.0,
+          "max_abs_force_ligand_environment_kj_mol_nm": 0.0,
+          "abs_tol_kj_mol": 1e-06,
+          "force_abs_tol": 0.001,
+          "platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": [],
+          "passed": true
+        },
+        "passed": true
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 0.0,
+      "dcd": "traj_state10_lam0.00.dcd",
+      "frame_index": 120,
+      "C": {
+        "gate1_reference_identity": {
+          "label": "C_seam_gate1_reference_frame120",
+          "e_production_kj_mol": -223386.21742291207,
+          "e_reference_kj_mol": -223386.38621932792,
+          "abs_delta_e_kj_mol": 0.16879641584819183,
+          "rel_delta_e": 7.556253481018404e-07,
+          "max_abs_force_component_diff_kj_mol_nm": 2.2737367544323206e-13,
+          "worst_atom_index": 11190,
+          "worst_component": "y",
+          "worst_atom_force_production_kj_mol_nm": [
+            1128.5187242951165,
+            1082.1097417005021,
+            -334.73494298664383
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            1128.5187242951165,
+            1082.109741700502,
+            -334.73494298664383
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "hard",
+          "forces_finite": true,
+          "force_within_tolerance": true,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "reference_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "gate2_mixed_live_vs_baked": {
+          "applicable": false,
+          "reason": "vanishing 侧每个 λ_vdw 态的 CV 是固定构造（不是运行时可设的 GlobalParameter），charging 侧在喂给 vanishing 前已被结构性烘焙——没有可比较的 live-vs-baked 对象。",
+          "passed": true
+        },
+        "gate3_mixed_production_vs_reference": {
+          "label": "C_seam_gate3_mixed_production_vs_reference_frame120",
+          "e_production_kj_mol": -223386.1808029886,
+          "e_reference_kj_mol": -223386.34954671282,
+          "abs_delta_e_kj_mol": 0.16874372423626482,
+          "rel_delta_e": 7.553895955535029e-07,
+          "max_abs_force_component_diff_kj_mol_nm": 0.013171124970540404,
+          "worst_atom_index": 4233,
+          "worst_component": "z",
+          "worst_atom_force_production_kj_mol_nm": [
+            -1887.0196344144642,
+            -31.25486931949854,
+            466.49712688615546
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            -1887.012743592728,
+            -31.25425760447979,
+            466.4839557611849
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "diagnostic",
+          "forces_finite": true,
+          "force_within_tolerance": false,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "reference_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "passed": true
+      },
+      "D": {
+        "gate1_reference_identity": {
+          "label": "D_vs_reference_gate1_reference_frame120",
+          "e_production_kj_mol": -223381.54085429106,
+          "e_reference_kj_mol": -223381.54085429106,
+          "abs_delta_e_kj_mol": 0.0,
+          "rel_delta_e": 0.0,
+          "max_abs_force_component_diff_kj_mol_nm": 9.094947017729282e-12,
+          "worst_atom_index": 5686,
+          "worst_component": "x",
+          "worst_atom_force_production_kj_mol_nm": [
+            -4038.886176633211,
+            -801.2036447062342,
+            1393.2943514393326
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            -4038.88617663322,
+            -801.2036447062328,
+            1393.2943514393342
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "hard",
+          "forces_finite": true,
+          "force_within_tolerance": true,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "reference_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "gate2_mixed_live_vs_baked": {
+          "applicable": false,
+          "reason": "vanishing 侧每个 λ_vdw 态的 CV 是固定构造（不是运行时可设的 GlobalParameter），charging 侧在喂给 vanishing 前已被结构性烘焙——没有可比较的 live-vs-baked 对象。",
+          "passed": true
+        },
+        "gate3_mixed_production_vs_reference": {
+          "label": "D_vs_reference_gate3_mixed_production_vs_reference_frame120",
+          "e_production_kj_mol": -223381.50432126073,
+          "e_reference_kj_mol": -223381.50414573937,
+          "abs_delta_e_kj_mol": 0.00017552135977894068,
+          "rel_delta_e": 7.857470583796696e-10,
+          "max_abs_force_component_diff_kj_mol_nm": 0.013771421043202281,
+          "worst_atom_index": 21518,
+          "worst_component": "x",
+          "worst_atom_force_production_kj_mol_nm": [
+            -84.82477958896197,
+            -211.09516236232594,
+            -244.98985148756765
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            -84.81100816791877,
+            -211.09334476152435,
+            -244.99379087402485
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "diagnostic",
+          "forces_finite": true,
+          "force_within_tolerance": false,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "reference_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "strict_zero_reference": {
+          "label": "D_ligand_environment_strict_zero",
+          "e_ligand_environment_kj_mol": 0.0,
+          "max_abs_force_ligand_environment_kj_mol_nm": 0.0,
+          "abs_tol_kj_mol": 1e-06,
+          "force_abs_tol": 0.001,
+          "platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": [],
+          "passed": true
+        },
+        "strict_zero_mixed": {
+          "label": "D_ligand_environment_strict_zero",
+          "e_ligand_environment_kj_mol": 0.0,
+          "max_abs_force_ligand_environment_kj_mol_nm": 0.0,
+          "abs_tol_kj_mol": 1e-06,
+          "force_abs_tol": 0.001,
+          "platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": [],
+          "passed": true
+        },
+        "passed": true
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 0.0,
+      "dcd": "traj_state10_lam0.00.dcd",
+      "frame_index": 140,
+      "C": {
+        "gate1_reference_identity": {
+          "label": "C_seam_gate1_reference_frame140",
+          "e_production_kj_mol": -224775.25282275505,
+          "e_reference_kj_mol": -224775.42172667204,
+          "abs_delta_e_kj_mol": 0.168903916986892,
+          "rel_delta_e": 7.514341011548849e-07,
+          "max_abs_force_component_diff_kj_mol_nm": 4.547473508864641e-13,
+          "worst_atom_index": 14850,
+          "worst_component": "x",
+          "worst_atom_force_production_kj_mol_nm": [
+            2118.7883452454016,
+            -557.0548319330552,
+            -88.56102401142486
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            2118.788345245402,
+            -557.0548319330552,
+            -88.56102401142485
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "hard",
+          "forces_finite": true,
+          "force_within_tolerance": true,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "reference_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "gate2_mixed_live_vs_baked": {
+          "applicable": false,
+          "reason": "vanishing 侧每个 λ_vdw 态的 CV 是固定构造（不是运行时可设的 GlobalParameter），charging 侧在喂给 vanishing 前已被结构性烘焙——没有可比较的 live-vs-baked 对象。",
+          "passed": true
+        },
+        "gate3_mixed_production_vs_reference": {
+          "label": "C_seam_gate3_mixed_production_vs_reference_frame140",
+          "e_production_kj_mol": -224775.28858758893,
+          "e_reference_kj_mol": -224775.45613700897,
+          "abs_delta_e_kj_mol": 0.1675494200317189,
+          "rel_delta_e": 7.454079858683117e-07,
+          "max_abs_force_component_diff_kj_mol_nm": 0.020602846518158913,
+          "worst_atom_index": 10761,
+          "worst_component": "x",
+          "worst_atom_force_production_kj_mol_nm": [
+            -799.0661250213161,
+            126.90017174580134,
+            150.6712116142735
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            -799.045522174798,
+            126.90247233957052,
+            150.6747244198341
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "diagnostic",
+          "forces_finite": true,
+          "force_within_tolerance": false,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "reference_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "passed": true
+      },
+      "D": {
+        "gate1_reference_identity": {
+          "label": "D_vs_reference_gate1_reference_frame140",
+          "e_production_kj_mol": -224771.50359428668,
+          "e_reference_kj_mol": -224771.50359428665,
+          "abs_delta_e_kj_mol": 2.9103830456733704e-11,
+          "rel_delta_e": 1.2948185153072705e-16,
+          "max_abs_force_component_diff_kj_mol_nm": 8.185452315956354e-12,
+          "worst_atom_index": 5469,
+          "worst_component": "x",
+          "worst_atom_force_production_kj_mol_nm": [
+            2351.0379272972928,
+            -598.7691277075504,
+            1232.0554416923267
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            2351.037927297301,
+            -598.7691277075505,
+            1232.0554416923262
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "hard",
+          "forces_finite": true,
+          "force_within_tolerance": true,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "reference_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "gate2_mixed_live_vs_baked": {
+          "applicable": false,
+          "reason": "vanishing 侧每个 λ_vdw 态的 CV 是固定构造（不是运行时可设的 GlobalParameter），charging 侧在喂给 vanishing 前已被结构性烘焙——没有可比较的 live-vs-baked 对象。",
+          "passed": true
+        },
+        "gate3_mixed_production_vs_reference": {
+          "label": "D_vs_reference_gate3_mixed_production_vs_reference_frame140",
+          "e_production_kj_mol": -224771.53936149587,
+          "e_reference_kj_mol": -224771.53799076285,
+          "abs_delta_e_kj_mol": 0.0013707330217584968,
+          "rel_delta_e": 6.098338935665547e-09,
+          "max_abs_force_component_diff_kj_mol_nm": 0.020633840933442116,
+          "worst_atom_index": 10761,
+          "worst_component": "x",
+          "worst_atom_force_production_kj_mol_nm": [
+            -799.0661474326625,
+            126.90015267231502,
+            150.67119873967022
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            -799.0455135917291,
+            126.90247233957052,
+            150.67471845936961
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "diagnostic",
+          "forces_finite": true,
+          "force_within_tolerance": false,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "reference_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "strict_zero_reference": {
+          "label": "D_ligand_environment_strict_zero",
+          "e_ligand_environment_kj_mol": 0.0,
+          "max_abs_force_ligand_environment_kj_mol_nm": 0.0,
+          "abs_tol_kj_mol": 1e-06,
+          "force_abs_tol": 0.001,
+          "platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": [],
+          "passed": true
+        },
+        "strict_zero_mixed": {
+          "label": "D_ligand_environment_strict_zero",
+          "e_ligand_environment_kj_mol": 0.0,
+          "max_abs_force_ligand_environment_kj_mol_nm": 0.0,
+          "abs_tol_kj_mol": 1e-06,
+          "force_abs_tol": 0.001,
+          "platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": [],
+          "passed": true
+        },
+        "passed": true
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 0.0,
+      "dcd": "traj_state10_lam0.00.dcd",
+      "frame_index": 160,
+      "C": {
+        "gate1_reference_identity": {
+          "label": "C_seam_gate1_reference_frame160",
+          "e_production_kj_mol": -224266.6627002433,
+          "e_reference_kj_mol": -224266.83130573697,
+          "abs_delta_e_kj_mol": 0.16860549367265776,
+          "rel_delta_e": 7.518075352070338e-07,
+          "max_abs_force_component_diff_kj_mol_nm": 2.2737367544323206e-13,
+          "worst_atom_index": 14076,
+          "worst_component": "x",
+          "worst_atom_force_production_kj_mol_nm": [
+            -1155.2615859212667,
+            -667.3128768975171,
+            -503.9267434705779
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            -1155.2615859212665,
+            -667.3128768975171,
+            -503.9267434705779
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "hard",
+          "forces_finite": true,
+          "force_within_tolerance": true,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "reference_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "gate2_mixed_live_vs_baked": {
+          "applicable": false,
+          "reason": "vanishing 侧每个 λ_vdw 态的 CV 是固定构造（不是运行时可设的 GlobalParameter），charging 侧在喂给 vanishing 前已被结构性烘焙——没有可比较的 live-vs-baked 对象。",
+          "passed": true
+        },
+        "gate3_mixed_production_vs_reference": {
+          "label": "C_seam_gate3_mixed_production_vs_reference_frame160",
+          "e_production_kj_mol": -224266.6959297266,
+          "e_reference_kj_mol": -224266.86577893584,
+          "abs_delta_e_kj_mol": 0.16984920925460756,
+          "rel_delta_e": 7.573531144009083e-07,
+          "max_abs_force_component_diff_kj_mol_nm": 0.01002788357436657,
+          "worst_atom_index": 19317,
+          "worst_component": "y",
+          "worst_atom_force_production_kj_mol_nm": [
+            -807.608106264146,
+            -416.1123033436015,
+            -1852.7793567385525
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            -807.6062463996932,
+            -416.10227546002716,
+            -1852.7768701575696
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "diagnostic",
+          "forces_finite": true,
+          "force_within_tolerance": false,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "reference_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "passed": true
+      },
+      "D": {
+        "gate1_reference_identity": {
+          "label": "D_vs_reference_gate1_reference_frame160",
+          "e_production_kj_mol": -224261.4938107101,
+          "e_reference_kj_mol": -224261.4938107101,
+          "abs_delta_e_kj_mol": 0.0,
+          "rel_delta_e": 0.0,
+          "max_abs_force_component_diff_kj_mol_nm": 7.73070496506989e-12,
+          "worst_atom_index": 7972,
+          "worst_component": "x",
+          "worst_atom_force_production_kj_mol_nm": [
+            -2608.739349412546,
+            1874.828055133028,
+            478.0185154075675
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            -2608.7393494125536,
+            1874.8280551330263,
+            478.0185154075684
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "hard",
+          "forces_finite": true,
+          "force_within_tolerance": true,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "reference_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "gate2_mixed_live_vs_baked": {
+          "applicable": false,
+          "reason": "vanishing 侧每个 λ_vdw 态的 CV 是固定构造（不是运行时可设的 GlobalParameter），charging 侧在喂给 vanishing 前已被结构性烘焙——没有可比较的 live-vs-baked 对象。",
+          "passed": true
+        },
+        "gate3_mixed_production_vs_reference": {
+          "label": "D_vs_reference_gate3_mixed_production_vs_reference_frame160",
+          "e_production_kj_mol": -224261.52701955405,
+          "e_reference_kj_mol": -224261.52785269357,
+          "abs_delta_e_kj_mol": 0.0008331395220011473,
+          "rel_delta_e": 3.715035431972959e-09,
+          "max_abs_force_component_diff_kj_mol_nm": 0.03340686275623739,
+          "worst_atom_index": 21518,
+          "worst_component": "x",
+          "worst_atom_force_production_kj_mol_nm": [
+            318.20722486497834,
+            -16.40444247983396,
+            251.56772212637588
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            318.2406317277346,
+            -16.41896214801818,
+            251.56271569989622
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "diagnostic",
+          "forces_finite": true,
+          "force_within_tolerance": false,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "reference_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "strict_zero_reference": {
+          "label": "D_ligand_environment_strict_zero",
+          "e_ligand_environment_kj_mol": 0.0,
+          "max_abs_force_ligand_environment_kj_mol_nm": 0.0,
+          "abs_tol_kj_mol": 1e-06,
+          "force_abs_tol": 0.001,
+          "platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": [],
+          "passed": true
+        },
+        "strict_zero_mixed": {
+          "label": "D_ligand_environment_strict_zero",
+          "e_ligand_environment_kj_mol": 0.0,
+          "max_abs_force_ligand_environment_kj_mol_nm": 0.0,
+          "abs_tol_kj_mol": 1e-06,
+          "force_abs_tol": 0.001,
+          "platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": [],
+          "passed": true
+        },
+        "passed": true
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 0.0,
+      "dcd": "traj_state10_lam0.00.dcd",
+      "frame_index": 180,
+      "C": {
+        "gate1_reference_identity": {
+          "label": "C_seam_gate1_reference_frame180",
+          "e_production_kj_mol": -224039.33591997024,
+          "e_reference_kj_mol": -224039.50467503752,
+          "abs_delta_e_kj_mol": 0.16875506727956235,
+          "rel_delta_e": 7.532379948988749e-07,
+          "max_abs_force_component_diff_kj_mol_nm": 2.2737367544323206e-13,
+          "worst_atom_index": 11031,
+          "worst_component": "x",
+          "worst_atom_force_production_kj_mol_nm": [
+            1060.6356505614103,
+            556.7759239743204,
+            -228.00581647508037
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            1060.63565056141,
+            556.7759239743204,
+            -228.00581647508034
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "hard",
+          "forces_finite": true,
+          "force_within_tolerance": true,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "reference_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "gate2_mixed_live_vs_baked": {
+          "applicable": false,
+          "reason": "vanishing 侧每个 λ_vdw 态的 CV 是固定构造（不是运行时可设的 GlobalParameter），charging 侧在喂给 vanishing 前已被结构性烘焙——没有可比较的 live-vs-baked 对象。",
+          "passed": true
+        },
+        "gate3_mixed_production_vs_reference": {
+          "label": "C_seam_gate3_mixed_production_vs_reference_frame180",
+          "e_production_kj_mol": -224039.35797625536,
+          "e_reference_kj_mol": -224039.5258333675,
+          "abs_delta_e_kj_mol": 0.1678571121301502,
+          "rel_delta_e": 7.492299026511789e-07,
+          "max_abs_force_component_diff_kj_mol_nm": 0.012299461988732219,
+          "worst_atom_index": 16662,
+          "worst_component": "y",
+          "worst_atom_force_production_kj_mol_nm": [
+            671.1716544153169,
+            751.719775257865,
+            -2186.4355690442026
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            671.1738092023879,
+            751.7320747198537,
+            -2186.4469594541006
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "diagnostic",
+          "forces_finite": true,
+          "force_within_tolerance": false,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "reference_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "passed": true
+      },
+      "D": {
+        "gate1_reference_identity": {
+          "label": "D_vs_reference_gate1_reference_frame180",
+          "e_production_kj_mol": -224034.75122794812,
+          "e_reference_kj_mol": -224034.75122794812,
+          "abs_delta_e_kj_mol": 0.0,
+          "rel_delta_e": 0.0,
+          "max_abs_force_component_diff_kj_mol_nm": 7.275957614183426e-12,
+          "worst_atom_index": 5138,
+          "worst_component": "z",
+          "worst_atom_force_production_kj_mol_nm": [
+            1078.8098313755795,
+            1309.3678575832923,
+            2285.1474493637834
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            1078.8098313755786,
+            1309.3678575832919,
+            2285.147449363776
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "hard",
+          "forces_finite": true,
+          "force_within_tolerance": true,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "reference_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "gate2_mixed_live_vs_baked": {
+          "applicable": false,
+          "reason": "vanishing 侧每个 λ_vdw 态的 CV 是固定构造（不是运行时可设的 GlobalParameter），charging 侧在喂给 vanishing 前已被结构性烘焙——没有可比较的 live-vs-baked 对象。",
+          "passed": true
+        },
+        "gate3_mixed_production_vs_reference": {
+          "label": "D_vs_reference_gate3_mixed_production_vs_reference_frame180",
+          "e_production_kj_mol": -224034.77328750084,
+          "e_reference_kj_mol": -224034.77221712063,
+          "abs_delta_e_kj_mol": 0.0010703802108764648,
+          "rel_delta_e": 4.7777414206001855e-09,
+          "max_abs_force_component_diff_kj_mol_nm": 0.02097248542122543,
+          "worst_atom_index": 21518,
+          "worst_component": "x",
+          "worst_atom_force_production_kj_mol_nm": [
+            166.12777551473118,
+            -61.373252619057894,
+            403.31880213785917
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            166.1487480001524,
+            -61.367356818169355,
+            403.31619475595653
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "diagnostic",
+          "forces_finite": true,
+          "force_within_tolerance": false,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "reference_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "strict_zero_reference": {
+          "label": "D_ligand_environment_strict_zero",
+          "e_ligand_environment_kj_mol": 0.0,
+          "max_abs_force_ligand_environment_kj_mol_nm": 0.0,
+          "abs_tol_kj_mol": 1e-06,
+          "force_abs_tol": 0.001,
+          "platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": [],
+          "passed": true
+        },
+        "strict_zero_mixed": {
+          "label": "D_ligand_environment_strict_zero",
+          "e_ligand_environment_kj_mol": 0.0,
+          "max_abs_force_ligand_environment_kj_mol_nm": 0.0,
+          "abs_tol_kj_mol": 1e-06,
+          "force_abs_tol": 0.001,
+          "platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": [],
+          "passed": true
+        },
+        "passed": true
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 0.0,
+      "dcd": "traj_state10_lam0.00.dcd",
+      "frame_index": 199,
+      "C": {
+        "gate1_reference_identity": {
+          "label": "C_seam_gate1_reference_frame199",
+          "e_production_kj_mol": -224254.10107298632,
+          "e_reference_kj_mol": -224254.27015314705,
+          "abs_delta_e_kj_mol": 0.1690801607328467,
+          "rel_delta_e": 7.539662928932367e-07,
+          "max_abs_force_component_diff_kj_mol_nm": 3.694822225952521e-13,
+          "worst_atom_index": 16761,
+          "worst_component": "x",
+          "worst_atom_force_production_kj_mol_nm": [
+            196.18108321502834,
+            273.24572631615524,
+            -756.6658529763573
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            196.1810832150287,
+            273.245726316155,
+            -756.6658529763574
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "hard",
+          "forces_finite": true,
+          "force_within_tolerance": true,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "reference_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "gate2_mixed_live_vs_baked": {
+          "applicable": false,
+          "reason": "vanishing 侧每个 λ_vdw 态的 CV 是固定构造（不是运行时可设的 GlobalParameter），charging 侧在喂给 vanishing 前已被结构性烘焙——没有可比较的 live-vs-baked 对象。",
+          "passed": true
+        },
+        "gate3_mixed_production_vs_reference": {
+          "label": "C_seam_gate3_mixed_production_vs_reference_frame199",
+          "e_production_kj_mol": -224254.11817074427,
+          "e_reference_kj_mol": -224254.2893059873,
+          "abs_delta_e_kj_mol": 0.17113524302840233,
+          "rel_delta_e": 7.631302997950427e-07,
+          "max_abs_force_component_diff_kj_mol_nm": 0.02283201110549271,
+          "worst_atom_index": 4233,
+          "worst_component": "x",
+          "worst_atom_force_production_kj_mol_nm": [
+            -710.4456059751101,
+            523.8668472683057,
+            136.933485458605
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            -710.4227739640046,
+            523.870433895383,
+            136.9296521623619
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "diagnostic",
+          "forces_finite": true,
+          "force_within_tolerance": false,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "reference_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "passed": true
+      },
+      "D": {
+        "gate1_reference_identity": {
+          "label": "D_vs_reference_gate1_reference_frame199",
+          "e_production_kj_mol": -224253.1987569718,
+          "e_reference_kj_mol": -224253.19875697183,
+          "abs_delta_e_kj_mol": 2.9103830456733704e-11,
+          "rel_delta_e": 1.2978111624741715e-16,
+          "max_abs_force_component_diff_kj_mol_nm": 1.1368683772161603e-11,
+          "worst_atom_index": 4814,
+          "worst_component": "z",
+          "worst_atom_force_production_kj_mol_nm": [
+            -273.30240419132025,
+            -241.92416050739408,
+            -2685.8548854410433
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            -273.3024041913203,
+            -241.92416050739334,
+            -2685.8548854410546
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "hard",
+          "forces_finite": true,
+          "force_within_tolerance": true,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "reference_platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "gate2_mixed_live_vs_baked": {
+          "applicable": false,
+          "reason": "vanishing 侧每个 λ_vdw 态的 CV 是固定构造（不是运行时可设的 GlobalParameter），charging 侧在喂给 vanishing 前已被结构性烘焙——没有可比较的 live-vs-baked 对象。",
+          "passed": true
+        },
+        "gate3_mixed_production_vs_reference": {
+          "label": "D_vs_reference_gate3_mixed_production_vs_reference_frame199",
+          "e_production_kj_mol": -224253.21585320146,
+          "e_reference_kj_mol": -224253.21806212293,
+          "abs_delta_e_kj_mol": 0.002208921476267278,
+          "rel_delta_e": 9.850121640864747e-09,
+          "max_abs_force_component_diff_kj_mol_nm": 0.024162797024473548,
+          "worst_atom_index": 21518,
+          "worst_component": "x",
+          "worst_atom_force_production_kj_mol_nm": [
+            -106.82546274829656,
+            -109.48541932622902,
+            -25.23834979441017
+          ],
+          "worst_atom_force_reference_kj_mol_nm": [
+            -106.80129995127209,
+            -109.4868557062,
+            -25.2426566677168
+          ],
+          "energy_rel_tol": 1e-05,
+          "force_abs_tol": 0.001,
+          "force_gate_mode": "diagnostic",
+          "forces_finite": true,
+          "force_within_tolerance": false,
+          "passed": true,
+          "production_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "reference_platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": []
+        },
+        "strict_zero_reference": {
+          "label": "D_ligand_environment_strict_zero",
+          "e_ligand_environment_kj_mol": 0.0,
+          "max_abs_force_ligand_environment_kj_mol_nm": 0.0,
+          "abs_tol_kj_mol": 1e-06,
+          "force_abs_tol": 0.001,
+          "platform_info": {
+            "platform_requested": "Reference",
+            "platform_resolved": "Reference",
+            "properties_requested": {},
+            "properties_resolved": {}
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": [],
+          "passed": true
+        },
+        "strict_zero_mixed": {
+          "label": "D_ligand_environment_strict_zero",
+          "e_ligand_environment_kj_mol": 0.0,
+          "max_abs_force_ligand_environment_kj_mol_nm": 0.0,
+          "abs_tol_kj_mol": 1e-06,
+          "force_abs_tol": 0.001,
+          "platform_info": {
+            "platform_requested": "CUDA",
+            "platform_resolved": "CUDA",
+            "properties_requested": {
+              "Precision": "mixed"
+            },
+            "properties_resolved": {
+              "Precision": "mixed"
+            }
+          },
+          "platform_verified": true,
+          "platform_mismatch_reasons": [],
+          "passed": true
+        },
+        "passed": true
+      },
+      "passed": true
+    }
+  ],
+  "passed": true
+}

@@ -1,0 +1,2856 @@
+{
+  "case_dir": "validation/c2_lipid_slab_v11/Na_thin_pos1",
+  "protocol_version": 2,
+  "lambda_name": "lam_coul",
+  "reference_platform_name": "Reference",
+  "mixed_platform_name": "CUDA",
+  "mixed_platform_properties": {
+    "Precision": "mixed"
+  },
+  "n_frames": 20,
+  "n_failed": 0,
+  "failed_frames": [],
+  "frames": [
+    {
+      "lambda_coul": 1.0,
+      "dcd": "traj_state00_lam1.00.dcd",
+      "frame_index": 10,
+      "gate1_reference_identity": {
+        "label": "gate1_reference_identity_lambda=1.0_frame10",
+        "e_production_kj_mol": -223916.02646215414,
+        "e_reference_kj_mol": -223916.02646215414,
+        "abs_delta_e_kj_mol": 0.0,
+        "rel_delta_e": 0.0,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0,
+        "worst_atom_index": 0,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          563.6026816757692,
+          910.8265552705203,
+          -494.13141819462675
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          563.6026816757692,
+          910.8265552705203,
+          -494.13141819462675
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "reference_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate2_mixed_live_vs_baked": {
+        "label": "gate2_mixed_live_vs_baked_lambda=1.0_frame10",
+        "e_production_kj_mol": -223915.97311459403,
+        "e_reference_kj_mol": -223916.00173934526,
+        "abs_delta_e_kj_mol": 0.028624751226743683,
+        "rel_delta_e": 1.2783700586108628e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0002346038818359375,
+        "worst_atom_index": 17466,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          1177.6456230748445,
+          57.29290468618274,
+          -10.877755258232355
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          1177.6453884709626,
+          57.29294664785266,
+          -10.877762649208307
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate3_mixed_production_vs_reference": {
+        "label": "gate3_mixed_production_vs_reference_lambda=1.0_frame10",
+        "e_production_kj_mol": -223915.97311132407,
+        "e_reference_kj_mol": -223916.00164202636,
+        "abs_delta_e_kj_mol": 0.02853070228593424,
+        "rel_delta_e": 1.2741698706975913e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.000537872314453125,
+        "worst_atom_index": 13584,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          -1164.8090278618038,
+          536.6089170910418,
+          -1587.4955388084054
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -1164.8084899894893,
+          536.6092184521258,
+          -1587.4954033866525
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "diagnostic",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 1.0,
+      "dcd": "traj_state00_lam1.00.dcd",
+      "frame_index": 20,
+      "gate1_reference_identity": {
+        "label": "gate1_reference_identity_lambda=1.0_frame20",
+        "e_production_kj_mol": -223840.2289775309,
+        "e_reference_kj_mol": -223840.2289775309,
+        "abs_delta_e_kj_mol": 0.0,
+        "rel_delta_e": 0.0,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0,
+        "worst_atom_index": 0,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          -187.878887557836,
+          106.54929102437991,
+          -435.4092678134597
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -187.878887557836,
+          106.54929102437991,
+          -435.4092678134597
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "reference_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate2_mixed_live_vs_baked": {
+        "label": "gate2_mixed_live_vs_baked_lambda=1.0_frame20",
+        "e_production_kj_mol": -223840.2055084838,
+        "e_reference_kj_mol": -223840.2340882026,
+        "abs_delta_e_kj_mol": 0.028579718782566488,
+        "rel_delta_e": 1.2767909620441543e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.00022125244140625,
+        "worst_atom_index": 2470,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          -1017.6743614124134,
+          764.7879137776326,
+          1861.0852450281382
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -1017.674140159972,
+          764.7878527424764,
+          1861.0853823572397
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate3_mixed_production_vs_reference": {
+        "label": "gate3_mixed_production_vs_reference_lambda=1.0_frame20",
+        "e_production_kj_mol": -223840.20546329807,
+        "e_reference_kj_mol": -223840.2339202785,
+        "abs_delta_e_kj_mol": 0.028456980420742184,
+        "rel_delta_e": 1.2713076609309316e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0009024534374475479,
+        "worst_atom_index": 21517,
+        "worst_component": "y",
+        "worst_atom_force_production_kj_mol_nm": [
+          150.64633307605982,
+          -175.69995641335845,
+          396.55492777377367
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          150.64631808176637,
+          -175.699053959921,
+          396.55439431220293
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "diagnostic",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 1.0,
+      "dcd": "traj_state00_lam1.00.dcd",
+      "frame_index": 30,
+      "gate1_reference_identity": {
+        "label": "gate1_reference_identity_lambda=1.0_frame30",
+        "e_production_kj_mol": -224064.76214095185,
+        "e_reference_kj_mol": -224064.76214095185,
+        "abs_delta_e_kj_mol": 0.0,
+        "rel_delta_e": 0.0,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0,
+        "worst_atom_index": 0,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          1132.3966933794115,
+          -508.87782365256044,
+          846.6002126248884
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          1132.3966933794115,
+          -508.87782365256044,
+          846.6002126248884
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "reference_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate2_mixed_live_vs_baked": {
+        "label": "gate2_mixed_live_vs_baked_lambda=1.0_frame30",
+        "e_production_kj_mol": -224064.7506037585,
+        "e_reference_kj_mol": -224064.7793443274,
+        "abs_delta_e_kj_mol": 0.02874056890141219,
+        "rel_delta_e": 1.2826901660097882e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.000225067138671875,
+        "worst_atom_index": 7952,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          42.265716006513685,
+          -2380.5980461118743,
+          -1749.7610420989804
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          42.26594107365236,
+          -2380.597970294766,
+          -1749.7609886932187
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate3_mixed_production_vs_reference": {
+        "label": "gate3_mixed_production_vs_reference_lambda=1.0_frame30",
+        "e_production_kj_mol": -224064.75062786942,
+        "e_reference_kj_mol": -224064.77925571054,
+        "abs_delta_e_kj_mol": 0.028627841122215614,
+        "rel_delta_e": 1.2776591313150794e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0009563229978084564,
+        "worst_atom_index": 21517,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          97.41681993054226,
+          -417.38066083937883,
+          -106.30223332648166
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          97.41586360754445,
+          -417.380661140196,
+          -106.30196103756316
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "diagnostic",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 1.0,
+      "dcd": "traj_state00_lam1.00.dcd",
+      "frame_index": 40,
+      "gate1_reference_identity": {
+        "label": "gate1_reference_identity_lambda=1.0_frame40",
+        "e_production_kj_mol": -224029.83662626255,
+        "e_reference_kj_mol": -224029.83662626255,
+        "abs_delta_e_kj_mol": 0.0,
+        "rel_delta_e": 0.0,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0,
+        "worst_atom_index": 0,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          -587.5528569203947,
+          348.53487002685347,
+          285.67776980105316
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -587.5528569203947,
+          348.53487002685347,
+          285.67776980105316
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "reference_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate2_mixed_live_vs_baked": {
+        "label": "gate2_mixed_live_vs_baked_lambda=1.0_frame40",
+        "e_production_kj_mol": -224029.78489116768,
+        "e_reference_kj_mol": -224029.8135564382,
+        "abs_delta_e_kj_mol": 0.028665270510828122,
+        "rel_delta_e": 1.2795292758482205e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0001773834228515625,
+        "worst_atom_index": 21063,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          139.67648595012724,
+          -605.6189076411538,
+          -633.2602345524356
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          139.6763085667044,
+          -605.6189410197549,
+          -633.2602574406192
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate3_mixed_production_vs_reference": {
+        "label": "gate3_mixed_production_vs_reference_lambda=1.0_frame40",
+        "e_production_kj_mol": -224029.7848096193,
+        "e_reference_kj_mol": -224029.81353815133,
+        "abs_delta_e_kj_mol": 0.02872853202279657,
+        "rel_delta_e": 1.282353074757357e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0009136199951171875,
+        "worst_atom_index": 17313,
+        "worst_component": "z",
+        "worst_atom_force_production_kj_mol_nm": [
+          253.57335566170514,
+          -1320.9166982604656,
+          -1084.6742974622175
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          253.57408999092877,
+          -1320.9168737365399,
+          -1084.6752110822126
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "diagnostic",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 1.0,
+      "dcd": "traj_state00_lam1.00.dcd",
+      "frame_index": 50,
+      "gate1_reference_identity": {
+        "label": "gate1_reference_identity_lambda=1.0_frame50",
+        "e_production_kj_mol": -224014.63618622973,
+        "e_reference_kj_mol": -224014.63618622973,
+        "abs_delta_e_kj_mol": 0.0,
+        "rel_delta_e": 0.0,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0,
+        "worst_atom_index": 0,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          779.677436249319,
+          -884.0646604388708,
+          -416.3632091813905
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          779.677436249319,
+          -884.0646604388708,
+          -416.3632091813905
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "reference_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate2_mixed_live_vs_baked": {
+        "label": "gate2_mixed_live_vs_baked_lambda=1.0_frame50",
+        "e_production_kj_mol": -224014.59794108814,
+        "e_reference_kj_mol": -224014.62659427885,
+        "abs_delta_e_kj_mol": 0.02865319070406258,
+        "rel_delta_e": 1.2790767790336046e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.00017547607421875,
+        "worst_atom_index": 6892,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          72.11240989528596,
+          132.1045679114759,
+          1211.5014894418418
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          72.11258537136018,
+          132.1045735143125,
+          1211.5014856271446
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate3_mixed_production_vs_reference": {
+        "label": "gate3_mixed_production_vs_reference_lambda=1.0_frame50",
+        "e_production_kj_mol": -224014.59799493322,
+        "e_reference_kj_mol": -224014.6266588061,
+        "abs_delta_e_kj_mol": 0.02866387288668193,
+        "rel_delta_e": 1.2795536306805322e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0002644583582878113,
+        "worst_atom_index": 21517,
+        "worst_component": "z",
+        "worst_atom_force_production_kj_mol_nm": [
+          -652.2242094660178,
+          -45.51988410297781,
+          -244.06911723595113
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -652.2242229143158,
+          -45.51993871573359,
+          -244.0693816943094
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "diagnostic",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 1.0,
+      "dcd": "traj_state00_lam1.00.dcd",
+      "frame_index": 60,
+      "gate1_reference_identity": {
+        "label": "gate1_reference_identity_lambda=1.0_frame60",
+        "e_production_kj_mol": -223696.96446633764,
+        "e_reference_kj_mol": -223696.96446633764,
+        "abs_delta_e_kj_mol": 0.0,
+        "rel_delta_e": 0.0,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0,
+        "worst_atom_index": 0,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          -556.6479358249744,
+          486.64642363869416,
+          -879.4484061739987
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -556.6479358249744,
+          486.64642363869416,
+          -879.4484061739987
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "reference_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate2_mixed_live_vs_baked": {
+        "label": "gate2_mixed_live_vs_baked_lambda=1.0_frame60",
+        "e_production_kj_mol": -223696.99301258818,
+        "e_reference_kj_mol": -223697.0216457293,
+        "abs_delta_e_kj_mol": 0.028633141133468598,
+        "rel_delta_e": 1.279996529359927e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0001983642578125,
+        "worst_atom_index": 9170,
+        "worst_component": "z",
+        "worst_atom_force_production_kj_mol_nm": [
+          3363.70566579164,
+          635.7498806174845,
+          582.4291235562414
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          3363.7056429034565,
+          635.7498806174845,
+          582.4289251919836
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate3_mixed_production_vs_reference": {
+        "label": "gate3_mixed_production_vs_reference_lambda=1.0_frame60",
+        "e_production_kj_mol": -223696.99300029795,
+        "e_reference_kj_mol": -223697.0215698519,
+        "abs_delta_e_kj_mol": 0.02856955394963734,
+        "rel_delta_e": 1.2771539714361453e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0010995585471391678,
+        "worst_atom_index": 21517,
+        "worst_component": "y",
+        "worst_atom_force_production_kj_mol_nm": [
+          -382.60622552689165,
+          627.788058757782,
+          -69.6039878949523
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -382.60584272723645,
+          627.7891583163291,
+          -69.60420650988817
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "diagnostic",
+        "forces_finite": true,
+        "force_within_tolerance": false,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 1.0,
+      "dcd": "traj_state00_lam1.00.dcd",
+      "frame_index": 70,
+      "gate1_reference_identity": {
+        "label": "gate1_reference_identity_lambda=1.0_frame70",
+        "e_production_kj_mol": -224054.04098243226,
+        "e_reference_kj_mol": -224054.04098243226,
+        "abs_delta_e_kj_mol": 0.0,
+        "rel_delta_e": 0.0,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0,
+        "worst_atom_index": 0,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          622.7885068183718,
+          418.53129316893677,
+          -255.3172694421464
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          622.7885068183718,
+          418.53129316893677,
+          -255.3172694421464
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "reference_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate2_mixed_live_vs_baked": {
+        "label": "gate2_mixed_live_vs_baked_lambda=1.0_frame70",
+        "e_production_kj_mol": -224053.97341708833,
+        "e_reference_kj_mol": -224054.00216066418,
+        "abs_delta_e_kj_mol": 0.028743575850967318,
+        "rel_delta_e": 1.2828860709373062e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0002465248107910156,
+        "worst_atom_index": 1934,
+        "worst_component": "z",
+        "worst_atom_force_production_kj_mol_nm": [
+          152.2613069168292,
+          -586.7268976457417,
+          2673.5062609715387
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          152.26136795198545,
+          -586.7269663102925,
+          2673.506014446728
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate3_mixed_production_vs_reference": {
+        "label": "gate3_mixed_production_vs_reference_lambda=1.0_frame70",
+        "e_production_kj_mol": -224053.97347291684,
+        "e_reference_kj_mol": -224054.0021096418,
+        "abs_delta_e_kj_mol": 0.02863672495004721,
+        "rel_delta_e": 1.2781170914337744e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.00043905642814934254,
+        "worst_atom_index": 21517,
+        "worst_component": "y",
+        "worst_atom_force_production_kj_mol_nm": [
+          739.0929306671023,
+          209.36442720447667,
+          -20.681074395542964
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          739.0931903477758,
+          209.36398814804852,
+          -20.681509479647502
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "diagnostic",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 1.0,
+      "dcd": "traj_state00_lam1.00.dcd",
+      "frame_index": 80,
+      "gate1_reference_identity": {
+        "label": "gate1_reference_identity_lambda=1.0_frame80",
+        "e_production_kj_mol": -223356.2036337548,
+        "e_reference_kj_mol": -223356.2036337548,
+        "abs_delta_e_kj_mol": 0.0,
+        "rel_delta_e": 0.0,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0,
+        "worst_atom_index": 0,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          -1259.7031053557707,
+          -20.35768851211052,
+          -77.13036960510753
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -1259.7031053557707,
+          -20.35768851211052,
+          -77.13036960510753
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "reference_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate2_mixed_live_vs_baked": {
+        "label": "gate2_mixed_live_vs_baked_lambda=1.0_frame80",
+        "e_production_kj_mol": -223356.1591761947,
+        "e_reference_kj_mol": -223356.18791464588,
+        "abs_delta_e_kj_mol": 0.028738451190292835,
+        "rel_delta_e": 1.2866646524821174e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0001888275146484375,
+        "worst_atom_index": 15843,
+        "worst_component": "z",
+        "worst_atom_force_production_kj_mol_nm": [
+          908.2996259815991,
+          577.6573184537701,
+          594.9252862809226
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          908.2995973713696,
+          577.6572917508893,
+          594.925097453408
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate3_mixed_production_vs_reference": {
+        "label": "gate3_mixed_production_vs_reference_lambda=1.0_frame80",
+        "e_production_kj_mol": -223356.1592633893,
+        "e_reference_kj_mol": -223356.18775135337,
+        "abs_delta_e_kj_mol": 0.028487964067608118,
+        "rel_delta_e": 1.275449959744198e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.008730256231501698,
+        "worst_atom_index": 21517,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          445.10843725386076,
+          23.062540596351027,
+          -474.67146740527824
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          445.09970699762926,
+          23.061085540801287,
+          -474.6713157836348
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "diagnostic",
+        "forces_finite": true,
+        "force_within_tolerance": false,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 1.0,
+      "dcd": "traj_state00_lam1.00.dcd",
+      "frame_index": 90,
+      "gate1_reference_identity": {
+        "label": "gate1_reference_identity_lambda=1.0_frame90",
+        "e_production_kj_mol": -224642.77020630823,
+        "e_reference_kj_mol": -224642.77020630823,
+        "abs_delta_e_kj_mol": 0.0,
+        "rel_delta_e": 0.0,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0,
+        "worst_atom_index": 0,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          -170.9506584657348,
+          -283.30238365335174,
+          -730.4766218218839
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -170.9506584657348,
+          -283.30238365335174,
+          -730.4766218218839
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "reference_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate2_mixed_live_vs_baked": {
+        "label": "gate2_mixed_live_vs_baked_lambda=1.0_frame90",
+        "e_production_kj_mol": -224642.74952316293,
+        "e_reference_kj_mol": -224642.77809780324,
+        "abs_delta_e_kj_mol": 0.02857464030967094,
+        "rel_delta_e": 1.2720035138289794e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.000209808349609375,
+        "worst_atom_index": 12615,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          429.684408060275,
+          -732.2229586634785,
+          -1390.3902004361153
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          429.6846178686246,
+          -732.2229128871113,
+          -1390.3902233242989
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate3_mixed_production_vs_reference": {
+        "label": "gate3_mixed_production_vs_reference_lambda=1.0_frame90",
+        "e_production_kj_mol": -224642.74953033353,
+        "e_reference_kj_mol": -224642.77813123434,
+        "abs_delta_e_kj_mol": 0.028600900812307373,
+        "rel_delta_e": 1.2731725030394246e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0007605738937854767,
+        "worst_atom_index": 21518,
+        "worst_component": "y",
+        "worst_atom_force_production_kj_mol_nm": [
+          14.309500215575099,
+          -23.348905268823728,
+          44.920867739245296
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          14.309341940563172,
+          -23.348144694929942,
+          44.9208681252785
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "diagnostic",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 1.0,
+      "dcd": "traj_state00_lam1.00.dcd",
+      "frame_index": 99,
+      "gate1_reference_identity": {
+        "label": "gate1_reference_identity_lambda=1.0_frame99",
+        "e_production_kj_mol": -224349.50004858384,
+        "e_reference_kj_mol": -224349.50004858384,
+        "abs_delta_e_kj_mol": 0.0,
+        "rel_delta_e": 0.0,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0,
+        "worst_atom_index": 0,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          758.3162018837156,
+          397.8290102402414,
+          850.3199211671622
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          758.3162018837156,
+          397.8290102402414,
+          850.3199211671622
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "reference_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate2_mixed_live_vs_baked": {
+        "label": "gate2_mixed_live_vs_baked_lambda=1.0_frame99",
+        "e_production_kj_mol": -224349.50750553407,
+        "e_reference_kj_mol": -224349.53619805456,
+        "abs_delta_e_kj_mol": 0.028692520485492423,
+        "rel_delta_e": 1.2789204279951272e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0001850128173828125,
+        "worst_atom_index": 14466,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          -72.11940539535135,
+          1293.378440456232,
+          306.00430713035166
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -72.11959040816873,
+          1293.378467159113,
+          306.004326203838
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate3_mixed_production_vs_reference": {
+        "label": "gate3_mixed_production_vs_reference_lambda=1.0_frame99",
+        "e_production_kj_mol": -224349.5075458233,
+        "e_reference_kj_mol": -224349.53582378617,
+        "abs_delta_e_kj_mol": 0.028277962876018137,
+        "rel_delta_e": 1.260442227891609e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.00878218188881874,
+        "worst_atom_index": 21517,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          -16.53212359175086,
+          20.59139370173216,
+          33.35385814495385
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -16.52334140986204,
+          20.592962201684713,
+          33.35569656081498
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "diagnostic",
+        "forces_finite": true,
+        "force_within_tolerance": false,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 0.0,
+      "dcd": "traj_state10_lam0.00.dcd",
+      "frame_index": 20,
+      "gate1_reference_identity": {
+        "label": "gate1_reference_identity_lambda=0.0_frame20",
+        "e_production_kj_mol": -224343.23614322464,
+        "e_reference_kj_mol": -224343.23614322464,
+        "abs_delta_e_kj_mol": 0.0,
+        "rel_delta_e": 0.0,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0,
+        "worst_atom_index": 0,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          143.46939782814724,
+          524.1548096305701,
+          -954.920754816256
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          143.46939782814724,
+          524.1548096305701,
+          -954.920754816256
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "reference_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate2_mixed_live_vs_baked": {
+        "label": "gate2_mixed_live_vs_baked_lambda=0.0_frame20",
+        "e_production_kj_mol": -224343.24886190603,
+        "e_reference_kj_mol": -224343.2775360957,
+        "abs_delta_e_kj_mol": 0.028674189670709893,
+        "rel_delta_e": 1.2781390191687986e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.000209808349609375,
+        "worst_atom_index": 17796,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          -1014.2406097054482,
+          -790.8654524004087,
+          879.2803865717724
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -1014.2408195137978,
+          -790.8654752885923,
+          879.2804285334423
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate3_mixed_production_vs_reference": {
+        "label": "gate3_mixed_production_vs_reference_lambda=0.0_frame20",
+        "e_production_kj_mol": -224343.2488508028,
+        "e_reference_kj_mol": -224343.27741701913,
+        "abs_delta_e_kj_mol": 0.02856621632236056,
+        "rel_delta_e": 1.2733261567388276e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0018364540301263332,
+        "worst_atom_index": 21517,
+        "worst_component": "z",
+        "worst_atom_force_production_kj_mol_nm": [
+          -7.083593314513564,
+          -32.15154042001814,
+          -97.2124007428065
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -7.084482883801684,
+          -32.15180018940009,
+          -97.21423719683662
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "diagnostic",
+        "forces_finite": true,
+        "force_within_tolerance": false,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 0.0,
+      "dcd": "traj_state10_lam0.00.dcd",
+      "frame_index": 40,
+      "gate1_reference_identity": {
+        "label": "gate1_reference_identity_lambda=0.0_frame40",
+        "e_production_kj_mol": -223666.56247123473,
+        "e_reference_kj_mol": -223666.56247123473,
+        "abs_delta_e_kj_mol": 0.0,
+        "rel_delta_e": 0.0,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0,
+        "worst_atom_index": 0,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          -641.5138378747359,
+          1290.407880075378,
+          -954.5506386348604
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -641.5138378747359,
+          1290.407880075378,
+          -954.5506386348604
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "reference_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate2_mixed_live_vs_baked": {
+        "label": "gate2_mixed_live_vs_baked_lambda=0.0_frame40",
+        "e_production_kj_mol": -223666.4865071951,
+        "e_reference_kj_mol": -223666.51507968595,
+        "abs_delta_e_kj_mol": 0.028572490846272558,
+        "rel_delta_e": 1.277459472916319e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0002593994140625,
+        "worst_atom_index": 9036,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          2054.7674391982146,
+          -220.44323120685294,
+          1620.3689406244084
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          2054.7671797988005,
+          -220.44322310062125,
+          1620.368948253803
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate3_mixed_production_vs_reference": {
+        "label": "gate3_mixed_production_vs_reference_lambda=0.0_frame40",
+        "e_production_kj_mol": -223666.4865307079,
+        "e_reference_kj_mol": -223666.51517809066,
+        "abs_delta_e_kj_mol": 0.028647382772760466,
+        "rel_delta_e": 1.2808078468943138e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.00022602081298828125,
+        "worst_atom_index": 19278,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          394.03766570426524,
+          -654.8259974420071,
+          116.71274436358362
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          394.03743968345225,
+          -654.8261490762234,
+          116.71291030291468
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "diagnostic",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 0.0,
+      "dcd": "traj_state10_lam0.00.dcd",
+      "frame_index": 60,
+      "gate1_reference_identity": {
+        "label": "gate1_reference_identity_lambda=0.0_frame60",
+        "e_production_kj_mol": -224350.25405130986,
+        "e_reference_kj_mol": -224350.25405130986,
+        "abs_delta_e_kj_mol": 0.0,
+        "rel_delta_e": 0.0,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0,
+        "worst_atom_index": 0,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          -2279.280666682043,
+          -102.32937363385878,
+          1251.8607689050868
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -2279.280666682043,
+          -102.32937363385878,
+          1251.8607689050868
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "reference_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate2_mixed_live_vs_baked": {
+        "label": "gate2_mixed_live_vs_baked_lambda=0.0_frame60",
+        "e_production_kj_mol": -224350.23438918195,
+        "e_reference_kj_mol": -224350.26301629737,
+        "abs_delta_e_kj_mol": 0.028627115418203175,
+        "rel_delta_e": 1.2760009742499668e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.00020599365234375,
+        "worst_atom_index": 17532,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          -640.2211730999406,
+          2025.8907762255985,
+          -494.36960220802575
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -640.2209671062883,
+          2025.8907762255985,
+          -494.36957931984216
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate3_mixed_production_vs_reference": {
+        "label": "gate3_mixed_production_vs_reference_lambda=0.0_frame60",
+        "e_production_kj_mol": -224350.2343608596,
+        "e_reference_kj_mol": -224350.26296235144,
+        "abs_delta_e_kj_mol": 0.028601491823792458,
+        "rel_delta_e": 1.2748588500024232e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.00024700164794921875,
+        "worst_atom_index": 10742,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          43.28127439552918,
+          22.994792379438877,
+          480.630488996394
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          43.28102739388123,
+          22.994761861860752,
+          480.6305676745251
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "diagnostic",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 0.0,
+      "dcd": "traj_state10_lam0.00.dcd",
+      "frame_index": 80,
+      "gate1_reference_identity": {
+        "label": "gate1_reference_identity_lambda=0.0_frame80",
+        "e_production_kj_mol": -223837.7330274554,
+        "e_reference_kj_mol": -223837.7330274554,
+        "abs_delta_e_kj_mol": 0.0,
+        "rel_delta_e": 0.0,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0,
+        "worst_atom_index": 0,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          190.39543808675296,
+          293.78573609956965,
+          204.38256135069645
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          190.39543808675296,
+          293.78573609956965,
+          204.38256135069645
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "reference_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate2_mixed_live_vs_baked": {
+        "label": "gate2_mixed_live_vs_baked_lambda=0.0_frame80",
+        "e_production_kj_mol": -223837.71795285522,
+        "e_reference_kj_mol": -223837.74651576346,
+        "abs_delta_e_kj_mol": 0.028562908235471696,
+        "rel_delta_e": 1.2760541365376994e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.00019168853759765625,
+        "worst_atom_index": 20439,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          396.34282908495516,
+          67.22352882102132,
+          -653.6819537468255
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          396.34302077349275,
+          67.22353764250875,
+          -653.6819537468255
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate3_mixed_production_vs_reference": {
+        "label": "gate3_mixed_production_vs_reference_lambda=0.0_frame80",
+        "e_production_kj_mol": -223837.71791374692,
+        "e_reference_kj_mol": -223837.74655475526,
+        "abs_delta_e_kj_mol": 0.02864100833539851,
+        "rel_delta_e": 1.279543275262215e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0002593994140625,
+        "worst_atom_index": 7294,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          -616.7807900612243,
+          1389.472184118582,
+          1452.7532926183194
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -616.7805306618102,
+          1389.4721292823087,
+          1452.753185806796
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "diagnostic",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 0.0,
+      "dcd": "traj_state10_lam0.00.dcd",
+      "frame_index": 100,
+      "gate1_reference_identity": {
+        "label": "gate1_reference_identity_lambda=0.0_frame100",
+        "e_production_kj_mol": -224898.51625641313,
+        "e_reference_kj_mol": -224898.51625641313,
+        "abs_delta_e_kj_mol": 0.0,
+        "rel_delta_e": 0.0,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0,
+        "worst_atom_index": 0,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          -605.0066115815762,
+          -602.6574660025105,
+          -756.0969767732809
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -605.0066115815762,
+          -602.6574660025105,
+          -756.0969767732809
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "reference_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate2_mixed_live_vs_baked": {
+        "label": "gate2_mixed_live_vs_baked_lambda=0.0_frame100",
+        "e_production_kj_mol": -224898.5323567283,
+        "e_reference_kj_mol": -224898.5610098926,
+        "abs_delta_e_kj_mol": 0.028653164306888357,
+        "rel_delta_e": 1.274048361102141e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0001926422119140625,
+        "worst_atom_index": 11325,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          -1057.6232672464103,
+          1179.5539847537875,
+          708.4261949462816
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -1057.6230746041983,
+          1179.5539857074618,
+          708.4261920852587
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate3_mixed_production_vs_reference": {
+        "label": "gate3_mixed_production_vs_reference_lambda=0.0_frame100",
+        "e_production_kj_mol": -224898.5323055472,
+        "e_reference_kj_mol": -224898.56101334176,
+        "abs_delta_e_kj_mol": 0.028707794554065913,
+        "rel_delta_e": 1.2764774672063317e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.00052642822265625,
+        "worst_atom_index": 20541,
+        "worst_component": "z",
+        "worst_atom_force_production_kj_mol_nm": [
+          337.4710564389825,
+          497.80853458307683,
+          260.0524902269244
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          337.4712137952447,
+          497.8083858098835,
+          260.0530166551471
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "diagnostic",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 0.0,
+      "dcd": "traj_state10_lam0.00.dcd",
+      "frame_index": 120,
+      "gate1_reference_identity": {
+        "label": "gate1_reference_identity_lambda=0.0_frame120",
+        "e_production_kj_mol": -224516.32283183385,
+        "e_reference_kj_mol": -224516.32283183385,
+        "abs_delta_e_kj_mol": 0.0,
+        "rel_delta_e": 0.0,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0,
+        "worst_atom_index": 0,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          115.86419679814318,
+          -486.2606523575437,
+          -232.75628905161892
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          115.86419679814318,
+          -486.2606523575437,
+          -232.75628905161892
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "reference_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate2_mixed_live_vs_baked": {
+        "label": "gate2_mixed_live_vs_baked_lambda=0.0_frame120",
+        "e_production_kj_mol": -224516.26480136398,
+        "e_reference_kj_mol": -224516.2933977485,
+        "abs_delta_e_kj_mol": 0.028596384509000927,
+        "rel_delta_e": 1.273688607460669e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.000244140625,
+        "worst_atom_index": 19425,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          535.78093831148,
+          -457.6985900970176,
+          -1394.0440925210714
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          535.781182452105,
+          -457.69860535580665,
+          -1394.0441411584616
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate3_mixed_production_vs_reference": {
+        "label": "gate3_mixed_production_vs_reference_lambda=0.0_frame120",
+        "e_production_kj_mol": -224516.26471782767,
+        "e_reference_kj_mol": -224516.29319432867,
+        "abs_delta_e_kj_mol": 0.028476501000113785,
+        "rel_delta_e": 1.2683489734736592e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.018221868202090263,
+        "worst_atom_index": 21518,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          906.0467251907103,
+          264.0837233494967,
+          -889.516277654795
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          906.0649470589124,
+          264.0836556199938,
+          -889.5250624367036
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "diagnostic",
+        "forces_finite": true,
+        "force_within_tolerance": false,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 0.0,
+      "dcd": "traj_state10_lam0.00.dcd",
+      "frame_index": 140,
+      "gate1_reference_identity": {
+        "label": "gate1_reference_identity_lambda=0.0_frame140",
+        "e_production_kj_mol": -224270.19793661067,
+        "e_reference_kj_mol": -224270.19793661067,
+        "abs_delta_e_kj_mol": 0.0,
+        "rel_delta_e": 0.0,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0,
+        "worst_atom_index": 0,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          -147.32865641210628,
+          -893.021219472905,
+          27.981257871345214
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -147.32865641210628,
+          -893.021219472905,
+          27.981257871345214
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "reference_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate2_mixed_live_vs_baked": {
+        "label": "gate2_mixed_live_vs_baked_lambda=0.0_frame140",
+        "e_production_kj_mol": -224270.24379431145,
+        "e_reference_kj_mol": -224270.272402836,
+        "abs_delta_e_kj_mol": 0.028608524560695514,
+        "rel_delta_e": 1.2756271374794008e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.000194549560546875,
+        "worst_atom_index": 4480,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          509.10343326674774,
+          541.2462737620808,
+          -710.216241936665
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          509.1032387171872,
+          541.2461593211628,
+          -710.2162877130322
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate3_mixed_production_vs_reference": {
+        "label": "gate3_mixed_production_vs_reference_lambda=0.0_frame140",
+        "e_production_kj_mol": -224270.24376532246,
+        "e_reference_kj_mol": -224270.27178541617,
+        "abs_delta_e_kj_mol": 0.02802009371225722,
+        "rel_delta_e": 1.249389564171354e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.02105727232992649,
+        "worst_atom_index": 21518,
+        "worst_component": "y",
+        "worst_atom_force_production_kj_mol_nm": [
+          -319.2705471026711,
+          -91.04212621599436,
+          141.0495017822832
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -319.25647119479254,
+          -91.02106894366443,
+          141.0570084452629
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "diagnostic",
+        "forces_finite": true,
+        "force_within_tolerance": false,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 0.0,
+      "dcd": "traj_state10_lam0.00.dcd",
+      "frame_index": 160,
+      "gate1_reference_identity": {
+        "label": "gate1_reference_identity_lambda=0.0_frame160",
+        "e_production_kj_mol": -223732.710999326,
+        "e_reference_kj_mol": -223732.710999326,
+        "abs_delta_e_kj_mol": 0.0,
+        "rel_delta_e": 0.0,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0,
+        "worst_atom_index": 0,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          -387.7006940998769,
+          574.5391708483062,
+          572.8753989284118
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -387.7006940998769,
+          574.5391708483062,
+          572.8753989284118
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "reference_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate2_mixed_live_vs_baked": {
+        "label": "gate2_mixed_live_vs_baked_lambda=0.0_frame160",
+        "e_production_kj_mol": -223732.7207493286,
+        "e_reference_kj_mol": -223732.74939951708,
+        "abs_delta_e_kj_mol": 0.028650188469327986,
+        "rel_delta_e": 1.2805540783020398e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.000194549560546875,
+        "worst_atom_index": 2336,
+        "worst_component": "y",
+        "worst_atom_force_production_kj_mol_nm": [
+          -311.9452513535507,
+          1164.9880851099733,
+          -502.128230324015
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -311.9452513535507,
+          1164.9878905604128,
+          -502.1282761003822
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate3_mixed_production_vs_reference": {
+        "label": "gate3_mixed_production_vs_reference_lambda=0.0_frame160",
+        "e_production_kj_mol": -223732.72079281355,
+        "e_reference_kj_mol": -223732.74951707572,
+        "abs_delta_e_kj_mol": 0.028724262170726433,
+        "rel_delta_e": 1.2838648893703485e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.00577303022146225,
+        "worst_atom_index": 21518,
+        "worst_component": "y",
+        "worst_atom_force_production_kj_mol_nm": [
+          -116.26124621415511,
+          -81.94314538594335,
+          -226.93834368139505
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -116.25700248638168,
+          -81.94891841616482,
+          -226.93951132148504
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "diagnostic",
+        "forces_finite": true,
+        "force_within_tolerance": false,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 0.0,
+      "dcd": "traj_state10_lam0.00.dcd",
+      "frame_index": 180,
+      "gate1_reference_identity": {
+        "label": "gate1_reference_identity_lambda=0.0_frame180",
+        "e_production_kj_mol": -224143.88239499618,
+        "e_reference_kj_mol": -224143.88239499618,
+        "abs_delta_e_kj_mol": 0.0,
+        "rel_delta_e": 0.0,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0,
+        "worst_atom_index": 0,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          378.7630602515616,
+          52.26682533392663,
+          -144.515338980345
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          378.7630602515616,
+          52.26682533392663,
+          -144.515338980345
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "reference_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate2_mixed_live_vs_baked": {
+        "label": "gate2_mixed_live_vs_baked_lambda=0.0_frame180",
+        "e_production_kj_mol": -224143.81647864162,
+        "e_reference_kj_mol": -224143.8450733251,
+        "abs_delta_e_kj_mol": 0.028594683477422222,
+        "rel_delta_e": 1.2757291402789992e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.000240325927734375,
+        "worst_atom_index": 4480,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          -596.9355191043578,
+          2166.17301452416,
+          -1150.916273928713
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -596.9352787784301,
+          2166.1730679299217,
+          -1150.9162205229513
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate3_mixed_production_vs_reference": {
+        "label": "gate3_mixed_production_vs_reference_lambda=0.0_frame180",
+        "e_production_kj_mol": -224143.81633495007,
+        "e_reference_kj_mol": -224143.8449698739,
+        "abs_delta_e_kj_mol": 0.028634923830395564,
+        "rel_delta_e": 1.2775244323235486e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.00022983551025390625,
+        "worst_atom_index": 17937,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          -20.72043324029073,
+          -533.1939639968332,
+          -812.8413543272763
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -20.720663075800985,
+          -533.1940288466867,
+          -812.8412704039365
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "diagnostic",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "passed": true
+    },
+    {
+      "lambda_coul": 0.0,
+      "dcd": "traj_state10_lam0.00.dcd",
+      "frame_index": 199,
+      "gate1_reference_identity": {
+        "label": "gate1_reference_identity_lambda=0.0_frame199",
+        "e_production_kj_mol": -223992.7488588329,
+        "e_reference_kj_mol": -223992.7488588329,
+        "abs_delta_e_kj_mol": 0.0,
+        "rel_delta_e": 0.0,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0,
+        "worst_atom_index": 0,
+        "worst_component": "x",
+        "worst_atom_force_production_kj_mol_nm": [
+          234.7785335295182,
+          372.5678629493828,
+          480.1652737320526
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          234.7785335295182,
+          372.5678629493828,
+          480.1652737320526
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "reference_platform_info": {
+          "platform_requested": "Reference",
+          "platform_resolved": "Reference",
+          "properties_requested": {},
+          "properties_resolved": {}
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate2_mixed_live_vs_baked": {
+        "label": "gate2_mixed_live_vs_baked_lambda=0.0_frame199",
+        "e_production_kj_mol": -223992.70385611136,
+        "e_reference_kj_mol": -223992.73257791845,
+        "abs_delta_e_kj_mol": 0.028721807088004425,
+        "rel_delta_e": 1.282265132330274e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0001983642578125,
+        "worst_atom_index": 3542,
+        "worst_component": "z",
+        "worst_atom_force_production_kj_mol_nm": [
+          -1067.830178655684,
+          302.57799575384706,
+          -1061.9986369919498
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          -1067.8301481381059,
+          302.5780262714252,
+          -1061.9988353562076
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "hard",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "gate3_mixed_production_vs_reference": {
+        "label": "gate3_mixed_production_vs_reference_lambda=0.0_frame199",
+        "e_production_kj_mol": -223992.70385009702,
+        "e_reference_kj_mol": -223992.73247341719,
+        "abs_delta_e_kj_mol": 0.028623320162296295,
+        "rel_delta_e": 1.2778682525198995e-07,
+        "max_abs_force_component_diff_kj_mol_nm": 0.0008281944319605827,
+        "worst_atom_index": 21517,
+        "worst_component": "y",
+        "worst_atom_force_production_kj_mol_nm": [
+          0.4930501701310277,
+          -16.009173829574138,
+          0.324855713872239
+        ],
+        "worst_atom_force_reference_kj_mol_nm": [
+          0.49354645353741944,
+          -16.0100020240061,
+          0.32443031878210604
+        ],
+        "energy_rel_tol": 1e-05,
+        "force_abs_tol": 0.001,
+        "force_gate_mode": "diagnostic",
+        "forces_finite": true,
+        "force_within_tolerance": true,
+        "passed": true,
+        "production_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "reference_platform_info": {
+          "platform_requested": "CUDA",
+          "platform_resolved": "CUDA",
+          "properties_requested": {
+            "Precision": "mixed"
+          },
+          "properties_resolved": {
+            "Precision": "mixed"
+          }
+        },
+        "platform_verified": true,
+        "platform_mismatch_reasons": []
+      },
+      "passed": true
+    }
+  ],
+  "passed": true
+}

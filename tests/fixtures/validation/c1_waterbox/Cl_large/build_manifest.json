@@ -1,0 +1,37 @@
+{
+  "protocol_version": 1,
+  "case": "Cl_large",
+  "ion": "Cl",
+  "ligand_net_charge_e": -1,
+  "box_size_label": "large",
+  "box_edge_nm": 4.2,
+  "nonbonded_cutoff_nm": 1.0,
+  "ionic_strength_molar": 0.15,
+  "forcefield_xml": [
+    "amber14-all.xml",
+    "amber14/tip3p.xml"
+  ],
+  "n_atoms": 7158,
+  "n_water": 2381,
+  "na_count_total": 7,
+  "cl_count_total": 8,
+  "ordinary_na_count": 7,
+  "ordinary_cl_count": 6,
+  "reserved_coion_indices": [
+    7157
+  ],
+  "reserved_coion_cation": false,
+  "ligand_indices": [
+    0
+  ],
+  "co_ion_indices": [
+    7157
+  ],
+  "ligand_coion_min_image_distances_nm": [
+    3.594917925349618
+  ],
+  "charge_treatment": "co_alchemical_charge_transfer",
+  "coalchemical_ion_fingerprint": "9143eb6127e4b78e646bb02924fbca589a1b9c21a4c1714a2e4b40ed279a3caa",
+  "system_xml_sha256": "9aa21d2448d91b0dc16bf7b92276a76d3d04706bf8a4e4316089ee84919332b1",
+  "topology_cif_sha256": "153b703e68870e7384d67e6e5c9fdc37703a2c49aa424e161004bd251f906e1f"
+}

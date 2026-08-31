@@ -1,0 +1,72 @@
+{
+  "case": "Na_small",
+  "identity_fingerprint": [
+    3197
+  ],
+  "charge_conservation_report": {
+    "lambda_name": "lambda_coul",
+    "n_particle_offsets": 2,
+    "base_sum_e": 0.0,
+    "scale_sum_e": 0.0,
+    "total_charge_by_lambda_e": {
+      "1": 0.0,
+      "0.9": 0.0,
+      "0.8": 0.0,
+      "0.7": 0.0,
+      "0.6": 0.0,
+      "0.5": 0.0,
+      "0.4": 0.0,
+      "0.3": 0.0,
+      "0.2": 0.0,
+      "0.1": 0.0,
+      "0": 0.0
+    },
+    "total_charge_is_lambda_independent": true,
+    "tolerance_e": 1e-06,
+    "ligand_charge_by_lambda_e": {
+      "1": 1.0,
+      "0.9": 0.9,
+      "0.8": 0.8,
+      "0.7": 0.7,
+      "0.6": 0.6,
+      "0.5": 0.5,
+      "0.4": 0.4,
+      "0.3": 0.3,
+      "0.2": 0.2,
+      "0.1": 0.1,
+      "0": 0.0
+    },
+    "ligand_charge_matches_lambda_times_qL": true,
+    "co_ion_charge_by_lambda_e": {
+      "1": 0.0,
+      "0.9": 0.09999999999999998,
+      "0.8": 0.19999999999999996,
+      "0.7": 0.30000000000000004,
+      "0.6": 0.4,
+      "0.5": 0.5,
+      "0.4": 0.6,
+      "0.3": 0.7,
+      "0.2": 0.8,
+      "0.1": 0.9,
+      "0": 1.0
+    }
+  },
+  "endpoint_single_point_energies_cpu": {
+    "1.0": {
+      "potential_kj_mol": 64195.622487956396,
+      "max_force_kj_mol_nm": 52237.08465282545
+    },
+    "0.5": {
+      "potential_kj_mol": 64451.18407474406,
+      "max_force_kj_mol_nm": 52120.8473337541
+    },
+    "0.0": {
+      "potential_kj_mol": 64662.14044469001,
+      "max_force_kj_mol_nm": 52005.008272688996
+    }
+  },
+  "ligand_coion_min_image_distances_nm": [
+    2.554513333298537
+  ],
+  "passed": true
+}
