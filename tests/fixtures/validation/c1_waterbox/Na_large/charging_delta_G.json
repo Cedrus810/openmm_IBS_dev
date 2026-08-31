@@ -1,0 +1,13 @@
+{
+  "case": "Na_large",
+  "delta_G_charging_kJ_mol": 0.5881812007280282,
+  "uncertainty_kJ_mol": 3.7874589140426895,
+  "delta_G_charging_kcal_mol": 0.1405786808623394,
+  "uncertainty_kcal_mol": 0.905224405841943,
+  "method": "MBAR-default",
+  "converged": true,
+  "min_overlap": 0.06797810756217852,
+  "n_states": 11,
+  "n_frames": 376,
+  "u_kn_path": "validation/c1_waterbox/Na_large/u_kn.npz"
+}

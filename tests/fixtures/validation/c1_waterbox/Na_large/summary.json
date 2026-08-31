@@ -1,0 +1,14 @@
+{
+  "case": "Na_large",
+  "passed": true,
+  "charge_conservation_passed": true,
+  "finite_energy_force_passed": true,
+  "coion_geometry_initial_passed": true,
+  "restraint_force_group_passed": true,
+  "endpoint_charge_passed": true,
+  "dynamics_completed": true,
+  "ukn_completed": true,
+  "delta_G_charging_kJ_mol": 0.5881812007280282,
+  "uncertainty_kJ_mol": 3.7874589140426895,
+  "failure_reasons": []
+}

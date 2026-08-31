@@ -1,0 +1,124 @@
+{
+  "protocol_version": 2,
+  "charge_treatment": "co_alchemical_charge_transfer",
+  "lambda_direction": "lam_coul_1_to_0",
+  "ligand_net_charge_e": 2,
+  "ions": [
+    {
+      "atom_index": 7172,
+      "placement_diagnostics": {
+        "anchor_to_coion_distance_nm": 3.5949179253496175,
+        "flat_bottom_radius_nm": 0.5,
+        "wall_margin_nm": 0.3158695164399376,
+        "wall_margin_kt": 2.0,
+        "ligand_extent_from_anchor_nm": 0.0,
+        "guaranteed_min_ligand_distance_nm": 2.77904840890968,
+        "required_min_ligand_distance_nm": 1.2,
+        "initial_threshold_nm": 1.6,
+        "satisfies_runtime_threshold": true,
+        "satisfies_initial_threshold": true,
+        "enforced": true
+      },
+      "residue_index": 2402,
+      "residue_name": "NA",
+      "element": "Na",
+      "charge_at_lambda1_e": 0.0,
+      "charge_at_lambda0_e": 1.0,
+      "sigma_nm": 0.2439280690268249,
+      "epsilon_kj_mol": 0.3658460312,
+      "mass_amu": 22.99,
+      "restraint": {
+        "form": "flat_bottom_anchor_relative",
+        "expression": "0.5*k_ion*max(0, pointdistance(x1,y1,z1, x2+dx0, y2+dy0, z2+dz0) - r0_ion)^2",
+        "reference_frame": "anchor_atom_relative_displacement",
+        "k_kj_per_mol_nm2": 100.0,
+        "flat_bottom_radius_nm": 0.5,
+        "force_group": 6,
+        "anchor_atom_index": 0,
+        "anchor_selection_rule": "ligand_heavy_atom_nearest_ligand_center_of_mass",
+        "reference_displacement_nm": [
+          -2.0822,
+          2.0837,
+          2.0606
+        ],
+        "selection_time_absolute_position_nm": [
+          0.0178,
+          4.1837,
+          4.1606
+        ]
+      },
+      "physical_charge_e": 0.0,
+      "spec_position": 0
+    },
+    {
+      "atom_index": 7173,
+      "placement_diagnostics": {
+        "anchor_to_coion_distance_nm": 2.9287834488060054,
+        "flat_bottom_radius_nm": 0.5,
+        "wall_margin_nm": 0.3158695164399376,
+        "wall_margin_kt": 2.0,
+        "ligand_extent_from_anchor_nm": 0.0,
+        "guaranteed_min_ligand_distance_nm": 2.1129139323660677,
+        "required_min_ligand_distance_nm": 1.2,
+        "initial_threshold_nm": 1.6,
+        "satisfies_runtime_threshold": true,
+        "satisfies_initial_threshold": true,
+        "enforced": true
+      },
+      "residue_index": 2403,
+      "residue_name": "NA",
+      "element": "Na",
+      "charge_at_lambda1_e": 0.0,
+      "charge_at_lambda0_e": 1.0,
+      "sigma_nm": 0.2439280690268249,
+      "epsilon_kj_mol": 0.3658460312,
+      "mass_amu": 22.99,
+      "restraint": {
+        "form": "flat_bottom_anchor_relative",
+        "expression": "0.5*k_ion*max(0, pointdistance(x1,y1,z1, x2+dx0, y2+dy0, z2+dz0) - r0_ion)^2",
+        "reference_frame": "anchor_atom_relative_displacement",
+        "k_kj_per_mol_nm2": 100.0,
+        "flat_bottom_radius_nm": 0.5,
+        "force_group": 6,
+        "anchor_atom_index": 0,
+        "anchor_selection_rule": "ligand_heavy_atom_nearest_ligand_center_of_mass",
+        "reference_displacement_nm": [
+          0.132,
+          -2.0393,
+          -2.098
+        ],
+        "selection_time_absolute_position_nm": [
+          2.232,
+          0.0607,
+          0.002
+        ]
+      },
+      "physical_charge_e": 0.0,
+      "spec_position": 1
+    }
+  ],
+  "selection_provenance": {
+    "selection": "reserved_neutral_ion_shaped_dummy_identified_by_zero_charge",
+    "coordinate_independent": true,
+    "required_count": 2,
+    "candidates": [
+      {
+        "ion_index": 7172,
+        "residue_name": "NA",
+        "element": "Na",
+        "charge_e": 0.0,
+        "sigma_nm": 0.2439280690268249,
+        "epsilon_kj_mol": 0.3658460312
+      },
+      {
+        "ion_index": 7173,
+        "residue_name": "NA",
+        "element": "Na",
+        "charge_e": 0.0,
+        "sigma_nm": 0.2439280690268249,
+        "epsilon_kj_mol": 0.3658460312
+      }
+    ]
+  },
+  "fingerprint": "06ec610f93a00754b8716cfba7076e14e01f7a6fd8ef76c157f0ef2e7730939d"
+}

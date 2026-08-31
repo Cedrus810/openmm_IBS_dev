@@ -1,0 +1,70 @@
+{
+  "protocol_version": 2,
+  "charge_treatment": "co_alchemical_charge_transfer",
+  "lambda_direction": "lam_coul_1_to_0",
+  "ligand_net_charge_e": 1,
+  "ions": [
+    {
+      "atom_index": 3197,
+      "placement_diagnostics": {
+        "anchor_to_coion_distance_nm": 2.5545133332985364,
+        "flat_bottom_radius_nm": 0.5,
+        "wall_margin_nm": 0.3158695164399376,
+        "wall_margin_kt": 2.0,
+        "ligand_extent_from_anchor_nm": 0.0,
+        "guaranteed_min_ligand_distance_nm": 1.7386438168585987,
+        "required_min_ligand_distance_nm": 1.2,
+        "initial_threshold_nm": 1.6,
+        "satisfies_runtime_threshold": true,
+        "satisfies_initial_threshold": true,
+        "enforced": true
+      },
+      "residue_index": 1071,
+      "residue_name": "NA",
+      "element": "Na",
+      "charge_at_lambda1_e": 0.0,
+      "charge_at_lambda0_e": 1.0,
+      "sigma_nm": 0.2439280690268249,
+      "epsilon_kj_mol": 0.3658460312,
+      "mass_amu": 22.99,
+      "restraint": {
+        "form": "flat_bottom_anchor_relative",
+        "expression": "0.5*k_ion*max(0, pointdistance(x1,y1,z1, x2+dx0, y2+dy0, z2+dz0) - r0_ion)^2",
+        "reference_frame": "anchor_atom_relative_displacement",
+        "k_kj_per_mol_nm2": 100.0,
+        "flat_bottom_radius_nm": 0.5,
+        "force_group": 6,
+        "anchor_atom_index": 0,
+        "anchor_selection_rule": "ligand_heavy_atom_nearest_ligand_center_of_mass",
+        "reference_displacement_nm": [
+          1.5779,
+          -1.537,
+          1.2936
+        ],
+        "selection_time_absolute_position_nm": [
+          3.1779,
+          0.063,
+          2.8936
+        ]
+      },
+      "physical_charge_e": 0.0,
+      "spec_position": 0
+    }
+  ],
+  "selection_provenance": {
+    "selection": "reserved_neutral_ion_shaped_dummy_identified_by_zero_charge",
+    "coordinate_independent": true,
+    "required_count": 1,
+    "candidates": [
+      {
+        "ion_index": 3197,
+        "residue_name": "NA",
+        "element": "Na",
+        "charge_e": 0.0,
+        "sigma_nm": 0.2439280690268249,
+        "epsilon_kj_mol": 0.3658460312
+      }
+    ]
+  },
+  "fingerprint": "529e03ee47a513e0c1d6eedaad750591809617b7fb293d70516e5e6877ed8e29"
+}

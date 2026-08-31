@@ -1,0 +1,16 @@
+name: openmm-ibs-ci
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - openmm
+  - pymbar-core=4.2.0
+  - numpy
+  - scipy
+  - mdtraj
+  - rdkit
+  - pandas
+  - pyyaml
+  - pdbfixer
+  - pytest
+  - pip

@@ -1,0 +1,15 @@
+{
+  "small_case": "Cl_small",
+  "large_case": "Cl_large",
+  "small_box_edge_nm": 3.2,
+  "large_box_edge_nm": 4.2,
+  "delta_G_small_kcal_mol": 0.3622595450459254,
+  "uncertainty_small_kcal_mol": 0.7678926747874136,
+  "delta_G_large_kcal_mol": 0.6254743114752279,
+  "uncertainty_large_kcal_mol": 0.788563392689581,
+  "delta_delta_G_kcal_mol": 0.2632147664293025,
+  "combined_sigma_kcal_mol": 1.100677693188279,
+  "threshold_2sigma_kcal_mol": 2.201355386376558,
+  "threshold_abs_kcal_mol": 1.0,
+  "passed": true
+}
