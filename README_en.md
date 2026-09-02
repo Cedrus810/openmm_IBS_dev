@@ -7,29 +7,60 @@ ABFE-IBS is an OpenMM-based absolute binding free-energy workflow. It consumes G
 complex and bulk-solvent legs, and combines IBS sampling, MBAR/TMBAR analysis, a Boresch
 restraint ledger, and explicit long-range corrections in a documented thermodynamic cycle.
 
-This repository contains reusable workflow code, the Atenolol-rank11 reference system, and
-the full record of production candidates, validation runs, failed experiments, and historical
-decisions. Reference `output*`, `validation`, and `memtest` trees are evidence from specific
-runs; they must not be reused as checkpoints for another molecular system.
+This repository is the **engineering branch** of ABFE-IBS, aimed at release. It contains
+only the reusable workflow source (`runabfe.py` and friends -- see
+[PROJECT_LAYOUT.md](PROJECT_LAYOUT.md)), the production regression tests (`tests/`),
+manual diagnostic tooling (`tools/`), and the user documentation (`docs/`).
 
-## Scientific status (evidence through 2026-08-12)
+**Not here**: reference-system `output*` trees, validation trajectories and checkpoints,
+development-era experiment scripts (`exp0XX_*`), failed-experiment records, and the
+per-decision history. Those live in the `Atenolol-rank11` workspace; this repository keeps
+only an [index of that material](docs/HISTORY_LOG.md).
+
+To move to a different protein-ligand system, read the
+[migration guide](docs/MIGRATING_TO_A_NEW_SYSTEM.md). Never reuse one system's checkpoints
+for another.
+
+## Scientific status (evidence through 2026-09-02)
 
 The main software path includes GROMACS-to-OpenMM construction, complex and solvent legs,
 dual-lambda decoupling, IBS warmup and frozen-bias production, MBAR/TMBAR, Boresch
 attachment/release accounting, LJ long-range correction, caching, resume, and fail-closed
-checks. Current reports identify the principal protocol versions as IBS v29, thermodynamic
-path v21, LJ LRC v3, and WCA v2.
+checks.
 
-Independent repeats, the production seed ledger, parts of the validation matrix, and the
-time-correlated uncertainty model are not yet closed. The repository is ready to report
-software and method-development progress, but not a final publishable Atenolol binding free
-energy.
+**The current production system is 4W53 (T4 lysozyme L99A + toluene), no longer Atenolol.**
 
-| Result | Registry status | Final/citable? |
+Principal protocol identities, read directly from the source constants (not restated):
+
+| Protocol | Constant | Value |
 |---|---|---|
-| `−23.1622 ± 2.5139 kJ/mol` from `output_lrc_fix` | `CANDIDATE` | No: no independent repeat, empty seed ledger, clipped Boresch `kr` |
-| `+40.8362 ± 1.3178 kJ/mol` from historical `output` | `INVALIDATED` | No: opposite historical sign convention and diagnostic issues |
-| `+16.00 ± 2.20 kJ/mol` from 2026-07-27 | `INVALIDATED` | No: stale and incorrect Boresch equilibrium geometry |
+| IBS bias | `ibs_engine.IBS_BIAS_PROTOCOL_VERSION` | **32** |
+| Thermodynamic path | `abfe_preoptimizer.THERMODYNAMIC_PATH_PROTOCOL_VERSION` | 21 |
+| LJ long-range correction | `ibs_engine.TRADITIONAL_LJ_LRC_PROTOCOL_VERSION` | 3 |
+| WCA accounting | `ibs_engine.WCA_ACCOUNTING_VERSION` | **3** (`WCA_SHIELD_RETIRED = True`) |
+| ESS gate | `ibs_engine.ESS_GATE_PROTOCOL_VERSION` | **5** |
+| Ligand COM restraint | `ibs_engine.LIGAND_COM_RESTRAINT_PROTOCOL_VERSION` | 2 |
+
+### Result registry
+
+| Result | System / run | Registry status | Final/citable? |
+|---|---|---|---|
+| **`−21.36 ± 0.93 kJ/mol`** (`−5.11 ± 0.22 kcal/mol`) | 4W53, `output_v3_seed20260908`, 2026-09-02 | **label pending maintainer** | **No: single seed (`20260908`), no second independent repeat in this repository** |
+| `−23.1622 ± 2.5139 kJ/mol` from `output_lrc_fix` | Atenolol-rank11 | **VOIDED (declared 2026-08-24)** | No |
+| `+40.8362 ± 1.3178 kJ/mol` from historical `output` | Atenolol-rank11 | `INVALIDATED` | No: opposite historical sign convention and diagnostic issues |
+| `+16.00 ± 2.20 kJ/mol` from 2026-07-27 | Atenolol-rank11 | `INVALIDATED` | No: stale and incorrect Boresch equilibrium geometry |
+
+For the 4W53 row: experiment is **−23.10 kJ/mol** (`−5.52 ± 0.04 kcal/mol`), so the
+discrepancy is **0.41 kcal/mol, within 1.83σ**. The quality gates turned healthy at the same
+time (solvent-leg stage2 raw ESS 2.93 → 173.33, top-1% weight 0.828 → 0.047). Per-item
+evidence: [docs/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md](docs/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md).
+
+**Still open (not blocking, but must be quoted alongside the number):** solvent-leg stage2 is
+the only quantity with an independent reference truth. Measured ≈ **−8.3** against a truth of
+**−6.58 ± 0.26** (no-LRC convention, see
+[docs/reference_data/README.md](docs/reference_data/README.md)); the 1.7-4.2 kJ/mol gap is not
+yet attributed. Independent repeats, the production seed ledger, and the time-correlated
+uncertainty model remain **unclosed**.
 
 The current sign convention is:
 
@@ -37,9 +68,10 @@ The current sign convention is:
 Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS
 ```
 
-A filename containing `final` does not make an artifact citable. Consult the
-the result index and machine-readable registry (`RESULT_REGISTRY.csv`) in the
-`Atenolol-rank11` workspace — neither ships with this engineering branch.
+A filename containing `final` does not make an artifact citable. For the **three Atenolol
+rows**, the raw artifacts, result index, and machine-readable registry (`RESULT_REGISTRY.csv`)
+live in the `Atenolol-rank11` workspace and do not ship with this engineering branch. The
+evidence for the 4W53 row is in this repository's `docs/` (linked above).
 
 ## Quick start
 

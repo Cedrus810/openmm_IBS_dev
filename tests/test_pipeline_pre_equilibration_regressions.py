@@ -23,6 +23,13 @@ ROOT = Path(__file__).resolve().parents[1]
 PIPELINE_PATH = ROOT / "abfe_pipeline.py"
 
 
+def _pipeline_module():
+    """真实的 abfe_pipeline 模块（本文件其余部分刻意只做源码级编译）。"""
+    import abfe_pipeline
+
+    return abfe_pipeline
+
+
 def _compile_pipeline_method(name: str):
     tree = ast.parse(PIPELINE_PATH.read_text(encoding="utf-8"), filename=str(PIPELINE_PATH))
     pipeline_class = next(
@@ -187,6 +194,17 @@ def _pre_equilibration_namespace():
         "ENVIRONMENT_TYPE_MEMBRANE": "membrane",
         "MEMBRANE_POST_MINIMIZATION_MAX_FORCE_KJ_PER_MOL_NM": 1.0,
         "_build_platform_props": lambda _name: ("CPU", {}),
+        # [0831issue P2] `pre_equilibrate` 现在用 base 平台名判断要不要显式释放
+        # CUDA Context（裸 `== "CUDA"` 匹配不上 "CUDA:1"）。这里注入**真实**的
+        # 解析器而不是 stub：它是纯字符串函数、不碰 OpenMM，编进来能顺带保证
+        # 生产代码与本测试用的是同一份 spec 语法。
+        "_split_platform_spec": _compile_pipeline_top_level("_split_platform_spec"),
+        # [2026-09-01] `pre_equilibrate` 的 resume 分支改走跨平台迁移入口。
+        # 这里注入**真实**实现而不是 stub：本组用例要验的正是"loadCheckpoint 被
+        # 真的调用了、失败后走完整 fresh 初始化"，而真实入口的第一件事就是调
+        # `simulation.loadCheckpoint(path)`；只有当报错是"platform 不匹配"时才
+        # 转迁移，其它异常原样抛给外层。注入 stub 反而会把要验的行为遮掉。
+        "load_checkpoint_with_platform_migration": _pipeline_module().load_checkpoint_with_platform_migration,
         "ensure_barostat_for_protocol": lambda *args, **kwargs: {
             "action": "reused",
             "barostat_class": "MonteCarloBarostat",
@@ -214,7 +232,12 @@ def test_checkpoint_load_failure_runs_the_complete_fresh_initialization(tmp_path
     (tmp_path.parent / "unused").mkdir(exist_ok=True)
 
     class _Pipeline:
-        pass
+        # 2026-09-01：`pre_equilibrate` 改走 `pre_equilibration_identity_fingerprint()`
+        # 统一入口（见 test_platform_routing_regressions 里那组用例）。本组用例测的是
+        # checkpoint/DCD 行为、不是指纹内容，所以沿用与 `_pre_equilibration_fingerprint`
+        # 同一个桩值 "fp"，与下面写进磁盘的 fingerprint.json 对齐。
+        def pre_equilibration_identity_fingerprint(self, requested_steps):
+            return "fp"
 
     pipeline = _Pipeline()
     pipeline.output_dir = str(tmp_path)
@@ -303,7 +326,12 @@ def test_successful_checkpoint_resume_starts_a_new_segment_without_appending_old
     )
 
     class _Pipeline:
-        pass
+        # 2026-09-01：`pre_equilibrate` 改走 `pre_equilibration_identity_fingerprint()`
+        # 统一入口（见 test_platform_routing_regressions 里那组用例）。本组用例测的是
+        # checkpoint/DCD 行为、不是指纹内容，所以沿用与 `_pre_equilibration_fingerprint`
+        # 同一个桩值 "fp"，与下面写进磁盘的 fingerprint.json 对齐。
+        def pre_equilibration_identity_fingerprint(self, requested_steps):
+            return "fp"
 
     pipeline = _Pipeline()
     pipeline.output_dir = str(tmp_path)
@@ -375,7 +403,12 @@ def test_run_full_pipeline_forwards_explicit_equilibration_budget_and_records_id
     )
 
     class _Pipeline:
-        pass
+        # 2026-09-01：`pre_equilibrate` 改走 `pre_equilibration_identity_fingerprint()`
+        # 统一入口（见 test_platform_routing_regressions 里那组用例）。本组用例测的是
+        # checkpoint/DCD 行为、不是指纹内容，所以沿用与 `_pre_equilibration_fingerprint`
+        # 同一个桩值 "fp"，与下面写进磁盘的 fingerprint.json 对齐。
+        def pre_equilibration_identity_fingerprint(self, requested_steps):
+            return "fp"
 
     pipeline = _Pipeline()
     pipeline.temperature = _FakeQuantity(300.0)

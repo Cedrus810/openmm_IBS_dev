@@ -21,7 +21,7 @@ import hashlib
 import glob
 import re
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import openmm
@@ -74,6 +74,10 @@ from abfe_core import (
     ensure_barostat_for_protocol,
     PRE_EQUILIBRATION_TIMESTEP_PS,
 )
+# PLAN_openmm_8_6_remd_backend.md P0：REMD 后端选择器。本模块不 import openmm
+# 顶层，旧环境仍可导入。
+import free_energy_engine
+
 from abfe_pipeline import (
     ABFEPipeline, TraditionalABFEPipeline, _collect_pipeline_provenance, _pme_u_kn_meta_payload,
     _pre_equilibration_fingerprint,
@@ -117,6 +121,93 @@ logging.basicConfig(
 log = logging.getLogger("runabfe")
 
 
+# ---------------------------------------------------------------------------
+# 两条腿的配体约束/HMR 身份比较
+# ---------------------------------------------------------------------------
+# 🔑 [2026-09-01] 质量比较必须带容差，且容差要有物理依据。
+#
+# 起因（4W53 实测）：两条腿的配体是同一个分子、约束对逐位相同，但质量表来源不同 ——
+#   complex 腿走 GROMACS 拓扑（LIG.itp，AMBER 表）：C = 12.010736, H = 1.007941
+#   solvent 腿走 OpenMM 元素表                    ：C = 12.010780, H = 1.007947
+# 相对差 3.7e-6 / 6.0e-6。`comparison_sha256` 是逐位哈希，于是整个热力学循环
+# 在最后一步被拦下，两条腿都已经算完了。
+#
+# 为什么 5e-4 amu 这个门槛是安全的（不是为了让它变绿凑出来的）：
+#   * 这道门要抓的是**同位素级/HMR 级**的改动。HMR 把 H 从 1.008 抬到 3.0~4.0
+#     （Δ ≈ 2 amu），重原子相应扣减（C 12.011 → ~5.96，Δ ≈ 6 amu）；氘代 Δ ≈ 1 amu。
+#     最小的真实改动也是 **1 amu 量级**。
+#   * 质量表来源差异是 **5e-5 amu 量级**。
+#   两者相差 4 个数量级，5e-4 amu 落在正中间，两边各有 10× 和 2000× 余量。
+#
+# 约束**对与距离**仍然逐位比较，不给任何容差：约束集合变了就是不同的
+# constrained Hamiltonian，与质量表来源无关。
+#
+# 物理上为什么可以放行：配体质量在同一条腿内不随 λ 变化，动量部分与
+# constrained-metric 因子在腿内精确抵消；腿间残留的敏感度 ~ kT × 4e-6，
+# 即 ~1e-5 kJ/mol 量级，比这条腿本身的统计误差（0.6 kJ/mol）小五个数量级。
+_LIGAND_MASS_COMPARISON_DECIMALS = 3   # 5e-4 amu
+
+
+def _ligand_constraint_comparable_view(identity: Dict) -> Dict:
+    """把一份 constraint_identity 化成**腿间可比**的形式。
+
+    两条腿的全局原子编号必然不同，所以约束用配体内局部序号表示；质量按
+    `_LIGAND_MASS_COMPARISON_DECIMALS` 量化。对新算出来的和已落盘的 identity
+    都适用（只吃 ligand_indices / ligand_masses_amu / ligand_constraints 三个字段）。
+    """
+    indices = [int(i) for i in (identity.get("ligand_indices") or [])]
+    local = {g: k for k, g in enumerate(indices)}
+    masses = [
+        round(float(m), _LIGAND_MASS_COMPARISON_DECIMALS)
+        for _, m in (identity.get("ligand_masses_amu") or [])
+    ]
+    constraints = sorted(
+        (
+            str(local.get(int(a), "external")),
+            str(local.get(int(b), "external")),
+            round(float(d), 12),
+        )
+        for a, b, d in (identity.get("ligand_constraints") or [])
+    )
+    return {"n_atoms": len(indices), "masses": masses, "constraints": constraints}
+
+
+def _describe_constraint_identity_mismatch(
+    complex_identity: Dict, solvent_identity: Dict
+) -> str:
+    """说清楚到底差在哪 —— 光打两个 sha256 对定位毫无帮助。"""
+    cv = _ligand_constraint_comparable_view(complex_identity)
+    sv = _ligand_constraint_comparable_view(solvent_identity)
+    lines = []
+    if cv["n_atoms"] != sv["n_atoms"]:
+        lines.append(f"配体原子数不同: complex={cv['n_atoms']} solvent={sv['n_atoms']}")
+    if cv["constraints"] != sv["constraints"]:
+        lines.append(
+            f"配体约束集合不同（局部序号）: complex={cv['constraints']} "
+            f"solvent={sv['constraints']}"
+        )
+    c_raw = [float(m) for _, m in (complex_identity.get("ligand_masses_amu") or [])]
+    s_raw = [float(m) for _, m in (solvent_identity.get("ligand_masses_amu") or [])]
+    if len(c_raw) == len(s_raw) and c_raw:
+        worst = max(
+            range(len(c_raw)),
+            key=lambda k: abs(c_raw[k] - s_raw[k]) / max(abs(s_raw[k]), 1e-30),
+        )
+        d_abs = abs(c_raw[worst] - s_raw[worst])
+        d_rel = d_abs / max(abs(s_raw[worst]), 1e-30)
+        lines.append(
+            f"质量最大偏差在配体局部原子 {worst}: complex={c_raw[worst]!r} "
+            f"solvent={s_raw[worst]!r}（绝对 {d_abs:.3e} amu，相对 {d_rel:.3e}；"
+            f"容差 {10 ** -_LIGAND_MASS_COMPARISON_DECIMALS:.0e} amu）"
+        )
+        if d_abs < 10 ** -_LIGAND_MASS_COMPARISON_DECIMALS:
+            lines.append(
+                "  ↑ 这个量级是**质量表来源差异**（如 GROMACS 拓扑 vs OpenMM 元素表），"
+                "不是 HMR/同位素；已在容差内，不应由这道门拦下。"
+            )
+    return "；".join(lines) if lines else "（未能定位到具体差异字段）"
+
+
 def _assert_matching_ligand_constraint_identity(
     complex_system,
     complex_ligand_indices,
@@ -140,14 +231,24 @@ def _assert_matching_ligand_constraint_identity(
     solvent_identity = constraint_identity_fingerprint(
         solvent_system, solvent_ligand_indices
     )
+    # 逐位相同是快路径；不同的时候再按物理判据看差异是否在容差内。
     if (
         complex_identity.get("comparison_sha256")
         != solvent_identity.get("comparison_sha256")
     ):
-        raise RuntimeError(
-            f"{context} 的配体约束/HMR 身份不一致；拒绝用伪 Jacobian 修正掩盖差异。"
-            f" complex={complex_identity.get('comparison_sha256')},"
-            f" solvent={solvent_identity.get('comparison_sha256')}"
+        if _ligand_constraint_comparable_view(
+            complex_identity
+        ) != _ligand_constraint_comparable_view(solvent_identity):
+            raise RuntimeError(
+                f"{context} 的配体约束/HMR 身份不一致；拒绝用伪 Jacobian 修正掩盖差异。"
+                f" {_describe_constraint_identity_mismatch(complex_identity, solvent_identity)}"
+                f" [complex={complex_identity.get('comparison_sha256')},"
+                f" solvent={solvent_identity.get('comparison_sha256')}]"
+            )
+        log.warning(
+            "⚠️ 两条腿的配体质量表来源不同但在容差内，按同一 constrained Hamiltonian "
+            "处理：%s",
+            _describe_constraint_identity_mismatch(complex_identity, solvent_identity),
         )
     return complex_identity
 
@@ -174,10 +275,24 @@ def _assert_matching_result_constraint_identity(
         )
     c_hash = complex_identity.get("comparison_sha256")
     s_hash = solvent_identity.get("comparison_sha256")
-    if not c_hash or c_hash != s_hash:
+    if not c_hash or not s_hash:
         raise RuntimeError(
-            f"{context} 的持久化配体约束/HMR 身份不一致；拒绝汇总。"
-            f" complex={c_hash!r}, solvent={s_hash!r}"
+            f"{context} 的持久化 constraint_identity 缺少 comparison_sha256；"
+            "无法证明两条腿的约束/HMR 身份一致，拒绝汇总。"
+        )
+    if c_hash != s_hash:
+        if _ligand_constraint_comparable_view(
+            complex_identity
+        ) != _ligand_constraint_comparable_view(solvent_identity):
+            raise RuntimeError(
+                f"{context} 的持久化配体约束/HMR 身份不一致；拒绝汇总。"
+                f" {_describe_constraint_identity_mismatch(complex_identity, solvent_identity)}"
+                f" [complex={c_hash!r}, solvent={s_hash!r}]"
+            )
+        log.warning(
+            "⚠️ 持久化身份的配体质量表来源不同但在容差内，按同一 constrained "
+            "Hamiltonian 处理：%s",
+            _describe_constraint_identity_mismatch(complex_identity, solvent_identity),
         )
     return complex_identity
 
@@ -799,6 +914,18 @@ def _checkpoint_probe_simulation(pipeline: "ABFEPipeline"):
     return probe
 
 
+# 🔑 [2026-09-01] 本函数返回 False 只表示"不判定为已完成"，**不**表示"要从零重跑"。
+# 下游 `pre_equilibrate(resume=True)` 仍会尝试 loadCheckpoint；命中时剩余步数可能是 0。
+# 实测（4W53 resume_v3.log）：日志连报两次"将重新执行预平衡"，紧接着却是
+# `♻️ 从 Checkpoint 恢复 | 已完成: 5000000 | 剩余: 0`，整段不到 7 分钟、一步没跑。
+# 旧文案让人以为烧掉了 500 万步 GPU，是"消息说谎"——与本项目其它几处同类问题一样，
+# 它不报错、不影响数值，只误导读日志的人去查一个不存在的性能问题。
+_REENTER_NOTE = (
+    "（注意：这里只是**不把它判定为已完成**；下游 pre_equilibrate(resume=True) 仍会"
+    "尝试加载 checkpoint，命中则从断点续跑、剩余步数可能为 0，并不等于从零重跑）"
+)
+
+
 def equilibrium_is_done(
     output_dir: str,
     expected_fingerprint: Optional[str] = None,
@@ -830,7 +957,7 @@ def equilibrium_is_done(
     if not traj_is_valid:
         log.warning(
             "⚠️ %s 未通过真实 DCD parser 校验（截断/损坏/0 帧）。拒绝把它当成"
-            "已完成的预平衡复用，将重新执行预平衡。",
+            "已完成的预平衡复用，将重新进入预平衡阶段" + _REENTER_NOTE + "。",
             traj,
         )
         return False
@@ -838,7 +965,8 @@ def equilibrium_is_done(
         if not _is_checkpoint_valid(chk, simulation=simulation):
             log.warning(
                 "⚠️ %s 无法被目标 Simulation loadCheckpoint（损坏/不属于当前 "
-                "System/Platform）。拒绝复用该预平衡，将重新执行。",
+                "System/Platform）。拒绝复用该预平衡，将重新进入预平衡阶段"
+                + _REENTER_NOTE + "。",
                 chk,
             )
             return False
@@ -852,7 +980,7 @@ def equilibrium_is_done(
         log.warning(
             "⚠️ 预平衡轨迹/Checkpoint 存在，但缺少 pre_equilibration_fingerprint.json，"
             "无法确认是否匹配当前 system/config（可能来自本次修复之前的旧运行），"
-            "保守视为未完成，将重新执行预平衡。"
+            "保守视为未完成，将重新进入预平衡阶段" + _REENTER_NOTE + "。"
         )
         return False
     try:
@@ -864,7 +992,8 @@ def equilibrium_is_done(
     if recorded != expected_fingerprint:
         log.warning(
             "⚠️ 已有预平衡轨迹的指纹与当前 system/config 不匹配（可能是换了 gro/top/ligand/"
-            "温度或目标步数但复用了同一个 --output 目录），拒绝复用，将重新执行预平衡。"
+            "温度或目标步数但复用了同一个 --output 目录），拒绝把它判定为已完成，"
+            "将重新进入预平衡阶段" + _REENTER_NOTE + "。"
         )
         return False
 
@@ -2414,6 +2543,93 @@ def _load_dexp_params_fail_closed(
     return DEXPSurrogatePotential.from_dict(dexp_dict).get_parameters_dict()
 
 
+def _coerce_positive_seed(raw: Any, origin: str) -> int:
+    """把一个 seed 输入解析成正整数，失败一律 SystemExit（启动期硬门）。
+
+    非整数值（如 `1.5`）必须**拒绝**而不是 `int()` 静默截断：seed 决定整个独立重复
+    的随机流身份，"我写了 1.5、实际用了 1" 这种静默改写会让 provenance 里的 seed
+    与真正消费的 seed 不是同一个数。
+    """
+    if isinstance(raw, bool):
+        raise SystemExit(f"{origin} 必须是正整数，收到 {raw!r}")
+    try:
+        seed = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"{origin} 必须是正整数，收到 {raw!r}") from exc
+    # 截断检测：float/带小数的字符串都会在这里被挡住。
+    try:
+        if float(raw) != float(seed):
+            raise SystemExit(
+                f"{origin} 必须是整数，收到 {raw!r}（int() 会静默截断成 {seed}，"
+                "而 seed 决定随机流身份，不允许静默改写）"
+            )
+    except (TypeError, ValueError):
+        raise SystemExit(f"{origin} 必须是正整数，收到 {raw!r}") from None
+    if seed <= 0:
+        raise SystemExit(f"{origin} 必须是正整数，收到 {raw!r}")
+    return seed
+
+
+def _resolve_repeat_seed(
+    args: argparse.Namespace, config: "RunConfig"
+) -> Tuple[Optional[int], Optional[str]]:
+    """[RELEASE_READINESS R1] 解析唯一的 repeat seed，返回 `(seed, source)`。
+
+    优先级 **CLI `--seed` > 环境变量 `ABFE_RANDOM_SEED` > 配置文件 `repeat_seed`**，
+    与 `RunConfig` 自己"命令行 > 配置文件 > 预设"的约定同向。三者都没给则返回
+    `(None, None)`：**刻意保留未显式设置 seed 时的历史行为**，不为旧 resume 偷补新
+    seed、不改动任何既有随机流。
+
+    ⚠️ [2026-09-01] 第三档**不静默生效**：只有配置文件写了 `repeat_seed`、而 CLI 与
+    env 都没给时，本函数 `SystemExit` 要求显式确认，而不是直接采用。理由见该分支注释
+    —— 那等于在用户没表态的情况下改掉一个既有 output 目录的随机流。
+    所以实际语义是「CLI/env 直接生效；config 需确认；都没有则保留历史行为」。
+
+    这个函数是唯一入口：解析结果由 `main()` 回写 `config.data["repeat_seed"]`，
+    所以 traditional 路径（读 `config.get("repeat_seed")`）与 IBS 路径（读局部
+    `_repeat_seed`）从此拿到的是同一个值，配置快照也不可能再声明一个管线没收到的 seed。
+    """
+    cli_seed = getattr(args, "seed", None)
+    if cli_seed is not None:
+        return _coerce_positive_seed(cli_seed, "--seed"), "cli:--seed"
+
+    env_raw = os.environ.get("ABFE_RANDOM_SEED")
+    if env_raw not in (None, ""):
+        return (
+            _coerce_positive_seed(env_raw, "ABFE_RANDOM_SEED"),
+            "env:ABFE_RANDOM_SEED",
+        )
+
+    cfg_raw = config.get("repeat_seed")
+    if cfg_raw not in (None, ""):
+        # 🔑 [2026-09-01] 配置文件里的 repeat_seed **不再静默采用**，要求显式确认。
+        #
+        # R1 要求"建立唯一 resolved seed、明确优先级"，但同一段还有一句同等重要的：
+        # 「保留未显式设置 seed 的历史行为；**不要为旧 resume 偷补新 seed 或更改随机流**。」
+        # 把 config 里的 repeat_seed 接进管线本身是对的（以前 IBS 管线根本收不到它，
+        # 配置快照会声明一个管线没用过的 seed）；但对一个**过去实际靠 env 或什么都不靠
+        # 跑出来的 output 目录**，现在突然开始用 config 里那个值，等于在用户没表态的
+        # 情况下改掉了它的随机流 —— 而随机流决定独立重复的身份。
+        #
+        # 所以这条路径改成 fail-closed：报清楚检测到什么、影响是什么、两条出路分别是
+        # 什么，由人来选。CLI `--seed` 与 `ABFE_RANDOM_SEED` 都是**显式意图**，不受影响。
+        _cfg_seed = _coerce_positive_seed(cfg_raw, "config repeat_seed")
+        raise SystemExit(
+            f"配置文件里写了 repeat_seed={_cfg_seed}，但命令行 --seed 和环境变量 "
+            "ABFE_RANDOM_SEED 都没给。\n"
+            "拒绝静默采用配置文件里的值：这个 output 目录过去可能是靠 env 或不带 seed "
+            "跑出来的，现在改用 config 的 seed 会改变随机流，而随机流决定"
+            "「独立重复」的身份（验收门要求 3 个独立重复且跨重复 σ ≤ 1 kcal/mol）。\n"
+            "两条出路，按你的真实意图选一条：\n"
+            f"  · 确实要用这个 seed  → 显式加 --seed {_cfg_seed}（或设 "
+            f"ABFE_RANDOM_SEED={_cfg_seed}）\n"
+            "  · 只想保持原样重跑  → 从配置文件里删掉 repeat_seed 键\n"
+            "（CLI/env 给了 seed 时本检查不触发；三者都不给时保留历史随机流，也不触发。）"
+        )
+
+    return None, None
+
+
 class RunConfig:
     """统一运行时配置，优先级：命令行 > 配置文件 > 预设"""
 
@@ -2494,6 +2710,8 @@ class RunConfig:
             preset["potential"] = args.potential
         if _flag_present("--dexp-params"):
             preset["dexp_params"] = args.dexp_params
+        if _flag_present("--remd-backend"):
+            preset["remd_backend"] = args.remd_backend
         if _flag_present("--decharge-method"):
             preset["decharge_method"] = args.decharge_method
         if _flag_present("--gro"):
@@ -2639,6 +2857,8 @@ class RunConfig:
             "only_complex_charging": False,
             "charging_rerun_dir": None,
             "charging_max_resident_contexts": None,
+            # PLAN_openmm_8_6_remd_backend.md §3 的目标默认值。
+            "remd_backend": free_energy_engine.REMD_BACKEND_DEFAULT,
             # [P1-17] Boresch attachment 腿 A′→A
             "only_boresch_attachment": False,
             "attachment_rerun_dir": None,
@@ -2771,6 +2991,41 @@ def _write_run_provenance(
         )
     # §13：阈值必须进 provenance，否则"当时用的哪套阈值"无从追溯。
     provenance["acceptance_thresholds"] = acceptance_thresholds_payload()
+
+    # 🔑 [2026-09-02] 软核族 / alpha 约定必须进**顶层** provenance。
+    #
+    # 缺这一条已经真的害过人：2026-09-02 拿独立参考真值给 stage2 做逐窗口误差
+    # 归因时，必须知道生产的 softcore 指数才能判断"中间态是否同一个哈密顿量"
+    # （端点与指数无关，中间态不是）。`run_provenance.json` 里查不到，只能翻某个
+    # 窗口的 `convergence.json.stage_protocol_key.payload.aces_softcore_params`
+    # 才挖出 `power_lj=[2,2]`。而 abfe_core 里那条注释（ALPHA_CONVENTION 处）
+    # 明写"写进 get_parameters_dict() → 进入协议指纹"，读起来像顶层可查。
+    #
+    # 记的是**类级约定 + 默认构造值**：alpha 数值可能被 optimize_alpha(n) 按态数
+    # 调整，所以逐 stage 的**有效**值仍以各 stage 的
+    # `stage_protocol_key.payload.aces_softcore_params` 为准 —— 这里显式给出指针，
+    # 不在顶层复制一份可能过期的数字。
+    try:
+        _sc_defaults = ACESoftcorePotential().get_parameters_dict()
+    except Exception as _sc_exc:  # 绝不让 provenance 记录本身打断运行
+        _sc_defaults = {"error": f"unavailable: {_sc_exc}"}
+    provenance["softcore_family"] = {
+        "class": "ACESoftcorePotential",
+        "alpha_convention": getattr(
+            ACESoftcorePotential, "ALPHA_CONVENTION", None
+        ),
+        "constructor_defaults": _sc_defaults,
+        "effective_values_are_per_stage": True,
+        "effective_values_location": (
+            "<stage>_convergence.json / final_results.json -> "
+            "stage_protocol_key.payload.aces_softcore_params"
+        ),
+        "why_it_matters": (
+            "λ 端点（λ=1 精确 LJ、λ=0 为 0）与 power_lj/power_coul 无关，"
+            "但**中间态**是不同的哈密顿量。拿外部参考做逐窗口对比前必须先对齐指数，"
+            "否则只有总量可比。见 docs/reference_data/README.md。"
+        ),
+    }
     if charge_protocol is not None:
         provenance["charge_protocol"] = charge_protocol
         provenance["charge_treatment"] = charge_protocol.get("charge_treatment")
@@ -2806,6 +3061,13 @@ def _write_run_provenance(
             )
     if co_alchemical_ions is not None:
         provenance["co_alchemical_ions"] = co_alchemical_ions
+    # PLAN_openmm_8_6_remd_backend.md §4.3：requested/resolved backend、原始与解析后
+    # OpenMM 版本、适配器协议版本、选择原因、交换算法都必须可审计地落盘。
+    # 🔑 用 config.get 而不是属性访问：旧的 provenance 消费者和测试里的 config stub
+    # 不一定有这个键，缺失时安静跳过，不能让新增字段炸掉既有 resume。
+    _remd_backend_provenance = config.get("_remd_backend_resolution")
+    if _remd_backend_provenance:
+        provenance["remd_backend"] = dict(_remd_backend_provenance)
     provenance["input_files"] = {
         "gro": config.get("gro"),
         "top": config.get("top"),
@@ -3197,12 +3459,10 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
     # 带 Boresch rebalance"。这里的判断本身沿用原有的 resume/指纹缓存逻辑，
     # 只是把触发时机提到了 source 分支之前，让所有来源都必然先有这一步。
     _n_equil_steps = config.get("n_equil_steps", 5_000_000)
-    _equil_fingerprint = _pre_equilibration_fingerprint(
-        pipeline.system, pipeline.ligand_indices, pipeline.temperature, pipeline.pressure,
-        positions=pipeline.positions,
-        box_vectors=pipeline.box_vectors,
-        requested_steps=_n_equil_steps,
-        barostat_protocol=pipeline.barostat_protocol,
+    # 🔑 [2026-09-01] 必须走 pipeline 的统一入口：它用**构造期冻结**的坐标并量化，
+    # 否则这里（PBC 修复之前）与 pre_equilibrate 内部（修复之后）算出的指纹永远不同。
+    _equil_fingerprint = pipeline.pre_equilibration_identity_fingerprint(
+        _n_equil_steps
     )
     if not config.reset and equilibrium_is_done(
         output_dir,
@@ -3497,6 +3757,20 @@ def parse_arguments():
     )
     parser.add_argument("--potential", default="softcore", choices=["softcore", "dexp"])
     parser.add_argument("--dexp-params", default=None, help="DEXP 参数文件 (JSON)")
+    # 🔑 [PLAN_openmm_8_6_remd_backend.md P0] REMD 采样后端选择。
+    # auto：环境与协议都合格时用官方 ReplicaExchangeSampler，否则回退 legacy 并记录原因。
+    # legacy：始终用本项目自带的相邻扫描 REMD（复现/回退用）。
+    # openmm：显式要求官方后端，任一检查不通过就在烧 GPU 之前报错，**不静默降级**。
+    # 当前官方适配器尚未实现，所以 auto 恒定解析为 legacy、openmm 恒定报错。
+    parser.add_argument(
+        "--remd-backend",
+        default=None,
+        choices=list(free_energy_engine.REMD_BACKEND_CHOICES),
+        help=(
+            "REMD 采样后端：auto（默认，自动判定并可回退）/ legacy（始终用旧引擎）/ "
+            "openmm（显式要求 OpenMM >= 8.6 官方采样器，不可用则报错）"
+        ),
+    )
     parser.add_argument(
         "--outer-lambda-local-residual-ibs",
         dest="outer_lambda_local_residual_ibs",
@@ -3530,6 +3804,14 @@ def parse_arguments():
         help="dual_lambda 去电荷阶段的实现方式：pme(默认，生产路线) 或 "
              "shadow_ibs(实验性 Shadow-Coulomb IBS，尚未经物理验证)",
     )
+
+    # 🔑 [RELEASE_READINESS R1] 独立重复的唯一 seed 入口。优先级
+    # --seed > ABFE_RANDOM_SEED > config 里的 repeat_seed；三者都不给则保留历史
+    # 随机流（不注入新 seed）。解析见 `_resolve_repeat_seed`。
+    parser.add_argument("--seed", type=int, default=None,
+                        help="独立重复的 repeat seed（正整数）。优先级高于 "
+                             "ABFE_RANDOM_SEED 与配置文件的 repeat_seed；"
+                             "不给则沿用历史默认随机流")
 
     # Boresch 相关
     parser.add_argument("--boresch", action=argparse.BooleanOptionalAction, default=None,
@@ -3574,6 +3856,20 @@ def parse_arguments():
     # Accept explicit OpenMM device specifications such as CUDA:1/OpenCL:0.
     # The base platform and DeviceIndex are validated by _build_platform_props.
     parser.add_argument("--platform", default="CUDA")
+    parser.add_argument(
+        "--allow-untrusted-stage-results",
+        action="store_true",
+        help=(
+            "把 stage 质量门（物理目标支撑度 / raw ESS 等 6 条）从"
+            "「中止流程」降级为「标记结果为 results_untrusted 并继续」。"
+            "证据一条不少地写进结果与日志，但带此标记的 ΔG **不得**作为可发布"
+            "结果——它的唯一用途是把流程推过复合物腿、跑到溶剂腿（溶剂腿是唯一"
+            "有独立参考真值 ΔG_LJ 能判断对错的地方；口径见 "
+            "docs/reference_data/README.md —— 与生产逐窗口可比的是 m2n2 的 "
+            "−6.581±0.256 kJ/mol，且为 no-LRC，别直接相减）。"
+            "默认关闭 = fail-closed。"
+        ),
+    )
 
     # ---- 膜受体体系（memtodolist §3.1/§3.2，B1）。默认 soluble，不传等于关闭 ----
     # ⚠️ 这里的 --system-type 是**环境类型**（soluble/membrane），决定用哪种
@@ -4222,6 +4518,18 @@ def run_post_analysis(args):
             apbs_correction = float(
                 _run_provenance.get("config", {}).get("apbs_correction_kJ_mol", 0.0) or 0.0
             )
+    # 🔑 [0831issue P2] note 必须跟着值一起从 provenance 恢复。以前值被恢复、note 却在
+    # 落盘处写成 `getattr(args, ...) or ""`，于是 `--analyze-only` 重跑会产出一个
+    # **非零 APBS 修正却没有任何来源说明**的结果文件，违背 provenance 可追溯口径。
+    # 与值同样的判据：只有本次显式传了 --apbs-correction-note 才用命令行的。
+    if _flag_present("--apbs-correction-note"):
+        apbs_correction_note = getattr(args, "apbs_correction_note", None) or ""
+    else:
+        apbs_correction_note = ""
+        if _run_provenance:
+            apbs_correction_note = str(
+                _run_provenance.get("config", {}).get("apbs_correction_note", "") or ""
+            )
 
     _production_qualification = _resolve_production_qualification_from_sources(
         complex_leg, solvent_leg, _run_provenance
@@ -4336,6 +4644,16 @@ def run_post_analysis(args):
         # 同时显式标记它是否已经烘焙进 complex_leg_delta_G_kJ_mol，避免下游
         # 消费者误以为这里恒为独立可加项而对 complex_delta_G 二次扣减。
         "boresch_correction_kJ_mol": float(dg_boresch),
+        # 🔑 [0831issue P2] 与 run_traditional_mode 的字段集对齐，让同一批工件经两条
+        # 路径产出的 JSON 可以逐字段比对。这里的 Boresch 修正由
+        # `calculate_boresch_analytical_correction` 直接给出标量，没有伴随的模型误差
+        # 估计（run_traditional_mode 那边来自 `apply_boresch_correction` 的 "error"），
+        # 所以显式写 None + 原因，而不是用 0.0 假装"误差为零"。
+        "boresch_correction_error_kJ_mol": None,
+        "boresch_correction_error_unavailable_reason": (
+            "analyze-only 从解析公式重算 Boresch 释放项，不经过 apply_boresch_correction，"
+            "拿不到其模型误差估计；该项按约定本就不并入 total_error_kJ_mol"
+        ),
         "constraint_identity": complex_leg.get("constraint_identity"),
         "charge_transfer_reservoir_correction": _reservoir_payload,
         "boresch_correction_already_included_in_complex_delta_G": bool(boresch_included_in_complex_dg),
@@ -4348,7 +4666,9 @@ def run_post_analysis(args):
         ),
         "delta_G_bind_uncorrected_kJ_mol": float(delta_g_bind_uncorrected),
         "apbs_correction_kJ_mol": float(apbs_correction),
-        "apbs_correction_note": getattr(args, "apbs_correction_note", None) or "",
+        # [0831issue P2] 与 apbs_correction 同源解析（见上方 _flag_present 分支），
+        # 不再无条件回落到本次 CLI 参数。
+        "apbs_correction_note": apbs_correction_note,
         "delta_G_bind_kJ_mol": float(final_dg),
         "delta_G_bind_kcal_mol": float(final_dg / 4.184),
         "total_error_kJ_mol": final_err,
@@ -4599,15 +4919,10 @@ def run_traditional_mode(config: RunConfig):
         charge_treatment=config.get("charge_treatment"),
     )
     _trad_n_equil_steps = config.get("n_equil_steps", 5_000_000)
-    _trad_equil_fingerprint = _pre_equilibration_fingerprint(
-        traditional_baseline.system,
-        traditional_baseline.ligand_indices,
-        traditional_baseline.temperature,
-        traditional_baseline.pressure,
-        positions=traditional_baseline.positions,
-        box_vectors=traditional_baseline.box_vectors,
-        requested_steps=_trad_n_equil_steps,
-        barostat_protocol=traditional_baseline.barostat_protocol,
+    # 🔑 [2026-09-01] 必须走 pipeline 的统一入口：它用**构造期冻结**的坐标并量化，
+    # 否则这里（PBC 修复之前）与 pre_equilibrate 内部（修复之后）算出的指纹永远不同。
+    _trad_equil_fingerprint = (
+        traditional_baseline.pre_equilibration_identity_fingerprint(_trad_n_equil_steps)
     )
     if not config.reset and equilibrium_is_done(
         output_dir,
@@ -4679,6 +4994,9 @@ def run_traditional_mode(config: RunConfig):
     log.info("🔄 开始传统复合物腿 REMD + MBAR (n_lambda=%d, n_steps=%d)",
              config.n_lambda, config.n_steps_per_window or 500000)
     complex_results = complex_pipeline.run_full(
+        allow_untrusted_stage_results=bool(
+            config.get("allow_untrusted_stage_results", False)
+        ),
         n_lambda=config.n_lambda,
         n_steps_per_leg=config.n_steps_per_window or 500000,
         boresch_correction=0.0,
@@ -4722,15 +5040,10 @@ def run_traditional_mode(config: RunConfig):
         forcefield_family=config.get("forcefield_family"),
         charge_treatment=config.get("charge_treatment"),
     )
-    _solv_equil_fingerprint = _pre_equilibration_fingerprint(
-        solvent_baseline.system,
-        solvent_baseline.ligand_indices,
-        solvent_baseline.temperature,
-        solvent_baseline.pressure,
-        positions=solvent_baseline.positions,
-        box_vectors=solvent_baseline.box_vectors,
-        requested_steps=_trad_n_equil_steps,
-        barostat_protocol=solvent_baseline.barostat_protocol,
+    # 🔑 [2026-09-01] 必须走 pipeline 的统一入口：它用**构造期冻结**的坐标并量化，
+    # 否则这里（PBC 修复之前）与 pre_equilibrate 内部（修复之后）算出的指纹永远不同。
+    _solv_equil_fingerprint = (
+        solvent_baseline.pre_equilibration_identity_fingerprint(_trad_n_equil_steps)
     )
     if not config.reset and equilibrium_is_done(
         _solv_runtime_dir,
@@ -4766,6 +5079,9 @@ def run_traditional_mode(config: RunConfig):
     log.info("🔄 开始传统溶剂腿 REMD + MBAR (n_lambda=%d, n_steps=%d)",
              config.n_lambda, config.n_steps_per_window or 500000)
     solvent_results = solvent_pipeline.run_full(
+        allow_untrusted_stage_results=bool(
+            config.get("allow_untrusted_stage_results", False)
+        ),
         n_lambda=config.n_lambda,
         n_steps_per_leg=config.n_steps_per_window or 500000,
         boresch_correction=0.0,
@@ -4805,9 +5121,15 @@ def run_traditional_mode(config: RunConfig):
         apbs_correction_kJ_mol=apbs_correction,
     )
     delta_g_bind = cycle["delta_G_bind_kJ_mol"]
-    total_err_bind = float(
-        np.sqrt(float(cycle["total_error_kJ_mol"]) ** 2 + err_boresch**2)
-    )
+    # 🔑 [0831issue P2] `err_boresch` 不再并入 total_error。
+    # `abfe_core.combine_binding_free_energy` 的 docstring 是唯一约定：
+    # "Boresch 解析释放项与 APBS 都是确定性解析量，没有独立采样方差，不并入。"
+    # 这里原来单独加了一次平方和，于是同一批工件经 `run_traditional_mode` 与
+    # `run_post_analysis --analyze-only --mode traditional` 会得到**两个不同的 ±**，
+    # 跨 seed 的 SEM 与文献比较口径随之漂移。现在两条路径都用 cycle 的口径；
+    # `err_boresch` 仍作为独立字段落盘（`boresch_correction_error_kJ_mol`），
+    # 需要它的下游自己按解析模型误差处理，不混进统计误差棒。
+    total_err_bind = float(cycle["total_error_kJ_mol"])
 
     final = {
         "complex_leg": complex_results,
@@ -4843,8 +5165,24 @@ def run_traditional_mode(config: RunConfig):
 # ---------------------------------------------------------------------------
 # 复合物 charging-only 隔离重跑
 # ---------------------------------------------------------------------------
-def _load_frozen_stage_result(path: str, expected_stage: str) -> Dict:
-    """Load a completed stage as a read-only input for an isolated rerun."""
+def _load_frozen_stage_result(
+    path: str,
+    expected_stage: str,
+    expected_temperature_K: Optional[float] = None,
+) -> Dict:
+    """Load a completed stage as a read-only input for an isolated rerun.
+
+    🔑 [0831issue P2] `expected_temperature_K` 关掉"混温候选"这个缺口。
+    `--only-complex-charging` / `--only-boresch-attachment` 会把这份冻结 stage 与
+    **本次**新采样的结果求和，而新采样侧的指纹两边都用本次温度、恒过；冻结侧的
+    `protocol_key.payload.temperature_K` 一直在手上却从不比对。于是
+    "stage2/预平衡跑完后改 `--temperature` 300→310 再 `--resume --only-*`" 会产出一份
+    跨温度非法求和的 `final_binding_results_candidate.json`（kBT 差约 3%），且无任何告警。
+    对照组 `_analyze_dual_leg_artifacts` 早就有同样的硬校验。
+
+    不一致 → 直接拒绝。字段缺失 → 大声告警但不阻断：那只说明这份工件来自记录该字段
+    之前的版本，硬拒会连带堵掉合法的旧工件重跑。
+    """
     if not os.path.isfile(path):
         raise FileNotFoundError(f"缺少冻结的 {expected_stage} 结果: {path}")
     with open(path, encoding="utf-8") as handle:
@@ -4857,17 +5195,43 @@ def _load_frozen_stage_result(path: str, expected_stage: str) -> Dict:
         value = result.get(key)
         if not isinstance(value, (int, float)) or not np.isfinite(float(value)):
             raise RuntimeError(f"冻结结果 {path} 的 {key}={value!r} 非法")
+    if expected_temperature_K is not None:
+        frozen_temp = (
+            ((result.get("protocol_key") or {}).get("payload") or {})
+            .get("temperature_K")
+        )
+        if frozen_temp is None:
+            log.warning(
+                "⚠️ 冻结 %s 结果没有记录 temperature_K（%s）：无法核对它与本次 "
+                "--temperature=%.4f K 是否一致。若这份工件是在别的温度下采的，"
+                "把它与本次新采样求和是跨温度非法组装。",
+                expected_stage, path, float(expected_temperature_K),
+            )
+        elif not np.isclose(
+            float(frozen_temp), float(expected_temperature_K), rtol=0.0, atol=1e-6
+        ):
+            raise RuntimeError(
+                f"冻结 {expected_stage} 的采样温度 {float(frozen_temp)} K 与本次 "
+                f"--temperature={float(expected_temperature_K)} K 不一致（{path}）。"
+                "两者会被求和进同一个 ΔG_bind，kBT 口径不同即非法组装；"
+                "请用原温度重跑，或换一个新的 --output 目录重新采样。"
+            )
     return result
 
 
-def _load_frozen_stage2_boresch(output_dir: str) -> Dict:
+def _load_frozen_stage2_boresch(
+    output_dir: str, expected_temperature_K: Optional[float] = None
+) -> Dict:
     """Use the exact restraint Hamiltonian that produced frozen Stage 2."""
     stage2_path = os.path.join(
         os.path.abspath(output_dir),
         "checkpoints",
         "stage2_vanishing.json",
     )
-    stage2 = _load_frozen_stage_result(stage2_path, "vanishing")
+    # [0831issue P2] 顺带核对冻结 Stage 2 的采样温度，见 _load_frozen_stage_result。
+    stage2 = _load_frozen_stage_result(
+        stage2_path, "vanishing", expected_temperature_K=expected_temperature_K
+    )
     params = (
         ((stage2.get("protocol_key") or {}).get("payload") or {}).get(
             "boresch_params"
@@ -5018,11 +5382,15 @@ def _run_boresch_attachment_only(
     from ibs_engine import run_boresch_attachment_leg
 
     source_dir = os.path.abspath(config.output)
+    # [0831issue P2] 冻结两阶段必须与本次 --temperature 同温，否则求和跨温度非法。
+    _expected_temp_K = float(config.temperature)
     stage1 = _load_frozen_stage_result(
-        os.path.join(source_dir, "checkpoints", "stage1_decharging.json"), "decharging"
+        os.path.join(source_dir, "checkpoints", "stage1_decharging.json"), "decharging",
+        expected_temperature_K=_expected_temp_K,
     )
     stage2 = _load_frozen_stage_result(
-        os.path.join(source_dir, "checkpoints", "stage2_vanishing.json"), "vanishing"
+        os.path.join(source_dir, "checkpoints", "stage2_vanishing.json"), "vanishing",
+        expected_temperature_K=_expected_temp_K,
     )
     solvent_path = os.path.join(source_dir, "solvent_leg", "final_results.json")
     if not os.path.isfile(solvent_path):
@@ -5232,7 +5600,10 @@ def _run_complex_charging_only(
     source_dir = os.path.abspath(config.output)
     stage2_path = os.path.join(source_dir, "checkpoints", "stage2_vanishing.json")
     solvent_path = os.path.join(source_dir, "solvent_leg", "final_results.json")
-    stage2 = _load_frozen_stage_result(stage2_path, "vanishing")
+    # [0831issue P2] 见 _load_frozen_stage_result：拒绝跨温度组装。
+    stage2 = _load_frozen_stage_result(
+        stage2_path, "vanishing", expected_temperature_K=float(config.temperature)
+    )
     if not os.path.isfile(solvent_path):
         raise FileNotFoundError(f"缺少冻结的 solvent 最终结果: {solvent_path}")
     with open(solvent_path, encoding="utf-8") as handle:
@@ -5562,24 +5933,46 @@ def main():
         run_post_analysis(config)
         return
 
-    _repeat_seed_raw = os.environ.get("ABFE_RANDOM_SEED")
-    _repeat_seed = None
-    if _repeat_seed_raw not in (None, ""):
-        try:
-            _repeat_seed = int(_repeat_seed_raw)
-        except ValueError as exc:
-            raise SystemExit(
-                f"ABFE_RANDOM_SEED 必须是正整数，收到 {_repeat_seed_raw!r}"
-            ) from exc
-        if _repeat_seed <= 0:
-            raise SystemExit("ABFE_RANDOM_SEED 必须是正整数")
+    # 🔑 [RELEASE_READINESS R1] 唯一 resolved seed。以前这里只读环境变量，而
+    # traditional 路径读 `config.get("repeat_seed")`、RunConfig 又会保留配置文件里的
+    # `repeat_seed` —— 用户在 JSON 里写了 seed，配置快照记着它，IBS 管线却根本没收到。
+    # 现在集中解析一次并回写 config.data，两种模式与配置快照从同一个值出发。
+    _repeat_seed, _repeat_seed_source = _resolve_repeat_seed(args, config)
+    if _repeat_seed is not None:
         # Include the resolved repeat seed in the immutable runtime snapshot;
         # the backend's derived map is added after each leg completes.
         config.data["repeat_seed"] = _repeat_seed
+        config.data["repeat_seed_source"] = _repeat_seed_source
+        log.info(
+            "🎲 resolved repeat_seed=%d（来源：%s）；两腿/预平衡/attachment/采样统一使用该值",
+            _repeat_seed,
+            _repeat_seed_source,
+        )
+    else:
+        # 未显式设置 —— 保留历史行为（各处沿用自己的默认常量），不偷补新 seed。
+        log.info(
+            "🎲 未显式设置 repeat_seed（--seed / ABFE_RANDOM_SEED / config 均未给）；"
+            "沿用历史默认随机流，不注入新 seed"
+        )
     dexp_params = _load_dexp_params_fail_closed(
         config.potential,
         config.dexp_params,
     )
+    # 🔑 [PLAN_openmm_8_6_remd_backend.md P0] 后端只在这里解析一次（§3 实施要求 6），
+    # 位置刻意选在建立任何 Context / 写任何轨迹之前：显式 --remd-backend openmm 而
+    # 环境或适配器不合格时必须在烧 GPU 之前 SystemExit，不能跑到一半才发现。
+    # 采样开始后不得再重新解析或换引擎。
+    try:
+        _remd_resolution = free_energy_engine.resolve_remd_backend(
+            config.get("remd_backend")
+        )
+    except free_energy_engine.UnsupportedRemdBackendError as exc:
+        raise SystemExit(str(exc)) from exc
+    except ValueError as exc:
+        raise SystemExit(f"--remd-backend 取值非法：{exc}") from exc
+    log.info(_remd_resolution.format_log())
+    # 存进 config.data 供 provenance 落盘；下划线前缀表示它是解析产物而非用户配置。
+    config.data["_remd_backend_resolution"] = _remd_resolution.to_provenance()
     if not config.ligand:
         log.error("未提供配体残基名称。请通过 --ligand 或配置文件中的 ligand 指定。")
         sys.exit(2)
@@ -6270,7 +6663,11 @@ def main():
     # restr_pull_decouple.mdp 由**同一份** restrinfo 生成(678)。
     if config.only_complex_charging or config.only_boresch_attachment:
         _mode = "charging-only" if config.only_complex_charging else "attachment-only"
-        boresch_restraint = _load_frozen_stage2_boresch(output_dir)
+        # [0831issue P2] 这两个 only-* 入口会把冻结 Stage 2 与本次新采样求和，
+        # 所以在这里就把温度一致性挡住（详见 _load_frozen_stage_result）。
+        boresch_restraint = _load_frozen_stage2_boresch(
+            output_dir, expected_temperature_K=float(config.temperature)
+        )
         log.info(
             "🔒 %s：rebalance 之前就采用冻结 Stage 2 的 Boresch Hamiltonian "
             "(r0=%.6f nm)，不读取/重估 boresch_simple.json",
@@ -6341,6 +6738,11 @@ def main():
         pipeline, outer_lambda_runtime is not None
     )
     complex_results = pipeline.run_full_pipeline(
+        # 🔑 [2026-09-01] 质量门放行开关（见 --allow-untrusted-stage-results）。
+        # 不传的话 _last_run_config 里就是 False，行为与之前完全一致（fail-closed）。
+        allow_untrusted_stage_results=bool(
+            config.get("allow_untrusted_stage_results", False)
+        ),
         decoupling_scheme=config.decoupling,
         potential_type=config.potential,
         dexp_params=dexp_params,
@@ -6350,12 +6752,9 @@ def main():
         resume=config.resume and not config.reset,
         run_equilibration=not equilibrium_is_done(
             output_dir,
-            expected_fingerprint=_pre_equilibration_fingerprint(
-                pipeline.system, pipeline.ligand_indices, pipeline.temperature, pipeline.pressure,
-                positions=pipeline.positions,
-                box_vectors=pipeline.box_vectors,
-                requested_steps=config.get("n_equil_steps", 5_000_000),
-                barostat_protocol=pipeline.barostat_protocol,
+            # 🔑 [2026-09-01] 同上：走统一入口，口径与 pre_equilibrate 内部一致。
+            expected_fingerprint=pipeline.pre_equilibration_identity_fingerprint(
+                config.get("n_equil_steps", 5_000_000)
             ),
             # [P1-07] checkpoint 以目标 Simulation 的真实 loadCheckpoint 成功为准。
             simulation=_checkpoint_probe_simulation(pipeline),
@@ -6389,6 +6788,10 @@ def main():
         refine_max_window_span_kJ=config.get("refine_max_window_span_kJ", 35.0),
         pilot_finite_difference_delta=config.get("pilot_finite_difference_delta", 0.01),
         pilot_n_steps_per_state=config.get("pilot_n_steps_per_state", 10000),
+        # 🔑 [0831issue P2] abfe_config.json 把这个键文档化成可用开关，但 main() 从来
+        # 没透传过 —— 用户按注释设成正整数后一个 shadow 诊断都不会写，却毫无提示。
+        # None（默认）时 abfe_pipeline 侧行为不变，不产生任何 shadow 诊断。
+        pilot_shadow_checkpoint_interval=config.get("pilot_shadow_checkpoint_interval"),
         ibs_lse_log_residual_tolerance=config.get(
             "ibs_lse_log_residual_tolerance", 0.5
         ),
@@ -6573,15 +6976,10 @@ def main():
         resume=config.resume and not config.reset,
         run_equilibration=not equilibrium_is_done(
             solvent_out_dir,
-            expected_fingerprint=_pre_equilibration_fingerprint(
-                pipeline_solv.system, pipeline_solv.ligand_indices, pipeline_solv.temperature,
-                pipeline_solv.pressure,
-                positions=pipeline_solv.positions,
-                box_vectors=pipeline_solv.box_vectors,
-                requested_steps=config.get("n_equil_steps", 5_000_000),
-                # 溶剂腿永远是 soluble（§3.2：溶剂腿继续用普通 MonteCarloBarostat），
-                # 所以这里的 payload 恒为 None，指纹与改动前一致。
-                barostat_protocol=pipeline_solv.barostat_protocol,
+            # 🔑 [2026-09-01] 同上：走统一入口。溶剂腿永远是 soluble
+            # （§3.2：继续用普通 MonteCarloBarostat），barostat payload 恒为 None。
+            expected_fingerprint=pipeline_solv.pre_equilibration_identity_fingerprint(
+                config.get("n_equil_steps", 5_000_000)
             ),
             # [P1-07] checkpoint 以目标 Simulation 的真实 loadCheckpoint 成功为准。
             simulation=_checkpoint_probe_simulation(pipeline_solv),
@@ -6612,6 +7010,10 @@ def main():
         refine_max_window_span_kJ=config.get("refine_max_window_span_kJ", 35.0),
         pilot_finite_difference_delta=config.get("pilot_finite_difference_delta", 0.01),
         pilot_n_steps_per_state=config.get("pilot_n_steps_per_state", 10000),
+        # 🔑 [0831issue P2] abfe_config.json 把这个键文档化成可用开关，但 main() 从来
+        # 没透传过 —— 用户按注释设成正整数后一个 shadow 诊断都不会写，却毫无提示。
+        # None（默认）时 abfe_pipeline 侧行为不变，不产生任何 shadow 诊断。
+        pilot_shadow_checkpoint_interval=config.get("pilot_shadow_checkpoint_interval"),
         ibs_lse_log_residual_tolerance=config.get(
             "ibs_lse_log_residual_tolerance", 0.5
         ),

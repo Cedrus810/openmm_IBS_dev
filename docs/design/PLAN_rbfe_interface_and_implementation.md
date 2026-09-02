@@ -1,7 +1,69 @@
 # RBFE 接口与代码实现计划
 
-日期：2026-08-31  
-状态：仅设计；按用户要求采用大模块化，给出职责、依赖方向、接口契约和未来验收标准。本次不新增 Python 模块、不修改生产代码，不代表当前已有可运行的 RBFE 引擎。
+日期：2026-08-31（撰写）／2026-08-31（状态复核）  
+状态：**R0 完成；R1-R4 未开始。**
+
+## 0. 实施状态（2026-08-31）
+
+| 阶段 | 状态 | 说明 |
+|---|---|---|
+| **R0** | ✅ **完成** | `rbfe_core.py` + `runrbfe.py`（validate/combine/template），65 条测试 |
+| R1 | ⬜ NOT_STARTED | 映射与 hybrid builder |
+| R2 | ⬜ NOT_STARTED | 采样契约已就绪（REMD 计划 P2′），但那层**尚未接进生产** |
+| R3 / R4 | ⬜ NOT_STARTED | |
+
+### 模块落地情况（§4 的四个大模块）
+
+| 模块 | 状态 |
+|---|---|
+| `rbfe_core.py` | ✅ 已建（R0 部分：数据契约 + 验证 + ΔΔG 汇总） |
+| `free_energy_engine.py` | 🟡 已建：后端选择器（P0，已接线）+ 共用采样契约（P2′，未接线）；见 [REMD 后端计划](PLAN_openmm_8_6_remd_backend.md) §0 |
+| `rbfe_pipeline.py` | ⬜ 不存在 |
+| `runrbfe.py` | ✅ 已建（R0 部分：validate / combine / template） |
+
+### R0 已完成
+
+`rbfe_core.py`（新建，2026-08-31），不 import openmm、不建 System、不碰 GPU：
+
+* **数据契约**：`LigandEndpoint` / `EnvironmentSpec` / `ProtocolSpec` / `EdgeSpec`
+  （§5.1 的身份字段，含输入 sha256、质子化态、立体化学、部分电荷来源）；
+  `EdgeSpec.manifest()` 产出 §7 的 `edge_manifest.json` 内容
+* **验证**：`validate_edge()` 实现 §2 首版范围拒绝——净电荷变化、同电荷带电配体
+  （两条独立判据）、膜体系、质子化态改变、A→A 自边、未声明的身份字段、非法协议。
+  错误信息保留「这是本项目首版的范围限制，不是 RBFE 方法不支持」的区分
+* **诚实的未检查清单**：环断裂/闭合、手性反转、共价配体、互变异构等需要原子映射
+  才能判定，R0 查不了，一律进 `ValidationReport.unchecked`，**不让 PASS 被读成
+  「全都查过了」**
+* **ΔΔG 汇总**：`combine_rbfe()` 实现 §3 符号约定（`complex − solvent`，与 ABFE
+  的 `solvent − complex` 相反）+ §7 误差传播（独立时方差相加；有协方差时
+  `−2Cov`；传播后方差为负时**报错而不是 clamp 到 0**）+ 两腿身份校验
+* R1/R2 的 `prepare_edge` / `build_hybrid_leg` / `analyze_leg` 一律
+  `raise NotImplementedError`——§4.1 明令不提供「尚未实现但返回成功」的占位实现
+* `tests/test_rbfe_core_r0.py`：46 条，按 §8 的 R0 验收标准组织
+
+### R0 的 CLI（已完成）
+
+`runrbfe.py`，不 import openmm、不启动 GPU：
+
+* `validate --config edge.json [--json]`——加载 + schema 校验 + R0 验证。
+  **未知字段一律拒绝**（`temperature_kelvim` 这种 typo 静默忽略会用默认温度跑完全程）。
+  `--json` 时 stdout 只有 JSON，人类可读文本走 stderr，可直接 `| jq`。
+* `combine --complex-json --solvent-json [--covariance]`——两腿 ΔΔG，
+  验证符号与误差传播
+* `template`——打印一份**本身就能通过验证**的边配置模板
+* `prepare` / `run` / `analyze` 注册为子命令但**明确报错退出**（退出码 3），不假装成功
+* 三种退出码可区分：0 通过 / 2 输入被拒绝 / 3 尚未实现
+* `tests/test_runrbfe_cli.py`：19 条
+
+### 前置依赖现状
+
+R2 需要的共用采样契约（`SamplingRequest` / `SamplingArtifacts` / `run_sampling`）
+**已经写好并测过**，见 REMD 计划 P2′。但它**还没接进生产**——ABFE 那三个
+`REMDManager` 调用点仍走老路。R2 可以直接对着这层契约写，不必等 OpenMM 升级；
+真正被 8.6 阻塞的只有官方适配器（P1）。
+
+**§8 仍未满足的硬前提**：配体 B 的结构／参数至今没有提供，也没有指定公开基准
+配体对（§8 原话：不能根据 Atenolol 文件名猜测 B）。这是 R3 的前提，不是实现细节。
 
 ## 1. 是否需要
 

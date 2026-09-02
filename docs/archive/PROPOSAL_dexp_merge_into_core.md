@@ -1,8 +1,48 @@
 # 提案：把 `dexp_NEW.py` 合并进 `abfe_core.py`，并隔离退役的 Orb 拟合代码
 
-日期：2026-07-29
-状态：**提案，未实施**。不改默认势（生产保持 `potential = softcore`）。
+> **📦 已归档（2026-08-31）。** 本提案的六条改动**全部实施完毕**，随后又被
+> MEM-00h（softcore cutoff 改 1.0）和发布整理（退役 fitter 整体删除、基线作废）覆盖。
+> 保留原文只为追溯当初的决策依据；**不是待办，不要再照着做**。
+> 现状以第 0 节「实施状态」为准，正文其余部分是 2026-07-29 的原貌。
+
+日期：2026-07-29（撰写）／2026-08-31（状态复核）
+状态：**已全部实施并已被现实推进覆盖。本文件转为历史提案，不再是待办。**
+生产默认势仍是 `potential = softcore`（提案目标之一，保持住了）。
 关联：[`../experiments/DEXP_KERNEL_PHYSICS_ISSUES.md`](../HISTORY_LOG.md) §1 / §2 / §6.7 / §12
+
+## 0. 实施状态（2026-08-31 逐条核对源码）
+
+第 4 节的六条改动**全部落地**：
+
+| 提案条目 | 现状 | 位置 |
+|---|---|---|
+| 4.1 DEXP 契约收窄到 alpha/beta | ✅ | `abfe_core.py:6941 DEXPSurrogatePotential` |
+| 4.1 `from_dict` 先拒未知键 | ✅ 拒未知键 + `DEXP_LEGACY_FIT_KEYS` fail-closed | `abfe_core.py:96`、`:7023`、`:7033-7035` |
+| 4.1 四个模块级常量 | ✅ 数值与提案一致（0.70/0.20/0.10/0.70） | `abfe_core.py:81-84` |
+| 4.1 `_validate_minimum_image` 搬进 core 并调用 | ✅ | 定义 `abfe_core.py:6344`，调用 `:9215` |
+| 4.1 静电 cutoff 不再读 `surrogate_potential.cutoff_distance` | ✅ 改读 `GAUSS_COUL_CUTOFF_NM` | `abfe_core.py:9284`、`:9302` |
+| 4.2 软化力读自己的常量 | ✅ | `ibs_engine.py:44-45` import，`:4069-4070` 使用 |
+| 4.3 退役 Orb 拟合隔离 | ✅ **但做法不同，见下** | — |
+| 4.4 删拟合入口 + 堵 fail-open | ✅ `--fit-dexp`/`--save-dexp`/`fit_dexp_parameters` 零命中；fail-closed 加载器已建 | `runabfe.py:2401 _load_dexp_params_fail_closed`，调用点 `:5357`、`:5579` |
+| 4.5 删 `dexp_NEW.py` | ✅ 文件不存在；`tests/test_dexp_new_production.py`、`tests/smoke_test_dexp_baseline.py` 都还在 | — |
+
+### 现实与提案不一致的三处（以现实为准）
+
+1. **没有 `dexp_退役.py`／`dexp_retired.py`**。`Orbv3SurrogateFitter`、`OrbScanner`、
+   `Orbv3SurrogatePipeline`、`Orbv3DEXPFittingPipeline`、`run_orbv3_dexp_fitting`
+   **在本工程区分支里被整体删除**，不是搬进独立文件——2026-08-31 的发布整理把研究期
+   harness（含 `dexp_experiment.py`）一并移出本分支。§4.3 关于非 ASCII 文件名的顾虑
+   因此不再适用。原文保存在 `Atenolol-rank11` 工作区。
+2. **§4.2 的 `SOFTCORE_CUTOFF_NM` / `SOFTCORE_SWITCH_NM` 不是 1.2/1.0**。
+   提案写的是「把裸魔数 1.2/1.0 提成常量、数值不变」；实际后来 MEM-00h 把非 DEXP 分支
+   统一到基础力场的 **1.0 nm、无 switching**（`ibs_engine.py:210 SOFTCORE_CUTOFF_NM = 1.0`，
+   `switch_nm` 特意设成等于 cutoff 让 LJ 尾项积分区间宽度为 0）。另有
+   `abfe_core.py:92 BEUTLER_SOFTCORE_CUTOFF_NM = 1.0`。DEXP 分支的 0.70/0.20 不受影响。
+   **§4.2 的「数值保持现状」目标已被一次独立的物理决策覆盖，不是回归。**
+3. **§2/§4.0 的「基线逐位不变」验收对象已作废**。ΔG_bind = −5.54 ± 0.60 kcal/mol
+   （复合物腿 181.00 / 溶剂腿 157.84）来自 `output_lrc_fix/`，该目录不在本分支，
+   且这条可溶基线线已于 2026-08-24 判定作废（协议错误）。
+   **§6 第 2 条「基线不动证明」无法也不需要再执行。** 其余五条验证仍然有效。
 
 ---
 

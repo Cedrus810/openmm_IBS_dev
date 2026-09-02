@@ -39,6 +39,10 @@
 
 ## 首先修复的两个具体问题
 
+> **状态（2026-09-01）：R1、R2 均已修复**，见下方各自的「处置」小节与
+> 「第九轮审查 backlog」B 组。行为测试在 `openmm_dev` 环境下通过；
+> 仍未做的是 R1 验收清单里的 "首次运行/resume" 真机场景与 seed ledger 落盘对账。
+
 ### R1：配置中的种子与 IBS 主入口实际传参不一致
 
 位置：`runabfe.py:2343`、`runabfe.py:5462`、`runabfe.py:6083`、
@@ -66,6 +70,16 @@ ABFE_RANDOM_SEED 未设置时，main._repeat_seed = None
 验收：JSON 单独指定、环境变量单独指定、冲突优先级、traditional/IBS、首次运行/resume
 都有行为测试；结果快照与 backend seed ledger 一致。
 
+**处置（2026-09-01，已修）**：新增 `_resolve_repeat_seed(args, config)` 作为唯一入口，
+优先级 **`--seed` > `ABFE_RANDOM_SEED` > config `repeat_seed`**（与 `RunConfig` 自身
+"命令行 > 配置文件 > 预设"同向）；解析结果由 `main()` 回写 `config.data["repeat_seed"]`，
+所以 traditional 路径（读 `config.get("repeat_seed")`）与 IBS 路径（读局部 `_repeat_seed`）
+从此是同一个值，配置快照不可能再声明一个管线没收到的 seed。同时落
+`config.data["repeat_seed_source"]` 并在启动日志打印 resolved 值与来源。
+非正整数在启动期 `SystemExit`。三者都不给时返回 `(None, None)` ——
+**刻意保留未显式设置 seed 时的历史随机流，不偷补新 seed**。
+新增 `--seed` CLI 参数。已实测四种优先级组合与三类非法输入。
+
 ### R2：状态锁把 PermissionError 判成进程已退出
 
 位置：`abfe_pipeline.py:1295`。
@@ -82,6 +96,19 @@ ABFE_RANDOM_SEED 未设置时，main._repeat_seed = None
 补充锁创建后尚未写 PID 的竞争场景测试。
 
 验收：活进程、已退出进程、权限不足、锁元数据写入中、不同主机、竞争清理均有测试。
+
+**处置（2026-09-01，已修）**：三处一起收紧，方向统一为"只在**能证明**锁已无主人时才删"。
+
+1. `_pid_is_alive` 按三类分开处理：`ProcessLookupError` → 确认不存在（唯一算 stale 的信号）；
+   `PermissionError` → 进程存在、只是不属本用户 → 算活着；其它 `OSError` → 判不了 → 算活着。
+2. 建锁与写 PID 之间的竞态：读到空/不可解析 payload 时不再立即判 stale，
+   要求该文件 mtime 已老于 `_EMPTY_PAYLOAD_GRACE_S`（30 s）——正常竞态窗口是微秒级，
+   宽限期足以覆盖，同时仍能清理"建锁后被 kill -9"留下的空壳。
+3. 共享文件系统：payload 改为 JSON `{"pid", "hostname"}`（仍兼容旧的裸整数写法），
+   hostname 与本机不一致时一律视为"还活着"，**绝不删别的节点的锁**；
+   写入后加一次 `fsync`，保证别人判断得了归属。
+
+正常路径（无竞争时的获取/释放）行为不变，只改变"判不了"时的默认。
 
 ## 发布前应补齐的交付项
 
@@ -111,7 +138,7 @@ ABFE_RANDOM_SEED 未设置时，main._repeat_seed = None
 ### 带电 charge-transfer 仍是条件性阻塞
 
 `abfe_core.py:663` 起显式设置实验状态，C4/C5 均为 False。
-`docs/status/BUGFIX_HANDOFF_2026-08-29.md:601` 说明仍缺真实带电体系扫描 artifact。
+`docs/status/BUGFIX_HANDOFF_2026-08-29.md:601`（在 `Atenolol-rank11`，**不在本仓**）说明仍缺真实带电体系扫描 artifact。
 双腿 reservoir-release correction 的校验与汇总接口已经接入；**接口存在不等于
 修正已经测量，更不等于生产资格成立**。
 
@@ -195,6 +222,164 @@ software_version + protocol_versions + input_identity + actual_seed_ledger
 限制：当前解释器找不到 OpenMM、SciPy、PyMBAR、pytest 和 ruff。
 没有安装/升级依赖，没有运行完整 pytest、ruff、wheel 安装验证或 CPU/GPU MD。
 不能根据本次评估声称最新修复已通过数值与真实体系回归。
+
+> **2026-09-01 补充：** 上面这条限制针对的是 08-31 那次评估的解释器环境。
+> `openmm_dev` 环境（`/home/ruigengji/miniforge3/envs/openmm_dev`）可用，
+> 该环境下 `tests/` 全套为 **1568 passed / 0 failed / 5 skipped / 3 xfailed / 1 xpassed**
+> （2026-09-01 最终一次干净全量运行，162 s；改动前基线 1515 passed）。
+> R1、R2 与并入的 P2 backlog 已在该环境下逐批验证，见上方「第九轮审查 backlog」。
+> **仍然没有任何 GPU / 真实体系回归**，wheel 安装验证与端到端 CLI 测试也仍未做——
+> 这两条限制不因 CPU 全套通过而解除。
+
+## 第九轮审查 backlog 已并入本文（2026-09-01）
+
+原 `Atenolol-rank11/0831issue.md` 是第九轮 7 路分片审查的清单，位于**旧工地目录**、
+不在主线库里。为免发布验收再去翻另一个仓库，把它的**剩余项**整体并到本文管理。
+
+### 并入时的账目核对（先说清数目，不照抄汇总）
+
+原文档「总汇总」写 **0 P0 / 13 P1 / 43 P2**。逐条点数后，真实情况是：
+
+| 项 | 汇总声称 | 实际正文 | 差异原因 |
+|---|---|---|---|
+| P1 | 13 | 13 | 一致；**已全部收口**（见下） |
+| P2 | 43 | **37** | `abfe_core` 分片的 5 条只有汇总行、**正文完全缺失**；`abfe_pipeline` 分片汇总写 7 条而正文只有 6 条 |
+
+所以 P2 的真实可执行清单是 **37 条**，另有 **5 条 abfe_core P2 无正文**、**1 条 pipeline P2 数目对不上**。
+`abfe_core.py` 分片在原文档的状态栏至今仍是「审查中」，却已被计入汇总——这一条本身
+就是发布验收的缺口：**不能把一份自己都没写完的清单当成"已审查过"的证据。**
+
+### P1：13 条全部处置完毕
+
+| 批次 | 结果 |
+|---|---|
+| 前 8 条（2026-08-31） | 5 已修（含 `IBS_BIAS_PROTOCOL_VERSION` 31→32）、2 误报、1 转交 4w53-21 |
+| 后 5 条（2026-09-01） | 3 已修（含 `ESS_GATE_PROTOCOL_VERSION` 3→4）、1 误报、1 加固（当前不可达） |
+
+合计：**8 已修、3 误报、1 加固、1 转交**。逐条依据与数值复核留在 `0831issue.md`（在 `Atenolol-rank11`，**不在本仓**）的两个
+回填小节里，不在本文重复。三条与发布直接相关的结论：
+
+* `_compute_geom_gradients` 的键角解析梯度错了 **130%~200%**（原报告写 +29%），
+  经 `--boresch-source auto` / `orb_simple` 到达，直接决定 `kthetaA/kthetaB`。
+* residual 臂的混合覆盖度门此前用错口径（物理 `u_kn` 配 sampling-gauge `f_k`）。
+  ΔG 不受影响，但 **EXP-030 candidate 臂的收敛门读数在修复前不可引用**。
+* 传统 REMD "resume 清空 DCD" 是误报：`_steps_completed` 没有任何从盘恢复的入口，
+  截断是调用方主动作废旧采样后的正确行为。已在测试里钉住这个前提。
+
+### P2：本轮处置结果（37 条）
+
+**已修 30 条 / 加标注 4 条 / 明确暂缓 3 条。** 全量 `tests/`：**1568 passed / 0 failed / 5 skipped**
+（含本轮新增 53 条回归；改动前基线是 1515 passed）。
+
+以下按"改了什么行为"分组，只列发布相关的判断，逐条位置见 `0831issue.md`（在 `Atenolol-rank11`，**不在本仓**）正文。
+
+> 📄 **两件本节没有、只在归档技术报告里的东西**：
+> [archive/TECH_REPORT_0831issue_P2_2026-09-01.md](archive/TECH_REPORT_0831issue_P2_2026-09-01.md)
+> 的 **§7** 给了 `ESS_GATE_PROTOCOL_VERSION` 3→4 为什么不作废缓存的完整论证；
+> **§8** 逐条记了改动期间调整的 5 处既有测试锚点（原锚点、为什么改、断言是更强
+> 还是更弱）——那是判断「有没有偷偷放松测试」的唯一记录。
+
+**A. 会算错数的（已修，7 条）**
+
+* `abfe_preoptimizer` CDF 构造：`xp[-1] = 1.0` 事后覆盖把最后一个区间宽度从 `w[N-2]`
+  变成 `w[N-2]+w[N-1]`，λ[N-2] 权重双重计入。改为用前 N-1 个权重按自身和归一化，
+  末端天然为 1.0（实测最后一段 0.65 → 0.53，两处副本同改）。
+* `_reduced_energies_for_record`：LJ 尾项系数用"记录列布局位置"索引，而系数按物理 λ
+  态编址。当前生产者写恒等布局故不可达，但任何非恒等布局都会静默把尾项配错 λ。
+* `pme_offset_charge_square_sum`：`Σq(λ)²` 只算 `λ²Σscale²`，隐含"base 电荷为 0"。
+  前提成立但无守护，已就地断言（否则改成分段去电荷时两腿同错、循环里不抵消）。
+* `_normalize_softcore_params`：`n_lj <= 0` 会让 λ=0 态的 LJ 尾项系数被静默置零，改为拒绝。
+* `_collect_shadow_cross_exclusions`：跨组 1-4 静电在背景力与 shadow 力**两边都不算**。
+  Atenolol 非共价 → 当前为 0 影响；改为 fail closed，共价体系不会静默少一项。
+* `_safe_boresch_ramp`：灾难判据 `abs(总势能) > 1e5` 对 7 万原子盒恒真（−5e5~−1e6 量级），
+  一旦重新接线会把全部正常体系判失败。改判 ΔE。
+* `analyze_gradient_and_optimize_path`：仍用 `Var(U_group1)` 而非 `beta²Var[dU/dλ]`，
+  且 NaN 样本被替换成前值/0.0 后继续计入方差。已按 **PHY-08 同等处置** fail-closed
+  （唯一调用者 `run_preoptimization` 自身零调用方，生产不可达），NaN 改为丢弃。
+
+**B. 口径 / 契约不一致（已修，10 条）**
+
+* **R1（本文原有条目）**：seed 解析三处不统一。新增 `--seed`，优先级
+  `--seed > ABFE_RANDOM_SEED > config.repeat_seed`，集中解析后回写 `config.data`，
+  IBS 与 traditional 从同一个值出发；三者都不给时**保留历史随机流**，不注入新 seed。
+  同时落 `repeat_seed_source`，配置快照不可能再声明一个管线没收到的 seed。
+* **R2（本文原有条目）**：`_pid_is_alive` 的 `PermissionError` 分支不可达（`OSError` 子类
+  写在后面），"判不了"被当成"已退出"。改为只有 `ProcessLookupError` 算 stale；
+  同时修掉建锁与写 PID 之间的竞态（空 payload 需老于宽限期才判残留），
+  并把 payload 改成含 hostname 的 JSON（兼容旧裸 PID），**绝不删别的节点的锁**。
+* `run_full_abfe_loop` 溶剂腿拿不到 repeat-seed contract（`seed_ledger` 恒 None，
+  两条腿不是同一 repeat 的独立腿）。已透传 `repeat_seed`/`leg_name`。
+* traditional 两条路径对同一批工件报两个不同的 ±：`err_boresch` 只加在一条路径上。
+  按 `combine_binding_free_energy` docstring 的唯一约定（解析量不并入）统一为不并入，
+  `boresch_correction_error_kJ_mol` 仍作独立字段落盘；analyze-only 侧补齐同名字段
+  （显式 `None` + 原因，不用 0.0 假装误差为零）。
+* `--only-complex-charging` / `--only-boresch-attachment` 不校验冻结腿采样温度，
+  可拼出跨温度非法求和（kBT 差 ~3%）。已在 `_load_frozen_stage_result` 一处集中比对：
+  不一致拒绝，字段缺失则大声告警（不硬拒，免得堵掉合法旧工件）。
+* `_strip_unit_suffix` 接受 `_deg` 却按弧度消费（释放项错约 57 倍）→ 直接拒绝
+  （与 P1 #5 在 `format_boresch_json` 的处置同源）。
+* `pilot_shadow_checkpoint_interval` 在 `abfe_config.json` 文档化为可用开关，
+  `main()` 从不透传 → 已透传（两条腿）。
+* `--analyze-only` 恢复了 APBS 修正值却把 `apbs_correction_note` 重置为空 → 与值同源恢复。
+* `CUDA:N` 写法跳过预平衡/再平衡的显式 Context 释放（裸 `== "CUDA"` 匹配不上）→ 用 base 名比较。
+* REMD 种子域 phase 硬编码 `"charging"`（该类同时服务 mixed/vanishing）→ 改为可注入，
+  **默认值不变**（改字符串就是改随机流，属协议变更）。
+
+**C. 落盘 / 日志 / 可审计性（已修，13 条）**
+
+* 同进程第二条腿的日志：`logging` FileHandler 每次**追加**从不摘除（第 N 条腿的行写 N 遍、
+  第一条腿的文件继续收后面的行），stdout tee 又用 `isinstance` 短路导致第二条腿根本不装 tee
+  （它的裸 print 全进第一条腿的文件、自己的 `pipeline.log` 几乎是空的）。改为进程级单例
+  「摘旧挂新 + tee retarget」，已实测两条腿各自干净分离、无重复。
+* 独立端点 walker 记录与湿种子缓存改**原子写**（`_atomic_save_npz`），读取侧加损坏容错
+  （截断 npz 以前会让每次 resume 都崩且指不出该删哪个文件）。
+* 2D 测地线寻径失败会静默回退对角线线性路径，返回值与成功路径**无法区分**，
+  次优路径被当成功结果写进 `geodesic_path.json` 并被后续 run 复用。现在寻径 provenance
+  （`fallback` / `fallback_reason` / `magnitude_gate_dropped_edges`）一起落盘 + 告警。
+* 测地线 `|g| > 1e7` 量级闸门弃边数已计入诊断（**阈值未动**——动它会改已验证路径的数值）。
+* `window_overlap_records` 与 `local_results` 两个 append 放进同一原子块，
+  消除"进了落盘统计却没进协方差链"的孤儿窗口。
+* split-half σ 膨胀：缺证据窗口以前静默 `floor=0.0`（看不出哪些窗口其实无实测），
+  现在逐窗口 `sigma_floor_unavailable` + 汇总名单/计数；并显式标注 `df_k` 与
+  `endpoint_error_after_offset` **仍是 MBAR-only 口径**
+  （逐窗口 σ 下界无法无歧义映射到逐态 df_k，随手缩放等于编误差棒）。
+* `top1pct_raw_weight` 在 N<100 时退化成"最大单帧"（阈值 0.35 按 N≈330–430 校准）：
+  落盘 `n_top_frames` 与 `degenerate_max_single_frame` 标注。**门的行为未改**——
+  置 not-evaluable 同样 fail-closed，并不能让小样本窗口通过，真正的修法是门的重新设计。
+* 在线 early-stop 的 `step_at_check` 加回 resume 前已完成步数（纯诊断标签）。
+* `diagnose_force_breakdown` 标注为"近似重建"：丢 switching / λ 电荷 offset /
+  配体内部清零，Group-12 `max|F|` 可能被幻影项主导、误导爆炸源定位。
+* 三个 decharging builder 的 `frozen_ll_pairs` 收集后从不读取——**P0-01 赖以成立的
+  「既有 L–L exception 已冻结」这个前提此前零守护**。已加共享断言：逐对复核 chargeProd
+  与改写前一致、且没有任何 λ offset 指向它们。
+* attachment 腿 `n_samples` 的 `max(2, ...)` 下限会让实跑步数**超过设定**且 split-half
+  每半只剩 1 帧 → 改为直接拒绝该参数组合（生产 250000/1000 不受影响）。
+* 软核告警块每个 λ 态重复打印（K=23 时刷 23 行，淹掉真告警）→ 只打一次。
+* `generate_overlapping_windows` docstring 示例与实测不符（银行家舍入，
+  `(8,13)` 实为 `(7,13)`）→ 已改正并写明原因。
+* 模块常量被捕获为函数默认值（`VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS` 历史 2→6→4）
+  → 默认 `None`、函数体内读当前值，与校验方同源。
+
+**D. 明确暂缓（3 条，都需要先做决定，不是漏掉）**
+
+| 条目 | 为什么不在本轮做 |
+|---|---|
+| 主/生产窗口 checkpoint manifest 与窗口级缓存门不含 repeat-seed 身份 | 往这三处指纹加字段会**作废现有 GPU checkpoint**。生产确实启用 seed_ledger，所以条件插入也躲不开冷启动代价。属于需要用户明确批准的协议变更（先例：`IBS_BIAS_PROTOCOL_VERSION` 32 那次） |
+| `build_ibs_dual_system` 的 WCA 力与软核 CV 排除表不一致（WCA 用 `softcore_excl`，CV 用 `full_softcore_excl`；`build_shadow_bridge_system` 口径相反） | 改排除表会**改变能量**。原条目自评置信度低、"后果未验证"，且生产正在跑。需要先在最小体系上量化两种口径的能量差再决定，不能盲改 |
+| `compute_boresch_attachment_u_kn` / `attachment_convergence_diagnostics` 零调用方 | 这是 #79 的 attachment 收敛诊断（round-trip 硬门、⟨U_B⟩ 单调性），**当前不在线上执行**。接线＝新增硬门（协议变更、要定阈值）；删除有 att27 先例但 #79 未被撤销。已在源码就地写明这个决定点，不擅自二选一 |
+
+### 仍缺的两件事（发布验收口径）
+
+1. **`abfe_core.py` 分片没审完。** 原文档状态栏是「审查中」，5 条 P2 只有汇总行、无正文。
+   本文上方「五个文件分别应补什么」把 `abfe_core.py` 的职责定为"集中最终结果资格与协议登记"，
+   而这个文件恰恰是唯一没有分片正文的。补审它属于预览版前的工作。
+2. **本轮全部是 CPU/静态验证。** 1515 passed 是完整 CPU 全套（不是静态清点），但
+   **没有任何 GPU 运行验证**。受影响最需要真机复验的三处：
+   * residual 臂混合覆盖度门换口径后，EXP-030 candidate 臂的门读数（`ess_gate_mixture_gauge`
+     应为 `sampling_states`）；
+   * 三个 decharging builder 新增的 `frozen_ll_pairs` 断言（若它在真实体系上触发，
+     说明 P0-01 的前提本来就不成立，那是一个需要立刻处理的发现，不是这次改动的回归）；
+   * 两条腿同进程时的 `pipeline.log` 分离（已用最小复现验证，未在真实两腿运行上确认）。
 
 ## 建议执行顺序
 

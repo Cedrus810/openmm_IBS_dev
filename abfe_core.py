@@ -8462,8 +8462,21 @@ class OrbBoreschEstimator:
             q[i + 1] = np.arccos(cosA)
             sinA = np.sqrt(1 - cosA**2) + 1e-10
             if sinA > 1e-3:
-                dbda = (cosA * bc / nbc - ba / nba) / (nba * sinA)
-                dbdc = (cosA * ba / nba - bc / nbc) / (nbc * sinA)
+                # 🚨 [0831issue #4] 这两行原来把两个端点的分子写反了：
+                #     dbda = (cosA*bc/nbc - ba/nba)/(nba*sinA)   ← 错
+                #     dbdc = (cosA*ba/nba - bc/nbc)/(nbc*sinA)   ← 错
+                # 正确的解析梯度是（θ = 顶点 b 处 ba 与 bc 的夹角）：
+                #     ∂cosθ/∂a = (1/|ba|)·(bc/|bc| − cosθ·ba/|ba|)
+                #     ∂θ/∂a    = −(1/sinθ)·∂cosθ/∂a
+                #              = (cosθ·ba/|ba| − bc/|bc|) / (|ba|·sinθ)
+                # 即端点 a 的分子必须是 **自己那条边的单位向量** 乘 cosθ 再减
+                # 对边单位向量；端点 c 同理镜像。旧式把两个分子互换后又各自保留
+                # 了原来的 1/|ba| vs 1/|bc| 缩放，两处错误不互相抵消。
+                # 有限差分复核（随机构型 5 组，eps=1e-6）：旧式相对误差
+                # 130%~200%，新式与 FD 一致到 ~1e-9。顶点项 −dbda−dbdc 依赖平移
+                # 不变性，因此端点错时顶点同样错。
+                dbda = (cosA * ba / nba - bc / nbc) / (nba * sinA)
+                dbdc = (cosA * bc / nbc - ba / nba) / (nbc * sinA)
                 grads[i + 1, sa, :] = dbda
                 grads[i + 1, sb, :] = -dbda - dbdc
                 grads[i + 1, sc, :] = dbdc
@@ -10512,6 +10525,13 @@ class SolventLegRunner:
         if self._cached_system is None:
             raise RuntimeError("请先调用 build_solvent_system 构建溶剂系统")
         
+        # 🔑 [0831issue P2] repeat-seed contract 是**构造参数**（ABFEPipeline 在
+        # __init__ 里据此建 Exp019SeedLedger），不是 run_full_pipeline 的参数。
+        # 调用方（run_full_abfe_loop）把它放在 pipeline_kwargs 里传过来，所以这里
+        # 必须 pop 出来交给构造函数，否则会以未知 kwarg 撞进 run_full_pipeline。
+        pipeline_kwargs = dict(pipeline_kwargs)
+        _repeat_seed = pipeline_kwargs.pop("repeat_seed", None)
+        _leg_name = pipeline_kwargs.pop("leg_name", None)
         pipe = ABFEPipeline(
             system=self._cached_system,          # ✅ 修复：传入有效 system
             topology=self._cached_topology,
@@ -10525,6 +10545,8 @@ class SolventLegRunner:
             charge_transfer_reservoir_correction=pipeline_kwargs.get(
                 "charge_transfer_reservoir_correction"
             ),
+            repeat_seed=_repeat_seed,
+            leg_name=_leg_name,
         )
         # ✅ 移除 decoupling_scheme 硬编码，透传用户配置
         return pipe.run_full_pipeline(**pipeline_kwargs)

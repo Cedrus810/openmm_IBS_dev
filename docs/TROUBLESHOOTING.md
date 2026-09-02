@@ -16,15 +16,55 @@
 python -c "import openmm; print(openmm.__version__)"
 ```
 
+### `--openmm-cache-only` 下仍然警告「GROMACS 力场 include 目录找不到」
+
+**这条警告在 `--openmm-cache-only` 下是噪音，可以忽略。** 2026-09-02 实测（原始记录
+见 [archive/RUNTIME_ISSUES_2026-09-02.md](archive/RUNTIME_ISSUES_2026-09-02.md)）。
+
+原因：`runabfe.py:6034` 的 `find_gmx_include_dir(config.gmx_path)` 在
+`if args.openmm_cache_only:` 分支**之前**就无条件执行了，所以即使这一路根本不需要
+include 树，警告也照样打。
+
+它确实用不到——三条路径逐个查过：
+
+| 用到 `include_dir` 的地方 | cache-only 下会不会真用 |
+|---|---|
+| `main_cache_identity`（`:6055`） | ❌ 不会，身份取自 `validate_openmm_cache_only` 的审计结果 |
+| `system_cache_exists(...)`（`:6061`） | ❌ 不会，`or` 短路，`openmm_cache_only=True` 时整个调用不执行 |
+| `load_native_system(gmx_include_dir=...)`（`:6071`） | ❌ 不会，见下 |
+
+`load_native_system` 里只有两处会用它，cache-only 下都到不了：
+`:2260` 的 `.top` 重建要求 `require_bonded_topology`，而 cache-only 在 `:6037`
+就明确拒绝膜体系；`:2265` 的 `.top` 降级只在 `topology is None`（mmCIF 缓存损坏）
+时触发，而 `validate_openmm_cache_only`（`:1077`）已经先把 mmCIF 的存在性和哈希
+验过并 fail-closed。
+
+⟹ **在审计通过的缓存上，`include_dir` 一次都不会被解引用。**
+
+> 想彻底消掉这条警告，要把 `:6034` 那次调用挪进 `else` 分支。对 cache-only
+> 路径行为中立。**尚未做**，登记在 [TODO.md](TODO.md)《未关闭的代码缺陷》。
+
+顺带一个**独立**的坑：本仓 `abfe_config.json` 的 `gmx_path` 写的是
+`/home/ruigengji/gmx26.0C`，**该路径不存在**。它是这条警告的直接触发原因，
+但即使路径写对了、上面的分析也不变。真要跑非 cache-only 的路径，先修这个值
+（前缀和 `share/gromacs/top` 两种写法都能吃，见下面《GROMACS include 文件找不到》；
+问题只是这个路径本身不存在）。
+
 ### GROMACS include 文件找不到
 
-检查 `--gmx-path` 是否指向包含 `.ff` 文件夹的目录，例如：
+`--gmx-path`（或 `config.gmx_path`）**两种写法都接受**：
 
 ```text
-/path/to/gromacs/share/gromacs/top
+/path/to/gromacs                      # 安装前缀 —— 会自动往下找 share/gromacs/top、top
+/path/to/gromacs/share/gromacs/top    # 直接给力场目录
 ```
 
-也可设置 `GMXDATA`，让代码自动尝试 `$GMXDATA/top`。
+给前缀时的自动定位是 `runabfe.py:557` `find_gmx_include_dir` 第 1 步做的，
+只在「前缀本身不是一个已填充的 include 目录」时才往下找，所以不会改变任何
+原本就能解析成功的输入。
+
+四条显式入口，先到先得：`--gmx-path` → `$GMXLIB`（值本身就是力场目录，不拼 `top`）
+→ `$GMXDATA`（力场在其 `top/` 下）→ PATH 上的 `gmx` 反推 `share/gromacs/top`。
 
 ### 找不到配体残基
 
@@ -55,6 +95,22 @@ output/decharging/decharging_pme_u_kn.npy
 output/vanishing/dual_window_*_energies.npy
 ```
 
-### 结果里的 `thermodynamic_cycle` 和缺陷清单冲突
+### 结果里的 `thermodynamic_cycle` 字段和当前口径冲突
 
-这是历史 provenance 文本缓存造成的已知问题。当前 README 和 `status/AUDIT_STATUS.md` 的结论优先（`PHYSICS_DEFECTS.md` 已被 `status/AUDIT_STATUS.md` 取代，文件已不存在）：APBS 不替代 LJ tail correction，手动 PME self `+C*lambda^2` 不作为生产修正项，`Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS`（不是 `Delta G_complex - Delta G_solvent`）。如果手头的 `output/final_binding_results.json`/`thermodynamic_cycle.md` 是在这几处文档修正之前生成的，其中的 `delta_G_bind_kJ_mol` 符号可能是反的，`thermodynamic_cycle` 字段文本也会是旧版本——重新跑一遍复合物腿+溶剂腿的最终汇总（不需要重新采样，只要 `complex_results`/`solv_results` 能从缓存加载）即可刷新成当前约定。
+这是历史 provenance 文本缓存造成的已知问题。**当前口径以本仓库的代码为准**
+（下面三条都能在源码里查到，不依赖任何已迁出本分支的文档）：
+
+- `Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS`
+  ——**不是** `Delta G_complex - Delta G_solvent`；
+- APBS 修正**不替代** LJ tail correction，两者各自独立记账；
+- 手动 PME self 项 `+C*lambda^2` **不作为生产修正项**。
+
+如果手头的 `output/final_binding_results.json` 是在这几处口径修正之前生成的，
+其中 `delta_G_bind_kJ_mol` 的符号可能是反的、`thermodynamic_cycle` 字段文本也是
+旧版本。**不需要重新采样**：只要 `complex_results`/`solv_results` 能从缓存加载，
+重跑一次最终汇总即可刷新成当前约定。
+
+> 早期版本的本节曾让读者去查 `status/AUDIT_STATUS.md`、`PHYSICS_DEFECTS.md`、
+> `thermodynamic_cycle.md`。**这三份都不在本工程区分支**（原文在
+> `Atenolol-rank11`，登记在 [HISTORY_LOG.md](HISTORY_LOG.md)），且其中
+> `PHYSICS_DEFECTS.md` 当时就已被取代。上面三条口径已经把需要的结论直接写在这里。

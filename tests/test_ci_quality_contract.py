@@ -10,6 +10,9 @@ RUNTIME_MODULES = (
     ROOT / "abfe_core.py",
     ROOT / "abfe_pipeline.py",
     ROOT / "abfe_preoptimizer.py",
+    # 2026-08-31 新增的生产模块，纳入同一套质量契约。
+    ROOT / "free_energy_engine.py",
+    ROOT / "rbfe_core.py",
 )
 
 

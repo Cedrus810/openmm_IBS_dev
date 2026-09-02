@@ -40,10 +40,25 @@ def test_the_retired_switch_is_rejected_loudly():
     assert "已废弃" in src[i:i + 400]
 
 
-def test_vanishing_without_enough_windows_fails_closed():
-    """窗口数不足以拆出端点段时必须 fail-closed，不得退回纯 IBS。"""
+def test_endpoint_segment_is_opt_in_and_still_fails_closed_when_requested():
+    """[2026-09-01 用户决定] 独立端点段默认不跑；**显式请求**时前提不满足仍 fail-closed。
+
+    这条契约取代了旧的 "vanishing 阶段必须启用独立端点段"。改动理由：该装置在
+    复合物腿上是最大单项耗时（8 条逐态轨迹、约 90 分钟、整段不打日志），而它的
+    判据（count_cavity_waters）把探针锚在会漂移的幽灵配体上——λ_vdw→0 时配体只
+    被 Boresch 松弛系着，实测同一 0.24 nm 探针内蛋白重原子比水还多，所以那个
+    观测量在复合物腿上根本不是状态函数，没有判别力。
+
+    关掉它的代价必须留在代码里、不能静默：末窗口回到 IBS 单轨迹重加权，而那条
+    路径在**溶剂腿**上被证明采不到「水塌进配体空腔」的构型。
+    """
     src = (REPO / "abfe_pipeline.py").read_text(encoding="utf-8")
-    assert "vanishing 阶段必须启用独立端点段" in src
+    # 1) 默认关闭，必须显式开关才启用
+    assert 'kwargs.get("stage2_independent_endpoint", False)' in src
+    # 2) 显式请求了、但窗口数不够 → 仍然 fail-closed，不许静默降级
+    assert "显式请求了独立端点段" in src
+    # 3) 关闭它的代价必须显式告知，不能只是跳过
+    assert "STAGE2_ROOT_CAUSE_2026-08-28.md §3.3" in src
 
 
 def test_bridge_rescue_cannot_overwrite_the_stitched_result():

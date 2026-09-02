@@ -118,8 +118,11 @@ class ChargingOnlySourceContractTests(unittest.TestCase):
         self.assertIn("return", between)
 
     def test_charging_only_bypasses_generic_boresch_resolver(self):
+        # [0831issue P2] 锚点从整行字面量改成函数名：该调用现在多行传
+        # expected_temperature_K（拒绝跨温度组装）。本测试要钉的是"frozen 分支在
+        # 通用 resolver 之前、且两者由 else: 分开"这个结构，不是调用的排版。
         frozen_branch = self.runner.index(
-            "boresch_restraint = _load_frozen_stage2_boresch(output_dir)"
+            "boresch_restraint = _load_frozen_stage2_boresch("
         )
         generic_resolver = self.runner.index(
             "boresch_restraint = resolve_boresch_restraint(config, pipeline)",

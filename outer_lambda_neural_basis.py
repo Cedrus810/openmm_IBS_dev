@@ -3725,14 +3725,24 @@ class IBSSamplerNeuralPathAdapter:
             getattr(self.sampler, "_energy_query_attempts", 0)
         ) + 1
         try:
+            # 🔑 [2026-09-02] 力组切分**不在本文件定义**。这里原本独立写了一份
+            # `{0,2,3,5}` / `{1,4}` 字面量，且不引用 `WCA_ACCOUNTING_VERSION` ——
+            # 切分一改、版本号升了，本文件的产物不会跟着失效，是真实的记账不一致
+            # 风险（力组决定"哪些能量算物理、哪些算纯采样偏置"）。
+            # 改为从唯一定义处取。**惰性 import**：本文件顶层刻意不依赖任何本仓库
+            # 模块（保持可独立导入），而调用时两个模块必然都已加载，无循环风险。
+            from ibs_engine import (  # noqa: PLC0415
+                IBS_E_BASE_FORCE_GROUPS,
+                IBS_E_BIAS_FORCE_GROUPS,
+            )
             base_state = self.sampler.context.getState(
-                getEnergy=True, groups={0, 2, 3, 5}
+                getEnergy=True, groups=set(IBS_E_BASE_FORCE_GROUPS)
             )
             base_energy = base_state.getPotentialEnergy().value_in_unit(
                 unit.kilojoules_per_mole
             )
             bias_state = self.sampler.context.getState(
-                getEnergy=True, groups={1, 4}
+                getEnergy=True, groups=set(IBS_E_BIAS_FORCE_GROUPS)
             )
             sampling_bias = bias_state.getPotentialEnergy().value_in_unit(
                 unit.kilojoules_per_mole

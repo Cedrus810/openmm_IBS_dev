@@ -114,14 +114,34 @@ Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS
 
 ## 并行与 GPU
 
-`--parallel-stages` 会尝试并行运行 decharging 和 vanishing。CUDA 下如果两阶段共用同一 GPU，代码可能回退为串行以避免上下文冲突。
+> ## 🛑 `--parallel-stages` 已于 2026-07-27 整体移除，**带上它会直接报错退出**
+>
+> `abfe_pipeline.py:9687` 一读到这个参数就 `raise RuntimeError`：
+>
+> ```text
+> --parallel-stages 已于 2026-07-27 整体移除。它此前被无条件禁用
+> （跨进程 warmup 失败反馈尚未序列化），并行分支与 spawn worker 都不可达；
+> 归档见 docs/archive/removed_parallel_stages.md。请去掉该参数，直接串行运行。
+> ```
+>
+> 本节早期版本给的是**两条可以直接复制粘贴、但现在必然失败的命令**
+> （带 `--parallel-stages` + `IBS_STAGE1/2_CUDA_DEVICE`）。已删除。
+> 为什么移除见 [archive/removed_parallel_stages.md](archive/removed_parallel_stages.md)
+> —— 它在移除之前就**早已被无条件禁用**，所以从来没有真正并行过。
+>
+> ⚠️ CLI 里那个 `--parallel-stages` 参数**还在**（`runabfe.py:4020`），
+> 保留的只是「几秒内明确失败」的守卫，不是功能。
 
-Linux shell 示例：
+**decharging 与 vanishing 现在一律串行。** 正常跑法就是不加任何并行参数：
 
 ```bash
-IBS_STAGE1_CUDA_DEVICE=0 IBS_STAGE2_CUDA_DEVICE=1 \
-python runabfe.py --config abfe_config.json --ligand MOL --resume --parallel-stages
+python runabfe.py --config abfe_config.json --ligand MOL --resume
 ```
+
+`IBS_STAGE1_CUDA_DEVICE` / `IBS_STAGE2_CUDA_DEVICE` 这两个环境变量是配合已移除的
+并行分支用的，串行路径下不起作用。要指定 GPU 用 `--platform CUDA` 加 OpenMM 自己的
+设备选择途径。
+
 
 Windows PowerShell 示例：
 

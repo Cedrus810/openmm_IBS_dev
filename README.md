@@ -9,9 +9,14 @@ ABFE-IBS 是一个基于 OpenMM、面向 GROMACS 输入的绝对结合自由能�
 `Atenolol-rank11` 工作区，本仓库只保留一份
 [历史材料 log](docs/HISTORY_LOG.md) 做索引。
 
-> 当前科学边界：截至 2026-08-12，软件与方法开发已经形成系统证据，但尚无可正式发表的
-> Atenolol 最终结合自由能。`output_lrc_fix` 的 `−23.1622 ± 2.5139 kJ/mol`
-> 是 `CANDIDATE`，不是最终结论。
+> 当前科学边界：截至 2026-09-02，主线体系是 **4W53（T4 lysozyme L99A + toluene）**。
+> λ-WCA 防护壳退役后热力学循环闭合到 **−21.36 ± 0.93 kJ/mol**（实验 −23.10，
+> 差 0.41 kcal/mol、1.83σ 内）。**但这是单 seed 结果**（`20260908`），本仓库内
+> 没有第二个独立重复，注册状态标签待维护者指定 —— 不能当最终结论引用。
+> 证据见 [BUG_LOCATION_stage2…](docs/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md)。
+>
+> 旧 Atenolol 主线（`output_lrc_fix` 的 `−23.1622 ± 2.5139 kJ/mol`）**已于
+> 2026-08-24 判定作废**，不得再引用；原始复核记录在 `Atenolol-rank11`。
 
 ## 从这里开始
 

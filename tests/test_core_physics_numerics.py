@@ -442,7 +442,23 @@ def test_ess_gate_is_mixture_coverage_and_raw_ess_is_diagnostic_only():
     # production-entry 占据门（ibs_engine.py:11361）保持不变。本条测试断言的三件事
     # ——受门量是扣掉共模的混合覆盖度、absolute_ess 阈值退役、raw 项只报告——
     # 与那次改动正交，故只更新版本号，语义断言原样保留。
-    assert result["ess_gate_protocol_version"] == 3
+    # v3 → v4（2026-09-01，0831issue）：混合覆盖度改用 sampling-state 能量口径
+    # （residual 臂的 f_k 就是在它上面学的）。baseline / 本用例的合成数据没有
+    # `sampling_state_energies` 键 → 走 "physical_targets" 口径，数值逐位不变，
+    # 故下面所有语义断言原样保留。
+    # v4 → v5（2026-09-01）：受门的 raw 权重退化量（`raw_min_absolute_ess` /
+    # `top1pct_raw_weight`）从"去相关后的子集"改到"去相关前的全帧集"。已逐条核对
+    # 下面的语义断言，全部仍然成立：
+    #   · 受门量仍是扣掉共模的混合覆盖度（`min_overlap_method` /
+    #     `ess_gate_metric` 都取自 `quality`，即去相关后那一份，未改）；
+    #   · `min_absolute_ess_threshold is None`（混合绝对 ESS 阈值退役）未改；
+    #   · raw 三项仍然落盘且非 None，只是**测的帧集**换了 —— 这恰恰是 v5 的要点，
+    #     不是把它们变回受门量（它们在 TARGET_SUPPORT_GATE 里一直是受门的，
+    #     那是另一道门，与本条断言的"ESS_GATE 自己的 absolute 阈值已退役"不冲突）。
+    # 新增的 `raw_*_post_decorrelation` 保留旧口径供历史产物对账。
+    assert result["ess_gate_protocol_version"] == 5
+    for record in result["window_overlap_diagnostics"]:
+        assert record["ess_gate_mixture_gauge"] == "physical_targets"
     # absolute_ess 仍然算、仍然落盘，但阈值必须是 None——它在构造上等于
     # min_ess_ratio × n_frames_decorrelated，不是第二份独立证据。阈值置 None 同时
     # 让 abfe_pipeline 侧两处"字段存在才检查"的镜像判据自动失活。

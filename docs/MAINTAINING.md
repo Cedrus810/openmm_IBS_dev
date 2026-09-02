@@ -1,45 +1,82 @@
 # 维护与修改代码
 
 [返回项目首页](../README.md) · [目录约定](../PROJECT_LAYOUT.md) ·
-[测试说明](../tests/README.md)
+[测试说明](../tests/README.md) · [文档导航](README.md)
 
-## 维护建议
+更新日期：**2026-09-02**
 
-修改代码后先做语法检查：
+## 改完代码先跑什么
+
+三档，从快到慢。前两档不需要 OpenMM。
+
+**1. 语法（秒级）**
 
 ```bash
-python -c "import ast, pathlib; files=['runabfe.py','abfe_pipeline.py','abfe_preoptimizer.py','ibs_engine.py','abfe_core.py']; [ast.parse(pathlib.Path(f).read_text(encoding='utf-8'), filename=f) for f in files]; print('syntax ok')"
+python -m py_compile abfe_core.py abfe_pipeline.py abfe_preoptimizer.py ibs_engine.py runabfe.py
 ```
 
-然后运行：
+**2. 离线全量（CPU，唯一的"最低验证"标准）**
+
+```bash
+./tests/run_offline_tests.sh                                  # 全部
+./tests/run_offline_tests.sh tests/test_core_physics_numerics.py   # 单文件
+```
+
+**3. 需要 OpenMM 的自检**
 
 ```bash
 python runabfe.py self-test
 ```
 
-如果 self-test 与 `status/AUDIT_STATUS.md` 的最新物理结论不一致，应更新测试和热力学循环文档，避免旧假设继续进入新 provenance。完整测试还需要 OpenMM、PyMBAR 和 pytest；缺少运行依赖时，语法检查通过不等价于端到端验证通过。
+`self-test`（`runabfe.py:3275` `run_self_tests`）会在缺依赖时逐项 `SKIP` 而不是
+报错——**看到 PASS 之前先确认没有一片 SKIP**，否则它什么也没验证。
 
-推荐下一步优先事项：
+> ⚠️ 语法检查通过 ≠ 端到端通过。GPU 相关行为（checkpoint 跨 platform 迁移、
+> CUDA 插件、REMD 显存）在 CPU 上一条都验不到。
 
-1. 在目标环境运行完整 `python -m pytest -q`，重点覆盖 fixed-H bank、native checkpoint、LRC 和 v12 冻结验证状态机。
-2. 在真实 GPU 上复验 v12 的 `calibrated_pending_validation` 续验和 fixed-H `lambda_shield` 同步修复。
-3. 对目标体系的最终配置做至少一次独立重复运行。
-4. 根据 stage diagnostics 判断是否需要进一步加密 vanishing 阶段窗口或增加采样；其余源码级 P2 以 `TODO.md` 为准。
+CI 跑的是哪些门见 [`.github/workflows/cpu-ci.yml`](../.github/workflows/cpu-ci.yml)：
+`py_compile` + `ruff check` + 对 CI 自维护文件的 `black --check`，再加离线测试。
 
+## 改完代码该更新哪份文档
 
-## 版本控制现状
+按"结论的出处"决定，不要新开平行的"当前状态"文档（[docs/README.md](README.md) 维护规则第 1 条）：
 
-本目录不是一个可用的 git 仓库：`.git/` 下只有一个空的 `info/` 子目录，没有
-`HEAD`/`refs`/`objects`，`git log`、`git status` 等命令会直接报错退出。不要假设
-可以用 git 历史核对改动时间线或找回旧版本；改动的时间线和依据只能靠文件 mtime 和
-`EXPERIMENT_LOG_*.md`/`IMPLEMENTATION_PLAN_*.md` 里的 DEC 记录追溯。
+| 改了什么 | 更新哪里 |
+|---|---|
+| 协议版本号、fail-closed 判据、物理口径 | 改动点的代码注释 + [TODO.md](TODO.md) 的《未关闭的代码缺陷》 |
+| 设计合同 / 提案的实施状态 | [design/README.md](design/README.md) 的状态表（**必须同步复核日期**） |
+| 发布阻塞项 | [RELEASE_READINESS_2026-08-31.md](RELEASE_READINESS_2026-08-31.md) |
+| 稳定用法 | [GETTING_STARTED.md](GETTING_STARTED.md) / [OUTPUTS_AND_RESUME.md](OUTPUTS_AND_RESUME.md) |
+| 新的科学结论、数值 | 见 docs/README.md 维护规则第 4 条：必须附来源、单位、符号、协议身份、有效性、是否可引用 |
 
-## 最低验证
+`README.md`/`README_cn.md`/`README_en.md` 的科学状态日期戳由
+`tools/diagnostics/check_doc_staleness.py` 盯着，契约测试是
+`tests/test_doc_staleness_contract.py`。
 
-```bash
-./tests/run_offline_tests.sh
-```
+> ⚠️ 那份契约测试里的 `test_snapshot_docs_are_not_stale` 带
+> `xfail(strict=True)`。**刷新三份 README 的日期戳时必须同时摘掉这个标记**，
+> 否则它会 XPASS 而 `strict=True` 把 XPASS 当失败报出来。这是刻意设计的握手：
+> 逼"文档已经刷新"被显式确认一次。
 
-新增测试只能放在 `tests/`；一次性诊断、修复和绘图脚本分别放入
-`tools/diagnostics/`、`tools/repairs/` 和 `tools/plots/`。历史补丁与源码副本只放
-`archive/`，不得被生产代码导入。
+## 版本控制
+
+本仓库是一个正常可用的 git 库（`master` 分支，起点 commit `eaf1c7e`
+"Initial cleaned ABFE IBS version"，2026-08-31 迁移建立）。
+
+> ⚠️ 已知环境问题：仓库在 NFS 上，文件属主 uid 与当前用户不一致，
+> **提交可能因权限失败**。这不是仓库损坏。
+
+2026-08-31 之前的改动**没有 git 历史可查**——那段时间线只能靠文件 mtime 和
+`Atenolol-rank11` 工作区里的 DEC 记录追溯（登记在
+[HISTORY_LOG.md](HISTORY_LOG.md)）。
+
+## 放文件的规矩
+
+完整规则见 [PROJECT_LAYOUT.md](../PROJECT_LAYOUT.md)《维护规则》。最常踩的三条：
+
+1. 新的自动化测试**只**放 `tests/`。
+2. 一次性诊断 → `tools/diagnostics/`；可复用修复 → `tools/repairs/`；
+   画图 → `tools/plots/`；验证 → `tools/validation/`。
+3. **旧源码副本、`*_bak`、`*_pre_patch` 一律不进本分支**，留在 `Atenolol-rank11`。
+   `docs/archive/` 只放文档，且其中 `removed_*.md` 是防回归凭证
+   （`tests/test_att27_dead_code_removed.py` 断言它们存在），**不能删**。
