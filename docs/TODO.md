@@ -38,7 +38,10 @@
 
 ## 膜受体–配体路线
 
-> 2026-08-31 发布整理并入，原文件 `docs/status/memtodolist.md`。
+> 2026-08-31 发布整理并入，原文件 `docs/status/memtodolist.md`（在 `Atenolol-rank11`，**不在本仓**）。
+>
+> ⚠️ 本仓库现在**也有**一个 `docs/status/` 目录，但里面只有按日期的运行期记录，
+> **没有** `memtodolist*.md`。别在本仓里找。
 
 
 更新日期：2026-08-11（**C3 与 MEM-00h 已正式关闭（用户确认），进入 C4**。
@@ -50,7 +53,7 @@ C3-0~C3-4 全部跑过一轮；co-ion/ParameterOffset 归因诊断完成；C3 pr
 状态：Phase B 工程实现基本完成；B5 已关闭。C1、C2、C3 已关闭；MEM-00h 已
 关闭。当前进入 C4。
 
-**已关闭事项的完整过程、失败证据和验收记录均已原文迁移到 `docs/status/memtodolist_archive.md`。**
+**已关闭事项的完整过程、失败证据和验收记录均已原文迁移到 `docs/status/memtodolist_archive.md`（在 `Atenolol-rank11`，**不在本仓**）。**
 
 
 ---
@@ -111,7 +114,7 @@ slab（无蛋白）不能代替这里的真实 receptor–ligand complex；C4 �
   全部现成）。`abfe_core.py`/`runabfe.py` 的 charge-transfer + 膜恒压器
   通用接线（`--only-complex-charging`、`--membrane-input-declaration`、
   co-ion dummy 插入）已经用这套中性体系验证过，从未在带电配体上跑过。
-- **真正的冲突**：`docs/status/memtodolist_archive.md`（2026-07-29）记录过一条决定——
+- **真正的冲突**：`docs/status/memtodolist_archive.md`（在 `Atenolol-rank11`，**不在本仓**）（2026-07-29）记录过一条决定——
   **"首个体系 = SERT（血清素转运体），配体默认净电荷 +1"**。但实际建出来
   并跑通的是上面这个 GPCR + 中性 Atenolol，跟当年那条决定不是同一个体系：
   SERT 从未真正建过膜体系（没有对应的 CHARMM-GUI 产物、没有嵌膜、没有跑过
@@ -250,11 +253,11 @@ slab（无蛋白）不能代替这里的真实 receptor–ligand complex；C4 �
 
 ## 未关闭的代码缺陷
 
-> 2026-08-31 发布整理并入，原文件 `docs/status/BUGFIX_HANDOFF_2026-08-29.md`。
+> 2026-08-31 发布整理并入，原文件 `docs/status/BUGFIX_HANDOFF_2026-08-29.md`（在 `Atenolol-rank11`，**不在本仓**）。
 
 
 > 2026-08-31 状态：40 项已修复并已拆分为 GitHub issue；1 项科学验证（PHY-03）挂起。
-> 已解决条目的完整交接内容已归档到 archive/patches/BUGFIX_HANDOFF_2026-08-29_resolved_issues.md。
+> 已解决条目的完整交接内容已归档到 `Atenolol-rank11/archive/patches/BUGFIX_HANDOFF_2026-08-29_resolved_issues.md`（在 `Atenolol-rank11`，**不在本仓**）。
 
 ### 给接手人的提醒
 
@@ -265,6 +268,103 @@ slab（无蛋白）不能代替这里的真实 receptor–ligand complex；C4 �
 缓存指纹和回归测试。
 
 ### 当前未完成项
+
+#### [ ] XFAIL-01（P2，标签错账）P1-19 的 C_seam 已修好，但 xfail 标记还挂着
+
+- 位置：`tests/test_charge_transfer_real_endpoints.py:453` 的
+  `@pytest.mark.xfail(strict=False)`，挂在
+  `test_vanishing_lambda_one_seam_matches_charging_lambda_zero` 上。
+- reason 自述「实测 118.5 kJ/mol（中性 4 原子 fixture）…… **修复后此标记应转
+  XPASS 并摘除**」。它**现在正是 XPASS**，但 `strict=False` ⟹ 套件不会提醒任何人摘。
+- **实测（2026-09-02）**：`tools/diagnostics/probe_p119_charge_transfer_seam.py`
+
+  ```
+  abs_delta_e = 3.63206042e-04 kJ/mol      ← 不是 118.5，小 5.51 个数量级
+  rel_delta_e = 1.807e-06                  (门 1e-05)
+  max|ΔF|分量 = 2.526e-06 kJ/mol/nm        (门 1e-03)
+  ```
+
+- **剩下这 3.6e-4 不是 seam 残余**：同文件
+  `test_bake_handoff_seam_matches_for_charged_ligand_with_realistic_geometry`
+  上方的注释精确描述过它——紧凑几何（配体 4 原子挤在 <0.2 nm 内）自带一个
+  「与几何基本无关的 ~0.0005 kJ/mol 绝对残差」，数值性的，不是 Hamiltonian
+  构造错误。量级吻合。**没有这条排除性说明，下一个人会以为 3.6e-4 是 seam 残余。**
+- **已排掉「fixture 绕过失效路径」**（这是「真修好」与「绕过去了」的唯一分界）：
+  `LIGAND_CHARGES_NEUTRAL_E = (0.5, 0.3, -0.4, -0.4)` 逐原子非零，
+  `LIGAND_ORDINARY_PAIRS = {(0, 3)}` 是真正的 ordinary L-L 对（未定义任何
+  exception、走标准 combining rule，q_i·q_j = −0.2 e²）⟹ 内部库仑真实存在、
+  **机制被触发**，但常数不见了。
+- **谁修的、什么时候修的：未知。** 跨会话核对过时间线，只能**排除**：不是
+  2026-09-02 那两个会话中的任何一个，也不是 λ-WCA 壳退役、也不是力组切分收敛
+  （`IBS_E_BASE_FORCE_GROUPS`/`IBS_E_BIAS_FORCE_GROUPS`）的连带效果——那天第一次
+  全套跑之前 seam 就已经 XPASS。⚠️ **"未知"就是未知**，不要把它写成「大概是某次
+  改动的连带效果」——那种猜测会被后人当结论。
+- 处置：摘掉 `:453` 那个标记。**低风险**（有上面的实测支撑）。摘之前顺手确认
+  P1-19 在 issue 追踪里的状态该不该一起关。
+
+#### [ ] XFAIL-02（P2，标签错账）另两个 xfail 的 reason 是错的：它们红在 D，不在 C
+
+- 位置：`tests/test_charge_transfer_real_endpoints.py:633` 与 `:822`
+  （`test_run_protocol_v2_matrix_cd_wiring_passes_on_charged_fixture`、
+  `test_run_protocol_v2_matrix_cd_normalizes_c2_style_switch_before_c_seam`）。
+- 两条的 reason 都写「同 …… 的 xfail 理由」，即都记在 P1-19 的 C_seam 失配上。
+  **这是错的。**
+- **实测（2026-09-02）**，复现方式
+  `python -m pytest tests/test_charge_transfer_real_endpoints.py --runxfail -q`，
+  两条的 `failed_frames` 完全一致：
+
+  ```
+  'failing': ['D:gate1_reference_identity,gate3_mixed_production_vs_reference']
+  ```
+
+  **前缀是 `D:`。整个输出里 `failing` 一次都没出现 `C:`** ⟹ C（seam）在这两条里
+  也是通过的，红的是 **D 端点**（全解耦：λ_coul≡0 且 λ_vdw=0）。
+- 讽刺的是 `:822` 那条测试名叫 `..._normalizes_c2_style_switch_before_c_seam`
+  ——它本身是为 C seam 写的，却卡在 D。
+- 为什么与 XFAIL-01 是**不同机制**：这两条的 fixture 是 `_case(1, n_dummies=1)`
+  （净电荷 +1 + reserved dummy），走完整 `run_protocol_v2_matrix_cd`，即
+  **co-alchemical charge-transfer** 路径（配体 +1 e → 0、co-ion 0 → +1 e、
+  flat-bottom 位置限制 k=100 kJ/mol/nm²）。失败的是 co-ion 在 λ=0 时的
+  reference identity 与 mixed(CPU)-vs-reference 一致性，跟「配体内部库仑常数」
+  没有关系。
+- ⚠️ **不是静默的生产 bug**：`charge_treatment=co_alchemical_charge_transfer`
+  本就 `production_qualified=False`，PHY-03（P1，见本节下方）仍挂着。属于
+  **已知未合格路径上的已知未合格行为**，只是被错标成了 P1-19。
+  **别当 P0 处理。**
+- 处置：重写这两条的 reason（照实写 D 端点 + co-ion），并重新定级——先判它到底
+  属于 PHY-03 的范围，还是一个独立条目。**这一步未做**，需要读 `gate1_reference_identity`
+  / `gate3_mixed_production_vs_reference` 各自断言什么。
+- **为什么这条值得单列**：三条 xfail 共用一条错 reason，是**能自我掩盖的**——
+  谁照那两条的 reason 去修 C seam，会去修一个已经修好的东西；而真问题
+  （co-ion 在 D 端点）继续没人管；而且它不会在测试里报警，因为 XFAIL 也算"预期"。
+
+#### [ ] CACHE-01（P2，纯噪音）`--openmm-cache-only` 下无条件调用 `find_gmx_include_dir`
+
+- 位置：`runabfe.py:6034`——`include_dir = find_gmx_include_dir(config.gmx_path)`
+  在 `if args.openmm_cache_only:`（`:6036`）**之前**无条件执行。
+- 症状：带 `--openmm-cache-only` 跑时照样打「找不到 GROMACS 力场 include 目录」
+  警告（`runabfe.py:646`），而这一路根本不需要 include 树。
+- 已查清：审计通过的缓存上 `include_dir` **一次都不会被解引用**（三条使用路径
+  逐个核对过，见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md) 同名小节）。
+  ⟹ **只是噪音，不影响任何数值。**
+- 修法：把 `:6034` 那次调用挪进 `else` 分支。对 cache-only 路径行为中立。
+- 为什么还没做：属于纯降噪，不影响结果；且要顺带确认 `:6061` 的
+  `system_cache_exists(...)` 参数求值顺序在挪动后仍然短路。
+- 来源：2026-09-02 运行期记录（原文已归档到
+  [archive/RUNTIME_ISSUES_2026-09-02.md](archive/RUNTIME_ISSUES_2026-09-02.md) BUG-1）。
+
+#### [ ] CFG-01（P2，配置）`abfe_config.json` 的 `gmx_path` 指向不存在的路径
+
+- 现值 `/home/ruigengji/gmx26.0C`，**本机不存在**。
+- 2026-09-01 那次实跑的 provenance 记的是
+  `/home/ruigengji/gmx26.3/share/gromacs/top`，与 config 里的值不同 ⟹ 配置里的
+  值从来没被那次运行用上（那次带了 `--openmm-cache-only`）。
+- 与 CACHE-01 **是两件事**：CACHE-01 是「不该问」，这条是「问了但答案是错的」。
+  非 cache-only 路径会真的用到它。
+- 修法：写 GROMACS 的**安装前缀**，不要写 `share/gromacs/top`
+  （解析逻辑见 `runabfe.py:557` `find_gmx_include_dir`，两种写法都能吃，但前缀是
+  2026-08-31 之后的约定）。**改配置会动 provenance，需用户确认取哪个版本的 GROMACS。**
+
 #### [ ] PHY-03（P1，实验路线）charge-transfer 的 tethered charge carrier 不能按当前论证严格跨腿抵消
 
 - 位置：`abfe_core.py` 的 co-ion restraint 说明与表达式（约 1088–1117 行）；

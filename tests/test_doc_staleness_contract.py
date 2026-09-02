@@ -1,26 +1,30 @@
 """状态快照文档的过期契约（2026-08-24 新增，防再次静默过期）。
 
-## 现状说明——这份文件里的两类测试分别代表什么
+## 这份文件里的两条测试分别代表什么
 
-跟 `tests/test_open_issue_fail_closed_contracts.py` 用的是同一套约定：
+* `test_staleness_checker_finds_the_known_stale_docs` —— **检测机制本身**能不能
+  正确工作。它必须一直通过；不通过说明检测器坏了（通常是文档措辞改了、
+  `check_doc_staleness.TRACKED_DOCS` 的正则没跟着改）。
+* `test_snapshot_docs_are_not_stale` —— **文档内容本身**是不是新鲜。
 
-* `test_staleness_checker_finds_the_known_stale_docs` 是**普通测试**，描述"过期检测机制
-  本身能不能正确工作"——它必须一直通过，不通过说明检测器坏了。
-* `test_snapshot_docs_are_not_stale` 用 `xfail(strict=True)` 标记——它描述"文档内容
-  本身是不是新鲜"，**这次新增时就是预期失败的**：`README*`/`docs/README.md`/
-  `curated_project/00_从这里开始/CURRENT_STATUS.md` 全部还停在 2026-08-12，而仓库实际
-  活跃到 08-24。等有人把这几份文档的日期戳刷新到位，这个测试会意外通过（XPASS），
-  `strict=True` 会把 XPASS 当成错误报出来，提醒维护者把 `xfail` 标记摘掉——这正是这个
-  标记要做的事：逼着"文档已经刷新"这件事被显式确认一次，而不是让检测器从红变绿却没人
-  注意到已经不需要再盯着它了。
+## 2026-09-02：`xfail(strict=True)` 已摘
+
+第二条测试从 2026-08-24 新增起一直挂着 `xfail(strict=True)`，因为
+`README.md`/`README_cn.md`/`README_en.md` 的科学状态全部停在 2026-08-12，
+而 2026-08-31 的发布整理只合并了目录结构、**没有**替维护者定科学结论。
+
+2026-09-02 那三份文档的科学状态被真正改写了（主线体系 Atenolol → 4W53、
+旧 `output_lrc_fix` 的 `−23.1622` 标为已作废、协议版本号从转述改为直接读源码
+常量、日期戳刷到 09-02），检测器转全绿，于是标记按它自己 reason 里写的约定摘掉。
+
+**这两条现在都是普通测试。** 第二条红了就是三份 README 又落后于仓库前沿超过
+阈值——去更新文档，不要改测试、不要放宽 `threshold_days`。
 """
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-
-import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools" / "diagnostics"))
@@ -42,15 +46,17 @@ def test_staleness_checker_finds_the_known_stale_docs():
     assert tracked_paths == set(staleness.TRACKED_DOCS)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "README.md/README_cn.md/README_en.md 的科学状态日期戳"
-        "仍停在 2026-08-12。2026-08-31 的发布整理只做了目录与文档结构的合并，"
-        "**没有**替维护者改写这几份文档里的科学结论和候选数值——那需要人来定。"
-        "刷新日期戳后这个测试会 XPASS，strict=True 会报错提醒摘掉这个标记。"
-    ),
-)
 def test_snapshot_docs_are_not_stale():
+    """三份 README 的科学状态日期戳必须跟得上仓库前沿。
+
+    2026-09-02：`xfail(strict=True)` 标记已摘掉。原因是那三份文档的科学状态
+    在这一天被真正改写了——主线体系从 Atenolol 换成 4W53、旧
+    `output_lrc_fix` 的 `−23.1622` 标为已作废、协议版本号从转述改为直接
+    读源码常量、日期戳刷到 2026-09-02。此前这个测试挂 `xfail` 是因为
+    2026-08-31 的发布整理只合并了目录结构，**没有**替维护者定科学结论。
+
+    从现在起这是一条**普通测试**：它红了就说明三份 README 又落后于仓库前沿
+    超过阈值，去更新文档，不要来改这个测试或阈值。
+    """
     result = staleness.run(ROOT, threshold_days=3)
     assert result.all_fresh, "\n" + result.render_report()

@@ -17,6 +17,7 @@ import openmm
 from openmm import app, unit, XmlSerializer
 import gc
 import numpy as np
+import re
 import os
 import glob
 import json
@@ -27,6 +28,7 @@ import logging
 import builtins
 import hashlib
 import platform
+import socket
 import sys
 import math
 import atexit
@@ -471,6 +473,28 @@ class _StdoutTeeToFile:
             # 终端那一行已经通过上面 self._original.write(s) 正常写出去了。
             pass
 
+    def retarget(self, log_path: str) -> None:
+        """把这个 tee 指向新的日志文件。
+
+        🔑 [0831issue P2] 同进程跑第二条腿时，旧代码用
+        `if not isinstance(sys.stdout, _StdoutTeeToFile)` 短路，于是第二条腿**根本
+        没装 tee**：它的裸 print() 全部继续写进第一条腿的 `pipeline.log`，第二条腿
+        自己的日志文件几乎是空的。这里改成"已经是我们的 tee 就换目标"，既不套娃
+        （套娃会让每行在多个文件里重复），也不丢腿。
+        """
+        if log_path == self._log_path and self._fh is not None:
+            return
+        # 换文件前把半行缓冲落到**旧**文件里，避免一行被切到两个文件。
+        if self._line_buffer:
+            self._append_line(self._line_buffer)
+            self._line_buffer = ""
+        self.close()
+        self._log_path = log_path
+        try:
+            self._fh = open(self._log_path, "a", encoding="utf-8")
+        except OSError:
+            self._fh = None
+
     def close(self) -> None:
         if self._fh is not None:
             try:
@@ -495,6 +519,9 @@ class _StdoutTeeToFile:
 
 
 _PROCESS_WIDE_LOG_FILE: Optional[str] = None
+# [0831issue P2] 进程级单例句柄，供 _install_process_wide_log_file 换目标时摘旧挂新。
+_PROCESS_WIDE_LOG_HANDLER: Optional[logging.Handler] = None
+_PROCESS_WIDE_LOG_TEE: Optional["_StdoutTeeToFile"] = None
 
 
 def _install_process_wide_log_file(log_file_path: str) -> None:
@@ -510,9 +537,28 @@ def _install_process_wide_log_file(log_file_path: str) -> None:
     2. 裸 `print()`（`ibs_engine.py` 等）只到 stdout——用上面的
        `_StdoutTeeToFile` 包一层。
     """
-    global _PROCESS_WIDE_LOG_FILE
+    global _PROCESS_WIDE_LOG_FILE, _PROCESS_WIDE_LOG_HANDLER, _PROCESS_WIDE_LOG_TEE
     if _PROCESS_WIDE_LOG_FILE == log_file_path:
         return
+
+    # 🔑 [0831issue P2] 同进程第二条腿（abfe_core 会在同一进程里新建第二个
+    # pipeline）以前会踩两个坑：
+    #   (a) `logging.getLogger().addHandler(...)` 每次调用都**追加**一个 FileHandler，
+    #       旧的从不摘掉 —— 第 N 条腿的每行 logging 输出会被写 N 遍，而且第一条腿的
+    #       日志文件会一直继续收第二条腿的行；
+    #   (b) stdout tee 用 `isinstance` 短路，第二条腿根本不装 tee，它的裸 print()
+    #       全进了第一条腿的文件，自己的 `pipeline.log` 几乎是空的。
+    # 现在两者都按"进程级单例 + 换目标"处理：先摘旧 handler 再挂新的，tee 直接
+    # retarget（不套娃）。
+    root_logger = logging.getLogger()
+    if _PROCESS_WIDE_LOG_HANDLER is not None:
+        try:
+            root_logger.removeHandler(_PROCESS_WIDE_LOG_HANDLER)
+            _PROCESS_WIDE_LOG_HANDLER.close()
+        except Exception:
+            pass
+        _PROCESS_WIDE_LOG_HANDLER = None
+
     file_handler = logging.FileHandler(log_file_path, mode="a", encoding="utf-8")
     file_handler.setFormatter(
         logging.Formatter(
@@ -520,13 +566,19 @@ def _install_process_wide_log_file(log_file_path: str) -> None:
             datefmt="%Y-%m-%d %H:%M:%S",
         )
     )
-    logging.getLogger().addHandler(file_handler)
+    root_logger.addHandler(file_handler)
+    _PROCESS_WIDE_LOG_HANDLER = file_handler
 
-    if not isinstance(sys.stdout, _StdoutTeeToFile):
+    if isinstance(sys.stdout, _StdoutTeeToFile):
+        sys.stdout.retarget(log_file_path)
+        _PROCESS_WIDE_LOG_TEE = sys.stdout
+    else:
         tee = _StdoutTeeToFile(sys.stdout, log_file_path)
         sys.stdout = tee
+        _PROCESS_WIDE_LOG_TEE = tee
         # 常驻句柄需要在进程退出时显式收尾（原来的每行 open/close 不需要，
         # 因为从不跨语句持有句柄）；atexit 保证正常退出路径都会 flush+close。
+        # 只注册一次：retarget 路径复用同一个对象，重复注册会让 close() 被调多次。
         atexit.register(tee.close)
 
     _PROCESS_WIDE_LOG_FILE = log_file_path
@@ -569,6 +621,33 @@ def _topology_hash(topology: Optional[app.Topology]) -> Optional[str]:
     else:
         box_nm = None
     return _sha256_text(json.dumps({"atoms": atoms, "bonds": bonds, "box_nm": box_nm}, sort_keys=True))
+
+
+# 🔑 [2026-09-01] 坐标进指纹时必须先量化。`_positions_hash` 哈希的是原始 float64
+# 字节，**1e-15 的差也换哈希**：同一套坐标经 GRO 读入与经 mmCIF 缓存读回相差
+# ~1.8e-15（实测），于是首跑与 resume 的指纹永远不同。0.001 Å 远细于任何真实的
+# "换了个 pose/盒子"，但足以吸收往返浮点噪声。
+# ⚠️ 诚实的局限：量化有**边界**——若某个坐标恰好落在舍入边界上，1e-15 的噪声也能把它
+# 推过去、从而改变哈希。这不是保证，是概率：以实测噪声 ~1.8e-15、量子 1e-4 nm、
+# 5 万原子计，单次比较误失配概率约 1e-15/1e-4 × 1.5e5 ≈ 1.5e-6。
+# 相对"当前 100% 必然失配"是决定性改善，但**不要当成"永不误判"**。
+# 1e-4 nm = 0.001 Å，仍比任何真实的"换了个 pose"细两个量级（实测 0.002 Å 就能抓到）。
+# 真要确定性，得存坐标而非存哈希、按容差比较，那是另一个量级的改动。
+_PRE_EQUIL_IDENTITY_COORD_DECIMALS_NM = 4
+
+
+def _quantize_positions_for_identity(positions):
+    if positions is None:
+        return None
+    try:
+        arr = (
+            np.asarray(positions.value_in_unit(unit.nanometer), dtype=np.float64)
+            if hasattr(positions, "value_in_unit")
+            else np.asarray(positions, dtype=np.float64)
+        )
+    except Exception:
+        return positions
+    return np.round(arr, _PRE_EQUIL_IDENTITY_COORD_DECIMALS_NM) * unit.nanometer
 
 
 def _pre_equilibration_fingerprint(
@@ -618,7 +697,10 @@ def _pre_equilibration_fingerprint(
         "ligand_indices": sorted(int(i) for i in (ligand_indices or [])),
         "temperature_K": round(float(temp_k), 6),
         "pressure_bar": round(float(pressure_bar), 6) if pressure_bar is not None else None,
-        "positions_sha256": _positions_hash(positions),
+        # 量化后再哈希，见 `_quantize_positions_for_identity` 上方说明。
+        "positions_sha256": _positions_hash(
+            _quantize_positions_for_identity(positions)
+        ),
         "box_vectors_sha256": _box_vectors_hash(box_vectors),
         "requested_steps": int(requested_steps) if requested_steps is not None else None,
     }
@@ -1286,6 +1368,31 @@ def _has_valid_boresch_restraint(params: Optional[Dict]) -> bool:
 
 
 class _PipelineStateLock:
+    """`pipeline_state.json` 的短时互斥锁。
+
+    🔑 [RELEASE_READINESS R2 + 0831issue P2] 三处修正，全部朝"只在**能证明**锁已经
+    没有主人时才敢删"的方向收紧：
+
+    1. **`PermissionError` 分支原来不可达。** 它是 `OSError` 的子类，写在 `except
+       OSError` 之后永远轮不到，于是"权限不足、无法判断"被当成"进程已退出"，
+       stale-lock 清理可能删掉仍在使用的锁。现在按 `ProcessLookupError`（确认不
+       存在）/ `PermissionError`（存在但不属于本用户）/ 其它 `OSError`（判不了）
+       三类分开处理，只有第一类算 stale。
+    2. **建锁与写 PID 之间有竞态。** `O_CREAT|O_EXCL` 成功之后才写 PID，另一个进程
+       在这个窗口里读到空文件会得出 `pid=-1` 并把 A 的锁删掉 → 双持锁。现在读到
+       空/不可解析的 payload 时不立即判 stale，而是要求该文件的 mtime 已经老于
+       `_EMPTY_PAYLOAD_GRACE_S`；正常竞态窗口是微秒级，宽限期足以覆盖。
+    3. **共享文件系统上 PID 不可跨节点比较。** payload 改为 JSON
+       `{"pid": ..., "hostname": ...}`（仍然兼容旧的裸整数写法）。hostname 与本机
+       不一致时一律视为"还活着"，绝不删别的节点的锁。
+
+    这些都不改变正常路径的行为（无竞争时照常获取/释放），只改变"判不了"时的默认。
+    """
+
+    # 建锁与写 payload 之间的竞态窗口是微秒级；给足宽限期，避免把正在建的锁
+    # 当成残留锁删掉。同时仍然能清理"进程建了锁就被 kill -9"留下的空文件。
+    _EMPTY_PAYLOAD_GRACE_S = 30.0
+
     def __init__(self, path: str, timeout_s: float = 10.0, poll_s: float = 0.05):
         self.path = path
         self.timeout_s = timeout_s
@@ -1294,25 +1401,86 @@ class _PipelineStateLock:
 
     @staticmethod
     def _pid_is_alive(pid: int) -> bool:
+        """只有**确认该 PID 不存在**时才返回 False；判不了一律 True（保守）。"""
         if pid <= 0:
             return False
         try:
             os.kill(pid, 0)
-        except OSError:
+        except ProcessLookupError:
+            # 唯一能确认"这个 PID 已经没了"的信号。
             return False
         except PermissionError:
+            # 进程存在，只是不属于本用户 —— 必须算活着。
+            return True
+        except OSError:
+            # 其它 errno（EINVAL 等）说明我们判不了，不能据此删锁。
             return True
         return True
 
-    def _break_stale_lock_if_needed(self) -> None:
+    @staticmethod
+    def _own_hostname() -> str:
+        try:
+            return socket.gethostname()
+        except Exception:
+            return ""
+
+    def _lock_payload(self) -> str:
+        return json.dumps(
+            {"pid": int(os.getpid()), "hostname": self._own_hostname()},
+            ensure_ascii=False,
+        )
+
+    def _read_lock_owner(self) -> Tuple[Optional[int], Optional[str], bool]:
+        """返回 `(pid, hostname, payload_present)`。
+
+        `payload_present=False` 表示文件存在但内容为空或无法解析 —— 可能是竞态中的
+        锁，也可能是被 kill -9 留下的空壳，由调用方结合 mtime 决定。
+        兼容旧格式：裸十进制整数即 PID，hostname 未知（None）。
+        """
         try:
             with open(self.path, "r", encoding="utf-8") as f:
                 payload = f.read().strip()
-            pid = int(payload) if payload else -1
-        except Exception:
-            pid = -1
-        if pid > 0 and self._pid_is_alive(pid):
-            return
+        except OSError:
+            return None, None, False
+        if not payload:
+            return None, None, False
+        try:
+            parsed = json.loads(payload)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            try:
+                pid = int(parsed.get("pid", -1))
+            except (TypeError, ValueError):
+                return None, None, False
+            hostname = parsed.get("hostname")
+            return pid, (str(hostname) if hostname else None), True
+        # 旧格式：裸 PID，没有 hostname 信息。
+        try:
+            return int(payload), None, True
+        except ValueError:
+            return None, None, False
+
+    def _break_stale_lock_if_needed(self) -> None:
+        pid, hostname, payload_present = self._read_lock_owner()
+
+        if not payload_present:
+            # 竞态窗口：锁刚被 O_EXCL 建立、payload 还没写完。只有明显老于宽限期
+            # 的空文件才当残留处理。
+            try:
+                age = time.time() - os.path.getmtime(self.path)
+            except OSError:
+                return
+            if age < self._EMPTY_PAYLOAD_GRACE_S:
+                return
+        else:
+            own_host = self._own_hostname()
+            if hostname and own_host and hostname != own_host:
+                # 共享文件系统：别的节点的 PID 在本机毫无意义，绝不据此删锁。
+                return
+            if pid is not None and pid > 0 and self._pid_is_alive(pid):
+                return
+
         try:
             if os.path.exists(self.path):
                 os.remove(self.path)
@@ -1324,7 +1492,13 @@ class _PipelineStateLock:
         while True:
             try:
                 self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
-                os.write(self.fd, str(os.getpid()).encode("utf-8"))
+                os.write(self.fd, self._lock_payload().encode("utf-8"))
+                # payload 必须真的落到文件里，别人才判断得了归属；这条锁只活几十
+                # 毫秒，一次 fsync 的代价可以忽略。
+                try:
+                    os.fsync(self.fd)
+                except OSError:
+                    pass
                 return self
             except FileExistsError:
                 self._break_stale_lock_if_needed()
@@ -1379,6 +1553,107 @@ def attach_simulation_reporters(
 #============================================================================
 # 辅助函数：Checkpoint 与轨迹完整性校验 (Step 3)
 #============================================================================
+# ---------------------------------------------------------------------------
+# 跨 platform 的 checkpoint 迁移
+# ---------------------------------------------------------------------------
+# 🔑 [2026-09-01] "这个 checkpoint 是别的 platform 写的" 和 "这个 checkpoint 坏了"
+# 是两件事，此前被同一个 `except Exception: return False` 吞成一件。
+#
+# 4W53 实测：`checkpoints/pre_equil.chk` 文件头是 `CPUB`，OpenMM 报
+#   loadCheckpoint: Checkpoint was created with a different Platform: CPU
+# 成因是那次运行开始时 CUDA 没被检测到、强制降级到 CPU 跑完了预平衡（该误降级
+# 已于同日修复）。现在 CUDA 认得出来了，于是这份**完好**的 checkpoint 载不进
+# CUDA context，`equilibrium_is_done` 判成"没做完"，要重跑 5,000,000 步预平衡。
+#
+# 迁移做法：用同一个 System + 同一个（反序列化出来的）Integrator，在 checkpoint
+# 自己的 platform 上建一个一次性 Simulation 载入，取出 State 再 setState 到目标
+# Context，并搬运 step count 与 time。
+#
+# **迁移得到什么、丢什么，说清楚：**
+#   搬过去了：坐标、速度、周期盒、全部全局参数（含 λ、Boresch scale 等）、
+#             已完成步数、模拟时间 —— 也就是全部**物理**状态。
+#   搬不过去：Integrator 内部的随机数流（State 不含它）。
+#   代价评估：Langevin 的 RNG 流不是体系的物理状态；从同一个 (x, v) 用新的随机
+#             流继续积分，仍然是同一个系综的合法续算，丢的是**逐位可复现性**，
+#             不是正确性。而不迁移的代价是整段轨迹作废、从初始坐标重跑 —— 那才
+#             是真正丢状态。所以迁移严格优于现状。
+#   迁移发生时会打醒目警告并写进 `checkpoint_platform_migration` 供 provenance
+#   追溯，绝不静默。
+_CHECKPOINT_PLATFORM_MISMATCH_RE = re.compile(
+    r"created with a different Platform:\s*([A-Za-z0-9_]+)"
+)
+
+
+def _checkpoint_source_platform(exc) -> Optional[str]:
+    """从 OpenMM 的报错里认出 checkpoint 自己的 platform；不是这个原因则 None。"""
+    m = _CHECKPOINT_PLATFORM_MISMATCH_RE.search(str(exc))
+    return m.group(1) if m else None
+
+
+def load_checkpoint_with_platform_migration(simulation, chk_path: str) -> str:
+    """把 checkpoint 载入 ``simulation``，必要时跨 platform 迁移。
+
+    返回 ``"native"`` 或 ``"migrated:<源 platform>"``。
+    只有 platform 不匹配这一种失败会走迁移；其它异常原样抛出（损坏、System 不符
+    等仍然 fail-closed）。
+    """
+    try:
+        simulation.loadCheckpoint(chk_path)
+        return "native"
+    except Exception as exc:  # noqa: BLE001 - 需要看异常内容才能分类
+        source_platform = _checkpoint_source_platform(exc)
+        if source_platform is None:
+            raise
+
+    import openmm.app as _app
+
+    probe_system = openmm.XmlSerializer.deserialize(
+        openmm.XmlSerializer.serialize(simulation.system)
+    )
+    probe_integrator = openmm.XmlSerializer.deserialize(
+        openmm.XmlSerializer.serialize(simulation.integrator)
+    )
+    probe = _app.Simulation(
+        simulation.topology,
+        probe_system,
+        probe_integrator,
+        openmm.Platform.getPlatformByName(source_platform),
+    )
+    probe.loadCheckpoint(chk_path)
+    state = probe.context.getState(
+        getPositions=True,
+        getVelocities=True,
+        getParameters=True,
+        enforcePeriodicBox=False,
+    )
+    # ⚠️ 这里**不能**用 `context.setState(state)` 一把梭：它会把 checkpoint 里的
+    # 全局参数整表往目标 context 上灌，目标少任何一个就抛
+    # "Called setParameter() with invalid parameter name: ..." —— 而更危险的是
+    # 反过来：如果哪天它改成宽容模式，一个被静默丢掉的全局参数（λ_vdw、
+    # λ_shield、Boresch scale 都是全局参数）就是一个静默的正确性 bug。
+    # 所以逐项搬，并且**缺任何一个参数就 fail-closed**，把名字列出来。
+    source_parameters = dict(state.getParameters())
+    target_parameters = set(simulation.context.getParameters().keys())
+    missing = sorted(set(source_parameters) - target_parameters)
+    if missing:
+        raise RuntimeError(
+            f"checkpoint（{source_platform} 平台写入）带有目标 Context 不认识的全局参数 "
+            f"{missing}；这说明两边的 System 不是同一个（例如缺 barostat 或缺某个 "
+            "λ 控制的力），拒绝迁移 —— 静默丢掉全局参数会直接算错。"
+        )
+    simulation.context.setPositions(state.getPositions())
+    simulation.context.setVelocities(state.getVelocities())
+    simulation.context.setPeriodicBoxVectors(*state.getPeriodicBoxVectors())
+    for name, value in source_parameters.items():
+        simulation.context.setParameter(name, value)
+    # 上面这些都不搬步数/时间，但它们决定"还剩多少步"，必须一起搬。
+    simulation.context.setStepCount(probe.context.getStepCount())
+    simulation.context.setTime(probe.context.getTime())
+    simulation.currentStep = probe.context.getStepCount()
+    del probe
+    return f"migrated:{source_platform}"
+
+
 def _is_checkpoint_valid(
     chk_path: str,
     simulation=None,
@@ -1407,8 +1682,16 @@ def _is_checkpoint_valid(
         return False
     try:
         load_checkpoint(chk_path)
-    except Exception:
-        return False
+    except Exception as exc:  # noqa: BLE001 - 需要区分"别的 platform 写的"与"坏了"
+        # platform 不匹配不等于无效：只要能在源 platform 上载入并把 State 迁过来，
+        # 这份 checkpoint 就是完好且可用的。simulation 为 None（调用方只给了裸
+        # load_checkpoint 函数）时无法迁移，维持原来的 fail-closed。
+        if simulation is None or _checkpoint_source_platform(exc) is None:
+            return False
+        try:
+            load_checkpoint_with_platform_migration(simulation, chk_path)
+        except Exception:
+            return False
     return True
 
 
@@ -1839,7 +2122,9 @@ def _remd_sampling_fingerprint(
         "temperature_K": round(float(temperature_K), 8),
         "n_steps": int(n_steps),
         "exchange_interval": int(exchange_interval),
-        "boresch_params": boresch_params,
+        # 🔑 [2026-09-01] 同 `_stage_protocol_key`：只有收窄后的四项决定限制力
+        # Hamiltonian；诊断/评分/provenance 进键会让"同一个限制力的不同说明"触发重算。
+        "boresch_params": _preopt_boresch_protocol_payload(boresch_params),
         "potential_type": str(potential_type),
         "platform_name": str(platform_name),
         "max_resident_contexts": (
@@ -2131,6 +2416,13 @@ class ABFEPipeline:
         self.topology = topology
         self.positions = positions
         self.box_vectors = box_vectors
+        # 🔑 [2026-09-01] 预平衡身份用的坐标必须在**构造期**冻结，且与 self.positions
+        # 解耦。self.positions 会被 PBC 修复、居中、再平衡、预平衡本身反复改写；
+        # 而 `_pre_equilibration_fingerprint` 两侧的调用时机落在这些变换的不同位置上，
+        # 导致指纹**构造上必然不匹配**（实测 4W53：mmCIF 坐标与预平衡 DCD 第 0 帧
+        # 全部 48962 个原子都不同、最大差 13 nm）。冻结一份就没有这个时序问题。
+        self._identity_positions = positions
+        self._identity_box_vectors = box_vectors
         self.ligand_indices = ligand_indices or []
         residual_runtime = _normalize_residual_sampling_runtime(
             residual_sampling_enabled,
@@ -2300,6 +2592,50 @@ class ABFEPipeline:
             return None
         return self.seed_ledger.derive(phase, stage, window, stream, attempt)
 
+    def pre_equilibration_identity_fingerprint(
+        self, requested_steps: Optional[int]
+    ) -> str:
+        """预平衡缓存身份。**两侧必须都调它**，否则时序不同 ⇒ 永远不匹配。
+
+        坐标取构造期冻结的那份并量化，因此不受 PBC 修复/居中/再平衡影响，
+        也不受 GRO↔mmCIF 往返浮点噪声影响。
+        """
+        return _pre_equilibration_fingerprint(
+            self.system,
+            self.ligand_indices,
+            self.temperature,
+            self.pressure,
+            positions=getattr(self, "_identity_positions", self.positions),
+            box_vectors=getattr(self, "_identity_box_vectors", self.box_vectors),
+            requested_steps=requested_steps,
+            barostat_protocol=self.barostat_protocol,
+        )
+
+    def seed_contract_identity(self) -> Optional[Dict[str, Any]]:
+        """种子契约的**稳定身份**，供缓存/协议指纹使用。
+
+        🔑 [2026-09-01] 与 `seed_contract_snapshot()` 的区别是**不含 derived_seed_map**。
+        那张表记的是"本进程到此刻为止派生过哪些种子"，随执行路径增长：首跑时预平衡
+        真跑过、派生了 equilibration/* 的种子；resume 时预平衡走 checkpoint 没派生，
+        同一份配置下快照就不同。实测事故（4W53 resume_v3.log）：Stage 1 结果缓存因
+        `seed_contract.derived_seed_map.equilibration/pre_equilibration/...
+        缓存=285721177 -> 当前='<missing>'` 判失配，整段 Stage 1 重算。
+        缓存键必须只依赖**配置身份**，不能依赖**执行历史**。
+        """
+        _ledger = getattr(self, "seed_ledger", None)
+        if _ledger is None:
+            return None
+        # 优先用 ledger 自己的稳定身份；但 ledger 是 duck-typed 的（测试里有只实现
+        # snapshot() 的替身），所以没有 identity() 时从 snapshot 里剥掉那张
+        # 随执行路径增长的 derived_seed_map —— 语义保证与实现无关。
+        _identity = getattr(_ledger, "identity", None)
+        if callable(_identity):
+            return _identity()
+        _snap = _ledger.snapshot()
+        if isinstance(_snap, dict):
+            return {k: v for k, v in _snap.items() if k != "derived_seed_map"}
+        return _snap
+
     def seed_contract_snapshot(self) -> Optional[Dict[str, Any]]:
         # `seed_ledger` 在 __init__ 里无条件赋值（有 repeat_seed 时是 ledger、
         # 否则 None），所以生产路径上一定存在。用 getattr 兜底是为了让
@@ -2359,17 +2695,52 @@ class ABFEPipeline:
         if platform_base.upper() != "CUDA":
             return {"strategy": "cpu", "devices": [], "n_gpus": 0}
         
+        # 🔑 [2026-09-01 修] 判据必须是 **OpenMM 自己的 CUDA 平台**，不是 torch。
+        #
+        # 这里原来是 `torch.cuda.is_available()`。但本管线的动力学全部跑在 OpenMM 上，
+        # torch 只是 MLP 侧的可选依赖 —— 拿它当 CUDA 可用性判据是把两个无关的运行时
+        # 绑在了一起。实测事故：计算节点上 OpenMM 的 CUDA 平台完全可用，而 torch
+        # （自带 CUDA 12.9 运行时）因驱动/可见性差异 `is_available()` 返回 False，
+        # 于是整条生产被静默降级到 CPU 跑 —— 一次 GPU 作业就此报废。
+        # torch 缺席（纯 OpenMM 环境）时更是必然误判。
+        #
+        # 「平台注册」不等于「驱动能用」，所以这里真的建一个最小 Context 探一下：
+        # 误判为可用的代价是几小时后才崩，比多花几毫秒探测贵得多。
+        n_gpus = 0
+        devices: List[int] = []
         try:
-            import torch
-            if not torch.cuda.is_available():
-                raise RuntimeError("Torch CUDA unavailable")
-            n_gpus = torch.cuda.device_count()
-            devices = list(range(n_gpus))
-        except Exception:
-            msg = "🚨 [设备策略] 未检测到可用 CUDA 设备，已强制降级至 CPU。请检查 GPU 队列/驱动。"
+            cuda_platform = openmm.Platform.getPlatformByName("CUDA")
+            _probe_sys = openmm.System()
+            _probe_sys.addParticle(1.0)
+            _probe_int = openmm.VerletIntegrator(0.001)
+            try:
+                _probe_ctx = openmm.Context(_probe_sys, _probe_int, cuda_platform)
+                del _probe_ctx
+            finally:
+                del _probe_int
+        except Exception as exc:
+            msg = (
+                "🚨 [设备策略] OpenMM CUDA 平台不可用，已强制降级至 CPU。"
+                f"请检查 GPU 队列/驱动。底层错误: {type(exc).__name__}: {exc}"
+            )
             warnings.warn(msg, UserWarning, stacklevel=2)
             print(f"\033[93m⚠️ {msg}\033[0m")
             return {"strategy": "cpu", "devices": [], "n_gpus": 0}
+
+        # 设备数只用于决定要不要多卡；调度器给的 CUDA_VISIBLE_DEVICES 是权威来源。
+        _visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if _visible is not None and _visible.strip() != "":
+            devices = list(range(len([x for x in _visible.split(",") if x.strip() != ""])))
+        else:
+            try:
+                import torch  # 仅用于数卡；**不**用它判断可用性
+                if torch.cuda.is_available():
+                    devices = list(range(torch.cuda.device_count()))
+            except Exception:
+                devices = []
+            if not devices:
+                devices = [0]
+        n_gpus = len(devices)
             
         if n_gpus >= 2 and n_windows >= 2:
             return {"strategy": "multi_gpu", "devices": devices, "n_gpus": n_gpus}
@@ -3071,16 +3442,9 @@ class ABFEPipeline:
         monitor_file = os.path.join(self.output_dir, "pre_equilibration_monitor.csv")
         chk_file = os.path.join(self.checkpoint_dir, "pre_equil.chk")
         fp_file = os.path.join(self.output_dir, "pre_equilibration_fingerprint.json")
-        requested_fingerprint = _pre_equilibration_fingerprint(
-            self.system,
-            self.ligand_indices,
-            self.temperature,
-            self.pressure,
-            positions=self.positions,
-            box_vectors=self.box_vectors,
-            requested_steps=n_steps,
-            barostat_protocol=self.barostat_protocol,
-        )
+        # ⚠️ 用**构造期快照**，不是 self.positions —— 后者此刻已被上面的 PBC 修复改过，
+        # 而调用方（runabfe 的 equilibrium_is_done）是在那之前算的期望值。
+        requested_fingerprint = self.pre_equilibration_identity_fingerprint(n_steps)
 
         # A binary OpenMM checkpoint is only meaningful for the exact initial
         # pose/box/Hamiltonian and requested budget that created it.
@@ -3194,7 +3558,14 @@ class ABFEPipeline:
         resume_from_chk = False
         if resume and os.path.exists(chk_file):
             try:
-                simulation.loadCheckpoint(chk_file)
+                _how = load_checkpoint_with_platform_migration(simulation, chk_file)
+                if _how != "native":
+                    self._log(
+                        f"  🔀 预平衡 checkpoint 由 {_how.split(':', 1)[1]} platform 写入，"
+                        "已迁移坐标/速度/盒子/全局参数/步数到当前 platform。"
+                        "⚠️ Integrator 随机数流不随 State 迁移：物理状态完整，"
+                        "但本段续算不再逐位可复现。"
+                    )
                 current_step = simulation.currentStep
                 steps_remaining = max(0, n_steps - current_step)
                 self._log(f"  ♻️ 从 Checkpoint 恢复 | 已完成: {current_step} | 剩余: {steps_remaining}")
@@ -3411,7 +3782,10 @@ class ABFEPipeline:
         final_energy = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
         
         # ✅ 关键修复：预平衡完成后，显式清理 CUDA 上下文（避免污染后续采样）
-        if equil_platform.upper() == "CUDA":
+        # 🔑 [0831issue P2] 用 base 平台名比较：`equil_platform` 可能是 "CUDA:1"
+        # 这种显式设备写法，裸 `.upper() == "CUDA"` 匹配不上，于是显式的
+        # Context/System 释放被整段跳过、显存要等 GC 才回收。
+        if _split_platform_spec(equil_platform)[0].upper() == "CUDA":
             try:
                 del simulation.context
                 del integrator
@@ -3662,7 +4036,12 @@ class ABFEPipeline:
         if resume and rebalance_cache_trusted and os.path.isfile(chk_path):
             self._log(f"  ♻️ 检测到再平衡 Checkpoint ({chk_path})，恢复状态...")
             try:
-                simulation.loadCheckpoint(chk_path)
+                _how = load_checkpoint_with_platform_migration(simulation, chk_path)
+                if _how != "native":
+                    self._log(
+                        f"  🔀 再平衡 checkpoint 由 {_how.split(':', 1)[1]} platform 写入，"
+                        "已迁移物理状态到当前 platform（Integrator 随机数流除外）。"
+                    )
                 steps_remaining = max(0, n_steps - simulation.currentStep)
                 resume_enabled = True
             except Exception as e:
@@ -3703,7 +4082,10 @@ class ABFEPipeline:
         new_box = state.getPeriodicBoxVectors()
         
         # 6. 清理上下文（防止污染后续采样）
-        if equil_platform.upper() == "CUDA":
+        # 🔑 [0831issue P2] 用 base 平台名比较：`equil_platform` 可能是 "CUDA:1"
+        # 这种显式设备写法，裸 `.upper() == "CUDA"` 匹配不上，于是显式的
+        # Context/System 释放被整段跳过、显存要等 GC 才回收。
+        if _split_platform_spec(equil_platform)[0].upper() == "CUDA":
             try:
                 del simulation.context
                 del integrator
@@ -4466,7 +4848,7 @@ class ABFEPipeline:
                 # seed 派生入口（见下方 REMDManager 的 random_seed/seed_ledger），
                 # 其身份必须进 sampling fingerprint：repeat_seed 一变，旧
                 # DCD/u_kn 缓存立即失效。
-                seed_contract=self.seed_contract_snapshot(),
+                seed_contract=self.seed_contract_identity(),
             )
             expected_frames = max(1, _expected_remd_frame_count(n_steps_per_window))
             sampling_cache_ok = bool(
@@ -4918,25 +5300,60 @@ class ABFEPipeline:
         # 端点段，两条腿统一执行，不再提供关闭开关。
         # `allow_partial_vanishing_rescue` 仍然排除在外，但那条路径现在 fail-closed
         # （见下面 rescue 处的说明），不会再静默退回纯 IBS。
+        # 🔑 [2026-09-01] 独立端点段（干/湿双起点装置）**默认不跑**。
+        #
+        # 用户决定，反复明确过：别再为它算。4W53 上它是最大的单项时间开销
+        # （8 条逐态轨迹约 90 分钟，且整段**不打进度日志**，从日志上看像卡死），
+        # 而它产出的判据在复合物腿上没有判别力——`count_cavity_waters` 的探针锚在
+        # **配体重原子**上，λ_vdw→0 时幽灵配体与环境无 LJ、只被 Boresch 松松拴着、
+        # 会漂，所以它测的是「幽灵漂到哪、那儿 0.24 nm 内有几个水」，不是空腔水合度，
+        # 根本不是状态函数（v3 实测：同一 λ 上 s1|w1 转变 181 次、s1|w0 零次，
+        # 同分布下单段干驻留 ≥500 帧的概率 ≈ 1e-141）。
+        #
+        # ⚠️ 代价必须写明：末窗口因此回到 IBS 单轨迹重加权。
+        # `STAGE2_ROOT_CAUSE_2026-08-28.md §3.3` 在**溶剂腿**上论证过那条路径采不到
+        # 「水塌进配体空腔」的构型。所以关掉它不是「那个问题不存在了」，
+        # 而是「这个装置在复合物腿上解决不了它、却在持续烧时间」。
+        #
+        # ⚠️ [2026-09-02 归因更正] 原文在这里写「该腿实测误差 +41.87 kJ/mol」，
+        # 把整个幅度记在单系综重加权头上。**错了**：见
+        # `docs/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md`（09-02 结案），
+        # 该误差的 **98% 是 λ-WCA 防护壳**；壳退役后溶剂腿 stage2 从 +38.59
+        # 变成 ≈ -8.3（独立参考真值 -6.58 ± 0.26，no-LRC）。单系综机制没被证伪，
+        # 但现在只对残余 1.7~4.2 kJ/mol（≈4%）负责，另一个候选是 LRC 口径。
+        # 要重新启用：`stage2_independent_endpoint=True`。真正的修法是把探针锚点
+        # 从配体换成蛋白腔壁参考原子，让观测量重新成为状态函数。
+        _endpoint_requested = bool(kwargs.get("stage2_independent_endpoint", False))
         _independent_endpoint_enabled = bool(
-            stage_name == "vanishing"
+            _endpoint_requested
+            and stage_name == "vanishing"
             and not allow_partial_vanishing_rescue
             and window_ranges
             and len(window_ranges) >= 2
         )
-        if stage_name == "vanishing" and not _independent_endpoint_enabled \
+        if stage_name == "vanishing" and not _independent_endpoint_enabled:
+            self._log(
+                "  ⏭️ [独立端点段] **未启用**（默认关闭）。末窗口沿用 IBS 单轨迹重加权。"
+                "⚠️ 该路径在溶剂腿上被论证为采不到「水塌进配体空腔」的构型"
+                "（STAGE2_ROOT_CAUSE_2026-08-28.md §3.3）——关闭它是"
+                "「这个装置解决不了该问题且在持续烧时间」，不是「该问题已消失」。"
+                "[2026-09-02] 该文档原先把 stage2 的整个误差归因于此，实测 98% 是"
+                " λ-WCA 防护壳（已退役）；单系综机制现在只对残余约 4% 负责，"
+                "见 docs/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md。"
+                "要启用：stage2_independent_endpoint=True。"
+            )
+        if _endpoint_requested and stage_name == "vanishing" \
+                and not _independent_endpoint_enabled \
                 and not allow_partial_vanishing_rescue:
             raise RuntimeError(
-                f"vanishing 阶段必须启用独立端点段，但当前窗口划分不满足前提"
-                f"（window_ranges={window_ranges}）。至少需要 2 个窗口：一段交给 IBS"
-                "重加权，末段交给逐态独立固定-λ 采样。拒绝退回旧的纯 IBS 路径——"
-                "那条路径已被证明采不到「水塌进配体空腔」的构型（见 "
-                "4W53/STAGE2_ROOT_CAUSE_2026-08-28.md §3.3）。"
+                f"显式请求了独立端点段（stage2_independent_endpoint=True），但当前窗口"
+                f"划分不满足前提（window_ranges={window_ranges}）：至少需要 2 个窗口，"
+                "一段交给 IBS 重加权、末段交给逐态独立固定-λ 采样。"
             )
         if "stage2_independent_endpoint_states" in kwargs:
             raise RuntimeError(
-                "stage2_independent_endpoint_states 已废弃：独立端点段现在对 vanishing "
-                "阶段默认且强制启用，不再是可选开关。请移除该参数。"
+                "stage2_independent_endpoint_states 已废弃，请改用 "
+                "stage2_independent_endpoint（默认 False，即不跑独立端点段）。"
             )
         _endpoint_join_index = None
         if _independent_endpoint_enabled:
@@ -5187,7 +5604,7 @@ class ABFEPipeline:
             "exchange_interval": int(shadow_bridge_exchange_interval),
             "platform_name": str(self.platform_name),
             "restraint_params": _preopt_boresch_protocol_payload(boresch_params),
-            "seed_contract": self.seed_contract_snapshot(),
+            "seed_contract": self.seed_contract_identity(),
         })
 
         self._log(f"\n{'=' * 60}")
@@ -5451,7 +5868,7 @@ class ABFEPipeline:
             # [P1-18] 该分支虽然已把 random_seed 接进 REMDManager，但采样
             # 缓存身份此前不含 seed contract——repeat_seed 变了还是会复用
             # 旧 DCD。与 decharging/traditional 分支同口径补上。
-            seed_contract=self.seed_contract_snapshot(),
+            seed_contract=self.seed_contract_identity(),
         )
         expected_frames = max(1, _expected_remd_frame_count(n_steps_per_window))
         sampling_cache_ok = bool(
@@ -5594,10 +6011,25 @@ class ABFEPipeline:
     # === 替换 apply_boresch_correction ===
     @staticmethod
     def _strip_unit_suffix(key: str, target_keys: Dict[str, str]) -> Optional[str]:
-        """智能剥离单位后缀"""
+        """智能剥离单位后缀。
+
+        🚨 [0831issue P2] `_deg` 必须 **fail closed**，不能只剥后缀。
+        消费点（`apply_boresch_correction` 里 `float(v)`）把剥完后缀的值当**弧度**
+        直接送进解析校正，所以一个 `thetaA0_deg: 89.5` 会被当成 89.5 rad，释放项错
+        约 57 倍且毫无提示。本仓库当前没有任何生产者写出 `_deg`（纯潜伏），正因如此
+        这里不做 deg→rad 换算而是直接拒绝：静默换算会让"到底以什么单位落盘"这件事
+        变成两套并存的约定，而拒绝能把问题挡在第一次出现的地方。
+        同一处修正也在 `abfe_core.UnitFormatter.format_boresch_json`（P1 #5）做过。
+        """
         if key in target_keys: return target_keys[key]
+        if key.endswith("_deg"):
+            raise ValueError(
+                f"Boresch 参数键 {key!r} 带 `_deg` 后缀：本代码路径把角度一律当**弧度**"
+                "消费（apply_boresch_correction 直接 float() 后送进解析校正），"
+                "按度数读入会让释放项错约 57 倍。请改用 `_rad` 后缀或裸键并提供弧度值。"
+            )
         # 移除常见后缀并匹配
-        suffixes = ["_kJ_mol_nm2", "_kJ_mol_rad2", "_nm", "_rad", "_deg"]
+        suffixes = ["_kJ_mol_nm2", "_kJ_mol_rad2", "_nm", "_rad"]
         for suffix in suffixes:
             if key.endswith(suffix):
                 base = key[:-len(suffix)]
@@ -6390,6 +6822,16 @@ class ABFEPipeline:
             solvent_kwargs[
                 "charge_transfer_reservoir_correction"
             ] = getattr(self, "charge_transfer_reservoir_correction", None)
+            # 🔑 [0831issue P2] repeat-seed contract 必须跟到溶剂腿。以前这个入口
+            # 完全不传 repeat_seed/leg_name，于是溶剂腿的 `seed_ledger` 恒为 None
+            # ——两条腿的随机流不是"同一个 repeat 的两条独立腿"，EXP-019 种子契约在
+            # 这条路径上整段失效。leg_name 必须是 'solvent'（复合物腿是 'complex'），
+            # 两者共用同一个 repeat_seed、由 leg 名做域分隔，这正是 ledger 的设计。
+            # repeat_seed 为 None 时（未启用独立重复）行为逐位不变。
+            _repeat_seed = getattr(self, "repeat_seed", None)
+            if _repeat_seed is not None:
+                solvent_kwargs["repeat_seed"] = int(_repeat_seed)
+                solvent_kwargs["leg_name"] = "solvent"
             solvent_res = solvent_runner.run_solvent_decoupling(pos_solv, top_solv, solvent_ligand_indices, **solvent_kwargs)
             if str(self.charge_treatment or "").strip().lower() == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
                 expected_correction = getattr(
@@ -6690,6 +7132,20 @@ class ABFEPipeline:
                 )
 
         # ------------------------------------------------------------------
+        # 📌 溶剂腿 stage2 的独立参考真值——**唯一权威口径在**
+        #     `docs/reference_data/stage2_vanishing_truth_toluene_2026-09-02.json`
+        #     （说明见 `docs/reference_data/README.md`）。
+        #
+        # ⚠️ 不要在代码里再转述一个裸数字。本文件这一带曾经写着
+        # "ΔG_LJ = −6.26 kJ/mol"，不写方向、不写 LRC 口径、不写软核指数——
+        # 那种写法已经害人两次（reference_data/README.md §用法 记了原委）。
+        # 要点：
+        #   * 与生产逐窗口可比的只有 **m2n2**（λ² / 0.5(1−λ)²，与生产软核指数一致），
+        #     值 **−6.581 ± 0.256 kJ/mol**（λ_vdw 1→0）；m1n1 的中间态是不同的
+        #     哈密顿量，只有总量可比。
+        #   * 两份都是 **no-LRC**。生产 stage2 含 LJ 尾项，直接相减会**重复计 LRC**，
+        #     必须按当次 `lj_tail_lrc_coeff_kj_mol` 自己折算。
+        # ------------------------------------------------------------------
         # 🔑 [TARGET_SUPPORT_GATE_PROTOCOL_VERSION=1] 物理目标支撑度硬门。
         #
         # 下面 min_overlap 那道门用的是 mixture 覆盖度——**共模因子已经被除掉**，
@@ -6697,6 +7153,11 @@ class ABFEPipeline:
         # λ-WCA 防护壳偏置过、整窗只有一条轨迹的采样能重加权到真实物理系综"。
         # 4W53 实测（STAGE2_ROOT_CAUSE_2026-08-28.md）：溶剂腿 mixture 0.4684 判优、
         # raw 0.0196，converged=True，stage2 报 +35.61 而独立参考是 -6.29 kJ/mol。
+        # ⚠️ [2026-09-02] 上面这组数字是**壳退役前**的。这道门的因果性在 09-02
+        # 得到正面验证：壳一去掉（`WCA_SHIELD_RETIRED = True`），溶剂腿 stage2 的
+        # raw ESS 从 2.93 跳到 173.33、top1% 权重从 0.828 掉到 0.047 —— 也就是说
+        # "raw 支撑度崩掉"确实是被壳偏置直接引起的，不是门本身过严。
+        # 见 docs/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md。
         # 所以求解器侧已把 raw 绝对 ESS 与权重集中度升级为硬门，这里做同等级的
         # 镜像检查——不能只看 result["min_overlap"]。
         #
@@ -6705,6 +7166,22 @@ class ABFEPipeline:
         # 阈值进了 _stage_protocol_key 的 final_gate_thresholds，所以升级前写下的
         # "completed" 缓存本来也会因指纹变化而失效、被强制重算。
         # ------------------------------------------------------------------
+        # 🔑 [2026-09-01] 质量门是否 fail-closed，由**调用方显式决定**，默认仍然 fail-closed。
+        #
+        # 背景：4W53 复合物腿的 raw_min_absolute_ess 只有 2.8~11（阈值 20），于是
+        # 复合物腿永远走不完、溶剂腿一次都没跑过 —— 而溶剂腿是**唯一**有独立参考真值
+        # （ΔG_LJ，见下）能判断这套修复对错的地方。门拦住的是一个本来就无法
+        # 验证对错的数，代价却是永远拿不到能验证的那个。
+        #
+        # 但这是**用户对某一次运行的决定**，不是代码该默认放松的东西：默认保持
+        # fail-closed（一整套测试专门钉住这一点）。要放行必须显式传
+        # `allow_untrusted_stage_results=True`，该决定会随 run_provenance 落盘。
+        _allow_untrusted = bool(
+            (getattr(self, "_last_run_config", {}) or {}).get(
+                "allow_untrusted_stage_results", False
+            )
+        )
+
         target_support_gate = result.get("target_support_gate")
         if result.get("stage") == "vanishing" and not isinstance(target_support_gate, dict):
             raise RuntimeError(
@@ -6716,24 +7193,50 @@ class ABFEPipeline:
             )
         if isinstance(target_support_gate, dict) and target_support_gate.get("passed") is not True:
             failure_details = self._stage_quality_failure_details(result)
-            raise RuntimeError(
+            # 🔑 [2026-09-01] 这道门**不再中止流程**，改为把结果标记为不可信并继续。
+            #
+            # 4W53 复合物腿实测 raw_min_absolute_ess 只有 2.8~11（阈值 20），
+            # 于是复合物腿永远走不完、溶剂腿一次都没跑过 —— 而溶剂腿是**唯一**
+            # 有独立参考真值（ΔG_LJ，口径见 docs/reference_data/README.md）、
+            # 能判断这套修复对错的地方。
+            # 门拦住的是一个我们本来就无法验证对错的数（复合物腿没有参考值），
+            # 代价却是永远拿不到能验证的那个数。
+            #
+            # 所以：证据一条不少地写进结果（下面 stage_quality_failures），
+            # 日志显式告警，`results_untrusted` 标记随结果落盘 —— 但不 raise。
+            # ⚠️ 带此标记的 ΔG **不得**当作可发布结果，只用于把流程推进到溶剂腿。
+            _msg = (
                 f"{stage_label} 未通过物理目标支撑度硬门"
                 f"（failure_reason={target_support_gate.get('failure_reason')!r}，"
                 f"failed_checks={target_support_gate.get('failed_checks')}）："
                 f"raw_min_absolute_ess={target_support_gate.get('raw_min_absolute_ess')} "
                 f"(阈值 >= {target_support_gate.get('raw_min_absolute_ess_threshold')})，"
                 f"max_top1pct_raw_weight={target_support_gate.get('max_top1pct_raw_weight')} "
-                f"(阈值 <= {target_support_gate.get('max_top1pct_raw_weight_threshold')})，"
-                f"raw_min_ess_ratio={target_support_gate.get('raw_min_ess_ratio')}，"
-                f"共模 sigma_r={target_support_gate.get('max_common_mode_log_sigma_kT')} kT。"
-                "含义：重加权到**没有 Group-4 防护壳**的物理目标态之后，等效独立样本"
-                "数/权重集中度已经撑不起这个估计——mixture 覆盖度达标不能替代这份证据。"
-                "拒绝标记为 completed。这不是「重叠不足」类的可自动修复失败：不要在原地"
-                "拆窗/插 λ/重校准 f_k，见 STAGE2_ROOT_CAUSE_2026-08-28.md §8.2（端点态"
-                "独立采样 / 窗口内真实 replica exchange / 把 lambda_WCA 变成显式热力学"
-                f"维度）。逐窗口瓶颈：{self._format_stage_quality_failure_details(failure_details)}。"
+                f"(阈值 <= {target_support_gate.get('max_top1pct_raw_weight_threshold')})。"
+                f"逐窗口瓶颈：{self._format_stage_quality_failure_details(failure_details)}"
             )
-
+            if not _allow_untrusted:
+                raise RuntimeError(_msg)
+            self._log(f"  🚨 [结果不可信] {_msg}")
+            self._log(
+                "  🚨 已**不中止**流程继续推进（2026-09-01 决定：为了拿到溶剂腿——"
+                "唯一有独立参考真值的那条腿）。本阶段 ΔG 已标记 results_untrusted=True，"
+                "不得作为可发布结果引用。"
+            )
+            result["results_untrusted"] = True
+            result.setdefault("stage_quality_failures", []).append({
+                "gate": "target_support_gate",
+                "failure_reason": target_support_gate.get("failure_reason"),
+                "failed_checks": target_support_gate.get("failed_checks"),
+                "raw_min_absolute_ess": target_support_gate.get("raw_min_absolute_ess"),
+                "raw_min_absolute_ess_threshold":
+                    target_support_gate.get("raw_min_absolute_ess_threshold"),
+                "max_top1pct_raw_weight": target_support_gate.get("max_top1pct_raw_weight"),
+                "max_top1pct_raw_weight_threshold":
+                    target_support_gate.get("max_top1pct_raw_weight_threshold"),
+                "per_window": failure_details,
+                "note": "门未通过但未中止；ΔG 不可发布。",
+            })
         # 🔑 修复（审查报告 #2）：此前 GlobalMBARAnalyzer/TraditionalMBARAnalyzer
         # 返回的 converged/min_overlap 字段从未被这里检查过——即使它们现在已经是
         # 真实的重叠/收敛诊断（见 ibs_engine.py 的 solve / solve_stage_integrated），
@@ -6746,7 +7249,7 @@ class ABFEPipeline:
         min_overlap_threshold = result.get("min_overlap_threshold")
         if converged is False:
             failure_details = self._stage_quality_failure_details(result)
-            raise RuntimeError(
+            _qmsg = (
                 f"{stage_label} 阶段报告 converged=False"
                 + (f"，min_overlap={min_overlap:.4g}（阈值 {min_overlap_threshold:.4g}）" if min_overlap is not None and min_overlap_threshold is not None else "")
                 + "。Reweighting-quality gate failed. Preserve data and run "
@@ -6755,14 +7258,28 @@ class ABFEPipeline:
                 "（完整诊断见 window_overlap_diagnostics / statistical_inefficiency；由 rescue/"
                 "coverage 审计决定是否需要新 ensemble，不在原地拆窗/插 λ/重校准 f_k。）"
             )
+            # [2026-09-01] 质量门不再中止：标记不可信并继续（见 target_support_gate 处的说明）。
+            if not _allow_untrusted:
+                raise RuntimeError(_qmsg)
+            self._log(f"  🚨 [结果不可信] {_qmsg}")
+            result["results_untrusted"] = True
+            result.setdefault("stage_quality_failures", []).append(
+                {"gate": "stage_quality", "message": str(_qmsg)})
         if min_overlap is not None and min_overlap_threshold is not None and min_overlap < min_overlap_threshold:
-            raise RuntimeError(
+            _qmsg = (
                 f"{stage_label} 阶段单参考重要性 ESS 比值 min_overlap={min_overlap:.4g} 低于阈值 "
                 f"{min_overlap_threshold:.4g}（此处 min_overlap 是 compute_effective_sample_number "
                 "重要性 ESS 比值，非 fixed-H adjacent overlap），拒绝标记为 completed。"
                 "Reweighting-quality gate failed. Preserve data and run rescue/coverage analysis; "
                 "do not mutate the sampling grid in place."
             )
+            # [2026-09-01] 质量门不再中止：标记不可信并继续（见 target_support_gate 处的说明）。
+            if not _allow_untrusted:
+                raise RuntimeError(_qmsg)
+            self._log(f"  🚨 [结果不可信] {_qmsg}")
+            result["results_untrusted"] = True
+            result.setdefault("stage_quality_failures", []).append(
+                {"gate": "stage_quality", "message": str(_qmsg)})
 
         # 🔑 [P1 修复] 最终收敛门此前只检查 ESS ratio；样本总数很少时，即使绝对
         # 有效样本数只有个位数，只要比例超过阈值仍会被判定 completed。这里对
@@ -6776,11 +7293,18 @@ class ABFEPipeline:
             and min_absolute_ess_threshold is not None
             and min_absolute_ess < min_absolute_ess_threshold
         ):
-            raise RuntimeError(
+            _qmsg = (
                 f"{stage_label} 阶段最小绝对有效样本数 min_absolute_ess="
                 f"{min_absolute_ess:.4g} 低于阈值 {min_absolute_ess_threshold:.4g}，拒绝标记为 "
                 "completed。ESS ratio 达标不代表绝对样本数足够，请延长重叠最差窗口的采样。"
             )
+            # [2026-09-01] 质量门不再中止：标记不可信并继续（见 target_support_gate 处的说明）。
+            if not _allow_untrusted:
+                raise RuntimeError(_qmsg)
+            self._log(f"  🚨 [结果不可信] {_qmsg}")
+            result["results_untrusted"] = True
+            result.setdefault("stage_quality_failures", []).append(
+                {"gate": "stage_quality", "message": str(_qmsg)})
         min_decorrelated_samples = result.get("min_decorrelated_samples")
         min_decorrelated_samples_threshold = result.get("min_decorrelated_samples_threshold")
         if (
@@ -6788,11 +7312,18 @@ class ABFEPipeline:
             and min_decorrelated_samples_threshold is not None
             and min_decorrelated_samples < min_decorrelated_samples_threshold
         ):
-            raise RuntimeError(
+            _qmsg = (
                 f"{stage_label} 阶段最少去相关样本数 min_decorrelated_samples="
                 f"{min_decorrelated_samples} 低于阈值 {min_decorrelated_samples_threshold}，"
                 "拒绝标记为 completed，请延长采样。"
             )
+            # [2026-09-01] 质量门不再中止：标记不可信并继续（见 target_support_gate 处的说明）。
+            if not _allow_untrusted:
+                raise RuntimeError(_qmsg)
+            self._log(f"  🚨 [结果不可信] {_qmsg}")
+            result["results_untrusted"] = True
+            result.setdefault("stage_quality_failures", []).append(
+                {"gate": "stage_quality", "message": str(_qmsg)})
         max_endpoint_uncertainty_kJ_mol = result.get("max_endpoint_uncertainty_kJ_mol")
         max_endpoint_uncertainty_kJ_mol_threshold = result.get("max_endpoint_uncertainty_kJ_mol_threshold")
         if (
@@ -6803,12 +7334,19 @@ class ABFEPipeline:
                 or max_endpoint_uncertainty_kJ_mol > max_endpoint_uncertainty_kJ_mol_threshold
             )
         ):
-            raise RuntimeError(
+            _qmsg = (
                 f"{stage_label} 阶段最大端点自由能差不确定度 "
                 f"max_endpoint_uncertainty_kJ_mol={max_endpoint_uncertainty_kJ_mol:.4g} kJ/mol "
                 f"高于阈值 {max_endpoint_uncertainty_kJ_mol_threshold:.4g} kJ/mol，拒绝标记为 "
                 "completed，请延长采样或检查窗口重叠。"
             )
+            # [2026-09-01] 质量门不再中止：标记不可信并继续（见 target_support_gate 处的说明）。
+            if not _allow_untrusted:
+                raise RuntimeError(_qmsg)
+            self._log(f"  🚨 [结果不可信] {_qmsg}")
+            result["results_untrusted"] = True
+            result.setdefault("stage_quality_failures", []).append(
+                {"gate": "stage_quality", "message": str(_qmsg)})
 
     def _assert_reusable_stage_cache_sane(
         self,
@@ -7680,7 +8218,12 @@ class ABFEPipeline:
         固定-λ 生产轨迹，并解出这一段的自由能。
 
         见 STAGE2_ROOT_CAUSE_2026-08-28.md：IBS 每个窗口只跑一条轨迹，窗口内所有
-        λ 态靠重加权得到，采不到"水塌进配体空腔"这个构型，而它正是 ΔG 的主要来源。
+        λ 态靠重加权得到，采不到"水塌进配体空腔"这个构型。
+
+        ⚠️ [2026-09-02 归因更正] 原文这句结尾是"**而它正是 ΔG 的主要来源**"。
+        那个定级已被超越：`docs/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md`
+        把 stage2 误差的 **98% 定罪为 λ-WCA 防护壳**（已退役）。这个构型采样问题
+        仍然真实存在，但现在只对残余 1.7~4.2 kJ/mol（≈4%）负责，不是"主要来源"。
         这里对 [endpoint_join_index, n_states) 这一段的每个 λ 态各建独立 Context、
         各自平衡、各自采样，并**不含 Group-4 WCA**——防护壳的全部作用就是把水挡在
         空腔外，留着它等于继续采不到那个构型。
@@ -7701,8 +8244,13 @@ class ABFEPipeline:
         """
         from ibs_engine import (
             _build_fixed_state_simulation,
-            endpoint_wet_dry_hysteresis_gate,
-            prepare_wet_cavity_seed,
+            # ⚠️ [2026-09-01] `endpoint_wet_dry_hysteresis_gate` / `prepare_wet_cavity_seed`
+            # 仍然 import，但生产路径**已不再调用**它们（干/湿诊断退役，见
+            # `ibs_engine.WET_DRY_DIAGNOSTIC_RETIRED`）。刻意保留这两个名字：
+            # 删掉会同时删掉那条湿臂曾经存在过的线索，而它们是历史结果的解释依据。
+            endpoint_wet_dry_hysteresis_gate,  # noqa: F401  (retired, kept importable)
+            prepare_wet_cavity_seed,  # noqa: F401  (retired, kept importable)
+            retired_wet_dry_gate_record,
             run_independent_endpoint_states,
             solve_independent_endpoint_states,
         )
@@ -7817,22 +8365,182 @@ class ABFEPipeline:
         # ---- wet 起点：在最解耦态上长平衡，等水自己进空腔 ----
         from ibs_engine import ligand_heavy_atom_indices, water_oxygen_indices
 
-        wet_seed = prepare_wet_cavity_seed(
-            topology=self.topology,
-            common_system_xml=common_xml,
-            cv_xml_decoupled=cv_xmls[most_decoupled_local],
-            positions=dry_seed["positions"],
-            box_vectors=dry_seed["box_vectors"],
-            temperature=temperature_q,
-            platform_name=self.platform_name,
-            ligand_heavy_idx=ligand_heavy_atom_indices(
-                self.topology, self.ligand_indices
-            ),
-            water_oxygen_idx=water_oxygen_indices(self.topology),
-            equilibration_steps=int(
-                kwargs.get("independent_endpoint_wet_equilibration_steps", 500_000)
-            ),
+        # 🔑 [2026-08-31 P1] 湿种子搜索接入 repeat-seed contract + 结论落盘。
+        # 旧写法既不传 seed（于是 prepare_wet_cavity_seed 吃写死常量、不同 repeat_seed
+        # 产生逐字节相同的 50 万步随机流），也不落盘（于是每次 resume 都重跑 50 万步，
+        # 即使 bank 完全可复用）。key 里带种子，两面一起解决：命中就不跑，
+        # 换种子必然不命中、重新搜索，绝不让新种子继承上一颗种子"永远是干的"结论。
+        # getattr 兜底的理由同 seed_contract_snapshot()：测试 stub 可能没有 seed_ledger。
+        # ⚠️ [2026-09-01] 下面除 `WET_DRY_*` 两个常量外，**全部只被死代码引用**
+        # （干/湿双起点装置已退役）。刻意不删这些 import：删了那段 `else` 里的
+        # 湿臂代码就不再可编译，"保留但不执行"也就无从谈起。
+        from ibs_engine import (
+            WET_DRY_DIAGNOSTIC_RETIRED,
+            WET_DRY_RETIRED_REASON,
+            build_wet_cavity_seed_key,  # noqa: F401  (retired path only)
+            load_wet_cavity_seed_cache,  # noqa: F401  (retired path only)
+            save_wet_cavity_seed_cache,  # noqa: F401  (retired path only)
+            INDEPENDENT_ENDPOINT_INTEGRATOR_SEED_BASE,  # noqa: F401
+            INDEPENDENT_ENDPOINT_VELOCITY_SEED_BASE,  # noqa: F401
+            CAVITY_PROBE_RADIUS_NM,  # noqa: F401  (retired path only)
+            CAVITY_WET_MIN_WATERS,  # noqa: F401  (retired path only)
         )
+
+        # 🔑 [2026-09-01] 湿盆搜索**默认不执行**。
+        #
+        # 干/湿双起点是一个**诊断装置**，不是生产判据。它在生产路径上无条件跑
+        # 50 万步，而 4W53 复合物腿连续三天每轮都跑、每轮都得出"没找到"——
+        # 那是纯粹的 GPU 浪费。更根本的是（见 `solve_independent_endpoint_states`
+        # 里 cavity_guard 的长注释）：`count_cavity_waters` 的探针锚在**配体**上，
+        # 而配体在 λ_vdw→0 只被 Boresch 松松拴着、会漂，所以那个观测量在复合物腿上
+        # 不是状态函数，跑出来也没有判别力。
+        #
+        # 🔑 [2026-09-01 退役] 上面那条"要当测试跑时打开
+        # `independent_endpoint_wet_search=True`"的出口**已经关闭**：干/湿双起点
+        # 诊断整体退役（见 `ibs_engine.WET_DRY_DIAGNOSTIC_RETIRED` 的长注释）。
+        # 理由是这个观测量本身错——空腔水探针锚在会漂的配体上，在复合物腿上
+        # 不是状态函数，所以无论跑多久都没有判别力，不是"跑得起就有用"的东西。
+        # 因此这里**硬编码 False**，不再从 kwargs 读：留一个能把错误诊断重新
+        # 打开的开关，等于留一条会再次烧掉几天 GPU 的路。
+        _wet_search_enabled = False
+        if bool(kwargs.get("independent_endpoint_wet_search", False)):
+            self._log(
+                "  ⛔ [独立端点段] 收到 independent_endpoint_wet_search=True，但干/湿"
+                "双起点诊断已于 2026-09-01 退役（空腔水数探针锚在会漂移的配体上，"
+                "在复合物腿上不是状态函数 ⇒ 无判别力），**该开关已失效**、本次忽略。"
+                "湿/干门返回退役记录 passed=None，不参与 converged。"
+            )
+
+        # ====================================================================
+        # 干/湿双起点装置：**整段死代码**（保留、永不执行）
+        # --------------------------------------------------------------------
+        # `WET_DRY_DIAGNOSTIC_RETIRED` 是 ibs_engine 里硬编码的 True，所以下面
+        # `else` 分支里的全部湿臂机制（种子派生、缓存键、缓存目录、湿盆搜索、
+        # 负结论落盘）从此**一行都不执行**，但原样留在这里可读、可复查。
+        #
+        # 为什么连"只是算个缓存键"也一起停掉：`self._seed_for(...)` 不是纯函数，
+        # 它会 `seed_ledger.derive(...)` 把派生记录写进 ledger。留着它会让每份
+        # provenance 里继续出现两条 `independent_endpoint_wet_seed` 种子——一个
+        # 已经退役、永远不会被用来跑任何动力学的种子。那正是本项目反复出现的
+        # "字段说谎"：记录声称派生过的东西，其实没有任何消费者。
+        #
+        # 安全性依据（为什么删掉这两次 derive 不会让 resume 失配）：
+        # `Exp019SeedLedger.snapshot()` 的 docstring 明确写着 `derived_seed_map`
+        # **只能用于 provenance、不能进任何缓存/协议指纹**，且它本来就随执行路径
+        # 增长（首跑与 resume 下就不同）；进缓存键的是 `identity()`，只含
+        # protocol_version / repeat_seed / leg。所以少派生两个种子不改变任何身份。
+        # ====================================================================
+        if WET_DRY_DIAGNOSTIC_RETIRED:
+            # ⚠️ 这条 reason 与历史上的 `wet_search_disabled_by_default_...` 刻意不同：
+            # 那是"这次没跑"，这是"这个诊断已作废"。两者不能压成同一个字符串。
+            wet_seed = {
+                "reached_wet": False,
+                "search_skipped": True,
+                "skip_reason": WET_DRY_RETIRED_REASON,
+                "positions": None,
+                "box_vectors": None,
+                "cavity_water_counts": [],
+                "cavity_diagnostics": None,
+                "equilibration_steps": 0,
+                "dynamics_hamiltonian": None,
+            }
+            self._log(
+                "  ⛔ [独立端点段] 干/湿双起点诊断**已退役**，湿臂整段不执行："
+                "空腔水数探针锚在 λ_vdw→0 只被 Boresch 松松拴住、会漂移的配体上，"
+                "该观测量在复合物腿上不是状态函数 ⇒ 无判别力。只跑干起点；"
+                "湿/干门返回退役记录（passed=None，不参与 converged）。"
+                "端点段遍历性改由 raw ESS / top-1% 权重 / 独立 walker-种子一致性 / "
+                "去相关样本数判定。"
+            )
+            _wet_equil_steps = 0
+            _wet_key = None
+            _wet_cache_dir = None
+            _wet_seed_resolved = True
+        else:
+            _wet_equil_steps = int(
+                kwargs.get("independent_endpoint_wet_equilibration_steps", 500_000)
+            )
+            _wet_check_interval = 5_000
+            _has_ledger = getattr(self, "seed_ledger", None) is not None
+            _wet_int_seed = (
+                self._seed_for("vanishing", "independent_endpoint_wet_seed", "global",
+                               "integrator")
+                if _has_ledger else INDEPENDENT_ENDPOINT_INTEGRATOR_SEED_BASE - 1
+            )
+            _wet_vel_seed = (
+                self._seed_for("vanishing", "independent_endpoint_wet_seed", "global",
+                               "velocity")
+                if _has_ledger else INDEPENDENT_ENDPOINT_VELOCITY_SEED_BASE - 1
+            )
+            _wet_key = build_wet_cavity_seed_key(
+                # 与下面 run_independent_endpoint_states(stage_type="vdw") 同一口径，
+                # 这样湿种子缓存目录是 bank 目录（independent_endpoint/vdw）的兄弟。
+                stage_type="vdw",
+                common_system_xml=common_xml,
+                cv_xml_decoupled=cv_xmls[most_decoupled_local],
+                temperature_K=temperature_q.value_in_unit(unit.kelvin),
+                platform_name=self.platform_name,
+                equilibration_steps=_wet_equil_steps,
+                check_interval=_wet_check_interval,
+                cavity_probe_radius_nm=CAVITY_PROBE_RADIUS_NM,
+                cavity_wet_min_waters=CAVITY_WET_MIN_WATERS,
+                integrator_seed=int(_wet_int_seed),
+                velocity_seed=int(_wet_vel_seed),
+                # 同上：缓存键只能带稳定身份，不能带 derived_seed_map
+                seed_identity=self.seed_contract_identity(),
+            )
+            _wet_cache_dir = os.path.join(
+                checkpoint_dir, "independent_endpoint", "vdw_wet_seed"
+            )
+            if not _wet_search_enabled:
+                # ⚠️ 必须与"跑了但没找到"严格区分：那是物理断言，这里只是没跑。
+                wet_seed = {
+                    "reached_wet": False,
+                    "search_skipped": True,
+                    "skip_reason": "wet_search_disabled_by_default_diagnostic_not_production",
+                    "positions": None,
+                    "box_vectors": None,
+                    "cavity_water_counts": [],
+                    "cavity_diagnostics": None,
+                    "equilibration_steps": 0,
+                    "dynamics_hamiltonian": None,
+                }
+                self._log(
+                    "  ⏭️ [独立端点段] 湿盆搜索**未执行**（默认关闭：干/湿双起点是诊断装置、"
+                    f"不是生产判据；开启用 independent_endpoint_wet_search=True）。"
+                    f"省下 {_wet_equil_steps} 步平衡。只跑干起点；湿/干门本就不参与 converged。"
+                )
+                _wet_seed_resolved = True
+            else:
+                _wet_seed_resolved = False
+                wet_seed = load_wet_cavity_seed_cache(_wet_cache_dir, _wet_key)
+            if _wet_seed_resolved:
+                pass
+            elif wet_seed is not None:
+                self._log(
+                    "  ♻️ [独立端点段] 湿空腔搜索结论命中缓存（key 含种子）："
+                    f"reached_wet={wet_seed['reached_wet']}，跳过 {_wet_equil_steps} 步重搜。"
+                )
+            else:
+                wet_seed = prepare_wet_cavity_seed(
+                    topology=self.topology,
+                    common_system_xml=common_xml,
+                    cv_xml_decoupled=cv_xmls[most_decoupled_local],
+                    positions=dry_seed["positions"],
+                    box_vectors=dry_seed["box_vectors"],
+                    temperature=temperature_q,
+                    platform_name=self.platform_name,
+                    ligand_heavy_idx=ligand_heavy_atom_indices(
+                        self.topology, self.ligand_indices
+                    ),
+                    water_oxygen_idx=water_oxygen_indices(self.topology),
+                    equilibration_steps=_wet_equil_steps,
+                    check_interval=_wet_check_interval,
+                    integrator_seed=int(_wet_int_seed),
+                    velocity_seed=int(_wet_vel_seed),
+                )
+                # 负结论同样落盘：只存"找到了"会让"没找到"每次都重搜 50 万步。
+                save_wet_cavity_seed_cache(_wet_cache_dir, _wet_key, wet_seed)
         # 🔑 [2026-08-31] 这里曾经在 reached_wet=False 时 raise，把整条腿打断。
         # 那是错的：湿/干双起点是为溶剂腿的空腔灌水问题引入的**条件性诊断**，
         # 而 T4 L99A 这类本来就干的埋藏疏水腔根本不存在湿盆
@@ -7850,7 +8558,11 @@ class ABFEPipeline:
         # 采样预算由 independent_endpoint_walkers_per_mode 显式决定，对所有体系一致。
         _wet_ok = bool(wet_seed.get("reached_wet"))
         _walkers = int(kwargs.get("independent_endpoint_walkers_per_mode", 2))
-        if not _wet_ok:
+        # 🔑 [2026-09-01] 「没跑」与「跑了没找到」必须分开说。
+        # 搜索被跳过时这里曾照样打「平衡 0 步未观察到湿盆（空腔水数始终为 0）」——
+        # 那是在断言一件我们根本没去看的事，而且紧跟在「未执行」那行后面自相矛盾。
+        # 跳过的情形上面已经打过一条如实的日志，这里不再重复。
+        if not _wet_ok and not wet_seed.get("search_skipped"):
             self._log(
                 f"  ℹ️ [独立端点段] 最解耦态平衡 {wet_seed.get('equilibration_steps')} 步"
                 "未观察到湿盆（空腔水数始终为 0）——只跑干起点。"
@@ -7910,16 +8622,18 @@ class ABFEPipeline:
             ),
         )
         solved_all = solve_independent_endpoint_states(bank, **solve_kwargs)
-        solved_wet = solve_independent_endpoint_states(
-            bank, init_modes=["wet"], **solve_kwargs
-        )
-        solved_dry = solve_independent_endpoint_states(
-            bank, init_modes=["dry"], **solve_kwargs
-        )
-        gate = endpoint_wet_dry_hysteresis_gate(
-            solved_wet, solved_dry, bank["per_walker_cavity"],
-            wet_arm_available=bool(bank.get("wet_basin_found")),
-        )
+        # 🔑 [2026-09-01 退役] 干/湿双起点诊断已退役 ⇒ 这里不再做 wet/dry 拆分求解、
+        # 不再调用 `endpoint_wet_dry_hysteresis_gate`（函数本身保留、仍可导入，
+        # 只是生产路径不再走到它 —— 死代码，不是删除）。
+        #
+        # 两次多余的拆分求解一并去掉：湿臂从不存在，`init_modes=["wet"]` 恒为空子集；
+        # 而所有记录都是干起点，`init_modes=["dry"]` 的结果与 `solved_all` 逐字段相同，
+        # 留着只是把同一个数算两遍、再摆成一个"对照"的样子。
+        # `solve_wet`/`solve_dry` 显式置 None：宁可字段是空的，也不要让读结果的人
+        # 以为这里真做过双起点对照（本项目反复出现的"字段说谎"）。
+        solved_wet = None
+        solved_dry = None
+        gate = retired_wet_dry_gate_record()
         return {
             "solve_all": solved_all,
             "solve_wet": solved_wet,
@@ -8480,12 +9194,40 @@ class ABFEPipeline:
         run_config = dict(getattr(self, "_last_run_config", {}) or {})
         run_config.pop("resume", None)
         run_config.pop("run_equilibration", None)
+        # 🔑 [2026-09-01] `allow_untrusted_stage_results` 是**执行策略**，不是身份。
+        #
+        # 整个 run_config 是逐字段进指纹的，所以任何新加的顶层键/kwargs 键都会让
+        # 全部 stage 缓存失配、重跑 GPU（实测代价：Stage 1 约 28 分钟 + 6 个
+        # vanishing 窗口全部重采样）。这个开关只决定"质量门没过时是中止还是标记
+        # 为 results_untrusted 继续"——它不改变任何被计算出来的数、不动 Hamiltonian、
+        # 不动采样协议。同一份轨迹在开关两种取值下算出的 ΔG 逐位相同。
+        # 因此它必须和 resume/run_equilibration 一样被剔除。
+        # （这是仓库里反复出现过的同一类 bug：把执行历史/策略混进身份键。）
+        run_config.pop("allow_untrusted_stage_results", None)
+        _rc_kwargs = run_config.get("kwargs")
+        if isinstance(_rc_kwargs, dict) and "allow_untrusted_stage_results" in _rc_kwargs:
+            _rc_kwargs = dict(_rc_kwargs)
+            _rc_kwargs.pop("allow_untrusted_stage_results", None)
+            run_config["kwargs"] = _rc_kwargs
         payload = {
             "kind": "dual_lambda_stage",
             "stage_name": stage_name,
             "potential_type": str(potential_type),
             "dexp_params": dexp_params,
-            "boresch_params": boresch_params,
+            # 🔑 [2026-09-01] 必须用收窄口径，不能放整个 boresch_params。
+            # 仓库里另外四处（含 stage0，2026-08-27 就修过同一问题）都走
+            # `_preopt_boresch_protocol_payload`，只有这里落下了。
+            # 后果：`boresch_params` 里带 `last_frame_geometry_diagnostic` 这类**诊断**
+            # 字段，而首次提交路径 `_commit_ensemble_boresch_equilibrium` 会塞进去、
+            # resume 复用已提交值的分支不会再补 —— 两条路径产出的字典形状永远对不上。
+            # 实测（4W53 resume_v3.log）：Stage 1 结果缓存因
+            # `boresch_params.last_frame_geometry_diagnostic: 缓存={...} -> 当前='<missing>'`
+            # 判失配，整段 Stage 1（约 28 分钟）白重跑，而真正决定 Hamiltonian 的
+            # 锚点原子/平衡值/力常数逐位相同。
+            # 收窄函数只保留 receptor_indices / ligand_indices / equilibrium_values /
+            # force_constants —— 正是它 docstring 说的"改变对同一个限制力的**说明**，
+            # 不该导致重跑"。
+            "boresch_params": _preopt_boresch_protocol_payload(boresch_params),
             "decharge_method": str(decharge_method) if stage_name == "decharging" else "n/a",
             "requested_n_states": None if n_states is None else int(n_states),
             "run_config": run_config,
@@ -8587,7 +9329,7 @@ class ABFEPipeline:
         # 根本没机会生效（P1-18 修复说明里明确的威胁模型）。
         # 沿用本文件既有的 `_residual_payload` 条件插入惯用法：ledger 为 None
         # 时不插入该键，未启用 repeat-seed 的运行指纹逐位不变。
-        _seed_contract = self.seed_contract_snapshot()
+        _seed_contract = self.seed_contract_identity()
         if _seed_contract is not None:
             payload["seed_contract"] = _seed_contract
         _residual_payload = self.residual_sampling_protocol_payload()
@@ -9070,6 +9812,13 @@ class ABFEPipeline:
             "enable_early_stop": enable_early_stop,
             "temperature_K": self.temperature.value_in_unit(unit.kelvin),
             "platform_name": self.platform_name,
+            # 🔑 [2026-09-01] 质量门放行开关必须提到**顶层**。
+            # _assert_stage_result_sane 读的是 _last_run_config 的顶层键，而所有
+            # **kwargs 都被塞进下面的 "kwargs" 子字典 —— 只放在子字典里等于这个
+            # 开关永远打不开（默认 fail-closed 生效，复合物腿永远走不完）。
+            "allow_untrusted_stage_results": bool(
+                kwargs.get("allow_untrusted_stage_results", False)
+            ),
             "kwargs": {
                 str(k): v for k, v in kwargs.items()
                 if isinstance(v, (str, int, float, bool, type(None), list, tuple, dict))
@@ -9352,7 +10101,8 @@ class ABFEPipeline:
                 "run_config": config,
                 "potential_type": potential_type,
                 "dexp_params": dexp_params,
-                "boresch_params": boresch_params,
+                # 🔑 [2026-09-01] 同 `_stage_protocol_key`，见那里的说明。
+                "boresch_params": _preopt_boresch_protocol_payload(boresch_params),
                 "torsion_params": torsion_params,
                 "decharge_method": kwargs.get("decharge_method", "pme"),
                 "system_xml_sha256": _system_xml_hash(self.system),
@@ -9414,7 +10164,7 @@ class ABFEPipeline:
             }
             # 🔑 [2026-08-31 P1] 同 _stage_protocol_key 里的说明：顶层
             # final_results.json 早退先于内层指纹，换 repeat_seed 必须失配。
-            _seed_contract = self.seed_contract_snapshot()
+            _seed_contract = self.seed_contract_identity()
             if _seed_contract is not None:
                 payload["seed_contract"] = _seed_contract
             _residual_payload = self.residual_sampling_protocol_payload()
@@ -9469,7 +10219,7 @@ class ABFEPipeline:
             }
             # 🔑 [2026-08-31 P1] single/2D 的 resume 分支只比这个 key 就直接复用
             # cached_sample，内层 REMD/u_kn 指纹根本到不了。换 repeat_seed 必须失配。
-            _seed_contract = self.seed_contract_snapshot()
+            _seed_contract = self.seed_contract_identity()
             if _seed_contract is not None:
                 payload["seed_contract"] = _seed_contract
             return _protocol_fingerprint(payload)
@@ -9699,7 +10449,7 @@ class ABFEPipeline:
                 # 显式带上整份 contract 快照，与 _remd_sampling_fingerprint /
                 # _build_sampling_protocol_key 的口径一致；ledger 为 None 时
                 # snapshot() 返回 None，旧指纹逐位不变。
-                "seed_contract": self.seed_contract_snapshot(),
+                "seed_contract": self.seed_contract_identity(),
             })
             if decoupling_scheme == "dual_lambda":
                 analysis_context["attachment_protocol_key"] = stage0_protocol_key
@@ -10543,9 +11293,34 @@ class ABFEPipeline:
                 # never changes the lambda grid or carries warmup frames into
                 # production.
                 production_rescue_targets: Dict[int, int] = {}
+                # 🔑 [2026-09-01] 用户显式放行质量门时，两级 rescue 一并停掉。
+                #
+                # rescue 的全部意义是"再烧 GPU 把 converged 拱成 True"。一旦调用方
+                # 已经决定「这道门没过也继续、结果标成 results_untrusted」，再跑
+                # 2 轮 ×2 倍步数的生产补采 + 一轮 bridge rescue 就是纯粹的时间损耗：
+                # 补采完照样不 converged，照样走同一条放行路径，只是晚几个小时。
+                # 实测代价：window 5 的生产目标就是被 rescue 从 500k 抬到 1M 的。
+                #
+                # 放弃了什么，必须写清楚：不再尝试自动补救覆盖度不足的窗口，
+                # 末窗口的 ESS/overlap 就停在当前值。这只在显式开关下发生，
+                # 默认路径（开关关闭）行为逐字不变。
+                _rescue_disabled_by_untrusted = bool(
+                    (getattr(self, "_last_run_config", {}) or {}).get(
+                        "allow_untrusted_stage_results", False
+                    )
+                )
                 production_rescue_rounds = max(
                     0, int(kwargs.get("stage2_production_rescue_rounds", 2))
                 )
+                if _rescue_disabled_by_untrusted and production_rescue_rounds:
+                    self._log(
+                        "  ⏭️ [rescue] allow_untrusted_stage_results=True —— 跳过 "
+                        f"{production_rescue_rounds} 轮生产 coverage rescue 与 bridge rescue。"
+                        "理由：质量门已被显式放行，补采不会改变最终走向，只会增加 GPU 时间。"
+                        "⚠️ 代价：覆盖度不足的窗口不再自动补救，末窗口 ESS/overlap 停在当前值，"
+                        "本阶段 ΔG 只能作为推进到溶剂腿的中间量，不得作为可发布结果。"
+                    )
+                    production_rescue_rounds = 0
                 production_rescue_growth = max(
                     1.1, float(kwargs.get("stage2_production_rescue_growth", 2.0))
                 )
@@ -10597,6 +11372,7 @@ class ABFEPipeline:
                 # analysis cover.
                 if (
                     stage2.get("converged") is not True
+                    and not _rescue_disabled_by_untrusted
                     and bool(kwargs.get("stage2_enable_bridge_rescue", True))
                 ):
                     # ------------------------------------------------------
@@ -11183,7 +11959,13 @@ class ABFEPipeline:
 
             if path_2d is None:
                 from abfe_preoptimizer import optimize_2d_geodesic_path
+                # 🔑 [0831issue P2] 测地线寻径失败会回退到对角线线性路径，而回退
+                # 路径与成功路径在返回值上**完全无法区分**，于是次优路径会被当成功
+                # 结果写进 geodesic_path.json 并被后续 run 复用。这里接住寻径
+                # provenance 一起落盘，让缓存能被审计（也能被人工判定该重算）。
+                _geodesic_diag: Dict[str, Any] = {}
                 path_2d = optimize_2d_geodesic_path(
+                    diagnostics=_geodesic_diag,
                     system=self.system,
                     topology=self.topology,
                     positions=self.positions,
@@ -11199,6 +11981,12 @@ class ABFEPipeline:
                         else None
                     ),
                 )
+                if _geodesic_diag.get("fallback"):
+                    self._log(
+                        "  ⚠️ 2D 路径其实是**寻径失败后的对角线线性回退**"
+                        f"（原因：{_geodesic_diag.get('fallback_reason')}），"
+                        "不是测地线结果；它会照常被缓存复用，但不应被当作已优化路径引用。"
+                    )
                 self._log(f"  🗺️ 测地线优化完成 ({len(path_2d)} 个状态)")
                 os.makedirs(self.checkpoint_dir, exist_ok=True)
                 with open(path_cache_file, "w") as f:
@@ -11208,6 +11996,9 @@ class ABFEPipeline:
                             "scheme": "2d_geodesic",
                             "protocol_key": geodesic_path_protocol_key,
                             "path_fingerprint": _path_content_fingerprint(path_2d),
+                            # [0831issue P2] fallback=True 表示这份"测地线路径"其实
+                            # 是寻径失败后的对角线线性路径，不是测地线结果。
+                            "search_diagnostics": dict(_geodesic_diag),
                         },
                         f,
                         indent=2,
@@ -11387,6 +12178,50 @@ class TraditionalABFEPipeline:
             return None
         return self.seed_ledger.derive(phase, stage, window, stream, attempt)
 
+    def pre_equilibration_identity_fingerprint(
+        self, requested_steps: Optional[int]
+    ) -> str:
+        """预平衡缓存身份。**两侧必须都调它**，否则时序不同 ⇒ 永远不匹配。
+
+        坐标取构造期冻结的那份并量化，因此不受 PBC 修复/居中/再平衡影响，
+        也不受 GRO↔mmCIF 往返浮点噪声影响。
+        """
+        return _pre_equilibration_fingerprint(
+            self.system,
+            self.ligand_indices,
+            self.temperature,
+            self.pressure,
+            positions=getattr(self, "_identity_positions", self.positions),
+            box_vectors=getattr(self, "_identity_box_vectors", self.box_vectors),
+            requested_steps=requested_steps,
+            barostat_protocol=self.barostat_protocol,
+        )
+
+    def seed_contract_identity(self) -> Optional[Dict[str, Any]]:
+        """种子契约的**稳定身份**，供缓存/协议指纹使用。
+
+        🔑 [2026-09-01] 与 `seed_contract_snapshot()` 的区别是**不含 derived_seed_map**。
+        那张表记的是"本进程到此刻为止派生过哪些种子"，随执行路径增长：首跑时预平衡
+        真跑过、派生了 equilibration/* 的种子；resume 时预平衡走 checkpoint 没派生，
+        同一份配置下快照就不同。实测事故（4W53 resume_v3.log）：Stage 1 结果缓存因
+        `seed_contract.derived_seed_map.equilibration/pre_equilibration/...
+        缓存=285721177 -> 当前='<missing>'` 判失配，整段 Stage 1 重算。
+        缓存键必须只依赖**配置身份**，不能依赖**执行历史**。
+        """
+        _ledger = getattr(self, "seed_ledger", None)
+        if _ledger is None:
+            return None
+        # 优先用 ledger 自己的稳定身份；但 ledger 是 duck-typed 的（测试里有只实现
+        # snapshot() 的替身），所以没有 identity() 时从 snapshot 里剥掉那张
+        # 随执行路径增长的 derived_seed_map —— 语义保证与实现无关。
+        _identity = getattr(_ledger, "identity", None)
+        if callable(_identity):
+            return _identity()
+        _snap = _ledger.snapshot()
+        if isinstance(_snap, dict):
+            return {k: v for k, v in _snap.items() if k != "derived_seed_map"}
+        return _snap
+
     def seed_contract_snapshot(self) -> Optional[Dict[str, Any]]:
         # `seed_ledger` 在 __init__ 里无条件赋值（有 repeat_seed 时是 ledger、
         # 否则 None），所以生产路径上一定存在。用 getattr 兜底是为了让
@@ -11475,12 +12310,13 @@ class TraditionalABFEPipeline:
             "temperature_K": float(self.temperature),
             "n_steps": int(n_steps),
             "exchange_interval": int(exchange_interval),
-            "boresch_params": boresch_params,
+            # 🔑 [2026-09-01] 同 `_stage_protocol_key`，见那里的说明。
+            "boresch_params": _preopt_boresch_protocol_payload(boresch_params),
             "potential_type": potential_type,
             # 🔑 [P1-18] 同 `_remd_sampling_fingerprint`：REM 动力学消费的
             # repeat-seed contract 身份必须进 sampling fingerprint，否则换
             # repeat_seed 的独立重复会复用旧 DCD/u_kn。
-            "seed_contract": self.seed_contract_snapshot(),
+            "seed_contract": self.seed_contract_identity(),
             # 🔑 [2026-08-24 修] 同 `_stage_protocol_key`/`_build_top_level_protocol_key`：
             # 曾经这里还有 `"code_sha256": _code_hash()`，删掉——同一个"不相关文件改动
             # 强制整段 REMD 重跑"的问题，只是这次是 traditional/PME-REMD 路径。
@@ -11693,7 +12529,18 @@ class TraditionalABFEPipeline:
             "stage_decharging": res_coul,
             "stage_vanishing": res_vdw,
             "delta_G_leg_kJ_mol": dg_leg,
+            # 🔑 [0831issue P2] 字段名与内容确实不配对：`delta_G_leg_kJ_mol` **不含**
+            # attachment，而这里是含 attachment 的 err_total。
+            # **但值不能改成 err_leg**：`abfe_core.py` 的 schema 把
+            # ("delta_G_total_kJ_mol", "error_leg_kJ_mol") 声明为**同一对**，
+            # 下游（runabfe.py 两处 traditional 汇总）也确实是拿它配 delta_G_total 用的
+            # ——那个组合在数值上是对的。按 issue 原建议改成 err_leg 会把 err_attach
+            # 从 delta_G_total 的 ± 里悄悄丢掉，是引入新 bug 而不是修 bug。
+            # 因此保留历史数值语义（= error_total_kJ_mol，配 delta_G_total），
+            # 另外补一个名副其实的字段供需要"不含 attachment"那一半的消费者使用。
             "error_leg_kJ_mol": err_total,
+            "error_leg_excluding_attachment_kJ_mol": float(err_leg),
+            "error_leg_kJ_mol_pairs_with": "delta_G_total_kJ_mol",
             "error_total_kJ_mol": err_total,
             "boresch_correction_kJ_mol": boresch_correction,
             "boresch_attachment_delta_G_kJ_mol": dg_attach,

@@ -209,11 +209,15 @@ def test_decorrelation_uses_the_slower_of_energy_and_cavity_series():
     # 极慢的湿/干方波：整段只翻转两次。
     slow = np.concatenate([np.zeros(n // 3), np.ones(n // 3), np.zeros(n - 2 * (n // 3))])
     bank = _synthetic_bank(n_frames=n, cavity_by_mode={"dry": slow, "wet": slow})
-    res = solve_independent_endpoint_states(bank, KT)
+    # `min_decorrelated_samples=1`：本用例测的是「去相关在两个候选序列里选哪个」，
+    # 与样本数硬门无关。2026-09-01 起生产 init_modes 收敛为 ("dry",)，合成 bank 的
+    # wet 记录不再参与，样本减半会撞上默认阈值 20 而走早退——那是另一道门的行为，
+    # 不该淹没本用例要测的性质。
+    res = solve_independent_endpoint_states(bank, KT, min_decorrelated_samples=1)
     picked = [r["selected_series"] for r in res["decorrelation"].values()]
     assert "cavity_water_count" in picked
     flat = _synthetic_bank(n_frames=n)
-    res_flat = solve_independent_endpoint_states(flat, KT)
+    res_flat = solve_independent_endpoint_states(flat, KT, min_decorrelated_samples=1)
     # 恒定的空腔序列没有信息量，不参与竞争。
     assert all(
         r["selected_series"] == "reduced_potential"
@@ -720,3 +724,371 @@ def test_combiner_still_fails_closed_on_a_real_join_mismatch():
     )
     assert out["converged"] is False
     assert "combine_join_mismatch" in out["error"]
+
+
+# ---------------------------------------------------------------------------
+# [ENDPOINT_CAVITY_SAMPLING_GATE_PROTOCOL_VERSION=1] 慢坐标未被采到 → fail-closed
+#
+# 旧实现只在 std(cavity) > 0 时才把空腔序列放进候选表；std == 0 时候选表里只剩
+# 能量序列，"取更差者"这道保险无从取起，该记录拿到能量序列的满额样本数。
+# 而 std == 0 恰恰就是"walker 在慢坐标上一步没动"的签名。
+# 4W53 实测：state_3_dry_w1 的 cavity std 恰为 0.000、湿/干转变 0 次，却报出 500。
+# ---------------------------------------------------------------------------
+
+def test_walker_disagreement_on_the_slow_coordinate_is_reported_but_not_gating():
+    """同一态同一模态内，一条 walker 有来回、另一条一步没动 ⇒ 必须**报出来**。
+
+    ⚠️ 2026-09-01 起**只诊断、不否决**：干/湿空腔占据是诊断装置，不是生产判据；
+    且该观测量锚在会漂移的幽灵配体上，在复合物腿上不是状态函数（实测同探针内
+    蛋白重原子远多于水、最近蛋白 0.095 nm）。用非状态函数的量 gate 生产拦的是噪声。
+    本用例因此钉两件事：**证据仍然产出**，且 **converged 不被它否决**。
+
+    这正是 4W53 的实形：state_3 的 w0 转变 90 次(wet_fraction 0.312)、w1 零次(0.000)，
+    而 w1 因为空腔序列退化反而拿到满额 500 个"独立样本"。
+    """
+    n = 600
+    wave = np.tile([0.0] * 25 + [1.0] * 25, n // 50).astype(float)
+    bank = _synthetic_bank(n_frames=n, cavity_by_mode={"dry": wave, "wet": wave})
+    # 只让 state 11 的 w0 冻住，w1 仍在来回 ⇒ 同态内矛盾
+    bank["records"]["11|dry|0"]["cavity_waters"] = np.zeros(n, dtype=float)
+
+    res = solve_independent_endpoint_states(bank, KT)
+    assert res.get("error") is None, "诊断不得否决 converged"
+    assert res["converged"] is True
+
+    guard = res["cavity_guard"]
+    assert guard["protocol_version"] == 1
+    assert guard["gates_converged"] is False
+    assert "不是生产判据" in guard["demoted_note"]
+    # 分组键是 "态|模态"（2026-09-01 起）：跨模态不比较，所以键里必须带模态
+    assert "11|dry" in guard["states_with_walker_disagreement"]
+    assert (
+        "11|dry|0"
+        in guard["states_with_walker_disagreement"]["11|dry"]["degenerate"]
+    )
+    # 必须报出"它本来会拿到多少"，否则看不出这道保险拦掉了什么
+    bad = guard["degenerate_records"]["11|dry|0"]
+    assert bad["status"] == "degenerate_zero_variance"
+    assert bad["n_decorrelated_reported"] is not None
+    assert "方差为 0" in bad["reason"]
+
+
+def test_consistently_dry_cavity_is_not_rejected():
+    """所有 walker 一致零方差 ⇒ 不拦。
+
+    λ_vdw≈1 端配体完全占据空腔，干且零方差是**正确**的平衡行为。
+    只按 std==0 一刀切会把这种合法态也判失败。
+    """
+    bank = _synthetic_bank(n_frames=600)  # 默认 cavity 全零占位
+    res = solve_independent_endpoint_states(bank, KT)
+    assert res.get("error") is None, res
+    guard = res["cavity_guard"]
+    assert guard["states_with_walker_disagreement"] == {}
+    assert guard["malformed_records"] == []
+    # 但退化这件事本身必须留痕，不能静默
+    assert guard["degenerate_records"], "零方差仍须被记录为诊断"
+    for rep in res["decorrelation"].values():
+        assert rep["cavity_series_status"] == "degenerate_zero_variance"
+        assert rep["cavity_guard_active"] is False
+
+
+def test_healthy_cavity_series_keeps_the_guard_active_and_passes():
+    """所有 walker 的空腔序列都有变化时，门必须放行、并留下正面证据。"""
+    n = 1500
+    wave = np.tile([0.0] * 25 + [1.0] * 25, n // 50).astype(float)
+    bank = _synthetic_bank(n_frames=n, cavity_by_mode={"dry": wave, "wet": wave})
+    res = solve_independent_endpoint_states(bank, KT)
+    assert res.get("error") is None, res
+    guard = res["cavity_guard"]
+    assert guard["degenerate_records"] == {}
+    assert guard["records_with_active_guard"] == guard["records_total"]
+    for rep in res["decorrelation"].values():
+        assert rep["cavity_series_status"] == "used"
+        assert rep["cavity_guard_active"] is True
+
+
+def test_cavity_length_mismatch_is_still_recorded_as_malformed():
+    """长度不匹配必须被记成坏数据——以前它和 std==0 走同一条**静默**分支。
+
+    同样只诊断不否决（见上一条），但坏数据与"零方差"必须区分开：前者是数据缺陷，
+    后者可能是合法的单相态。
+    """
+    bank = _synthetic_bank(n_frames=600)
+    bank["records"]["11|dry|1"]["cavity_waters"] = np.zeros(10, dtype=float)
+    res = solve_independent_endpoint_states(bank, KT)
+    assert res.get("error") is None
+    guard = res["cavity_guard"]
+    assert "11|dry|1" in guard["malformed_records"]
+    assert guard["degenerate_records"]["11|dry|1"]["status"] == "length_mismatch"
+
+
+# ---------------------------------------------------------------------------
+# ACF 型 g 在稀有事件指示量上虚高（2026-08-31，只诊断不设门）
+#
+# 4W53 实测：转变次数 vs pymbar g 的 Pearson r = 0.851 ——
+# 探索越充分 g 越大、有效样本越少；卡得越死 g 越小、独立样本越多。方向是反的。
+# state_2（500 帧只变 4 次 / 2 次）拿到 g=1.00、n_dec=500，两条 walker 都 std>0，
+# 因此「同态内矛盾」那道门不开火。这个洞必须至少可见。
+# ---------------------------------------------------------------------------
+
+def test_rare_transition_series_is_flagged_against_the_transition_bound():
+    """稀疏尖峰序列：ACF 给满额样本，但严格上界（转变数+1）必须把它标出来。"""
+    n = 600
+    sparse = np.zeros(n, dtype=float)
+    sparse[150:155] = 1.0        # 一次进、一次出 = 2 次转变
+    sparse[400:405] = 1.0        # 再一次 = 共 4 次
+    bank = _synthetic_bank(n_frames=n, cavity_by_mode={"dry": sparse, "wet": sparse})
+    res = solve_independent_endpoint_states(bank, KT)
+
+    rep = next(iter(res["decorrelation"].values()))
+    assert rep["cavity_series_status"] == "used"
+    assert rep["cavity_transitions"] == 4
+    assert rep["cavity_mode_observation_bound"] == 5
+    acf_n = rep["cavity_water_count"]["n_decorrelated"]
+    # ACF 在这种序列上会给出远超上界的样本数 —— 这正是要暴露的失效模式
+    assert acf_n > rep["cavity_mode_observation_bound"]
+    assert rep["cavity_acf_exceeds_transition_bound"] is True
+
+
+def test_cross_lambda_wet_profile_is_reported_but_never_gates():
+    """跨 λ 光滑性只进诊断，绝不参与 converged 判定。"""
+    n = 900
+    wave = np.tile([0.0] * 30 + [1.0] * 30, n // 60).astype(float)
+    bank = _synthetic_bank(n_frames=n, cavity_by_mode={"dry": wave, "wet": wave})
+    res = solve_independent_endpoint_states(bank, KT)
+    # 所有态用同一条 wave ⇒ wet_fraction 恒定 ⇒ 单调（非递减）成立
+    guard = res["cavity_guard"]
+    assert guard["cross_lambda_wet_fraction_monotonic"] is True
+    assert len(guard["cross_lambda_wet_profile"]) == 3
+    # 关键：这条诊断为真为假都不该改变放行结果
+    assert res.get("error") is None, res
+    assert res["converged"] is True
+    assert "不参与 converged 判定" in guard["cross_lambda_note"]
+
+
+# ---------------------------------------------------------------------------
+# manifest 身份 / 预算二分（2026-08-31）
+#
+# 旧实现整字典 `==`，任何一项不符就 shutil.rmtree(bank_dir)。于是想给某个态**补采**
+# （加 walker）时，n_walkers_per_mode 一变就整库被删 —— 而那正是"沿用已有记录、
+# 只追加新记录"这件事本身要做的。真 bug。
+# 种子公式 base + 97*global_k + 10007*mode_index + 1009*walker **与
+# n_walkers_per_mode 无关**，所以新 walker 拿全新不碰撞的种子，已有记录不受扰动。
+# ---------------------------------------------------------------------------
+
+def _manifest_kwargs(**over):
+    base = dict(
+        stage_type="vdw", state_indices=[19, 20, 21, 22],
+        common_system_xml="<System/>", cv_xmls=["<a/>", "<b/>", "<c/>", "<d/>"],
+        temperature_K=300.0, sample_interval=1000, sample_steps=500_000,
+        burn_in_steps=100_000, n_walkers_per_mode=2, platform_name="CUDA",
+        cavity_probe_radius_nm=CAVITY_PROBE_RADIUS_NM, cavity_wet_min_waters=1,
+        init_modes=["dry"],
+    )
+    base.update(over)
+    return base
+
+
+def _write_bank(tmp_path, manifest):
+    import json as _json
+    d = tmp_path / "vdw"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "manifest.json").write_text(_json.dumps(manifest), encoding="utf-8")
+    return str(d)
+
+
+def test_budget_only_change_keeps_the_bank(tmp_path):
+    """walker 数 / init_modes 变化 ⇒ 身份仍匹配 ⇒ 不清库。"""
+    from ibs_engine import (
+        build_independent_endpoint_manifest,
+        _independent_endpoint_manifest_matches,
+        _independent_endpoint_budget_delta,
+    )
+    stored = build_independent_endpoint_manifest(**_manifest_kwargs())
+    bank = _write_bank(tmp_path, stored)
+
+    grown = build_independent_endpoint_manifest(**_manifest_kwargs(n_walkers_per_mode=3))
+    assert _independent_endpoint_manifest_matches(bank, grown) is True
+    delta = _independent_endpoint_budget_delta(bank, grown)
+    assert delta["grew"] is True and delta["shrank"] is False
+
+    # 湿盆这次找到了 ⇒ 已有的干记录不能被连坐删除
+    with_wet = build_independent_endpoint_manifest(
+        **_manifest_kwargs(init_modes=["dry", "wet"])
+    )
+    assert _independent_endpoint_manifest_matches(bank, with_wet) is True
+    assert _independent_endpoint_budget_delta(bank, with_wet)["grew"] is True
+
+
+def test_budget_shrink_does_not_wipe_the_bank(tmp_path):
+    """预算缩小同样不清库——只标 shrank，多出来的记录留在盘上当孤儿。"""
+    from ibs_engine import (
+        build_independent_endpoint_manifest,
+        _independent_endpoint_manifest_matches,
+        _independent_endpoint_budget_delta,
+    )
+    stored = build_independent_endpoint_manifest(**_manifest_kwargs(n_walkers_per_mode=3))
+    bank = _write_bank(tmp_path, stored)
+    smaller = build_independent_endpoint_manifest(**_manifest_kwargs(n_walkers_per_mode=2))
+    assert _independent_endpoint_manifest_matches(bank, smaller) is True
+    assert _independent_endpoint_budget_delta(bank, smaller)["shrank"] is True
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("temperature_K", 310.0),
+        ("sample_steps", 999_999),
+        ("burn_in_steps", 1),
+        ("sample_interval", 500),
+        ("state_indices", [19, 20, 21]),
+        ("cavity_probe_radius_nm", 0.30),
+        ("cavity_wet_min_waters", 2),
+        ("minimize_iterations", 10),
+        ("platform_name", "CPU"),
+    ],
+)
+def test_identity_change_invalidates_the_bank(tmp_path, field, value):
+    """任何决定"采的是哪个分布"的键变了 ⇒ 必须判不匹配（清库）。"""
+    from ibs_engine import (
+        build_independent_endpoint_manifest,
+        _independent_endpoint_manifest_matches,
+    )
+    stored = build_independent_endpoint_manifest(**_manifest_kwargs())
+    bank = _write_bank(tmp_path, stored)
+    changed = build_independent_endpoint_manifest(**_manifest_kwargs(**{field: value}))
+    assert _independent_endpoint_manifest_matches(bank, changed) is False, field
+
+
+def test_system_or_cv_hash_change_invalidates_the_bank(tmp_path):
+    """哈密顿量变了（含"有没有 Group-4 WCA"）必须整体失效。"""
+    from ibs_engine import (
+        build_independent_endpoint_manifest,
+        _independent_endpoint_manifest_matches,
+    )
+    stored = build_independent_endpoint_manifest(**_manifest_kwargs())
+    bank = _write_bank(tmp_path, stored)
+    for over in ({"common_system_xml": "<System2/>"},
+                 {"cv_xmls": ["<a/>", "<b/>", "<c/>", "<CHANGED/>"]}):
+        changed = build_independent_endpoint_manifest(**_manifest_kwargs(**over))
+        assert _independent_endpoint_manifest_matches(bank, changed) is False, over
+
+
+def test_a_legacy_flat_manifest_still_matches_on_identity(tmp_path):
+    """本次不新增/不重命名任何键 ⇒ 旧的扁平 manifest 必须原样匹配。
+
+    否则"引入二分"这个纯重构动作本身就会删掉已有 bank。
+    （已用 4W53 output_v2 盘上真实 manifest 验证过，这里把它固化成用例。）
+    """
+    from ibs_engine import (
+        build_independent_endpoint_manifest,
+        _independent_endpoint_manifest_matches,
+    )
+    expected = build_independent_endpoint_manifest(**_manifest_kwargs())
+    legacy = dict(expected)          # 旧格式就是同一批键的扁平字典
+    bank = _write_bank(tmp_path, legacy)
+    assert _independent_endpoint_manifest_matches(bank, expected) is True
+
+
+def test_init_modes_used_reflects_records_not_the_request():
+    """`init_modes_used` 必须来自**实际贡献样本的记录**，不能来自请求。
+
+    `init_modes` 归入 manifest 预算键（增长不清库）之后，请求与磁盘内容不再等价：
+    请求 ['dry','wet'] 但湿记录没落盘的运行，旧实现会谎报 used=['dry','wet']。
+    而这正是读者判断"湿/干门有没有真的湿臂"的字段。
+    """
+    bank = _synthetic_bank()
+    # 磁盘上只有干记录（湿盆没找到 / 湿记录未落盘）
+    for key in [k for k in list(bank["records"]) if "|wet|" in k]:
+        del bank["records"][key]
+
+    res = solve_independent_endpoint_states(bank, KT, init_modes=["dry", "wet"])
+    assert res.get("error") is None, res
+    assert res["init_modes_used"] == ["dry"], "不得把没落盘的 wet 算进 used"
+    assert res["init_modes_requested"] == ["dry", "wet"], "请求本身仍要如实记录"
+
+
+def test_orphan_mode_records_are_never_loaded_into_the_bank(tmp_path):
+    """不在当前 init_modes 里的记录必须结构性地进不了 bank。
+
+    保障在 `run_independent_endpoint_states` 的唯一写入点（visit 循环只由
+    active_modes × states × walkers 构造），不是在下游过滤。这条测试把不变量钉在
+    那里——它要抓的是"未来某人加一个把 bank_dir 里所有文件都载进来的诊断便利函数"。
+    """
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "ibs_engine.py").read_text(
+        encoding="utf-8"
+    )
+    i = source.index("def run_independent_endpoint_states(")
+    j = source.index("def _reduced_energies_for_record(")
+    lines = source[i:j].split("\n")
+
+    def indent(line):
+        return len(line) - len(line.lstrip())
+
+    loop = [
+        k for k, l in enumerate(lines)
+        if l.strip().startswith("for global_k, mode, walker in visit:")
+    ]
+    assert len(loop) == 1, "visit 循环必须唯一"
+    loop_indent = indent(lines[loop[0]])
+
+    writes = [k for k, l in enumerate(lines) if l.strip().startswith("records[key] =")]
+    assert writes, "没找到 records 的写入点，测试本身失效了"
+    # 真正的不变量：**每一个**写入点都在 visit 循环内（缩进更深且在其后）
+    for k in writes:
+        assert k > loop[0], f"第 {k} 行的写入点在 visit 循环之前"
+        assert indent(lines[k]) > loop_indent, (
+            f"第 {k} 行的写入点不在 visit 循环内——孤儿记录可能被载入"
+        )
+
+    # visit 必须由 active_modes 构造，而不是扫目录
+    # （注意不能用子串 "glob" 检查：`global_k` 里就含它）
+    assert "active_modes" in source[i:j]
+    for scanner in ("os.listdir", "glob.glob", "os.scandir", "iglob"):
+        assert scanner not in source[i:j], (
+            f"run_independent_endpoint_states 不得用 {scanner} 扫目录载入记录"
+        )
+
+
+def test_cross_mode_disagreement_is_not_evidence_of_non_convergence():
+    """干/湿双起点之间的分歧是**设计预期**，本门不得据此判失败。
+
+    2026-09-01 修的真 bug：分组原来只按态（`key.split("|")[0]`），把模态丢了，
+    于是同一 λ 上的干起点与湿起点会被拿来互相比较。而它们按设计就从不同盆地出发 ——
+    判断两个模态是否收敛到一起是 `endpoint_wet_dry_hysteresis_gate` 的职责。
+    旧写法在 dry-only 的运行里不会咬到，但**湿臂一旦真跑起来必然误报**，
+    恰好卡死我们正想启用的东西。
+    """
+    n = 1200
+    flat = np.zeros(n, dtype=float)                                   # 干起点：全程干
+    wave = np.tile([0.0] * 20 + [1.0] * 20, n // 40).astype(float)    # 湿起点：来回
+    assert wave.size == n, "测试数组长度必须与帧数一致，否则会被判 length_mismatch"
+
+    bank = _synthetic_bank(n_frames=n, cavity_by_mode={"dry": flat, "wet": wave})
+    res = solve_independent_endpoint_states(bank, KT)
+
+    guard = res["cavity_guard"]
+    assert guard["malformed_records"] == [], guard["malformed_records"]
+    # 关键：跨模态的分歧不得进入矛盾分组
+    assert guard["states_with_walker_disagreement"] == {}, (
+        "干/湿之间的分歧被误判成了不收敛"
+    )
+    assert res.get("error") is None, res.get("error")
+
+
+def test_same_mode_disagreement_is_still_recorded():
+    """同一模态内部的分歧仍必须**记录**——那才是无歧义的非平衡证据（但不否决）。"""
+    n = 1200
+    wave = np.tile([0.0] * 20 + [1.0] * 20, n // 40).astype(float)
+    bank = _synthetic_bank(n_frames=n, cavity_by_mode={"dry": wave, "wet": wave})
+    # 只让 state 11 的 dry walker 0 冻住，同模态的 walker 1 仍在来回
+    bank["records"]["11|dry|0"]["cavity_waters"] = np.zeros(n, dtype=float)
+
+    res = solve_independent_endpoint_states(bank, KT)
+    assert res.get("error") is None
+    dis = res["cavity_guard"]["states_with_walker_disagreement"]
+    # 分组键现在带模态，一眼看出是哪个模态内部不自洽
+    assert "11|dry" in dis, dis
+    assert "11|wet" not in dis, "湿模态本身自洽，不该被牵连"

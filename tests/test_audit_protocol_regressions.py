@@ -764,16 +764,41 @@ class SourceContractTests(unittest.TestCase):
             self.pipeline,
         )
 
-    def test_stage1_cdf_endpoint_is_clamped_to_one(self):
+    def test_stage1_cdf_endpoint_reaches_one_without_double_counting(self):
         # todolist.md P1: optimize_stage1_decharging's CDF interpolation used to
-        # omit the xp[-1]=1.0 clamp that optimize_lambda_path_adaptive already
+        # omit the endpoint guarantee that optimize_lambda_path_adaptive already
         # has, letting np.interp silently clamp the last 1-2 target points to
-        # fp[-1]=0.0 (duplicate lambda_coul=0.0 states).
-        idx = self.preoptimizer.index(
-            "xp = np.concatenate(([0.0], cumulative_density[:-1] / total_density)).astype(float).ravel()"
+        # fp[-1]=0.0 (duplicate lambda_coul=0.0 states).  The invariant to keep
+        # is therefore "xp ends at exactly 1.0".
+        #
+        # [0831issue P2] 那个不变量原来是靠 `xp[-1] = 1.0` **事后覆盖**实现的，而这个
+        # 赋值同时把倒数第二个累积坐标 c_{N-2} 也覆盖掉了 —— 最后一个区间的宽度从
+        # w[N-2] 变成 w[N-2]+w[N-1]，λ[N-2] 的权重被双重计入。现在改成"用前 N-1 个
+        # 权重当区间宽度、按它们自己的和归一化"，末端天然为 1.0。
+        # 因此这条测试不再 grep 那行赋值（它已经不该存在），而是直接验证构造本身：
+        # 既保住端点不变量，又不能再有双重计入。
+        both = [
+            "interval_weights = np.asarray(density_weight, dtype=float)[:-1]",
+            "interval_weights = np.asarray(density_weight, dtype=float).ravel()[:-1]",
+        ]
+        for needle in both:
+            self.assertIn(needle, self.preoptimizer)
+        # 覆盖式写法必须彻底消失（两处都是）。
+        self.assertNotIn("xp[-1] = 1.0", self.preoptimizer)
+
+        # 数值不变量（与生产实现同一算式，纯 numpy，不需要导入 OpenMM）。
+        weights = np.array([0.05, 0.10, 0.20, 0.40, 0.25])
+        interval_weights = weights[:-1]
+        interval_total = max(1e-10, float(np.sum(interval_weights)))
+        xp = np.concatenate(([0.0], np.cumsum(interval_weights) / interval_total))
+        self.assertEqual(len(xp), len(weights))
+        self.assertAlmostEqual(float(xp[0]), 0.0, places=12)
+        self.assertAlmostEqual(float(xp[-1]), 1.0, places=12)
+        self.assertTrue(np.all(np.diff(xp) > 0.0), "CDF 必须严格单调递增")
+        # 每个区间宽度 == 归一化后的对应权重：没有任何一个被计两次。
+        np.testing.assert_allclose(
+            np.diff(xp), interval_weights / interval_total, rtol=0, atol=1e-12
         )
-        block = self.preoptimizer[idx:idx + 200]
-        self.assertIn("xp[-1] = 1.0", block)
 
     def test_analyze_only_apbs_correction_reads_provenance_not_raw_cli_attr(self):
         # todolist.md P1: --analyze-only used to read the lower-case CLI dest

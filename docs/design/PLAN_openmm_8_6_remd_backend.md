@@ -1,7 +1,86 @@
 # OpenMM 8.6+ 官方 REMD 后端接入计划
 
-日期：2026-08-31  
-状态：设计计划；本次只新增本文档，不修改运行代码、不升级环境、不启动模拟。
+日期：2026-08-31（撰写）／2026-08-31（状态复核）  
+状态：**P0 完成；P2′ 契约已写但未接线；P1/P2/P3/P4 未开始。**
+
+## 0. 实施状态（2026-08-31）
+
+| 阶段 | 状态 | 说明 |
+|---|---|---|
+| **P0** | ✅ **完成** | 选择器 + CLI + 决议日志 + provenance，50 条测试 |
+| **P2′** | 🟡 **契约已写，未接线** | `SamplingRequest`/`StepPlan`/`SamplingArtifacts`/`run_sampling`，36 条测试；三个 REMDManager 调用点仍未改走它 |
+| P1 | ⬜ NOT_STARTED | 需要真的 OpenMM >= 8.6，被环境阻塞 |
+| P2 | ⬜ NOT_STARTED | 采样指纹纳入后端与步数身份 |
+| P3 / P4 | ⬜ NOT_STARTED | |
+
+### P0 已完成
+
+`free_energy_engine.py`（新建，2026-08-31）：
+
+* `resolve_openmm_version()`——延迟导入、`packaging.version` 语义比较、保留原始版本串
+* `probe_official_remd_capability()`——逐项检查类／方法／`__init__` 参数，
+  并显式记录**没验证**的实例属性
+* `resolve_remd_backend()`——实现 §3 决议表；`legacy` 无条件、`auto` 回退并记原因、
+  显式 `openmm` 抛 `UnsupportedRemdBackendError` 且一次列出全部差距
+* `BackendResolution.to_provenance()` / `format_log()`——§4.3 要求的可审计字段
+* `OFFICIAL_REMD_ADAPTER_IMPLEMENTED = False`：适配器未实现前，`auto` 恒定 legacy、
+  显式 `openmm` 恒定报错。**当前对生产运行零行为影响。**
+* `packaging` 已在 `environment.yml` / `environment-ci.yml` 显式声明
+* `tests/test_free_energy_engine_backend_selection.py`：37 条，覆盖 §6 验证清单
+  第 1、2 条（模拟版本边界 8.5.x／8.6.0／8.6.1／8.10.0／rc／dev／不可解析；
+  能力异常区分「不可用」与运行错误）
+
+### P0 的 CLI 与接线（已完成）
+
+* `runabfe.py --remd-backend auto|legacy|openmm`（`RunConfig` 默认 `auto`，
+  配置文件可覆盖，命令行优先）
+* **解析点只有一处**，位于 `main()` 里 ligand 校验之前——建立任何 Context、
+  写任何轨迹之前（§3 实施要求 6）。实测：`--remd-backend openmm` 在
+  OpenMM 8.5.2 环境下 `exit=1` 并一次列出全部三条差距。
+* 决议写入 `run_provenance.json` 的 `remd_backend` 段（用 `config.get` 兜底读，
+  缺失时安静跳过，不炸旧 resume）
+* `tests/test_remd_backend_cli_wiring.py`：13 条
+
+### P2′ 已完成（契约层）
+
+`free_energy_engine.py` 新增：
+
+* `StepPlan` / `resolve_step_plan()`——§4.2 的「MD steps / 交换间隔 / iterations」
+  三种单位分离，尾段如实产出并**逐步对账**，不静默四舍五入
+* `SamplingRequest` + `validate()`——状态表连续升序、**所有状态键集合必须相同**
+  （官方 API 不会替你报错）、每个副本各自的初始构型、系综合法性、身份字段必填
+* `SamplingArtifacts`——轨迹数必须等于状态数；显式记录
+  `trajectory_files_are_per_state_not_per_replica`（§2 点名的坑）和 `checkpoint_kind`
+* `run_sampling()`——官方后端路径显式 `NotImplementedError`，不返回假产物
+* `tests/test_free_energy_engine_sampling_contract.py`：36 条
+
+### 还没做（下次从这里继续）
+
+1. **P2′ 接线**：`abfe_pipeline.py` 三个 `REMDManager` 构造点（`:4569` dual_lambda、
+   `:5500` 2D/单λ、`:11551` traditional）目前仍直接调 `remd.run(...)`，未经过
+   `SamplingRequest` / `run_sampling`。§2 明确「不能只处理 `--mode traditional`」。
+   接线时必须逐点验证产物逐字节不变。
+2. **P2**：把 `BackendResolution` + `StepPlan` 纳入采样指纹与 resume 身份。
+3. **P1**：官方适配器，等 OpenMM 升级。
+
+### 环境前提：**8.6.0 暂不可用（2026-09-01 实测结论）**
+
+用户 2026-09-01 试装过 OpenMM 8.6 后**已降级回 8.5.2**，结论是：
+
+> **8.6.0 现在不稳定，没有 GPU 版本。**
+
+实测到的具体表现（pip wheel `8.6.0.dev-c6173db`）：
+
+| 现象 | 细节 |
+|---|---|
+| **没有 CUDA 平台** | 可用平台只有 `Reference / CPU / OpenCL`。wheel 自带插件目录 `site-packages/OpenMM.libs/lib/plugins/` 里**没有 CUDA 插件**，conda 的 `libOpenMMCUDA.so` 不会被它加载。与 `OPENMM_PLUGIN_DIR` 无关（该变量未设时 conda 版照样有 CUDA）。 |
+| **openmm-torch 段错误** | conda 的 `openmm-torch 1.5.1` 按 8.5.2 编译；含 TorchForce 的 System 建 Context 时段错误。指定 `OPENMM_PLUGIN_DIR` 也不解决。 |
+| 官方 REMD API | **是齐备的**——`ReplicaExchangeSampler` / `ReplicaExchangeReporter` 逐项探测通过。缺的是可用的 GPU 构建，不是 API。 |
+
+**因此 P1 继续阻塞**，阻塞原因从「等升级」变成「等一个稳定且带 GPU 的 8.6 发行版」。
+在那之前不要再花时间试装 8.6——这一轮已经试过了。
+
+当前环境：`openmm 8.5.2.dev-36a30cb`（注意它**也是 dev 构建**），CUDA 平台正常。
 
 ## 1. 结论与目标
 

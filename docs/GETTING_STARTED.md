@@ -23,7 +23,19 @@
 - GROMACS force-field include 目录，用于首次从 `.top` 构建系统。
 - OpenMM-ML、torch、MACE/ORB 相关依赖，仅在使用 `--boresch-source auto`、`orb_simple`、`orb_ml` 或相关 ML 功能时需要。
 
-当前 `output/run_provenance.json` 记录的运行环境为 Python 3.12.13、OpenMM 8.5.1、NumPy 2.4.3、PyMBAR 4.0.3、MDTraj 1.10.3。
+版本以仓库里的环境文件为准（[`environment.yml`](../environment.yml) /
+[`environment-ci.yml`](../environment-ci.yml)）：`python=3.12`，**`pymbar-core=4.2.0`（钉死）**。
+
+> ⚠️ **`pymbar-core` 的版本是钉死的，不是"建议"。** 理由见
+> [PYMBAR_UNCERTAINTY_PROTOCOL.md](PYMBAR_UNCERTAINTY_PROTOCOL.md)：报告出去的 ABFE
+> 不确定度不能因为换了个 environment 就静默改变。换版本要走那份文档里的完整流程。
+>
+> 本节早期版本写的是「`output/run_provenance.json` 记录 …… PyMBAR 4.0.3」——
+> 那个版本号**与当前 pin 冲突**，且本工程区分支的 `output/` 是空目录、没有
+> `run_provenance.json`（它是跑起来才生成的）。已按环境文件更正。
+
+实际跑的时候以运行产物 `<output>/run_provenance.json` 里记录的 `pymbar.__version__`
+为准 —— 那才是那次运行真正导入的版本。
 
 ## 输入要求
 
@@ -32,7 +44,10 @@
 - `--gro`：GROMACS 坐标文件。当前配置使用 `solv_ions.gro`。
 - `--top`：GROMACS 拓扑文件。当前配置使用 `topol.top`。
 - `--ligand`：配体残基名。当前配置使用 `MOL`。
-- `--gmx-path`：GROMACS force-field include 目录。也可通过 `GMXDATA` 或本机 `gmx` 自动探测。
+- `--gmx-path`：GROMACS 力场目录。**写安装前缀（如 `/opt/gromacs`）或写全到
+  `share/gromacs/top` 都可以** —— 给前缀时会自动往下找 `share/gromacs/top`、`top`
+  子目录（`runabfe.py:557` `find_gmx_include_dir` 第 1 步）。也可通过 `GMXLIB`
+  （值本身就是力场目录）、`GMXDATA`（力场在其 `top/` 下）或 PATH 上的 `gmx` 自动探测。
 - `--ligand-xml`：可选；构建溶剂腿时可显式指定配体 XML/FFXML。若未提供，代码会尝试从 GROMACS 拓扑抽取并生成 `output/ligand_only.xml`。
 
 命令行参数优先级高于配置文件。

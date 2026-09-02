@@ -4,6 +4,10 @@ channels:
 dependencies:
   - python=3.12
   - openmm
+  # PLAN_openmm_8_6_remd_backend.md §3 实施要求 1：REMD 后端选择必须用
+  # packaging.version 做语义版本比较（字符串序下 '8.10.0' < '8.6.0'）。
+  # 它通常作为 setuptools 的传递依赖存在，但显式声明才不会哪天被优化掉。
+  - packaging
   - pymbar-core=4.2.0
   - numpy
   - scipy

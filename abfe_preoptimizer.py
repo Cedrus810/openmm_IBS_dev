@@ -2112,6 +2112,7 @@ class ABFEPreOptimizer:
         context: openmm.Context,
         lambdas: List[float],
         temperature: float = 300.0,
+        target_phase: str = "auto",
     ):
         # ✅ 修复 3: 只通过 context 获取 system，确保生命周期一致
         self.context = context
@@ -2135,7 +2136,14 @@ class ABFEPreOptimizer:
         self.optimized_params["lambda_path"] = {}
         
         # #[P1 FIX] 动态探测 lambda 参数名，避免硬编码导致的更新失效问题
-        self._active_lambda_param = self._detect_active_parameter()
+        # 🔑 [0831issue P2] `target_phase` 现在可显式指定。默认 "auto" 的优先级表把
+        # `lam_coul` 排在 `lam_vdw` 前面（见 _detect_active_parameter），所以对一个
+        # **同时注册了两个轴**的探针系统，vdW/vanishing 阶段会沿着 λ_coul 那根轴去
+        # 测方差、路径密度权重与目标阶段完全不对应。构造时就知道自己是哪个阶段的
+        # 调用方应显式传 "vdw"/"vanishing" 或 "coul"/"decharging"；不传则保持
+        # 原来的 auto 行为，逐位不变。
+        self.target_phase = str(target_phase or "auto")
+        self._active_lambda_param = self._detect_active_parameter(self.target_phase)
 
     def _detect_active_parameter(self, target_phase: str = "auto") -> str:
         """探测系统中实际使用的 Lambda 参数名（支持双λ动态优先级）"""
@@ -2197,7 +2205,27 @@ class ABFEPreOptimizer:
         """
         [步骤 1.5] 轻量级能量景观分析 (Pathfinding)
         【修复 4】安全参数设置
+
+        🚨 [0831issue P2] **已禁用，与 PHY-08 对 `optimize_stage1_decharging` 的处置
+        完全同源同理由**：本方法用 `Var(U_group1)` 当度量（见下方 `np.var(energies)`），
+        而生产 PME Hamiltonian 的 Fisher 度量是 `beta² Var[dU/dλ]`。
+        `Var(U)` 里混着大量 λ 无关的环境涨落（总势能被溶剂主导），据它排出来的 λ 路径
+        不能用于热力学采样。PHY-08 当时只禁掉了同模式的 Stage-1 入口，漏了这个
+        同样公开的姐妹入口。
+
+        到达性已核实：唯一调用者是 `abfe_pipeline.ABFEPipeline.run_preoptimization`，
+        而 `run_preoptimization` **全仓库没有任何调用者**（连测试都没有）；另一个是
+        本类的兼容包装 `run_probing_sampling`。所以这道 fail-closed 不影响任何生产路径，
+        作用是让将来复活这条路的人先把度量换成 `beta² Var[dU/dλ]`
+        （本类 `_sample_scalar_metric` 已有正确实现，冻结构型有限差分 + force group 隔离）。
         """
+        raise RuntimeError(
+            "轻量能量景观分析已禁用（0831issue P2 / 同 PHY-08）：旧实现使用 Var(U_group1) "
+            "而非生产 PME 的 beta² Var[dU/dlambda]，其路径不能用于热力学采样。"
+            "正确度量见 ABFEPreOptimizer._sample_scalar_metric；"
+            "生产流程请使用已验证的线性/测地线路径。"
+        )
+
         print(f"\n→ 正在执行能量景观分析 ({n_steps_per_state} 步/状态)... ")
 
         # === 【修复 4】安全检查参数是否存在 ===
@@ -2260,16 +2288,23 @@ class ABFEPreOptimizer:
 
             energies = []
             nan_count = 0
+            n_sampled = 0
 
+            # 🔑 [0831issue P2 / PHY-08 同类] NaN/Inf 样本必须**丢弃**，不能替换成
+            # "前一帧的值"或 0.0 再计入方差。旧写法把坏帧换成前值后照样 append，于是
+            # (a) 方差被人为压低（重复值零离差），(b) 首帧就坏时注入一个纯虚构的 0.0，
+            # 两者都直接歪曲这个度量，而它是 λ 路径密度的唯一依据。
+            # nan_count/n_sampled 的比例判据保持原语义（分母仍是总采样帧数）。
             for e in _sample_group1_energies(self.context, n_steps_per_state, sample_interval=50):
+                n_sampled += 1
                 if np.isnan(e) or np.isinf(e):
                     nan_count += 1
-                    e = energies[-1] if energies else 0.0
+                    continue
                 energies.append(e)
 
-            if nan_count > len(energies) * 0.5:
+            if nan_count > n_sampled * 0.5:
                 print(
-                    f"  ⚠️  lam={lam:.2f} 能量异常过多 ({nan_count}/{len(energies)})，使用默认值 "
+                    f"  ⚠️  lam={lam:.2f} 能量异常过多 ({nan_count}/{n_sampled})，使用默认值 "
                 )
                 variance_data.append(1.0)
                 mean_energy.append(0.0)
@@ -2519,11 +2554,15 @@ class ABFEPreOptimizer:
         density_weight /= np.sum(density_weight)
 
         # === 【步骤 7】累积分布与插值 ===
-        cumulative_density = np.cumsum(density_weight)
-        total_density = max(1e-10, cumulative_density[-1])
-        # 构造与 lambda 节点一一对应的单调 CDF：首节点固定为 0，末节点固定为 1。
-        xp = np.concatenate(([0.0], cumulative_density[:-1] / total_density))
-        xp[-1] = 1.0
+        # 🔑 [0831issue P2] 构造与 lambda 节点一一对应的单调 CDF：首节点 0、末节点 1。
+        # 旧写法是 `xp = [0] + cumsum(w)[:-1]/sum(w)` 然后把末元素**覆盖**成 1.0 —— 那个赋值
+        # **覆盖**掉了倒数第二个累积坐标 c_{N-2}/T，于是最后一个区间的宽度从
+        # w[N-2] 变成 w[N-2]+w[N-1]，λ[N-2] 的权重被双重计入，λ→0 尾段的加密方向失真。
+        # 正解：N 个节点之间只有 N-1 个区间，就用前 N-1 个权重当区间宽度、并按
+        # **它们自己的和**归一化——末端于是天然等于 1.0，不需要事后覆盖。
+        interval_weights = np.asarray(density_weight, dtype=float)[:-1]
+        interval_total = max(1e-10, float(np.sum(interval_weights)))
+        xp = np.concatenate(([0.0], np.cumsum(interval_weights) / interval_total))
 
         # 原始 lambdas 是降序 [1.0, ..., 0.0]，长度必须与 xp 严格一致。
         original_lambdas = np.asarray(self.lambdas.copy(), dtype=float)
@@ -2757,7 +2796,12 @@ def pilot_early_stop_pressure_test(
     checkpoint_metric_g: float,
     worst_case_inflation_ratio: float = 3.0,
     max_allowed_lambda_shift: float = 0.01,
-    first_ensemble_target_intervals: Optional[int] = VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS,
+    # 🔑 [0831issue P2] 默认值改成 None、在函数体内再读模块常量。
+    # 默认参数在**函数定义时**求值一次，所以写成
+    # `= VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS` 会把常量当时的值永久焊进签名；
+    # 该常量历史上经过 2→6→4 的演进，而校验方 `redistribute_vanishing_lambda_subdomains`
+    # 读的是**当前**全局值——两者会静默失配，压力测试基线与生产布点契约就对不上了。
+    first_ensemble_target_intervals: Optional[int] = None,
 ) -> Dict[str, Any]:
     """压力测试：如果 ``point_index`` 这个点在某个 checkpoint 就已经拿到了
     ``checkpoint_metric_g``（而不是跑满 30000 步后的真实
@@ -2775,6 +2819,10 @@ def pilot_early_stop_pressure_test(
     不变量等）时返回 ``{"valid": False, "reason": ...}``——这是离线诊断函
     数，不能让分析脚本因为一次异常输入就整体崩溃。
     """
+    # [0831issue P2] None → 此刻读模块常量的当前值，跟校验方
+    # redistribute_vanishing_lambda_subdomains 用同一个来源，不会被定义期快照冻住。
+    if first_ensemble_target_intervals is None:
+        first_ensemble_target_intervals = VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS
     try:
         lam = np.asarray(pilot_lambdas, dtype=float)
         g_final = np.asarray(final_metric_g, dtype=float)
@@ -3026,10 +3074,14 @@ class DualLambdaPreOptimizer:
         # 路径重分布 (保持原逻辑)
         std_dev = np.sqrt(np.array(variance_data) + 1e-10)
         density_weight = np.asarray(_normalize_variance_weights(std_dev, max_ratio=0.15), dtype=float).ravel()
-        cumulative_density = np.cumsum(density_weight)
-        total_density = float(cumulative_density[-1]) + 1e-10
-        xp = np.concatenate(([0.0], cumulative_density[:-1] / total_density)).astype(float).ravel()
-        xp[-1] = 1.0
+        # [0831issue P2] 同 optimize_lambda_path_adaptive：用前 N-1 个权重当区间宽度、
+        # 按它们自己的和归一化，末端天然为 1.0，不再事后覆盖 c_{N-2}（那会把
+        # λ[N-2] 的权重双重计入）。
+        interval_weights = np.asarray(density_weight, dtype=float).ravel()[:-1]
+        interval_total = max(1e-10, float(np.sum(interval_weights)))
+        xp = np.concatenate(
+            ([0.0], np.cumsum(interval_weights) / interval_total)
+        ).astype(float).ravel()
         fp = np.asarray(lambdas, dtype=float).ravel()
         target_cumulative = np.linspace(0, 1.0, n_states)
         optimized_lambdas = np.asarray(np.interp(target_cumulative, xp, fp), dtype=float).ravel()
@@ -3769,11 +3821,31 @@ def optimize_2d_geodesic_path(
     temperature: float = 300.0,
     platform_name: str = "CUDA",
     co_alchemical_ion_spec: Optional[Dict[str, Any]] = None,
+    diagnostics: Optional[Dict[str, Any]] = None,
 ) -> List[Tuple[float, float]]:
     """运行 2D 度量张量场采集 + Dijkstra 测地线寻径
 
     返回从 (1.0, 1.0) 到 (0.0, 0.0) 的最优 (λ_coul, λ_vdw) 路径
+
+    🔑 [0831issue P2] `diagnostics`：调用方可以传一个 dict 进来，本函数会往里写
+    寻径过程的可审计事实。**返回值类型刻意不变**（现有调用方与测试都按
+    `List[Tuple[float,float]]` 消费），所以用 out-param 而不是改成元组返回。
+    写入的键：
+
+      * `fallback` (bool)：寻径是否失败并回退到对角线线性路径。以前这个回退只
+        print 一行、返回值与成功路径**完全无法区分**，于是次优路径会被当成功
+        路径写进 `geodesic_path.json` 缓存并被后续 run 复用。
+      * `fallback_reason` (str|None)：回退原因。
+      * `magnitude_gate_dropped_edges` (int)：被 `|g_mid| > 1e7` 量级闸门判为不可
+        通行、因而被 Dijkstra 静默丢弃的边数。`g = β²·Cov(dU/dλ)`，`g > 1e7` 对应
+        `std(dU/dλ) ≳ 7.9e3 kJ/mol`——软核去 LJ 的陡峭/冲突区并不是真的不可达，
+        这个闸门丢边过多正是上面那个静默回退的常见触发路径。本轮**不改闸门阈值**
+        （那会改变已验证路径的数值），只把它丢了多少边如实记下来。
     """
+    if diagnostics is not None:
+        diagnostics.setdefault("fallback", False)
+        diagnostics.setdefault("fallback_reason", None)
+        diagnostics.setdefault("magnitude_gate_dropped_edges", 0)
     try:
         n_grid_float = float(n_grid)
         n_grid_int = int(n_grid)
@@ -3847,14 +3919,32 @@ def optimize_2d_geodesic_path(
     )
     if metric_diagnostics.get("warning"):
         print(f"  ⚠️ {metric_diagnostics['warning']}")
+    _search_diag: Dict[str, Any] = {}
     try:
-        path = dijkstra_monotonic_geodesic(G, lam_c_grid, lam_v_grid)
+        path = dijkstra_monotonic_geodesic(
+            G, lam_c_grid, lam_v_grid, diagnostics=_search_diag
+        )
         print(f"  🏆 测地线路径: {len(path)} 个状态")
         print(f"     λ_coul: {path[0][0]:.3f} → {path[-1][0]:.3f}")
         print(f"     λ_vdw:  {path[0][1]:.3f} → {path[-1][1]:.3f}")
     except Exception as e:
-        print(f"  ⚠️ 测地线寻径失败 ({e})，回退到对角线线性路径。")
+        # [0831issue P2] 回退必须可审计：见本函数 docstring 的 `diagnostics`。
+        print(
+            f"  ⚠️ 测地线寻径失败 ({e})，回退到对角线线性路径 —— "
+            "这条路径是次优的，不要把它当成测地线结果引用。"
+        )
         path = list(zip(np.linspace(1.0, 0.0, n_grid), np.linspace(1.0, 0.0, n_grid)))
+        if diagnostics is not None:
+            diagnostics["fallback"] = True
+            diagnostics["fallback_reason"] = f"{type(e).__name__}: {e}"
+    if diagnostics is not None:
+        dropped = int(_search_diag.get("magnitude_gate_dropped_edges", 0) or 0)
+        diagnostics["magnitude_gate_dropped_edges"] = dropped
+        if dropped:
+            print(
+                f"  ⚠️ 测地线寻径中有 {dropped} 条边被 |g_mid|>1e7 量级闸门判为"
+                "不可通行并丢弃（合法的高方差格点也会被它挡住，见 0831issue P2）。"
+            )
 
     path_arr = np.array(path)
     # 确保 lam_coul 和 lam_vdw 严格单调递减 (从 1.0 -> 0.0)
@@ -3952,8 +4042,16 @@ def _integrated_geodesic_move_cost(
     return total
 
 
-def dijkstra_monotonic_geodesic(G, lam_c_grid, lam_v_grid):
-    """单调有向图 Dijkstra 寻径 — 在 (λ_coul, λ_vdw) 2D 平面上找最短热力学路径"""
+def dijkstra_monotonic_geodesic(
+    G, lam_c_grid, lam_v_grid, diagnostics: Optional[Dict[str, Any]] = None
+):
+    """单调有向图 Dijkstra 寻径 — 在 (λ_coul, λ_vdw) 2D 平面上找最短热力学路径
+
+    [0831issue P2] `diagnostics`（可选 out-param）会收到
+    `magnitude_gate_dropped_edges`：被 `_integrated_geodesic_move_cost` 的
+    `|g_mid| > 1e7` 量级闸门判为不可通行、因而被这里静默丢弃的边数。丢边太多是
+    "终点不可达 → 上层静默回退对角线"的常见前因，必须可见。闸门本身不动。
+    """
     import heapq
     nc, nv = G.shape[:2]
     dist = np.full((nc, nv), np.inf)
@@ -3994,6 +4092,11 @@ def dijkstra_monotonic_geodesic(G, lam_c_grid, lam_v_grid):
                 # 移动路径按跨越的格数分段积分（相邻移动天然只有一段，行为不变）。
                 w = _integrated_geodesic_move_cost(G, lam_c_grid, lam_v_grid, i, j, ni, nj)
                 if w is None:
+                    # [0831issue P2] 量级闸门/非有限度量弃边，如实计数。
+                    if diagnostics is not None:
+                        diagnostics["magnitude_gate_dropped_edges"] = int(
+                            diagnostics.get("magnitude_gate_dropped_edges", 0) or 0
+                        ) + 1
                     continue
                 w += 1e-4
                 if dist[i, j] + w < dist[ni, nj]:

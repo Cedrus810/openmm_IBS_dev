@@ -26,6 +26,11 @@ class _Ledger:
         return {"seed": self.seed, "leg": self.leg}
 
 
+from abfe_pipeline import (  # noqa: E402
+    _preopt_boresch_protocol_payload as _real_preopt_boresch_protocol_payload,
+)
+
+
 def _traditional_class(tmp_path, charge=0.0):
     tree = ast.parse(PIPELINE_PATH.read_text(encoding="utf-8"), filename=str(PIPELINE_PATH))
     class_node = next(
@@ -46,6 +51,10 @@ def _traditional_class(tmp_path, charge=0.0):
         "os": os,
         "json": json,
         "Exp019SeedLedger": _Ledger,
+        # 2026-09-01：`run_leg` 的 sampling fingerprint 改用收窄口径的 boresch_params
+        # （诊断字段不得进缓存键，见 test_decharging_seed_contract 里那两条）。
+        # 这个合成命名空间只 exec 了类体，模块级函数要显式注入。
+        "_preopt_boresch_protocol_payload": _real_preopt_boresch_protocol_payload,
         "LIGAND_NET_CHARGE_INTEGER_TOLERANCE_E": 1.0e-3,
         "_compute_ligand_net_charge": lambda _system, _indices: charge,
     }

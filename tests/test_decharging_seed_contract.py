@@ -125,7 +125,7 @@ def test_decharging_remd_manager_receives_the_seed_contract():
 
 def test_both_dual_lambda_fingerprint_call_sites_pass_seed_contract():
     src = _abfe_pipeline_class_source()
-    assert src.count("seed_contract=self.seed_contract_snapshot()") >= 2, (
+    assert src.count("seed_contract=self.seed_contract_identity()") >= 2, (
         "decharging 与 single/2D 两处 sampling fingerprint 都必须包含 seed contract"
     )
 
@@ -189,7 +189,7 @@ def test_stage0_protocol_key_contains_the_seed_contract():
     src = _abfe_pipeline_class_source()
     i = src.index('"kind": "boresch_attachment_stage0"')
     block = src[i:i + 2000]
-    assert '"seed_contract": self.seed_contract_snapshot()' in block, (
+    assert '"seed_contract": self.seed_contract_identity()' in block, (
         "换 repeat_seed 必须让 stage0 attachment 缓存失配"
     )
 
@@ -211,7 +211,7 @@ def test_all_three_outer_aggregate_keys_carry_the_seed_contract():
             seen[node.name] = body
     assert seen.keys() == wanted, f"没找齐三个函数: {sorted(seen)}"
     for name, body in seen.items():
-        assert "_seed_contract = self.seed_contract_snapshot()" in body, name
+        assert "_seed_contract = self.seed_contract_identity()" in body, name
         assert 'payload["seed_contract"] = _seed_contract' in body, name
         # 必须是条件插入，否则未启用 repeat-seed 的旧指纹会无谓失效
         assert "if _seed_contract is not None:" in body, name
@@ -233,3 +233,123 @@ def test_attachment_seed_actually_changes_with_repeat_seed():
     assert attach_seed(20260905) == a
     # 两条腿也不能撞
     assert attach_seed(20260905, "solvent") != a
+
+
+# ---------------------------------------------------------------------------
+# [2026-09-01] 缓存键只能带**稳定身份**，不能带 derived_seed_map
+#
+# 事故（4W53 resume_v3.log）：Stage 1 结果缓存被拒，原因之一是
+#   seed_contract.derived_seed_map.equilibration/pre_equilibration/global/velocity/0:
+#   缓存=285721177 -> 当前='<missing>'
+# derived_seed_map 记的是"本进程到此刻为止派生过哪些种子"，随执行路径增长：
+# 首跑时预平衡真跑过、派生了 equilibration/* 的种子；resume 时预平衡走 checkpoint
+# 没派生，同一份配置下快照就不同 ⇒ 每次 resume 都判失配、整段重算。
+# 缓存键必须只依赖**配置身份**，不能依赖**执行历史**。
+# ---------------------------------------------------------------------------
+
+def test_identity_is_stable_across_derivations_but_snapshot_is_not():
+    a = Exp019SeedLedger(20260908, "complex")
+    before = a.identity()
+    a.derive("equilibration", "pre_equilibration", "global", "velocity", 0)
+    a.derive("equilibration", "boresch_rebalance", "global", "velocity", 0)
+    assert a.identity() == before, "identity 不得随已派生种子变化"
+    # 对照：snapshot 会变——这正是它不能进缓存键的原因
+    assert a.snapshot() != Exp019SeedLedger(20260908, "complex").snapshot()
+    assert "derived_seed_map" not in a.identity()
+
+
+def test_identity_still_distinguishes_repeat_seed_and_leg():
+    base = Exp019SeedLedger(20260908, "complex").identity()
+    assert Exp019SeedLedger(20260909, "complex").identity() != base
+    assert Exp019SeedLedger(20260908, "solvent").identity() != base
+
+
+def test_no_cache_key_uses_the_path_dependent_snapshot():
+    """协议指纹/缓存键一律走 identity；snapshot 只留给 provenance。"""
+    src = PIPELINE_PATH.read_text(encoding="utf-8")
+    lines = [
+        l for l in src.split("\n")
+        if "self.seed_contract_snapshot()" in l
+        and not l.strip().startswith("#")
+        and "`" not in l          # 排除 docstring / 注释里的文字引用
+    ]
+    assert lines == [], f"这些行仍在用路径依赖的 snapshot 做键：{lines}"
+    # 且 identity 确实被用上了
+    assert src.count("seed_contract_identity()") >= 5
+
+
+def test_identity_works_with_a_ledger_that_only_has_snapshot():
+    """ledger 是 duck-typed 的：只实现 snapshot() 的替身也必须能取到稳定身份。
+
+    2026-09-01 踩过：`seed_contract_identity()` 直接调 `_ledger.identity()`，
+    在只实现 snapshot() 的测试替身上抛 AttributeError。
+    语义保证（键里没有 derived_seed_map）必须与 ledger 实现无关。
+    """
+    import abfe_pipeline
+
+    class _SnapshotOnlyLedger:
+        def snapshot(self):
+            return {
+                "protocol_version": 1,
+                "repeat_seed": 20260908,
+                "leg": "complex",
+                "derived_seed_map": {"equilibration/pre_equilibration/x/y/0": 123},
+            }
+
+    stub = object.__new__(abfe_pipeline.ABFEPipeline)
+    stub.seed_ledger = _SnapshotOnlyLedger()
+    got = abfe_pipeline.ABFEPipeline.seed_contract_identity(stub)
+    assert got == {"protocol_version": 1, "repeat_seed": 20260908, "leg": "complex"}
+    assert "derived_seed_map" not in got
+
+
+# ---------------------------------------------------------------------------
+# [2026-09-01] 缓存键里的 boresch_params 必须走收窄口径
+#
+# 事故（4W53 resume_v3.log）：Stage 1 结果缓存被拒，原因之一是
+#   boresch_params.last_frame_geometry_diagnostic: 缓存={...} -> 当前='<missing>'
+# 首次提交路径 `_commit_ensemble_boresch_equilibrium` 会往 boresch_params 里塞这个
+# **诊断**字段，而 resume 复用已提交值的分支不会再补 —— 两条路径产出的字典形状永远
+# 对不上，即使真正决定 Hamiltonian 的锚点/平衡值/力常数逐位相同。
+# stage0 在 2026-08-27 就改用了收窄函数，其余键当时没跟上。
+# ---------------------------------------------------------------------------
+
+def test_every_cache_key_narrows_boresch_params():
+    """任何进缓存键的 boresch_params 都必须先过 `_preopt_boresch_protocol_payload`。"""
+    src = PIPELINE_PATH.read_text(encoding="utf-8")
+    raw = [
+        (i + 1, l) for i, l in enumerate(src.split("\n"))
+        if '"boresch_params": boresch_params' in l
+    ]
+    assert raw == [], f"这些键仍放未收窄的 boresch_params：{raw}"
+    # 且收窄口径确实在用（stage0 / stage / 顶层 / 两处 sampling fingerprint …）
+    assert src.count('"boresch_params": _preopt_boresch_protocol_payload') >= 6
+
+
+def test_narrowing_drops_diagnostics_but_keeps_the_hamiltonian():
+    """收窄必须扔掉诊断、保住四项 Hamiltonian 身份。"""
+    from abfe_pipeline import _preopt_boresch_protocol_payload
+
+    params = {
+        "receptor_indices": [1, 2, 3],
+        "ligand_indices": [4, 5, 6],
+        "equilibrium_values": {
+            "r0": 0.36, "thetaA0": 1.47, "thetaB0": 1.42,
+            "phiA0": 1.44, "phiB0": -2.32, "phiC0": -1.41,
+        },
+        "force_constants": {
+            "kr": 2000.0, "kthetaA": 200.0, "kthetaB": 200.0,
+            "kphiA": 100.0, "kphiB": 100.0, "kphiC": 100.0,
+        },
+    }
+    bare = _preopt_boresch_protocol_payload(dict(params))
+    with_diag = _preopt_boresch_protocol_payload(
+        {**params, "last_frame_geometry_diagnostic": {"status": "DIAGNOSTIC_ONLY"},
+         "total_score": 0.87, "provenance": {"when": "now"}}
+    )
+    assert bare == with_diag, "加一段诊断不得改变缓存身份"
+    # 而真正决定 Hamiltonian 的量变了，身份必须变
+    moved = _preopt_boresch_protocol_payload(
+        {**params, "force_constants": {**params["force_constants"], "kr": 1000.0}}
+    )
+    assert moved != bare
