@@ -656,7 +656,7 @@ def test_bad_starting_state_fails_closed_after_minimization():
         "\ndef "
     )[0]
     # 必须先报数、再判门；门要 raise 而不是 warning。
-    assert "📐 {label}: PE =" in gate_body
+    assert "{label}: PE =" in gate_body
     assert "raise RuntimeError(" in gate_body
     assert "起始态就是坏的" in gate_body
     # NaN/Inf 受力要单独更早地拦住。

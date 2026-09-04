@@ -1,27 +1,217 @@
 # RBFE 接口与代码实现计划
 
-日期：2026-08-31（撰写）／2026-08-31（状态复核）  
-状态：**R0 完成；R1-R4 未开始。**
+日期：2026-08-31（撰写）／**2026-09-03（状态复核）**  
+状态：**R0、R1 完成；R2 完成一半（独立窗口 + 分析已通，REMD 未验证）；R3/R4 未开始。**
 
-## 0. 实施状态（2026-08-31）
+## 0. 实施状态（2026-09-03）
 
 | 阶段 | 状态 | 说明 |
 |---|---|---|
-| **R0** | ✅ **完成** | `rbfe_core.py` + `runrbfe.py`（validate/combine/template），65 条测试 |
-| R1 | ⬜ NOT_STARTED | 映射与 hybrid builder |
-| R2 | ⬜ NOT_STARTED | 采样契约已就绪（REMD 计划 P2′），但那层**尚未接进生产** |
+| **R0** | ✅ **完成** | `rbfe_core.py` + `runrbfe.py`（validate/combine/template） |
+| **R1a** | ✅ **完成** | 原子映射：分子图 / 环分析 / 片段分解 / A→B 映射 / 映射验证 / `runrbfe.py map`，55 条测试 |
+| **R1b** | ✅ **完成** | 受限 hybrid builder：`build_hybrid_system` + 端点等价 / 有限差分力 / 逐 λ 电荷三项验收，44 条测试 |
+| **R2** | 🟡 **一半** | 独立窗口采样 + `compute_hybrid_u_kn` + `analyze_leg` → `LegResult` 已通，21 条测试；**REMD 那半未验证**（§8 原文：「独立窗口先跑通，**再验证 REMD**」） |
 | R3 / R4 | ⬜ NOT_STARTED | |
 
 ### 模块落地情况（§4 的四个大模块）
 
 | 模块 | 状态 |
 |---|---|
-| `rbfe_core.py` | ✅ 已建（R0 部分：数据契约 + 验证 + ΔΔG 汇总） |
-| `free_energy_engine.py` | 🟡 已建：后端选择器（P0，已接线）+ 共用采样契约（P2′，未接线）；见 [REMD 后端计划](PLAN_openmm_8_6_remd_backend.md) §0 |
-| `rbfe_pipeline.py` | ⬜ 不存在 |
-| `runrbfe.py` | ✅ 已建（R0 部分：validate / combine / template） |
+| `rbfe_core.py` | 🟢 已建：R0 契约 + 验证 + ΔΔG 汇总、R1a 映射层、R1b 受限 hybrid builder、**R2 的 u_kn 与 `analyze_leg`**。仍未实现的只剩 `prepare_edge`（要可跑的配体 B）与 `build_hybrid_leg`（要 `PreparedEdge`） |
+| `free_energy_engine.py` | 🟡 已建：后端选择器（P0，已接线）+ 共用采样契约（P2′，未接线）+ **独立窗口采样 `run_independent_windows`**（新增路径，ABFE 三个 REMDManager 调用点完全不经过它）；见 [REMD 后端计划](PLAN_openmm_8_6_remd_backend.md) §0 |
+| `rbfe_pipeline.py` | ✅ 已建（2026-09-01）：身份指纹 / 目录契约 / 续跑校验 / 两腿汇总 / 独立重复 / 网络闭环 / ABFE 锚点。⚠ 本表在 2026-09-02 之前一直写着「不存在」，是**文档失同步**，不是模块缺失 |
+| `runrbfe.py` | ✅ 已建：validate / combine / template / **map**（R1a） |
 
-### R0 已完成
+### R2 完成一半（2026-09-03）
+
+§8 的 R2 验收是「**独立窗口先跑通，再验证 REMD**；真实 hybrid 能量和样本归属一致」。
+前半句做完了，后半句没有——所以是一半，不是完成。
+
+#### 分工（§6 那句话的两半都照做）
+
+§6 禁止复用 `TraditionalMBARAnalyzer.compute_u_kn`（它按单配体去耦与 LRC 假设
+**重建评估系统**：PME self correction、ligand_charge_square_sum、co-ion、Boresch，
+这些假设对 hybrid Hamiltonian 全不成立）。同一句话的后半段说**独立的 MBAR 数值
+求解部分**可以复用。于是：
+
+| 层 | 来源 |
+|---|---|
+| u_kn | RBFE 自己算（`rbfe_core.compute_hybrid_u_kn`）：hybrid System 只有一个，换态就是 `setParameter`，**结构上不可能算错评估体系** |
+| MBAR 求解 | 复用 `ibs_engine.TraditionalMBARAnalyzer.solve()`（去相关子采样、overlap 诊断、多套 solver protocol 兜底），**惰性 import，不改 ABFE 一行** |
+| 独立窗口采样 | 新增 `free_energy_engine.run_independent_windows`，engine 只按状态表推进、不解释 λ 语义、**不生成 seed**（拿不到 `integrator_seeds` 就报错）、**不往调用方 System 里加 barostat** |
+
+#### 方向链（计划 §3 的落点）
+
+`solve()` 返回的 `delta_G` 是 `(f[-1] − f[0])·kT`。`HybridLambdaSchedule` 强制端点
+0→1，λ=0 对应 A、λ=1 对应 B，所以 `delta_G == G(B) − G(A) == ΔG(A→B)`，
+正是 `LegResult.delta_g` 要求的含义。这条链跨三个模块，靠记忆维持迟早出错，
+有测试钉着。
+
+#### 验收数字
+
+**A→A 自边 ΔG = +2×10⁻⁸ ± 3.5×10⁻⁷ kJ/mol**（真 MD，5 窗口）——
+§8 里 R3 那条「A→A 为零」在分析层的落点。该性质对**任意**样本成立
+（自边所有 λ 态 Hamiltonian 逐位相同 ⟹ u_kn 每行相同 ⟹ MBAR 恒为 0），
+所以单元测试用合成样本验到底，只留一条真 MD 的贯通用例。
+
+#### R2 期间抓到的一个真 bug（**这条最值得记**）
+
+**一个 interaction group 都没有的 `CustomNonbondedForce` 会计算全体粒子对**——
+这是 OpenMM 的默认行为，不是"什么都不算"。原代码是 `if a_only: force_a.addInteractionGroup(...)`，
+于是**没有 dummy 原子的边**（A→A 自边，以及任何「只改参数、不增删原子」的突变——
+那是很常见的一类边）会多挂两个退化成"全体粒子对"的力，与 core 力和 native 力
+**重复计数**。
+
+它一度被正确答案掩盖：A→A 的 ΔG 照样算出 0，因为 λ 表对称、两个端点上 softcore
+lift 都是 0，两个力恰好互为镜像而抵消——**端点对了，中间态全错**。
+端点验收（R1b 的三项）结构上抓不到它；抓到它的是 R2 新写的
+`test_self_edge_u_kn_rows_are_identical`，因为那条验的是**中间态**。
+
+教训：端点等价是必要条件，不是充分条件。已修（无 group 的力不再加进 System），
+并补了四条回归测试，包括一条「只改电荷不增删原子」的边走完整端点 + 有限差分验收。
+
+#### R2 未做的
+
+* **REMD 未验证**：`run_independent_windows` 之外还没有 hybrid 状态表的副本交换路径。
+  `run_sampling` 那条契约转交的是调用方构造好的 sampler，而
+  `ibs_engine.REMDManager.__init__` 的签名写死了 ABFE 去耦语义
+  （`lambdas_coul / lambdas_vdw / ligand_indices / boresch_params / co_alchemical_ion_spec`），
+  RBFE 用不了，需要另写。
+* 采样产物目前**留在内存**（`InMemoryWindowSamples`），没有落盘/续跑路径——
+  §7 的目录契约在 `rbfe_pipeline.RunLayout` 里已经有了，两者还没接上。
+
+### R1a 已完成（2026-09-03）
+
+路线由用户拍板为 [`PROPOSAL_rbfe_r1_fragment_mapping.md`](PROPOSAL_rbfe_r1_fragment_mapping.md) §3 的
+**A+B 混合**：片段级匹配定骨架对应，片段内部原子级对齐；rdkit 只在「位置对应但
+组成不同」的那一对片段内部出场，且建 RWMol 时全部按单键、比较时忽略键级，
+**不引入化学感知、不重参数化**（计划 §5.1 红线）。
+
+`rbfe_core.py` 新增（仍然不 import openmm、不建 System、不启动 GPU）：
+
+* `MolecularGraph`：配体键图。三个入口——`from_atoms_and_bonds` /
+  `from_openmm_topology`（惰性用 openmm，模块本身不 import）/ `from_gromacs_itp`
+  （只读 `[atomtypes]`/`[atoms]`/`[bonds]`，元素取 at.num，**拿不到就报错不猜**）。
+  构造即校验：重复索引、自环、跨界键、**不连通**（= 共价配体，§2 拒绝）
+* 环分析：`ring_bonds()` / `ring_atoms()` / `smallest_ring_size()` / `ring_size_profile()`
+* `decompose_into_fragments()`：在**非环可旋转键**处切分（判据与
+  `outer_lambda_neural_basis.discover_ligand_rotatable_torsions` 语义一致，但是
+  重写的——那份实现是函数内闭包，import 不出来，且按依赖方向本模块不得 import ABFE）
+* `map_atoms()`：M3-M5。种子（两边签名都唯一的最大片段）→ 沿切键生长 →
+  片段内同构对齐 → 差异片段 MCS → 组装冻结映射
+* `AtomMapping`：分子内索引为唯一坐标系；`project()` 投影到每条腿的全局索引
+  （两腿物理上不可能用不同映射）；`hybrid_indices()` 给出 core→A-only→B-only 的
+  hybrid 编号；`fingerprint()` 进边身份，**故意不含原子名**（改名不该让已跑完的采样作废）
+* `validate_mapping()`：一一对应、索引范围、**元素一致**、**核心连通性**、
+  **环断裂/闭合** —— R0 挂在 `unchecked` 里的环与元素两类在这里被真正查掉
+* `validate_edge(spec, mapping=, graph_a=, graph_b=)`：给了映射证据就真查，
+  对应的 `unchecked` 条目随之消失；只给一部分证据直接报错，不悄悄退回"没查"
+
+`runrbfe.py map --ligand-a … --ligand-b … --out atom_mapping.json`：R1 验收
+第一条「**映射可审计**」的落点。产物含片段配对、公共核心、A-only/B-only、
+对称等价解数量、歧义说明、指纹。
+
+在仓库自带的**真实** Atenolol（41 原子、含苯环）上验证：A→A 恒等零 dummy；
+H→CH₃ 变换公共核心 40、A-only 恰好那个氢、B-only 恰好新甲基的 4 个原子。
+
+#### R1a 期间踩到并已修的两件事（别放宽对应测试）
+
+1. **按签名生长会漏掉差异片段之后的整段。** 第一版沿片段图按签名生长，苯环换
+   取代基后签名变了，生长在苯环处断掉，苯环**后面**那一整段（酰胺尾，A/B 完全
+   相同）被整段判成 dummy——公共核心 32 而不是 40，而且**验证照样 PASS**。
+   改成按**接点原子对应**生长才对（接点对应不因取代基变化而失效）。
+2. **差异在分子中部时，保守路径（不用 MCS）给不出可用映射。** 整块 dummy 会把
+   公共核心从中间切断，`validate_mapping` 的连通性判据正确拒绝。结论：
+   **rdkit MCS 不是优化项**，只有差异位于末端片段时保守路径才可用。错误信息
+   已经把这条写进去了。
+
+### R1a 未做的（诚实清单）
+
+手性反转、结合姿势歧义、互变异构——都需要**坐标**，本层只有键图，一律进
+`ValidationReport.unchecked`。虚拟位点/约束/自定义 Force 的支持范围需要建系，
+属于 R1b。
+
+### R1b 已完成（2026-09-03）
+
+用户决定：**直接 import `abfe_core` 复用，但不改 ABFE 一行代码。** 本轮严格照办——
+`abfe_core.py / abfe_pipeline.py / ibs_engine.py / runabfe.py` 一行未动，import 全部
+**惰性**（放在函数体内），因为 `abfe_core` 会拉进 openmm，放模块顶部会让 R0/R1a
+那两层「不 import openmm、不启动 GPU」的性质连同它们 110 条测试一起失效。
+
+`rbfe_core.py` 新增 `build_hybrid_system(system_a, ligand_indices_a, system_b,
+ligand_indices_b, mapping, schedule) -> HybridSystemBundle`。
+
+#### 首版受限 builder 的分类约定
+
+| 力项涉及的原子 | 处理 | 力组 |
+|---|---|---|
+| 纯环境 | 从 A 原样搬 | 0 |
+| 纯 core，A、B 参数相同 | 原样搬（native 力） | 0 |
+| 纯 core，键/角参数不同 | `Custom*Force` 按 `lambda_rbfe_bonded` **插值参数** | 0 |
+| 纯 core，二面角不同 | **双项缩放**：A 的项 ×(1−λ)、B 的项 ×λ | 0 |
+| 涉及 A-only（dummy） | **全强度保留，永不缩放** | 1 |
+| 涉及 B-only（dummy） | **全强度保留，永不缩放** | 2 |
+
+dummy 成键项全强度保留是它能抵消的**前提**：dummy 的构型积分因此是一个与 λ 无关的
+可分离因子，在两腿之间严格相消（§5.3 要求「明确可分离因子及其抵消条件」）。
+把它们放进**独立力组**则让这件事可以直接读数——端点验收就是靠扣掉对侧 dummy 力组
+做精确等式比对，不用估容差。
+
+静电全部留在 native `NonbondedForce` 走参数 offset（保 PME，这是从 ABFE 抄的最关键
+一条）。LJ 从 native 力摘掉，拆成三个 `CustomNonbondedForce`：core（参数插值、
+不加 softcore）、A-only（前因子 1−λ、softcore lift λ）、B-only（前因子 λ、lift 1−λ）。
+**A-only × B-only 不在任何 interaction group 里且显式加了排除**——两组 dummy 永远
+不能相互看见，这是 hybrid 拓扑的硬约束，ABFE 里没有对应概念。
+
+#### 三项验收（都在真实 OpenMM Context 上跑，不是纸面推导）
+
+* `verify_hybrid_endpoints`：`E_hybrid(λ=0) − E[dummy_B 力组] == E_A`，λ=1 同理。
+  实测 **ΔE = 0 / 2×10⁻¹³ kJ/mol，逐原子最大力偏差 1.6×10⁻¹² kJ/mol/nm**。
+* `verify_hybrid_forces_finite_difference`：中心差分 −dU/dx vs 解析力，确定性抽样。
+  5 个 λ 态全通过，抽样覆盖 dummy 原子（softcore 分母是手写的，不测等于没测）。
+* `hybrid_charge_ledger`：**读建好的 System** 的粒子电荷与 offset 逐态求和，
+  不是把 builder 的意图重算一遍。
+
+#### R1b 期间踩到并已修的三件事（别放宽对应测试）
+
+1. **`max(0.0, nan)` 在 Python 里返回 `0.0`**（因为 `nan > 0.0` 是 False）。端点比对
+   一度把一个 NaN 力偏差静默当成"零偏差"通过了验收——fail-closed 的检查器自己漏 NaN，
+   比没有检查器更危险。现在非有限值在 `_energy_and_forces` 里就抛错。
+2. NaN 的来源是 **`CustomTorsionForce` 在退化几何（四原子共线）处的解析导数没有定义**，
+   而 OpenMM 内建的 `PeriodicTorsionForce` 在那里是安全的。因此纯 core 且 A、B 逐位
+   相同的二面角一律走 native 力，把 Custom 的暴露面压到"真正随 λ 变的那几个"。
+3. **LJ 长程校正（LRC）缺口**：炼金原子的 epsilon 在 native 力上被清零，native 的
+   色散校正不再包含配体那部分，hybrid 与纯 A 体系之间差一个常数（力恒为 0）。
+   端点等式因此在关掉 LRC 的副本上做，缺口本身**量化成 `lj_lrc_gap_kJ_per_mol`
+   报出来**，不留含糊 caveat。
+
+#### 从 ABFE 抄 offset 时必须改掉的系数（点名记一笔）
+
+`ibs_engine.py:3583` 那段 exception 电荷 offset 的判据是
+`(p1 in alchemical) ^ (p2 in alchemical)`——**异或**，只处理「单端炼金」，
+系数写的是 `base=0, scale=chargeProd`，即插到**零**（ABFE 的端点）。
+RBFE 的端点是 B，所以：机制照用（它保 PME），**系数必须换成
+`base=值ᴬ, scale=值ᴮ−值ᴬ`**；配套的 `_assert_frozen_ligand_ligand_exceptions`
+不能照搬，因为「单端」前提在 RBFE 里不成立。测试
+`test_charge_offset_interpolates_to_B_not_to_zero` 专门守这条。
+
+#### R1b 的已知缺口（写进产物的 `provenance.known_gaps`，不藏在注释里）
+
+* 炼金区的 LJ 长程校正未计入。ABFE 侧有现成的
+  `ibs_engine._lj_softcore_tail_radial_integrals`（switching-aware + softcore-aware
+  径向积分）可接，R1b v1 未接。
+* 手性 / 结合姿势 / 互变异构仍未检查（需要坐标）。
+* 受限范围：只支持 `HarmonicBond/HarmonicAngle/PeriodicTorsion/Nonbonded`
+  （加 `CMMotionRemover`、`MonteCarloBarostat`），虚拟位点、多个 `NonbondedForce`、
+  core–core 的成键/断键、core 质量不同（同位素/HMR）一律 fail closed。
+
+### R1b 未做的（诚实清单）
+
+`prepare_edge`（从 `EdgeSpec` 的输入路径建出两个端点体系）与
+`build_hybrid_leg`（`PreparedEdge` 上的薄封装）仍是 `NotImplementedError`。
+两者都卡在同一个前提上：一份**可跑的**配体 B。R2 的 `analyze_leg` 也未开始。
+
+### R0 已完成（2026-08-31）
 
 `rbfe_core.py`（新建，2026-08-31），不 import openmm、不建 System、不碰 GPU：
 
@@ -62,8 +252,14 @@ R2 需要的共用采样契约（`SamplingRequest` / `SamplingArtifacts` / `run_
 `REMDManager` 调用点仍走老路。R2 可以直接对着这层契约写，不必等 OpenMM 升级；
 真正被 8.6 阻塞的只有官方适配器（P1）。
 
-**§8 仍未满足的硬前提**：配体 B 的结构／参数至今没有提供，也没有指定公开基准
-配体对（§8 原话：不能根据 Atenolol 文件名猜测 B）。这是 R3 的前提，不是实现细节。
+**§8 硬前提的现状（2026-09-03 更新）**：用户决定**不从外部取配体 B**，而是
+**从现有拓扑派生**——改动配体残基的一个末端基团。R1a 的映射层已按这条路线在
+真实 Atenolol 上验证（图层面的 H→CH₃）。但要注意区分两件事：
+
+* **R1a 只需要键图**，图手术就够，已完成；
+* **R1b/R3 需要一份真正可跑的 B**：改基团必然要重新给部分电荷与成键参数，
+  这条参数化路线本身要单独验收（§5.1 不允许悄悄重参数化）。这仍然是 R3 的
+  硬前提，没有因为 R1a 完成而消失。
 
 ## 1. 是否需要
 

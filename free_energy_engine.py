@@ -47,6 +47,7 @@ from __future__ import annotations
 import inspect
 import math
 import re
+import numpy as np
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Sequence
 
@@ -857,6 +858,201 @@ def run_sampling(
         diagnostics=dict(getattr(sampler, "exchange_diagnostics", {}) or {}),
         checkpoint_kind=str(getattr(sampler, "checkpoint_kind", "none")),
         caller_protocol_fingerprint=request.caller_protocol_fingerprint,
+    )
+
+
+# ===========================================================================
+# 独立窗口采样（RBFE 计划 §8 的 R2：「**独立窗口先跑通**，再验证 REMD」）
+# ===========================================================================
+#
+# 这是本模块表格里「通用独立窗口与 REMD 推进」的**独立窗口**那一半。
+# 它与上面的 `run_sampling` 是两条并列的路径，不是替代关系：
+#
+#   run_sampling            —— 转交给调用方**已构造好**的 REMD sampler
+#                              （legacy 路径就是 ibs_engine.REMDManager），产物是轨迹文件；
+#   run_independent_windows —— engine 自己按状态表推进 N 个互不交换的窗口，
+#                              产物**留在内存里**。
+#
+# 为什么产物留内存：R2 的验收对象是「真实 hybrid 能量和样本归属一致」，需要把
+# 样本原样喂进 u_kn 计算。中间落一趟 DCD 只会引入一层文件格式的失真（ABFE 那边
+# `image_molecules` / 重复帧那几个坑都出在这一层），而且小体系单元测试里没必要。
+# 生产上要落盘时由 pipeline 决定，engine 不替它决定。
+#
+# ⚠ 这段是**新增**路径，ABFE 现有的三个 REMDManager 调用点完全不经过它，
+#   行为逐位不变。
+
+
+@dataclass(frozen=True)
+class InMemoryWindowSamples:
+    """独立窗口采样的产物。
+
+    `positions_by_state[k]` 是第 k 个状态自己那条轨迹的保存帧，
+    形状 (n_frames, n_atoms, 3)，单位 nm。**样本归属由数组下标承载**——
+    不靠文件名、不靠猜（计划 §7：「不按文件名猜」）。
+    """
+
+    positions_by_state: tuple
+    box_vectors_by_state: tuple
+    state_parameters: tuple
+    step_plan: StepPlan
+    temperature_kelvin: float
+    pressure_bar: Optional[float]
+    seeds_by_state: tuple
+    provenance: dict
+
+    @property
+    def n_states(self) -> int:
+        return len(self.positions_by_state)
+
+    @property
+    def n_frames_by_state(self) -> tuple:
+        return tuple(int(len(frames)) for frames in self.positions_by_state)
+
+    def to_provenance(self) -> dict:
+        payload = dict(self.provenance)
+        payload.update({
+            "n_states": self.n_states,
+            "n_frames_by_state": list(self.n_frames_by_state),
+            "temperature_kelvin": float(self.temperature_kelvin),
+            "pressure_bar": self.pressure_bar,
+            "seeds_by_state": [int(s) for s in self.seeds_by_state],
+            "state_parameters": [dict(p) for p in self.state_parameters],
+            "samples_are_indexed_by_state_not_by_replica": True,
+        })
+        return payload
+
+
+def _resolve_window_seeds(request: "SamplingRequest") -> tuple:
+    """从 `seed_plan` 里取每个窗口的积分器种子。**engine 不生成种子。**
+
+    契约第 §4.1 条写的是「seed 计划……engine 不生成 seed，只转交并登记」。
+    所以这里拿不到就报错，**不**自己 `random.randint` 一个——那会让同一份配置
+    两次跑出不同的随机流，而且事后无从对账。
+    """
+    plan = request.seed_plan or {}
+    seeds = plan.get("integrator_seeds")
+    if seeds is None:
+        raise SamplingContractError(
+            "seed_plan 里没有 'integrator_seeds'。engine 不生成种子——"
+            "调用方必须显式给出每个窗口的积分器种子，否则随机流不可复现、也无从对账。"
+        )
+    seeds = [int(s) for s in seeds]
+    if len(seeds) != request.n_states:
+        raise SamplingContractError(
+            f"integrator_seeds 有 {len(seeds)} 个，状态表有 {request.n_states} 个状态"
+        )
+    return tuple(seeds)
+
+
+def run_independent_windows(
+    request: "SamplingRequest",
+    *,
+    minimize: bool = True,
+    equilibration_steps: int = 0,
+    friction_per_ps: float = 1.0,
+) -> InMemoryWindowSamples:
+    """按状态表推进 N 个互不交换的窗口，返回逐状态的保存帧。
+
+    每个窗口：设全局参数 → （可选）能量最小化 → （可选）预平衡 → 生产采样。
+    窗口之间**完全独立**，没有副本交换——这正是 R2 要求的先跑通的那一档。
+
+    engine 不构建 System、不加力、不选 λ 语义：`request.states[k].parameters`
+    是一组 `{全局参数名: 值}`，engine 原样 `setParameter` 进去，不解释它们的含义。
+    """
+    import openmm
+    from openmm import unit
+
+    request.validate()
+    seeds = _resolve_window_seeds(request)
+    plan = request.step_plan()
+
+    if request.pressure_bar is not None:
+        has_barostat = any(
+            isinstance(f, (openmm.MonteCarloBarostat, openmm.MonteCarloMembraneBarostat))
+            for f in request.system.getForces()
+        )
+        if not has_barostat:
+            raise SamplingContractError(
+                f"请求了 NPT（pressure_bar={request.pressure_bar}）但 System 里没有 barostat。"
+                "engine **不往调用方的 System 里加力**（计划 §4.1：engine 不构建 System）——"
+                "恒压器属于体系定义，必须由 core/pipeline 建好再传进来。"
+            )
+
+    platform = openmm.Platform.getPlatformByName(request.platform_name)
+    positions_by_state = []
+    boxes_by_state = []
+    parameters_by_state = []
+
+    for k, state in enumerate(request.states):
+        integrator = openmm.LangevinMiddleIntegrator(
+            request.temperature_kelvin * unit.kelvin,
+            friction_per_ps / unit.picosecond,
+            request.timestep_fs * unit.femtosecond,
+        )
+        integrator.setRandomNumberSeed(int(seeds[k]))
+        context = openmm.Context(request.system, integrator, platform)
+        context.setPeriodicBoxVectors(*request.initial_box_vectors[k])
+        context.setPositions(request.initial_positions[k])
+        for name, value in state.parameters.items():
+            context.setParameter(name, float(value))
+        if request.initial_velocities is not None and request.initial_velocities[k] is not None:
+            context.setVelocities(request.initial_velocities[k])
+        else:
+            context.setVelocitiesToTemperature(
+                request.temperature_kelvin * unit.kelvin, int(seeds[k])
+            )
+        if minimize:
+            openmm.LocalEnergyMinimizer.minimize(context)
+        if equilibration_steps > 0:
+            integrator.step(int(equilibration_steps))
+
+        frames = []
+        boxes = []
+        remaining = plan.total_md_steps
+        while remaining > 0:
+            chunk = min(plan.save_interval, remaining)
+            integrator.step(chunk)
+            remaining -= chunk
+            snapshot = context.getState(getPositions=True)
+            frames.append(
+                np.asarray(
+                    snapshot.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+                    dtype=float,
+                )
+            )
+            boxes.append(
+                np.asarray(
+                    [
+                        v.value_in_unit(unit.nanometer)
+                        for v in snapshot.getPeriodicBoxVectors()
+                    ],
+                    dtype=float,
+                )
+            )
+        positions_by_state.append(np.asarray(frames, dtype=float))
+        boxes_by_state.append(np.asarray(boxes, dtype=float))
+        parameters_by_state.append(dict(state.parameters))
+        del context, integrator
+
+    return InMemoryWindowSamples(
+        positions_by_state=tuple(positions_by_state),
+        box_vectors_by_state=tuple(boxes_by_state),
+        state_parameters=tuple(parameters_by_state),
+        step_plan=plan,
+        temperature_kelvin=float(request.temperature_kelvin),
+        pressure_bar=request.pressure_bar,
+        seeds_by_state=seeds,
+        provenance={
+            "sampler": "free_energy_engine.run_independent_windows",
+            "exchange": "none__independent_windows",
+            "minimized": bool(minimize),
+            "equilibration_steps": int(equilibration_steps),
+            "friction_per_ps": float(friction_per_ps),
+            "timestep_fs": float(request.timestep_fs),
+            "platform_name": request.platform_name,
+            "stage_name": request.stage_name,
+            "caller_protocol_fingerprint": request.caller_protocol_fingerprint,
+        },
     )
 
 

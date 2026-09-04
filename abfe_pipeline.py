@@ -164,6 +164,8 @@ from abfe_core import (
     PRE_EQUILIBRATION_CONVERGENCE_DENSITY_DRIFT_TOL_PERCENT,
     PRE_EQUILIBRATION_CONVERGENCE_PE_DRIFT_TOL_KJ_PER_MOL_PER_ATOM,
     PRE_EQUILIBRATION_CONVERGENCE_RMSD_DRIFT_TOL_NM,
+    PRE_EQUILIBRATION_CONVERGENCE_POSE_DRIFT_TOL_NM,
+    PRE_EQUILIBRATION_LIGAND_POSE_ESCAPE_TOL_NM,
     # 起始态体检（PE / max|F|）唯一实现；attachment 腿共用它。
     assert_starting_state_is_sane,
     load_gromacs_topology_for_openmm,
@@ -377,9 +379,9 @@ def boresch_committed_deviation_sigma(
 
 
 def _infer_log_level_from_message(message: str) -> int:
-    if any(token in message for token in ("⚠️", "警告", "warning")):
+    if any(token in message for token in ("[WARN]", "警告", "warning")):
         return logging.WARNING
-    if any(token in message for token in ("🚨", "❌", "失败", "错误", "异常", "error")):
+    if any(token in message for token in ("[ERR]", "失败", "错误", "异常", "error")):
         return logging.ERROR
     return logging.INFO
 
@@ -838,7 +840,7 @@ def _debug_code_hash_frozen() -> Optional[str]:
         return None
     if not _DEBUG_CODE_HASH_WARNED:
         print(
-            "  🚨 [DEBUG] ABFE_DEBUG_FREEZE_CODE_HASH=1：code_sha256 已冻结为固定常量，"
+            "  [ERR] [DEBUG] ABFE_DEBUG_FREEZE_CODE_HASH=1：code_sha256 已冻结为固定常量，"
             "不反映当前磁盘上的代码改动——仅供调试收敛逻辑时使用，正式出结果前必须"
             "取消设置这个环境变量并至少完整跑一次真正的哈希校验。"
         )
@@ -992,6 +994,50 @@ def _protocol_fingerprint_ignoring_code_hash(key):
     return stripped_key
 
 
+class _Missing:
+    """`_walk` 里表示"这一侧根本没有这个键"的哨兵。
+
+    不用字符串 `"<missing>"`：那样一份真的存了字符串 `"<missing>"` 的 payload 会跟
+    "键不存在"无法区分，而且 `repr` 出来带引号、读日志的人会以为值就是那串字。
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<缺失>"
+
+
+_MISSING = _Missing()
+
+_MISMATCH_VALUE_REPR_LIMIT = 120
+
+
+def _brief_mismatch_value(value: Any, limit: int = _MISMATCH_VALUE_REPR_LIMIT) -> str:
+    """把一个 diff 叶子压成**有界长度**的字符串。
+
+    没有这一层，一条"缓存作废、重新跑"的日志能吐出几页文本。成因是 `_walk` 只在
+    **两边都是 dict** 时才递归：只要有一边整个缺了某个键（典型是旧缓存里有
+    `boresch_params.diagnostics`、新指纹里没有），另一边那棵完整的字典就会落到
+    `a != b` 分支、被当成叶子原样 `repr` 出来。实测那条日志 1151 字符，而两边都有
+    该键时只有 72 字符。
+
+    截断后给的是**结构摘要**（有几个键 / 几项、键名前几个）而不是掐断的 `repr`：
+    掐断的字典字面量既读不出全貌又不能复制粘贴，结构摘要至少能回答"是整块没了，
+    还是里面某个字段变了"。完整 payload 仍逐字留在磁盘缓存文件里。
+    """
+    text = repr(value)
+    if len(text) <= limit:
+        return text
+    if isinstance(value, dict):
+        keys = sorted(map(str, value))
+        head = ", ".join(keys[:6])
+        more = f", …共 {len(keys)} 个键" if len(keys) > 6 else ""
+        return f"<dict {len(keys)} 键: {head}{more}>"
+    if isinstance(value, (list, tuple)):
+        return f"<{type(value).__name__} {len(value)} 项>"
+    return text[: max(1, limit - 1)] + "…"
+
+
 def _summarize_protocol_mismatch(
     cached: Optional[Dict], current: Dict, max_diffs: int = 8
 ) -> str:
@@ -1021,7 +1067,19 @@ def _summarize_protocol_mismatch(
             for key in sorted(set(a) | set(b)):
                 if len(out) >= max_diffs:
                     return
-                _walk(path + (str(key),), a.get(key, "<missing>"), b.get(key, "<missing>"), out)
+                _walk(path + (str(key),), a.get(key, _MISSING), b.get(key, _MISSING), out)
+        elif (
+            isinstance(a, (list, tuple))
+            and isinstance(b, (list, tuple))
+            and len(a) == len(b)
+        ):
+            # 也要进 list：`boresch_harmonicity_check.fluctuation_distribution` 就是
+            # 一个 list of dict，不进去的话一有差异就把整段甩进日志（而且指不出是哪个
+            # 自由度的哪个统计量变了）。长度不同就没法逐项对齐，退化成只报长度。
+            for index, (item_a, item_b) in enumerate(zip(a, b)):
+                if len(out) >= max_diffs:
+                    return
+                _walk(path + (f"[{index}]",), item_a, item_b, out)
         elif a != b:
             out.append((".".join(path) or "<root>", a, b))
 
@@ -1038,7 +1096,10 @@ def _summarize_protocol_mismatch(
         )
 
     truncated = len(diffs) >= max_diffs
-    lines = [f"{p}: 缓存={a!r} -> 当前={b!r}" for p, a, b in diffs]
+    lines = [
+        f"{p}: 缓存={_brief_mismatch_value(a)} -> 当前={_brief_mismatch_value(b)}"
+        for p, a, b in diffs
+    ]
     if truncated:
         lines.append(f"...（已截断，只列出前 {max_diffs} 条差异）")
     return "; ".join(lines)
@@ -2170,9 +2231,9 @@ def cleanup_temp_files(checkpoint_dir: str):
         if f.endswith(".chk.tmp") or f.endswith(".dcd.tmp"):
             try:
                 os.remove(os.path.join(checkpoint_dir, f))
-                print(f"  🗑️ 已清理临时文件: {f}")
+                print(f"  已清理临时文件: {f}")
             except Exception as e:
-                print(f"  ⚠️ 清理失败 {f}: {e}")
+                print(f"  [WARN] 清理失败 {f}: {e}")
 
 #============================================================================
 # 辅助函数：能量聚合 (Step 5)
@@ -2187,7 +2248,7 @@ def aggregate_all_energies(output_dir: str):
     u_kn_global = np.hstack(all_e)  # 形状: (K, total_frames)
     
     np.save(os.path.join(output_dir, "full_u_kn_matrix.npy"), u_kn_global)
-    print(f"  ✓ 已聚合 {len(all_e)} 个窗口能量，全局矩阵形状: {u_kn_global.shape}")
+    print(f"  [OK] 已聚合 {len(all_e)} 个窗口能量，全局矩阵形状: {u_kn_global.shape}")
     return True
 
 def _split_platform_spec(platform_name: str) -> Tuple[str, Optional[str]]:
@@ -2259,7 +2320,7 @@ def _create_context_with_local_cpu_fallback(
         if requested_base.upper() == "CPU":
             raise
         log(
-            f"  ⚠️ 平台 {platform_name!r} 的 Context 初始化失败: {exc}，"
+            f"  [WARN] 平台 {platform_name!r} 的 Context 初始化失败: {exc}，"
             "本阶段局部回退到 CPU"
         )
         integrator = integrator_factory()
@@ -2680,7 +2741,7 @@ class ABFEPipeline:
             # ✅ 修复：移除 kelvin**2 脏分支，改为严格校验+自动转换
             try:
                 val = temp_input.value_in_unit(unit.kelvin)
-                print(f"  ⚠️ 温度单位非 Kelvin ({temp_input.unit})，已自动转换: {val} K")
+                print(f"  [WARN] 温度单位非 Kelvin ({temp_input.unit})，已自动转换: {val} K")
                 return val * unit.kelvin
             except Exception:
                 raise ValueError(f"无法将温度转换为 Kelvin: {temp_input}")
@@ -2720,11 +2781,11 @@ class ABFEPipeline:
                 del _probe_int
         except Exception as exc:
             msg = (
-                "🚨 [设备策略] OpenMM CUDA 平台不可用，已强制降级至 CPU。"
+                "[设备策略] OpenMM CUDA 平台不可用，已强制降级至 CPU。"
                 f"请检查 GPU 队列/驱动。底层错误: {type(exc).__name__}: {exc}"
             )
             warnings.warn(msg, UserWarning, stacklevel=2)
-            print(f"\033[93m⚠️ {msg}\033[0m")
+            print(f"\033[93m[WARN] {msg}\033[0m")
             return {"strategy": "cpu", "devices": [], "n_gpus": 0}
 
         # 设备数只用于决定要不要多卡；调度器给的 CUDA_VISIBLE_DEVICES 是权威来源。
@@ -2787,7 +2848,7 @@ class ABFEPipeline:
         vram = _gpu_memory_mib()
         if vram:
             self._log(
-                f"  📊 [显存] {label}: used={vram[0]} free={vram[1]} total={vram[2]} MiB"
+                f"  [显存] {label}: used={vram[0]} free={vram[1]} total={vram[2]} MiB"
             )
 
     def _co_alchemical_ion_spec_path(self) -> str:
@@ -2894,7 +2955,7 @@ class ABFEPipeline:
                 context=f"resume 读取 {os.path.basename(path)}",
             )
             self._log(
-                f"  🔒 [MEM-00c] 复用已冻结的 co-ion 身份 {pinned} "
+                f"  [MEM-00c] 复用已冻结的 co-ion 身份 {pinned} "
                 f"(fingerprint {str(spec.get('fingerprint'))[:12]}…)"
             )
             self._co_alchemical_ion_spec_cached = spec
@@ -2940,7 +3001,7 @@ class ABFEPipeline:
             _json_safe(spec),
         )
         self._log(
-            "  🔒 [MEM-00c] co-ion 身份已选定并冻结: "
+            "  [MEM-00c] co-ion 身份已选定并冻结: "
             f"{[ion['atom_index'] for ion in spec['ions']]} "
             f"(fingerprint {spec['fingerprint'][:12]}…) → {path}"
         )
@@ -2982,7 +3043,7 @@ class ABFEPipeline:
                 json.dump(state, f, indent=2)
             os.replace(tmp_file, state_file)
         except Exception as e:
-            self._log(f"  ⚠️ 状态保存失败: {e}")
+            self._log(f"  [WARN] 状态保存失败: {e}")
 
     def _update_stage_status(self, stage: str, status: str, extra: Dict = None):
         """更新阶段状态"""
@@ -2999,9 +3060,9 @@ class ABFEPipeline:
                 }
                 self._save_pipeline_state(state)
         except Exception as e:
-            self._log(f"  ⚠️ 状态更新失败 ({stage}={status}): {e}")
+            self._log(f"  [WARN] 状态更新失败 ({stage}={status}): {e}")
             return
-        self._log(f"  📝 状态更新: {stage} = {status}")
+        self._log(f"  状态更新: {stage} = {status}")
 
     # =========================================================================
     # 1. 物理预平衡 (10 ns) → 保存轨迹 → 提取稳态坐标
@@ -3026,10 +3087,10 @@ class ABFEPipeline:
         带着未修复的构型继续——等于把"修复失败"降级成"看起来修好了"。
         """
         if self.positions is None or self.box_vectors is None:
-            self._log(f"  ⏭️ 无坐标/盒矢量，跳过 PBC 分子完整性修复{('（' + context + '）') if context else ''}")
+            self._log(f"  无坐标/盒矢量，跳过 PBC 分子完整性修复{('（' + context + '）') if context else ''}")
             return False
 
-        self._log(f"  📦 正在执行 PBC 分子完整性修复与配体居中{('（' + context + '）') if context else ''}...")
+        self._log(f"  正在执行 PBC 分子完整性修复与配体居中{('（' + context + '）') if context else ''}...")
         try:
             import mdtraj as md
             md_top = md.Topology.from_openmm(self.topology)
@@ -3068,7 +3129,7 @@ class ABFEPipeline:
                 _constraint_bonds += 1
             if _constraint_bonds:
                 self._log(
-                    f"  🔗 已把 {_constraint_bonds} 个约束补成键用于分子归组"
+                    f"  已把 {_constraint_bonds} 个约束补成键用于分子归组"
                     "（刚性水的 O–H 只以约束存在，否则会被逐原子回卷撕开）"
                 )
             # ⚠️ Quantity.value_in_unit() 在底层是 list-of-Vec3（而非 numpy 数组）时
@@ -3100,7 +3161,7 @@ class ABFEPipeline:
             self.positions = [
                 openmm.Vec3(float(x), float(y), float(z)) for x, y, z in traj.xyz[0]
             ] * unit.nanometer
-            self._log("  ✓ PBC 分子完整性已修复，体系已居中至主周期")
+            self._log("  [OK] PBC 分子完整性已修复，体系已居中至主周期")
             self._pbc_integrity_repaired = True
             return True
         except Exception as exc:  # noqa: BLE001
@@ -3307,10 +3368,37 @@ class ABFEPipeline:
                     pos_map = {int(g): i for i, g in enumerate(subset)}
                     bb_sub = np.asarray([pos_map[int(i)] for i in backbone_idx], dtype=int)
                     lig_sub = np.asarray([pos_map[int(i)] for i in ligand_heavy_idx], dtype=int)
-                    xyz2 = np.stack(
+                    # 🔑 [2026-09-03] 周期镜像修复。`pos_nm` 来自
+                    # `getPositions(enforcePeriodicBox=True)`，OpenMM 按**分子整体**
+                    # 折回主盒；参考帧只在跨过地板时抓一次，之后配体分子完全可能被
+                    # 折到与参考帧不同的镜像里。实测（4W53 复合物腿，盒边长 7.894 nm）
+                    # `ligand_pose_drift_nm` 因此在 0.07 和 7.80–7.99 之间反复横跳——
+                    # 7.8x 就是一个盒长，不是配体真的位移了 7.9 nm。判据比的是相邻
+                    # block 的变化量，所以每次折过去/折回来都产生一个 ~7.8 nm 的假 Δ，
+                    # 把 stable_streak 清零，预平衡早停因此**一次都没触发过**。
+                    #
+                    # 修法：在刚体对齐**之前**，把配体整体平移到离受体骨架质心最近的
+                    # 那个镜像（正交盒的最小镜像；三斜盒同样成立，因为这里用的是盒
+                    # 矢量的整数线性组合而不是逐轴取模）。参考帧与当前帧各自独立做，
+                    # 两边都落到"贴着受体"的那个镜像，Δ 才有物理意义。
+                    box_nm = box  # 本 block 末帧的盒矢量（3x3，nm）
+                    xyz_pair = np.stack(
                         [reference_xyz_nm[subset], pos_nm[subset]], axis=0
-                    ).astype(np.float32)
+                    ).astype(np.float64)
+                    for frame_i in range(xyz_pair.shape[0]):
+                        recep_com = xyz_pair[frame_i, bb_sub].mean(axis=0)
+                        lig_com = xyz_pair[frame_i, lig_sub].mean(axis=0)
+                        # 解 delta = box^T · n，取最近整数 n，再把这份平移减掉。
+                        frac = np.linalg.solve(np.asarray(box_nm).T, lig_com - recep_com)
+                        shift = np.asarray(box_nm).T @ np.round(frac)
+                        xyz_pair[frame_i, lig_sub] -= shift
+                    xyz2 = xyz_pair.astype(np.float32)
                     sub_traj = md.Trajectory(xyz2, md_top.subset(subset))
+                    # 盒矢量也交给 mdtraj——原来没传，等于让它在"没有周期信息"的状态
+                    # 下工作，任何需要最小镜像的操作都无从判断。
+                    sub_traj.unitcell_vectors = np.repeat(
+                        np.asarray(box_nm, dtype=np.float32)[None, :, :], 2, axis=0
+                    )
                     summary["backbone_rmsd_nm"] = float(
                         md.rmsd(sub_traj, sub_traj, 0, atom_indices=bb_sub)[1]
                     )
@@ -3362,13 +3450,33 @@ class ABFEPipeline:
                         abs(summary["backbone_rmsd_nm"] - prev_summary["backbone_rmsd_nm"])
                         <= PRE_EQUILIBRATION_CONVERGENCE_RMSD_DRIFT_TOL_NM
                     )
+                    # 🔑 [2026-09-03] 配体位姿漂移用它自己的容差
+                    # PRE_EQUILIBRATION_CONVERGENCE_POSE_DRIFT_TOL_NM(0.10)，不再复用
+                    # backbone 那个 0.02——见该常量处的实测依据（0.02 小于位姿本身的
+                    # 热涨落幅度，是无法满足的判据）。
                     checks.append(
                         abs(
                             summary["ligand_pose_drift_nm"]
                             - prev_summary["ligand_pose_drift_nm"]
                         )
-                        <= PRE_EQUILIBRATION_CONVERGENCE_RMSD_DRIFT_TOL_NM
+                        <= PRE_EQUILIBRATION_CONVERGENCE_POSE_DRIFT_TOL_NM
                     )
+                    # 🔑 [2026-09-03] 新增的 fail-closed 绝对上限（不是放松）：配体
+                    # 已经离开结合位姿时，"位姿稳定"没有意义。不中止运行，只拒绝宣布
+                    # 稳定 → 退化为跑满 n_equil_steps，并打一条显著警告。
+                    pose_escaped = (
+                        float(summary["ligand_pose_drift_nm"])
+                        > PRE_EQUILIBRATION_LIGAND_POSE_ESCAPE_TOL_NM
+                    )
+                    if pose_escaped:
+                        self._log(
+                            f"  [WARN] 预平衡第 {current_step} 步：配体位姿漂移 "
+                            f"{summary['ligand_pose_drift_nm']:.3f} nm 超过绝对上限 "
+                            f"{PRE_EQUILIBRATION_LIGAND_POSE_ESCAPE_TOL_NM} nm"
+                            "（配体可能已离开结合位姿）；拒绝宣布预平衡收敛，"
+                            "将跑满剩余步数。请检查 Boresch 锚点与起始位姿。"
+                        )
+                    checks.append(not pose_escaped)
                 else:
                     checks.append(
                         abs(
@@ -3388,7 +3496,7 @@ class ABFEPipeline:
             if stable_streak >= stable_required and remaining > 0:
                 stopped_at_step = current_step
                 self._log(
-                    f"  ✅ 预平衡提前收敛停止于第 {current_step} 步"
+                    f"  [OK] 预平衡提前收敛停止于第 {current_step} 步"
                     f"（连续 {stable_streak} 个 block 稳定，"
                     f"节省 {remaining} 步）"
                 )
@@ -3406,7 +3514,7 @@ class ABFEPipeline:
                 writer.writeheader()
                 writer.writerows(rows)
         except Exception as e:
-            self._log(f"  ⚠️ 预平衡收敛监控 CSV 写入失败（不影响结果）: {e}")
+            self._log(f"  [WARN] 预平衡收敛监控 CSV 写入失败（不影响结果）: {e}")
 
         return {
             "steps_run": current_step - start_step,
@@ -3456,7 +3564,7 @@ class ABFEPipeline:
                 recorded_fingerprint = None
             if recorded_fingerprint != requested_fingerprint:
                 self._log(
-                    "  ⚠️ 预平衡 checkpoint 的坐标/盒子/System/步数指纹不匹配，"
+                    "  [WARN] 预平衡 checkpoint 的坐标/盒子/System/步数指纹不匹配，"
                     "拒绝恢复并从当前输入重新开始"
                 )
                 resume = False
@@ -3500,18 +3608,18 @@ class ABFEPipeline:
         )
         if barostat_result["action"] == "added":
             self._log(
-                f"  🧊 已添加 {barostat_result['barostat_class']}"
+                f"  已添加 {barostat_result['barostat_class']}"
                 f"（environment_type={self.environment_type}，"
                 f"频率={self.barostat_protocol['barostat_frequency']}）"
             )
         else:
             self._log(
-                f"  ♻️ 复用输入 System 已有的 {barostat_result['barostat_class']}，不重复添加"
+                f"  复用输入 System 已有的 {barostat_result['barostat_class']}，不重复添加"
             )
         if self.environment_type == ENVIRONMENT_TYPE_MEMBRANE:
             membrane_cfg = self.barostat_protocol["membrane"]
             self._log(
-                f"  🧫 膜恒压协议: 法向={membrane_cfg['normal_axis']}, "
+                f"  膜恒压协议: 法向={membrane_cfg['normal_axis']}, "
                 f"表面张力={membrane_cfg['surface_tension_bar_nm']} bar·nm, "
                 f"XY={membrane_cfg['xy_mode']}, Z={membrane_cfg['z_mode']}"
             )
@@ -3537,7 +3645,7 @@ class ABFEPipeline:
             platform = openmm.Platform.getPlatformByName(resolved_platform)
         except Exception as e:
             self._log(
-                f"  ⚠️ Platform '{equil_platform}' 初始化失败: {e}，本阶段回退到 CPU"
+                f"  [WARN] Platform '{equil_platform}' 初始化失败: {e}，本阶段回退到 CPU"
             )
             platform = openmm.Platform.getPlatformByName("CPU")
             props = {}
@@ -3561,17 +3669,17 @@ class ABFEPipeline:
                 _how = load_checkpoint_with_platform_migration(simulation, chk_file)
                 if _how != "native":
                     self._log(
-                        f"  🔀 预平衡 checkpoint 由 {_how.split(':', 1)[1]} platform 写入，"
+                        f"  预平衡 checkpoint 由 {_how.split(':', 1)[1]} platform 写入，"
                         "已迁移坐标/速度/盒子/全局参数/步数到当前 platform。"
-                        "⚠️ Integrator 随机数流不随 State 迁移：物理状态完整，"
+                        "[WARN] Integrator 随机数流不随 State 迁移：物理状态完整，"
                         "但本段续算不再逐位可复现。"
                     )
                 current_step = simulation.currentStep
                 steps_remaining = max(0, n_steps - current_step)
-                self._log(f"  ♻️ 从 Checkpoint 恢复 | 已完成: {current_step} | 剩余: {steps_remaining}")
+                self._log(f"  从 Checkpoint 恢复 | 已完成: {current_step} | 剩余: {steps_remaining}")
                 resume_from_chk = True
             except Exception as e:
-                self._log(f"  ⚠️ Checkpoint 加载失败 ({e})，将重新开始")
+                self._log(f"  [WARN] Checkpoint 加载失败 ({e})，将重新开始")
                 steps_remaining = n_steps
         if not resume_from_chk:
             simulation.context.setPositions(self.positions)
@@ -3636,7 +3744,7 @@ class ABFEPipeline:
                     self.temperature, MEMBRANE_EQUILIBRATION_VELOCITY_SEED
                 )
                 self._log(
-                    f"  🌡️ 膜体系：速度已初始化到 {self.temperature}"
+                    f"  膜体系：速度已初始化到 {self.temperature}"
                     f"（seed={MEMBRANE_EQUILIBRATION_VELOCITY_SEED}）——"
                     "避免 0 K 冷启动下 barostat 压塌盒子"
                 )
@@ -3658,7 +3766,7 @@ class ABFEPipeline:
                     requested_fingerprint,
                 )
                 self._log(
-                    "  🧩 预平衡续跑已开启新轨迹 segment "
+                    "  预平衡续跑已开启新轨迹 segment "
                     f"{active_segment['segment_index']}（旧 DCD/monitor 已归档，"
                     "canonical reporter 使用 append=False）"
                 )
@@ -3702,7 +3810,7 @@ class ABFEPipeline:
                 "    修法：加载/重建拓扑后调用 `topology.setPeriodicBoxVectors(box)`。"
             )
             if self.membrane_quality_gate_mode == MEMBRANE_QUALITY_GATE_MODE_ADVISORY:
-                self._log(f"  ⚠️ [膜质量门 advisory] {_box_message}")
+                self._log(f"  [WARN] [膜质量门 advisory] {_box_message}")
             else:
                 raise RuntimeError(_box_message)
 
@@ -3738,7 +3846,7 @@ class ABFEPipeline:
                 )
             )
             self._log(
-                f"  📈 膜体系监控已启用（每 {MEMBRANE_EQUILIBRATION_MONITOR_INTERVAL} 步）: "
+                f"  膜体系监控已启用（每 {MEMBRANE_EQUILIBRATION_MONITOR_INTERVAL} 步）: "
                 f"{monitor_file}"
             )
         
@@ -3793,11 +3901,11 @@ class ABFEPipeline:
                 import gc; gc.collect()
                 # 可选：重置 CUDA 上下文（需要 PyCUDA）
                 # import pycuda.driver as cuda; cuda.Context.pop()
-                self._log("  ✓ CUDA 上下文已清理，后续采样可安全复用 GPU")
+                self._log("  [OK] CUDA 上下文已清理，后续采样可安全复用 GPU")
             except Exception as e:
-                self._log(f"  ⚠️ 上下文清理警告: {e}（通常不影响后续运行）")
+                self._log(f"  [WARN] 上下文清理警告: {e}（通常不影响后续运行）")
         
-        self._log(f"  ✓ 预平衡完成 | 最终势能: {final_energy:.2f} kJ/mol")
+        self._log(f"  [OK] 预平衡完成 | 最终势能: {final_energy:.2f} kJ/mol")
         self._log_vram("预平衡结束（Context 已清理）")
 
         # `total_steps` 记录**实际跑的步数**（本次调用之前已完成的 + 本次调用跑的），
@@ -3832,7 +3940,7 @@ class ABFEPipeline:
                         indent=2,
                     )
             except Exception as e:
-                self._log(f"  ⚠️ 预平衡指纹写入失败（不影响本次结果，但下次 resume 无法校验缓存是否匹配当前系统）: {e}")
+                self._log(f"  [WARN] 预平衡指纹写入失败（不影响本次结果，但下次 resume 无法校验缓存是否匹配当前系统）: {e}")
         # 🔑 标记本进程已经做过一次预平衡——run_full_pipeline() 内部的预平衡块
         # 会用这个标记短路，不再重新跑一次并覆盖这里刚更新的 self.positions。
         self._pre_equilibration_done_this_process = True
@@ -3870,7 +3978,7 @@ class ABFEPipeline:
         from abfe_core import LambdaDependentBoreschForce
         
         cleanup_temp_files(self.checkpoint_dir)
-        self._log(f"🔄 启动带 Boresch 限制力的再平衡 ({n_steps} 步)...")
+        self._log(f"启动带 Boresch 限制力的再平衡 ({n_steps} 步)...")
         chk_path = os.path.join(self.output_dir, "rebalance.chk")
         traj_path = os.path.join(self.output_dir, "rebalance_traj.dcd")
         state_path = os.path.join(self.output_dir, "rebalance_state.json")
@@ -3922,7 +4030,7 @@ class ABFEPipeline:
             box_lengths = np.linalg.norm(box_nm, axis=1)
             if np.linalg.norm(lig_com - box_center) > 0.4 * np.min(box_lengths):
                 self.positions, self.box_vectors = self._wrap_ligand_to_box(self.positions, self.box_vectors)
-                self._log("  📦 检测到配体偏离主周期，已自动执行 PBC 居中")
+                self._log("  检测到配体偏离主周期，已自动执行 PBC 居中")
                 pos_nm = np.asarray(
                     self.positions.value_in_unit(unit.nanometer)
                     if hasattr(self.positions, "value_in_unit")
@@ -3938,7 +4046,7 @@ class ABFEPipeline:
 
             if abs(actual_dist - target_r0) > 0.15:
                 self._log(
-                    f"  ⚠️ Boresch 末帧 r0 偏离系综均值: "
+                    f"  [WARN] Boresch 末帧 r0 偏离系综均值: "
                     f"{target_r0*10:.2f}Å → {actual_dist*10:.2f}Å；"
                     "仅作 deviation diagnostic，不覆盖已冻结的系综均值。"
                 )
@@ -3969,7 +4077,7 @@ class ABFEPipeline:
                 rebalance_cache_reject_reason = "rebalance_state.json 读取失败"
         if not rebalance_cache_trusted:
             self._log(
-                f"  ⚠️ 再平衡缓存视为无效（{rebalance_cache_reject_reason}），将忽略已有 "
+                f"  [WARN] 再平衡缓存视为无效（{rebalance_cache_reject_reason}），将忽略已有 "
                 "Checkpoint/轨迹，从当前坐标重新做一次完整的 Boresch 限制力再平衡。"
             )
 
@@ -3997,7 +4105,7 @@ class ABFEPipeline:
             )
             rest_force.setForceGroup(3)  # 与采样阶段一致
             rebal_sys.addForce(rest_force)
-            self._log(f"  ✓ Boresch 限制力已注入 (Group 3)")
+            self._log(f"  [OK] Boresch 限制力已注入 (Group 3)")
         
         # 2. 创建 Integrator + Platform
         integrator = openmm.LangevinMiddleIntegrator(
@@ -4017,7 +4125,7 @@ class ABFEPipeline:
             _, props = _build_platform_props(equil_platform)
         except Exception as e:
             self._log(
-                f"  ⚠️ Platform '{equil_platform}' 初始化失败: {e}，本阶段回退到 CPU"
+                f"  [WARN] Platform '{equil_platform}' 初始化失败: {e}，本阶段回退到 CPU"
             )
             platform, props = openmm.Platform.getPlatformByName("CPU"), {}
             # 只降级本阶段局部用的 equil_platform，不永久 mutate self.platform_name
@@ -4034,18 +4142,18 @@ class ABFEPipeline:
         # random/seekable checkpoint can never trigger append=True.
         resume_enabled = False
         if resume and rebalance_cache_trusted and os.path.isfile(chk_path):
-            self._log(f"  ♻️ 检测到再平衡 Checkpoint ({chk_path})，恢复状态...")
+            self._log(f"  检测到再平衡 Checkpoint ({chk_path})，恢复状态...")
             try:
                 _how = load_checkpoint_with_platform_migration(simulation, chk_path)
                 if _how != "native":
                     self._log(
-                        f"  🔀 再平衡 checkpoint 由 {_how.split(':', 1)[1]} platform 写入，"
+                        f"  再平衡 checkpoint 由 {_how.split(':', 1)[1]} platform 写入，"
                         "已迁移物理状态到当前 platform（Integrator 随机数流除外）。"
                     )
                 steps_remaining = max(0, n_steps - simulation.currentStep)
                 resume_enabled = True
             except Exception as e:
-                self._log(f"  ⚠️ Checkpoint 加载失败 ({e})，重新开始")
+                self._log(f"  [WARN] Checkpoint 加载失败 ({e})，重新开始")
                 steps_remaining = n_steps
         else:
             steps_remaining = n_steps
@@ -4092,7 +4200,7 @@ class ABFEPipeline:
                 del rebal_sys
                 import gc; gc.collect()
             except Exception as e:
-                self._log(f"  ⚠️ 上下文清理警告: {e}")
+                self._log(f"  [WARN] 上下文清理警告: {e}")
 
         try:
             with open(state_path, "w", encoding="utf-8") as f:
@@ -4110,9 +4218,9 @@ class ABFEPipeline:
                     indent=2,
                 )
         except Exception as e:
-            self._log(f"  ⚠️ 再平衡完成态保存失败: {e}")
+            self._log(f"  [WARN] 再平衡完成态保存失败: {e}")
 
-        self._log(f"  ✓ 再平衡完成 | 坐标已更新")
+        self._log(f"  [OK] 再平衡完成 | 坐标已更新")
         # 标记本进程已完成 Boresch 再平衡（见 __init__ 里的说明和
         # run_full_pipeline() 内部预平衡块对这个标记的使用）。
         self._boresch_rebalance_done_this_process = True
@@ -4233,7 +4341,7 @@ class ABFEPipeline:
             platform = openmm.Platform.getPlatformByName("CUDA")
             props = {"Precision": "mixed"}
         except Exception as e:
-            self._log(f"  ⚠️ CUDA 探针平台初始化失败: {e}，回退至 CPU")
+            self._log(f"  [WARN] CUDA 探针平台初始化失败: {e}，回退至 CPU")
             platform = openmm.Platform.getPlatformByName("CPU")  # ✅ 强制获取 CPU 平台对象
             props = {}
 
@@ -4293,7 +4401,7 @@ class ABFEPipeline:
         if not torsion_params:
             return
 
-        self._log("🔧 应用二面角修正力...")
+        self._log("应用二面角修正力...")
 
         fmt = torsion_params.get("format", "traditional")
         torsions = (
@@ -4318,7 +4426,7 @@ class ABFEPipeline:
             max_order = max(max_order, order)
 
         if max_order == 0:
-            self._log("  ⚠️ 无有效的傅里叶二面角参数")
+            self._log("  [WARN] 无有效的傅里叶二面角参数")
             return
 
         terms = ["offset"]
@@ -4327,7 +4435,7 @@ class ABFEPipeline:
             terms.append(f"s{n}*sin({n}*theta)")
 
         expr = " + ".join(terms)
-        self._log(f"  📐 傅里叶表达式 (阶数={max_order}): {expr}")
+        self._log(f"  傅里叶表达式 (阶数={max_order}): {expr}")
 
         force = CustomTorsionForce(expr)
         force.addPerTorsionParameter("offset")
@@ -4361,10 +4469,10 @@ class ABFEPipeline:
         if applied > 0:
             self.system.addForce(force)
             self._log(
-                f"  ✓ 已添加 {applied} 个傅里叶二面角修正项 (最大阶数={max_order})"
+                f"  [OK] 已添加 {applied} 个傅里叶二面角修正项 (最大阶数={max_order})"
             )
         else:
-            self._log("  ⚠️ 无有效的二面角修正项")
+            self._log("  [WARN] 无有效的二面角修正项")
 
     def _apply_traditional_torsions(self, torsions: List[Dict]):
         """应用传统 k/n/phi 格式的二面角修正"""
@@ -4394,9 +4502,9 @@ class ABFEPipeline:
 
         if applied > 0:
             self.system.addForce(force)
-            self._log(f"  ✓ 已添加 {applied} 个传统二面角修正项")
+            self._log(f"  [OK] 已添加 {applied} 个传统二面角修正项")
         else:
-            self._log("  ⚠️ 无有效的二面角修正项")
+            self._log("  [WARN] 无有效的二面角修正项")
 
     # =========================================================================
     # 3. IBS 生产采样
@@ -4430,6 +4538,9 @@ class ABFEPipeline:
         # （4/6），行为不变。
         min_states_per_window: Optional[int] = None,
         max_states_per_window: Optional[int] = None,
+        # 🔑 [THERMODYNAMIC_PATH_PROTOCOL_VERSION=22] 自由能定向加密点数。None/0 =
+        # 关闭，布点与 v21 逐字节相同；总态数仍是 final_state_count，成本不变。
+        free_energy_densify_points: Optional[int] = None,
     ) -> Dict:
         from abfe_preoptimizer import DualLambdaPreOptimizer
         
@@ -4585,10 +4696,10 @@ class ABFEPipeline:
                 try:
                     context.setParameter(p_name, float(p_val))
                     injected[p_name] = True
-                    self._log(f"[CONTEXT] ✅ 强制注入成功: {p_name}={p_val}")
+                    self._log(f"[CONTEXT] [OK] 强制注入成功: {p_name}={p_val}")
                 except Exception as e:
                     injected[p_name] = False
-                    self._log(f"[CONTEXT] ❌ 强制注入失败 {p_name} | 报错: {e}")
+                    self._log(f"[CONTEXT] [ERR] 强制注入失败 {p_name} | 报错: {e}")
         
         optimizer = DualLambdaPreOptimizer(probe_sys, context, self.temperature.value_in_unit(unit.kelvin))
         
@@ -4616,6 +4727,10 @@ class ABFEPipeline:
                     _vanishing_kwargs["min_states_per_window"] = int(min_states_per_window)
                 if max_states_per_window is not None:
                     _vanishing_kwargs["max_states_per_window"] = int(max_states_per_window)
+                if free_energy_densify_points is not None:
+                    _vanishing_kwargs["free_energy_densify_points"] = int(
+                        free_energy_densify_points
+                    )
                 opt_res = optimizer.optimize_stage2_vanishing(**_vanishing_kwargs)
             self._log(f"[OUTPUT] 优化成功返回: keys={list(opt_res.keys())}")
         except Exception as e:
@@ -4659,7 +4774,7 @@ class ABFEPipeline:
         _vram_after_release = _gpu_memory_mib()
         if _vram_before_release and _vram_after_release:
             self._log(
-                f"  🧹 λ 预优化 Context 已释放 | 显存 used "
+                f"  λ 预优化 Context 已释放 | 显存 used "
                 f"{_vram_before_release[0]} → {_vram_after_release[0]} MiB "
                 f"(free {_vram_before_release[1]} → {_vram_after_release[1]} MiB)"
             )
@@ -4783,10 +4898,10 @@ class ABFEPipeline:
         # 1. 确定 Lambda 路径
         if optimized_lambdas is not None:
             lambdas_var = optimized_lambdas
-            self._log(f"  ✓ 使用自适应优化 Lambda 路径 ({len(lambdas_var)} 个状态)")
+            self._log(f"  [OK] 使用自适应优化 Lambda 路径 ({len(lambdas_var)} 个状态)")
         else:
             lambdas_var = np.linspace(1.0, 0.0, n_states).tolist()
-            self._log(f"  ⚠️ 使用线性 Lambda 路径 ({n_states} 个状态)")
+            self._log(f"  [WARN] 使用线性 Lambda 路径 ({n_states} 个状态)")
 
         n_states = len(lambdas_var)
         # 固定另一个 Lambda
@@ -4818,7 +4933,7 @@ class ABFEPipeline:
 
         if stage_name == "decharging":
             self._log(
-                "  ⚠️ Coulomb 去电荷阶段已禁用 IBS-CustomNonbondedForce；"
+                "  [WARN] Coulomb 去电荷阶段已禁用 IBS-CustomNonbondedForce；"
                 "改用 NonbondedForce ParameterOffset 路径以保留 PME 长程静电。"
             )
             stage_output_dir = os.path.join(self.output_dir, stage_name)
@@ -4876,7 +4991,7 @@ class ABFEPipeline:
                 boresch_params,
                 coion_identity=getattr(self, "_coion_runtime_identity", None),
             ) and sampling_cache_ok:
-                self._log("  ♻️ 检测到已有 PME u_kn，跳过 REMD 采样与重算，直接求解 MBAR")
+                self._log("  检测到已有 PME u_kn，跳过 REMD 采样与重算，直接求解 MBAR")
                 u_kn = np.load(u_kn_path)
                 analyzer = TraditionalMBARAnalyzer(temperature=temp_k)
                 if not os.path.exists(n_k_path):
@@ -4929,14 +5044,14 @@ class ABFEPipeline:
                     coion_identity=getattr(self, "_coion_runtime_identity", None),
                 ) and not sampling_cache_ok:
                     self._log(
-                        "  ⚠️ PME u_kn 虽匹配当前 Hamiltonian，但 REMD sampling "
+                        "  [WARN] PME u_kn 虽匹配当前 Hamiltonian，但 REMD sampling "
                         "fingerprint 缺失/不匹配；拒绝跳过 REMD，重新采样并重算。"
                     )
                 else:
-                    self._log("  ♻️ 检测到旧版 PME u_kn 缓存，但模型版本不兼容；保留轨迹并重新执行离线 MBAR 重算。")
+                    self._log("  检测到旧版 PME u_kn 缓存，但模型版本不兼容；保留轨迹并重新执行离线 MBAR 重算。")
 
             if sampling_cache_ok:
-                self._log("  ♻️ 检测到完整 REMD DCD，视为采样已完成，跳过 REMD 继续离线 MBAR")
+                self._log("  检测到完整 REMD DCD，视为采样已完成，跳过 REMD 继续离线 MBAR")
             else:
                 if resume and _all_remd_trajs_valid(
                     stage_output_dir,
@@ -4945,7 +5060,7 @@ class ABFEPipeline:
                     min_frames=expected_frames,
                 ):
                     self._log(
-                        "  ⚠️ REMD DCD 虽完整，但 sampling fingerprint 缺失或不匹配；"
+                        "  [WARN] REMD DCD 虽完整，但 sampling fingerprint 缺失或不匹配；"
                         "拒绝用新 Hamiltonian 重算旧采样分布，重新执行 REMD"
                     )
                 remd = REMDManager(
@@ -5100,7 +5215,7 @@ class ABFEPipeline:
                 if int(window_ranges[i - 1][1]) - 1 == int(window_ranges[i][0])
             ]
             self._log(
-                f"  🪟 {len(window_ranges)} 个 IBS ensemble："
+                f"  {len(window_ranges)} 个 IBS ensemble："
                 f"λ 节点范围（半开）={window_ranges}；"
                 f"λ interval 分区（半开、互不重复）={_edge_ranges}；"
                 f"复用的共同边界节点={_shared_boundary_nodes}"
@@ -5114,7 +5229,7 @@ class ABFEPipeline:
                 pts_per_window=pts_per_window,
                 overlap=overlap
             )
-            self._log(f"  🪟 自动划分 {len(window_ranges)} 个 IBS 窗口")
+            self._log(f"  自动划分 {len(window_ranges)} 个 IBS 窗口")
 
         # 3. 初始化 Manager
         stage_output_dir = (
@@ -5164,7 +5279,7 @@ class ABFEPipeline:
                 _charging_snapshot, "lambda_coul", 0.0
             )
             self._log(
-                "  🔗 [Stage2 handoff] charge-transfer 配体：vanishing 输入已"
+                "  [Stage2 handoff] charge-transfer 配体：vanishing 输入已"
                 "固化为 charging λ_coul=0 端点（配体 0 电荷、co-ion 满电，"
                 f"protocol_version={CHARGE_TRANSFER_VANISHING_HANDOFF_PROTOCOL_VERSION}）。"
             )
@@ -5333,8 +5448,8 @@ class ABFEPipeline:
         )
         if stage_name == "vanishing" and not _independent_endpoint_enabled:
             self._log(
-                "  ⏭️ [独立端点段] **未启用**（默认关闭）。末窗口沿用 IBS 单轨迹重加权。"
-                "⚠️ 该路径在溶剂腿上被论证为采不到「水塌进配体空腔」的构型"
+                "  [独立端点段] **未启用**（默认关闭）。末窗口沿用 IBS 单轨迹重加权。"
+                "[WARN] 该路径在溶剂腿上被论证为采不到「水塌进配体空腔」的构型"
                 "（STAGE2_ROOT_CAUSE_2026-08-28.md §3.3）——关闭它是"
                 "「这个装置解决不了该问题且在持续烧时间」，不是「该问题已消失」。"
                 "[2026-09-02] 该文档原先把 stage2 的整个误差归因于此，实测 98% 是"
@@ -5360,7 +5475,7 @@ class ABFEPipeline:
             _endpoint_window_index = len(window_ranges) - 1
             _endpoint_join_index = int(window_ranges[-1][0])
             self._log(
-                f"  🧪 [独立端点段] λ 索引 [{_endpoint_join_index}, {n_states}) 改用"
+                f"  [独立端点段] λ 索引 [{_endpoint_join_index}, {n_states}) 改用"
                 "逐态独立固定-λ 轨迹（无 Group-4 WCA、湿/干双起点）；"
                 f"IBS 窗口 {_endpoint_window_index} 的数据保留作对照，不参与拼接。"
             )
@@ -5619,14 +5734,14 @@ class ABFEPipeline:
                     bridge_result = json.load(f)
                 if bridge_result.get("protocol_key") != bridge_protocol_key:
                     raise ValueError("Shadow-Bridge 缓存协议指纹不匹配")
-                self._log("  ♻️ 检测到已有 Shadow-Bridge 结果缓存，跳过重新采样")
+                self._log("  检测到已有 Shadow-Bridge 结果缓存，跳过重新采样")
             except Exception as exc:
-                self._log(f"  ⚠️ Shadow-Bridge 缓存拒绝复用: {exc}，重新采样")
+                self._log(f"  [WARN] Shadow-Bridge 缓存拒绝复用: {exc}，重新采样")
                 bridge_result = None
         else:
             bridge_result = None
         if bridge_result is None:
-            self._log(f"  🌉 [Bridge 腿] 运行 {len(shadow_bridge_lambdas)} 个窗口 (PME↔Shadow 满电荷端点)...")
+            self._log(f"  [Bridge 腿] 运行 {len(shadow_bridge_lambdas)} 个窗口 (PME↔Shadow 满电荷端点)...")
             bridge_result = run_shadow_bridge_leg(
                 system=self.system,
                 topology=self.topology,
@@ -5687,7 +5802,7 @@ class ABFEPipeline:
                 "拒绝把这条子腿的结果并入 Stage1 去电荷总量。"
             )
         self._log(
-            f"  ✓ Bridge 腿完成: ΔG={bridge_result['total_delta_G']:.2f} ± "
+            f"  [OK] Bridge 腿完成: ΔG={bridge_result['total_delta_G']:.2f} ± "
             f"{bridge_result['total_error']:.2f} kJ/mol"
         )
 
@@ -5704,7 +5819,7 @@ class ABFEPipeline:
             window_ranges = generate_overlapping_windows(
                 n_states=n_states, n_windows=None, pts_per_window=6, overlap=2
             )
-            self._log(f"  🪟 自动划分 {len(window_ranges)} 个 Shadow-IBS 窗口")
+            self._log(f"  自动划分 {len(window_ranges)} 个 Shadow-IBS 窗口")
 
         manager = IBSWindowManagerShadowCoul(
             system_template=self.system,
@@ -5760,7 +5875,7 @@ class ABFEPipeline:
                 "子腿的结果并入 Stage1 去电荷总量。"
             )
         self._log(
-            f"  ✓ Shadow-IBS 腿完成: ΔG={shadow_ibs_result['total_delta_G']:.2f} ± "
+            f"  [OK] Shadow-IBS 腿完成: ΔG={shadow_ibs_result['total_delta_G']:.2f} ± "
             f"{shadow_ibs_result['total_error']:.2f} kJ/mol"
         )
 
@@ -5893,7 +6008,7 @@ class ABFEPipeline:
             boresch_params,
             coion_identity=getattr(self, "_coion_runtime_identity", None),
         ) and sampling_cache_ok:
-            self._log("  ♻️ 检测到兼容的 PME u_kn 缓存，直接求解 MBAR")
+            self._log("  检测到兼容的 PME u_kn 缓存，直接求解 MBAR")
             u_kn = np.load(u_kn_path)
             analyzer = TraditionalMBARAnalyzer(
                 temperature=self.temperature.value_in_unit(unit.kelvin)
@@ -5904,16 +6019,16 @@ class ABFEPipeline:
             res = analyzer.solve(u_kn)
         else:
             if sampling_cache_ok:
-                self._log("  ♻️ 检测到完整 REMD 轨迹，跳过采样直接重算 u_kn")
+                self._log("  检测到完整 REMD 轨迹，跳过采样直接重算 u_kn")
             else:
                 if resume and _all_remd_trajs_valid(
                     stage_output_dir, label, n_states, min_frames=expected_frames
                 ):
                     self._log(
-                        "  ⚠️ 2D REMD DCD 虽完整，但 sampling fingerprint 缺失或不匹配；"
+                        "  [WARN] 2D REMD DCD 虽完整，但 sampling fingerprint 缺失或不匹配；"
                         "拒绝重用旧采样分布，重新执行 REMD"
                     )
-                self._log("  ⚡ 2D/单λ 路径改走 PME-preserving REMD+MBAR 通路")
+                self._log("  2D/单λ 路径改走 PME-preserving REMD+MBAR 通路")
                 remd = REMDManager(
                     system_template=self.system,
                     topology=self.topology,
@@ -5999,7 +6114,7 @@ class ABFEPipeline:
         # 流入任何缓存/完成标记/最终 ΔG。
         _assert_sampling_result_converged(stage_result, context=f"{label} stage")
         self._log(
-            f"  ✓ {label} 路径完成: ΔG={stage_result['total_delta_G']:.2f} ± "
+            f"  [OK] {label} 路径完成: ΔG={stage_result['total_delta_G']:.2f} ± "
             f"{stage_result['total_error']:.2f} kJ/mol"
         )
         return stage_result
@@ -6046,7 +6161,7 @@ class ABFEPipeline:
         if boresch_params is None:
             boresch_path = os.path.join(self.output_dir, "boresch_params.json")
             if autoload_from_disk and os.path.exists(boresch_path):
-                self._log(f"  📂 参数未传入，自动从磁盘加载: {boresch_path}")
+                self._log(f"  参数未传入，自动从磁盘加载: {boresch_path}")
                 with open(boresch_path, "r") as f:
                     boresch_params = json.load(f)
             else:
@@ -6144,7 +6259,7 @@ class ABFEPipeline:
             boresch_json_path,
             _json_safe(boresch_json),
         )
-        self._log(f"  ✓ Boresch 参数已保存 (JSON): {boresch_json_path}")
+        self._log(f"  [OK] Boresch 参数已保存 (JSON): {boresch_json_path}")
         
         return {
             "delta_g_rest": float(delta_g),
@@ -6203,13 +6318,13 @@ class ABFEPipeline:
                 )
         else:
             self._log(
-                f"  ⚠️ {os.path.basename(committed_path)} 是无身份信息的旧格式"
+                f"  [WARN] {os.path.basename(committed_path)} 是无身份信息的旧格式"
                 f"（schema_version 缺失），无法核对锚点来源；仍将执行几何一致性校验。"
             )
 
         force_constants = boresch_params.get("force_constants") or {}
         if len(rec) != 3 or len(lig) != 3 or not force_constants:
-            self._log("  ⚠️ 缺锚点或力常数，跳过 Boresch 平衡值几何一致性校验。")
+            self._log("  [WARN] 缺锚点或力常数，跳过 Boresch 平衡值几何一致性校验。")
             return
 
         try:
@@ -6226,7 +6341,7 @@ class ABFEPipeline:
             self.temperature.value_in_unit(unit.kelvin),
         )
         if not report:
-            self._log("  ⚠️ 没有可比较的自由度，跳过 Boresch 平衡值几何一致性校验。")
+            self._log("  [WARN] 没有可比较的自由度，跳过 Boresch 平衡值几何一致性校验。")
             return
 
         worst_key = max(report, key=lambda k: report[k]["deviation_sigma"])
@@ -6237,7 +6352,7 @@ class ABFEPipeline:
             warn_at = float(BORESCH_COMMITTED_WARN_DEVIATION_SIGMA)
             if worst > warn_at:
                 self._log(
-                    f"  ⚠️ 已提交 Boresch 平衡值与当前坐标偏离 {worst:.2f} σ @ {worst_key}"
+                    f"  [WARN] 已提交 Boresch 平衡值与当前坐标偏离 {worst:.2f} σ @ {worst_key}"
                     f"（告警带 {warn_at:.1f}-{threshold:.1f} σ，未阻断）。"
                     "单帧比较本身带 ~√2σ 噪声，偶发一次可以忽略；但若每次 resume 都出现、"
                     "或多个自由度同时进入该带，说明平衡值已经在偏离当前构象，"
@@ -6250,7 +6365,7 @@ class ABFEPipeline:
                     )
             else:
                 self._log(
-                    f"  ✓ 已提交 Boresch 平衡值与当前坐标一致（最大偏离 "
+                    f"  [OK] 已提交 Boresch 平衡值与当前坐标一致（最大偏离 "
                     f"{worst:.2f} σ @ {worst_key}，阈值 {threshold:.1f} σ）"
                 )
             return
@@ -6350,7 +6465,7 @@ class ABFEPipeline:
             }),
         )
         self._log(
-            "  📌 已提交 Boresch 预平衡轨迹系综均值；末帧仅作 diagnostic，"
+            "  已提交 Boresch 预平衡轨迹系综均值；末帧仅作 diagnostic，"
             f"不进行 re-anchor: {committed_path}"
         )
         return committed_params
@@ -6377,14 +6492,14 @@ class ABFEPipeline:
             # 🔑 强校验 1：角度奇点硬拦截 (安全域: 40°~140° ≈ 0.698~2.443 rad)
             thA_deg, thB_deg = np.degrees(new_thA), np.degrees(new_thB)
             if not (40.0 <= thA_deg <= 140.0) or not (40.0 <= thB_deg <= 140.0):
-                self._log(f"  ⚠️ 自动更新拦截：新角度 θA={thA_deg:.1f}°, θB={thB_deg:.1f}° 触及奇点 (<40° 或 >140°)")
+                self._log(f"  [WARN] 自动更新拦截：新角度 θA={thA_deg:.1f}°, θB={thB_deg:.1f}° 触及奇点 (<40° 或 >140°)")
                 self._log(f"     保留原始安全平衡值 (r0={orig_r0*10:.2f}Å)，请检查预平衡轨迹或手动指定锚点")
                 return boresch_params  # 🛑 拒绝更新，阻断 NaN 源头
                 
             # 🔑 强校验 2：距离漂移拦截 (> 2.5 Å 视为配体脱离口袋或严重穿模)
             r0_drift = abs(new_r0 - orig_r0)
             if r0_drift > 0.25:
-                self._log(f"  ⚠️ 自动更新拦截：r0 漂移过大 ({r0_drift*10:.2f} Å > 2.5 Å)")
+                self._log(f"  [WARN] 自动更新拦截：r0 漂移过大 ({r0_drift*10:.2f} Å > 2.5 Å)")
                 self._log(f"     保留原始平衡值，体系可能未充分弛豫")
                 return boresch_params
                 
@@ -6418,7 +6533,7 @@ class ABFEPipeline:
                     _worst_name, _worst = _name, _sig
             if _worst > float(BORESCH_COMMITTED_MAX_DEVIATION_SIGMA):
                 self._log(
-                    f"  ⚠️ 自动更新拦截（BOR-02）：{_worst_name} 偏离 {_worst:.2f}σ "
+                    f"  [WARN] 自动更新拦截（BOR-02）：{_worst_name} 偏离 {_worst:.2f}σ "
                     f"> {float(BORESCH_COMMITTED_MAX_DEVIATION_SIGMA):.1f}σ"
                 )
                 self._log(
@@ -6429,17 +6544,17 @@ class ABFEPipeline:
                 return boresch_params
             if _worst > float(BORESCH_COMMITTED_WARN_DEVIATION_SIGMA):
                 self._log(
-                    f"  ⚠️ Boresch 平衡值 {_worst_name} 偏离 {_worst:.2f}σ"
+                    f"  [WARN] Boresch 平衡值 {_worst_name} 偏离 {_worst:.2f}σ"
                     f"（告警阈值 {float(BORESCH_COMMITTED_WARN_DEVIATION_SIGMA):.1f}σ），"
                     "仍在容许范围内，已采用"
                 )
 
             # ✅ 校验通过，安全覆盖
             boresch_params["equilibrium_values"] = new_eq
-            self._log(f"  ✅ 已用最后一帧安全更新 Boresch 平衡值: r0={new_r0*10:.2f}Å, θA={thA_deg:.1f}°, θB={thB_deg:.1f}°")
+            self._log(f"  [OK] 已用最后一帧安全更新 Boresch 平衡值: r0={new_r0*10:.2f}Å, θA={thA_deg:.1f}°, θB={thB_deg:.1f}°")
             self._log(f"     逐自由度最大偏差 {_worst:.2f}σ（{_worst_name}），含三个二面角")
         except Exception as e:
-            self._log(f"  ⚠️ Boresch 平衡值更新失败: {e}，使用原始值")
+            self._log(f"  [WARN] Boresch 平衡值更新失败: {e}，使用原始值")
         return boresch_params
 
     def compute_final_results(self, sampling_results: Dict, correction_results: Dict, system: openmm.System = None, decoupling_scheme: str = "dual_lambda") -> Dict:
@@ -6512,16 +6627,16 @@ class ABFEPipeline:
             err_phys = np.sqrt(err_attach**2 + err_decharge**2 + err_vdw**2)
             if stage0:
                 self._log(
-                    f"  🔗 双λ解耦: ΔG_attach={dg_attach:.2f} + ΔG_charge={dg_decharge:.2f} "
+                    f"  双λ解耦: ΔG_attach={dg_attach:.2f} + ΔG_charge={dg_decharge:.2f} "
                     f"+ ΔG_vdw={dg_vdw:.2f} = {dg_phys:.2f} ± {err_phys:.2f} kJ/mol"
                 )
             elif _system_type == "complex":
                 self._log(
-                    f"  🔗 双λ解耦: ΔG_charge={dg_decharge:.2f} + ΔG_vdw={dg_vdw:.2f} "
+                    f"  双λ解耦: ΔG_charge={dg_decharge:.2f} + ΔG_vdw={dg_vdw:.2f} "
                     f"= {dg_phys:.2f} ± {err_phys:.2f} kJ/mol"
                 )
                 self._log(
-                    "  ⚠️ [P1-17] 未提供 Boresch attachment 腿 (stage0)，"
+                    "  [WARN] [P1-17] 未提供 Boresch attachment 腿 (stage0)，"
                     "复合物腿缺 A′→A 项；该结果不是闭合循环。"
                 )
         else:
@@ -6762,8 +6877,8 @@ class ABFEPipeline:
         cycle_path = os.path.join(self.output_dir, "thermodynamic_cycle.md")
         with open(cycle_path, "w", encoding="utf-8") as f:
             f.write(THERMODYNAMIC_CYCLE_DOC + "\n")
-        self._log(f"\n✅ 最终结果已保存: {out_path}")
-        self._log(f"  ✓ 热力学循环说明已保存: {cycle_path}")
+        self._log(f"\n[OK] 最终结果已保存: {out_path}")
+        self._log(f"  [OK] 热力学循环说明已保存: {cycle_path}")
         self._log(UnitFormatter.format_results_human(final))
         return final
 
@@ -6778,7 +6893,7 @@ class ABFEPipeline:
         """完整 ABFE 循环：复合物 + 溶剂相 → 结合自由能"""
         # 1. 复合物腿
         self._log(f"\n{'='*60}")
-        self._log(f"🔬 开始复合物相 ABFE 计算...")
+        self._log(f"开始复合物相 ABFE 计算...")
         self._log(f"{'='*60}")
         complex_kwargs = dict(kwargs)
         complex_kwargs.setdefault("system_type", "complex")
@@ -6800,7 +6915,7 @@ class ABFEPipeline:
         cycle = None
 
         if run_solvent and solvent_gro and solvent_top:
-            print("\n💧 启动溶剂相 (Ligand-in-Water) 计算...")
+            print("\n启动溶剂相 (Ligand-in-Water) 计算...")
             from abfe_core import SolventLegRunner  # ✅ 修复 E10：正确导入路径
             # ✅ 修复：传递残基名称字符串而非整数索引
             ligand_resname = self.topology.atom(self.ligand_indices[0]).residue.name
@@ -6919,10 +7034,10 @@ class ABFEPipeline:
 
         if cycle is None:
             print(
-                "\n⚠️ 未运行溶剂腿：下面这个数只是 -ΔG_complex，**不是**结合自由能，"
+                "\n[WARN] 未运行溶剂腿：下面这个数只是 -ΔG_complex，**不是**结合自由能，"
                 "热力学循环没有闭合。"
             )
-        print(f"\n🎯 最终结合自由能 ΔG_bind = {delta_g_bind:.2f} ± {total_err_bind:.2f} kJ/mol")
+        print(f"\n最终结合自由能 ΔG_bind = {delta_g_bind:.2f} ± {total_err_bind:.2f} kJ/mol")
         return {
             "delta_g_bind": delta_g_bind,
             "total_error": total_err_bind,
@@ -7217,9 +7332,9 @@ class ABFEPipeline:
             )
             if not _allow_untrusted:
                 raise RuntimeError(_msg)
-            self._log(f"  🚨 [结果不可信] {_msg}")
+            self._log(f"  [ERR] [结果不可信] {_msg}")
             self._log(
-                "  🚨 已**不中止**流程继续推进（2026-09-01 决定：为了拿到溶剂腿——"
+                "  [ERR] 已**不中止**流程继续推进（2026-09-01 决定：为了拿到溶剂腿——"
                 "唯一有独立参考真值的那条腿）。本阶段 ΔG 已标记 results_untrusted=True，"
                 "不得作为可发布结果引用。"
             )
@@ -7261,7 +7376,7 @@ class ABFEPipeline:
             # [2026-09-01] 质量门不再中止：标记不可信并继续（见 target_support_gate 处的说明）。
             if not _allow_untrusted:
                 raise RuntimeError(_qmsg)
-            self._log(f"  🚨 [结果不可信] {_qmsg}")
+            self._log(f"  [ERR] [结果不可信] {_qmsg}")
             result["results_untrusted"] = True
             result.setdefault("stage_quality_failures", []).append(
                 {"gate": "stage_quality", "message": str(_qmsg)})
@@ -7276,7 +7391,7 @@ class ABFEPipeline:
             # [2026-09-01] 质量门不再中止：标记不可信并继续（见 target_support_gate 处的说明）。
             if not _allow_untrusted:
                 raise RuntimeError(_qmsg)
-            self._log(f"  🚨 [结果不可信] {_qmsg}")
+            self._log(f"  [ERR] [结果不可信] {_qmsg}")
             result["results_untrusted"] = True
             result.setdefault("stage_quality_failures", []).append(
                 {"gate": "stage_quality", "message": str(_qmsg)})
@@ -7301,7 +7416,7 @@ class ABFEPipeline:
             # [2026-09-01] 质量门不再中止：标记不可信并继续（见 target_support_gate 处的说明）。
             if not _allow_untrusted:
                 raise RuntimeError(_qmsg)
-            self._log(f"  🚨 [结果不可信] {_qmsg}")
+            self._log(f"  [ERR] [结果不可信] {_qmsg}")
             result["results_untrusted"] = True
             result.setdefault("stage_quality_failures", []).append(
                 {"gate": "stage_quality", "message": str(_qmsg)})
@@ -7320,7 +7435,7 @@ class ABFEPipeline:
             # [2026-09-01] 质量门不再中止：标记不可信并继续（见 target_support_gate 处的说明）。
             if not _allow_untrusted:
                 raise RuntimeError(_qmsg)
-            self._log(f"  🚨 [结果不可信] {_qmsg}")
+            self._log(f"  [ERR] [结果不可信] {_qmsg}")
             result["results_untrusted"] = True
             result.setdefault("stage_quality_failures", []).append(
                 {"gate": "stage_quality", "message": str(_qmsg)})
@@ -7343,7 +7458,7 @@ class ABFEPipeline:
             # [2026-09-01] 质量门不再中止：标记不可信并继续（见 target_support_gate 处的说明）。
             if not _allow_untrusted:
                 raise RuntimeError(_qmsg)
-            self._log(f"  🚨 [结果不可信] {_qmsg}")
+            self._log(f"  [ERR] [结果不可信] {_qmsg}")
             result["results_untrusted"] = True
             result.setdefault("stage_quality_failures", []).append(
                 {"gate": "stage_quality", "message": str(_qmsg)})
@@ -7531,7 +7646,7 @@ class ABFEPipeline:
             if action["decision"] == "recalibrate_f_k":
                 bad_edges = [i for i, m in enumerate(action["mismatched_edges"]) if m]
                 self._log(
-                    f"  🎯 {stage_label}: 窗口 {se} fixed-H 全通过但 production ESS 低于阈值 "
+                    f"  {stage_label}: 窗口 {se} fixed-H 全通过但 production ESS 低于阈值 "
                     f"{threshold:.4g}；相邻边 {bad_edges} 的生产冻结 f_k 增量与 fixed-H "
                     f"BAR/MBAR ΔF 差异超出各自噪声阈值（max|Δ|="
                     f"{action['max_abs_edge_diff_kJ_mol']:.3f} kJ/mol，阈值="
@@ -7559,7 +7674,7 @@ class ABFEPipeline:
                     new_steps = int(round(n_steps_per_window * new_multiplier))
                     pending_step_overrides[window_idx] = new_steps
                     self._log(
-                        f"  🔁 {stage_label}: 窗口 {se} fixed-H 全通过但 production ESS 低于阈值 "
+                        f"  {stage_label}: 窗口 {se} fixed-H 全通过但 production ESS 低于阈值 "
                         f"{threshold:.4g}；每条相邻边的生产冻结 f_k 增量与 fixed-H BAR/MBAR ΔF 都"
                         f"在各自噪声阈值内一致（max|Δ|={action['max_abs_edge_diff_kJ_mol']:.3f} "
                         "kJ/mol）——偏置本身没问题，更可能是构象弛豫慢/采样太短；只清空该窗口"
@@ -7568,7 +7683,7 @@ class ABFEPipeline:
                     )
                 else:
                     self._log(
-                        f"  🔁 {stage_label}: 窗口 {se} fixed-H 全通过但 production ESS 低于阈值 "
+                        f"  {stage_label}: 窗口 {se} fixed-H 全通过但 production ESS 低于阈值 "
                         f"{threshold:.4g}；每条相邻边的生产冻结 f_k 增量与 fixed-H BAR/MBAR ΔF 都"
                         f"在各自噪声阈值内一致（max|Δ|={action['max_abs_edge_diff_kJ_mol']:.3f} "
                         "kJ/mol）——偏置本身没问题，更可能是构象弛豫慢/采样太短；但本次调用未"
@@ -7578,7 +7693,7 @@ class ABFEPipeline:
                     )
             else:
                 self._log(
-                    f"  ⚠️ {stage_label}: 窗口 {se} fixed-H 全通过但 production ESS 低于阈值 "
+                    f"  [WARN] {stage_label}: 窗口 {se} fixed-H 全通过但 production ESS 低于阈值 "
                     f"{threshold:.4g}，且无法自动诊断/修复（{action.get('note')}）——详情见 "
                     f"{repair_file}，需要人工检查；不插 λ、不拆窗，production 结果保留不动。"
                 )
@@ -7717,11 +7832,11 @@ class ABFEPipeline:
 
         if reused_new_idx:
             self._log(
-                f"  ♻️  λ 路径已变更，其中 {len(reused_new_idx)} 个窗口覆盖的 λ 集合与之前完全一致，"
+                f"  λ 路径已变更，其中 {len(reused_new_idx)} 个窗口覆盖的 λ 集合与之前完全一致，"
                 "直接复用旧产物（未重新采样）"
             )
         if removed:
-            self._log(f"  🧹 λ 路径已变更，清理 {len(removed)} 个受影响的旧窗口产物，强制重新采样")
+            self._log(f"  λ 路径已变更，清理 {len(removed)} 个受影响的旧窗口产物，强制重新采样")
 
     def _load_window_bias_warmup_status(
         self,
@@ -8405,7 +8520,7 @@ class ABFEPipeline:
         _wet_search_enabled = False
         if bool(kwargs.get("independent_endpoint_wet_search", False)):
             self._log(
-                "  ⛔ [独立端点段] 收到 independent_endpoint_wet_search=True，但干/湿"
+                "  [ERR] [独立端点段] 收到 independent_endpoint_wet_search=True，但干/湿"
                 "双起点诊断已于 2026-09-01 退役（空腔水数探针锚在会漂移的配体上，"
                 "在复合物腿上不是状态函数 ⇒ 无判别力），**该开关已失效**、本次忽略。"
                 "湿/干门返回退役记录 passed=None，不参与 converged。"
@@ -8445,7 +8560,7 @@ class ABFEPipeline:
                 "dynamics_hamiltonian": None,
             }
             self._log(
-                "  ⛔ [独立端点段] 干/湿双起点诊断**已退役**，湿臂整段不执行："
+                "  [ERR] [独立端点段] 干/湿双起点诊断**已退役**，湿臂整段不执行："
                 "空腔水数探针锚在 λ_vdw→0 只被 Boresch 松松拴住、会漂移的配体上，"
                 "该观测量在复合物腿上不是状态函数 ⇒ 无判别力。只跑干起点；"
                 "湿/干门返回退役记录（passed=None，不参与 converged）。"
@@ -8506,7 +8621,7 @@ class ABFEPipeline:
                     "dynamics_hamiltonian": None,
                 }
                 self._log(
-                    "  ⏭️ [独立端点段] 湿盆搜索**未执行**（默认关闭：干/湿双起点是诊断装置、"
+                    "  [独立端点段] 湿盆搜索**未执行**（默认关闭：干/湿双起点是诊断装置、"
                     f"不是生产判据；开启用 independent_endpoint_wet_search=True）。"
                     f"省下 {_wet_equil_steps} 步平衡。只跑干起点；湿/干门本就不参与 converged。"
                 )
@@ -8518,7 +8633,7 @@ class ABFEPipeline:
                 pass
             elif wet_seed is not None:
                 self._log(
-                    "  ♻️ [独立端点段] 湿空腔搜索结论命中缓存（key 含种子）："
+                    "  [独立端点段] 湿空腔搜索结论命中缓存（key 含种子）："
                     f"reached_wet={wet_seed['reached_wet']}，跳过 {_wet_equil_steps} 步重搜。"
                 )
             else:
@@ -8564,7 +8679,7 @@ class ABFEPipeline:
         # 跳过的情形上面已经打过一条如实的日志，这里不再重复。
         if not _wet_ok and not wet_seed.get("search_skipped"):
             self._log(
-                f"  ℹ️ [独立端点段] 最解耦态平衡 {wet_seed.get('equilibration_steps')} 步"
+                f"  [独立端点段] 最解耦态平衡 {wet_seed.get('equilibration_steps')} 步"
                 "未观察到湿盆（空腔水数始终为 0）——只跑干起点。"
                 "湿/干双起点门标记为**未评估**：不算通过也不算失败，"
                 "不参与 converged 判定，结果里会带一条显式警告。"
@@ -9127,7 +9242,7 @@ class ABFEPipeline:
             return summary
         except Exception as exc:  # noqa: BLE001
             self._log(
-                f"  ⚠️ [P0-12a] 配体构象诊断未能计算（{type(exc).__name__}: {exc}）；"
+                f"  [WARN] [P0-12a] 配体构象诊断未能计算（{type(exc).__name__}: {exc}）；"
                 "跨腿构象门将记为 not_evaluated（不会伪装成通过）。"
             )
             return None
@@ -9734,7 +9849,7 @@ class ABFEPipeline:
         # 未在本次范围内的功能）。
         if kwargs.get("n_workers") is not None:
             print(
-                f"  ⚠️ n_workers={kwargs.get('n_workers')!r} 已设置，但当前实现里这个"
+                f"  [WARN] n_workers={kwargs.get('n_workers')!r} 已设置，但当前实现里这个"
                 "参数没有被任何地方消费——run_full_pipeline/_run_dual_lambda_stage 都"
                 "只串行运行，不会因为设置它而并行。忽略此设置，按串行执行。"
             )
@@ -9858,7 +9973,7 @@ class ABFEPipeline:
         )
         device_indices = gpu_strategy["devices"]
         self._log(
-            f"🖥️ GPU 策略: {gpu_strategy['strategy']} | 分配设备: {device_indices}"
+            f"GPU 策略: {gpu_strategy['strategy']} | 分配设备: {device_indices}"
         )
 
         # 加载全局状态
@@ -9892,12 +10007,12 @@ class ABFEPipeline:
         # run_equilibration 算对。
         if self._boresch_rebalance_done_this_process:
             self._log(
-                "  ⏭️ 本进程已完成 Boresch 限制力再平衡，跳过 run_full_pipeline 内部的"
+                "  本进程已完成 Boresch 限制力再平衡，跳过 run_full_pipeline 内部的"
                 "预平衡块（避免用无约束预平衡覆盖刚完成的 Boresch 平衡坐标）。"
             )
         elif self._pre_equilibration_done_this_process:
             self._log(
-                "  ⏭️ 本进程已完成一次预平衡（未带 Boresch），跳过 run_full_pipeline "
+                "  本进程已完成一次预平衡（未带 Boresch），跳过 run_full_pipeline "
                 "内部重复的预平衡块。"
             )
         elif run_equilibration:
@@ -9916,10 +10031,10 @@ class ABFEPipeline:
             )
             self.positions = equil_data["positions"]
             self.box_vectors = equil_data["box_vectors"]
-            self._log("  ✓ 预平衡轨迹已保存，坐标已更新至稳态。")
+            self._log("  [OK] 预平衡轨迹已保存，坐标已更新至稳态。")
             
             # === 2. 快速最小化消除残余应力（仅在新跑或续跑后执行） ===
-            self._log("  🔧 执行快速最小化 (2000 步) 以消除加载坐标的残余应力...")
+            self._log("  执行快速最小化 (2000 步) 以消除加载坐标的残余应力...")
             try:
                 temp_sys = XmlSerializer.deserialize(XmlSerializer.serialize(self.system))
                 integrator = openmm.LangevinMiddleIntegrator(
@@ -9940,13 +10055,13 @@ class ABFEPipeline:
                 state = sim.context.getState(getPositions=True, getEnergy=True)
                 self.positions = state.getPositions()
                 final_e = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-                self._log(f"  ✓ 快速最小化完成，势能: {final_e:.2f} kJ/mol")
+                self._log(f"  [OK] 快速最小化完成，势能: {final_e:.2f} kJ/mol")
                 del sim.context; del sim; del temp_sys
             except Exception as e:
-                self._log(f"  ⚠️ 快速最小化失败: {e}，使用当前坐标继续")
+                self._log(f"  [WARN] 快速最小化失败: {e}，使用当前坐标继续")
 
         else:
-            self._log("⚠️ 跳过预平衡 (使用传入初始坐标)。")
+            self._log("[WARN] 跳过预平衡 (使用传入初始坐标)。")
 
         # [P1-10] 进入 λ 窗口之前的最终膜质量硬门。无论预平衡是刚跑完
         # （pre_equilibrate 内部已判，这里幂等复用）、断点续传、还是调用方
@@ -10006,17 +10121,17 @@ class ABFEPipeline:
                 boresch_params["equilibrium_values"] = committed_eq
                 r0 = committed_eq.get("r0", 0) * 10  # nm → Å
                 self._log(
-                    f"  ♻️ 本腿此前已提交过 Boresch 平衡值 (resume)，复用缓存值 "
+                    f"  本腿此前已提交过 Boresch 平衡值 (resume)，复用缓存值 "
                     f"(r0={r0:.2f} Å)，不再从当前坐标重新锚定。"
                     "（已校验其与当前坐标的几何一致性）"
                 )
             else:
-                self._log("  🔒 提交 boresch_simple.json 的预平衡轨迹系综均值（禁止末帧 re-anchor）...")
+                self._log("  提交 boresch_simple.json 的预平衡轨迹系综均值（禁止末帧 re-anchor）...")
                 boresch_params = self._commit_ensemble_boresch_equilibrium(
                     boresch_params, committed_path
                 )
                 r0 = boresch_params["equilibrium_values"].get("r0", 0) * 10  # nm → Å
-                self._log(f"  ✓ Boresch 系综均值已提交: r0={r0:.2f} Å")
+                self._log(f"  [OK] Boresch 系综均值已提交: r0={r0:.2f} Å")
 
         # =========================================================================
         # 2. 路由采样 (支持阶段级 Resume)
@@ -10321,14 +10436,14 @@ class ABFEPipeline:
                 cached_top_key = final.get("protocol_key")
                 if cached_top_key is None:
                     self._log(
-                        "  ⚠️ 已有 final_results.json 缺少协议指纹（旧版本产物，可能产生于本次"
+                        "  [WARN] 已有 final_results.json 缺少协议指纹（旧版本产物，可能产生于本次"
                         "WCA 记账口径修复之前），拒绝直接复用，将重新校验/运行各阶段"
                     )
                 elif _protocol_fingerprint_ignoring_code_hash(
                     cached_top_key
                 ) != _protocol_fingerprint_ignoring_code_hash(_top_level_protocol_key):
                     self._log(
-                        f"  ⚠️ 已有 final_results.json 协议指纹不匹配（"
+                        f"  [WARN] 已有 final_results.json 协议指纹不匹配（"
                         f"{_summarize_protocol_mismatch(cached_top_key, _top_level_protocol_key)}"
                         "），拒绝直接复用，将重新校验/运行各阶段"
                     )
@@ -10348,16 +10463,16 @@ class ABFEPipeline:
                         )
                     except FinalResultValidationError as gate_exc:
                         self._log(
-                            f"  ⚠️ 已有 final_results.json 未通过统一 sanity gate（{gate_exc}），"
+                            f"  [WARN] 已有 final_results.json 未通过统一 sanity gate（{gate_exc}），"
                             "拒绝直接复用，将重新校验/运行各阶段"
                         )
                     else:
-                        self._log(f"  ♻️ {decoupling_scheme} 采样已完成，协议指纹一致，跳过")
+                        self._log(f"  {decoupling_scheme} 采样已完成，协议指纹一致，跳过")
                         self.results["final"] = final
-                        self._log("  ✓ 已加载已有最终结果")
+                        self._log("  [OK] 已加载已有最终结果")
                         return final
             else:
-                self._log("  ⚠️ 状态标记为完成但未找到结果文件，重新运行采样")
+                self._log("  [WARN] 状态标记为完成但未找到结果文件，重新运行采样")
         # Stage 0: 在完整复合物主线中显式计算 Boresch attachment A′→A。
         # 它必须与随后 stage1/stage2 使用同一个 committed Boresch Hamiltonian；
         # 溶剂腿没有 Boresch，因此不运行 stage0。
@@ -10489,18 +10604,18 @@ class ABFEPipeline:
                     if cached_protocol_key == stage0_protocol_key:
                         stage0 = cached_stage0
                         self._log(
-                            "  ♻️ Boresch attachment stage0 协议指纹一致，复用缓存: "
+                            "  Boresch attachment stage0 协议指纹一致，复用缓存: "
                             f"ΔG={float(cached_values[0]):.4f} ± "
                             f"{float(cached_values[1]):.4f} kJ/mol"
                         )
                     else:
                         self._log(
-                            "  ⚠️ Boresch attachment stage0 缓存缺失、非法或协议指纹不匹配，"
+                            "  [WARN] Boresch attachment stage0 缓存缺失、非法或协议指纹不匹配，"
                             "重新运行"
                         )
                 except Exception as exc:
                     self._log(
-                        f"  ⚠️ Boresch attachment stage0 缓存读取失败: {exc}；重新运行"
+                        f"  [WARN] Boresch attachment stage0 缓存读取失败: {exc}；重新运行"
                     )
 
             if stage0 is None:
@@ -10634,7 +10749,7 @@ class ABFEPipeline:
                         # 输入逐项核对完全一致，判定为纯 schema 迁移，不重新优化，
                         # 原地把 protocol_key 重新盖成新窄指纹（自愈一次即可）。
                         self._log(
-                            "  🩹 Stage 1 预优化缓存是旧 schema（_preopt_protocol_key 上线之前写入的"
+                            "  Stage 1 预优化缓存是旧 schema（_preopt_protocol_key 上线之前写入的"
                             "宽指纹），但预优化实际输入逐项核对完全一致——判定为 schema 迁移，"
                             "不重新优化，原地重盖 protocol_key。"
                         )
@@ -10650,7 +10765,7 @@ class ABFEPipeline:
                         optimized_lambdas_1 = cached_lambdas
                         if len(cached_lambdas) != stage1_states:
                             self._log(
-                                f"  ♻️ Stage 1 缓存态数 ({len(cached_lambdas)}) 与初始请求 "
+                                f"  Stage 1 缓存态数 ({len(cached_lambdas)}) 与初始请求 "
                                 f"({stage1_states}) 不同，但协议指纹一致且来自本协议下已验证的"
                                 "自动加密结果——采用缓存态数，而不是丢弃重新优化。"
                             )
@@ -10667,9 +10782,9 @@ class ABFEPipeline:
                             if covered == list(range(len(cached_lambdas))):
                                 window_ranges_1 = [tuple(r) for r in cached_ranges]
                             else:
-                                self._log("  ⚠️ Stage 1 缓存里的 window_ranges 覆盖范围与 lambdas_var 不匹配，忽略并回退自动划分")
+                                self._log("  [WARN] Stage 1 缓存里的 window_ranges 覆盖范围与 lambdas_var 不匹配，忽略并回退自动划分")
                         self._log(
-                            f"  ♻️ 已加载 Stage 1 优化路径缓存 ({len(optimized_lambdas_1)} 个状态)"
+                            f"  已加载 Stage 1 优化路径缓存 ({len(optimized_lambdas_1)} 个状态)"
                             + ("，含手动窗口边界" if window_ranges_1 else "")
                         )
                     elif not protocol_match:
@@ -10677,17 +10792,17 @@ class ABFEPipeline:
                             cached_protocol, _stage1_preopt_key
                         )
                         self._log(
-                            "  ⚠️ Stage 1 preopt cache mismatch:\n"
+                            "  [WARN] Stage 1 preopt cache mismatch:\n"
                             + "\n".join(f"    - {item}" for item in differences[:12])
                             + "\n    将重新优化完整 λ 路径。"
                         )
                     else:
                         self._log(
-                            f"  ⚠️ Stage 1 优化路径缓存状态数不匹配 "
+                            f"  [WARN] Stage 1 优化路径缓存状态数不匹配 "
                             f"({len(cached_lambdas)} != {stage1_states})，且非本协议下已验证的自动加密结果，重新优化"
                         )
                 except Exception as e:
-                    self._log(f"  ⚠️ 加载 Stage 1 优化缓存失败: {e}，将重新优化")
+                    self._log(f"  [WARN] 加载 Stage 1 优化缓存失败: {e}，将重新优化")
 
             if optimized_lambdas_1 is None:
                 try:
@@ -10711,7 +10826,7 @@ class ABFEPipeline:
                             "protocol_key": _stage1_preopt_key,
                             "n_states": len(optimized_lambdas_1),
                         }, f, indent=2)
-                    self._log(f"  ✓ Stage 1 优化路径已缓存")
+                    self._log(f"  [OK] Stage 1 优化路径已缓存")
                 except Exception as e:
                     raise RuntimeError(f"Stage 1 自适应优化失败，拒绝静默回退线性路径: {e}") from e
 
@@ -10722,34 +10837,34 @@ class ABFEPipeline:
                         stage1 = json.load(f)
                     cached_protocol_1 = stage1.get("protocol_key")
                     if stage1.get("n_states") != stage1_states:
-                        self._log("  ⚠️ Stage 1 结果缓存状态数不匹配，重新运行")
+                        self._log("  [WARN] Stage 1 结果缓存状态数不匹配，重新运行")
                     elif cached_protocol_1 is None:
                         # 🔑 [P0] 之前这里是"信任并跳过"——旧格式缓存(在 protocol_key
                         # 字段存在之前生成，包括 WCA e_base/e_bias 记账口径修复之前的
                         # 所有历史结果)会被直接当成有效结果复用。缺指纹就是没法校验，
                         # 必须 fail closed 视为缓存失效，而不是"大概率没变"。
-                        self._log("  ⚠️ Stage 1 结果缓存无协议指纹（旧版本产物），视为缓存失效，重新运行")
+                        self._log("  [WARN] Stage 1 结果缓存无协议指纹（旧版本产物），视为缓存失效，重新运行")
                     elif _protocol_fingerprint_ignoring_code_hash(
                         cached_protocol_1
                     ) != _protocol_fingerprint_ignoring_code_hash(_stage1_protocol_key):
                         self._log(
-                            "  ⚠️ Stage 1 结果缓存协议指纹不匹配（"
+                            "  [WARN] Stage 1 结果缓存协议指纹不匹配（"
                             f"{_summarize_protocol_mismatch(cached_protocol_1, _stage1_protocol_key)}"
                             "），拒绝静默复用，重新运行"
                         )
                     elif stage1.get("lambda_path_fingerprint") != self._lambda_path_fingerprint(
                         optimized_lambdas_1, window_ranges_1
                     ):
-                        self._log("  ⚠️ Stage 1 的 λ 内容/窗口边界指纹不匹配，重新运行")
+                        self._log("  [WARN] Stage 1 的 λ 内容/窗口边界指纹不匹配，重新运行")
                     else:
                         stage1 = self._validate_stage_checkpoint(
                             stage1, "decharging", _stage1_protocol_key,
                             optimized_lambdas_1, window_ranges_1,
                         )
-                        self._log("  ♻️ 双λ Stage 1 (去电荷) 已完成，跳过")
+                        self._log("  双λ Stage 1 (去电荷) 已完成，跳过")
                         should_run_stage1 = False
                 except Exception as e:
-                    self._log(f"  ⚠️ Stage 1 缓存读取失败: {e}，重新运行")
+                    self._log(f"  [WARN] Stage 1 缓存读取失败: {e}，重新运行")
 
             # === Stage 2: pre-opt + resume check ===
             optimized_lambdas_2 = None
@@ -10802,7 +10917,7 @@ class ABFEPipeline:
                         anchor_contract_match = True
                     except Exception as anchor_exc:
                         self._log(
-                            "  ⚠️ Stage 2 缓存违反 v21 vanishing 路径不变量："
+                            "  [WARN] Stage 2 缓存违反 v21 vanishing 路径不变量："
                             f"{anchor_exc}"
                         )
                     # 🔑 [预优化缓存范围收窄] 同 Stage 1：比对 _stage2_preopt_key
@@ -10834,7 +10949,7 @@ class ABFEPipeline:
                         # 输入逐项核对完全一致时判定为纯 schema 迁移，不重新优化，原地
                         # 重盖 protocol_key。
                         self._log(
-                            "  🩹 Stage 2 预优化缓存是旧 schema（_preopt_protocol_key 上线之前写入的"
+                            "  Stage 2 预优化缓存是旧 schema（_preopt_protocol_key 上线之前写入的"
                             "宽指纹），但预优化实际输入逐项核对完全一致——判定为 schema 迁移，"
                             "不重新优化，原地重盖 protocol_key。"
                         )
@@ -10854,7 +10969,7 @@ class ABFEPipeline:
                         optimized_lambdas_2 = cached_lambdas
                         if len(cached_lambdas) != stage2_states:
                             self._log(
-                                f"  ♻️ Stage 2 缓存态数 ({len(cached_lambdas)}) 与初始请求 "
+                                f"  Stage 2 缓存态数 ({len(cached_lambdas)}) 与初始请求 "
                                 f"({stage2_states}) 不同，但协议指纹一致且来自本协议下已验证的"
                                 "自动加密结果——采用缓存态数，而不是丢弃重新优化。"
                             )
@@ -10873,7 +10988,7 @@ class ABFEPipeline:
                         )
                         if normalized_cached_ranges != expected_subdomain_ranges:
                             self._log(
-                                "  ⚠️ Stage 2 缓存不是 vanishing v12 的热力学 few-state 子区间布局；"
+                                "  [WARN] Stage 2 缓存不是 vanishing v12 的热力学 few-state 子区间布局；"
                                 "拒绝单一 [0:K]、overlap=2 或滑动窗口缓存并重新优化。"
                             )
                             optimized_lambdas_2 = None
@@ -10881,7 +10996,7 @@ class ABFEPipeline:
                         else:
                             window_ranges_2 = expected_subdomain_ranges
                             self._log(
-                                f"  ♻️ 已加载 Stage 2 热力学 few-state IBS 子区间 "
+                                f"  已加载 Stage 2 热力学 few-state IBS 子区间 "
                                 f"({len(optimized_lambdas_2)} 个状态, ranges={window_ranges_2})"
                             )
                             # [IBS_BIAS_PROTOCOL_VERSION=20] Old caches
@@ -10911,18 +11026,18 @@ class ABFEPipeline:
                             cached_protocol, _stage2_preopt_key
                         )
                         self._log(
-                            "  ⚠️ Stage 2 preopt cache mismatch:\n"
+                            "  [WARN] Stage 2 preopt cache mismatch:\n"
                             + "\n".join(f"    - {item}" for item in differences[:12])
                             + "\n    将重新优化完整 λ 路径。"
                         )
                     else:
                         self._log(
-                            f"  ⚠️ Stage 2 优化路径缓存状态数不匹配 "
+                            f"  [WARN] Stage 2 优化路径缓存状态数不匹配 "
                             f"({len(cached_lambdas)} != {stage2_states})，"
                             "且非本协议下已验证的自动加密结果，重新优化"
                         )
                 except Exception as e:
-                    self._log(f"  ⚠️ 加载 Stage 2 优化缓存失败: {e}，将重新优化")
+                    self._log(f"  [WARN] 加载 Stage 2 优化缓存失败: {e}，将重新优化")
 
             if optimized_lambdas_2 is None:
                 try:
@@ -10960,6 +11075,10 @@ class ABFEPipeline:
                         ),
                         min_states_per_window=kwargs.get("stage2_window_min_states"),
                         max_states_per_window=kwargs.get("stage2_window_max_states"),
+                        # 🔑 [v22] 自由能定向加密；None/0 = 布点与 v21 逐字节相同。
+                        free_energy_densify_points=kwargs.get(
+                            "stage2_free_energy_densify_points"
+                        ),
                     )
                     optimized_lambdas_2 = opt_res["lambdas_var"]
                     # 🔑 [2026-08-28] 同上：final_state_count 配置成非 23(比如 12)时，
@@ -11028,7 +11147,7 @@ class ABFEPipeline:
                             "path_diagnostics": opt_res.get("path_diagnostics", {}),
                             "provenance": opt_res.get("provenance", {}),
                         }, f, indent=2)
-                    self._log(f"  ✓ Stage 2 优化路径已缓存")
+                    self._log(f"  [OK] Stage 2 优化路径已缓存")
                 except Exception as e:
                     raise RuntimeError(f"Stage 2 自适应优化失败，拒绝静默回退线性路径: {e}") from e
 
@@ -11039,31 +11158,31 @@ class ABFEPipeline:
                         stage2 = json.load(f)
                     cached_protocol_2 = stage2.get("protocol_key")
                     if stage2.get("n_states") != stage2_states:
-                        self._log("  ⚠️ Stage 2 结果缓存状态数不匹配，重新运行")
+                        self._log("  [WARN] Stage 2 结果缓存状态数不匹配，重新运行")
                     elif cached_protocol_2 is None:
                         # 🔑 [P0] 同 Stage 1：缺协议指纹一律 fail closed，不再"信任并跳过"。
-                        self._log("  ⚠️ Stage 2 结果缓存无协议指纹（旧版本产物），视为缓存失效，重新运行")
+                        self._log("  [WARN] Stage 2 结果缓存无协议指纹（旧版本产物），视为缓存失效，重新运行")
                     elif _protocol_fingerprint_ignoring_code_hash(
                         cached_protocol_2
                     ) != _protocol_fingerprint_ignoring_code_hash(_stage2_protocol_key):
                         self._log(
-                            "  ⚠️ Stage 2 结果缓存协议指纹不匹配（"
+                            "  [WARN] Stage 2 结果缓存协议指纹不匹配（"
                             f"{_summarize_protocol_mismatch(cached_protocol_2, _stage2_protocol_key)}"
                             "），拒绝静默复用，重新运行"
                         )
                     elif stage2.get("lambda_path_fingerprint") != self._lambda_path_fingerprint(
                         optimized_lambdas_2, window_ranges_2
                     ):
-                        self._log("  ⚠️ Stage 2 的 λ 内容/窗口边界指纹不匹配，重新运行")
+                        self._log("  [WARN] Stage 2 的 λ 内容/窗口边界指纹不匹配，重新运行")
                     else:
                         stage2 = self._validate_stage_checkpoint(
                             stage2, "vanishing", _stage2_protocol_key,
                             optimized_lambdas_2, window_ranges_2,
                         )
-                        self._log("  ♻️ 双λ Stage 2 (去VDW) 已完成，跳过")
+                        self._log("  双λ Stage 2 (去VDW) 已完成，跳过")
                         should_run_stage2 = False
                 except Exception as e:
-                    self._log(f"  ⚠️ Stage 2 缓存读取失败: {e}，重新运行")
+                    self._log(f"  [WARN] Stage 2 缓存读取失败: {e}，重新运行")
 
             # === Stage 2: 精修阶段（中等步数探针，基于实测 |Δf| 精修 λ 路径/窗口边界）===
             # 只对 Stage 2 (去VDW/vanishing) 生效：Stage 1 (去电荷) 走的是
@@ -11116,7 +11235,7 @@ class ABFEPipeline:
                         boresch_params=boresch_params,
                         enable_gradual_warmup=kwargs.get("enable_gradual_warmup", True),
                         warmup_steps=kwargs.get("warmup_steps", 500000),
-                        min_bias_updates=kwargs.get("min_bias_updates", 12),
+                                min_bias_updates=kwargs.get("min_bias_updates", 12),
                         max_bias_updates=kwargs.get("max_bias_updates", 50),
                         required_consecutive_bias_updates=kwargs.get(
                             "required_consecutive_bias_updates", 3
@@ -11203,7 +11322,7 @@ class ABFEPipeline:
                         boresch_params=boresch_params,
                         enable_gradual_warmup=kwargs.get("enable_gradual_warmup", True),
                         warmup_steps=kwargs.get("warmup_steps", 500000),
-                        min_bias_updates=kwargs.get("min_bias_updates", 12),
+                                min_bias_updates=kwargs.get("min_bias_updates", 12),
                         max_bias_updates=kwargs.get("max_bias_updates", 50),
                         required_consecutive_bias_updates=kwargs.get(
                             "required_consecutive_bias_updates", 3
@@ -11272,7 +11391,7 @@ class ABFEPipeline:
                     for i in range(1, len(expected_vanishing_ranges))
                 ]
                 self._log(
-                    "  🧩 Vanishing few-state："
+                    "  Vanishing few-state："
                     f"λ interval 分区（半开、互不重复）={vanishing_edge_ranges}；"
                     f"各 ensemble 使用的 λ 节点范围（半开）={expected_vanishing_ranges}；"
                     f"共同边界节点={vanishing_boundary_nodes}。"
@@ -11314,10 +11433,10 @@ class ABFEPipeline:
                 )
                 if _rescue_disabled_by_untrusted and production_rescue_rounds:
                     self._log(
-                        "  ⏭️ [rescue] allow_untrusted_stage_results=True —— 跳过 "
+                        "  [rescue] allow_untrusted_stage_results=True —— 跳过 "
                         f"{production_rescue_rounds} 轮生产 coverage rescue 与 bridge rescue。"
                         "理由：质量门已被显式放行，补采不会改变最终走向，只会增加 GPU 时间。"
-                        "⚠️ 代价：覆盖度不足的窗口不再自动补救，末窗口 ESS/overlap 停在当前值，"
+                        "[WARN] 代价：覆盖度不足的窗口不再自动补救，末窗口 ESS/overlap 停在当前值，"
                         "本阶段 ΔG 只能作为推进到溶剂腿的中间量，不得作为可发布结果。"
                     )
                     production_rescue_rounds = 0
@@ -11346,7 +11465,7 @@ class ABFEPipeline:
                             math.ceil(old_target * production_rescue_growth)
                         )
                     self._log(
-                        f"  🛟 Stage 2 production coverage rescue round "
+                        f"  Stage 2 production coverage rescue round "
                         f"{rescue_round}/{production_rescue_rounds}: 仅追加窗口 "
                         f"{failing_windows}，累计生产目标={production_rescue_targets}。"
                         "沿用各窗口 production checkpoint 与已锁定 f_k；不重新学习、"
@@ -11437,7 +11556,7 @@ class ABFEPipeline:
                             )
                         )
                         self._log(
-                            "  🌉 Stage 2 追加采样后仍未通过：保留原生产数据，"
+                            "  Stage 2 追加采样后仍未通过：保留原生产数据，"
                             f"为失败窗口 {failing_windows} 新建 immutable rescue "
                             f"ensembles={rescue_ranges}（仅使用现有 λ 节点，"
                             f"{rescue_steps} production steps/ensemble）。"
@@ -11465,7 +11584,7 @@ class ABFEPipeline:
                             enable_gradual_warmup=kwargs.get(
                                 "enable_gradual_warmup", True
                             ),
-                            warmup_steps=kwargs.get("warmup_steps", 500000),
+                                        warmup_steps=kwargs.get("warmup_steps", 500000),
                             min_bias_updates=kwargs.get("min_bias_updates", 12),
                             max_bias_updates=kwargs.get("max_bias_updates", 50),
                             required_consecutive_bias_updates=kwargs.get(
@@ -11586,7 +11705,7 @@ class ABFEPipeline:
                         # 逐段 ΔG/σ、converged、ESS 与 rescue provenance 全部丢失。
                         self._populate_stage_diagnostics(stage2)
                         self._log(
-                            "  🧮 Stage 2 rescue 合并求解完成："
+                            "  Stage 2 rescue 合并求解完成："
                             f"ΔG={stage2.get('total_delta_G', float('nan')):.4f} ± "
                             f"{stage2.get('total_error', float('nan')):.4f} kJ/mol，"
                             f"converged={stage2.get('converged')}；"
@@ -11674,9 +11793,9 @@ class ABFEPipeline:
             if resume and os.path.exists(path_cache_file):
                 try:
                     path_1d = _load_validated_simple_path(path_cache_file, "single_lambda")
-                    self._log(f"  ♻️ 已加载 single_lambda 路径缓存 ({len(path_1d)} 个状态)")
+                    self._log(f"  已加载 single_lambda 路径缓存 ({len(path_1d)} 个状态)")
                 except Exception as e:
-                    self._log(f"  ⚠️ 加载 single_lambda 路径缓存失败: {e}，将重新生成")
+                    self._log(f"  [WARN] 加载 single_lambda 路径缓存失败: {e}，将重新生成")
 
             if path_1d is None:
                 lambdas = np.linspace(1.0, 0.0, n_states_per_stage).tolist()
@@ -11715,16 +11834,16 @@ class ABFEPipeline:
                             and _sampling_result_convergence_rejection_reason(cached_sample) is None
                         ):
                             sample_result = cached_sample
-                            self._log("  ♻️ single_lambda 采样已完成，协议指纹一致，跳过")
+                            self._log("  single_lambda 采样已完成，协议指纹一致，跳过")
                             _should_run = False
                         else:
                             self._log(
-                                "  ⚠️ single_lambda 外层采样缓存协议指纹缺失/不匹配或未通过"
+                                "  [WARN] single_lambda 外层采样缓存协议指纹缺失/不匹配或未通过"
                                 "收敛 sanity gate（converged/有限性），拒绝复用并重新执行采样"
                             )
                     except Exception as exc:
                         self._log(
-                            f"  ⚠️ single_lambda 外层采样缓存读取失败: {exc}，"
+                            f"  [WARN] single_lambda 外层采样缓存读取失败: {exc}，"
                             "重新执行采样"
                         )
 
@@ -11797,16 +11916,16 @@ class ABFEPipeline:
             if resume and os.path.exists(path_cache_file):
                 try:
                     path_2d = _load_validated_simple_path(path_cache_file, "2d_diagonal")
-                    self._log(f"  ♻️ 已加载对角线 2D 路径缓存 ({len(path_2d)} 个状态)")
+                    self._log(f"  已加载对角线 2D 路径缓存 ({len(path_2d)} 个状态)")
                 except Exception as e:
-                    self._log(f"  ⚠️ 加载 2D 路径缓存失败: {e}，将重新生成")
+                    self._log(f"  [WARN] 加载 2D 路径缓存失败: {e}，将重新生成")
 
             if path_2d is None:
                 planner = TwoDimensionalLambdaPathPlanner(
                     n_points=n_states_per_stage, path_type="diagonal"
                 )
                 path_2d = planner.generate_path()
-                self._log(f"  📐 生成了对角线 2D 路径 ({len(path_2d)} 个状态)")
+                self._log(f"  生成了对角线 2D 路径 ({len(path_2d)} 个状态)")
                 os.makedirs(self.checkpoint_dir, exist_ok=True)
                 with open(path_cache_file, "w") as f:
                     json.dump(
@@ -11842,16 +11961,16 @@ class ABFEPipeline:
                             and _sampling_result_convergence_rejection_reason(cached_sample) is None
                         ):
                             sample_result = cached_sample
-                            self._log("  ♻️ 对角线 2D 采样已完成，协议指纹一致，跳过")
+                            self._log("  对角线 2D 采样已完成，协议指纹一致，跳过")
                             _should_run = False
                         else:
                             self._log(
-                                "  ⚠️ 对角线 2D 外层采样缓存协议指纹缺失/不匹配或未通过"
+                                "  [WARN] 对角线 2D 外层采样缓存协议指纹缺失/不匹配或未通过"
                                 "收敛 sanity gate（converged/有限性），拒绝复用并重新执行采样"
                             )
                     except Exception as exc:
                         self._log(
-                            f"  ⚠️ 对角线 2D 外层采样缓存读取失败: {exc}，"
+                            f"  [WARN] 对角线 2D 外层采样缓存读取失败: {exc}，"
                             "重新执行采样"
                         )
 
@@ -11921,7 +12040,7 @@ class ABFEPipeline:
                         _cached = json.load(f)
                     if _cached.get("protocol_key") != geodesic_path_protocol_key:
                         self._log(
-                            "  ⚠️ 测地线路径缓存协议指纹缺失或不匹配，"
+                            "  [WARN] 测地线路径缓存协议指纹缺失或不匹配，"
                             "拒绝复用并重新优化路径"
                         )
                     else:
@@ -11953,9 +12072,9 @@ class ABFEPipeline:
                             )
                         if _cached.get("path_fingerprint") != _path_content_fingerprint(path_2d):
                             raise ValueError("测地线路径内容指纹缺失或不匹配")
-                        self._log(f"  ♻️ 已加载测地线 2D 路径缓存 ({len(path_2d)} 个状态)")
+                        self._log(f"  已加载测地线 2D 路径缓存 ({len(path_2d)} 个状态)")
                 except Exception as e:
-                    self._log(f"  ⚠️ 加载测地线路径缓存失败: {e}，将重新优化")
+                    self._log(f"  [WARN] 加载测地线路径缓存失败: {e}，将重新优化")
 
             if path_2d is None:
                 from abfe_preoptimizer import optimize_2d_geodesic_path
@@ -11983,11 +12102,11 @@ class ABFEPipeline:
                 )
                 if _geodesic_diag.get("fallback"):
                     self._log(
-                        "  ⚠️ 2D 路径其实是**寻径失败后的对角线线性回退**"
+                        "  [WARN] 2D 路径其实是**寻径失败后的对角线线性回退**"
                         f"（原因：{_geodesic_diag.get('fallback_reason')}），"
                         "不是测地线结果；它会照常被缓存复用，但不应被当作已优化路径引用。"
                     )
-                self._log(f"  🗺️ 测地线优化完成 ({len(path_2d)} 个状态)")
+                self._log(f"  测地线优化完成 ({len(path_2d)} 个状态)")
                 os.makedirs(self.checkpoint_dir, exist_ok=True)
                 with open(path_cache_file, "w") as f:
                     json.dump(
@@ -12027,16 +12146,16 @@ class ABFEPipeline:
                             and _sampling_result_convergence_rejection_reason(cached_sample) is None
                         ):
                             sample_result = cached_sample
-                            self._log("  ♻️ 测地线 2D 采样已完成，协议指纹一致，跳过")
+                            self._log("  测地线 2D 采样已完成，协议指纹一致，跳过")
                             _should_run = False
                         else:
                             self._log(
-                                "  ⚠️ 测地线 2D 外层采样缓存协议指纹缺失/不匹配或未通过"
+                                "  [WARN] 测地线 2D 外层采样缓存协议指纹缺失/不匹配或未通过"
                                 "收敛 sanity gate（converged/有限性），拒绝复用并重新执行采样"
                             )
                     except Exception as exc:
                         self._log(
-                            f"  ⚠️ 测地线 2D 外层采样缓存读取失败: {exc}，"
+                            f"  [WARN] 测地线 2D 外层采样缓存读取失败: {exc}，"
                             "重新执行采样"
                         )
 
@@ -12279,7 +12398,7 @@ class TraditionalABFEPipeline:
         boresch_params: Optional[Dict] = None,
         potential_type: str = "softcore",
     ) -> Dict:
-        print(f"\n{'='*60}\n🧪 开始 {stage_name} 腿解耦\n{'='*60}")
+        print(f"\n{'='*60}\n开始 {stage_name} 腿解耦\n{'='*60}")
         if len(lambdas_coul) != len(lambdas_vdw):
             raise ValueError("传统 REMD 腿的 lambdas_coul/lambdas_vdw 长度必须一致。")
         if potential_type == "dexp":
@@ -12337,7 +12456,7 @@ class TraditionalABFEPipeline:
                     with open(u_kn_meta_path, "r", encoding="utf-8") as handle:
                         cached_meta = json.load(handle)
                 except Exception as exc:
-                    print(f"  ⚠️ u_kn 元数据不可读 ({exc})，拒绝复用")
+                    print(f"  [WARN] u_kn 元数据不可读 ({exc})，拒绝复用")
             if (
                 cached_meta is not None
                 and cached_meta.get("analysis_fingerprint") == analysis_fingerprint
@@ -12351,7 +12470,7 @@ class TraditionalABFEPipeline:
                     and int(np.sum(n_k)) == u_kn.shape[1]
                     and np.all(np.isfinite(u_kn))
                 ):
-                    print("  ♻️ u_kn 完整协议指纹一致，跳过 REMD 与能量重算")
+                    print("  u_kn 完整协议指纹一致，跳过 REMD 与能量重算")
                     analyzer = TraditionalMBARAnalyzer(temperature=self.temperature)
                     analyzer._last_n_k = n_k
                     analyzer._last_lj_lrc_metadata = cached_meta.get(
@@ -12362,9 +12481,9 @@ class TraditionalABFEPipeline:
                         analyzer._last_lj_lrc_metadata
                     )
                     return result
-                print("  ⚠️ u_kn/n_k 内容或形状无效，拒绝复用")
+                print("  [WARN] u_kn/n_k 内容或形状无效，拒绝复用")
             else:
-                print("  ⚠️ u_kn 缺少或不匹配完整协议指纹，拒绝复用")
+                print("  [WARN] u_kn 缺少或不匹配完整协议指纹，拒绝复用")
 
         expected_frames = max(1, _expected_remd_frame_count(n_steps))
         remd_fingerprint_matches = False
@@ -12375,14 +12494,14 @@ class TraditionalABFEPipeline:
                         json.load(handle).get("sampling_fingerprint")
                     ) == _protocol_fingerprint_ignoring_code_hash(sampling_fingerprint)
             except Exception as exc:
-                print(f"  ⚠️ REMD 元数据不可读 ({exc})，拒绝复用轨迹")
+                print(f"  [WARN] REMD 元数据不可读 ({exc})，拒绝复用轨迹")
         if resume and remd_fingerprint_matches and _all_remd_trajs_valid(
             stage_output_dir,
             stage_name,
             len(lambdas_coul),
             min_frames=expected_frames,
         ):
-            print("  ♻️ 检测到完整 REMD DCD，视为采样已完成，跳过 REMD 继续离线 MBAR")
+            print("  检测到完整 REMD DCD，视为采样已完成，跳过 REMD 继续离线 MBAR")
         else:
             remd = REMDManager(
                 system_template=self.system,
@@ -12560,5 +12679,5 @@ class TraditionalABFEPipeline:
         }
         with open(os.path.join(self.output_dir, "final_results.json"), "w") as f:
             json.dump(final, f, indent=2)
-        print(f"\n✅ 传统腿完成 | ΔG_leg = {dg_total:.2f} ± {err_total:.2f} kJ/mol")
+        print(f"\n[OK] 传统腿完成 | ΔG_leg = {dg_total:.2f} ± {err_total:.2f} kJ/mol")
         return final

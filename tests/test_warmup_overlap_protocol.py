@@ -545,7 +545,7 @@ def test_protocol_versions_reject_old_semantics():
     # 等于人为注入共模因子（4W53 实测 window 0 达 3.10 kT，比真实防护壳共模的
     # 0.95~2.40 kT 还大）。在线学习输入变了，缓存兼容集合收窄成只有 32。
     assert IBS_BIAS_PROTOCOL_VERSION == 32
-    assert THERMODYNAMIC_PATH_PROTOCOL_VERSION == 21
+    assert THERMODYNAMIC_PATH_PROTOCOL_VERSION == 22
 
 
 def test_inclusive_tmbar_thresholds_accept_roundoff_but_not_real_shortfall():

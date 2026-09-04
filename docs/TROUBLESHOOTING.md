@@ -18,12 +18,17 @@ python -c "import openmm; print(openmm.__version__)"
 
 ### `--openmm-cache-only` 下仍然警告「GROMACS 力场 include 目录找不到」
 
-**这条警告在 `--openmm-cache-only` 下是噪音，可以忽略。** 2026-09-02 实测（原始记录
-见 [archive/RUNTIME_ISSUES_2026-09-02.md](archive/RUNTIME_ISSUES_2026-09-02.md)）。
+**已修（2026-09-02，CACHE-01）。** 修法就是下面那句"要把调用挪进 else 分支"：
+`find_gmx_include_dir(config.gmx_path)` 现在只在**非** cache-only 分支里调用，
+cache-only 路径把 `include_dir` 留成 `None`。cache-only 下不再打这条警告。
 
-原因：`runabfe.py:6034` 的 `find_gmx_include_dir(config.gmx_path)` 在
+历史原因与"为什么这么改是安全的"的核对留在下面——它同时也是
+"cache-only 路径确实用不到 include_dir"这个结论的证据。
+
+原来的现象：`find_gmx_include_dir(config.gmx_path)` 在
 `if args.openmm_cache_only:` 分支**之前**就无条件执行了，所以即使这一路根本不需要
-include 树，警告也照样打。
+include 树，警告也照样打。2026-09-02 实测（原始记录见
+[archive/RUNTIME_ISSUES_2026-09-02.md](archive/RUNTIME_ISSUES_2026-09-02.md)）。
 
 它确实用不到——三条路径逐个查过：
 
@@ -41,8 +46,10 @@ include 树，警告也照样打。
 
 ⟹ **在审计通过的缓存上，`include_dir` 一次都不会被解引用。**
 
-> 想彻底消掉这条警告，要把 `:6034` 那次调用挪进 `else` 分支。对 cache-only
-> 路径行为中立。**尚未做**，登记在 [TODO.md](TODO.md)《未关闭的代码缺陷》。
+> 想彻底消掉这条警告，要把那次调用挪进 `else` 分支。对 cache-only
+> 路径行为中立。**2026-09-02 已按此修复**（`runabfe.py` 里搜 `[CACHE-01`）；
+> `system_cache_exists(...)` 那处的 `or` 短路顺序未变，仍然在
+> `openmm_cache_only=True` 时整个不执行。
 
 顺带一个**独立**的坑：本仓 `abfe_config.json` 的 `gmx_path` 写的是
 `/home/ruigengji/gmx26.0C`，**该路径不存在**。它是这条警告的直接触发原因，

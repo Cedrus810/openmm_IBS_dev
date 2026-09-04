@@ -232,7 +232,7 @@ class SourceContractTests(unittest.TestCase):
         # 每态平均 softcore 能量自举播 f_k=⟨u_k⟩，避免从 0 慢爬；(b) 硬 2 kT pairwise
         # cap 只加在可信绝对 TMBAR 路径，bounded occupancy 反馈改用其自适应上限
         # （严重塌陷区最高 ~10 kT），让大谱宽窗口快速建起 f_k。
-        self.assertIn("🌱 [自举 TI 种子]", self.engine)
+        self.assertIn("[自举 TI 种子]", self.engine)
         self.assertIn("f_k_warm_started", self.engine)
         update_start = self.engine.index("    def update_weights(")
         update_end = self.engine.index("    def apply_learning_rate_penalty(", update_start)
@@ -540,7 +540,7 @@ class SourceContractTests(unittest.TestCase):
         self.assertIn('manifest["ordinary_cl_count"]', self.runabfe)
 
     def test_vanishing_uses_thermodynamic_few_state_subdomains_without_overlap_two(self):
-        self.assertIn("THERMODYNAMIC_PATH_PROTOCOL_VERSION = 21", self.preoptimizer)
+        self.assertIn("THERMODYNAMIC_PATH_PROTOCOL_VERSION = 22", self.preoptimizer)
         self.assertIn(
             "redistribute_vanishing_lambda_subdomains(",
             self.preoptimizer,
@@ -619,7 +619,26 @@ class SourceContractTests(unittest.TestCase):
         self.assertNotIn("_fisher_lambdas", redistribute_body)
         self.assertIn('"total_window_state_slots": int(', redistribute_body)
         self.assertNotIn("_pilot_ti_cumulative_f", redistribute_body)
-        self.assertNotIn("mean_dU_dlambda", redistribute_body)
+        # 🔑 [2026-09-03, 路径协议 v22] 这里原本是 assertNotIn("mean_dU_dlambda")。
+        # 它要守的是「TI 自由能不得**取代**度规成为基础布点」（v19/v20 的回归），
+        # 不是「模块里不准出现梯度」。v22 加了自由能定向加密：基础布点仍然是
+        # blended_metric_vanishing_lambdas，ΔF 只在其之上**追加**点，且默认关闭。
+        # 所以把断言收窄到原本的意图，并补上 v22 自己的守卫。
+        self.assertIn(
+            "blended_metric_vanishing_lambdas(", redistribute_body
+        )
+        # 基础布点吃的必须是 base_state_count（final_state_count 减去加密点数），
+        # 不能是别的东西——否则总态数会对不上。
+        self.assertIn("base_state_count = final_state_count - n_densify", redistribute_body)
+        # 加密只能发生在 n_densify 为真时；默认参数必须是 0（关闭 = 与 v21 逐字节相同）。
+        self.assertIn("free_energy_densify_points: int = 0", redistribute_body)
+        self.assertIn("if n_densify:", redistribute_body)
+        # 没给实测梯度就要求加密 → 必须 fail closed，不准猜。
+        self.assertIn("if pilot_mean_dU_dlambda is None:", redistribute_body)
+        # 梯度绝不能出现在基础布点那次调用的参数里。
+        base_call_start = redistribute_body.index("optimized_lambdas, cumulative, optimized_edge_lengths = (")
+        base_call_end = redistribute_body.index("if n_densify:", base_call_start)
+        self.assertNotIn("mean_dU_dlambda", redistribute_body[base_call_start:base_call_end])
         self.assertIn(
             '"ibs_ensemble_layout": "few_state_thermodynamic_subdomains"',
             self.preoptimizer,

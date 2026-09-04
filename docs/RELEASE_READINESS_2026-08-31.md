@@ -117,8 +117,8 @@ ABFE_RANDOM_SEED 未设置时，main._repeat_seed = None
 | 预览版前 | 可安装的 Python 包与命令 | `pyproject.toml` 只有工具设置，没有 `[build-system]`、`[project]`、依赖或 console script | 构建 wheel/sdist；在干净目录安装 wheel，离开源码目录仍能运行 help、诊断和示例；安装资源齐全 |
 | 预览版前 | 环境与支持矩阵 | `environment.yml` 含 `/home/canna/...` prefix 与 CUDA 12.9 开发工具链；文档写 Python 3.10+，CI 只测 3.12 | 基础环境与 GPU/ML 可选环境分离；声明已测版本组合；干净机器按文档安装成功；不依赖个人路径 |
 | 预览版前 | 最新核心回归证据 | 8 月 31 日交接记录明确只有静态通过；本轮也缺必需运行依赖 | 锁定待发布源码，在完整环境跑 CPU 全套，记录 passed/failed/skipped；必需功能不能因 importorskip 被跳过后算通过；GPU smoke 另跑 |
-| 预览版前 | 小型端到端 fixture | 现有大量单元、源码契约与实验测试不能单独证明产品入口贯通 | 一个可分发的小体系走实际 CLI，覆盖两腿、attachment、结果落盘、resume、analyze-only；失败/未收敛时准确输出状态，不降低门槛换成功 |
-| 预览版前 | 用户可读的配置与运行诊断 | 配置解析集中但不是完整 schema；help 顶层先 import OpenMM；没有独立 doctor/dry-run 命令 | 新增只读 `doctor`、`validate-config`、`dry-run`；给出最终参数及来源、设备、输入依赖、阶段计划、输出位置；诊断不启动 MD |
+| ~~预览版前~~ | ~~小型端到端 fixture~~ | **2026-09-02 用户决定：不作为本仓的缺口，已关闭。** 本仓是**工程区分支**（见 [PROJECT_LAYOUT.md](../PROJECT_LAYOUT.md)），端到端贯通的证据是**真实生产运行本身**——4W53 那次热力学循环闭合就是走真实 `runabfe.py` 入口跑完的，原始轨迹、checkpoint 与产物在 `Atenolol-rank11`，不在本仓 | —（不要再在 `tests/` 里加"走真实 CLI 的小体系 fixture"当验收项；要复核贯通性去看生产运行的原始产物） |
+| 预览版前 | 用户可读的配置与运行诊断 | **2026-09-02 完成**：`doctor` / `validate-config` / `config-template` 三个只读命令已落地（`abfe_diagnostics.py`），覆盖依赖版本·平台·GPU·磁盘·GROMACS、配置未知键·取值·路径·参数来源，以及带说明和默认值的配置模板；均不启动 MD。`--help` 从 4.3 s 降到 ~2.2 s（torch/pymbar 改惰性 import）。**`dry-run` 按 2026-09-02 用户决定不做**——它要预测的东西里，静态部分（有哪些键、默认值、输出位置）由 `config-template` + `validate-config` 覆盖，而 Stage 2 的实际窗口划分是运行期 Fisher 探针的结果，任何"预演"都只能是猜 | `config-template` 生成的模板必须零错误通过 `validate-config`（已由 `test_template_round_trips_through_validate_config` 钉住） |
 | 预览版前 | 输出目录与长任务保护 | 有 checkpoint 和短时 pipeline state lock；未见覆盖整个作业生命周期的输出目录独占锁、SIGTERM 处理或磁盘预检 | 重复启动同一输出目录被明确拒绝；调度器中断后可从一致边界续跑；磁盘不足失败可解释；测试多文件写入中断 |
 | 预览版前 | 版本、发布清单与维护材料 | 当前 `.git` 不是有效 checkout；无项目级 LICENSE/CITATION；尚无软件版本及发布构建流水线 | 在真实上游 checkout 冻结版本；确定代码和数据授权；加入变更说明、引用信息、支持范围；构建产物不混入原始轨迹、旧副本和开发缓存 |
 | 稳定生产版前 | 跨体系 benchmark 与误差验收 | TODO 中仍有基准与统计口径课题；历史最终文件名不代表结果合格 | 对声明支持的范围提供公开输入、冻结配置、独立 seed、环境、原始分析证据和复现脚本；记录不确定度方法与失败项；在运行前固定验收标准 |
@@ -380,6 +380,38 @@ software_version + protocol_versions + input_identity + actual_seed_ledger
    * 三个 decharging builder 新增的 `frozen_ll_pairs` 断言（若它在真实体系上触发，
      说明 P0-01 的前提本来就不成立，那是一个需要立刻处理的发现，不是这次改动的回归）；
    * 两条腿同进程时的 `pipeline.log` 分离（已用最小复现验证，未在真实两腿运行上确认）。
+
+### 2026-09-02 追加：CLI-01（用户诊断与启动开销）
+
+已落地，全部在 CPU 上验证过（`tests/test_cli_diagnostics_and_lazy_imports.py`，17 passed）：
+
+1. **`runabfe.py doctor`**——只读环境体检：解释器、必需/可选依赖版本（pymbar 偏离
+   契约版本 4.2.0 会告警）、OpenMM 真实可用平台、`nvidia-smi` 的 GPU/显存、
+   GROMACS 四条入口的解析结果、输出目录所在盘余量、原生插件已构建的 `.so`。
+2. **`runabfe.py validate-config`**——只读配置检查：未知键与拼写建议
+   （`temprature` → `temperature`）、类型与取值（约束从真 parser 上读，不维护第二份
+   参数表）、输入路径存在性、GROMACS include 解析、关键参数的**来源**
+   （配置文件／预设／argparse 默认值）。
+   两个命令都支持 `--json`，有错误时退出码 1。
+3. **不是启动硬门**——未知键仍然照常合并进运行配置；拼写检查只在这个命令里生效。
+   2026-08-24 那次启动期硬拒绝未知键炸掉 resume 的结论没有被推翻，
+   由 `test_run_config_still_accepts_unknown_keys` 钉住。
+4. **启动开销**——`torch`/`openmmml`/`pymbar` 在 `abfe_core.py`、`ibs_engine.py` 里
+   改成惰性 memoized 探测（`has_orb()` / `has_pymbar()` / `_require_*()`），
+   `HAS_ORB`/`HAS_PYMBAR` 作为模块属性仍可读。`--help` 4.3 s → ~2.2 s。
+   剩下的 ~2.2 s 主要是 openmm 0.56 s + mdtraj ~1.0 s；mdtraj 同样可以惰性化
+   （19 处 `mdtraj.` 调用点），本次没做。
+5. **CACHE-01 一并关闭**——`find_gmx_include_dir` 挪进非 cache-only 分支。
+6. **`runabfe.py config-template`**——打印可直接改的配置模板：键顺序与人工
+   `_comment_*` 说明取自仓库 `abfe_config.json`，取值重新解析
+   （预设 > 该文件的生产值 > argparse 默认），机器本地路径与必填输入一律留空，
+   运行期回填的 provenance 字段（`repeat_seed_source`、`openmm_cache_only_*` 等）
+   不输出。`--all` 追加不常用/实验开关并附 argparse 帮助文本。
+   模板零错误通过 `validate-config`，构成"生成 → 改 → 自查"的闭环。
+   这条替代了原计划的 `dry-run`（见上方表格该行）。
+
+本条只改 CLI 表层与 import 结构，**没有**改任何 Hamiltonian、估计器、协议指纹或
+验收阈值；协议版本号未动。
 
 ## 建议执行顺序
 

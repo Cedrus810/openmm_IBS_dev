@@ -337,7 +337,22 @@ except ImportError:
 #               large), which compressed the entire hard->soft core transition
 #               into lambda_vdw in [0.96, 1].  Re-pilot before trusting any
 #               placement computed from a cached metric.
-THERMODYNAMIC_PATH_PROTOCOL_VERSION = 21
+# v22 (2026-09-03): 在 v21 的度规布点之后增加一个可选的**自由能定向加密**后处理
+#   （densify_lambdas_by_free_energy）。动机：pilot 实测显示这条路径上平均梯度
+#   <dU/dlambda> 与度规 beta^2 Var[dU/dlambda] 是**反相关**的——4W53 复合物腿在
+#   lambda=1 处 <dU/dl>=-144.8 kJ/mol 而 g=20.4，在 lambda=0.69 处 <dU/dl>=-46.7
+#   而 g=179。纯 sqrt(g) 布点因此系统性地在自由能落差最大的 lambda~1 段少放点：
+#   16 态时前 3 条边装了 54% 的自由能却只占 17% 的热力学长度，单条边 13.6 kJ/mol
+#   (5.5 kT)。这正是 window 0 历史上 ESS 塌缩的机制（不是重叠不足——那几条边的
+#   delta~0.6，交换接受率 66%），而重新分窗救不了它（穷举过所有合法分窗，最大窗
+#   ΔF 完全不变），全局改布点权重是零和的（ΔF 砍一半 delta_max 要涨到 1.8）。
+#   v22 保持总态数不变，只把节点从平坦中段挪到陡峭段：14+2 使 4W53 两条腿的最大
+#   边 ΔF 从 13.6/9.2 降到 7.7/6.4（比 23 态生产路径的 9.9/6.6 还好），delta_max
+#   1.08/1.10 仍在 delta~1 目标上。
+#   ⚠️ free_energy_densify_points=0（默认）时布点与 v21 逐字节相同。
+#   与 v20 那个「lambda~1 四点增密」的区别：v20 的点是**手挑常数**、完全无视实测
+#   度规，v22 的点由 pilot 实测的 <dU/dlambda> 推出来，且不动 v21 的基础布点。
+THERMODYNAMIC_PATH_PROTOCOL_VERSION = 22
 
 VANISHING_PROBE_BASE_STATE_COUNT = 17
 VANISHING_FINAL_STATE_COUNT = 23
@@ -347,6 +362,10 @@ VANISHING_FINAL_STATE_COUNT = 23
 # v18 showed pure equipartition can strand the decoupled endpoint).  0.3 bounds
 # any single lambda gap at 1/(0.3*22) = 0.152 for the 23-state vanishing path.
 VANISHING_GEOMETRIC_FLOOR_WEIGHT = 0.3
+# [v22] 默认 0 = 关闭自由能定向加密，布点与 v21 逐字节相同。设成 k>0 时，基础布点
+# 用 (final_state_count - k) 态，再贪心插入 k 个点：每次找 |ΔF| 最大的那条边、在
+# 它的等 ΔF 中点插一个。总态数不变，所以采样成本完全不变。
+VANISHING_FREE_ENERGY_DENSIFY_POINTS = 0
 VANISHING_FIXED_WINDOW_RANGES = (
     (0, 5),
     (4, 8),
@@ -464,7 +483,7 @@ def human_vanishing_initial_lambdas(requested_base_n_states: int) -> np.ndarray:
         raise ValueError(f"vanishing pilot 探针网格至少需要 2 个点；收到 base_n_states={n}")
     if n != VANISHING_PROBE_BASE_STATE_COUNT:
         print(
-            f"  ⚠️ [vanishing pilot 探针网格] 探针密度 base_n_states={n}，"
+            f"  [WARN] [vanishing pilot 探针网格] 探针密度 base_n_states={n}，"
             f"偏离常规默认值 {VANISHING_PROBE_BASE_STATE_COUNT}——如果这不是故意"
             f"传的，请检查 --stage2-n-states / config 里的 stage2_n_states 是不是"
             f"设错了，再决定要不要现在就烧 GPU 时间跑下去。"
@@ -576,6 +595,148 @@ def blended_metric_vanishing_lambdas(
         )
     placed_cumulative = np.interp(placed[::-1], lam[::-1], cumulative[::-1])[::-1]
     return placed, cumulative, np.abs(np.diff(placed_cumulative))
+
+
+def _free_energy_arclength(pilot_lambdas, mean_dU_dlambda):
+    """Cumulative |<dU/dlambda>| integral as a strictly increasing function of
+    ``u = 1 - lambda``.
+
+    Returns ``(u_grid_ascending, cumulative_ascending)``.  Total variation, not
+    net displacement -- same reasoning as
+    ``partition_windows_by_delta_f_budget``: <dU/dlambda> is not guaranteed
+    monotonic along a softcore path, and a net-displacement measure would call a
+    segment that goes up and comes back "flat" and refuse to densify it.
+    """
+    lam = np.asarray(pilot_lambdas, dtype=float).ravel()
+    grad = np.asarray(mean_dU_dlambda, dtype=float).ravel()
+    if lam.size != grad.size or lam.size < 2:
+        raise ValueError("pilot_lambdas/mean_dU_dlambda 必须等长且至少两个点")
+    if not np.all(np.isfinite(lam)) or not np.all(np.isfinite(grad)):
+        raise ValueError("pilot lambda 与 <dU/dlambda> 必须有限")
+    order = np.argsort(lam)          # lambda 升序 -> u 降序，取反得到 u 升序
+    lam = lam[order][::-1]
+    grad = grad[order][::-1]
+    u = 1.0 - lam
+    if not np.all(np.diff(u) > 0.0):
+        raise ValueError("pilot lambda 必须唯一且严格单调")
+    mag = np.abs(grad)
+    cumulative = np.concatenate((
+        [0.0], np.cumsum(0.5 * (mag[:-1] + mag[1:]) * np.diff(u)),
+    ))
+    return u, cumulative
+
+
+def _pilot_mean_gradients_or_none(pilot_points) -> Optional[np.ndarray]:
+    """Collect ``mean_dU_dlambda_kJ_mol`` from pilot points, or None.
+
+    Returns None -- never a substitute value -- if ANY point is missing the key
+    or carries a non-finite gradient.  Some probe paths (a failed
+    ``_sample_scalar_metric``, reduced test doubles) legitimately produce points
+    without it.  Downstream, None means the free-energy diagnostics are simply
+    absent and ``free_energy_densify_points > 0`` fails closed, which is the
+    intended behaviour: densifying by free energy with a guessed gradient would
+    silently move production lambda states based on a number nobody measured.
+    """
+    values = []
+    for point in pilot_points:
+        try:
+            value = float(point["mean_dU_dlambda_kJ_mol"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not np.isfinite(value):
+            return None
+        values.append(value)
+    if len(values) < 2:
+        return None
+    return np.asarray(values, dtype=float)
+
+
+def densify_lambdas_by_free_energy(
+    lambdas,
+    pilot_lambdas,
+    mean_dU_dlambda,
+    n_extra: int,
+    min_lambda_gap: float = 1.0e-4,
+) -> np.ndarray:
+    """[THERMODYNAMIC_PATH_PROTOCOL_VERSION=22] Insert ``n_extra`` states into
+    the edges carrying the most free energy, keeping every existing state.
+
+    ``lambdas`` is a strictly decreasing 1 -> 0 production path (typically the
+    output of :func:`blended_metric_vanishing_lambdas`); ``pilot_lambdas`` and
+    ``mean_dU_dlambda`` are the pilot grid and its measured
+    ``<dU/dlambda>`` (kJ/mol), i.e. ``pilot_points[i]["mean_dU_dlambda_kJ_mol"]``
+    -- data the probe ALREADY collects, so this costs no extra sampling.
+
+    Greedy, one point at a time: find the edge with the largest |Delta F|, insert
+    the lambda that splits that edge's |Delta F| in half, repeat.  Splitting by
+    free energy (not by lambda, not by thermodynamic length) is the whole point
+    -- the thermodynamic metric is what is already driving the base placement,
+    and on a real path the two disagree exactly where it matters.
+
+    Fail-closed: refuses to insert into an edge whose |Delta F| is numerically
+    zero (nothing to split -- densifying there would be arbitrary), and refuses
+    to produce two states closer than ``min_lambda_gap``.  Endpoints
+    ``lambda = 1`` and ``lambda = 0`` are never moved.
+    """
+    path = np.asarray(lambdas, dtype=float).ravel().copy()
+    n_extra = int(n_extra)
+    if n_extra < 0:
+        raise ValueError(f"n_extra 不能为负：{n_extra}")
+    if n_extra == 0:
+        return path
+    if path.size < 2 or not np.all(np.diff(path) < 0.0):
+        raise ValueError("待加密的 lambda 路径必须严格递减且至少 2 态")
+
+    u_pilot, cum = _free_energy_arclength(pilot_lambdas, mean_dU_dlambda)
+    total = float(cum[-1])
+    if not np.isfinite(total) or total <= 0.0:
+        raise ValueError(
+            f"pilot 的 |<dU/dlambda>| 累积积分非正/非有限（{total}），无法按自由能加密"
+        )
+    # 严格递增才可反解；相邻相等只可能来自梯度恒零的区段。
+    if not np.all(np.diff(cum) > 0.0):
+        raise ValueError(
+            "pilot 自由能弧长不是严格递增的（存在 <dU/dlambda> 恒为零的区段），"
+            "无法按自由能反解插点"
+        )
+    f_of = lambda lam_q: np.interp(1.0 - np.asarray(lam_q, dtype=float), u_pilot, cum)
+
+    for _ in range(n_extra):
+        f_nodes = f_of(path)
+        edge_df = np.abs(np.diff(f_nodes))
+        worst = int(np.argmax(edge_df))
+        if not np.isfinite(edge_df[worst]) or edge_df[worst] <= 0.0:
+            raise RuntimeError(
+                "所有边的 |Delta F| 都为零，没有可加密的目标；"
+                "请检查 pilot 的 mean_dU_dlambda 是否真的被采到"
+            )
+        target = 0.5 * (f_nodes[worst] + f_nodes[worst + 1])
+        # cum 随 u 严格递增 -> 用 u 反解再换回 lambda
+        u_new = float(np.interp(target, cum, u_pilot))
+        lam_new = 1.0 - u_new
+        hi, lo = float(path[worst]), float(path[worst + 1])
+        if not (lo + min_lambda_gap <= lam_new <= hi - min_lambda_gap):
+            raise RuntimeError(
+                f"自由能加密解出的 lambda={lam_new:.6f} 不在待拆边 "
+                f"({hi:.6f}, {lo:.6f}) 内、或与端点间距小于 {min_lambda_gap}；"
+                "拒绝插入退化状态"
+            )
+        path = np.insert(path, worst + 1, lam_new)
+
+    if not np.all(np.diff(path) < 0.0):
+        raise RuntimeError("自由能加密后 lambda 路径不再严格递减")
+    if not (np.isclose(path[0], 1.0) and np.isclose(path[-1], 0.0)):
+        raise RuntimeError("自由能加密不得移动 lambda=1 / lambda=0 端点")
+    return path
+
+
+def edge_free_energy_kJ_mol(lambdas, pilot_lambdas, mean_dU_dlambda) -> np.ndarray:
+    """Per-edge |Delta F| (kJ/mol) of a lambda path, from the pilot TI gradients."""
+    u_pilot, cum = _free_energy_arclength(pilot_lambdas, mean_dU_dlambda)
+    f_nodes = np.interp(
+        1.0 - np.asarray(lambdas, dtype=float).ravel(), u_pilot, cum
+    )
+    return np.abs(np.diff(f_nodes))
 
 
 def validate_vanishing_lambda_path_invariants(
@@ -846,6 +1007,12 @@ def redistribute_vanishing_lambda_subdomains(
     # 被用到。
     min_states_per_window: int = 4,
     max_states_per_window: int = 6,
+    # 🔑 [THERMODYNAMIC_PATH_PROTOCOL_VERSION=22] 自由能定向加密。0 = 关闭，布点与
+    # v21 逐字节相同。k>0 时基础布点用 (final_state_count - k) 态，再按实测
+    # <dU/dlambda> 贪心插 k 个点；**总态数不变**，采样成本不变。需要
+    # pilot_mean_dU_dlambda（pilot_points[i]["mean_dU_dlambda_kJ_mol"]）。
+    free_energy_densify_points: int = 0,
+    pilot_mean_dU_dlambda: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Tuple[int, int]], Dict]:
     """Place the production vanishing lambdas from the measured Fisher metric.
 
@@ -910,14 +1077,48 @@ def redistribute_vanishing_lambda_subdomains(
     # 真正生效：!= 23 时 vanishing_subdomain_ranges_from_lambdas 走
     # _greedy_vanishing_window_ranges（见该函数），23 时逐字节走原来那张手工
     # 表，两条路径互不影响。新路径的 window0 行为还没在真机上跑过。
+    n_densify = int(free_energy_densify_points)
+    if n_densify < 0:
+        raise ValueError(f"free_energy_densify_points 不能为负：{n_densify}")
+    base_state_count = final_state_count - n_densify
+    if n_densify and base_state_count < 2:
+        raise ValueError(
+            f"free_energy_densify_points={n_densify} too large for "
+            f"final_state_count={final_state_count}：基础布点只剩 {base_state_count} 态"
+        )
     optimized_lambdas, cumulative, optimized_edge_lengths = (
         blended_metric_vanishing_lambdas(
             pilot_lambdas,
             np.asarray(metric_g, dtype=float),
-            final_state_count,
+            base_state_count,
             VANISHING_GEOMETRIC_FLOOR_WEIGHT,
         )
     )
+    if n_densify:
+        if pilot_mean_dU_dlambda is None:
+            raise ValueError(
+                "free_energy_densify_points > 0 需要 pilot_mean_dU_dlambda "
+                "（pilot_points 里的 mean_dU_dlambda_kJ_mol）；拒绝在没有实测梯度的"
+                "情况下猜测加密位置"
+            )
+        optimized_lambdas = densify_lambdas_by_free_energy(
+            optimized_lambdas,
+            pilot_lambdas,
+            np.asarray(pilot_mean_dU_dlambda, dtype=float),
+            n_densify,
+        )
+        if len(optimized_lambdas) != final_state_count:
+            raise RuntimeError(
+                f"自由能加密后态数 {len(optimized_lambdas)} != "
+                f"final_state_count {final_state_count}"
+            )
+        # 边热力学长度必须按加密后的实际网格重算——基础布点返回的那份是
+        # (final_state_count - k) 态的，直接沿用会让所有 delta 诊断全错。
+        pilot_desc = np.sort(np.asarray(pilot_lambdas, dtype=float).ravel())[::-1]
+        placed_cum = np.interp(
+            optimized_lambdas[::-1], pilot_desc[::-1], cumulative[::-1]
+        )[::-1]
+        optimized_edge_lengths = np.abs(np.diff(placed_cum))
     validate_vanishing_lambda_path_invariants(optimized_lambdas, n_states=final_state_count)
     window_ranges = vanishing_subdomain_ranges_from_lambdas(
         optimized_lambdas,
@@ -930,8 +1131,17 @@ def redistribute_vanishing_lambda_subdomains(
     )
     validate_single_shared_boundary_ranges(window_ranges, len(optimized_lambdas))
     interval_counts = [end - start - 1 for start, end in window_ranges]
+    edge_dF = (
+        edge_free_energy_kJ_mol(
+            optimized_lambdas, pilot_lambdas, np.asarray(pilot_mean_dU_dlambda, dtype=float)
+        )
+        if pilot_mean_dU_dlambda is not None
+        else None
+    )
     allocation = {
         "base_lambda_placement": "fisher_metric_blended_with_geometric_floor_v21",
+        "free_energy_densify_points": n_densify,
+        "base_state_count_before_densify": int(base_state_count),
         "geometric_floor_weight": float(VANISHING_GEOMETRIC_FLOOR_WEIGHT),
         "max_lambda_gap_bound": float(
             vanishing_max_lambda_gap_bound(final_state_count)
@@ -962,6 +1172,19 @@ def redistribute_vanishing_lambda_subdomains(
             list(range(start, end)) for start, end in window_ranges
         ],
     }
+    # [v22] 自由能诊断：探针一直在测 <dU/dlambda>，之前从没按边/按窗积出来过。
+    # 这是判断 window 的 IBS 偏置要爬多高的量，与 delta（重叠判据）是两个轴。
+    if edge_dF is not None:
+        allocation["edge_free_energy_kJ_mol"] = [float(x) for x in edge_dF]
+        allocation["max_edge_free_energy_kJ_mol"] = float(np.max(edge_dF)) if edge_dF.size else 0.0
+        allocation["total_free_energy_variation_kJ_mol"] = float(np.sum(edge_dF))
+        allocation["subdomain_free_energy_kJ_mol"] = [
+            float(np.sum(edge_dF[start:end - 1])) for start, end in window_ranges
+        ]
+        allocation["subdomain_max_edge_free_energy_kJ_mol"] = [
+            float(np.max(edge_dF[start:end - 1])) if end - 1 > start else 0.0
+            for start, end in window_ranges
+        ]
     return (
         optimized_lambdas,
         cumulative,
@@ -1647,12 +1870,12 @@ def estimate_f_k_from_pilot_ti(
         # e.g. a None entry from an older/partial pilot_points record that's
         # missing mean_dU_dlambda_kJ_mol for some point -- can't safely cast,
         # not a real estimate either way.
-        print("  ⚠️ [pilot TI 热启动] pilot_lambdas/mean_dU_dlambda 无法转换为数值数组，放弃热启动，回退 f_k=0.0")
+        print("  [WARN] [pilot TI 热启动] pilot_lambdas/mean_dU_dlambda 无法转换为数值数组，放弃热启动，回退 f_k=0.0")
         return None
     if pilot_lambdas.size < 2 or grad.size != pilot_lambdas.size:
         return None
     if not np.all(np.isfinite(pilot_lambdas)) or not np.all(np.isfinite(grad)):
-        print("  ⚠️ [pilot TI 热启动] pilot_lambdas/mean_dU_dlambda 含非有限值，放弃热启动，回退 f_k=0.0")
+        print("  [WARN] [pilot TI 热启动] pilot_lambdas/mean_dU_dlambda 含非有限值，放弃热启动，回退 f_k=0.0")
         return None
 
     order = np.argsort(pilot_lambdas)
@@ -1668,7 +1891,7 @@ def estimate_f_k_from_pilot_ti(
     lo, hi = float(lam_sorted[0]), float(lam_sorted[-1])
     if np.any(target < lo) or np.any(target > hi):
         print(
-            f"  ⚠️ [pilot TI 热启动] target_lambdas 超出 pilot 实测范围 "
+            f"  [WARN] [pilot TI 热启动] target_lambdas 超出 pilot 实测范围 "
             f"[{lo:.4f}, {hi:.4f}]，越界部分钳位到边界值，不做外推"
         )
     f_at_target = np.interp(target, lam_sorted, f_at_pilot, left=f_at_pilot[0], right=f_at_pilot[-1])
@@ -2160,7 +2383,7 @@ class ABFEPreOptimizer:
                     for j in range(force.getNumGlobalParameters()):
                         params.append(force.getGlobalParameterName(j))
         except Exception as e:
-            print(f"  ⚠️ 获取系统参数失败: {e}，探针系统可能未正确注入软核力。")
+            print(f"  [WARN] 获取系统参数失败: {e}，探针系统可能未正确注入软核力。")
             return "lam_coul"
 
         # ✅ 核心修复：根据目标阶段动态调整匹配优先级
@@ -2175,7 +2398,7 @@ class ABFEPreOptimizer:
         # 1. 精确匹配
         for name in priority_order:
             if name in params:
-                print(f"  🔍 探测到有效 Lambda 参数: '{name}' (phase={target_phase})")
+                print(f"  探测到有效 Lambda 参数: '{name}' (phase={target_phase})")
                 return name
 
         # 2. 模糊匹配（含关键字的候选）
@@ -2190,13 +2413,13 @@ class ABFEPreOptimizer:
         # 3. 通用/历史别名回退
         for name in ["lam", "lambda", "lambda1", "LIG_lambda", "lig_lambda"]:
             if name in params:
-                print(f"  🔍 探测到通用 Lambda 参数: '{name}'")
+                print(f"  探测到通用 Lambda 参数: '{name}'")
                 return name
 
         # 4. 终极兜底
         lam_params = [p for p in params if "lam" in p.lower()]
         if lam_params:
-            print(f"  🔍 模糊匹配到 Lambda 参数: '{lam_params[0]}'")
+            print(f"  模糊匹配到 Lambda 参数: '{lam_params[0]}'")
             return lam_params[0]
 
         raise RuntimeError("系统中找不到有效的 Lambda 参数名，请检查探针系统构建逻辑")
@@ -2249,10 +2472,10 @@ class ABFEPreOptimizer:
                         self._active_lambda_param = param_name
                         active_p = param_name  # ✅ 关键：同步更新循环使用的变量名
                         param_exists = True
-                        print(f"  ℹ️ 已回退至 Lambda 别名: '{param_name}'")
+                        print(f"  已回退至 Lambda 别名: '{param_name}'")
                         break
         except (openmm.OpenMMException, AttributeError) as e:
-            print(f"  ⚠️ 参数 '{active_p}' 设置失败: {e}")
+            print(f"  [WARN] 参数 '{active_p}' 设置失败: {e}")
             # ✅ 修复：不 pass，记录失败并尝试强制注入常见名称
             for p_name in list(self.context.getParameters().keys()):
                 if "lam" in p_name.lower():
@@ -2260,16 +2483,16 @@ class ABFEPreOptimizer:
                         self.context.setParameter(p_name, initial_lam)
                         active_p = p_name
                         param_exists = True
-                        print(f"  ✅ 强制注入成功: {p_name}")
+                        print(f"  [OK] 强制注入成功: {p_name}")
                         break
                     except (openmm.OpenMMException, AttributeError, TypeError, ValueError):
                         continue
 
         if not param_exists:
-            raise RuntimeError(f"❌ 无法在 Context 中找到或设置任何 Lambda 参数，优化终止。")
+            raise RuntimeError(f"[ERR] 无法在 Context 中找到或设置任何 Lambda 参数，优化终止。")
             
         if param_exists:
-            print(f"  ℹ️ 设置初始 {active_p}={initial_lam:.2f} 进行预平衡...")
+            print(f"  设置初始 {active_p}={initial_lam:.2f} 进行预平衡...")
             self.context.getIntegrator().step(25000)
 
         variance_data = []
@@ -2280,7 +2503,7 @@ class ABFEPreOptimizer:
             try:
                 self.context.setParameter(active_p, float(lam))  # ✅ 此时 active_p 已是有效名称
             except openmm.OpenMMException as e:
-                print(f"  ❌ 无法设置 Lambda={lam:.3f}: {e}。采样中断。")
+                print(f"  [ERR] 无法设置 Lambda={lam:.3f}: {e}。采样中断。")
                 raise
 
             # 先平衡 500 步再采样
@@ -2304,7 +2527,7 @@ class ABFEPreOptimizer:
 
             if nan_count > n_sampled * 0.5:
                 print(
-                    f"  ⚠️  lam={lam:.2f} 能量异常过多 ({nan_count}/{n_sampled})，使用默认值 "
+                    f"  [WARN] lam={lam:.2f} 能量异常过多 ({nan_count}/{n_sampled})，使用默认值 "
                 )
                 variance_data.append(1.0)
                 mean_energy.append(0.0)
@@ -2330,9 +2553,9 @@ class ABFEPreOptimizer:
         norm_variance = std_dev_clipped / (np.max(std_dev_clipped) + 1e-6)
 
         print(
-            f"  ✓ 能量景观分析完成。最大标准差位置：lam={self.lambdas[np.argmax(std_dev)]:.2f} "
+            f"  [OK] 能量景观分析完成。最大标准差位置：lam={self.lambdas[np.argmax(std_dev)]:.2f} "
         )
-        print(f"  ✓ 方差截断阈值：{threshold:.2f} (原始最大：{np.max(std_dev):.2f}) ")
+        print(f"  [OK] 方差截断阈值：{threshold:.2f} (原始最大：{np.max(std_dev):.2f}) ")
 
         return {
             "variance": variance_data,
@@ -2407,7 +2630,7 @@ class ABFEPreOptimizer:
         min_window_size = overlap + 1
         if total < n_ib_windows * min_window_size:
             n_ib_windows = max(1, total // min_window_size)
-            print(f"  ⚠️  状态数不足，调整窗口数为 {n_ib_windows}")
+            print(f"  [WARN] 状态数不足，调整窗口数为 {n_ib_windows}")
 
         if n_ib_windows > 1:
             step = (total - overlap) // n_ib_windows
@@ -2506,12 +2729,12 @@ class ABFEPreOptimizer:
 
         # 【修复】确保 target_n_states 至少为 12
         if target_n_states < 12:
-            print(f"  ⚠️  目标状态数 ({target_n_states}) 太少，调整为 12 ")
+            print(f"  [WARN] 目标状态数 ({target_n_states}) 太少，调整为 12 ")
             target_n_states = 12
 
         # === 检查 landscape_data 有效性 ===
         if landscape_data is None or landscape_data.get("std_dev_clipped") is None:
-            print("  ⚠️  landscape_data 无效，使用线性 Lambda 路径 ")
+            print("  [WARN] landscape_data 无效，使用线性 Lambda 路径 ")
             return np.linspace(1.0, 0.0, target_n_states).tolist()
 
         # === 【步骤 1】获取方差数据 ===
@@ -2520,7 +2743,7 @@ class ABFEPreOptimizer:
         # === 【步骤 2】长度检查与对齐 ===
         if len(std_dev_clipped) != len(self.lambdas):
             print(
-                f"⚠️  警告：std_dev_clipped 长度 ({len(std_dev_clipped)}) 与 self.lambdas 长度 ({len(self.lambdas)}) 不匹配 "
+                f"[WARN] 警告：std_dev_clipped 长度 ({len(std_dev_clipped)}) 与 self.lambdas 长度 ({len(self.lambdas)}) 不匹配 "
             )
             min_len = min(len(std_dev_clipped), len(self.lambdas))
             std_dev_clipped = std_dev_clipped[:min_len]
@@ -2586,7 +2809,7 @@ class ABFEPreOptimizer:
 
         optimized_lambdas = np.asarray(optimized_lambdas, dtype=float).ravel()
         if not np.all(np.isfinite(optimized_lambdas)):
-            print("  ⚠️  自适应插值产生非有限 λ，使用线性路径")
+            print("  [WARN] 自适应插值产生非有限 λ，使用线性路径")
             optimized_lambdas = np.linspace(1.0, 0.0, target_n_states)
 
         # === 【步骤 8】边界强制、最小间距与去重 (共享纯函数，见
@@ -2596,7 +2819,7 @@ class ABFEPreOptimizer:
             optimized_lambdas, target_n_states
         )
         if fell_back:
-            print(f"  ⚠️  去重后状态数少于目标 ({target_n_states})，使用线性路径 ")
+            print(f"  [WARN] 去重后状态数少于目标 ({target_n_states})，使用线性路径 ")
 
         if not (np.isclose(optimized_lambdas[0], 1.0) and np.isclose(optimized_lambdas[-1], 0.0)):
             raise RuntimeError(
@@ -2628,9 +2851,9 @@ class ABFEPreOptimizer:
 
         # 【关键验证】检查是否有负数
         if np.any(optimized_lambdas < 0.0):
-            print(f"  ⚠️  警告：检测到负 Lambda 值，已修正 ")
+            print(f"  [WARN] 警告：检测到负 Lambda 值，已修正 ")
         if np.any(optimized_lambdas > 1.0):
-            print(f"  ⚠️  警告：检测到 Lambda>1.0，已修正 ")
+            print(f"  [WARN] 警告：检测到 Lambda>1.0，已修正 ")
 
         # === 确保返回 list ===
         return optimized_lambdas.tolist()
@@ -2909,7 +3132,7 @@ class DualLambdaPreOptimizer:
                     print(f"  [SCAN] Force 包含参数: {names}")
                     for n in names:
                         if keyword in n.lower(): 
-                            print(f"  [SCAN] ✅ Force 匹配到: {n}")
+                            print(f"  [SCAN] [OK] Force 匹配到: {n}")
                             return n
         # 2. 扫 Context
         try:
@@ -2917,7 +3140,7 @@ class DualLambdaPreOptimizer:
             print(f"  [SCAN] Context 包含参数: {ctx_p}")
             for k in ctx_p:
                 if keyword in k.lower(): 
-                    print(f"  [SCAN] ✅ Context 匹配到: {k}")
+                    print(f"  [SCAN] [OK] Context 匹配到: {k}")
                     return k
         except Exception as e: print(f"  [SCAN] Context 读取失败: {e}")
         return None
@@ -3041,7 +3264,7 @@ class DualLambdaPreOptimizer:
         print(f"[STAGE1] 当前 param_coul='{self.param_coul}', param_vdw='{self.param_vdw}'")
         
         if self.param_coul is None:
-            print(f"[STAGE1] ⚠️ 探针系统未注册 Coulomb λ 参数，直接生成线性回退路径")
+            print(f"[STAGE1] [WARN] 探针系统未注册 Coulomb λ 参数，直接生成线性回退路径")
             return {"stage": "decharging", "lambdas_coul": np.linspace(1.0, 0.0, n_states).tolist(), "lambdas_vdw": [1.0]*n_states, "n_states": n_states}
             
         # 安全设置
@@ -3095,9 +3318,9 @@ class DualLambdaPreOptimizer:
             optimized_lambdas, n_states
         )
         if fell_back:
-            print(f"[STAGE1] ⚠️  去重后状态数少于目标 ({n_states})，使用线性路径")
+            print(f"[STAGE1] [WARN] 去重后状态数少于目标 ({n_states})，使用线性路径")
 
-        print(f"[STAGE1] ✓ 优化完成，返回前5个λ: {optimized_lambdas[:5]}")
+        print(f"[STAGE1] [OK] 优化完成，返回前5个λ: {optimized_lambdas[:5]}")
         return {"stage": "decharging", "lambdas_coul": optimized_lambdas.tolist(), "lambdas_vdw": [1.0]*len(optimized_lambdas), "n_states": len(optimized_lambdas)}
 
     def _refine_pilot_grid_in_steep_segments(
@@ -3157,7 +3380,7 @@ class DualLambdaPreOptimizer:
             lam_lo = pilot_lambdas[worst_idx + 1]
             new_lams = np.linspace(lam_hi, lam_lo, int(extra_points_per_segment) + 2)[1:-1]
             print(
-                f"  🔎 [pilot 加密] 段 [{lam_lo:.4f}, {lam_hi:.4f}] 占当前总热力学长度 "
+                f"  [pilot 加密] 段 [{lam_lo:.4f}, {lam_hi:.4f}] 占当前总热力学长度 "
                 f"{worst_fraction * 100:.1f}%（阈值 {float(max_segment_length_fraction) * 100:.0f}%），"
                 f"插入 {len(new_lams)} 个额外探针点重测（第 {_round + 1} 轮）"
             )
@@ -3181,7 +3404,7 @@ class DualLambdaPreOptimizer:
                 point_diag["is_refinement_point"] = True
                 _timing = point_diag.get("timing_s", {})
                 print(
-                    f"    ⏱️ [preopt 加密 λ={float(lam):.4f}] "
+                    f"    [preopt 加密 λ={float(lam):.4f}] "
                     + ", ".join(f"{k}={v:.1f}s" for k, v in _timing.items())
                 )
                 pilot_lambdas.insert(insert_at, float(lam))
@@ -3205,6 +3428,9 @@ class DualLambdaPreOptimizer:
         # 时生效，见 redistribute_vanishing_lambda_subdomains。
         min_states_per_window: int = 4,
         max_states_per_window: int = 6,
+        # 🔑 [THERMODYNAMIC_PATH_PROTOCOL_VERSION=22] 自由能定向加密点数，默认 0
+        # （布点与 v21 逐字节相同）。总态数仍是 final_state_count，成本不变。
+        free_energy_densify_points: int = VANISHING_FREE_ENERGY_DENSIFY_POINTS,
     ):
         print(
             f"\n→ Stage 2: 去 VDW 路径优化 "
@@ -3261,7 +3487,7 @@ class DualLambdaPreOptimizer:
             pilot_points.append(point_diag)
             _timing = point_diag.get("timing_s", {})
             print(
-                f"    ⏱️ [preopt λ={float(lam):.4f}] "
+                f"    [preopt λ={float(lam):.4f}] "
                 + ", ".join(f"{k}={v:.1f}s" for k, v in _timing.items())
             )
 
@@ -3289,6 +3515,8 @@ class DualLambdaPreOptimizer:
                 final_state_count=int(final_state_count),
                 min_states_per_window=int(min_states_per_window),
                 max_states_per_window=int(max_states_per_window),
+                free_energy_densify_points=int(free_energy_densify_points),
+                pilot_mean_dU_dlambda=_pilot_mean_gradients_or_none(pilot_points),
         )
         optimized_lambdas = np.asarray(optimized_lambdas, dtype=float).ravel()
         optimized_lambdas = np.clip(optimized_lambdas, 0.0, 1.0)
@@ -3314,6 +3542,9 @@ class DualLambdaPreOptimizer:
             "estimator": "beta^2_var_dU_dlambda_finite_difference",
             "lambda_placement_method": (
                 "fisher_metric_blended_with_geometric_floor_v21"
+                if not int(free_energy_densify_points)
+                else "fisher_metric_blended_with_geometric_floor_v21"
+                     "+free_energy_densified_v22"
             ),
             "path_protocol_version": THERMODYNAMIC_PATH_PROTOCOL_VERSION,
             "probe_controls_base_lambda_placement": True,
@@ -3344,7 +3575,7 @@ class DualLambdaPreOptimizer:
         if risk_zone_tags is not None:
             diagnostics["risk_zone_tags"] = risk_zone_tags
         print(
-            f"  ✓ Stage 2 热力学长度路径完成：L={cumulative_length[-1]:.3f}, "
+            f"  [OK] Stage 2 热力学长度路径完成：L={cumulative_length[-1]:.3f}, "
             f"{len(optimized_lambdas)} 态, {len(window_ranges)} 个 IBS 子区间"
         )
         print(f"    λ_vdw: {optimized_lambdas}")
@@ -3367,7 +3598,7 @@ def apply_safety_checks_on_disable_warmup(simulation, enable_warmup, warmup_step
     import warnings
     if not enable_warmup:
         if simulation.context is None:
-            print("  ⚠️ simulation.context 未初始化，跳过安全检查")
+            print("  [WARN] simulation.context 未初始化，跳过安全检查")
             return
         try:
             state = simulation.context.getState(getEnergy=True, getForces=True)
@@ -3378,17 +3609,17 @@ def apply_safety_checks_on_disable_warmup(simulation, enable_warmup, warmup_step
             
             # ✅ RMS 阈值 5000 + 极值兜底 20000
             if np.isnan(rms_force) or np.isinf(rms_force) or rms_force > 5000 or max_force > 20000:
-                warnings.warn("⚠️ 检测到不合理 RMS 力或极值，强制能量最小化...", UserWarning)
+                warnings.warn("[WARN] 检测到不合理 RMS 力或极值，强制能量最小化...", UserWarning)
                 simulation.minimizeEnergy(maxIterations=10000)
                 state = simulation.context.getState(getEnergy=True, getForces=True)
                 forces = state.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole/unit.nanometer)
                 force_norms = np.linalg.norm(forces, axis=1)
                 rms_force = np.sqrt(np.mean(force_norms**2))
-                print(f"  ✓ 最小化后: RMS|F|={rms_force:.2e}, max|F|={np.max(force_norms):.2e}")
+                print(f"  [OK] 最小化后: RMS|F|={rms_force:.2e}, max|F|={np.max(force_norms):.2e}")
             else:
-                print(f"  ✓ 安全检查通过: RMS|F|={rms_force:.2e}")
+                print(f"  [OK] 安全检查通过: RMS|F|={rms_force:.2e}")
         except Exception as e:
-            print(f"  ❌ 安全检查失败: {e}")
+            print(f"  [ERR] 安全检查失败: {e}")
             raise
 
 # ============================================================================
@@ -3751,7 +3982,7 @@ def compute_2d_metric_grid(
             try:
                 context.getIntegrator().step(500)
             except Exception as exc:
-                print(f"  ⚠️ 2D 度量预采样失败 (λc={lc:.3f}, λv={lv:.3f}): {exc}")
+                print(f"  [WARN] 2D 度量预采样失败 (λc={lc:.3f}, λv={lv:.3f}): {exc}")
                 G[i, j] = np.eye(2, dtype=float) * 1e8
                 diagnostics["failed_points"] += 1
                 continue
@@ -3770,7 +4001,7 @@ def compute_2d_metric_grid(
                     context.setParameter("lam_coul", float(lc))
                     context.setParameter("lam_vdw", float(lv))
                 except Exception as exc:
-                    print(f"  ⚠️ 2D 度量采样失败 (λc={lc:.3f}, λv={lv:.3f}): {exc}")
+                    print(f"  [WARN] 2D 度量采样失败 (λc={lc:.3f}, λv={lv:.3f}): {exc}")
                     dc_vals = []
                     dv_vals = []
                     break
@@ -3901,7 +4132,7 @@ def optimize_2d_geodesic_path(
     lam_c_grid = np.linspace(1.0, 0.0, n_grid)
     lam_v_grid = np.linspace(1.0, 0.0, n_grid)
 
-    print(f"\n🗺️ 采集 2D 度量张量场 | {n_grid}×{n_grid} 网格 | {n_steps_per_point} 步/点")
+    print(f"\n采集 2D 度量张量场 | {n_grid}×{n_grid} 网格 | {n_steps_per_point} 步/点")
     G, metric_diagnostics = compute_2d_metric_grid(
         ctx, lam_c_grid, lam_v_grid,
         n_steps=n_steps_per_point,
@@ -3909,28 +4140,28 @@ def optimize_2d_geodesic_path(
         return_diagnostics=True,
     )
 
-    print(f"  ✅ 度量张量场完成 | 形状: {G.shape}")
+    print(f"  [OK] 度量张量场完成 | 形状: {G.shape}")
     print(
-        "  📊 2D 度量诊断: "
+        "  2D 度量诊断: "
         f"valid={metric_diagnostics['valid_points']}/{metric_diagnostics['total_points']} "
         f"({metric_diagnostics['valid_fraction']:.2%}), "
         f"median_samples={metric_diagnostics['median_samples_per_valid_point']:.1f}, "
         f"failed={metric_diagnostics['failed_points']}, unsafe={metric_diagnostics['unsafe_points']}"
     )
     if metric_diagnostics.get("warning"):
-        print(f"  ⚠️ {metric_diagnostics['warning']}")
+        print(f"  [WARN] {metric_diagnostics['warning']}")
     _search_diag: Dict[str, Any] = {}
     try:
         path = dijkstra_monotonic_geodesic(
             G, lam_c_grid, lam_v_grid, diagnostics=_search_diag
         )
-        print(f"  🏆 测地线路径: {len(path)} 个状态")
+        print(f"  测地线路径: {len(path)} 个状态")
         print(f"     λ_coul: {path[0][0]:.3f} → {path[-1][0]:.3f}")
         print(f"     λ_vdw:  {path[0][1]:.3f} → {path[-1][1]:.3f}")
     except Exception as e:
         # [0831issue P2] 回退必须可审计：见本函数 docstring 的 `diagnostics`。
         print(
-            f"  ⚠️ 测地线寻径失败 ({e})，回退到对角线线性路径 —— "
+            f"  [WARN] 测地线寻径失败 ({e})，回退到对角线线性路径 —— "
             "这条路径是次优的，不要把它当成测地线结果引用。"
         )
         path = list(zip(np.linspace(1.0, 0.0, n_grid), np.linspace(1.0, 0.0, n_grid)))
@@ -3942,7 +4173,7 @@ def optimize_2d_geodesic_path(
         diagnostics["magnitude_gate_dropped_edges"] = dropped
         if dropped:
             print(
-                f"  ⚠️ 测地线寻径中有 {dropped} 条边被 |g_mid|>1e7 量级闸门判为"
+                f"  [WARN] 测地线寻径中有 {dropped} 条边被 |g_mid|>1e7 量级闸门判为"
                 "不可通行并丢弃（合法的高方差格点也会被它挡住，见 0831issue P2）。"
             )
 
@@ -3962,7 +4193,7 @@ def optimize_2d_geodesic_path(
     path_arr = path_arr[unique_mask]
     
     path = [tuple(p) for p in path_arr]
-    print(f"  🏆 测地线路径 (单调性已校准): {len(path)} 个状态")
+    print(f"  测地线路径 (单调性已校准): {len(path)} 个状态")
     
     del ctx, integ, probe_sys
     _gc.collect()

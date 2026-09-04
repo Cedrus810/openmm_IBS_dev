@@ -80,13 +80,12 @@ from abfe_core import (
     charge_at_lambda,
     co_alchemical_charge_offset_plan,
     minimum_image_displacement_nm,
+    # [CLI-01, 2026-09-02] pymbar 的可用性探测统一在 abfe_core 里做（惰性、
+    # memoized）。本模块以前在这里 eager `import pymbar`，让每个 import
+    # ibs_engine 的入口都付一次 JAX 初始化；实际用到 pymbar 的只有
+    # `from pymbar import other_estimators` 那处函数内 import。
+    has_pymbar,
 )
-
-try:
-    import pymbar
-    HAS_PYMBAR = True
-except ImportError:
-    HAS_PYMBAR = False
 
 logger = logging.getLogger(__name__)
 
@@ -303,9 +302,9 @@ ENERGY_QUERY_FAILURE_FRACTION_MIN_ATTEMPTS = 100
 
 
 def _infer_log_level_from_message(message: str) -> int:
-    if any(token in message for token in ("⚠️", "警告", "warning")):
+    if any(token in message for token in ("[WARN]", "警告", "warning")):
         return logging.WARNING
-    if any(token in message for token in ("🚨", "❌", "失败", "错误", "异常", "error")):
+    if any(token in message for token in ("[ERR]", "失败", "错误", "异常", "error")):
         return logging.ERROR
     return logging.INFO
 
@@ -320,6 +319,29 @@ def _log_print(*args, sep=" ", end="\n", file=None, flush=False):
 
 
 print = _log_print
+
+
+_ONCE_EMITTED_KEYS: set = set()
+
+
+def print_once(key: str, *args, **kwargs) -> None:
+    """同一份日志文件里，同一个 `key` 只打印一次。
+
+    专门给"纯静态说理"类输出用：内容跟运行时状态无关，但打印点在热路径上。例如
+    `_create_softcore_force` 每建一次软核力就调一次，4W53 的一次 run 里同一段 460 字
+    的理由重复了 257 次、占了 `pipeline.log` 体积的 31.5%。
+
+    去重键里带上当前 tee 的目标文件（`_StdoutTeeToFile._log_path`）：同进程跑第二条腿、
+    日志 retarget 到新的 `pipeline.log` 时，这段说明会在新文件里重新出现一次，而不是
+    因为"进程内已经打过"就让整条腿的日志都查不到它。tee 没装时 scope 为 None，退化成
+    进程级去重。
+    """
+    scope = getattr(sys.stdout, "_log_path", None)
+    dedup_key = (scope, key)
+    if dedup_key in _ONCE_EMITTED_KEYS:
+        return
+    _ONCE_EMITTED_KEYS.add(dedup_key)
+    print(*args, **kwargs)
 
 
 def _atomic_save_npy(filepath: str, array: np.ndarray) -> None:
@@ -2176,7 +2198,7 @@ def run_boresch_attachment_leg(
         vals = np.array([r["attachment_delta_G_kJ_mol"] for r in runs], dtype=float)
         mean = float(np.mean(vals))
         sem = float(np.std(vals, ddof=1) / np.sqrt(vals.size))
-        log(f"\n  ✅ 跨 {n_seeds} 个 seed: ΔG(A′→A) = {mean:.4f} ± {sem:.4f} kJ/mol "
+        log(f"\n  [OK] 跨 {n_seeds} 个 seed: ΔG(A′→A) = {mean:.4f} ± {sem:.4f} kJ/mol "
             f"= {mean / 4.184:.4f} ± {sem / 4.184:.4f} kcal/mol")
         log(f"     逐 seed: {[round(v, 4) for v in vals.tolist()]}")
         return {
@@ -2240,7 +2262,7 @@ def run_boresch_attachment_leg(
             f"thetaA={tha_chk}°, thetaB={thb_chk}°）：角度接近 0°/180°，"
             "力的解析梯度会发散。请换锚点或起始构象。"
         )
-    log(f"  ✓ 锚点几何: r0={r0_chk:.4f} nm  θA={tha_chk:.2f}°  θB={thb_chk:.2f}°")
+    log(f"  [OK] 锚点几何: r0={r0_chk:.4f} nm  θA={tha_chk:.2f}°  θB={thb_chk:.2f}°")
 
     # 🔑 [0831issue P2] `max(2, ...)` 这个下限会让**实际步数超过用户设定**：采样循环
     # 按 n_samples 次 × steps_per_sample 步推进，所以当
@@ -2265,7 +2287,7 @@ def run_boresch_attachment_leg(
     order = list(range(K - 1, -1, -1))   # 从全强度端往下走
     log(f"  attachment 腿：{K} 个 λ 态 {np.round(lam, 4).tolist()}")
     log(
-        f"  ⚠️ 扫描顺序是**从全强度端往下**：第一个实际跑的态是 "
+        f"  [WARN] 扫描顺序是**从全强度端往下**：第一个实际跑的态是 "
         f"λ={float(lam[order[0]]):.4f}，不是列表里的第一个 λ。"
     )
     log(f"  每态 平衡 {equil_steps_per_state} 步 + 生产 {n_steps_per_state} 步 → {n_samples} 帧")
@@ -2285,7 +2307,7 @@ def run_boresch_attachment_leg(
         BORESCH_ATTACHMENT_LAMBDA_NAME, float(lam[order[0]])
     )
     log(
-        "  🔎 Boresch 力常数: "
+        "  Boresch 力常数: "
         + ", ".join(
             f"{name}={float(restraint_params['force_constants'][name]):.4g}"
             for name in ("kr", "kthetaA", "kthetaB", "kphiA", "kphiB", "kphiC")
@@ -2300,7 +2322,7 @@ def run_boresch_attachment_leg(
         )
         _eq = restraint_params.get("equilibrium_values") or {}
         log(
-            "  🔎 起点实测几何 vs 已提交平衡值: "
+            "  起点实测几何 vs 已提交平衡值: "
             + ", ".join(
                 f"{key}: {float(_measured[key]):.4f} / {float(_eq[key]):.4f}"
                 for key in ("r0", "thetaA0", "thetaB0", "phiA0", "phiB0", "phiC0")
@@ -2309,7 +2331,7 @@ def run_boresch_attachment_leg(
         )
     except Exception as exc:  # noqa: BLE001
         # 诊断失败不该顶替真正的失败，但也不许静默 —— 说出来，然后继续体检受力。
-        log(f"  ⚠️ 起点几何诊断未能完成（不阻断）：{type(exc).__name__}: {exc}")
+        log(f"  [WARN] 起点几何诊断未能完成（不阻断）：{type(exc).__name__}: {exc}")
     _group_energies = {}
     for _group in (0, BORESCH_ATTACHMENT_FORCE_GROUP):
         try:
@@ -2322,7 +2344,7 @@ def run_boresch_attachment_leg(
             pass
     if _group_energies:
         log(
-            "  🔎 逐 force group 能量 (kJ/mol): "
+            "  逐 force group 能量 (kJ/mol): "
             + ", ".join(f"g{g}={e:.6g}" for g, e in sorted(_group_energies.items()))
         )
     # ---- 入口快照 + 在跑中监控（2026-08-03）----
@@ -2418,7 +2440,7 @@ def run_boresch_attachment_leg(
         _snap_path = os.path.join(_diag_dir, "stage0_attachment_inputs.json")
         with open(_snap_path, "w", encoding="utf-8") as _h:
             json.dump(_snapshot, _h, indent=2, ensure_ascii=False, cls=NumpyEncoder)
-        log(f"  🧾 attachment 腿入口快照已落盘: {_snap_path}")
+        log(f"  attachment 腿入口快照已落盘: {_snap_path}")
         # ⚠️ **坐标本身**也要存，不能只存 SHA256。
         # 2026-08-03 的教训：只有哈希时，离线既无法复现也无法逐力分解 ——
         # 那次 NaN 发生在第一个 500 步分块内（< 1 ps），而用 rebalance 末帧做的
@@ -2429,11 +2451,11 @@ def run_boresch_attachment_leg(
         np.savez_compressed(
             _start_path, positions_nm=_pos_nm, box_vectors_nm=_box_nm
         )
-        log(f"  🧾 attachment 腿起点坐标已落盘（可离线复现）: {_start_path}")
+        log(f"  attachment 腿起点坐标已落盘（可离线复现）: {_start_path}")
         _torn = [t for t, v in _anchor_pairs.items() if v["differs"]]
         if _torn:
             log(
-                f"  ⚠️ 锚点对 {_torn} 的 raw 距离与 minimum-image 距离不同 —— "
+                f"  [WARN] 锚点对 {_torn} 的 raw 距离与 minimum-image 距离不同 —— "
                 "说明锚点分处不同周期镜像。`CustomCompoundBondForce` 的 "
                 "angle()/dihedral() **不做** minimum-image，这会让被约束的几何量"
                 "不是你以为的那个。"
@@ -2445,7 +2467,7 @@ def run_boresch_attachment_leg(
     except RuntimeError:
         raise
     except Exception as _exc:  # noqa: BLE001
-        log(f"  ⚠️ 入口快照落盘失败（不阻断）: {type(_exc).__name__}: {_exc}")
+        log(f"  [WARN] 入口快照落盘失败（不阻断）: {type(_exc).__name__}: {_exc}")
 
     _monitor_path = os.path.join(_diag_dir, "stage0_attachment_monitor.csv")
     _monitor = None
@@ -2454,10 +2476,10 @@ def run_boresch_attachment_leg(
         _monitor.write("cumulative_step,lambda_index_k,lambda,phase,"
                        "potential_kJ_mol,temperature_K,max_force_kJ_mol_nm,"
                        "max_force_atom_index,boresch_energy_kJ_mol\n")
-        log(f"  📈 attachment 腿监控已启用（每 {ATTACHMENT_MONITOR_INTERVAL} 步）: "
+        log(f"  attachment 腿监控已启用（每 {ATTACHMENT_MONITOR_INTERVAL} 步）: "
             f"{_monitor_path}")
     except Exception as _exc:  # noqa: BLE001
-        log(f"  ⚠️ 监控无法写入（不阻断）: {_exc}")
+        log(f"  [WARN] 监控无法写入（不阻断）: {_exc}")
         _monitor = None
 
     _n_dof = 3 * work.getNumParticles() - work.getNumConstraints()
@@ -2559,7 +2581,7 @@ def run_boresch_attachment_leg(
                         )
                 simulation.context.setParameter(BORESCH_ATTACHMENT_LAMBDA_NAME, float(lam[k]))
                 linearity_checked = True
-                log("  ✓ U(λ) 对 λ 的线性性自检通过（λ=0.35 / 0.8 两点）")
+                log("  [OK] U(λ) 对 λ 的线性性自检通过（λ=0.35 / 0.8 两点）")
 
         log(f"    λ={lam[k]:.4f}  ⟨U_Boresch⟩={float(np.mean(u_boresch[k])):9.3f} "
             f"± {float(np.std(u_boresch[k])):7.3f}  max={float(np.max(u_boresch[k])):9.3f} kJ/mol")
@@ -2592,7 +2614,7 @@ def run_boresch_attachment_leg(
         dg_mbar, err_mbar = float(_m["delta_G"]), float(_m["error"])
     except Exception as exc:
         dg_mbar, err_mbar = float("nan"), float("nan")
-        log(f"  ⚠️ MBAR 诊断失败（不影响主值）: {exc}")
+        log(f"  [WARN] MBAR 诊断失败（不影响主值）: {exc}")
 
     log(f"  BAR(主) {dg:.4f} ± {err:.4f} | TI {dg_ti:.4f} | MBAR(诊断) {dg_mbar:.4f}")
     if not np.isfinite(dg):
@@ -2611,7 +2633,7 @@ def run_boresch_attachment_leg(
     )
     dihedral_flip_seen = bool(np.isfinite(flip_scale) and max_ub > 0.5 * flip_scale)
     if dihedral_flip_seen:
-        log(f"  ⚠️ 采到了 U_B={max_ub:.1f} kJ/mol 的帧（最软二面角反转标度 {flip_scale:.1f}），"
+        log(f"  [WARN] 采到了 U_B={max_ub:.1f} kJ/mol 的帧（最软二面角反转标度 {flip_scale:.1f}），"
             "指数平均可能被单帧支配；BAR/TI 一致性门是唯一的拦截。")
 
     # ---- 门：只在真不一致时失败 ----
@@ -2622,10 +2644,10 @@ def run_boresch_attachment_leg(
                 f"attachment 腿 {ti_msg}。两者对稀有大能量帧的敏感度不同，"
                 "分歧说明估计量被少数帧支配（多半是二面角反转）。"
             )
-        log(f"  ⚠️ [门已关闭] {ti_msg} —— 超容差但未阻断")
+        log(f"  [WARN] [门已关闭] {ti_msg} —— 超容差但未阻断")
     mbar_z = abs(dg_mbar - dg) / err if (err > 0 and np.isfinite(dg_mbar)) else float("nan")
     if np.isfinite(mbar_z) and mbar_z > 3.0:
-        log(f"  ⚠️ 去相关 MBAR({dg_mbar:.4f}) 偏离主值 {mbar_z:.1f}σ —— 只记录不失败，"
+        log(f"  [WARN] 去相关 MBAR({dg_mbar:.4f}) 偏离主值 {mbar_z:.1f}σ —— 只记录不失败，"
             "MBAR 已降级为诊断。")
 
     half = {}
@@ -2649,12 +2671,12 @@ def run_boresch_attachment_leg(
         if not sh_ok:
             if enforce_convergence_gates:
                 raise RuntimeError(f"attachment 腿{sh_msg}，系综未收敛，拒绝返回。")
-            log(f"  ⚠️ [门已关闭] {sh_msg} —— 超容差但未阻断")
+            log(f"  [WARN] [门已关闭] {sh_msg} —— 超容差但未阻断")
     except RuntimeError:
         raise
     except Exception as exc:
         half = {"error": str(exc)}
-        log(f"  ⚠️ split-half 诊断失败（不影响主值）: {exc}")
+        log(f"  [WARN] split-half 诊断失败（不影响主值）: {exc}")
 
     payload = {
         "stage": "boresch_attachment",
@@ -2704,7 +2726,7 @@ def run_boresch_attachment_leg(
         "split_half": half,
     }
 
-    log(f"  ✅ ΔG(A′→A) = {dg:.4f} ± {err:.4f} kJ/mol "
+    log(f"  [OK] ΔG(A′→A) = {dg:.4f} ± {err:.4f} kJ/mol "
         f"= {dg / 4.184:.4f} ± {err / 4.184:.4f} kcal/mol")
 
     if output_dir:
@@ -2737,7 +2759,7 @@ def run_boresch_attachment_leg(
     _vram_after_release = _gpu_memory_mib()
     if _vram_before_release and _vram_after_release:
         log(
-            f"  🧹 attachment 腿 Context 已释放 | 显存 used "
+            f"  attachment 腿 Context 已释放 | 显存 used "
             f"{_vram_before_release[0]} → {_vram_after_release[0]} MiB "
             f"(free {_vram_before_release[1]} → {_vram_after_release[1]} MiB)"
         )
@@ -2954,7 +2976,7 @@ def _compute_u_kn_chunk(task: Dict) -> Tuple[int, np.ndarray]:
             pme_self_prefactor_kj = pme_self_correction_prefactor_kj(alpha_ewald, lig_qsq)
             if frame_offset == 0:
                 print(
-                    f"  🔎 [PME 自能修正 worker] alpha_ewald={alpha_ewald:.6f} /nm "
+                    f"  [PME 自能修正 worker] alpha_ewald={alpha_ewald:.6f} /nm "
                     f"(来源={alpha_source})，Σq²={lig_qsq:.6f} e² → "
                     f"prefactor={pme_self_prefactor_kj:.4f} kJ/mol"
                 )
@@ -3004,6 +3026,8 @@ def _split_platform_spec(platform_name: str) -> Tuple[str, Optional[str]]:
 
 # [P0-REMD-CUDA] 判 OOM 的下限：一个 45354 原子 PME Context 实测约 315–338 MiB
 # （`memtest/probe_remd_context_capacity.py`）。留一倍余量当"还装得下一个"的门槛。
+
+
 _REMD_CONTEXT_VRAM_FLOOR_MIB = 700.0
 
 
@@ -3168,7 +3192,7 @@ def charging_charge_conservation_report(
 def _inject_co_alchemical_ion_restraints(
     system: openmm.System,
     co_alchemical_ion_spec: Dict[str, Any],
-    log_prefix: str = "  🪢",
+    log_prefix: str = "  ",
 ) -> List[Dict[str, Any]]:
     """[MEM-00d] 按冻结 spec 注入每个 co-ion 的 flat-bottom 锚点相对位置限制。
 
@@ -3418,7 +3442,7 @@ def configure_charge_transfer_decharging(
         ligand_net_charge_e=lig_net_charge,
     )
     print(
-        f"  ⚡ [B3] charge-transfer charging 已配置: 配体 {lig_net_charge:+d} e → 0，"
+        f"  [B3] charge-transfer charging 已配置: 配体 {lig_net_charge:+d} e → 0，"
         f"co-ion {ion_indices} 0 → {lig_net_charge:+d} e（每粒子 ≤ 1 单位电荷）；"
         f"逐 λ 总电荷恒为 {report['base_sum_e']:+.6f} e "
         f"(Σscale={report['scale_sum_e']:+.2e} e)"
@@ -3512,7 +3536,7 @@ def configure_coalchemical_neutral_decharging(
         )
 
     if lig_net_charge == 0:
-        print("  ℹ️ 配体为电中性，无需共消电反离子。使用标准 PME Offset。")
+        print("  配体为电中性，无需共消电反离子。使用标准 PME Offset。")
         best_ion_indices: List[int] = []
         ion_meta: Dict[str, Any] = {}
     else:
@@ -3551,7 +3575,7 @@ def configure_coalchemical_neutral_decharging(
         # 与 charge-transfer 共用同一份形式（§4.4）。
         ion_meta = dict(co_alchemical_ion_spec.get("selection_provenance") or {})
         print(
-            f"  🔒 [MEM-00c] 复用已冻结的共炼金反离子身份: Indices {best_ion_indices} "
+            f"  [MEM-00c] 复用已冻结的共炼金反离子身份: Indices {best_ion_indices} "
             f"(fingerprint {str(co_alchemical_ion_spec.get('fingerprint'))[:12]}…)"
         )
 
@@ -3630,7 +3654,7 @@ def configure_coalchemical_neutral_decharging(
             ligand_net_charge_e=lig_net_charge,
         )
 
-    print("  ✅ 共炼金反离子防御阵列部署完毕。PME 倒空间计算全程严格电中性！")
+    print("  [OK] 共炼金反离子防御阵列部署完毕。PME 倒空间计算全程严格电中性！")
     return original_charges, list(best_ion_indices)
 
 
@@ -4289,16 +4313,21 @@ def _create_softcore_force(
         switch_nm = SOFTCORE_CUTOFF_NM
         use_switching = False
     sc_force.setCutoffDistance(cutoff_nm * unit.nanometer)
-    print(
-        "  ⚠️ [VDW softcore] OpenMM 原生 CustomNonbondedForce.setUseLongRangeCorrection 已禁用"
-        "（LJ+Coulomb 拼在同一个表达式里，原生解析修正对 Coulomb 的 1/r 尾项会发散，"
-        "实测直接让 CUDA 崩溃，见 AUDIT_STATUS.md）——这不代表 LJ tail 完全不补偿："
-        "对默认 softcore/ACE 路径，build_ibs_dual_system 会在此后为每个 λ_vdw 态单独算出"
-        "手写解析尾项系数并挂在 ibs_wrapper 上（下方 [LJ LRC] 日志），由 IBSSampler 每帧加进 "
-        "target_energies，不走这个原生开关；potential_type='dexp' 时该解析尾项尚未验证，会"
-        "显式跳过（见下方对应日志）。APBS 外部项仅用于静电/连续介质类长程修正，跟这个 "
-        "LJ tail 项无关。"
-    )
+    # 为什么禁用原生开关：LJ+Coulomb 拼在同一个表达式里，OpenMM 的原生解析修正对
+    # Coulomb 的 1/r 尾项会发散，实测直接让 CUDA 崩溃（见 AUDIT_STATUS.md）。这不代表
+    # LJ tail 不补偿——默认 softcore/ACE 路径下，build_ibs_dual_system 会在此后为每个
+    # λ_vdw 态单独算出手写解析尾项系数挂在 ibs_wrapper 上，由 IBSSampler 每帧加进
+    # target_energies；是否施加、按哪个协议版本，都记在 final_results.json 的
+    # `lj_long_range_dispersion_correction` / `traditional_lj_lrc_protocol_version` 里。
+    # APBS 外部项只管静电/连续介质类长程修正，跟这个 LJ tail 项无关。
+    # 以上是纯静态设计理由，不再打进日志（本函数每建一次软核力就调一次）。
+    if is_dexp:
+        # dexp 路线例外：尾项**真的没补**，这是运行时的实质缺口，必须留在日志里。
+        print_once(
+            "vdw_softcore_lj_tail_dexp",
+            "  [WARN] [VDW softcore] potential_type='dexp'：手写解析 LJ 尾项尚未验证，会显式跳过"
+            "——本次 run 的 LJ tail 完全不补偿。",
+        )
     sc_force.setUseLongRangeCorrection(False)
     
     if reference_exclusions:
@@ -4377,11 +4406,14 @@ def _normalize_softcore_params(
         "alpha_convention": ACESoftcorePotential.ALPHA_CONVENTION,
         "note": "Softcore parameters are no longer silently overwritten by a fixed production default.",
     }
-    print(
-        f"  🧪 [Softcore 参数] {source}: "
+    # 去重键由消息文本本身派生：键和值不可能漂移，只压掉逐字节相同的重复。参数一变
+    # 就重新打一行。本函数每次建系都被调用，一次 4W53 run 里同一行重复了 50 次。
+    _msg = (
+        f"  [Softcore 参数] {source}: "
         f"alpha_lj={normalized.alpha_lj:.3f} nm^6, alpha_coul={normalized.alpha_coul:.3f} nm^2 "
         f"(输入值: LJ={requested_lj:.3f}, Coul={requested_coul:.3f})"
     )
+    print_once(f"softcore_params|{_msg}", _msg)
     return normalized
 
 
@@ -4681,7 +4713,7 @@ def diagnose_softcore_cv_values(
         total_span = float(np.max(finite) - np.min(finite))
         print(f"  ΔU诊断: 窗口跨度={total_span:.1f} kJ/mol | 最大相邻ΔU={max_adjacent:.1f} kJ/mol")
         if max_adjacent > 50.0:
-            print("  ⚠️ 相邻 λ 能量差远超 50 kJ/mol，IBS 权重很可能塌缩；建议显著增加该阶段 λ 状态数。")
+            print("  [WARN] 相邻 λ 能量差远超 50 kJ/mol，IBS 权重很可能塌缩；建议显著增加该阶段 λ 状态数。")
 
 def _serialize_ibs_common_system(window_system: openmm.System) -> str:
     """Return U_common from an assembled VDW-IBS window.
@@ -4841,7 +4873,7 @@ def build_ibs_dual_system(
             f"K={len(lambdas_vdw)}, 每态 {IBS_DUAL_CVS_PER_LAMBDA_STATE} 个 CV，"
             f"将超过 OpenMM CustomCVForce 的 {OPENMM_CUSTOM_CV_MAX_VARIABLES}-CV 上限。"
             "请把 vanishing 域划为多个物理子区间；禁止使用单一 [0:K] ensemble。"
-            "\n\n⚠️ 这条限制来自 **Group-1 IBS 混合偏置力**（CustomCVForce 一次最多引用 "
+            "\n\n[WARN] 这条限制来自 **Group-1 IBS 混合偏置力**（CustomCVForce 一次最多引用 "
             f"{OPENMM_CUSTOM_CV_MAX_VARIABLES} 个 CV），**不是** λ 态数本身的物理上限。"
             "逐态独立固定-λ 采样（INDEPENDENT_ENDPOINT_PROTOCOL_VERSION）根本不用这个"
             "混合偏置力——它只需要 λ 无关的 U_common 和逐态的 _int_cv_force_xmls[k]。"
@@ -4991,18 +5023,16 @@ def build_ibs_dual_system(
     # ---------- 6. λ-WCA 防护壳（Group 4） & COM 限制（Group 5） ----------
     # 🔑 [WCA_SHIELD_RETIRED，2026-09-02] 整段**死代码**（保留、永不执行）。
     # 退役依据是实测因果归因：这个壳解释了 4W53 甲苯溶剂腿 stage2 误差的 **98%**
-    # （+44.21 / +45.30 kJ/mol）。见该常量处的长注释与
+    # （+44.21 / +45.30 kJ/mol）——壳幅度 4λ(1−λ) 在 λ→0 只线性衰减，而物理 LJ 是
+    # λ²，比值 4(1−λ)/λ 发散 ⟹ 目标态无壳而系综带壳，水贴近配体的构型从未被采到。
+    # 见该常量处的长注释与
     # docs/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md §2.10。
     # 翻 `WCA_SHIELD_RETIRED = False` 即整段复活。
-    if WCA_SHIELD_RETIRED:
-        print(
-            "  ⛔ [λ-WCA 防护壳] **已退役**，不加入生产采样系统（Group 4 为空组）。"
-            "实测该壳占 stage2 溶剂腿误差的 98%（+44.21/+45.30 kJ/mol）：壳幅度"
-            " 4λ(1−λ) 在 λ→0 只线性衰减，而物理 LJ 是 λ²，比值 4(1−λ)/λ 发散 ⟹"
-            " 目标态无壳而系综带壳，水贴近配体的构型从未被采到。"
-            f"（WCA_ACCOUNTING_VERSION={WCA_ACCOUNTING_VERSION}）"
-        )
-    else:
+    #
+    # 已退役 ⟹ **不打任何日志**。壳根本不进生产采样系统，每次建系再报一遍"它没参与"
+    # 是纯噪声；退役理由属于代码史，留在上面这段注释里就够了。Group 4 现为空组，
+    # e_base = groups{0,2,3,5} 的记账口径（WCA_ACCOUNTING_VERSION）不受影响。
+    if not WCA_SHIELD_RETIRED:
         wca_expr = (
             "4.0*lambda_shield*(1.0-lambda_shield)*step(rc-r)*eps_wca*"
             "(((rc/max(r, 1e-6))^6)^2 - 2*((rc/max(r, 1e-6))^6) + 1)"
@@ -5019,11 +5049,12 @@ def build_ibs_dual_system(
         for p1, p2 in softcore_excl: wca_force.addExclusion(int(p1), int(p2))
         wca_force.setForceGroup(4)
         new_sys.addForce(wca_force)
-        print(
-            "  🛡️ [λ-WCA 防护壳] "
+        _msg = (
+            "  [λ-WCA 防护壳] "
             f"rc={wca_params['rc_nm']:.3f} nm, eps={wca_params['eps_wca_kJ_mol']:.3f} kJ/mol "
             f"({wca_params['source']}, sigma_ref={wca_params['sigma_reference_nm']:.3f} nm)"
         )
+        print_once(f"wca_shield_params|{_msg}", _msg)
 
     # ---------- Group 5（配体 COM 限制）已移除 ----------
     # [LIGAND_COM_RESTRAINT_PROTOCOL_VERSION=2] 详见文件上方该常量的长注释。
@@ -5039,12 +5070,18 @@ def build_ibs_dual_system(
     # 结论：不再添加任何 Group 5 力。**Group 5 现为空组**——`e_base = groups{0,2,3,5}`
     # 的记账口径（WCA_ACCOUNTING_VERSION=2）不受影响，该组只是贡献 0。
     if _has_valid_boresch_restraint(restraint_params):
-        print("  ℹ️ 复合物腿由 Boresch 锚定定位配体；Group 5 COM 限制力已于"
-              " LIGAND_COM_RESTRAINT_PROTOCOL_VERSION=2 全局移除。")
+        print_once(
+            "group5_com_removed_complex",
+            "  复合物腿由 Boresch 锚定定位配体；Group 5 COM 限制力已于"
+            " LIGAND_COM_RESTRAINT_PROTOCOL_VERSION=2 全局移除。",
+        )
     else:
-        print("  ℹ️ 溶剂腿不添加 Group 5 COM 限制力"
-              " (LIGAND_COM_RESTRAINT_PROTOCOL_VERSION=2)：旧的非周期绝对锚点实现在 CUDA 上"
-              "产生定向拖拽，均匀溶剂中该限制亦无必要。")
+        print_once(
+            "group5_com_removed_solvent",
+            "  溶剂腿不添加 Group 5 COM 限制力"
+            " (LIGAND_COM_RESTRAINT_PROTOCOL_VERSION=2)：旧的非周期绝对锚点实现在 CUDA 上"
+            "产生定向拖拽，均匀溶剂中该限制亦无必要。",
+        )
 
     # ---------- 7. IBS 偏置力与纯 VDW 软核 CV (Group 1) ----------
     if residual_basis_force is None:
@@ -5074,7 +5111,7 @@ def build_ibs_dual_system(
     )
     legacy_softcore_signature = "+ 1e-4)^2"
     if legacy_softcore_signature in cv_template.getEnergyFunction():
-        print("  ⚠️ [IBS CV] 检测到旧版 VDW softcore 表达式签名；请检查 CV 构造路径。")
+        print("  [WARN] [IBS CV] 检测到旧版 VDW softcore 表达式签名；请检查 CV 构造路径。")
     template_cutoff = cv_template.getCutoffDistance()
     template_switch = cv_template.getSwitchingDistance()
     template_use_switching = cv_template.getUseSwitchingFunction()
@@ -5106,7 +5143,7 @@ def build_ibs_dual_system(
         potential_type, dispersion_protocol, environment_type
     ):
         print(
-            "  ⚠️ [LJ LRC] "
+            "  [WARN] [LJ LRC] "
             f"{ibs_lj_tail_lrc_inapplicable_reason(potential_type, dispersion_protocol, environment_type)}"
             "，本次不附加修正。"
         )
@@ -5118,8 +5155,6 @@ def build_ibs_dual_system(
                 all_params, perturbed_indices, env_indices
             )
         )
-        tail_s6 = float(np.sum(tail_s6_per_sigma))
-        tail_s12 = float(np.sum(tail_s12_per_sigma))
         n_lj_exp = float(getattr(alchemical_params, "n_lj", 2))
         alpha_lj = float(getattr(alchemical_params, "alpha_lj", 0.5))
         m_lj = float(getattr(alchemical_params, "m_lj", 2))
@@ -5127,13 +5162,11 @@ def build_ibs_dual_system(
             lambdas_vdw, tail_sigma, tail_s6_per_sigma, tail_s12_per_sigma,
             alpha_lj, m_lj, n_lj_exp, rs_nm, rc_nm,
         )
-        print(
-            f"  🧮 [LJ LRC v{TRADITIONAL_LJ_LRC_PROTOCOL_VERSION}] switching+softcore-aware 解析长程尾项已启用："
-            f"S6={tail_s6:.4g} kJ·nm^6/mol, S12={tail_s12:.4g} kJ·nm^12/mol, "
-            f"{tail_sigma.size} 个 sigma 分组（{tail_sigma.min():.4f}~{tail_sigma.max():.4f} nm，逐组积分）, "
-            f"switch={rs_nm:.3f} nm, cutoff={rc_nm:.3f} nm, alpha_lj={alpha_lj:.4g}(无量纲), m_lj={m_lj:.1f}, "
-            f"n_lj={n_lj_exp:.1f}；每帧修正 = lrc_coeff[k] / V(t)，lrc_coeff 逐 (λ, sigma) 数值积分得出。"
-        )
+        # 这里原来打一行 S6/S12/sigma 分组/switch/cutoff/alpha_lj/m_lj/n_lj 的汇总。
+        # 去掉：这些数是已落盘输入（拓扑 + softcore 参数 + cutoff）的确定性函数，可复算；
+        # 而"尾项到底有没有施加、按哪个协议版本"这两个真正需要审计的事实，记在
+        # final_results.json 的 `lj_long_range_dispersion_correction`（applicable/applied/
+        # dispersion_protocol/environment_type）和 `traditional_lj_lrc_protocol_version` 里。
 
     for k, (_lc, lv) in enumerate(zip(lambdas_coul, lambdas_vdw)):
         # IBS/OpenMM 只允许处理短程 VDW CV；Coulomb 已禁止进入 CustomNonbondedForce，
@@ -5157,11 +5190,14 @@ def build_ibs_dual_system(
         # 单次建系就刷 23 行同样的文字，把真正的告警淹掉。它描述的是这个 CV 力族的
         # 一个**共同属性**，与 k 无关，所以只在第一个态打一次。
         if k == 0:
-            print(
-                "  ⚠️ [IBS CV] VDW custom softcore CV 不含 LJ 长程修正（全部 "
+            # 那次 P2 修的是"单次建系刷 K+1 行"；但 build_ibs_dual_system 本身在一次
+            # run 里被调几十次，所以 k==0 的守卫之外还需要跨调用去重（λ 态数变了会重打）。
+            _msg = (
+                "  [WARN] [IBS CV] VDW custom softcore CV 不含 LJ 长程修正（全部 "
                 f"{len(lambdas_coul)} 个 λ 态同此）；请勿直接等同于已含 dispersion "
                 "correction 的 PME/LJPME 循环；APBS 修正应作为最终外部项记录。"
             )
+            print_once(f"ibs_cv_no_lrc|{_msg}", _msg)
         int_f_cv.setUseLongRangeCorrection(False)
         # [MEM-00h，2026-08-06] 之前这里无条件写 True，会把 _create_softcore_force
         # 按 potential_type 已经算好的 use_switching 悄悄覆盖回"总是开 switching"——
@@ -6134,14 +6170,14 @@ class IBSBiasForce:
         try:
             context.setParameter(f"{self.prefix}_bias_scale", 1.0 if enabled else 0.0)
         except Exception as e:
-            print(f"  ⚠️ 偏置开关设置失败: {e}")
+            print(f"  [WARN] 偏置开关设置失败: {e}")
 
     def update_parameters(self, context: openmm.Context, f_values: np.ndarray):
         for k in range(self.n_states):
             try:
                 context.setParameter(f"{self.prefix}_f_{k}", float(f_values[k]))
             except Exception as e:
-                print(f"  ⚠️ 参数更新失败: {e}")
+                print(f"  [WARN] 参数更新失败: {e}")
 
 
 # The four-argument constructor is the stable public API. The runtime
@@ -7139,9 +7175,6 @@ IBS_TMBAR_UPDATE_DAMPING = 0.10
 # COLLAPSE 的中等区固定 4 kT（见该函数 severe 分支）。
 IBS_TMBAR_FALLBACK_SGD_PAIRWISE_STEP_KT = 10.0
 IBS_WARMUP_FRAME_STRIDE_STEPS = 250
-# 🔑 [IBS_BIAS_PROTOCOL_VERSION=29] 20 -> 40：20 帧太容易被单一构象主导，绝对
-# TMBAR/占据估计噪声大。40 帧 × local-MBAR gate 的 5 批滑窗 = 200 冻结帧，恰好
-# 满足"冻结后至少累计 ~200 帧再判 loose gate"。
 IBS_TMBAR_LEARNING_MINIBATCH_FRAMES = 40
 IBS_TMBAR_FREEZE_MAX_APPLIED_PAIRWISE_STEP_KT = 1.0
 # 🔑 [IBS_BIAS_PROTOCOL_VERSION=29] 任何一次 warmup 权重更新（绝对 TMBAR 或
@@ -7749,7 +7782,7 @@ class IBSSampler:
                 failure_reason = "base_energy"
                 self._consecutive_base_failures += 1
                 print(
-                    f"  🚨 Base 能量 (Group 0,2,3,5，来自 guard 复用值) 非有限"
+                    f"  [ERR] Base 能量 (Group 0,2,3,5，来自 guard 复用值) 非有限"
                     f"（连续第 {self._consecutive_base_failures} 次），本帧标记为 NaN 并跳过"
                 )
         else:
@@ -7803,7 +7836,7 @@ class IBSSampler:
                             "拒绝继续推进 MD。"
                         ) from e
                 print(
-                    f"  🚨 Base 能量 (Group 0,2,3,5) 获取失败（连续第 "
+                    f"  [ERR] Base 能量 (Group 0,2,3,5) 获取失败（连续第 "
                     f"{self._consecutive_base_failures} 次），本帧标记为 NaN 并跳过：{e}"
                 )
                 e_base = float("nan")
@@ -7922,7 +7955,7 @@ class IBSSampler:
                 or "LJ 长程尾项" in str(e)
             ):
                 raise
-            print(f"  ⚠️ CV 探针能量提取失败: {e}")
+            print(f"  [WARN] CV 探针能量提取失败: {e}")
             energies[:] = np.nan
             self._record_energy_query_result(False, "cv_probe")
         return energies
@@ -8796,13 +8829,13 @@ class IBSSampler:
                 state = json.load(f)
             if state.get("n_states") != self.n_states:
                 print(
-                    f"  ⚠️ IBS 状态与当前窗口不兼容 "
+                    f"  [WARN] IBS 状态与当前窗口不兼容 "
                     f"(cache n_states={state.get('n_states')}, current={self.n_states})，忽略旧状态"
                 )
                 return False
             if state.get("prefix") not in (None, self.prefix):
                 print(
-                    f"  ⚠️ IBS 状态 prefix 不兼容 "
+                    f"  [WARN] IBS 状态 prefix 不兼容 "
                     f"(cache={state.get('prefix')}, current={self.prefix})，忽略旧状态"
                 )
                 return False
@@ -8811,7 +8844,7 @@ class IBSSampler:
                 cached_protocol_version
             ):
                 print(
-                    f"  ⚠️ IBS 状态协议版本不匹配 (cache={cached_protocol_version!r}, "
+                    f"  [WARN] IBS 状态协议版本不匹配 (cache={cached_protocol_version!r}, "
                     f"兼容版本={sorted(IBS_BIAS_CACHE_COMPATIBLE_PROTOCOL_VERSIONS)})，"
                     "完全忽略旧状态（不作为热启动），"
                     "从 f_k=0 重新开始"
@@ -8826,7 +8859,7 @@ class IBSSampler:
                 != IBS_WARMUP_UPDATE_PROTOCOL_VERSION
             ):
                 print(
-                    "  ⚠️ 未完成的 IBS 预热状态使用旧权重控制器 "
+                    "  [WARN] 未完成的 IBS 预热状态使用旧权重控制器 "
                     f"(cache={cached_warmup_update_version!r}, "
                     f"current={IBS_WARMUP_UPDATE_PROTOCOL_VERSION})，"
                     "拒绝把旧控制器的中间 f_k 注入新自适应学习；从当前协议重新预热"
@@ -8846,7 +8879,7 @@ class IBSSampler:
             )
             if not lambdas_match:
                 print(
-                    "  ⚠️ IBS 状态对应的 λ 值与当前窗口不匹配（λ 路径已被自动加密/"
+                    "  [WARN] IBS 状态对应的 λ 值与当前窗口不匹配（λ 路径已被自动加密/"
                     "重新划分窗口，或旧状态缺少 λ 元数据），完全忽略旧状态（不作为"
                     "热启动，f_k[k] 错配到不同 λ 上是主动引入偏差，不是中性起点），"
                     "从 f_k=0 重新开始"
@@ -8912,7 +8945,7 @@ class IBSSampler:
                 != VDW_NONBONDED_PROTOCOL_VERSION
             ):
                 print(
-                    "  ⚠️ Stage 2 IBS 状态的 "
+                    "  [WARN] Stage 2 IBS 状态的 "
                     f"vdw_nonbonded_protocol_version={state.get('vdw_nonbonded_protocol_version')!r} "
                     f"与当前 {VDW_NONBONDED_PROTOCOL_VERSION} 不匹配，"
                     "拒绝恢复旧 Hamiltonian 的 f_k/u_kn 历史"
@@ -8943,7 +8976,7 @@ class IBSSampler:
                         },
                     )
                 print(
-                    "  ⚠️ IBS 状态 sampling_repair_policy 不匹配 "
+                    "  [WARN] IBS 状态 sampling_repair_policy 不匹配 "
                     f"(cache={cached_repair_policy!r}, current={current_repair_policy!r})，"
                     "legacy_mutating 模式下忽略旧状态并重新开始"
                 )
@@ -8952,7 +8985,7 @@ class IBSSampler:
             f_k = state["f_k"]
             t = state["t"]
             if len(f_k) != self.n_states or not np.all(np.isfinite(np.asarray(f_k, dtype=float))):
-                print("  ⚠️ IBS 状态 f_k 无效，忽略旧状态")
+                print("  [WARN] IBS 状态 f_k 无效，忽略旧状态")
                 return False
             cached_eta_penalty = state.get("eta_penalty")
             if (
@@ -8960,7 +8993,7 @@ class IBSSampler:
                 or not np.isfinite(float(cached_eta_penalty))
                 or not (0.25 <= float(cached_eta_penalty) <= 1.0)
             ):
-                print("  ⚠️ IBS 状态 eta_penalty 无效，忽略旧状态")
+                print("  [WARN] IBS 状态 eta_penalty 无效，忽略旧状态")
                 return False
 
             # [IBS_BIAS_PROTOCOL_VERSION=19] 每条 tmbar_history entry 必须完整
@@ -9012,7 +9045,7 @@ class IBSSampler:
                         tmbar_history_valid = False
                         break
             if not tmbar_history_valid:
-                print("  ⚠️ IBS 状态的 tmbar_history 无效，忽略旧状态")
+                print("  [WARN] IBS 状态的 tmbar_history 无效，忽略旧状态")
                 return False
 
             self.e_offset = state.get("e_offset", 0.0)
@@ -9108,7 +9141,7 @@ class IBSSampler:
                 else [np.array(f_k, dtype=np.float64)] * int(t)
             )
             print(
-                f"  ♻️ IBS 状态已恢复: t={t}, max|f_k|={np.max(np.abs(f_k)):.2f} kJ/mol, "
+                f"  IBS 状态已恢复: t={t}, max|f_k|={np.max(np.abs(f_k)):.2f} kJ/mol, "
                 f"tmbar_history entries={len(self.tmbar_history)}, "
                 f"bias_converged={self.bias_converged}, bias_status={self.bias_status}"
             )
@@ -9116,7 +9149,7 @@ class IBSSampler:
         except ExistingEnsembleRequiresRescueAudit:
             raise
         except Exception as e:
-            print(f"  ⚠️ IBS 状态加载失败: {e}")
+            print(f"  [WARN] IBS 状态加载失败: {e}")
             return False
 def _compute_bidirectional_overlap_from_u_kn(
     u_kn: np.ndarray,
@@ -9124,7 +9157,7 @@ def _compute_bidirectional_overlap_from_u_kn(
     threshold: float = 0.03,
 ) -> Dict[str, Any]:
     """Run the repository's normal MBAR overlap calculation for two states."""
-    if not HAS_PYMBAR:
+    if not has_pymbar():
         raise ImportError("fixed-lambda overlap 探针需要 pymbar")
     u_kn = np.asarray(u_kn, dtype=np.float64)
     n_k = np.asarray(n_k, dtype=int)
@@ -11962,7 +11995,7 @@ def run_independent_endpoint_states(
         _budget = _independent_endpoint_budget_delta(bank_dir, expected_manifest)
         if _budget["grew"] or _budget["shrank"]:
             print(
-                "  ♻️ [独立端点段] manifest 身份一致、预算变化："
+                "  [独立端点段] manifest 身份一致、预算变化："
                 f"walker {_budget['n_walkers_per_mode_stored']}→"
                 f"{_budget['n_walkers_per_mode_requested']}，"
                 f"init_modes {_budget['init_modes_stored']}→"
@@ -12021,7 +12054,7 @@ def run_independent_endpoint_states(
                 _record_readable = True
             except Exception as exc:
                 print(
-                    f"  ⚠️ 独立端点 walker 记录不可读（{os.path.basename(path)}: {exc}）；"
+                    f"  [WARN] 独立端点 walker 记录不可读（{os.path.basename(path)}: {exc}）；"
                     "按未完成处理，删除后重算该格。"
                 )
                 try:
@@ -12611,7 +12644,7 @@ def solve_independent_endpoint_states(
             "init_modes_used": sorted({str(r["init_mode"]) for r in used_records}),
             "converged": False,
         }
-    if not HAS_PYMBAR:
+    if not has_pymbar():
         return {
             "error": "pymbar_not_installed",
             "state_indices": state_indices,
@@ -12721,7 +12754,7 @@ def endpoint_wet_dry_hysteresis_gate(
                 "reason": "wet_search_not_attempted",
                 "note": ("本次**未执行**湿盆搜索（干/湿双起点是诊断装置、不是生产判据，"
                          "默认关闭；开启用 independent_endpoint_wet_search=True）。"
-                         "因此只跑了干起点。⚠️ 这**不是**「该体系没有湿盆」的证据——"
+                         "因此只跑了干起点。[WARN] 这**不是**「该体系没有湿盆」的证据——"
                          "我们这次根本没找。湿/干双起点门未评估，不参与 converged 判定；"
                          "该端点段的遍历性未经双起点检验。"),
                 "skip_reason": wet_seed.get("skip_reason"),
@@ -13303,7 +13336,7 @@ class IBSWindowManagerDualLambda:
             sim.context.setVelocitiesToTemperature(
                 self.temperature, recovery_velocity_seed
             )
-        print(f"    🔧 {label_prefix}触发回退，执行局部最小化释放应力...")
+        print(f"    {label_prefix}触发回退，执行局部最小化释放应力...")
         sim.minimizeEnergy(maxIterations=2000, tolerance=1.0)
         current_dt_ps = sim.integrator.getStepSize().value_in_unit(unit.picoseconds)
         new_dt_ps = max(0.0001, current_dt_ps * 0.5)
@@ -13315,7 +13348,7 @@ class IBSWindowManagerDualLambda:
         _start_production_segment(sampler, "catastrophe_rollback_rebuild")
         fmax_report = fmax if fmax is not None else float("nan")
         print(
-            f"    ⚠️ {label_prefix}灾难检测触发: {progress_note}"
+            f"    [WARN] {label_prefix}灾难检测触发: {progress_note}"
             f"E_total={e_total_n:.1f}, max|F|={fmax_report:.1f}. "
             f"已回退坐标并将步长降至 {new_dt_ps*1000.0:.1f} fs"
             + (f"；同步丢弃被放弃分支的 {dropped} 帧生产 history" if dropped else "")
@@ -13644,26 +13677,26 @@ class IBSWindowManagerDualLambda:
                         early_stop_reject_reason = _gate["early_stop_reject_reason"]
                         if _gate["usable"]:
                             print(
-                                f"  ⏭️  窗口 {window_idx} 已有有效缓存能量 {cached_e.shape} 且 λ 值匹配，"
+                                f"  窗口 {window_idx} 已有有效缓存能量 {cached_e.shape} 且 λ 值匹配，"
                                 f"resume 模式下跳过重新采样。"
                             )
                             continue
                         if cached_e.ndim == 2 and cached_e.shape[0] == len(lc_win) and cached_e.shape[1] > 0 and not version_match:
                             print(
-                                f"  ⚠️ 窗口 {window_idx} 缓存的 wca_accounting_version="
+                                f"  [WARN] 窗口 {window_idx} 缓存的 wca_accounting_version="
                                 f"{cached_conv.get('wca_accounting_version')!r}（期望 {WCA_ACCOUNTING_VERSION}），"
                                 "base/bias 力组口径已变更，视为无效缓存，将重新采样该窗口。"
                             )
                         elif cached_e.ndim == 2 and cached_e.shape[0] == len(lc_win) and cached_e.shape[1] > 0 and not bias_protocol_match:
                             print(
-                                f"  ⚠️ 窗口 {window_idx} 缓存的 ibs_bias_protocol_version="
+                                f"  [WARN] 窗口 {window_idx} 缓存的 ibs_bias_protocol_version="
                                 f"{cached_conv.get('ibs_bias_protocol_version')!r}（兼容版本 "
                                 f"{sorted(IBS_BIAS_CACHE_COMPATIBLE_PROTOCOL_VERSIONS)}），"
                                 "IBS 偏置预热/冻结协议已变更，视为无效缓存，将重新采样该窗口。"
                             )
                         elif cached_e.ndim == 2 and cached_e.shape[0] == len(lc_win) and cached_e.shape[1] > 0 and not com_restraint_version_match:
                             print(
-                                f"  ⚠️ 窗口 {window_idx} 缓存的 ligand_com_restraint_protocol_version="
+                                f"  [WARN] 窗口 {window_idx} 缓存的 ligand_com_restraint_protocol_version="
                                 f"{cached_conv.get('ligand_com_restraint_protocol_version')!r}"
                                 f"（期望 {LIGAND_COM_RESTRAINT_PROTOCOL_VERSION}）：v1 的 Group 5 "
                                 "COM 限制力在 CUDA 上产生永久激活、跨边界跳变的定向拖拽，该窗口"
@@ -13671,20 +13704,20 @@ class IBSWindowManagerDualLambda:
                             )
                         elif cached_e.ndim == 2 and cached_e.shape[0] == len(lc_win) and cached_e.shape[1] > 0 and not lse_tolerance_match:
                             print(
-                                f"  ⚠️ 窗口 {window_idx} 缓存的 LSE log 残差容差="
+                                f"  [WARN] 窗口 {window_idx} 缓存的 LSE log 残差容差="
                                 f"{cached_lse_tolerance!r}（当前 {lse_log_residual_tolerance}），"
                                 "自洽收敛门已改变，视为无效缓存，将重新采样该窗口。"
                             )
                         elif cached_e.ndim == 2 and cached_e.shape[0] == len(lc_win) and cached_e.shape[1] > 0 and not lrc_version_match:
                             print(
-                                f"  ⚠️ 窗口 {window_idx} 缓存的 lj_tail_lrc_protocol_version="
+                                f"  [WARN] 窗口 {window_idx} 缓存的 lj_tail_lrc_protocol_version="
                                 f"{cached_conv.get('lj_tail_lrc_protocol_version')!r}（期望 "
                                 f"{TRADITIONAL_LJ_LRC_PROTOCOL_VERSION}），LJ 长程尾项修正公式已变更"
                                 "（switching-aware），视为无效缓存，将重新采样该窗口。"
                             )
                         elif cached_e.ndim == 2 and cached_e.shape[0] == len(lc_win) and cached_e.shape[1] > 0 and not vdw_nb_version_match:
                             print(
-                                f"  ⚠️ 窗口 {window_idx}（stage_type={stage_type!r}）缓存的 "
+                                f"  [WARN] 窗口 {window_idx}（stage_type={stage_type!r}）缓存的 "
                                 f"vdw_nonbonded_protocol_version="
                                 f"{cached_conv.get('vdw_nonbonded_protocol_version')!r}（期望 "
                                 f"{VDW_NONBONDED_PROTOCOL_VERSION}），vdW softcore cutoff/switching "
@@ -13711,38 +13744,38 @@ class IBSWindowManagerDualLambda:
                                     },
                                 )
                             print(
-                                f"  ⚠️ 窗口 {window_idx} 缓存的 sampling_repair_policy="
+                                f"  [WARN] 窗口 {window_idx} 缓存的 sampling_repair_policy="
                                 f"{cached_conv.get('sampling_repair_policy')!r}（期望 {repair_policy!r}）——"
                                 "该缓存产自旧的变异修复策略（legacy_mutating 下按无效缓存重采）。"
                             )
                         elif cached_e.ndim == 2 and cached_e.shape[0] == len(lc_win) and cached_e.shape[1] > 0 and not coion_identity_match:
                             print(
-                                f"  ⚠️ 窗口 {window_idx} convergence.json 的 co-ion runtime identity="
+                                f"  [WARN] 窗口 {window_idx} convergence.json 的 co-ion runtime identity="
                                 f"{cached_conv.get('coion_identity')!r} 与当前"
                                 f" {self.coion_identity!r} 不一致或缺失，拒绝复用能量缓存，"
                                 "将重新采样该窗口。"
                             )
                         elif _gate["shape_ok"] and (not _gate["segment_metadata_match"] or not _gate["stage_protocol_match"]):
-                            print(f"  ⚠️ 窗口 {window_idx} 缓存不能复用: {_gate['reason']}；将重新采样该窗口。")
+                            print(f"  [WARN] 窗口 {window_idx} 缓存不能复用: {_gate['reason']}；将重新采样该窗口。")
                         elif cached_e.ndim == 2 and cached_e.shape[0] == len(lc_win) and cached_e.shape[1] > 0 and not early_stop_ok:
                             print(
-                                f"  ⚠️ 窗口 {window_idx} 缓存是 early stop 提前停止产出的短样本，"
+                                f"  [WARN] 窗口 {window_idx} 缓存是 early stop 提前停止产出的短样本，"
                                 f"但{early_stop_reject_reason}，视为无效缓存，将重新采样该窗口。"
                             )
                         elif cached_e.ndim == 2 and cached_e.shape[0] == len(lc_win) and cached_e.shape[1] > 0:
                             print(
-                                f"  ⚠️ 窗口 {window_idx} 缓存能量形状匹配但 λ 值不匹配"
+                                f"  [WARN] 窗口 {window_idx} 缓存能量形状匹配但 λ 值不匹配"
                                 f"（缺少 λ 元数据或 λ 路径已变更），视为无效缓存，将重新采样该窗口。"
                             )
                         else:
                             print(
-                                f"  ⚠️ 窗口 {window_idx} 缓存能量形状 {cached_e.shape} 与期望 "
+                                f"  [WARN] 窗口 {window_idx} 缓存能量形状 {cached_e.shape} 与期望 "
                                 f"({len(lc_win)}, N) 不符，将重新采样该窗口。"
                             )
                     except ExistingEnsembleRequiresRescueAudit:
                         raise
                     except Exception as e:
-                        print(f"  ⚠️ 窗口 {window_idx} 缓存能量加载失败 ({e})，将重新采样该窗口。")
+                        print(f"  [WARN] 窗口 {window_idx} 缓存能量加载失败 ({e})，将重新采样该窗口。")
 
             # ---------- 构建系统 ----------
             win_sys, ibs_wrap = self._build_window_system(lc_win, lv_win, resolved_box, positions)
@@ -13808,7 +13841,7 @@ class IBSWindowManagerDualLambda:
             if _system_has_global_parameter(win_sys, "lambda_shield"):
                 lam_vdw_center = float(np.mean(lv_win))
                 sim.context.setParameter("lambda_shield", lam_vdw_center)
-                print(f"  🛡️ λ-WCA 防护壳已同步: lambda_shield={lam_vdw_center:.4f}")
+                print(f"  λ-WCA 防护壳已同步: lambda_shield={lam_vdw_center:.4f}")
 
             # 🔑 [2026-08-05 修，排序 bug] Boresch 必须在最小化**之前**就已经在
             # scale=1.0（生产强度），不能先无限制力自由最小化、再事后爬坡拽回来
@@ -13830,7 +13863,7 @@ class IBSWindowManagerDualLambda:
                 restored_from_window_checkpoint = _try_load_main_window_checkpoint(sim, main_ckpt_path)
                 if restored_from_window_checkpoint:
                     print(
-                        f"  🧊 窗口 {window_idx} 从主窗口 OpenMM checkpoint 续算"
+                        f"  窗口 {window_idx} 从主窗口 OpenMM checkpoint 续算"
                         "（跳过最小化/dt测试步进/Boresch爬坡，构象/速度/积分器RNG状态与上次中断时完全一致）。"
                     )
                     # 防御性重设：checkpoint 是否连带保存了 setParameter 的全局
@@ -13847,7 +13880,7 @@ class IBSWindowManagerDualLambda:
                     if ibs_wrap.residual_enabled:
                         sim.context.setParameter(f"{ibs_wrap.prefix}_s_residual", 1.0)
                 else:
-                    print(f"  ⚠️ 窗口 {window_idx} 主窗口 checkpoint 加载失败，回退到完整重建流程。")
+                    print(f"  [WARN] 窗口 {window_idx} 主窗口 checkpoint 加载失败，回退到完整重建流程。")
 
             # ---------- 最小化 ----------
             if not restored_from_window_checkpoint:
@@ -13864,7 +13897,7 @@ class IBSWindowManagerDualLambda:
                     sim.context.setParameter(f"{ibs_wrap.prefix}_s_residual", 0.0)
                 print(f"\n  [阶段1] 开始能量最小化...")
                 sim.minimizeEnergy(maxIterations=20000)
-                print(f"  ✓ 最小化完成")
+                print(f"  [OK] 最小化完成")
                 initial_velocity_seed = self._seed_for(
                     "sampling", stage_type, window_idx, "velocity"
                 )
@@ -13885,7 +13918,7 @@ class IBSWindowManagerDualLambda:
                         f"窗口 {window_idx} Boresch 几何不合格 "
                         f"(r0={r0_chk*10:.1f}Å, θA={thA_chk:.1f}°, θB={thB_chk:.1f}°)"
                     )
-                print(f"  ✅ Boresch 几何检查通过：r0={r0_chk*10:.2f}Å，θA={thA_chk:.1f}°，θB={thB_chk:.1f}°")
+                print(f"  [OK] Boresch 几何检查通过：r0={r0_chk*10:.2f}Å，θA={thA_chk:.1f}°，θB={thB_chk:.1f}°")
 
             pre_test_breakdown = None
             if debug_mode:
@@ -13914,7 +13947,7 @@ class IBSWindowManagerDualLambda:
                             f"{image_dist} nm"
                         )
                     print(
-                        f"  ✅ Boresch minimum-image 锚点距离: {image_dist*10:.2f}Å "
+                        f"  [OK] Boresch minimum-image 锚点距离: {image_dist*10:.2f}Å "
                         "（未修改坐标）"
                     )
                     # 🔑 [2026-08-05 注释掉，排序 bug 修复的一部分] 不再把 scale
@@ -13924,51 +13957,92 @@ class IBSWindowManagerDualLambda:
                     # print(f"  🔧 Boresch 力常数缩放至 1%")
 
                 original_dt = sim.integrator.getStepSize()
-                test_schedule = [
-                    (0.00001, 200, "0.01fs"),
-                    (0.00005, 200, "0.05fs"),
-                    (0.0001,  500, "0.1fs"),
-                    (0.0002, 5000, "0.2fs"),
-                    (0.0005, 5000, "0.5fs"),
-                ]
-                for dt_ps, n_steps, label in test_schedule:
-                    sim.integrator.setStepSize(dt_ps * unit.picoseconds)
-                    for step_batch in range(0, n_steps, 50):
-                        actual_steps = min(50, n_steps - step_batch)
-                        sim.step(actual_steps)
-                        state = sim.context.getState(getEnergy=True, getForces=True, getPositions=True)
-                        e = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-                        forces = state.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole/unit.nanometer)
-                        max_f = np.max(np.linalg.norm(forces, axis=1))
-                        positions = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-                        has_bad_positions = np.any(~np.isfinite(positions))
-                        has_bad_energy = not np.isfinite(e)
-                        has_bad_force = not np.isfinite(max_f)
-                        has_bad_values = has_bad_positions or has_bad_energy or has_bad_force
-                        if debug_mode and (step_batch == 0 or step_batch >= n_steps - 50):
-                            print(f"    [dt={label}] 步{step_batch+actual_steps}: E={e:.1f}, max|F|={max_f:.1f}, finite={not (has_bad_positions or has_bad_energy or has_bad_force)}")
-                        if has_bad_values:
-                            print(f"    🚨 非有限数值检测，打印力组拆解：")
-                            diagnose_force_groups_detailed(sim.context, win_sys, prefix=f"窗口{window_idx}_NaN前_dt={label}")
-                            diagnose_force_breakdown(sim.context, win_sys, prefix=f"窗口{window_idx}_NaN前_dt={label}")
-                            # ✅ 诊断增强：只看力组拆解只能知道"哪一类力炸了"，看不出是哪个
-                            # 原子/哪对接触炸的。补一次原子级定位，直接指认具体原子，不用
-                            # 再靠猜。若这一步坐标本身已经是 NaN（力已发散到无法再取一次
-                            # 有限的 getForces），定位可能拿不到有效结果，静默跳过即可。
+                # 🔑 [2026-09-03] 这里原来是一段"测试步进 schedule"：把 dt 从
+                # 0.01 fs 一路爬到 0.5 fs、每 50 步下载一次整帧
+                # getState(positions+forces+energy)（单窗口 218 次 GPU→CPU 同步），
+                # 一炸就直接 raise、没有任何挽救。
+                #
+                # 那是脚手架，不是物理：EM 之后 max|F| 已经收敛，配体↔环境全部走
+                # softcore（能量有限、力有界，没有 r^-13 奇点），常规情况下根本不
+                # 需要从 0.01 fs 起步。**现在没有任何预备 schedule** —— 直接用生产
+                # 步长跑一小段热化，只有真的炸了才处理，而且只回退炸掉的那一小段：
+                # 回滚到该段开始前的构型/速度 → 步长减半 → 重做这一段 → 恢复步长
+                # 继续。连续减半到 0.01 fs 仍然炸才判这个窗口失败。
+                _THERMALIZE_STEPS = 10000          # 生产步长下的热化总步数
+                _CHUNK = 500                       # 一"帧"= 检查粒度，也是回退粒度
+                _MIN_DT_PS = 1.0e-5                # 减半下限 0.01 fs，到这儿还炸就是真坏了
+
+                def _chunk_is_finite():
+                    st = sim.context.getState(
+                        getEnergy=True, getForces=True, getPositions=True
+                    )
+                    e = st.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+                    f = st.getForces(asNumpy=True).value_in_unit(
+                        unit.kilojoule_per_mole / unit.nanometer
+                    )
+                    fmax = float(np.max(np.linalg.norm(f, axis=1))) if f.size else 0.0
+                    pos = st.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+                    ok = (
+                        np.isfinite(e)
+                        and np.isfinite(fmax)
+                        and not np.any(~np.isfinite(pos))
+                    )
+                    return ok, e, fmax
+
+                _rescued = 0
+                _done = 0
+                while _done < _THERMALIZE_STEPS:
+                    n = min(_CHUNK, _THERMALIZE_STEPS - _done)
+                    # 只为这一段留一个回滚点，段过了就丢，不留全程快照。
+                    before = sim.context.getState(getPositions=True, getVelocities=True)
+                    dt_here = sim.integrator.getStepSize()
+                    while True:
+                        sim.step(n)
+                        ok, e, fmax = _chunk_is_finite()
+                        if ok:
+                            break
+                        halved = dt_here.value_in_unit(unit.picoseconds) * 0.5
+                        if halved < _MIN_DT_PS:
+                            print("    [ERR] 步长已减半至下限仍出现非有限值，打印诊断：")
+                            diagnose_force_groups_detailed(
+                                sim.context, win_sys,
+                                prefix=f"窗口{window_idx}_热化NaN",
+                            )
+                            diagnose_force_breakdown(
+                                sim.context, win_sys,
+                                prefix=f"窗口{window_idx}_热化NaN",
+                            )
                             try:
                                 diagnose_top_force_atoms(
-                                    sim.context,
-                                    win_sys,
+                                    sim.context, win_sys,
                                     topology=self.topology,
                                     ligand_indices=self.ligand_indices,
-                                    prefix=f"窗口{window_idx}_NaN前_dt={label}",
+                                    prefix=f"窗口{window_idx}_热化NaN",
                                 )
                             except Exception as diag_exc:
-                                print(f"    ⚠️ 原子级定位诊断失败（不影响主异常上报）：{diag_exc}")
-                            raise RuntimeError(f"在 dt={label} 处发生非有限坐标/能量/力")
-    
+                                print(f"    [WARN] 原子级定位诊断失败：{diag_exc}")
+                            sim.integrator.setStepSize(original_dt)
+                            raise RuntimeError(
+                                f"窗口 {window_idx} 热化：步长降到 "
+                                f"{halved*1000:.3f} fs 仍出现非有限坐标/能量/力"
+                            )
+                        # 回退这一段，减半重做
+                        sim.context.setState(before)
+                        dt_here = halved * unit.picoseconds
+                        sim.integrator.setStepSize(dt_here)
+                        _rescued += 1
+                        print(
+                            f"    ↩️ 第 {_done}-{_done+n} 步出现非有限值，已回退该段，"
+                            f"步长降至 {halved*1000:.2f} fs 重做"
+                        )
+                    sim.integrator.setStepSize(original_dt)
+                    _done += n
+
+                if _rescued:
+                    print(f"  [OK] 热化完成（{_rescued} 次分段回退救回）")
+
                 sim.integrator.setStepSize(original_dt)
-                print(f"  ✅ 测试步进通过，恢复步长 {original_dt.value_in_unit(unit.picoseconds):.3f} ps")
+                print(f"  [OK] 测试步进通过，恢复步长 {original_dt.value_in_unit(unit.picoseconds):.3f} ps")
                 post_test_breakdown = None
                 if debug_mode:
                     post_test_breakdown = diagnose_force_breakdown(sim.context, win_sys, prefix=f"窗口{window_idx}_测试步进后")
@@ -13979,8 +14053,8 @@ class IBSWindowManagerDualLambda:
                     win_sys.getNumConstraints(),
                 )
                 if deadlock_msg is not None:
-                    print(f"  🚨 [约束死锁预警] {deadlock_msg}")
-                    print("  🧯 自动切换到 1.0 fs 保守步长，并执行额外最小化/松弛以避免生产阶段首步崩溃...")
+                    print(f"  [ERR] [约束死锁预警] {deadlock_msg}")
+                    print("  自动切换到 1.0 fs 保守步长，并执行额外最小化/松弛以避免生产阶段首步崩溃...")
                     original_dt = 0.001 * unit.picoseconds
                     sim.integrator.setStepSize(original_dt)
                     sim.minimizeEnergy(maxIterations=5000, tolerance=10.0)
@@ -14183,7 +14257,7 @@ class IBSWindowManagerDualLambda:
             if skip_warmup_entirely:
                 sim.context.setParameter(f"{self.prefix}_bias_scale", 1.0)
                 print(
-                    "  🚀 检测到已收敛的 IBS 历史状态：跳过 learning，"
+                    "  检测到已收敛的 IBS 历史状态：跳过 learning，"
                     "直接对已恢复的 f_k 重新做一次冻结 burn-in + 只读验证"
                     "（不重新学习权重，但也不会零平衡就直接进生产）。"
                 )
@@ -14207,14 +14281,14 @@ class IBSWindowManagerDualLambda:
                 for k, f_val in enumerate(sampler.frozen_f_k_pending):
                     sim.context.setParameter(f"{self.prefix}_f_{k}", float(f_val))
                 print(
-                    "  🧊 检测到 MBAR 校准已冻结但验证尚未通过的历史状态："
+                    "  检测到 MBAR 校准已冻结但验证尚未通过的历史状态："
                     "跳过 learning 与 fixed-H overlap/bias 校准探针，直接延长这份"
                     "冻结 f_k 的 burn-in + 只读验证（不重新学习权重，也不重新校准）。"
                 )
                 resumed_frozen_f_k = [float(x) for x in sampler.frozen_f_k_pending]
             elif is_resumed_ibs and not sampler.bias_converged:
                 print(
-                    "  ♻️ 检测到 IBS 历史状态，但此前预热未判定收敛——"
+                    "  检测到 IBS 历史状态，但此前预热未判定收敛——"
                     "以该状态为热启动起点继续走严格收敛判定，不清零重来，也不假设已经收敛。"
                 )
                 sim.context.setParameter(f"{self.prefix}_bias_scale", 1.0)
@@ -14320,19 +14394,19 @@ class IBSWindowManagerDualLambda:
                     f_k_warm_started = True
                     sampler.seed_source = "pilot"
                     print(
-                        f"  🌱 [pilot TI 热启动] 窗口 {window_idx} f_k 初始值（非冷启动 0.0）: "
+                        f"  [pilot TI 热启动] 窗口 {window_idx} f_k 初始值（非冷启动 0.0）: "
                         f"{[round(float(x), 3) for x in warm_start_seed]} kJ/mol"
                     )
                 elif warm_start_seed is not None:
                     print(
-                        f"  ⚠️ [pilot TI 热启动] 窗口 {window_idx} 估计出的种子长度 "
+                        f"  [WARN] [pilot TI 热启动] 窗口 {window_idx} 估计出的种子长度 "
                         f"({len(warm_start_seed)}) 与本窗口态数 ({len(lv_win)}) 不符，"
                         "拒绝注入，回退 f_k=0.0 冷启动"
                     )
                 else:
-                    print(f"  ℹ️ [pilot TI 热启动] 窗口 {window_idx} 无可用 pilot 数据，f_k 仍从 0.0 冷启动")
+                    print(f"  [pilot TI 热启动] 窗口 {window_idx} 无可用 pilot 数据，f_k 仍从 0.0 冷启动")
 
-                print(f"\n  🔥 [偏置预热] 开始... (从零缓慢加载偏置力)")
+                print(f"\n  [偏置预热] 开始... (从零缓慢加载偏置力)")
                 sim.integrator.setStepSize(0.001 * unit.picoseconds)
 
                 sim.context.setParameter(f"{self.prefix}_bias_scale", 0.0)
@@ -14359,11 +14433,6 @@ class IBSWindowManagerDualLambda:
                     if not np.isfinite(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)):
                         raise RuntimeError(f"偏置预热阶段在 scale={target_scale} 时能量 NaN")
                     print(" 完成")
-                # Ramp 只负责把动力学平滑带到正式 IBS Hamiltonian。scale<1 的
-                # 构型不能进入 scale=1 固定点方程，也不能提前修改 f_k。
-                sampler.energy_buffer = []
-                sampler.ema_mean_p = None
-
             # ---- bias_scale=1.0：两阶段严格收敛判据（learning -> freeze -> validate）----
             # 🔑 [IBS_BIAS_PROTOCOL_VERSION=7] v6 判据有个更深的问题：一轮"连续
             # N 次通过"里，每一次通过用的 mean_p_batch/ema_mean_p 都是从
@@ -14442,7 +14511,7 @@ class IBSWindowManagerDualLambda:
                         f_k_warm_started = True
                         sampler.seed_source = "bootstrap"
                         print(
-                            f"  🌱 [自举 TI 种子] 窗口 {window_idx} 冷启动无 pilot，用首批 "
+                            f"  [自举 TI 种子] 窗口 {window_idx} 冷启动无 pilot，用首批 "
                             f"{int(np.sum(_boot_valid))} 帧每态平均 softcore 能量播 "
                             f"f_k=⟨u_k⟩（去均值）: "
                             f"{[round(float(x), 2) for x in _boot_seed]} kJ/mol"
@@ -14450,12 +14519,12 @@ class IBSWindowManagerDualLambda:
                         )
                     else:
                         print(
-                            f"  ⚠️ [自举 TI 种子] 窗口 {window_idx} 种子非有限/维度不符，"
+                            f"  [WARN] [自举 TI 种子] 窗口 {window_idx} 种子非有限/维度不符，"
                             "回退 f_k=0 冷启动"
                         )
                 else:
                     print(
-                        f"  ⚠️ [自举 TI 种子] 窗口 {window_idx} 有效帧不足，回退 f_k=0 冷启动"
+                        f"  [WARN] [自举 TI 种子] 窗口 {window_idx} 有效帧不足，回退 f_k=0 冷启动"
                     )
                 sampler.energy_buffer = []
                 sampler.ema_mean_p = None
@@ -14711,7 +14780,7 @@ class IBSWindowManagerDualLambda:
                             for k in range(K)
                         ]
                         print(
-                            f"    🧊 占据 raw_residual={residual_severity:.3f}≤"
+                            f"    占据 raw_residual={residual_severity:.3f}≤"
                             f"{float(IBS_UPDATE_ADAPTIVE_RESIDUAL_LOW):.2f} → 冻结跑 "
                             "local-MBAR Δf−ΔF 门（VALIDATE 是唯一生产入口证明，"
                             "不再要求固定 min_bias_updates 批数）"
@@ -14989,7 +15058,7 @@ class IBSWindowManagerDualLambda:
                     bias_converged = True
                     last_failure_reason = None
                     print(
-                        "    ✅ local-MBAR loose gate 通过："
+                        "    [OK] local-MBAR loose gate 通过："
                         f"max|Δf_k−ΔF^MBAR|={max_adjacent_gap_kJ_mol:.3f} kJ/mol < "
                         f"{float(IBS_LOCAL_MBAR_GATE_MAX_ADJACENT_DELTA_KJ_MOL):.1f} kJ/mol"
                         f"（{validation_sample_count} frames；abs_ess={_gate_abs_ess:.1f}、"
@@ -15052,7 +15121,7 @@ class IBSWindowManagerDualLambda:
                         sim.context.setParameter(f"{self.prefix}_f_{k}", float(f_capped[k]))
                     frozen_f_k_snapshot = f_capped.astype(float).tolist()
                     print(
-                        "    🔧 occupancy 尚可但 local-MBAR gap 未过：对冻结 f_k 应用一次"
+                        "    occupancy 尚可但 local-MBAR gap 未过：对冻结 f_k 应用一次"
                         "阻尼+pairwise-capped 修正（用本次 local-MBAR 候选），直接重新"
                         "验证（跳过 learning，本轮仅此一次）"
                     )
@@ -15082,7 +15151,7 @@ class IBSWindowManagerDualLambda:
             # 🔑 [性能计时] warmup/learning 循环结束，打印一次耗时拆分汇总——
             # 只是诊断输出，不落盘、不参与任何 resume/协议比较。
             print(
-                "    ⏱️ [warmup 计时] "
+                "    [warmup 计时] "
                 + ", ".join(f"{k}={v:.1f}s" for k, v in warmup_timers.items())
             )
 
@@ -15126,7 +15195,7 @@ class IBSWindowManagerDualLambda:
                     else "n/a（local MBAR 从未在预算内解出）"
                 )
                 print(
-                    "    🤝 warmup 步数预算耗尽仍未通过 local-MBAR loose gate；接受当前 "
+                    "    warmup 步数预算耗尽仍未通过 local-MBAR loose gate；接受当前 "
                     f"f_k 进生产（最近一次 max|Δf_k−ΔF^MBAR|={_last_gap_repr}，阈值 "
                     f"{float(IBS_LOCAL_MBAR_GATE_MAX_ADJACENT_DELTA_KJ_MOL):.1f} kJ/mol）；"
                     "生产后独立质量门 + 最终 MBAR 继续兜底"
@@ -15147,13 +15216,13 @@ class IBSWindowManagerDualLambda:
                 )
                 if _acc_situation:
                     print(
-                        f"    🔎 现场：{_format_local_mbar_situation(_acc_situation)}"
+                        f"    现场：{_format_local_mbar_situation(_acc_situation)}"
                     )
                 _situ_ok = bool(_acc_situation and not _acc_situation.get("error"))
                 if _situ_ok and _acc_situation.get("occupancy_is_flat"):
                     # (b) 占据平坦：良性，不是插 λ 的场景。
                     print(
-                        "    ✔️ 判决：冻结占据已平坦（coverage_ESS="
+                        "    [OK] 判决：冻结占据已平坦（coverage_ESS="
                         f"{_acc_situation.get('coverage_ess', float('nan')):.2f}≥"
                         f"{IBS_LOCAL_MBAR_GATE_OCC_MIN_COVERAGE_ESS_FRACTION * float(K):.2f}），"
                         "只是短 warmup 的 local MBAR 绝对 ESS/端点 reweight ESS 偏低、未能走 "
@@ -15168,7 +15237,7 @@ class IBSWindowManagerDualLambda:
                     _sg = _acc_situation.get("starved_global_state")
                     _edges = _acc_situation.get("starved_edges_global") or []
                     print(
-                        "    ⚠️ 判决：占据塌陷 + local MBAR 全程重叠/ESS 不足 → 这是"
+                        "    [WARN] 判决：占据塌陷 + local MBAR 全程重叠/ESS 不足 → 这是"
                         f"{'端点' if _acc_situation.get('is_endpoint') else '内部'}"
                         f"热力学瓶颈（global s{_sg} 占据="
                         f"{_acc_situation.get('starved_occupancy'):.2e} 低于健康下限 "
@@ -15179,7 +15248,7 @@ class IBSWindowManagerDualLambda:
                 elif _never_trustworthy and _situ_ok:
                     # 中间态：占据没塌到下限、但也没达到平坦兜底门（如 coverage 略低）。
                     print(
-                        "    ℹ️ 判决：占据尚可但未达平坦兜底门、local MBAR 绝对 ESS 也不足；"
+                        "    判决：占据尚可但未达平坦兜底门、local MBAR 绝对 ESS 也不足；"
                         "已接受进生产（best-effort）。优先延长生产采样；若最终 MBAR 仍显示"
                         "某相邻边重叠不足，再考虑插 λ。现场见上。"
                     )
@@ -15467,7 +15536,7 @@ class IBSWindowManagerDualLambda:
                     bias_warmup_diag["status"] = "passed_but_asymmetric_overlap_bottleneck"
                     bias_warmup_diag["feedback_action"] = "insert_lambda_at_passed_bottleneck"
                     print(
-                        "    ⚠️ fixed-H 各边虽均超过绝对阈值，但检测到局部热力学瓶颈："
+                        "    [WARN] fixed-H 各边虽均超过绝对阈值，但检测到局部热力学瓶颈："
                         f"edge={asymmetric_bottleneck['global_edge']}，"
                         f"overlap ratio={asymmetric_bottleneck['overlap_ratio']:.2f}，"
                         f"slope ratio={asymmetric_bottleneck['slope_ratio']:.2f}；"
@@ -15511,7 +15580,7 @@ class IBSWindowManagerDualLambda:
 
                 if not calibration_sufficient:
                     print(
-                        "    ⚠️ bias 校准探针在多次延长采样后，仍有边的去相关样本数/ΔF 不确定度"
+                        "    [WARN] bias 校准探针在多次延长采样后，仍有边的去相关样本数/ΔF 不确定度"
                         "未达标，放弃本次 MBAR 校准（不拿不够精确的估计覆盖 f_k），"
                         "继续按未收敛处理，交给人工检查。"
                     )
@@ -15522,7 +15591,7 @@ class IBSWindowManagerDualLambda:
                     for k in range(K):
                         sim.context.setParameter(f"{self.prefix}_f_{k}", float(f_calibrated[k]))
                     print(
-                        f"    🎯 fixed-H 双向 overlap 全部通过（λ 网格没问题），bias 校准探针"
+                        f"    fixed-H 双向 overlap 全部通过（λ 网格没问题），bias 校准探针"
                         f"（含 WCA、不含 LRC）也已达到精度门槛："
                         f"用 ΔF_bias 校准 f_k={[f'{v:.2f}' for v in f_calibrated]}，"
                         "不再继续 SGD 搜索，重新做一次冻结 burn-in + 只读验证。"
@@ -15647,7 +15716,7 @@ class IBSWindowManagerDualLambda:
                             bias_warmup_diag["lse_balance"] = report_lse_balance
                             bias_warmup_diag["lse_residual_history"] = lse_residual_history
                         print(
-                            "    ⚠️ 用 BAR/MBAR（ΔF_bias，含 WCA、不含 LRC）校准的 f_k 冻结验证仍未"
+                            "    [WARN] 用 BAR/MBAR（ΔF_bias，含 WCA、不含 LRC）校准的 f_k 冻结验证仍未"
                             "通过——λ 网格和求解器都已排除，可能是构象弛豫过慢或偏置表达式本身有"
                             "问题，需要人工检查，不再自动重试。"
                         )
@@ -15873,7 +15942,7 @@ class IBSWindowManagerDualLambda:
                 if calibration_pending:
                     if is_final_rung:
                         print(
-                            f"    🛑 校准后的冻结 f_k 冻结验证累计 {new_cumulative_steps} 步后仍未通过，"
+                            f"    [ERR] 校准后的冻结 f_k 冻结验证累计 {new_cumulative_steps} 步后仍未通过，"
                             "已判定为终态失败（calibrated_validation_failed）——"
                             "不再自动续验/延长预算/回退 learning，需要人工检查。"
                         )
@@ -15885,7 +15954,7 @@ class IBSWindowManagerDualLambda:
                         )
                     else:
                         print(
-                            f"    🧊 校准后的冻结 f_k 已存为 calibrated_pending_validation"
+                            f"    校准后的冻结 f_k 已存为 calibrated_pending_validation"
                             f"（本次冻结验证累计 {new_cumulative_steps}/{effective_frozen_validation_budget} "
                             "步仍未通过），resume 会跳过 SGD/重新校准，直接续验"
                             f"（不重新烧已经验证过的这 {steps_spent_this_attempt} 步）。"
@@ -15939,11 +16008,11 @@ class IBSWindowManagerDualLambda:
             # 打印预热后的 f_k 值
             f_vals = [sim.context.getParameter(f"{self.prefix}_f_{k}") for k in range(len(lc_win))]
             print(
-                "  ✅ 偏置预热结束（f_k 已锁定；严格通过/预算终止类型见诊断）: "
+                "  [OK] 偏置预热结束（f_k 已锁定；严格通过/预算终止类型见诊断）: "
                 f"{[f'{v:.1f}' for v in f_vals]}"
             )
             if max(f_vals) - min(f_vals) < 1.0:
-                print(f"  ⚠️ 警告: f_k 仍未明显分化，可能需延长预热或检查窗口重叠度。")
+                print(f"  [WARN] 警告: f_k 仍未明显分化，可能需延长预热或检查窗口重叠度。")
             if debug_mode:
                 diagnose_softcore_cv_values(sim.context, ibs_wrap, lc_win, lv_win, prefix=f"窗口{window_idx}_偏置预热后", sampler=sampler)
             raw_probe = sampler.get_raw_interaction_energies()
@@ -16001,7 +16070,7 @@ class IBSWindowManagerDualLambda:
             )
             if effective_n_steps_per_window != int(n_steps_per_window):
                 print(
-                    f"  🔁 窗口 {window_idx} 使用步数覆盖：{effective_n_steps_per_window} 步"
+                    f"  窗口 {window_idx} 使用步数覆盖：{effective_n_steps_per_window} 步"
                     f"（默认 {n_steps_per_window} 步），来自 production_step_overrides"
                 )
 
@@ -16096,13 +16165,13 @@ class IBSWindowManagerDualLambda:
                                 resumed_production_checkpoint = True
                             else:
                                 print(
-                                    f"  ⚠️ 窗口 {window_idx} 生产 checkpoint 匹配，但已有能量/偏置/"
+                                    f"  [WARN] 窗口 {window_idx} 生产 checkpoint 匹配，但已有能量/偏置/"
                                     "基准数组帧数不一致，回退完整重采。"
                                 )
                         except Exception as e:
-                            print(f"  ⚠️ 窗口 {window_idx} 生产历史能量数组加载失败（{e}），回退完整重采。")
+                            print(f"  [WARN] 窗口 {window_idx} 生产历史能量数组加载失败（{e}），回退完整重采。")
                     else:
-                        print(f"  ⚠️ 窗口 {window_idx} 生产 checkpoint 加载失败，回退完整重采。")
+                        print(f"  [WARN] 窗口 {window_idx} 生产 checkpoint 加载失败，回退完整重采。")
             if resumed_production_checkpoint:
                 try:
                     if self.sampling_score_sha256 is not None and (
@@ -16136,7 +16205,7 @@ class IBSWindowManagerDualLambda:
                         float(value) for value in _prior_residual_basis
                     ]
                 except Exception as exc:
-                    print(f"  ⚠️ joint-score production ledgers unavailable ({exc}); full resample required")
+                    print(f"  [WARN] joint-score production ledgers unavailable ({exc}); full resample required")
                     resumed_production_checkpoint = False
             if not resumed_production_checkpoint:
                 prior_cumulative_production_steps = 0
@@ -16146,7 +16215,7 @@ class IBSWindowManagerDualLambda:
                 prior_bias_history = None
                 prior_base_energy_history = None
                 print(
-                    f"  🧱 窗口 {window_idx} 预热/冻结验证与生产严格隔离："
+                    f"  窗口 {window_idx} 预热/冻结验证与生产严格隔离："
                     "验证样本不计入生产，生产从 0 步开始"
                 )
 
@@ -16292,7 +16361,7 @@ class IBSWindowManagerDualLambda:
             )
             if resumed_production_checkpoint:
                 print(
-                    f"  🧊 窗口 {window_idx} 从生产 checkpoint 续算：累计已完成 "
+                    f"  窗口 {window_idx} 从生产 checkpoint 续算：累计已完成 "
                     f"{prior_cumulative_production_steps} 步，本次只需再跑 "
                     f"{remaining_production_steps} 步（目标 {effective_n_steps_per_window} 步），"
                     f"保留 {len(sampler.energy_history)} 帧已有样本，坐标/速度/积分器 RNG "
@@ -16334,7 +16403,7 @@ class IBSWindowManagerDualLambda:
                     set1, set2 = cv_force_0.getInteractionGroupParameters(gidx)
                     print(f"  [诊断] 交互组 {gidx}: size={len(set1)} × {len(set2)}")
 
-                print("\n🔬 软核 CV 详细诊断：")
+                print("\n软核 CV 详细诊断：")
 
                 # 1. 获取第一个 CV 力对象
                 cv_force = ibs_wrap.get_force().getCollectiveVariable(0)
@@ -16410,7 +16479,7 @@ class IBSWindowManagerDualLambda:
                     try:
                         sim.step(steps_per_update)
                     except Exception as e:
-                        print(f"\n  🚨 采样崩溃于 update={up}/{n_updates}")
+                        print(f"\n  [ERR] 采样崩溃于 update={up}/{n_updates}")
                         if debug_mode:
                             diagnose_force_groups_detailed(sim.context, win_sys, prefix=f"窗口{window_idx}_崩溃_update{up}")
                             diagnose_force_breakdown(sim.context, win_sys, prefix=f"窗口{window_idx}_崩溃_update{up}")
@@ -16675,7 +16744,7 @@ class IBSWindowManagerDualLambda:
                             "step": int(step_at_check), "passed": False, "error": local_result["error"],
                         })
                         print(
-                            f"    ⏱️ [early-stop] 窗口 {window_idx} 第 {step_at_check} 步检查：local MBAR "
+                            f"    [early-stop] 窗口 {window_idx} 第 {step_at_check} 步检查：local MBAR "
                             f"未解出 ({local_result['error']})，连续通过计数清零"
                         )
                     else:
@@ -16738,7 +16807,7 @@ class IBSWindowManagerDualLambda:
                         early_stop_previous_local_dg = local_dg
                         early_stop_pass_count = early_stop_pass_count + 1 if all_ok else 0
                         print(
-                            f"    ⏱️ [early-stop] 窗口 {window_idx} 第 {step_at_check} 步检查："
+                            f"    [early-stop] 窗口 {window_idx} 第 {step_at_check} 步检查："
                             f"{'通过' if all_ok else '未通过'}（连续 {early_stop_pass_count}/"
                             f"{early_stop_required_consecutive_passes}），ESS比例={min_ess_ratio}, "
                             f"绝对ESS={absolute_ess}, 去相关样本={n_frames_used}, "
@@ -16750,7 +16819,7 @@ class IBSWindowManagerDualLambda:
                             early_stop_stop_reason = "consecutive_passes_reached"
                             actual_production_updates = up + 1
                             print(
-                                f"    ✅ [early-stop] 窗口 {window_idx} 连续 {early_stop_pass_count} 次独立 "
+                                f"    [OK] [early-stop] 窗口 {window_idx} 连续 {early_stop_pass_count} 次独立 "
                                 f"block 通过，提前于第 {step_at_check} 步停止生产采样"
                             )
                             break
@@ -16761,7 +16830,7 @@ class IBSWindowManagerDualLambda:
                     has_nan_e = np.any(np.isnan(e))
                     print(f"    [采样] update={up}/{n_updates}: E_total={e_total:.1f}, NaN(E_total)={has_nan_energy}, NaN(E_k)={has_nan_e}")
                     if has_nan_energy or has_nan_e:
-                        print(f"    🚨 检测到 NaN 能量！主系统各组能量与最大受力：")
+                        print(f"    [ERR] 检测到 NaN 能量！主系统各组能量与最大受力：")
                         num_forces = win_sys.getNumForces()
                         for i in range(num_forces):
                             force = win_sys.getForce(i)
@@ -16789,7 +16858,7 @@ class IBSWindowManagerDualLambda:
                     try:
                         sim.step(remaining_steps)
                     except Exception as e:
-                        print(f"\n  🚨 余数补齐阶段崩溃 ({remaining_steps} 步)")
+                        print(f"\n  [ERR] 余数补齐阶段崩溃 ({remaining_steps} 步)")
                         if debug_mode:
                             diagnose_force_groups_detailed(sim.context, win_sys, prefix=f"窗口{window_idx}_余数补齐崩溃")
                             diagnose_force_breakdown(sim.context, win_sys, prefix=f"窗口{window_idx}_余数补齐崩溃")
@@ -17059,7 +17128,7 @@ class IBSWindowManagerDualLambda:
             sampler.save_ibs_state(
                 ibs_state_file, lc_win, lv_win, stage_type=stage_type
             )
-            print(f"  💾 窗口 {window_idx} 完成，能量已保存 ({e_save.shape})")
+            print(f"  窗口 {window_idx} 完成，能量已保存 ({e_save.shape})")
 
             # 清理
             if getattr(sampler, "_probe_context", None) is not None:
@@ -17075,7 +17144,7 @@ class IBSWindowManagerDualLambda:
             gc.collect()
 
         print(f"\n{'='*80}")
-        print(f"✅ 所有窗口采样完成")
+        print(f"[OK] 所有窗口采样完成")
         print(f"{'='*80}")
         return warmup_results if warmup_only else None
 
@@ -17093,7 +17162,7 @@ class IBSWindowManagerDualLambda:
         那一段，避免同一件事做两遍。warmup_steps 参数保留仅为向后兼容签名，
         当前不再被本函数使用。
         """
-        print("  🔥 渐进预热：时间步长爬坡...")
+        print("  渐进预热：时间步长爬坡...")
 
         # 偏置力在时间步长爬坡期间保持关闭，避免爬 dt 的同时还叠加一个尚未
         # 校准的偏置力，两个不稳定源混在一起更难诊断。
@@ -17112,7 +17181,7 @@ class IBSWindowManagerDualLambda:
                 print(f"    [爬坡 dt={dt_ps}ps] E={e:.1f}, max|F|={max_f:.1f}")
 
         sim.integrator.setStepSize(original_dt)
-        print("  ✅ 时间步长爬坡完成（偏置力将在下一步统一引入）")
+        print("  [OK] 时间步长爬坡完成（偏置力将在下一步统一引入）")
 
 
     def _safe_boresch_ramp(self, sim, final_scale=1.0, n_steps=200):
@@ -17148,7 +17217,7 @@ class IBSWindowManagerDualLambda:
             .value_in_unit(unit.kilojoule_per_mole)
         )
         if not np.isfinite(e_ref):
-            print(f"  🚨 Boresch 爬坡起点势能非有限（{e_ref}），拒绝爬坡")
+            print(f"  [ERR] Boresch 爬坡起点势能非有限（{e_ref}），拒绝爬坡")
             sim.integrator.setStepSize(original_dt)
             return False
         # Boresch 力全强度下三个二面角全反转的量级是 ~1200 kJ/mol（见
@@ -17165,7 +17234,7 @@ class IBSWindowManagerDualLambda:
             delta_e = e - e_ref
             if not np.isfinite(e) or delta_e > max_delta_e:
                 print(
-                    f"  🚨 Boresch 爬坡中断：scale={s:.3f}，势能={e:.1f} kJ/mol"
+                    f"  [ERR] Boresch 爬坡中断：scale={s:.3f}，势能={e:.1f} kJ/mol"
                     f"（ΔE={delta_e:+.1f} > {max_delta_e:.0f}），可能几何奇点"
                 )
                 sim.integrator.setStepSize(original_dt)
@@ -17176,7 +17245,7 @@ class IBSWindowManagerDualLambda:
             )
 
         sim.integrator.setStepSize(original_dt)
-        print("  ✅ Boresch 限制力已完全启用")
+        print("  [OK] Boresch 限制力已完全启用")
         return True
 
     def get_stage_data_for_analysis(
@@ -18015,7 +18084,7 @@ def _solve_single_window_local_mbar(
     if n_k_local[sampled_row] < min_frames:
         return {"error": "insufficient_valid_frames", "n_frames": int(n_k_local[sampled_row])}
 
-    if not HAS_PYMBAR:
+    if not has_pymbar():
         return {"error": "pymbar_not_installed"}
 
     try:
@@ -18249,7 +18318,7 @@ class GlobalMBARAnalyzer:
                     )
 
             if u_kj_raw.ndim != 2 or len(win_lams) != u_kj_raw.shape[0]:
-                print(f"  ⚠️ 窗口 {w_idx} 数据维度不匹配，跳过")
+                print(f"  [WARN] 窗口 {w_idx} 数据维度不匹配，跳过")
                 continue
             
             # 确定采样态索引 (通常 IBS 采样的是当前窗口的某个特定态，或者是加权平均)
@@ -18258,7 +18327,7 @@ class GlobalMBARAnalyzer:
             # 这里为了兼容旧逻辑，若未指定则取中间态，但需注意 bias_energies 必须对应正确的采样态。
             n_frames = u_kj_raw.shape[1]
             if n_frames < min_frames_per_window:
-                print(f"  ⚠️ 窗口 {w_idx} 原始帧数 ({n_frames}) < min_frames_per_window ({min_frames_per_window})，跳过")
+                print(f"  [WARN] 窗口 {w_idx} 原始帧数 ({n_frames}) < min_frames_per_window ({min_frames_per_window})，跳过")
                 continue
             if len(bias_kj) != n_frames or len(base_kj) != n_frames:
                 raise ValueError(
@@ -18331,7 +18400,7 @@ class GlobalMBARAnalyzer:
                 n_frames = int(sub_idx.size)
             window_g_values.append(float(g_val))
             if n_frames < min_frames_per_window:
-                print(f"  ⚠️ 窗口 {w_idx} 去相关子采样后有效帧数 ({n_frames}) < {min_frames_per_window}，跳过")
+                print(f"  [WARN] 窗口 {w_idx} 去相关子采样后有效帧数 ({n_frames}) < {min_frames_per_window}，跳过")
                 continue
 
             # ------------------------------------------------------------------
@@ -18406,13 +18475,13 @@ class GlobalMBARAnalyzer:
             # 未真正遵守 min_frames_per_window 参数）。
             if n_k_local[sampled_row] < min_frames_per_window:
                 print(
-                    f"  ⚠️ 窗口 {w_idx} 剔除 NaN/Inf 列后有效帧数 "
+                    f"  [WARN] 窗口 {w_idx} 剔除 NaN/Inf 列后有效帧数 "
                     f"({int(n_k_local[sampled_row])}) < min_frames_per_window "
                     f"({min_frames_per_window})，跳过"
                 )
                 continue
 
-            if not HAS_PYMBAR:
+            if not has_pymbar():
                 return {"error": "pymbar_not_installed", "converged": False}
             
             try:
@@ -18543,12 +18612,12 @@ class GlobalMBARAnalyzer:
                         # entry，逐 entry 打印会把日志刷爆；对它们 min_ess_ratio=None
                         # 本身就是信号（converged 因此 fail closed）。
                         print(
-                            f"  ⚠️ 窗口 {w_idx} 提供了 f_k 但无法计算混合覆盖度 ESS "
+                            f"  [WARN] 窗口 {w_idx} 提供了 f_k 但无法计算混合覆盖度 ESS "
                             f"({quality.get('error')})；该窗口 min_ess_ratio=None，"
                             "收敛门会因此判失败（fail closed，不当作通过）"
                         )
                 except Exception as ess_exc:
-                    print(f"  ⚠️ 窗口 {w_idx} 有效样本数(ESS)重叠诊断计算失败: {ess_exc}")
+                    print(f"  [WARN] 窗口 {w_idx} 有效样本数(ESS)重叠诊断计算失败: {ess_exc}")
                 # 🔑 [0831issue P2] 这条 overlap 记录**先构造、后 append**：以前它在这里
                 # 就直接进了 window_overlap_records，而 local_results 要到下面才进。
                 # 两者之间还有 ddf_matrix 的端点索引（n_lams>1 时 ddf_matrix[1, n_lams]）
@@ -18675,7 +18744,7 @@ class GlobalMBARAnalyzer:
                 window_overlap_records.append(_overlap_record)
                 
             except Exception as e:
-                print(f"  ⚠️ 局部 TMBAR 窗口 {w_idx} (Lams {win_lams}) 失败: {e}")
+                print(f"  [WARN] 局部 TMBAR 窗口 {w_idx} (Lams {win_lams}) 失败: {e}")
                 import traceback
                 traceback.print_exc()
 
@@ -19363,7 +19432,7 @@ def solve_stage_integrated(
                 key=lambda w: w["drift_over_2sigma"],
             )
             print(
-                f"  ⚠️ [split-half] {stage_name or 'stage'} 前后半程不一致："
+                f"  [WARN] [split-half] {stage_name or 'stage'} 前后半程不一致："
                 f"window {worst['window_index']} 漂移 {worst['drift_kJ_mol']:+.3f} kJ/mol "
                 f"= {worst['drift_over_2sigma']:.2f}×2σ（σ_win={worst['uncertainty_kJ_mol']:.3f}）。"
                 f"报出的不确定度低估了实际抽样波动。"
@@ -19380,7 +19449,7 @@ def solve_stage_integrated(
         res["sigma_inflation_applied"] = False
         if infl.get("available") and infl.get("n_windows_inflated"):
             print(
-                f"  ℹ️ [P1-19] {stage_name or 'stage'} 若按 σ≥|漂移|/2 定下界："
+                f"  [P1-19] {stage_name or 'stage'} 若按 σ≥|漂移|/2 定下界："
                 f"{infl['n_windows_inflated']}/{len(infl['per_window'])} 个窗口的 σ 被抬高，"
                 f"总 σ {infl['total_error_mbar_kJ_mol']:.4f} → "
                 f"{infl['total_error_inflated_kJ_mol']:.4f} kJ/mol "
@@ -19427,13 +19496,13 @@ def solve_stage_integrated(
                         res["converged"] = False
                         res["converged_revoked_by_sigma_inflation"] = True
                         print(
-                            f"  ⛔ [P1-23] σ 抬高后端点 σ = {_new_max:.4f} kJ/mol "
+                            f"  [ERR] [P1-23] σ 抬高后端点 σ = {_new_max:.4f} kJ/mol "
                             f"超过门限 {float(_thr):.4f}，`converged` 由 True 改判为 "
                             "False（此前这里是 fail-open：σ 抬上去了而门还在读旧的小 σ）"
                         )
                 if _old_max is not None:
                     print(
-                        f"  ℹ️ [P1-23] 端点 σ 随之更新：{float(_old_max):.4f} → "
+                        f"  [P1-23] 端点 σ 随之更新：{float(_old_max):.4f} → "
                         f"{_new_max:.4f} kJ/mol"
                     )
             # 🔑 [0831issue P2] 逐段 `uncertainty_kJ_mol`、`total_error`、
@@ -19465,7 +19534,7 @@ def solve_stage_integrated(
                 res["endpoint_error_after_offset_gauge"] = "mbar_asymptotic_only"
             res["sigma_inflation_applied"] = True
             print(
-                f"  ✅ [P1-19] 已采用 σ 下界：总 σ = "
+                f"  [OK] [P1-19] 已采用 σ 下界：总 σ = "
                 f"{res['total_error']:.4f} kJ/mol"
                 "（df_k / endpoint_error_after_offset 仍为 MBAR-only 口径，见 "
                 "sigma_inflation_scope）"
@@ -19496,16 +19565,16 @@ def _check_boresch_geometry_safe(context, boresch_params, min_sin_theta=0.1):
         L1 = L0 + _minimum_image_displacement_nm(pos[lig[1]] - L0, box_vectors)
         L2 = L1 + _minimum_image_displacement_nm(pos[lig[2]] - L1, box_vectors)
     except ValueError as exc:
-        print(f"  🚨 Boresch minimum-image 几何无法计算：{exc}")
+        print(f"  [ERR] Boresch minimum-image 几何无法计算：{exc}")
         return False, np.nan, np.nan, np.nan
     anchor_coords = np.asarray([H0, H1, H2, L0, L1, L2], dtype=float)
     if not np.all(np.isfinite(anchor_coords)):
-        print("  🚨 Boresch 锚点坐标包含 NaN/Inf，几何检查判定为不安全")
+        print("  [ERR] Boresch 锚点坐标包含 NaN/Inf，几何检查判定为不安全")
         return False, np.nan, np.nan, np.nan
 
     r0 = np.linalg.norm(H0 - L0)
     if not np.isfinite(r0):
-        print("  🚨 Boresch r0 为 NaN/Inf，几何检查判定为不安全")
+        print("  [ERR] Boresch r0 为 NaN/Inf，几何检查判定为不安全")
         return False, np.nan, np.nan, np.nan
 
     def calc_angle(a, b, c):
@@ -19522,7 +19591,7 @@ def _check_boresch_geometry_safe(context, boresch_params, min_sin_theta=0.1):
     thA = calc_angle(H1, H0, L0)
     thB = calc_angle(H0, L0, L1)
     if not np.all(np.isfinite([thA, thB])):
-        print("  🚨 Boresch θA/θB 为 NaN/Inf，几何检查判定为不安全")
+        print("  [ERR] Boresch θA/θB 为 NaN/Inf，几何检查判定为不安全")
         return False, float(r0), np.nan, np.nan
 
     sinA, sinB = np.sin(thA), np.sin(thB)
@@ -19531,7 +19600,7 @@ def _check_boresch_geometry_safe(context, boresch_params, min_sin_theta=0.1):
         or sinA < min_sin_theta
         or sinB < min_sin_theta
     ):
-        print(f"  🚨 Boresch 角度接近奇点：θA={np.degrees(thA):.1f}° (sin={sinA:.3f})，"
+        print(f"  [ERR] Boresch 角度接近奇点：θA={np.degrees(thA):.1f}° (sin={sinA:.3f})，"
               f"θB={np.degrees(thB):.1f}° (sin={sinB:.3f})")
         return False, r0, np.degrees(thA), np.degrees(thB)
 
@@ -19589,7 +19658,7 @@ def diagnose_top_force_atoms(
     norms = np.linalg.norm(total_forces, axis=1)
     order = np.argsort(norms)[::-1][:top_n]
 
-    print(f"\n🔎 [{prefix}] 最大受力原子定位:")
+    print(f"\n[{prefix}] 最大受力原子定位:")
     print(
         f"{'rank':<4} | {'atom':<7} | {'residue':<12} | {'role':<7} | "
         f"{'total':>10} | {'G0':>10} | {'G1':>10} | {'G2':>10} | {'G3':>10} | {'G4':>10}"
@@ -19671,14 +19740,14 @@ def diagnose_force_groups_detailed(context, system, prefix="窗口诊断"):
             norms = np.linalg.norm(forces, axis=1)
             max_f = np.max(norms)
             rms_f = np.sqrt(np.mean(norms**2))
-            status = "🚨 爆炸源" if max_f > 10000 else ("⚠️ 偏高" if max_f > 2000 else "✓ 正常")
+            status = "[ERR] 爆炸源" if max_f > 10000 else ("[WARN] 偏高" if max_f > 2000 else "[OK] 正常")
             print(f"Group {gid:<2} | {member_summary:<52} | {max_f:<20.2f} | {rms_f:<12.2f} | {status}")
         except Exception as e:
-            print(f"Group {gid:<2} | {member_summary:<52} | {'(CV/元力跳过)':<20} | {'N/A':<12} | ℹ️ {str(e)[:25]}")
+            print(f"Group {gid:<2} | {member_summary:<52} | {'(CV/元力跳过)':<20} | {'N/A':<12} | {str(e)[:25]}")
     print("-" * 125)
     n_cons = system.getNumConstraints()
     if n_cons > 0:
-        print(f"  🔗 系统含 {n_cons} 个刚性约束 (SHAKE/LINCS)。若上述力组均正常但合力爆炸，根因必为约束死锁或初始键长畸变。")
+        print(f"  系统含 {n_cons} 个刚性约束 (SHAKE/LINCS)。若上述力组均正常但合力爆炸，根因必为约束死锁或初始键长畸变。")
 
 
 def print_force_group_details(system: openmm.System, prefix: str = "系统"):
@@ -19799,7 +19868,7 @@ def diagnose_force_breakdown(main_context, main_system, prefix=""):
 
     # 读取各组力
     group_map = {10: "Bond", 11: "Angle", 12: "Nonbonded", 13: "Torsion"}
-    print(f"\n🔍 [{prefix}] 非侵入式力分解报告：")
+    print(f"\n[{prefix}] 非侵入式力分解报告：")
     stats = {}
     for gid, name in group_map.items():
         try:
@@ -19961,9 +20030,9 @@ class REMDManager:
             # 这个决定会让整个阶段慢约两个数量级，必须响亮且可在归档日志里看见——
             # 用 logger.warning 而不是裸 print，避免只出现在终端 stdout。
             _msg = (
-                f"⚠️ REMD replica 数({self.n_replicas})超过显式指定的 GPU 常驻 Context "
+                f"[WARN] REMD replica 数({self.n_replicas})超过显式指定的 GPU 常驻 Context "
                 f"上限({self.max_resident_contexts})；在创建任何 GPU Context 前回退 CPU。"
-                "\n     ⛔ 注意：CPU 回退会让本阶段慢约两个数量级（实测 73536 原子 × "
+                "\n     注意：CPU 回退会让本阶段慢约两个数量级（实测 73536 原子 × "
                 "12 副本 × PME：GPU ~24 分钟跑完 500 轮交换，CPU 上 23 分钟连第一帧 "
                 "DCD 都写不出来，表现得像卡死）。"
                 "\n     若显存足够，请提高 max_resident_contexts（完整流程用 "
@@ -20151,20 +20220,6 @@ class REMDManager:
                 self.contexts.append(ctx)
                 self.integrators.append(integ)
                 self.replica_systems.append(replica_sys)
-
-                # [P0-REMD-CUDA] 逐个记，断在第几个一看就知道。
-                _vram = _gpu_memory_mib()
-                if _vram and str(resolved_platform).upper() == "CUDA":
-                    _per_ctx = (
-                        (_vram[0] - _vram_baseline[0]) / len(self.contexts)
-                        if _vram_baseline else float("nan")
-                    )
-                    logger.info(
-                        "[REMD] Context %d/%d 建成: used=%d free=%d MiB "
-                        "(平均每 Context ≈ %.0f MiB)",
-                        len(self.contexts), self.n_replicas,
-                        _vram[0], _vram[1], _per_ctx,
-                    )
         except Exception as exc:
             # ⚠️ 显存必须在 `_clear_replica_contexts()` **之前**读——释放之后再读就
             # 只剩一个"失败后已回收"的数，判不了当时到底是不是不够用。
@@ -20225,7 +20280,7 @@ class REMDManager:
                                 )
                             if _baseline_used > 0.25 * _baseline_total:
                                 _diagnosis += (
-                                    f"。⚠️ 开跑前的占用已达全卡 "
+                                    f"。[WARN] 开跑前的占用已达全卡 "
                                     f"{100.0 * _baseline_used / _baseline_total:.0f}% —— "
                                     "**先查是谁占的**（`nvidia-smi` 看 PID：同卡上的别的作业？"
                                     "上一次没杀干净的进程？本进程前面某个 CUDA 阶段没释放？）。"
@@ -20244,11 +20299,11 @@ class REMDManager:
                                 "'REMD 自己吃满'与'开跑前已被占'——先补这个数再决定要不要减 λ。"
                             )
                 _message = (
-                    "⚠️ REMD GPU Context 构建失败，已释放已创建的 replica contexts；"
+                    "[WARN] REMD GPU Context 构建失败，已释放已创建的 replica contexts；"
                     f"回退 CPU 重建。\n"
                     f"     原始错误 [{type(exc).__name__}]: {exc}\n"
                     f"     {_diagnosis}\n"
-                    "     ⛔ CPU 回退会让本阶段慢约两个数量级（实测 45354 原子 × 12 副本："
+                    "     CPU 回退会让本阶段慢约两个数量级（实测 45354 原子 × 12 副本："
                     "第 0 轮交换用了 29 分钟，500 轮约 10 天），表现得像卡死。"
                 )
                 logger.warning(_message)
@@ -20288,7 +20343,7 @@ class REMDManager:
                             indent=2,
                             ensure_ascii=False,
                         )
-                    print(f"  🧾 平台回退证据已落盘: {_fallback_path}")
+                    print(f"  平台回退证据已落盘: {_fallback_path}")
                 except Exception as _write_exc:  # noqa: BLE001
                     logger.warning("平台回退证据落盘失败: %s", _write_exc)
 
@@ -20347,7 +20402,7 @@ class REMDManager:
             "exception": str(exc) if exc is not None else None,
         }
 
-        print("\n🚨 [REMD-NaN诊断] 捕获到不稳定 context")
+        print("\n[ERR] [REMD-NaN诊断] 捕获到不稳定 context")
         print(
             f"  phase={phase} | context={context_idx} | state={state_idx} | "
             f"lambda_coul={lam_coul:.6f} | lambda_vdw={lam_vdw:.6f}"
@@ -20365,12 +20420,12 @@ class REMDManager:
             )
         except Exception as state_exc:
             diag["state_read_error"] = str(state_exc)
-            print(f"  ⚠️ 无法同时读取能量/坐标/受力: {state_exc}")
+            print(f"  [WARN] 无法同时读取能量/坐标/受力: {state_exc}")
             try:
                 state = ctx.getState(getPositions=True, enforcePeriodicBox=False)
             except Exception as pos_exc:
                 diag["position_read_error"] = str(pos_exc)
-                print(f"  ⚠️ 坐标也无法读取: {pos_exc}")
+                print(f"  [WARN] 坐标也无法读取: {pos_exc}")
 
         if state is not None:
             try:
@@ -20379,7 +20434,7 @@ class REMDManager:
                 diag["n_nonfinite_position_atoms"] = int(len(bad_pos))
                 diag["nonfinite_position_atoms"] = [self._atom_label(i) for i in bad_pos[:20]]
                 if len(bad_pos) > 0:
-                    print(f"  ❌ 非有限坐标原子数: {len(bad_pos)}")
+                    print(f"  [ERR] 非有限坐标原子数: {len(bad_pos)}")
                     print("     " + ", ".join(diag["nonfinite_position_atoms"]))
             except Exception as pos_exc:
                 diag["position_parse_error"] = str(pos_exc)
@@ -20410,7 +20465,7 @@ class REMDManager:
                     print(f"  max|F|={diag['max_force_kj_mol_nm']:.1f} kJ/mol/nm")
                 if len(bad_force) > 0:
                     diag["nonfinite_force_atoms"] = [self._atom_label(i) for i in bad_force[:20]]
-                    print(f"  ❌ 非有限受力原子数: {len(bad_force)}")
+                    print(f"  [ERR] 非有限受力原子数: {len(bad_force)}")
                     print("     " + ", ".join(diag["nonfinite_force_atoms"]))
                 if diag["top_force_atoms"]:
                     print("  Top受力原子:")
@@ -20434,7 +20489,7 @@ class REMDManager:
                 )
             except Exception as boresch_exc:
                 diag["boresch_geometry_error"] = str(boresch_exc)
-                print(f"  ⚠️ Boresch 几何诊断失败: {boresch_exc}")
+                print(f"  [WARN] Boresch 几何诊断失败: {boresch_exc}")
 
         group_stats = []
         if system is not None:
@@ -20467,9 +20522,9 @@ class REMDManager:
             out_path = os.path.join(self.output_dir, "remd_last_failure.json")
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(diag, f, indent=2, ensure_ascii=False)
-            print(f"  📝 REMD 失败诊断已写入: {out_path}")
+            print(f"  REMD 失败诊断已写入: {out_path}")
         except Exception as write_exc:
-            print(f"  ⚠️ REMD 诊断写入失败: {write_exc}")
+            print(f"  [WARN] REMD 诊断写入失败: {write_exc}")
 
         return diag
 
@@ -20493,7 +20548,7 @@ class REMDManager:
                 )
             if max_force > max_force_limit:
                 print(
-                    f"  ⚠️ [REMD] context {context_idx} state {state_idx} "
+                    f"  [WARN] [REMD] context {context_idx} state {state_idx} "
                     f"预检查 max|F|={max_force:.1f} > {max_force_limit:.1f}，执行短最小化"
                 )
                 openmm.LocalEnergyMinimizer.minimize(ctx, tolerance=20.0, maxIterations=1000)
@@ -20516,10 +20571,6 @@ class REMDManager:
         em_iters = int(os.environ.get("IBS_REMD_PREHEAT_EM_ITERS", "5000"))
         em_tol = float(os.environ.get("IBS_REMD_PREHEAT_EM_TOL", "10.0"))
         try:
-            print(
-                f"  [REMD] context {context_idx} state {state_idx} "
-                f"预热前 EM: lambda_coul={lam_coul:.6f}, lambda_vdw={lam_vdw:.6f}"
-            )
             openmm.LocalEnergyMinimizer.minimize(
                 ctx,
                 tolerance=em_tol * unit.kilojoule_per_mole / unit.nanometer,
@@ -20680,14 +20731,14 @@ class REMDManager:
                 )
             if not append_mode and exists:
                 print(
-                    f"  ⚠️ [REMD] {os.path.basename(f)} 已存在且本次以写模式重建"
+                    f"  [WARN] [REMD] {os.path.basename(f)} 已存在且本次以写模式重建"
                     "（旧帧属于被作废的采样分布，本次将从第 0 步跑满 n_steps）。"
                 )
         reporters = [
             app.DCDReporter(f, save_interval, append=append_mode, enforcePeriodicBox=False)
             for f in traj_files
         ]
-        print(f"\n🔄 启动传统 REMD (单卡懒加载极速版) | {self.n_replicas} 副本 | 交换间隔={exchange_interval}")
+        print(f"\n启动传统 REMD (单卡懒加载极速版) | {self.n_replicas} 副本 | 交换间隔={exchange_interval}")
         
         # 预热
         if not self._is_warmed_up:
@@ -20704,7 +20755,15 @@ class REMDManager:
             self._is_warmed_up = True
             
         exchange_log = []
-        
+        # 🔑 [2026-09-03] 逐**边**接受率。`exchange_log`/`mean_acceptance` 是逐
+        # **轮**的（一轮里所有相邻对一起平均），`min_acceptance` 是最差那一轮而
+        # 不是最差那条边——于是"哪条 λ 边太稀"这个信息一直拿不到，而定态数的
+        # 约束恰恰是最差那条边（δ_max），不是平均。
+        # 只统计真正执行过 Metropolis 判定的尝试：下面能量非有限的分支 `continue`
+        # 掉，那不是一次"被拒绝"，不能计入分母。
+        edge_accepts = [0] * max(0, self.n_replicas - 1)
+        edge_attempts = [0] * max(0, self.n_replicas - 1)
+
         for step in range(n_exchanges):
             # 1. 批量提交步进任务 (GPU 会在底层自动流水线并发，无需 Python 干预)
             prev_steps = self._steps_completed
@@ -20755,7 +20814,7 @@ class REMDManager:
 
                 if not np.all(np.isfinite([U_i_i, U_j_j, U_i_j, U_j_i])):
                     print(
-                        f"  ⚠️ [REMD] 交换能量非有限: pair=({state_i},{state_j}) "
+                        f"  [WARN] [REMD] 交换能量非有限: pair=({state_i},{state_j}) "
                         f"Uii={U_i_i}, Ujj={U_j_j}, Uij={U_i_j}, Uji={U_j_i}"
                     )
                     self._diagnose_context_failure(
@@ -20766,6 +20825,8 @@ class REMDManager:
                         ctx_idx_j,
                         f"{stage_name}:exchange_energy_state{state_i}_{state_j}",
                     )
+                    # 刻意不 edge_attempts[state_i] += 1：这一对根本没做判定，
+                    # 计入分母会把"探针坏了"混成"这条边重叠差"。
                     continue
                 
                 # --- 阶段 C: Metropolis 判定 ---
@@ -20788,6 +20849,9 @@ class REMDManager:
                     self._set_context_state(ctx_idx_i, state_j)
                     self._set_context_state(ctx_idx_j, state_i)
                     accepted += 1
+                edge_attempts[state_i] += 1
+                if accept:
+                    edge_accepts[state_i] += 1
                     
             # A one-replica REMD run is valid (it is simply a single-state
             # simulation), but has no exchange pairs. Avoid 0/0 and record a
@@ -20825,14 +20889,63 @@ class REMDManager:
             "platform_name": str(self.platform_name),
             "platform_fallback_reason": self.platform_fallback_reason,
             "n_exchange_attempts": int(n_exchanges),
+            # ⚠️ 下面四个是逐**轮**口径（一轮里所有相邻对一起平均）。
+            # `min_acceptance` 是最差那一**轮**，不是最差那条**边**——别拿它当
+            # "最稀的那条 λ 边"用。逐边口径见 edge_* 字段。
             "acceptance_by_round": [float(v) for v in exchange_log],
             "mean_acceptance": float(np.mean(exchange_log)) if exchange_log else 0.0,
             "min_acceptance": float(np.min(exchange_log)) if exchange_log else 0.0,
             "max_acceptance": float(np.max(exchange_log)) if exchange_log else 0.0,
+            # 🔑 [2026-09-03] 逐**边**口径。`edge_acceptance[i]` 是状态 i↔i+1 这条
+            # 边在整段运行里的接受率，分母只算真正做过 Metropolis 判定的尝试
+            # （能量非有限而跳过的对不计入，见交换循环里的说明）。
+            #
+            # 用途：相邻态接受率与该边的热力学长度是一一对应的
+            # （高斯近似下 ⟨P_acc⟩ = erfc(δ/2)，故 δ = 2·erfc⁻¹(P_acc)），所以逐边
+            # 接受率就是逐边 δ 的直接测量——这是判断 λ 态数够不够的判据，而定态数
+            # 的约束是**最差那条边**。刻意只落原始测量值、不在这里落反解出来的 δ：
+            # 那个反解依赖高斯近似，属于解释而不是测量，放在离线审计工具里做并在
+            # 那里说明假设。
+            #
+            # 长度恒为 n_replicas-1；`edge_attempts[i] == 0` 表示那条边一次判定都
+            # 没成功执行过（探针失败），此时 `edge_acceptance[i]` 记为 None 而不是
+            # 0.0——0.0 会被误读成"完全不接受"。
+            "edge_attempts": [int(v) for v in edge_attempts],
+            "edge_accepts": [int(v) for v in edge_accepts],
+            "edge_acceptance": [
+                (float(a) / float(n)) if n > 0 else None
+                for a, n in zip(edge_accepts, edge_attempts)
+            ],
         }
+        _edge_ok = [
+            float(a) / float(n)
+            for a, n in zip(edge_accepts, edge_attempts)
+            if n > 0
+        ]
+        exchange_summary["min_edge_acceptance"] = min(_edge_ok) if _edge_ok else None
+        exchange_summary["max_edge_acceptance"] = max(_edge_ok) if _edge_ok else None
+        exchange_summary["edges_without_attempts"] = [
+            int(i) for i, n in enumerate(edge_attempts) if n == 0
+        ]
         with open(os.path.join(self.output_dir, f"{stage_name}_exchange_diagnostics.json"), "w", encoding="utf-8") as f:
             json.dump(exchange_summary, f, indent=2)
-        print(f"✅ REMD 完成 | 平均交换接受率: {exchange_summary['mean_acceptance']:.3f}")
+        print(f"[OK] REMD 完成 | 平均交换接受率: {exchange_summary['mean_acceptance']:.3f}")
+        if _edge_ok:
+            _worst = int(min(range(len(_edge_ok)), key=lambda k: _edge_ok[k]))
+            print(
+                "   逐边接受率: "
+                + " ".join(
+                    ("--" if p is None else f"{p:.2f}")
+                    for p in exchange_summary["edge_acceptance"]
+                )
+                + f"  | 最差边 {_worst}↔{_worst + 1}: {min(_edge_ok):.3f}"
+                f" | 最好边: {max(_edge_ok):.3f}"
+            )
+        if exchange_summary["edges_without_attempts"]:
+            print(
+                "   [WARN] 以下 λ 边一次交换判定都没成功执行过（探针能量非有限）: "
+                f"{exchange_summary['edges_without_attempts']}"
+            )
         return traj_files
 
 
@@ -20948,7 +21061,7 @@ class BoreschAttachmentREMDManager(REMDManager):
             ):
                 self.platform_fallback_reason = str(exc)
                 print(
-                    "  ⚠️ attachment HREMD GPU Context 构建失败，已释放已创建的 contexts；"
+                    "  [WARN] attachment HREMD GPU Context 构建失败，已释放已创建的 contexts；"
                     f"回退 CPU 重建。原始错误: {exc}"
                 )
                 self.platform_name = "CPU"
@@ -21125,17 +21238,17 @@ def attachment_convergence_diagnostics(
     log(f"  交换接受率 平均 {mean_acc:.3f} / 最低 {exch.get('min_acceptance', float('nan'))}")
     log(f"  round trip 每副本: {trips}")
     log(f"  ⟨U_B⟩ 逐 λ: {[round(v, 3) for v in mean_ub]}"
-        + ("  ❌ 有倒挂" if violations else "  ✓ 单调"))
+        + ("  [ERR] 有倒挂" if violations else "  [OK] 单调"))
     if isinstance(half.get("drift"), float):
         log(f"  前后半程 {half['first']:.4f} / {half['second']:.4f}，"
             f"漂移 {half['drift']:+.4f}（|漂移|/2σ = {half['drift_over_2sigma']:.2f}）")
 
     if np.isfinite(mean_acc) and mean_acc < 0.20:
-        log(f"  ⚠️ 平均交换接受率 {mean_acc:.3f} < 0.20，λ 太稀，加中间态而不是加时间")
+        log(f"  [WARN] 平均交换接受率 {mean_acc:.3f} < 0.20，λ 太稀，加中间态而不是加时间")
     if max(trips) == 0:
-        log("  ⚠️ 没有任何副本完成 λ=0↔1 往返——副本交换等于没做，结果不比顺序窗口强")
+        log("  [WARN] 没有任何副本完成 λ=0↔1 往返——副本交换等于没做，结果不比顺序窗口强")
     if violations:
-        log(f"  ⚠️ ⟨U_B⟩ 有 {len(violations)} 处倒挂，仍未收敛")
+        log(f"  [WARN] ⟨U_B⟩ 有 {len(violations)} 处倒挂，仍未收敛")
 
     # 零 round trip = 副本交换等于没做，结果不比顺序窗口强，禁止进候选。
     if trips and max(trips) == 0:
@@ -21257,7 +21370,7 @@ class ShadowBridgeREMDManager(REMDManager):
             ):
                 self.platform_fallback_reason = str(exc)
                 print(
-                    "  ⚠️ Shadow-Bridge REMD GPU Context 构建失败，已释放已创建的 replica contexts；"
+                    "  [WARN] Shadow-Bridge REMD GPU Context 构建失败，已释放已创建的 replica contexts；"
                     f"回退 CPU 重建。原始错误: {exc}"
                 )
                 self.platform_name = "CPU"
@@ -21616,9 +21729,9 @@ class TraditionalMBARAnalyzer:
             # image_molecules 会根据拓扑连通性，将跨越边界的分子重新拼合
             # anchor_molecules 确保配体和受体不会在解包时被分到不同的镜像盒子
             traj.image_molecules(inplace=True)
-            print("  ✅ 轨迹 PBC 分子完整性已修复 (image_molecules)，消除撕裂隐患")
+            print("  [OK] 轨迹 PBC 分子完整性已修复 (image_molecules)，消除撕裂隐患")
         except Exception as e:
-            print(f"  ⚠️ PBC 修复失败: {e}，将使用原始坐标（存在跨盒撕裂导致 Energy Spike 的风险）")    
+            print(f"  [WARN] PBC 修复失败: {e}，将使用原始坐标（存在跨盒撕裂导致 Energy Spike 的风险）")    
         n_frames = traj.n_frames
         n_states = len(lambdas_coul)
         u_kn = np.zeros((n_states, n_frames))
@@ -21749,7 +21862,7 @@ class TraditionalMBARAnalyzer:
                 "volume_relative_span": relative_span,
             })
             print(
-                f"  ✅ 传统 Beutler LRC: v{TRADITIONAL_LJ_LRC_PROTOCOL_VERSION} "
+                f"  [OK] 传统 Beutler LRC: v{TRADITIONAL_LJ_LRC_PROTOCOL_VERSION} "
                 "switching+softcore-aware r^-6/r^-12 离线尾项已启用 "
                 f"({tail_sigma.size} 个 sigma 分组, V={mean_volume:.6f} nm^3, "
                 f"relative_span={relative_span:.3e})"
@@ -21820,7 +21933,7 @@ class TraditionalMBARAnalyzer:
                     ),
                 })
                 print(
-                    "  ℹ️ PME 自能诊断（未应用修正）: "
+                    "  PME 自能诊断（未应用修正）: "
                     f"Σq_offset²={offset_qsq:.6f} e²；OpenMM 已在每个 λ 态正确报告该项，"
                     "不再额外叠加 +Cλ² 修正。"
                 )
@@ -21862,7 +21975,7 @@ class TraditionalMBARAnalyzer:
                     ),
                 })
                 print(
-                    "  ℹ️ PME 自能诊断（未应用修正）: "
+                    "  PME 自能诊断（未应用修正）: "
                     f"Σq_offset²={offset_qsq:.6f} e²；OpenMM 已在每个 λ 态正确报告该项，"
                     "不再额外叠加 +Cλ² 修正。"
                 )
@@ -21889,7 +22002,7 @@ class TraditionalMBARAnalyzer:
             del eval_sys
 
         print(
-            f"\n📊 开始离线能量重算 | {n_frames} 帧 × {n_states} 态 | workers={n_workers} | "
+            f"\n开始离线能量重算 | {n_frames} 帧 × {n_states} 态 | workers={n_workers} | "
             f"chunk_size={chunk_size} | cpu_threads_per_worker={cpu_threads_per_worker}"
         )
         tasks = []
@@ -21956,7 +22069,7 @@ class TraditionalMBARAnalyzer:
                         u_kn[:, frame_offset:frame_end] = u_chunk
                         print(f"  → 帧 {frame_end}/{n_frames} 完成")
             except Exception as exc:
-                print(f"  ⚠️ 多进程重算失败，回退单进程: {exc}")
+                print(f"  [WARN] 多进程重算失败，回退单进程: {exc}")
                 for task in tasks:
                     frame_offset, u_chunk = _compute_u_kn_chunk(task)
                     frame_end = frame_offset + u_chunk.shape[1]
@@ -22010,7 +22123,7 @@ class TraditionalMBARAnalyzer:
             raise ValueError(f"MBAR 样本数不匹配: len(n_k)={len(n_k)}, sum(n_k)={np.sum(n_k)}, N={N}")
         if not np.all(np.isfinite(u_kn)):
             raise ValueError("u_kn 含 NaN/Inf，无法执行 MBAR")
-        if not HAS_PYMBAR:
+        if not has_pymbar():
             raise ImportError("需要 pymbar 包，请安装: pip install pymbar")
 
         # ------------------------------------------------------------------
@@ -22089,7 +22202,7 @@ class TraditionalMBARAnalyzer:
                     err = float(ddf_matrix[0, -1] * self.kt)
                 except Exception as cov_exc:
                     print(
-                        f"  ⚠️ MBAR 协方差求解失败 ({protocol}): {cov_exc}，"
+                        f"  [WARN] MBAR 协方差求解失败 ({protocol}): {cov_exc}，"
                         "尝试下一个 solver protocol 以求拿到真正的不确定度..."
                     )
                     if no_uncertainty_fallback is None:
@@ -22229,11 +22342,11 @@ class TraditionalMBARAnalyzer:
                 )
             except Exception as exc:
                 last_exc = exc
-                print(f"  ⚠️ MBAR {protocol} 求解失败: {exc}")
+                print(f"  [WARN] MBAR {protocol} 求解失败: {exc}")
 
         if no_uncertainty_fallback is not None:
             print(
-                "  🚨 所有 solver protocol 均无法给出不确定度估计；"
+                "  [ERR] 所有 solver protocol 均无法给出不确定度估计；"
                 f"返回 {no_uncertainty_fallback['method']} 的 ΔG，error 标记为 nan——"
                 "这条腿/阶段的最终误差棒不可信，请检查窗口重叠率与采样长度。"
             )
@@ -22330,14 +22443,14 @@ class TraditionalMBARAnalyzer:
                 result["ti_gate_failed"] = True
                 if result["ti_gate"].get("passed") is False:
                     print(
-                        f"  🚨 [TI 门] BAR 与重加权 FD-TI 分歧 "
+                        f"  [ERR] [TI 门] BAR 与重加权 FD-TI 分歧 "
                         f"{result['ti_gate']['abs_diff_kJ_mol']:.4f} > 容差 "
                         f"{result['ti_gate']['tolerance_kJ_mol']:.4f} kJ/mol "
                         "⟹ converged=False"
                     )
                 else:
                     print(
-                        "  🚨 [TI 门] BAR 主值缺少可判定且明确通过的 FD-TI 证据 "
+                        "  [ERR] [TI 门] BAR 主值缺少可判定且明确通过的 FD-TI 证据 "
                         f"({result['ti_gate'].get('reason')}) ⟹ converged=False"
                     )
 
@@ -22362,3 +22475,12 @@ class TraditionalMBARAnalyzer:
             ),
         })
         return result
+
+
+# [CLI-01, 2026-09-02] `HAS_PYMBAR` 改成惰性探测后模块里不再有这个全局名；
+# 外部若仍读 `ibs_engine.HAS_PYMBAR`，这里用 PEP 562 补上布尔值。
+# 模块内部一律调 `has_pymbar()`（全局名查找不走 `__getattr__`）。
+def __getattr__(name: str):
+    if name == "HAS_PYMBAR":
+        return has_pymbar()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

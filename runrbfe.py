@@ -24,6 +24,7 @@
     python runrbfe.py validate --config rbfe_edge.json
     python runrbfe.py combine  --complex-json c.json --solvent-json s.json
     python runrbfe.py template > rbfe_edge.json
+    python runrbfe.py map --ligand-a A.itp --ligand-b B.itp --out atom_mapping.json
 """
 
 from __future__ import annotations
@@ -247,7 +248,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
     try:
         spec = load_edge_spec(args.config)
     except rc.RBFEValidationError as exc:
-        print(f"❌ 配置加载失败：{exc}", file=sys.stderr)
+        print(f"[ERR] 配置加载失败：{exc}", file=sys.stderr)
         return EXIT_REJECTED
 
     report = rc.validate_edge(spec)
@@ -275,14 +276,14 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
     if not report.ok:
         print(
-            f"\n❌ 拒绝：{len(report.errors)} 项。这些是本项目首版的范围限制"
+            f"\n[ERR] 拒绝：{len(report.errors)} 项。这些是本项目首版的范围限制"
             "（计划 §2），不代表 RBFE 方法普遍不支持这些变换。",
             file=sys.stderr,
         )
         return EXIT_REJECTED
 
     print(
-        f"\n✅ 通过 R0 验证。⚠ 但有 {len(report.unchecked)} 项**本阶段查不了**"
+        f"\n[OK] 通过 R0 验证。[WARN] 但有 {len(report.unchecked)} 项**本阶段查不了**"
         "（需要原子映射，属于 R1）——通过不等于全都查过了。",
         file=human,
     )
@@ -296,17 +297,83 @@ def cmd_combine(args: argparse.Namespace) -> int:
         solvent_leg = load_leg_result(args.solvent_json, rc.PHASE_SOLVENT)
         result = rc.combine_rbfe(complex_leg, solvent_leg, covariance=args.covariance)
     except (rc.RBFEValidationError, ValueError) as exc:
-        print(f"❌ 汇总失败：{exc}", file=sys.stderr)
+        print(f"[ERR] 汇总失败：{exc}", file=sys.stderr)
         return EXIT_REJECTED
 
     print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
     print(f"\n{result.interpretation()}", file=sys.stderr)
     if not result.qualified:
         print(
-            f"⚠ 未通过 qualification：{'; '.join(result.qualification_reasons)}",
+            f"[WARN] 未通过 qualification：{'; '.join(result.qualification_reasons)}",
             file=sys.stderr,
         )
     return EXIT_OK
+
+
+def cmd_map(args: argparse.Namespace) -> int:
+    """R1a：算出 A→B 原子映射并落盘，供人工审计。
+
+    计划 §8 的 R1 验收标准第一条就是「**映射可审计**」。映射躺在内存里没法审，
+    所以这个子命令的产物就是 `atom_mapping.json`——片段配对、公共核心、
+    A-only/B-only、对称等价解数量、歧义说明全在里面。
+    """
+    try:
+        graph_a = _load_ligand_graph(args.ligand_a, args.moleculetype_a, "A")
+        graph_b = _load_ligand_graph(args.ligand_b, args.moleculetype_b, "B")
+        mapping = rc.map_atoms(graph_a, graph_b, allow_mcs=not args.no_mcs)
+    except rc.RBFEValidationError as exc:
+        print(f"[ERR] 映射失败：{exc}", file=sys.stderr)
+        return EXIT_REJECTED
+
+    report = rc.validate_mapping(mapping, graph_a, graph_b)
+    payload = dict(mapping.to_dict())
+    payload["fingerprint"] = mapping.fingerprint()
+    payload["validation"] = {
+        "ok": report.ok,
+        "errors": report.errors,
+        "warnings": report.warnings,
+        "unchecked": report.unchecked,
+    }
+
+    human = sys.stderr if args.json else sys.stdout
+    print(
+        f"A: {graph_a.n_atoms} 原子 B: {graph_b.n_atoms} 原子\n"
+        f"公共核心 {mapping.n_core}；A-only {len(mapping.a_only)}；"
+        f"B-only {len(mapping.b_only)}\n"
+        f"method={mapping.method} fingerprint={mapping.fingerprint()[:16]}…",
+        file=human,
+    )
+    print(report.render(), file=human)
+
+    if args.out:
+        Path(args.out).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"→ 已写入 {args.out}", file=human)
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+    if not report.ok:
+        print(f"\n[ERR] 映射被拒绝：{len(report.errors)} 项。", file=sys.stderr)
+        return EXIT_REJECTED
+    print(
+        f"\n[OK] 映射通过验证。[WARN] 仍有 {len(report.unchecked)} 项本层查不了"
+        "（手性/姿势/互变异构需要坐标，建系相关需要 R1b）。",
+        file=human,
+    )
+    return EXIT_OK
+
+
+def _load_ligand_graph(path: str, moleculetype: Optional[str], label: str):
+    """按后缀选择配体图的来源。首版只认已参数化的 GROMACS 输入（计划 §5.1）。"""
+    suffix = Path(path).suffix.lower()
+    if suffix in (".itp", ".top"):
+        return rc.MolecularGraph.from_gromacs_itp(path, moleculetype)
+    raise rc.RBFEMappingError(
+        f"配体 {label} 的输入 {path!r} 后缀是 {suffix!r}，本层不认识。"
+        "首版锁定的输入路线是**已参数化的 GROMACS 输入**（.itp/.top）；"
+        "SDF 等需要自动参数化的路线首版一律拒绝，不自动猜测转换（计划 §5.1）。"
+    )
 
 
 def cmd_template(args: argparse.Namespace) -> int:
@@ -317,7 +384,7 @@ def cmd_template(args: argparse.Namespace) -> int:
 def _not_implemented(stage: str, detail: str):
     def _run(args: argparse.Namespace) -> int:
         print(
-            f"❌ `{stage}` 属于 {detail}，尚未实现。\n"
+            f"[ERR] `{stage}` 属于 {detail}，尚未实现。\n"
             f"   当前 runrbfe.py 只有 validate / combine / template（R0）。\n"
             f"   见 docs/design/PLAN_rbfe_interface_and_implementation.md §8。",
             file=sys.stderr,
@@ -359,8 +426,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_tpl = sub.add_parser("template", help="打印一份边配置模板")
     p_tpl.set_defaults(func=cmd_template)
 
+    p_map = sub.add_parser(
+        "map", help="算出并审计 A→B 原子映射（R1a，不启动计算）"
+    )
+    p_map.add_argument("--ligand-a", required=True, help="配体 A 的 .itp/.top")
+    p_map.add_argument("--ligand-b", required=True, help="配体 B 的 .itp/.top")
+    p_map.add_argument("--moleculetype-a", default=None, help="A 的 moleculetype 名")
+    p_map.add_argument("--moleculetype-b", default=None, help="B 的 moleculetype 名")
+    p_map.add_argument("--out", default=None, help="写出 atom_mapping.json 的路径")
+    p_map.add_argument(
+        "--no-mcs",
+        action="store_true",
+        help=(
+            "完全不使用 rdkit：差异片段整块进 dummy。结果仍然正确，"
+            "但公共核心更小、收敛更差；降级会写进 method 字段"
+        ),
+    )
+    p_map.add_argument("--json", action="store_true", help="stdout 输出机器可读映射")
+    p_map.set_defaults(func=cmd_map)
+
     for name, detail in (
-        ("prepare", "R1（映射与 hybrid builder）"),
+        ("prepare", "R1b（hybrid builder；映射本身见 `map` 子命令）"),
         ("run", "R2（采样；还依赖 free_energy_engine 的 P2′ 接线）"),
         ("analyze", "R2（对真实 hybrid Hamiltonian 做 MBAR）"),
     ):

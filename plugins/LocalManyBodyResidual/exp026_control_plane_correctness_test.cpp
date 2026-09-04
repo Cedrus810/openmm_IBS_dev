@@ -1,3 +1,18 @@
+/* ---------------------------------------------------------------------------- *
+ * ABFE-IBS -- LocalManyBodyResidual plugin                                     *
+ *                                                                              *
+ * Copyright (c) 2026 Ruigeng Ji                                                *
+ *                                                                              *
+ * This plugin's directory layout, build scaffolding and API skeleton are       *
+ * derived from the OpenMM example plugin, which is MIT-licensed.               *
+ * Portions copyright (c) Stanford University and the Authors.                  *
+ *                                                                              *
+ * Distributed under the MIT License; see LICENSE at the repository root for    *
+ * the full text.  This plugin is compiled against OpenMM headers and linked    *
+ * at run time against a separately installed OpenMM, whose CUDA, HIP and       *
+ * OpenCL platforms are covered by the LGPL -- see NOTICE.                      *
+ * ---------------------------------------------------------------------------- */
+
 // EXP-026 Patch A1: device-resident control-plane correctness test.
 //
 // Scope: this test targets exactly what Patch A changed (unique-environment
