@@ -1,8 +1,9 @@
 # 设计文档状态索引
 
-复核日期：**2026-09-02**（逐份对当前源码核对过，不是转述）
+复核日期：**2026-09-03**（逐份对当前源码核对过，不是转述）
 
-> 本轮除了复核，还实现了 REMD 的 P0/P2′ 与 RBFE 的 R0，见下方状态表与各计划的第 0 节。
+> 08-31 那轮实现了 REMD 的 P0/P2′ 与 RBFE 的 R0；**09-03 这轮实现了 RBFE 的 R1a**
+> （原子映射）。见下方状态表与各计划的第 0 节。
 
 `docs/design/` 里有两类东西，**混在一起读会出事**：
 「合同」描述的是**代码现在就在跑的规则**；「提案／计划」描述的是**当时想做的事**，
@@ -12,8 +13,9 @@
 | 文件 | 类型 | 状态 | 一句话 |
 |---|---|---|---|
 | [PLAN_openmm_8_6_remd_backend.md](PLAN_openmm_8_6_remd_backend.md) | 计划 | 🟡 **P0 完成 / P2′ 未接线** | `free_energy_engine.py`：选择器已接进 `--remd-backend`；采样契约已写好但三个 REMDManager 调用点仍走老路；P1 等 OpenMM 升级 |
-| [PLAN_rbfe_interface_and_implementation.md](PLAN_rbfe_interface_and_implementation.md) | 计划 | 🟢 **R0 完成** | `rbfe_core.py` + `runrbfe.py`（validate/combine/template）；R1 起未开始；**配体 B 至今未提供，R3 无法开始** |
-| [PROPOSAL_rbfe_r1_fragment_mapping.md](PROPOSAL_rbfe_r1_fragment_mapping.md) | 提案 | ⬜ **待决定** | R1 原子映射走「片段级」路线的论证：可复用的四块图论代码、三条候选路线的取舍、以及三个需要用户拍板的问题 |
+| [PLAN_rbfe_interface_and_implementation.md](PLAN_rbfe_interface_and_implementation.md) | 计划 | 🟢 **R0 + R1 完成** | R0 契约/验证/汇总 + R1a 原子映射 + **R1b 受限 hybrid builder**（`build_hybrid_system`，端点等价/有限差分力/逐 λ 电荷三项验收已过）；`rbfe_pipeline.py` 已于 09-01 建好（本表此前误记为「不存在」）；**R2 未开始，`prepare_edge` 卡在「可跑的配体 B」** |
+| [PROPOSAL_rbfe_r1_fragment_mapping.md](PROPOSAL_rbfe_r1_fragment_mapping.md) | 提案 | ✅ **已采纳并实施**（2026-09-03） | 用户选定 §3 的 **A+B 混合**路线；M0-M6 全部落地在 `rbfe_core.py`，见 PLAN 第 0 节的 R1a 段 |
+| [PLAN_rbfe_pipeline_wiring.md](PLAN_rbfe_pipeline_wiring.md) | 计划 | ⬜ **盘点完成，未开工** | RBFE 作为一条 pipeline 还缺什么：接口漂移、身份指纹的两个洞、§7 产物树落了 2/6、续跑只有拒绝没有继续。**除建系外全都不依赖那份还没有的配体 B** |
 | [PROPOSAL_periodic_box_geometry_detection.md](PROPOSAL_periodic_box_geometry_detection.md) | 提案 | ⬜ **待决定** | 非长方体输入盒（截角八面体 / 菱形十二面体 / 一般三斜）的早期识别与统一处理：为什么不能靠盒矩阵字面值分类、各输入格式的盒子从哪读、以及一个「所有格式收敛成同一个报告对象」的漏斗设计 |
 
 ## 待办前沿（2026-08-31 更新）
@@ -48,6 +50,36 @@
 旧的 `LAMBDA_SCHEDULE_CONTRACT.md` 已归档（它描述的 23 态路径当前体系不走），
 当前 4W53 的 12 态路径只有代码、没有书面合同。要重写就基于
 `_greedy_vanishing_window_ranges()` 的实际行为写，**不要**照着归档件改。
+
+## 2026-09-03 新增：RBFE R1（R1a 映射 + R1b hybrid builder）落地
+
+用户拍板两件事，都记在 PLAN 的第 0 节：
+
+1. **映射路线 = A+B 混合**（片段级匹配 + 片段内 rdkit MCS）；
+2. **配体 B 从现有拓扑派生**（改配体残基的一个末端基团），不从外部取。
+
+R1a 全部完成并在仓库自带的真实 Atenolol 上验证；新增 55 条测试。
+`docs/design/PROPOSAL_rbfe_r1_fragment_mapping.md` 因此从「待决定」转为「已采纳」。
+
+同日用户追加决定：**RBFE 直接 import `abfe_core` 复用，但不改 ABFE 一行代码。**
+据此完成 **R1b 受限 hybrid builder**（`build_hybrid_system`），新增 44 条测试；
+`abfe_core.py / abfe_pipeline.py / ibs_engine.py / runabfe.py` 全程未改，
+import 一律惰性（放函数体内），以保住 R0/R1a「不 import openmm」的性质。
+
+⚠ 五条实测结论，下次接手别推翻：
+* 片段生长必须按**接点原子对应**，按签名生长会把差异片段之后的整段误判成 dummy
+  （而且验证照样 PASS，很隐蔽）；
+* 差异基团在分子中部时，**不用 MCS 的保守路径给不出可用映射**（核心会被切断）；
+* **`max(0.0, nan)` 在 Python 里返回 `0.0`**——端点比对一度把 NaN 力偏差静默当成
+  零偏差通过验收。非有限值必须显式抛错，别指望比较运算替你挡住；
+* NaN 来自 `CustomTorsionForce` 在四原子共线处导数没定义（native `PeriodicTorsionForce`
+  在那里是安全的）→ 纯 core 且 A、B 相同的二面角一律走 native 力；
+* 从 ABFE 抄电荷 offset：**机制照用、系数必须换**。`ibs_engine.py:3583` 写的是
+  `base=0, scale=chargeProd`（插到零，ABFE 的端点），RBFE 必须是
+  `base=值ᴬ, scale=值ᴮ−值ᴬ`；它那个「单端炼金」异或前提在 RBFE 里不成立。
+
+⚠ 本表在 2026-09-02 那次复核里把 `rbfe_pipeline.py` 记成「不存在」，
+但它 2026-09-01 就建好了（768 行 + 43 条测试）。已订正。
 
 ## 2026-09-02 新增
 

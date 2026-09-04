@@ -1,20 +1,43 @@
 name: openmm-ibs-ci
 channels:
   - conda-forge
+# ============================================================================
+# CPU CI 环境（2026-09-04 重划）
+# ============================================================================
+#
+# 与 environment.yml 的分工不同，**这里只钉「能改数字的」**：
+#
+#   钉死  = 换了版本就可能让自由能/不确定度/几何算出不同结果的包。
+#   放开  = 纯工具链。钉住它们对科学正确性零收益，只会让 CI 隔三差五因为
+#           一个无关的上游升级变红，然后所有人学会忽略红灯。
+#
+# 完整锁定的是 environment.yml（328 个包全钉，含 pip 段）——那是权威环境、
+# 生产结果的出处。CI 是回归网，不是复现基线，两者目的不同。
+#
+# 下面钉死的版本与 environment.yml 保持一致。.github/workflows/cpu-ci.yml 的
+# "Verify required runtime" 会**读这个文件**逐个对账（不复制版本号，免得两处
+# 各自漂移），解析到的版本对不上就在建任何 Context 之前失败。
+# ============================================================================
 dependencies:
+  # ---- 只跟到次版本：解释器补丁版不影响数值，还能拿到安全更新 ----
   - python=3.12
-  - openmm
-  # PLAN_openmm_8_6_remd_backend.md §3 实施要求 1：REMD 后端选择必须用
-  # packaging.version 做语义版本比较（字符串序下 '8.10.0' < '8.6.0'）。
-  # 它通常作为 setuptools 的传递依赖存在，但显式声明才不会哪天被优化掉。
-  - packaging
+
+  # ---- 钉死：换版本就可能改结果 ----
+  - openmm=8.5.2
   - pymbar-core=4.2.0
-  - numpy
-  - scipy
-  - mdtraj
-  - rdkit
-  - pandas
+  - numpy=2.4.3
+  - scipy=1.17.1
+  - mdtraj=1.11.1
+  - rdkit=2026.03.5
+  - pandas=2.3.3
+  - pdbfixer=1.12
+
+  # ---- 放开：纯工具链，版本对数值无影响 ----
+  # packaging：PLAN_openmm_8_6_remd_backend.md §3 实施要求 1——REMD 后端选择
+  # 必须用 packaging.version 做语义版本比较（字符串序下 '8.10.0' < '8.6.0'）。
+  # 它通常作为传递依赖存在，但显式声明才不会哪天被优化掉。只要在，版本无所谓。
+  - packaging
+  # pyyaml：cpu-ci.yml 的版本对账步骤用它解析本文件。
   - pyyaml
-  - pdbfixer
   - pytest
   - pip

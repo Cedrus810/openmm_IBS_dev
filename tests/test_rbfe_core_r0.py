@@ -404,17 +404,38 @@ def test_manifest_carries_full_identity():
     [
         (rc.prepare_edge, (None,)),
         (rc.build_hybrid_leg, (None, "complex")),
-        (rc.analyze_leg, (None, None)),
     ],
 )
 def test_unimplemented_stages_raise(fn, args):
-    """「不提供尚未实现但返回成功的占位 sampler」——接口存在 ≠ 科学计算可用。"""
+    """「不提供尚未实现但返回成功的占位 sampler」——接口存在 ≠ 科学计算可用。
+
+    ⚠ `analyze_leg` **已于 2026-09-03（R2）实现**，从这张表里移走了。
+    它此前是第三个参数化用例；实现之后 `analyze_leg(None, None)` 会先因为缺
+    keyword-only 参数抛 `TypeError`，而不是 `NotImplementedError`——留着的话
+    这条测试测的就不再是「未实现的必须抛错」，而是「调用签名写错了会报错」。
+    真正实现了的东西不该继续挂在"未实现"清单里。
+    """
     with pytest.raises(NotImplementedError):
         fn(*args)
 
 
-def test_core_does_not_import_abfe_or_openmm():
-    """依赖方向：rbfe_core 不得反向 import pipeline / ABFE / ibs_engine / openmm。"""
+def test_core_has_no_module_level_openmm_or_abfe_import():
+    """`rbfe_core` **模块顶层**不得 import openmm / ABFE / ibs_engine / rbfe_pipeline。
+
+    ## 这条测的是什么，以及为什么口径变了
+
+    原本的意图是「rbfe_core 不得反向 import ABFE」。2026-09-03 用户明确改口：
+    **RBFE 直接 import `abfe_core` 复用，但不改 ABFE 一行代码。** 所以「不许 import」
+    不再成立，剩下的约束是**位置**：
+
+      * 顶层 import 会让 `import rbfe_core` 无条件拉进 openmm/pymbar——R0 与 R1a
+        那两层「不 import openmm、不启动 GPU」的性质连同它们上百条测试会一起失效；
+      * 函数体内的惰性 import 只在真正用到 R1b/R2 时付出代价，两个性质都保住。
+
+    判据因此是「行首（第 0 列）不得出现这些 import」。缩进的惰性 import 是**刻意的**，
+    不算违规。`rbfe_pipeline` 仍然一概不许——那是真正的反向依赖，跟位置无关，
+    另有下面一条专门守它。
+    """
     from pathlib import Path
 
     source = Path(rc.__file__).read_text(encoding="utf-8")
@@ -427,4 +448,42 @@ def test_core_does_not_import_abfe_or_openmm():
             for mod in ("openmm", "abfe_core", "abfe_pipeline", "ibs_engine", "rbfe_pipeline")
         )
     ]
-    assert not offenders, f"违反依赖方向：{offenders}"
+    assert not offenders, f"这些 import 必须挪进函数体（惰性）：{offenders}"
+
+
+def test_core_never_imports_rbfe_pipeline_even_lazily():
+    """反向依赖是硬禁：`rbfe_core` 任何位置都不许 import `rbfe_pipeline`。
+
+    与上一条不同——那条管的是"放哪里"，这条管的是"能不能"。依赖方向
+    `runrbfe -> rbfe_pipeline -> rbfe_core` 是单向的，反过来就成环。
+    """
+    from pathlib import Path
+
+    source = Path(rc.__file__).read_text(encoding="utf-8")
+    offenders = [
+        line.strip()
+        for line in source.splitlines()
+        # 只看**真正的 import 语句**。此前这里是裸的 `"import " in line`，
+        # 结果把模块文档串里"本模块不 import rbfe_pipeline"那句话当成了违规。
+        if "rbfe_pipeline" in line
+        and (line.strip().startswith("import ") or line.strip().startswith("from "))
+    ]
+    assert not offenders, f"rbfe_core 反向 import 了 rbfe_pipeline：{offenders}"
+
+
+def test_lazy_imports_are_actually_lazy():
+    """确认惰性 import 真的惰性：单独 import rbfe_core 不应把 openmm 拉进来。"""
+    import subprocess
+    import sys as _sys
+    from pathlib import Path
+
+    repo_root = Path(rc.__file__).resolve().parent
+    probe = (
+        "import sys; sys.path.insert(0, %r); import rbfe_core; "
+        "print('openmm' in sys.modules, 'ibs_engine' in sys.modules)" % str(repo_root)
+    )
+    out = subprocess.run(
+        [_sys.executable, "-c", probe], capture_output=True, text=True, timeout=300
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "False False", out.stdout

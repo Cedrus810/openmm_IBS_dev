@@ -36,3 +36,11 @@ ABFE-IBS 是一个基于 OpenMM、面向 GROMACS 输入的绝对结合自由能�
 原始 `output*`、验证轨迹、checkpoint、日志和历史结论均为证据，保存在 `Atenolol-rank11`；
 文档整理不删除或原地改写它们。
 
+## 许可
+
+本项目以 [MIT License](LICENSE) 发布，Copyright (c) 2026 Ruigeng Ji。
+
+依赖的第三方组件（尤其是 **OpenMM 的双授权结构**：public API / reference /
+CPU platform / application layer 是 MIT，而 CUDA、HIP、OpenCL platform 是
+LGPL）以及本项目据以合规的依据，见 [NOTICE](NOTICE)。本仓库不 vendor 任何
+第三方源码，也不随包分发任何第三方二进制。

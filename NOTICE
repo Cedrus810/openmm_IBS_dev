@@ -1,0 +1,81 @@
+ABFE-IBS
+Copyright (c) 2026 Ruigeng Ji
+
+Distributed under the MIT License.  See LICENSE for the full text.
+
+
+================================================================================
+Third-party components
+================================================================================
+
+ABFE-IBS vendors no third-party source and redistributes no third-party
+binary.  Everything below is imported or linked at run time from a copy the
+user installed separately (conda-forge).  This section exists to satisfy the
+attribution obligations those components carry.
+
+
+--------------------------------------------------------------------------
+OpenMM -- https://openmm.org
+--------------------------------------------------------------------------
+
+OpenMM is NOT distributed under a single license.  Per the OpenMM User Guide,
+section 8.1.2:
+
+    "The public API, the low level API, the reference platform, the CPU
+     platform, and the application layer are all distributed under the MIT
+     license.  The CUDA, HIP, and OpenCL platforms are distributed under the
+     GNU Lesser General Public License (LGPL)."
+
+Both halves are in play here:
+
+  * The Python layer imports the MIT-licensed application layer and public
+    API.
+  * The native plugin under plugins/LocalManyBodyResidual/platforms/cuda/
+    includes OpenMM's CUDA platform headers -- CudaContext.h and
+    openmm/common/ComputeArray.h -- and so builds against the LGPL half.
+
+ABFE-IBS relies on LGPL-3 section 4(d)(1): the plugin is loaded at run time
+by OpenMM's own plugin loader, against a copy of OpenMM that the user
+installed separately.  Concretely:
+
+  * No OpenMM source is copied into this repository.
+  * No OpenMM binary is redistributed with it.  .gitignore excludes *.so,
+    *.a and plugins/*/build*/, so only plugin source is tracked.
+  * ABFE-IBS does not modify OpenMM itself; the plugin is a separate shared
+    library that registers its own kernel factory.
+
+License texts:
+    LGPL-3.0  https://www.gnu.org/licenses/lgpl-3.0.txt
+    GPL-3.0   https://www.gnu.org/licenses/gpl-3.0.txt
+
+NOTE -- this repository is a source-only distribution, for which linking to
+those texts is sufficient.  If a binary distribution is ever produced that
+bundles a compiled plugin alongside OpenMM libraries, the full LGPL-3 and
+GPL-3 texts must be shipped inside that distribution.
+
+The plugin's directory layout, build scaffolding and API skeleton are derived
+from the OpenMM example plugin, which is MIT-licensed:
+
+    Portions copyright (c) Stanford University and the Authors.
+
+
+--------------------------------------------------------------------------
+MDTraj -- https://mdtraj.org -- LGPL-2.1-or-later
+--------------------------------------------------------------------------
+
+Imported at run time only.  Not vendored, not redistributed, not modified.
+
+    License text: https://www.gnu.org/licenses/lgpl-2.1.txt
+
+
+--------------------------------------------------------------------------
+Permissively licensed run-time dependencies
+--------------------------------------------------------------------------
+
+Imported at run time only.  Not vendored, not redistributed, not modified.
+
+    PyMBAR      MIT             https://github.com/choderalab/pymbar
+    PDBFixer    MIT             https://github.com/openmm/pdbfixer
+    NumPy       BSD-3-Clause    https://numpy.org
+    SciPy       BSD-3-Clause    https://scipy.org
+    RDKit       BSD-3-Clause    https://www.rdkit.org

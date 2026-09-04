@@ -69,18 +69,64 @@ jobs:
           environment-file: environment-ci.yml
           cache-environment: true
           cache-downloads: true
+      # 版本核对必须**断言**、不能只 print。这一步存在的唯一理由是：解析出来的
+      # 版本一旦偏离 environment-ci.yml 的固定值，失败要发生在这里、并把实际
+      # 解析到的字符串打出来，而不是留到某条测试体内部报一个难懂的数值不符。
+      #
+      # 2026-09-04：pymbar 这条曾经因为"不确定 CI 上 pymbar-core=4.2.0 到底解析成
+      # 什么 __version__"而被 --deselect 绕过（issue #76）。已在 openmm_dev 实测：
+      # conda-forge 的 pymbar-core 4.2.0 是 noarch 包，pymbar.__version__ 就是
+      # "4.2.0"，契约测试通过。绕过已删除，改由下面的对账守住。
+      #
+      # 同日把 environment-ci.yml 整份钉死，对账范围随之从 pymbar 扩到全部。
+      # 版本号**不在这里重复一遍**——直接读 environment-ci.yml，让它保持唯一真源，
+      # 否则改了 env 文件忘了改这里，断言就变成守着一个过期的期望值。
       - name: Verify required runtime
         shell: bash -el {0}
         run: |
-          python -c "import openmm, pymbar, numpy, scipy, mdtraj; print(openmm.__version__, pymbar.__version__)"
-      # 2026-08-31 临时绕过：pymbar 版本契约（issue #76）暂时不在 CI 里判定。
-      # 该用例断言 pymbar.__version__ == 4.2.0，然后才验证 compute_free_energy_differences
-      # 的默认 uncertainty_method 等价于 "svd-ew"。测试文件本身没有被改动，本地和
-      # GPU 节点仍然会跑到它；这里只是把 CI 这一条 deselect 掉。
-      # TODO: 确认 environment-ci.yml 的 pymbar-core=4.2.0 在 CI 上真正解析到的
-      # __version__ 字符串之后，删掉下面的 --deselect 让契约重新生效。
+          python - <<'PYEOF'
+          import pathlib
+
+          import mdtraj, numpy, openmm, pandas, pymbar, scipy, yaml
+
+          pins = {}
+          for spec in yaml.safe_load(
+              pathlib.Path("environment-ci.yml").read_text(encoding="utf-8")
+          )["dependencies"]:
+              if isinstance(spec, str) and "=" in spec:
+                  name, _, version = spec.partition("=")
+                  pins[name] = version
+
+          # import 名 -> (实际版本, environment-ci.yml 里的包名)
+          checked = {
+              "openmm": (openmm.__version__, "openmm"),
+              "pymbar": (pymbar.__version__, "pymbar-core"),
+              "numpy": (numpy.__version__, "numpy"),
+              "scipy": (scipy.__version__, "scipy"),
+              "mdtraj": (mdtraj.__version__, "mdtraj"),
+              "pandas": (pandas.__version__, "pandas"),
+          }
+
+          # environment-ci.yml 只钉「能改数字的」，工具链是故意放开的。但下面这几个
+          # 必须是钉住的——某天有人把其中一条放开时，要在这里读到一句人话，
+          # 而不是一个 KeyError。
+          unpinned = sorted(name for _, name in checked.values() if name not in pins)
+          assert not unpinned, (
+              f"environment-ci.yml 里这些包没有钉版本，但它们会影响数值结果：{unpinned}。"
+              "要么钉回去，要么把它从本步骤的对账表里删掉并说明理由。"
+          )
+
+          drifted = []
+          for label, (actual, conda_name) in sorted(checked.items()):
+              want = pins[conda_name]
+              print(f"{label} {actual} (pinned {want})")
+              if actual != want:
+                  drifted.append(f"{label} 期望 {want} 实际 {actual}")
+
+          assert not drifted, (
+              "解析到的版本与 environment-ci.yml 的固定值不符：" + "；".join(drifted)
+          )
+          PYEOF
       - name: Run CPU test suite
         shell: bash -el {0}
-        run: >-
-          python -m pytest -m "not needs_gpu" -q -ra
-          --deselect tests/test_pymbar_version_and_uncertainty_contract.py::test_pymbar_420_default_uncertainty_matches_explicit_svd_ew
+        run: python -m pytest -m "not needs_gpu" -q -ra

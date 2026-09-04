@@ -8,6 +8,10 @@ ABFE 核心物理模块 (v6.0 - 完整收敛版)
 """
 
 import os
+import sys
+import contextlib
+import functools
+import tempfile
 
 # ============================================================================
 # [P0-REMD-CUDA] 必须在**任何** pymbar/JAX import 之前执行。
@@ -60,19 +64,90 @@ try:
     HAS_MDTRAJ = True
 except ImportError:
     HAS_MDTRAJ = False
-try:
-    import torch
-    from openmmml import MLPotential
+# [CLI-01, 2026-09-02] `torch` / `openmmml` / `pymbar` 以前在这里 eager import，
+# 于是**任何** import abfe_core 的入口都要付它们的代价：实测 `runabfe.py --help`
+# 4.3 s 里 torch 1.31 s + pymbar 1.12 s（`python -X importtime`），而 --help、
+# self-test、配置诊断这些路径一个都用不到它们。
+#
+# 改成惰性 memoized 探测，语义与旧的 try/except 完全一致：
+#   * `has_orb()` / `has_pymbar()` 仍然只回答"装没装"，不抛异常；
+#   * `HAS_ORB` / `HAS_PYMBAR` 作为模块属性继续可读（见文件末尾的
+#     `__getattr__`），外部 `abfe_core.HAS_PYMBAR` 和测试里的 monkeypatch
+#     都不受影响；
+#   * 真正要用模块对象的地方走 `_require_torch()` / `_require_pymbar()`。
+# 这是 [ATT-04] 那次"torch 不得有 import 期副作用"的同一条思路的延伸——那次
+# 消掉的是 import 期 `torch.cuda` 调用，这次消掉 import 本身。
+_TORCH_MODULE = None
+_MLPOTENTIAL_CLASS = None
+_ORB_PROBED = False
+_PYMBAR_MODULE = None
+_PYMBAR_PROBED = False
 
-    HAS_ORB = True
-except ImportError:
-    HAS_ORB = False
-try:
-    import pymbar
 
-    HAS_PYMBAR = True
-except ImportError:
-    HAS_PYMBAR = False
+def _probe_orb():
+    """首次调用时才 import torch/openmmml；返回 (torch, MLPotential) 或 (None, None)。"""
+    global _TORCH_MODULE, _MLPOTENTIAL_CLASS, _ORB_PROBED
+    if not _ORB_PROBED:
+        try:
+            import torch as _torch
+            from openmmml import MLPotential as _MLPotential
+
+            _TORCH_MODULE, _MLPOTENTIAL_CLASS = _torch, _MLPotential
+        except ImportError:
+            _TORCH_MODULE, _MLPOTENTIAL_CLASS = None, None
+        _ORB_PROBED = True
+    return _TORCH_MODULE, _MLPOTENTIAL_CLASS
+
+
+def has_orb() -> bool:
+    """torch + openmmml 是否可用。`HAS_ORB` 的模块级覆盖（monkeypatch）优先。"""
+    override = globals().get("HAS_ORB")
+    if override is not None:
+        return bool(override)
+    return _probe_orb()[0] is not None
+
+
+def _require_torch():
+    torch_module, _ = _probe_orb()
+    if torch_module is None:
+        raise ImportError("此路径需要 torch + openmmml（Orb/MACE ML 势），当前环境未安装")
+    return torch_module
+
+
+def _require_mlpotential():
+    _, mlpotential = _probe_orb()
+    if mlpotential is None:
+        raise ImportError("此路径需要 openmmml.MLPotential，当前环境未安装 openmm-ml")
+    return mlpotential
+
+
+def _probe_pymbar():
+    """首次调用时才 import pymbar（连带 JAX）；返回模块或 None。"""
+    global _PYMBAR_MODULE, _PYMBAR_PROBED
+    if not _PYMBAR_PROBED:
+        try:
+            import pymbar as _pymbar
+
+            _PYMBAR_MODULE = _pymbar
+        except ImportError:
+            _PYMBAR_MODULE = None
+        _PYMBAR_PROBED = True
+    return _PYMBAR_MODULE
+
+
+def has_pymbar() -> bool:
+    """pymbar 是否可用。`HAS_PYMBAR` 的模块级覆盖（monkeypatch）优先。"""
+    override = globals().get("HAS_PYMBAR")
+    if override is not None:
+        return bool(override)
+    return _probe_pymbar() is not None
+
+
+def _require_pymbar():
+    pymbar_module = _probe_pymbar()
+    if pymbar_module is None:
+        raise ImportError("此路径需要 pymbar（MBAR/TMBAR 估计器），当前环境未安装")
+    return pymbar_module
 
 logger = logging.getLogger(__name__)
 
@@ -316,7 +391,7 @@ def resolve_membrane_protocol(
                     + " 若确认这不是双层膜（例如只是几个游离脂质配体），"
                     "请显式传 confirm_soluble_with_lipids=True 留下记录。"
                 )
-            logger.warning("⚠️ %s 已由 confirm_soluble_with_lipids=True 显式确认。", message)
+            logger.warning("[WARN] %s 已由 confirm_soluble_with_lipids=True 显式确认。", message)
         return {
             "protocol_version": MEMBRANE_BAROSTAT_PROTOCOL_VERSION,
             "system_type": ENVIRONMENT_TYPE_SOLUBLE,
@@ -2400,6 +2475,22 @@ PRE_EQUILIBRATION_CONVERGENCE_VOLUME_DRIFT_TOL_PERCENT = 0.5
 PRE_EQUILIBRATION_CONVERGENCE_DENSITY_DRIFT_TOL_PERCENT = 0.5
 PRE_EQUILIBRATION_CONVERGENCE_PE_DRIFT_TOL_KJ_PER_MOL_PER_ATOM = 0.02
 PRE_EQUILIBRATION_CONVERGENCE_RMSD_DRIFT_TOL_NM = 0.02  # block-to-block Δ，非绝对值门
+# 🔑 [2026-09-03] 配体**位姿漂移**（相对受体的刚体位移）单独一个容差，不再复用上面
+# 那个 0.02。0.02 是给 backbone self-refit RMSD 定的——骨架内部柔性在 250k 步 block
+# 之间确实只变动 ~0.005 nm。但配体在口袋里的位姿本身有 ~0.05 nm 的**热涨落幅度**：
+# 4W53 实测（output_v3_seed20260908/pre_equilibration_convergence_monitor.csv，去掉
+# 镜像污染后）16 个 block 里 13 个的 Δpose > 0.02，最大 0.0756。拿 0.02 去要求"逐
+# block 变化小于它自身的自然涨落"，是原理上无法满足的判据——它测的不是收敛而是噪声，
+# 结果预平衡永远跑满 n_equil_steps（实测 5,000,000 步，而温度/体积/密度/势能四条判据
+# 从 1.25M 步之后就一直以 2.3–4.8 倍余量通过）。0.10 nm 取自实测涨落幅度的上包络。
+PRE_EQUILIBRATION_CONVERGENCE_POSE_DRIFT_TOL_NM = 0.10
+# 🔑 [2026-09-03] 配体位姿漂移的**绝对**上限（不是 block 间 Δ）。这是新增的 fail-closed
+# 守卫，不是放松：超过它说明配体已经在预平衡期间离开了结合位姿，此时"收敛"没有意义。
+# 口径对齐 fepsuite 的 EQ_RMSD_CUTOFF=0.4（abfe/rundir_template/para_conf.zsh：
+# "If ligand RMSD during equilibration exceeds this value, calculation stops"）。
+# 与 fepsuite 不同的是这里**不中止运行**，只是拒绝宣布稳定（于是退化为跑满
+# n_equil_steps）并打一条显著警告——新增一条硬 abort 路径的风险比它挡掉的问题更大。
+PRE_EQUILIBRATION_LIGAND_POSE_ESCAPE_TOL_NM = 0.4
 
 
 # ---- §13.3 膜质量门（判据统一为"末段窗口内线性漂移小于阈值"）----
@@ -3305,7 +3396,7 @@ def openmm_compatible_gromacs_top(
                 "manifest_path": manifest_path,
             }
         logger.warning(
-            "⚠️ %s 里已有的 funct-2 转换与当前输入不符（或不完整），重新转换。",
+            "[WARN] %s 里已有的 funct-2 转换与当前输入不符（或不完整），重新转换。",
             compat_dir,
         )
 
@@ -3577,7 +3668,7 @@ def resolve_forcefield_family(
         # §1.1：覆盖必须留记录，不能静默。
         if detection.get("family") and detection["family"] != override:
             logger.warning(
-                "⚠️ forcefield_family 被显式覆盖：自动识别为 %r（依据 %s），"
+                "[WARN] forcefield_family 被显式覆盖：自动识别为 %r（依据 %s），"
                 "但用户指定 %r。覆盖已记入 provenance。",
                 detection["family"], detection["reason"], override,
             )
@@ -4438,7 +4529,7 @@ def run_membrane_quality_gate(
             payload["observables"] = observables
         with open(summary_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, ensure_ascii=False, cls=NumpyEncoder)
-        emit(f"  ✓ 膜质量门摘要已保存: {summary_path}")
+        emit(f"  [OK] 膜质量门摘要已保存: {summary_path}")
         return summary_path
 
     def _blocked(message: str, observables=None) -> Dict[str, Any]:
@@ -4450,7 +4541,7 @@ def run_membrane_quality_gate(
         """
         if not advisory:
             raise RuntimeError(message)
-        emit(f"  ⚠️ [膜质量门 advisory] 未能完成评估：{message}")
+        emit(f"  [WARN] [膜质量门 advisory] 未能完成评估：{message}")
         report = {
             "protocol_version": MEMBRANE_QUALITY_GATE_PROTOCOL_VERSION,
             "mode": MEMBRANE_QUALITY_GATE_MODE_ADVISORY,
@@ -4523,7 +4614,7 @@ def run_membrane_quality_gate(
     summary_path = _write(report, observables)
 
     for check in report["checks"]:
-        flag = "✓" if check["passed"] else "✗"
+        flag = "[OK]" if check["passed"] else "[ERR]"
         emit(
             f"    {flag} {check['observable']} [{check['criterion']}] "
             f"{check['measured']:.6g} vs 阈值 {check['threshold']:.6g}"
@@ -4538,12 +4629,12 @@ def run_membrane_quality_gate(
         if not advisory:
             raise RuntimeError(message)
         emit(
-            f"  ⚠️ [膜质量门 advisory] {message}\n"
+            f"  [WARN] [膜质量门 advisory] {message}\n"
             "     以 advisory 模式放行继续 —— **这不是生产资格**，"
             "要报出的 ΔG_bind 必须在 enforce 下通过。"
         )
         return report
-    emit(f"  ✅ 膜质量门通过（模式 {mode}）")
+    emit(f"  [OK] 膜质量门通过（模式 {mode}）")
     return report
 
 
@@ -4643,10 +4734,10 @@ def _assert_periodic_images_are_consistent(context, *, label: str, log=None):
                 "于是跨边界的水被逐原子回卷、撕开。\n"
                 "    修法见 `ABFEPipeline.repair_pbc_molecule_integrity`（MEM-15）："
                 "把 System 的约束补成键再交给 `image_molecules()`。\n"
-                "    ⚠️ 这类损坏对键能 / 最大键长 / max|F| 全部隐形，只有本检查看得见。"
+                "    [WARN] 这类损坏对键能 / 最大键长 / max|F| 全部隐形，只有本检查看得见。"
             )
     emit(
-        f"  ✓ 镜像一致性: 排除对 {findings['nonbonded_exceptions']['n_pairs']} 个"
+        f"  [OK] 镜像一致性: 排除对 {findings['nonbonded_exceptions']['n_pairs']} 个"
         f"（最远 {findings['nonbonded_exceptions']['max_nm']:.3f} nm）、"
         f"约束对 {findings['constraints']['n_pairs']} 个"
         f"（最远 {findings['constraints']['max_nm']:.3f} nm），上限 {limit:.3f} nm"
@@ -4729,7 +4820,7 @@ def assert_starting_state_is_sane(
     worst = int(np.argmax(magnitudes))
     max_force = float(magnitudes.max())
     emit(
-        f"  📐 {label}: PE = {potential:.6g} kJ/mol, "
+        f"  {label}: PE = {potential:.6g} kJ/mol, "
         f"max|F| = {max_force:.4g} kJ/mol/nm "
         f"(idx={worst} {_atom_label(worst)}), "
         f"中位数 {np.median(magnitudes):.4g}"
@@ -4994,7 +5085,7 @@ def verify_membrane_normal_axis(
             "请在建系时把膜法向对齐 z。"
         )
     logger.info(
-        "🧫 膜法向实测确认为 %s（%d 个头基原子；上下叶 %d/%d，簇心间距 %.3f nm）",
+        "膜法向实测确认为 %s（%d 个头基原子；上下叶 %d/%d，簇心间距 %.3f nm）",
         measured, report["n_head_atoms"],
         per_axis[measured]["n_upper"], per_axis[measured]["n_lower"],
         per_axis[measured]["separation_nm"],
@@ -5056,7 +5147,7 @@ def validate_membrane_input(
             f"{MEMBRANE_UPSTREAM_STATUS_COMPLETED_UNRECORDED!r}"
             "（上游生产已完成但时长不可考，需同时给 final_equilibration_job）。"
             "沉默等于让未充分平衡的体系混进来。"
-            "⚠️ 无论走哪条，§9 的实测质量门都不受影响。"
+            "[WARN] 无论走哪条，§9 的实测质量门都不受影响。"
         )
 
     conformational_state = str(declared["conformational_state"]).strip()
@@ -5065,7 +5156,7 @@ def validate_membrane_input(
     )
     if not conformational_state_declared:
         logger.warning(
-            "⚠️ conformational_state=%r：构象态未声明，已如实记入 provenance。"
+            "[WARN] conformational_state=%r：构象态未声明，已如实记入 provenance。"
             "§1.1 的本意是防止跨构象态混用——本次运行的构象由输入文件指纹唯一确定，"
             "但若日后要与其它构象态的结果比较，这一项必须补上。",
             MEMBRANE_CONFORMATIONAL_STATE_UNSPECIFIED,
@@ -6415,8 +6506,8 @@ def _build_mace_potential(model_name: str):
     """
     cached_path = _MACE_LOCAL_MODEL_PATHS.get(model_name)
     if cached_path and os.path.isfile(cached_path):
-        return MLPotential("mace", modelPath=cached_path)
-    return MLPotential(model_name)
+        return _require_mlpotential()("mace", modelPath=cached_path)
+    return _require_mlpotential()(model_name)
 
 
 def _select_env_indices_from_mdtraj_frame(frame, lig_idx: np.ndarray, env_radius_nm: float, max_env_atoms: Optional[int] = None) -> np.ndarray:
@@ -6462,9 +6553,9 @@ def _select_env_indices_from_mdtraj_frame(frame, lig_idx: np.ndarray, env_radius
 
 
 def _infer_log_level_from_message(message: str) -> int:
-    if any(token in message for token in ("⚠️", "警告", "warning")):
+    if any(token in message for token in ("[WARN]", "警告", "warning")):
         return logging.WARNING
-    if any(token in message for token in ("🚨", "❌", "失败", "错误", "异常", "error")):
+    if any(token in message for token in ("[ERR]", "失败", "错误", "异常", "error")):
         return logging.ERROR
     return logging.INFO
 
@@ -6481,10 +6572,207 @@ def _log_print(*args, sep=" ", end="\n", file=None, flush=False):
 print = _log_print
 
 
+_ONCE_EMITTED_KEYS: set = set()
+
+
+def print_once(key: str, *args, **kwargs) -> None:
+    """同一份日志文件里，同一个 `key` 只打印一次。
+
+    `ibs_engine.print_once` 的同源副本——`_log_print` /
+    `_infer_log_level_from_message` 在本仓库就是这样逐模块复制的（避免 abfe_core 与
+    ibs_engine 之间新增 import 耦合），这里沿用同一模式。
+
+    去重键里带上当前 tee 的目标文件（`_StdoutTeeToFile._log_path`）：同进程跑第二条腿、
+    日志 retarget 到新的 `pipeline.log` 时，这段说明会在新文件里重新出现一次。
+    """
+    scope = getattr(sys.stdout, "_log_path", None)
+    dedup_key = (scope, key)
+    if dedup_key in _ONCE_EMITTED_KEYS:
+        return
+    _ONCE_EMITTED_KEYS.add(dedup_key)
+    print(*args, **kwargs)
+
+
+# ============================================================================
+# mdtraj 内置 VMD `dcdplugin` 的 C 层噪声
+# ============================================================================
+# 每打开一个 DCD，mdtraj 的 `dcd.cpython-*.so`（VMD dcdplugin.c）都会用 **C 的
+# printf 直接写 fd 1** 刷两行：
+#     dcdplugin) detected standard 32-bit DCD file of native endianness
+#     dcdplugin) CHARMM format DCD file (also NAMD 2.1 and later)
+# 这两行绕过 `sys.stdout`，所以 `contextlib.redirect_stdout`、`warnings` 和 logging
+# 一律拦不住；`DCDTrajectoryFile` 是 Cython 扩展类型，也没法直接 monkeypatch 它的
+# `__init__`（扩展类型不允许设属性）。唯一的拦截点在 fd 层。
+#
+# ⚠️ 关键：**不能**把 fd 1 一律重定向到 /dev/null。同一个 printf 通道里还会出来
+#     dcdplugin) unrecognized DCD header:
+#     dcdplugin) read_dcdheader: corruption or unrecognized file structure
+# 那是 DCD 截断/损坏的真实诊断（本仓库的 DCD append 出过这类事故，见
+# `_is_traj_valid` 的 fail-closed 说明），吞掉它等于把故障线索删了。所以这里做的是
+# **逐行过滤**：只丢下面这张白名单里的信息性行，其余原样保留。
+_C_STDOUT_DROP_PREFIXES: Tuple[str, ...] = (
+    "dcdplugin) detected ",
+    "dcdplugin) CHARMM format DCD file",
+)
+
+
+_LIBC_FFLUSH: Any = None
+
+
+def _c_fflush_all() -> None:
+    """强制 C 层 stdio 落盘（`fflush(NULL)` 刷所有输出流）。
+
+    ⚠️ 少了这一步，`_filter_c_stdout` 会**丢输出**，而且是静默丢：fd 1 一旦被重定向
+    到普通文件，glibc 就把 stdout 从行缓冲切成**全缓冲**，dcdplugin 的 printf 留在
+    C 的缓冲区里而不是落到那个临时文件；恢复 fd 1 再去读临时文件就读到空的，连
+    `dcdplugin) read_dcdheader: corruption or unrecognized file structure` 这种真实
+    故障诊断都会一起消失（实测确认过）。
+
+    拿不到 libc 时降级成 no-op：宁可留着噪声，也不能让日志装饰打断计算。
+    """
+    global _LIBC_FFLUSH
+    if _LIBC_FFLUSH is None:
+        try:
+            import ctypes
+
+            fflush = ctypes.CDLL(None).fflush
+            fflush.argtypes = [ctypes.c_void_p]
+            fflush.restype = ctypes.c_int
+            _LIBC_FFLUSH = fflush
+        except Exception:
+            _LIBC_FFLUSH = False
+    if _LIBC_FFLUSH:
+        try:
+            _LIBC_FFLUSH(None)
+        except Exception:
+            pass
+
+
+@contextlib.contextmanager
+def _filter_c_stdout(drop_prefixes: Tuple[str, ...]):
+    """在 fd 层捕获 C 库直写 fd 1 的输出，丢掉 `drop_prefixes` 命中的行，其余重发。
+
+    保留下来的行改用 `print()` 重发，于是它们**第一次**进了 `pipeline.log`——原来
+    C 层输出完全绕过 `_StdoutTeeToFile`，只出现在终端里，归档日志查不到。
+
+    用临时文件而不是管道做中转：管道有 64 KiB 容量上限，一个损坏的 DCD 可能刷出
+    大量行并把 C 侧的写阻塞死。
+
+    ⚠️ 作用域必须只包住第三方那一次调用。块内如果有 Python 侧 `print()`，它会被
+    一起捕获再重发，从而在 `pipeline.log` 里出现两遍（tee 已经写过一次）。
+
+    fd 1 拿不到（已被关闭等）时直接放行、不做任何拦截：日志装饰绝不能反过来打断计算。
+    """
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    try:
+        saved_fd = os.dup(1)
+    except OSError:
+        yield
+        return
+
+    captured = b""
+    tmp = tempfile.TemporaryFile()
+    try:
+        os.dup2(tmp.fileno(), 1)
+        try:
+            yield
+        finally:
+            # 必须在恢复 fd 1 **之前**刷 C 缓冲，否则那些字节根本没进 tmp。
+            _c_fflush_all()
+            os.dup2(saved_fd, 1)
+            try:
+                tmp.seek(0)
+                captured = tmp.read()
+            except OSError:
+                captured = b""
+    finally:
+        os.close(saved_fd)
+        tmp.close()
+        # 重发必须放在 `finally` 里。写在函数末尾会有一个致命的失效模式：块内抛异常
+        # （损坏 DCD 让 ctor 抛 OSError 正是如此）时，异常从 `yield` 处向外传播，末尾
+        # 的循环永远不执行——于是恰好在最需要看到诊断的那一刻把诊断丢干净。实测确认过。
+        for line in captured.decode("utf-8", errors="replace").splitlines():
+            if not line.startswith(drop_prefixes):
+                print(line)
+
+
+_MDTRAJ_DCD_QUIET_PATCHED = False
+
+
+def _install_mdtraj_dcd_quiet_patch() -> bool:
+    """给 mdtraj 的载入入口包一层 `_filter_c_stdout`。幂等，失败即放弃。
+
+    打在 **mdtraj 模块命名空间**上而不是逐个改调用点：本仓库 5 个模块里约 25 处
+    DCD 读取全都写成 `md.load(...)` 这种属性查找（已确认没有 `from mdtraj import
+    load`），所以换掉模块属性就能一次覆盖全部，也覆盖以后新增的调用点。补丁是
+    纯输出装饰，不改任何返回值或异常语义。
+    """
+    global _MDTRAJ_DCD_QUIET_PATCHED
+    if _MDTRAJ_DCD_QUIET_PATCHED or not HAS_MDTRAJ:
+        return False
+
+    def _wrap_call(fn):
+        @functools.wraps(fn)
+        def _quiet(*args, **kwargs):
+            with _filter_c_stdout(_C_STDOUT_DROP_PREFIXES):
+                return fn(*args, **kwargs)
+        _quiet._abfe_dcd_quiet = True
+        return _quiet
+
+    def _wrap_generator(fn):
+        # `yield` 必须在 with **外面**：否则调用方消费 chunk 期间 fd 1 还被捕获着，
+        # 会把调用方自己的输出吞进来再重发一遍。
+        @functools.wraps(fn)
+        def _quiet(*args, **kwargs):
+            with _filter_c_stdout(_C_STDOUT_DROP_PREFIXES):
+                iterator = fn(*args, **kwargs)
+            while True:
+                with _filter_c_stdout(_C_STDOUT_DROP_PREFIXES):
+                    try:
+                        chunk = next(iterator)
+                    except StopIteration:
+                        return
+                yield chunk
+        _quiet._abfe_dcd_quiet = True
+        return _quiet
+
+    patched_any = False
+    for owner, attr, wrapper in (
+        (mdtraj, "load", _wrap_call),
+        (mdtraj, "load_dcd", _wrap_call),
+        (mdtraj, "load_frame", _wrap_call),
+        (mdtraj, "iterload", _wrap_generator),
+        (getattr(mdtraj, "formats", None), "DCDTrajectoryFile", _wrap_call),
+    ):
+        if owner is None:
+            continue
+        original = getattr(owner, attr, None)
+        if original is None or getattr(original, "_abfe_dcd_quiet", False):
+            continue
+        try:
+            setattr(owner, attr, wrapper(original))
+        except (AttributeError, TypeError):
+            # 扩展模块可能拒绝改属性；静默跳过，日志噪声不值得让 import 失败。
+            continue
+        patched_any = True
+
+    _MDTRAJ_DCD_QUIET_PATCHED = True
+    return patched_any
+
+
+_install_mdtraj_dcd_quiet_patch()
+
+
 def _pymbar_version_tuple() -> Tuple[int, ...]:
-    if not HAS_PYMBAR:
+    if not has_pymbar():
         return (0,)
-    version_str = str(getattr(pymbar, "__version__", getattr(pymbar, "version", "0")))
+    pymbar_module = _require_pymbar()
+    version_str = str(
+        getattr(pymbar_module, "__version__", getattr(pymbar_module, "version", "0"))
+    )
     parts = []
     for token in version_str.replace("-", ".").split("."):
         digits = "".join(ch for ch in token if ch.isdigit())
@@ -6500,7 +6788,7 @@ def _build_mbar_compatible(u_kn, n_k, **kwargs):
     兼容 PyMBAR 3.x/4.x 的 MBAR 构造器。
     若某些关键字参数在当前版本不可用，则按保守顺序回退。
     """
-    if not HAS_PYMBAR:
+    if not has_pymbar():
         raise ImportError("需要 pymbar 包，请安装: pip install pymbar")
 
     base_kwargs = dict(kwargs)
@@ -6527,13 +6815,13 @@ def _build_mbar_compatible(u_kn, n_k, **kwargs):
     last_type_error = None
     for candidate in variants:
         try:
-            return pymbar.MBAR(u_kn, n_k, **candidate)
+            return _require_pymbar().MBAR(u_kn, n_k, **candidate)
         except TypeError as exc:
             last_type_error = exc
             continue
     if last_type_error is not None:
         raise last_type_error
-    return pymbar.MBAR(u_kn, n_k)
+    return _require_pymbar().MBAR(u_kn, n_k)
 
 
 def _extract_mbar_matrix(result, primary_name: str, fallback_names: Tuple[str, ...]) -> Optional[np.ndarray]:
@@ -6630,7 +6918,7 @@ def subsample_series_by_autocorrelation(
     series = np.asarray(series, dtype=np.float64)
     n = series.shape[0]
     full_indices = np.arange(n)
-    if not HAS_PYMBAR or n < min_frames_for_subsampling:
+    if not has_pymbar() or n < min_frames_for_subsampling:
         return full_indices, 1.0
     if not np.all(np.isfinite(series)) or np.std(series) < 1e-12:
         return full_indices, 1.0
@@ -6648,7 +6936,10 @@ def subsample_series_by_autocorrelation(
 
 
 def get_optimal_device_settings():
-    if not HAS_ORB or not torch.cuda.is_available():
+    if not has_orb():
+        return "cpu", False
+    torch = _require_torch()
+    if not torch.cuda.is_available():
         return "cpu", False
     device = "cuda"
     major, minor = torch.cuda.get_device_capability()
@@ -7372,7 +7663,7 @@ def evaluate_cross_leg_conformer_consistency(
             f"复合物腿 {observable} 的 [p{lo:g}, p{hi:g}] = [{c_lo:.3f}, {c_hi:.3f}] nm，"
             f"溶剂腿 = [{s_lo:.3f}, {s_hi:.3f}] nm，两者不相交。"
             "两条腿采的不是同一个构象族 ⟹ ΔG_bind = ΔG_solv − ΔG_cplx 没有意义（§3.0）。"
-            "⚠️ 严格说不重叠有两种读法：(1) 某条腿的构象系综**没收敛**（被困在一个 basin）；"
+            "[WARN] 严格说不重叠有两种读法：(1) 某条腿的构象系综**没收敛**（被困在一个 basin）；"
             "(2) 两相的构象偏好**真的**差这么多，那个差值本该是 ΔG_bind 的一部分。"
             "在当前每窗口 0.5 ns 的采样下这两者分辨不开 —— 看 "
             "`per_replica_mean_max_internal_heavy_distance_nm`：若各 replica 挤在同一个"
@@ -7873,9 +8164,6 @@ class LambdaDependentBoreschForce(openmm.CustomCompoundBondForce):
         kpB = fc["kphiB"]
         kpC = fc["kphiC"]
 
-        # 打印调试信息（确保 thA 是弧度）
-        print(f"  [Boresch] kr={kr:.1f} kJ/mol/nm², r0={r0:.3f} nm, θA={np.degrees(thA):.1f}°")
-
         ls = f"{fixed_lam:.6f}" if fixed_lam is not None else lam_name
 
         # ✅ 修复2：标准谐波势 (distance-r0)^2，导数连续且数值稳定
@@ -8016,11 +8304,11 @@ class OrbBoreschEstimator:
     }
 
     def __init__(self, temperature=300.0, device=None, cutoff_nm=0.9, n_frames=500):
-        if not HAS_ORB:
+        if not has_orb():
             raise ImportError("OrbBoreschEstimator 依赖 torch + openmmml，请安装后重试")
         self.T = temperature
         self.gas_constant_kj_per_mol_k = 8.314e-3
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device or ("cuda" if _require_torch().cuda.is_available() else "cpu")
         self.config = {
             **self.DEFAULT_CONFIG,
             "temperature": temperature,
@@ -8050,7 +8338,7 @@ class OrbBoreschEstimator:
     def _score_distance(self, dist_nm, resname):
         cfg = self.config
         if dist_nm < cfg["dist_reject_nm"]:
-            return -100, "❌ 太近"
+            return -100, "太近"
         c_dist = dist_nm - self._get_sidechain_correction(resname)
         if cfg["dist_gold_min_nm"] <= c_dist <= cfg["dist_gold_max_nm"]:
             center = (cfg["dist_gold_min_nm"] + cfg["dist_gold_max_nm"]) / 2
@@ -8059,15 +8347,15 @@ class OrbBoreschEstimator:
                 - abs(c_dist - center)
                 / (cfg["dist_gold_max_nm"] - cfg["dist_gold_min_nm"])
             )
-            return 50 + bonus, "✅ 黄金区间"
+            return 50 + bonus, "黄金区间"
         if cfg["dist_backup_min_nm"] <= c_dist <= cfg["dist_backup_max_nm"]:
             score = 30 * (
                 1
                 - (c_dist - cfg["dist_backup_min_nm"])
                 / (cfg["dist_backup_max_nm"] - cfg["dist_backup_min_nm"])
             )
-            return score, "⚠️ 备选区间"
-        return 5 if c_dist > cfg["dist_backup_max_nm"] else 25, "⚪ 过渡/较远"
+            return score, "备选区间"
+        return 5 if c_dist > cfg["dist_backup_max_nm"] else 25, "过渡/较远"
 
     def _check_anchor_geometry(self, rec_anchors, traj, pocket_sel):
         r = traj.xyz[0, pocket_sel]
@@ -8118,7 +8406,7 @@ class OrbBoreschEstimator:
             R0, R1, R2 = [ref_coords[a] for a in rec_anchors]
             L0, L1, L2 = [ref_coords[a] for a in lig_anchors]
         except IndexError:
-            return False, "❌ 锚点索引越界"
+            return False, "[ERR] 锚点索引越界"
 
         def dist(p1, p2): return np.linalg.norm(p1 - p2)
         def angle_rad(p1, p2, p3):
@@ -8136,26 +8424,26 @@ class OrbBoreschEstimator:
 
         # 2. 严格阈值拦截 (全部基于 nm/rad 比较)
         if not (0.50 <= r0_nm <= 1.00):
-            return False, f"❌ r0={r0_nm*10:.2f}Å [需5.0-10.0Å]"
+            return False, f"[ERR] r0={r0_nm*10:.2f}Å [需5.0-10.0Å]"
 
         thA_deg, thB_deg = np.degrees(thA_rad), np.degrees(thB_rad)
         if not (40.0 <= thA_deg <= 140.0):
-            return False, f"❌ θA={thA_deg:.1f}° [需40-140°]"
+            return False, f"[ERR] θA={thA_deg:.1f}° [需40-140°]"
         if not (40.0 <= thB_deg <= 140.0):
-            return False, f"❌ θB={thB_deg:.1f}° [需40-140°]"
+            return False, f"[ERR] θB={thB_deg:.1f}° [需40-140°]"
 
         # 3. 奇点保护：sin(θ) < 0.64 直接拒绝 (对应 θ<40° 或 θ>140°)
         if np.sin(thA_rad) < 0.64 or np.sin(thB_rad) < 0.64:
-            return False, f"❌ 几何奇异 sinθ≈0 (θA={thA_deg:.1f}°, θB={thB_deg:.1f}°)"
+            return False, f"[ERR] 几何奇异 sinθ≈0 (θA={thA_deg:.1f}°, θB={thB_deg:.1f}°)"
 
         # 4. 锚点共线/重叠保护
         if d_R01 < 0.38 or d_R12 < 0.38:
-            return False, f"❌ 受体锚点过近 (min={min(d_R01, d_R12)*10:.1f}Å)"
+            return False, f"[ERR] 受体锚点过近 (min={min(d_R01, d_R12)*10:.1f}Å)"
         if d_L01 < 0.25 or d_L12 < 0.25:
-            return False, f"❌ 配体锚点过近 (min={min(d_L01, d_L12)*10:.1f}Å)"
+            return False, f"[ERR] 配体锚点过近 (min={min(d_L01, d_L12)*10:.1f}Å)"
 
         # 5. 通过
-        return True, f"✅ 几何合格 r0={r0_nm*10:.2f}Å θA={thA_deg:.1f}° θB={thB_deg:.1f}°"
+        return True, f"[OK] 几何合格 r0={r0_nm*10:.2f}Å θA={thA_deg:.1f}° θB={thB_deg:.1f}°"
 
     def _add_capping_hydrogens(self, topology, selection, ref_coords):
         cap_h_info = []
@@ -8793,17 +9081,17 @@ class OrbBoreschEstimator:
             if n_keep > 0:
                 traj = traj[mask]
                 print(
-                    f"🔪 轨迹切片: 仅使用最后 {use_last_ns} ns ({n_keep} 帧 / 原始 {original_len} 帧)"
+                    f"轨迹切片: 仅使用最后 {use_last_ns} ns ({n_keep} 帧 / 原始 {original_len} 帧)"
                 )
             else:
                 print(
-                    f"⚠️ 轨迹长度不足 {use_last_ns} ns，使用全轨迹 ({original_len} 帧)"
+                    f"[WARN] 轨迹长度不足 {use_last_ns} ns，使用全轨迹 ({original_len} 帧)"
                 )
         else:
-            print(f"⚠️ 轨迹无时间信息，使用全轨迹 ({original_len} 帧)")
+            print(f"[WARN] 轨迹无时间信息，使用全轨迹 ({original_len} 帧)")
 
         print(
-            f"🔍 确定性枚举 v6.5 | 目标: {n_candidates} | r0≤{max_r0_angstrom}Å | kr≤{max_kr} | 残基间隔≥{min_residue_gap}"
+            f"确定性枚举 v6.5 | 目标: {n_candidates} | r0≤{max_r0_angstrom}Å | kr≤{max_kr} | 残基间隔≥{min_residue_gap}"
         )
 
         top = traj.topology
@@ -8838,7 +9126,7 @@ class OrbBoreschEstimator:
 
         # ✅ 安全检查：刚性原子不足无法构建 Boresch
         if len(rigid_ca) < 3:
-            print(f"  ❌ 刚性 Cα 原子不足 3 个 (当前 {len(rigid_ca)})，无法进行几何枚举。")
+            print(f"  [ERR] 刚性 Cα 原子不足 3 个 (当前 {len(rigid_ca)})，无法进行几何枚举。")
             return []
 
         # 1. 生成配体锚点候选三元组 (基于质量+刚性排序)
@@ -8959,7 +9247,7 @@ class OrbBoreschEstimator:
         # 辅助函数
         def log_cand(rank, r0_nm, kr, res_key, tag="合格"):
             r0_a = r0_nm * 10.0
-            print(f"  [{'✅' if tag=='合格' else '⬇️'} {tag}] #{rank}: r0={r0_a:.2f}Å | kr={kr:.1f} kJ/mol/nm² | 残基={res_key}")
+            print(f"  [{tag}] #{rank}: r0={r0_a:.2f}Å | kr={kr:.1f} kJ/mol/nm² | 残基={res_key}")
 
         for cand in validated:
             res_key = cand["res_key"]
@@ -9021,7 +9309,7 @@ class OrbBoreschEstimator:
 
         # 降级回退
         if len(results) < n_candidates and fallback_pool:
-            print(f"  ⚠️ 合格候选不足 ({len(results)}/{n_candidates})，启动降级回退...")
+            print(f"  [WARN] 合格候选不足 ({len(results)}/{n_candidates})，启动降级回退...")
             fallback_pool.sort(key=lambda x: x["ks"]["kr"])
             for final in fallback_pool:
                 if len(results) >= n_candidates: break
@@ -9062,9 +9350,9 @@ class OrbBoreschEstimator:
                 log_cand(len(results), final["eq"]["r0"], final["ks"]["kr"], res_key, tag="回退")
 
         if not results:
-            print(f"  ❌ 未找到满足条件的合格候选。")
+            print(f"  [ERR] 未找到满足条件的合格候选。")
         else:
-            print(f"✅ 最终返回 {len(results)} 个合格候选")
+            print(f"[OK] 最终返回 {len(results)} 个合格候选")
             
             # ✅ 【关键修复】按总分降序排序，并重新分配 rank 序号
             results.sort(key=lambda x: x.get("total_score", 0.0), reverse=True)
@@ -9074,7 +9362,7 @@ class OrbBoreschEstimator:
             
             # 打印诊断信息，确认排序生效
             top = results[0]
-            print(f"  🏆 推荐首选: Rank #{top['rank']} (残基={top['receptor_residues']})")
+            print(f"  推荐首选: Rank #{top['rank']} (残基={top['receptor_residues']})")
             print(f"     kr={top['force_constants']['kr']:.1f} | 总分={top['total_score']:.2f} | kr加分={top.get('kr_bonus',0):.2f}")
 
         if output_path:
@@ -9086,7 +9374,7 @@ class OrbBoreschEstimator:
                     return super().default(obj)
             with open(output_path, "w") as f:
                 json.dump({"candidates": results}, f, indent=2, cls=NumpyEncoder)
-            print(f"✅ 结果已保存: {output_path}")
+            print(f"[OK] 结果已保存: {output_path}")
             
         return results
 
@@ -9498,7 +9786,7 @@ class OnlineConvergenceMonitor:
 
         if energy_mean < -2500.0 and np.max(energy_var) < 5.0:
             print(
-                f"  ⚠️ [Monitor] 能量矩阵疑似遗漏限制力 (μ={energy_mean:.1f}, max(σ²)={np.max(energy_var):.1f})"
+                f"  [WARN] [Monitor] 能量矩阵疑似遗漏限制力 (μ={energy_mean:.1f}, max(σ²)={np.max(energy_var):.1f})"
             )
             print(
                 f"     → 请确保 ibs_engine 中 getState(groups={{group_id}}) 包含 Boresch 力"
@@ -9546,7 +9834,7 @@ class OnlineConvergenceMonitor:
                 if abs(i-j) == 1
             ])
             if min_offdiag < 0.03:
-                print(f"  🚨 [Monitor] 相邻窗口最小重叠 {min_offdiag:.3f} < 0.03，MBAR 误差可能低估！")
+                print(f"  [ERR] [Monitor] 相邻窗口最小重叠 {min_offdiag:.3f} < 0.03，MBAR 误差可能低估！")
                 print(f"     → 建议：延长采样 20% 或在重叠最差区域附近插值窗口")
 
             self.dg_deque.append(dg)
@@ -9618,7 +9906,7 @@ class OnlineConvergenceMonitor:
         import matplotlib.pyplot as plt
 
         if not self.history:
-            print(f"  ⚠️  无收敛历史数据，跳过绘图: {output_path}")
+            print(f"  [WARN] 无收敛历史数据，跳过绘图: {output_path}")
             return
 
         valid_data = [h for h in self.history if "dg" in h and "error" in h]
@@ -9662,9 +9950,9 @@ class OnlineConvergenceMonitor:
 
         try:
             plt.savefig(output_path, bbox_inches="tight")
-            print(f"  ✓ 收敛曲线已保存: {output_path}")
+            print(f"  [OK] 收敛曲线已保存: {output_path}")
         except Exception as e:
-            print(f"  ⚠️  保存图片失败: {e}")
+            print(f"  [WARN] 保存图片失败: {e}")
         finally:
             plt.close()
 
@@ -10024,7 +10312,7 @@ def auto_select_boresch_anchors_rmsf(
     if best_config is None:
         raise RuntimeError("未找到符合几何 (thA/thB) 与稳定性条件的锚点组合")
         
-    print(f"✅ 自动锚点选择完成: r0={best_config['equilibrium_r0']:.2f}nm, RMSF={best_config['rmsf_mean']:.3f}nm")
+    print(f"[OK] 自动锚点选择完成: r0={best_config['equilibrium_r0']:.2f}nm, RMSF={best_config['rmsf_mean']:.3f}nm")
     if output_path:
         with open(output_path, "w") as f:
             json.dump(best_config, f, indent=2, cls=NumpyEncoder)
@@ -10058,7 +10346,7 @@ class ChunkedMBARAnalyzer:
         
     def run_chunked_mbar(self, u_kn_total: np.ndarray, n_k_array: np.ndarray, stage_type: str = "coul"):
         """使用分态步幅抽样执行单次全局 MBAR，避免伪分块平均导致的统计错误。"""
-        if not HAS_PYMBAR:
+        if not has_pymbar():
             raise ImportError("需要 pymbar 进行 MBAR 分析: pip install pymbar")
         import pymbar
         
@@ -10078,7 +10366,7 @@ class ChunkedMBARAnalyzer:
             if np.sum(n_k_array) != N:
                 raise MemoryError("u_kn_total 列数与 n_k_array 总和不一致，无法安全执行分态步幅抽样")
 
-            print(f"  ⚠️ 内存受限，启用分态步幅抽样 (Stride={stride}) 后执行单次全局 MBAR")
+            print(f"  [WARN] 内存受限，启用分态步幅抽样 (Stride={stride}) 后执行单次全局 MBAR")
             keep_indices = []
             start = 0
             n_k_sub = np.zeros_like(n_k_array)
@@ -10097,7 +10385,7 @@ class ChunkedMBARAnalyzer:
 
             keep_indices = np.concatenate(keep_indices)
             u_kn_sub = u_kn_total[:, keep_indices]
-            print(f"  ℹ️ 抽样后保留 {u_kn_sub.shape[1]} 帧，分态样本数: {n_k_sub.tolist()}")
+            print(f"  抽样后保留 {u_kn_sub.shape[1]} 帧，分态样本数: {n_k_sub.tolist()}")
         else:
             u_kn_sub = u_kn_total
             n_k_sub = n_k_array.copy()
@@ -10113,7 +10401,7 @@ class ChunkedMBARAnalyzer:
             res = _compute_free_energy_result_compatible(mbar, compute_uncertainty=True)
             return self._extract_delta_g(res, n_k_sub, stage_type)
         except Exception as e:
-            print(f"  🚨 MBAR 求解失败: {e}，尝试降级至 robust 求解器...")
+            print(f"  [ERR] MBAR 求解失败: {e}，尝试降级至 robust 求解器...")
             mbar = _build_mbar_compatible(
                 u_kn_sub,
                 n_k_sub,
@@ -10372,7 +10660,7 @@ def resolve_water_model_xml(top_file: str) -> Tuple[str, str]:
         if identification["matched"]:
             params = identification["topology_params"]
             logger.info(
-                "💧 水模型按参数识别为 %s（moleculetype=%s, %d 位点, "
+                "水模型按参数识别为 %s（moleculetype=%s, %d 位点, "
                 "q_O=%+.6f, q_H=%+.6f, σ_O=%.9f nm, ε_O=%.6f kJ/mol）——"
                 "`#include` 文件名词干认不出，故用参数判定。",
                 identification["xml"], params["moleculetype"], params["n_sites"],
@@ -10475,7 +10763,7 @@ class SolventLegRunner:
 
         # 🔑 水模型不再硬编码，一律从复合物 .top 反推，保证两腿同模型。
         water_xml, water_itp = resolve_water_model_xml(top_file)
-        logger.info("  💧 溶剂腿水模型继承自复合物 .top: %s → %s", water_itp, water_xml)
+        logger.info("  溶剂腿水模型继承自复合物 .top: %s → %s", water_itp, water_xml)
         ff = ForceField("amber14-all.xml", water_xml)
 
         # 🔑 盒子显式给出，不用 padding=。理由见 solvent_box_edge_nm 的 docstring。
@@ -10588,10 +10876,10 @@ class UnitFormatter:
         eq = boresch_dict["equilibrium_values"]
         fc = boresch_dict["force_constants"]
         return (
-            f"📏 r0={cls.nm_to_A(eq['r0']):.2f} Å | "
+            f"r0={cls.nm_to_A(eq['r0']):.2f} Å | "
             f"θA={cls.rad_to_deg(eq['thetaA0']):.1f}° | "
             f"φA={cls.rad_to_deg(eq['phiA0']):.1f}°\n"
-            f"⚖️ kr={cls.kJ_to_kcal(fc['kr']) / 100.0:.2f} kcal/mol/Å²| "
+            f"kr={cls.kJ_to_kcal(fc['kr']) / 100.0:.2f} kcal/mol/Å²| "
             f"kθA={cls.kJ_to_kcal(fc['kthetaA']):.2f} kcal/mol/rad²"
         )
 
@@ -10702,19 +10990,19 @@ class UnitFormatter:
         _system_type = str(results.get("system_type") or "complex").lower()
         if "delta_G_bind_kJ_mol" in results:
             dg_kj = results.get("delta_G_bind_kJ_mol", 0.0)
-            title = "✅ 结合自由能 ΔG_bind"
+            title = "[OK] 结合自由能 ΔG_bind"
         elif "total_delta_G_complex_kJ_mol" in results and _system_type == "complex":
             dg_kj = results.get("total_delta_G_complex_kJ_mol", 0.0)
-            title = "✅ 复合物总自由能 ΔG_complex"
+            title = "[OK] 复合物总自由能 ΔG_complex"
         elif "total_delta_G_complex_kJ_mol" in results:
             dg_kj = results.get("total_delta_G_complex_kJ_mol", 0.0)
-            title = f"✅ 解耦腿自由能 ΔG_leg（system_type={results.get('system_type')}）"
+            title = f"[OK] 解耦腿自由能 ΔG_leg（system_type={results.get('system_type')}）"
         elif "decoupling_delta_G_kJ_mol" in results:
             dg_kj = results.get("decoupling_delta_G_kJ_mol", 0.0)
-            title = "✅ 解耦腿自由能 ΔG_leg"
+            title = "[OK] 解耦腿自由能 ΔG_leg"
         else:
             dg_kj = results.get("total_delta_G_complex_kJ_mol", results.get("total_delta_G_complex", 0.0))
-            title = "✅ 自由能结果 ΔG"
+            title = "[OK] 自由能结果 ΔG"
         return (
             f"\n{'='*50}\n"
             f"{title} = {cls.kJ_to_kcal(dg_kj):.2f} ± {cls.kJ_to_kcal(err_kj):.2f} kcal/mol\n"
@@ -10863,7 +11151,7 @@ def _copy_nonbonded_force_settings(
         setter(*getter())
     if skipped:
         print(
-            "  ⚠️ [bake_global_parameter_into_fixed_nonbonded_force] 当前 OpenMM "
+            "  [WARN] [bake_global_parameter_into_fixed_nonbonded_force] 当前 OpenMM "
             f"版本缺少以下 NonbondedForce 属性，未复制（版本差异，不是烘焙逻辑本身"
             f"的缺陷）：{skipped}"
         )
@@ -11194,7 +11482,9 @@ def create_ligand_internal_force(
         ll_force.addExclusion(p1, p2)
 
     # 🔍 诊断输出 (可选，生产环境可注释)
-    print(f"  🔍 [Group2 排除表] 共收集 {len(exclusion_pairs)} 对配体内部排除 (1-2/1-3/1-4)")
+    # 去重键由消息文本派生：对数一变就重新打一行（一次 4W53 run 里同一行重复 52 次）。
+    _msg = f"  [Group2 排除表] 共收集 {len(exclusion_pairs)} 对配体内部排除 (1-2/1-3/1-4)"
+    print_once(f"group2_exclusions|{_msg}", _msg)
 
     # 1-4 恢复力
     ll_14_force = None
@@ -11390,7 +11680,7 @@ class GeometricRestraintEstimator:
 
         if n_atoms and frac >= min_frac:
             print(
-                f"  ✓ [Boresch 锚点] {side_label}使用拓扑真实键"
+                f"  [OK] [Boresch 锚点] {side_label}使用拓扑真实键"
                 f"（2 深链起点 {n_two_deep}/{n_atoms} = {frac:.0%}）"
             )
             return adjacency, "topology", n_two_deep, n_atoms
@@ -11407,7 +11697,7 @@ class GeometricRestraintEstimator:
                 "非标准残基（配体）在其中没有键。"
             )
         print(
-            f"  ⚠️ [Boresch 锚点] {side_label}拓扑成键覆盖度不足（2 深链起点 "
+            f"  [WARN] [Boresch 锚点] {side_label}拓扑成键覆盖度不足（2 深链起点 "
             f"{n_two_deep}/{n_atoms} = {frac:.0%} < {min_frac:.0%}），"
             f"该侧退回几何阈值 {self.bond_dist} nm。"
         )
@@ -11566,7 +11856,7 @@ class GeometricRestraintEstimator:
 
         # 3. 化学连通组合枚举
         combos = self._generate_anchor_combos(traj, prot_indices, lig_heavy)
-        print(f"  🔗 化学连通候选组合数: {len(combos)}")
+        print(f"  化学连通候选组合数: {len(combos)}")
         if len(combos) == 0:
             raise RuntimeError("没有符合条件的6原子组合")
 
@@ -11639,7 +11929,7 @@ class GeometricRestraintEstimator:
         # 🔑 核心修复：拦截全 inf 灾难
         if np.all(np.isinf(total_var)):
             raise RuntimeError(
-                "❌ 所有候选锚点组合的几何角度 (θA/θB) 均超出安全范围 [45°, 135°]！\n"
+                "[ERR] 所有候选锚点组合的几何角度 (θA/θB) 均超出安全范围 [45°, 135°]！\n"
                 "   体系可能存在严重畸变或配体脱离口袋。请检查预平衡轨迹，或使用 --boresch-source auto 切换至 Orb 估算。"
             )
 
@@ -11745,16 +12035,29 @@ class GeometricRestraintEstimator:
             with open(output_path, 'w') as f:
                 json.dump(result, f, indent=2, cls=NumpyEncoder)
 
-        print(f"  🏆 最优锚点: 受体 {result['receptor_indices']} | 配体 {result['ligand_indices']}")
+        print(f"  最优锚点: 受体 {result['receptor_indices']} | 配体 {result['ligand_indices']}")
         print(f"     r0={eq['r0']*10:.2f} Å, θA={np.degrees(eq['thetaA0']):.1f}°, θB={np.degrees(eq['thetaB0']):.1f}°")
         print(f"     kr={fc['kr']:.1f} kJ/mol/nm², kθA={fc['kthetaA']:.1f} kJ/mol/rad²")
         if n_clipped:
-            print(f"  ⚠️ fluctuation Boresch 有 {n_clipped} 个力常数被裁剪；raw 值已写入结果 JSON。")
+            print(f"  [WARN] fluctuation Boresch 有 {n_clipped} 个力常数被裁剪；raw 值已写入结果 JSON。")
         if n_bad_diag:
-            print(f"  ⚠️ fluctuation Boresch 有 {n_bad_diag} 个坐标分布偏离高斯或采样不足；请检查 diagnostics。")
+            print(f"  [WARN] fluctuation Boresch 有 {n_bad_diag} 个坐标分布偏离高斯或采样不足；请检查 diagnostics。")
         return result
 
 
 # ============================================================================
 # 8. Orbv3 → DEXP 拟合流水线 (从 DEXP_class.py 合并)
 # ============================================================================
+
+
+# [CLI-01, 2026-09-02] `HAS_ORB` / `HAS_PYMBAR` 现在是惰性探测（见文件开头），
+# 模块里不再有这两个全局名。外部读 `abfe_core.HAS_PYMBAR` 的调用方和测试仍然
+# 要能拿到布尔值，所以这里用 PEP 562 的模块级 `__getattr__` 补上。
+# 注意：模块内部的代码必须调 `has_orb()` / `has_pymbar()`——模块内的全局名查找
+# 不会走 `__getattr__`，写成裸 `HAS_PYMBAR` 会直接 NameError。
+def __getattr__(name: str):
+    if name == "HAS_ORB":
+        return has_orb()
+    if name == "HAS_PYMBAR":
+        return has_pymbar()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

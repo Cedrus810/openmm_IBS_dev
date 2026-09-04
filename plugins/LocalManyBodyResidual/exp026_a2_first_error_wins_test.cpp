@@ -1,3 +1,18 @@
+/* ---------------------------------------------------------------------------- *
+ * ABFE-IBS -- LocalManyBodyResidual plugin                                     *
+ *                                                                              *
+ * Copyright (c) 2026 Ruigeng Ji                                                *
+ *                                                                              *
+ * This plugin's directory layout, build scaffolding and API skeleton are       *
+ * derived from the OpenMM example plugin, which is MIT-licensed.               *
+ * Portions copyright (c) Stanford University and the Authors.                  *
+ *                                                                              *
+ * Distributed under the MIT License; see LICENSE at the repository root for    *
+ * the full text.  This plugin is compiled against OpenMM headers and linked    *
+ * at run time against a separately installed OpenMM, whose CUDA, HIP and       *
+ * OpenCL platforms are covered by the LGPL -- see NOTICE.                      *
+ * ---------------------------------------------------------------------------- */
+
 // EXP-026 A2: first-error-wins across kernel stages, fault injection test.
 //
 // Scope: A2's mechanical change (consolidating 6 per-kernel errorFlagDevice/

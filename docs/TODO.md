@@ -338,18 +338,19 @@ slab（无蛋白）不能代替这里的真实 receptor–ligand complex；C4 �
   谁照那两条的 reason 去修 C seam，会去修一个已经修好的东西；而真问题
   （co-ion 在 D 端点）继续没人管；而且它不会在测试里报警，因为 XFAIL 也算"预期"。
 
-#### [ ] CACHE-01（P2，纯噪音）`--openmm-cache-only` 下无条件调用 `find_gmx_include_dir`
+#### [x] CACHE-01（P2，纯噪音）`--openmm-cache-only` 下无条件调用 `find_gmx_include_dir`
 
-- 位置：`runabfe.py:6034`——`include_dir = find_gmx_include_dir(config.gmx_path)`
-  在 `if args.openmm_cache_only:`（`:6036`）**之前**无条件执行。
-- 症状：带 `--openmm-cache-only` 跑时照样打「找不到 GROMACS 力场 include 目录」
-  警告（`runabfe.py:646`），而这一路根本不需要 include 树。
-- 已查清：审计通过的缓存上 `include_dir` **一次都不会被解引用**（三条使用路径
-  逐个核对过，见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md) 同名小节）。
-  ⟹ **只是噪音，不影响任何数值。**
-- 修法：把 `:6034` 那次调用挪进 `else` 分支。对 cache-only 路径行为中立。
-- 为什么还没做：属于纯降噪，不影响结果；且要顺带确认 `:6061` 的
-  `system_cache_exists(...)` 参数求值顺序在挪动后仍然短路。
+**已修（2026-09-02）。** `find_gmx_include_dir(config.gmx_path)` 挪进了非
+cache-only 的 `else` 分支，cache-only 路径 `include_dir` 留 `None`
+（`runabfe.py` 里搜 `[CACHE-01`）。cache-only 下不再打那条警告。
+
+- 原症状：带 `--openmm-cache-only` 跑时照样打「找不到 GROMACS 力场 include 目录」
+  警告，而这一路根本不需要 include 树。
+- 修改前已查清：审计通过的缓存上 `include_dir` **一次都不会被解引用**（三条使用
+  路径逐个核对过，见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md) 同名小节）。
+  ⟹ 只是噪音，不影响任何数值，挪动对 cache-only 路径行为中立。
+- 挪动后复核过的那一条：`system_cache_exists(...)` 仍然在 `or` 的右侧，
+  `openmm_cache_only=True` 时整个调用不执行（短路顺序未变）。
 - 来源：2026-09-02 运行期记录（原文已归档到
   [archive/RUNTIME_ISSUES_2026-09-02.md](archive/RUNTIME_ISSUES_2026-09-02.md) BUG-1）。
 

@@ -10,6 +10,9 @@
 - `abfe_config.json`：当前示例/生产配置。
 - `abfe_core.py`、`abfe_pipeline.py`、`abfe_preoptimizer.py`、`ibs_engine.py`：
   核心实现。暂时保留在仓库根目录，以维持现有导入和生产命令兼容。
+- `abfe_diagnostics.py`：`runabfe.py doctor` / `validate-config` / `config-template`
+  三个只读诊断命令的实现。只读、不建 Context、不是启动硬门——改之前先读它的
+  模块 docstring 里那三条约束。
 - `outer_lambda_neural_basis.py`：`local_residual.openmm_plugin` 的依赖，
   生产启动路径的一部分。
 - `local_residual/`：local-residual 路径势的**生产子集**（`openmm_plugin`、
@@ -18,6 +21,11 @@
 - `tools/`：人工诊断、修复、验证和绘图工具，不属于生产入口。
 - `plugins/LocalManyBodyResidual/`：原生 OpenMM 插件源码。
 - `docs/`：唯一文档集，见 [docs/README.md](docs/README.md)。
+- `LICENSE`：MIT，Copyright (c) 2026 Ruigeng Ji。
+- `NOTICE`：第三方组件署名。**OpenMM 是双授权的**——public API / reference /
+  CPU platform / application layer 走 MIT，CUDA、HIP、OpenCL platform 走 LGPL，
+  而 `plugins/LocalManyBodyResidual/platforms/cuda/` 正建在后者之上。改插件的
+  链接方式或开始分发编译产物之前先读这份。
 
 ## 修改代码后的最低检查
 
@@ -53,3 +61,9 @@
    只对 Atenolol 有效，换体系必须重训。开关默认 `false`；打开时 fail-closed
    并说明去 `Atenolol-rank11` 取什么。见 `docs/HISTORY_LOG.md`。
 8. 核心模块后续若迁入 `src/`，必须单独进行，并先保证整套测试通过。
+9. **`abfe_core.py` / `ibs_engine.py` 里 torch / openmmml / pymbar 必须保持惰性
+   import。** 它们以前是模块级 eager import，让每个入口（`--help`、`self-test`、
+   配置诊断）都白付 2.4 s。现在走 `has_orb()` / `has_pymbar()` /
+   `_require_torch()` / `_require_pymbar()`；模块内部**不得**写裸 `HAS_ORB` /
+   `HAS_PYMBAR`（模块级 `__getattr__` 只对外部属性访问生效，内部裸读会
+   NameError）。由 `tests/test_cli_diagnostics_and_lazy_imports.py` 钉住。

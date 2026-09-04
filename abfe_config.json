@@ -26,8 +26,20 @@
 
   "n_steps_per_window": 250000,
   "steps_per_update": 500,
-  "stage1_n_states": 12,
-  "stage2_n_states": 17,
+  "_comment_stage1_n_states": "🔑 [2026-09-03] 12 → 8。依据是把已有运行的 decharging_exchange_diagnostics.json 里的平均交换接受率按 delta = 2*erfcinv(P_acc) 反解成每边热力学长度：4W53/甲苯复合物腿 P=0.96 → delta≈0.07、溶剂腿 P=0.85 → delta≈0.27，两条腿的 L_coul 跨 N=8/12 不变（0.64 / 2.9），按 delta≈1 的判据分别只需 2 态和 4 态，12 是明显超采样。⚠️ 8 是本基准体系（几乎无电荷的甲苯）的经验值，不是体系无关默认值；极性/带电配体必须调大，换体系时读该体系自己的 P_acc 重新定。详见 runabfe.py PRESET_CONFIGS[\"production\"] 的注释。",
+  "stage1_n_states": 8,
+  "_comment_stage2_n_states": "🔑 [2026-09-03] Fisher 探针网格 17 → 9，同批 pilot_n_steps_per_state 30000 → 15000，pilot 总步数 510,000 → 135,000（约 6.8 min → 1.8 min）。纯配置，不改算法。⚠️ 这个键是**探针网格密度**（用来测度规 g(λ)、不产生生产窗口），生产态数是下面的 stage2_final_n_states=16，两者别混。依据（拿 4W53 已落盘的 17 点 pilot 离线重放 + 度规噪声蒙卡 300 次）：把度规相对误差从 5.8% 一路加到 14.1%（相当于每点步数 30k→5k），最终 λ 布点几乎不动（偏离中位数 0.0026 → 0.0060，而 λ 间距是 0.05–0.15）；真正的悬崖在**网格密度**——9 点偏离 0.009，7 点直接跳到 0.064，且 L 开始系统性偏。即 pilot 的采样长度不是瓶颈、网格结构才是，所以点数可以从 17 降到 9，**但不能低于 9**。两个轴不叠加：9×30k → 9×10k 偏离只从 0.0089 涨到 0.0094。⚠️ 对已完成运行的影响：vanishing 的 preopt 协议指纹里含 requested_n_states 与 pilot_n_steps_per_state（见任一 checkpoints/preopt_dual_vanishing.json 的 protocol_key.payload，实测 17 / 30000），所以任何用 17/30000 跑完的 preopt 缓存在此改动后一律失配、会重跑 pilot 并得到新的 λ 表。凡是要与旧运行逐项对比的实验，必须让所有臂用同一组值，不能一半 17/30000 一半 9/15000。",
+  "stage2_n_states": 9,
+
+  "_comment_stage2_final_n_states": "🔑 [2026-09-03] vdW 生产态数 23 → 16。⚠️ 与上面的 stage2_n_states 是两个不同的量：stage2_n_states=17 是 Fisher **探针网格**密度（不产生生产窗口），这里的 stage2_final_n_states 才是真正跑的生产 λ 态数。代码默认仍是 VANISHING_FINAL_STATE_COUNT=23（未改），本文件显式覆盖成 16。依据：拿 4W53 已落盘的 pilot 度规（preopt_dual_vanishing.json 的 pilot_lambdas/metric_g）离线重放布点，确定性重算每边热力学长度 δ —— N=23 给 δ_max=0.641（复合物）/0.647（溶剂），N=16 给 0.940/0.949，N=15 给 1.008/1.017。按「相邻态 δ≈1，即 σ_ΔU≈1 kT」的判据，16 恰好落在目标上，23 是约 1.5 倍超采样。两条腿的 L 接近（12.32 / 11.58），所以同一个 16 两条腿通用。",
+  "stage2_final_n_states": 16,
+
+  "_comment_stage2_window_bounds": "🔑 [2026-09-03] 只在 stage2_final_n_states != 23 时生效（23 走手工调过的固定窗口表）。取 max=5 而不是默认的 6 是**有意的**：N=16 在 min4/max6 下会分成 [6,6,6]，window 0 变成 6 态、窗内热力学跨度 3.80；而 23 态那张手工表的 window 0 是按协议 v14 特意收窄过的（真机上出现过 window 0 的 ESS 塌缩、占据卡在 state 0），窗内跨度只有 2.45。改成 max=5 得到 [(0,4),(3,8),(7,12),(11,16)]、态数 [4,5,5,5]，window 0 收回 4 态、窗内跨度 2.09，比 23 态时还紧，代价只有 1 个采样槽位（19 vs 18）。⚠️ 非 23 的贪心分窗路径从未在真机上验证过——第一次跑请重点看 window 0 的 ESS。",
+  "stage2_window_min_states": 4,
+  "stage2_window_max_states": 5,
+
+  "_comment_stage2_free_energy_densify_points": "🔑 [2026-09-03, 路径协议 v22] 「14+2」：总态数仍是上面的 stage2_final_n_states=16，但基础度规布点只放 14 态，剩下 2 个点按 pilot 实测的 <dU/dλ> 插在 |ΔF| 最大的边上。**总态数不变 ⇒ 采样成本一分不变**（仍是 4 窗 [4,5,5,5]、19 个槽位），只是把节点从平坦中段挪到自由能陡峭的 λ≈1 段。依据：pilot 实测显示这条路径上平均梯度与 Fisher 度规**反相关**（4W53 复合物腿 λ=1 处 <dU/dλ>=-144.8 而 g=20.4；λ=0.69 处 -46.7 而 g=179），纯 √g 布点因此在自由能落差最大的地方少放点——16 态时前 3 条边装了 54% 的自由能却只占 17% 的热力学长度，单条边 13.6 kJ/mol=5.5 kT。这就是 window 0 历史上 ESS 塌缩的机制（不是重叠不足：那几条边 δ≈0.6、交换接受率 66%）。重新分窗救不了（穷举过全部合法分窗，最大窗 ΔF 一模一样），全局改布点权重是零和的（ΔF 砍一半 δ_max 要涨到 1.8）。14+2 实测：最大边 ΔF 复合物腿 13.6→7.7、溶剂腿 9.2→6.4，**都比 23 态生产路径的 9.9/6.6 更好**，而 δ_max 1.082/1.095 仍压在 δ≈1 目标上。12+4 会把 δ_max 推到 1.28（最差边接受率 36%），过头了。设成 0 = 关闭，布点与 v21 逐字节相同。",
+  "stage2_free_energy_densify_points": 2,
 
   "boresch": true,
   "boresch_source": "simple",
@@ -47,7 +59,8 @@
   "max_bias_warmup_steps": 500000,
 
   "pilot_finite_difference_delta": 0.01,
-  "pilot_n_steps_per_state": 30000,
+  "_comment_pilot_n_steps_per_state": "🔑 [2026-09-03] ⏸️ **暂缓中：值仍是 30000，与 stage2_n_states 同批、同一原因（进 preopt 协议指纹，会破坏四档 A/B 配对）。**四档跑完后执行：30000 → 15000。见上面 _comment_stage2_n_states 的蒙卡依据：度规相对误差即使加到 14.1%（≈每点 5k 步）布点也几乎不动，所以每点步数是安全的削减方向。15000 留了 2 倍余量，没有一路砍到 5000。",
+  "pilot_n_steps_per_state": 15000,
   "_comment_pilot_shadow_checkpoint_interval": "Phase A shadow early-stop 插桩开关（λ路径规划 high-cost 讨论，2026-08-26）。null=关闭，不产生任何 shadow 诊断、不改变 pilot_n_steps_per_state 控制的真实采样长度。设成正整数（例如 2000）才会在 Stage2 vanishing pilot 每跑够这么多步时额外记一次“假想现在停下”的诊断（写进 preopt_dual_vanishing.json 的 path_diagnostics.pilot_points[i].shadow_trace / risk_zone_tags），供之后离线验证用；本身不会让任何一次真实采样提前停。",
   "pilot_shadow_checkpoint_interval": null,
   "ibs_lse_log_residual_tolerance": 0.5,
