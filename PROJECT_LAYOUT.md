@@ -44,8 +44,8 @@
 ## 维护规则
 
 1. 新的自动化测试只放在 `tests/`。
-2. 临时诊断脚本放入 `tools/diagnostics/`；可重复使用的修复脚本放入
-   `tools/repairs/`；画图脚本放入 `tools/plots/`；验证脚本放入 `tools/validation/`。
+2. 临时诊断脚本放入 `tools/diagnostics/`；验证脚本放入 `tools/validation/`。
+   事故结案后诊断脚本应随事故一起移出（见 `docs/MAINTAINING.md`）。
 3. 不要在代码整理中移动已有计算输入或结果。新诊断应通过显式 `--out`/`--output`
    参数写入对应运行目录或用户指定位置。
 4. 不得使用"副本""bak""pre_patch"等文件充当当前实现。旧源码副本留在

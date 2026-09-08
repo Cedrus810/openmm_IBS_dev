@@ -378,8 +378,9 @@ def test_template_round_trips_through_validate_config(capsys):
 def test_template_never_emits_machine_local_or_internal_keys(argv, capsys):
     """模板不许带机器本地路径的值，也不许列运行期回填的 provenance 字段。
 
-    `gmx_path` 在仓库配置里是 `/home/ruigengji/gmx26.0C`——抄进模板发给别人就是
-    错的；`repeat_seed_source` 这类由代码回填的键被用户预先写死会让快照说谎。
+    `gmx_path` 是 GROMACS 安装前缀，每台机器不同——抄进模板发给别人就是错的
+    （2026-09-07 起仓库配置本身也留空了）；`repeat_seed_source` 这类由代码回填的
+    键被用户预先写死会让快照说谎。
     """
     _, payload = _template(argv, capsys)
     for key in abfe_diagnostics._MACHINE_LOCAL_KEYS + abfe_diagnostics._REQUIRED_INPUT_KEYS:

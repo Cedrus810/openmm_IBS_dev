@@ -14,6 +14,8 @@
 
 | 任务 | 文档 |
 |---|---|
+| 查当前科学状态、结果能不能引用、协议版本 | [STATUS.md](STATUS.md) |
+| 查某一步实现的是哪篇文献的方法、怎么引用 | [METHODS.md](METHODS.md) |
 | 安装依赖、准备输入、首次运行 | [GETTING_STARTED.md](GETTING_STARTED.md) |
 | 理解输出、符号、缓存和续跑 | [OUTPUTS_AND_RESUME.md](OUTPUTS_AND_RESUME.md) |
 | 定位常见错误 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) |
@@ -26,28 +28,15 @@
 | 看当前流程全貌（一张图） | [current-pipeline.svg](current-pipeline.svg) |
 | 查 stage2 为什么算错过、怎么定位的 | [STAGE2_ROOT_CAUSE_2026-08-28.md](STAGE2_ROOT_CAUSE_2026-08-28.md) → [BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md](BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md) |
 | 拿独立参照真值对生产结果 | [reference_data/README.md](reference_data/README.md) |
+| 查 GPU 性能优化做过什么、结论是什么 | [EXP-031_GPU_OPTIMIZATION_2026-09-04.md](EXP-031_GPU_OPTIMIZATION_2026-09-04.md)（指路；正文与脚本在沙箱 `ABFE_IBS_CUDA`） |
 
 ## 结果与有效性
 
-当前符号约定：
+**全部登记在 [STATUS.md](STATUS.md)。** 那是本仓库唯一声明"当前科学结论"的文档：
+主线体系、结果登记表、协议版本、开放问题、状态词和证据保全目录都在那一份。
 
-```text
-Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS
-```
-
-**当前主线体系是 4W53（T4 lysozyme L99A + toluene）。** 完整登记表在
-[../README_cn.md](../README_cn.md)《当前科学状态》一节；本页只给判断口径：
-
-- **4W53 `−21.36 ± 0.93 kJ/mol`**（`output_v3_seed20260908`，2026-09-02）——
-  实验 −23.10，1.83σ 内。**单 seed，无独立重复；注册状态标签待维护者指定**，
-  现阶段不可作最终结论引用。证据见
-  [BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md](BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md)。
-- **Atenolol `−23.1622 ± 2.5139 kJ/mol`（`output_lrc_fix`）已于 2026-08-24 判定作废**，
-  不得再引用。旧的 `+40.8362` 和 `+16.00 kJ/mol` 早已标为无效。
-
-> ⚠ **Atenolol** 那几个数字的原始 artifact、结果登记表（`RESULT_REGISTRY.csv`）和
-> 有效性复核记录都在 `Atenolol-rank11`，不在本工程区分支——引用前先回那边核对，
-> 不要仅凭本文件转述。**4W53** 的证据在本目录内，可直接查。
+2026-09-05 之前，同样三张表在 `README.md` / `README_cn.md` / `README_en.md` /
+本文件各存了一份，热力学路径版本已经在其中三份里烂成了旧值。**不要再复制过来。**
 
 ## 设计与协议
 
@@ -142,11 +131,13 @@ Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS
 
 ## 文档维护规则
 
-1. 稳定用法写入教程；体系、日期和实验相关结论写入 [HISTORY_LOG.md](HISTORY_LOG.md)
-   或留在 `Atenolol-rank11`，不在本分支新开平行的"当前状态"文档。
+1. 稳定用法写入教程；当前科学结论**只**写 [STATUS.md](STATUS.md)（唯一一份，
+   别在 README 或别处复制它的表）；体系、日期和实验相关的过程材料写入
+   [HISTORY_LOG.md](HISTORY_LOG.md) 或留在 `Atenolol-rank11`。
 2. 计划、代码实现、测试通过和科学验证是四种不同状态，不要混为"成功"。
 3. 旧状态文档不原地重写为当前版；用替代关系保留历史。
 4. 新数字必须附来源、单位、符号、协议身份、有效性和是否可引用。
 5. 文档整理不移动或改写 `output*`、轨迹、checkpoint、日志和诊断 artifact。
-6. 文档日期戳由 `tools/diagnostics/check_doc_staleness.py` 盯着，
-   契约测试是 `tests/test_doc_staleness_contract.py`。
+6. [STATUS.md](STATUS.md) 的日期戳由 `tools/diagnostics/check_doc_staleness.py`
+   盯着，协议版本表由同一份契约测试 `tests/test_doc_staleness_contract.py`
+   对着源码常量钉住。三份 README 不再声明科学状态，因此不再进追踪表。

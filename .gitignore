@@ -18,3 +18,5 @@ __pycache__/
 *.a
 plugins/*/build/
 plugins/*/build_*/
+.mypy_cache/
+.ruff_cache/

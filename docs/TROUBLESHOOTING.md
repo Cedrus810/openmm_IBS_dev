@@ -51,11 +51,11 @@ include 树，警告也照样打。2026-09-02 实测（原始记录见
 > `system_cache_exists(...)` 那处的 `or` 短路顺序未变，仍然在
 > `openmm_cache_only=True` 时整个不执行。
 
-顺带一个**独立**的坑：本仓 `abfe_config.json` 的 `gmx_path` 写的是
-`/home/ruigengji/gmx26.0C`，**该路径不存在**。它是这条警告的直接触发原因，
-但即使路径写对了、上面的分析也不变。真要跑非 cache-only 的路径，先修这个值
-（前缀和 `share/gromacs/top` 两种写法都能吃，见下面《GROMACS include 文件找不到》；
-问题只是这个路径本身不存在）。
+顺带一个**独立**的坑：本仓 `abfe_config.json` 的 `gmx_path` 自 2026-09-07 起
+**留空**（它是机器本地路径，写死谁的都是错的）。留空时会回退到
+`GMXLIB`/`GMXDATA`/`PATH` 自动探测。要跑非 cache-only 的路径就自己填上本机的
+GROMACS 安装前缀（前缀和 `share/gromacs/top` 两种写法都能吃，见下面
+《GROMACS include 文件找不到》）。
 
 ### GROMACS include 文件找不到
 

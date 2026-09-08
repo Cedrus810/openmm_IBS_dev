@@ -49,26 +49,20 @@ class StalenessCheckError(RuntimeError):
     """声明的日期戳解析失败——措辞被改了，正则要跟着改，不能默默跳过。"""
 
 
-# 每份追踪文档自己的措辞不一样（中文"截至"/"证据截至"/"整理日期"，英文
-# "evidence through"），所以必须逐文件配一条正则，不能猜一个通用模式。
-# 2026-08-24 直接读过每份文件确认过原文，见下方注释。
+# 追踪文档的措辞可能各不相同，所以逐文件配一条正则，不猜通用模式。
+# 每条正则下面贴着它当天在原文里匹配到的那一行。
 _CN_ZHIQI = re.compile(r"截至\s*(\d{4}-\d{2}-\d{2})")
-_EN_THROUGH = re.compile(r"evidence through\s*(\d{4}-\d{2}-\d{2})")
 
 TRACKED_DOCS: dict[str, re.Pattern] = {
-    # "> 当前科学边界：截至 2026-08-12，软件与方法开发已经形成系统证据……"
-    "README.md": _CN_ZHIQI,
-    # "## 当前科学状态（证据截至 2026-08-12）"
-    "README_cn.md": _CN_ZHIQI,
-    # "## Scientific status (evidence through 2026-08-12)"
-    "README_en.md": _EN_THROUGH,
-    # 2026-08-31 发布整理，追踪表移除了两份：
-    #   * curated_project/00_从这里开始/CURRENT_STATUS.md —— 整理版知识库整体
-    #     移出工程区分支（原文在 Atenolol-rank11，登记在 docs/HISTORY_LOG.md）。
-    #   * docs/README.md —— 重写成纯导航页后不再声明"截至某日的综合判断"，
-    #     没有科学状态断言就没有会腐烂的日期戳。追踪一份不声明日期的文档只会
-    #     让 _extract_declared_date 硬报错，那是误报不是发现。
-    # 剩下三份 README 仍然带 2026-08-12 的科学状态断言，是真正需要盯的对象。
+    # "> **本页整理截至 2026-09-05**（协议版本一栏当天逐个对过源码常量）。"
+    "docs/STATUS.md": _CN_ZHIQI,
+    # 2026-09-05 README 去重，追踪表从三份 README 换成这一份：
+    #   科学状态、结果登记和协议版本表原来在 README.md / README_cn.md /
+    #   README_en.md / docs/README.md 各存一份，热力学路径版本已经在其中三份里
+    #   烂成旧值。现在四份都只留一行指向 docs/STATUS.md，**它们不再声明科学
+    #   状态、也就没有会腐烂的日期戳**——同 2026-08-31 把 docs/README.md 移出
+    #   追踪表的理由，追一份不声明日期的文档只会让 _extract_declared_date 硬报错。
+    # 阈值仍然是 3 天，没有放宽。
 }
 
 

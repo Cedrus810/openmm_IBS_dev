@@ -6,7 +6,7 @@
 > 📅 **2026-09-02 更新**：本文 2026-07-29 成稿时，参考体系是 Atenolol（工作区
 > `Atenolol-rank11`）。**现在的主线体系是 4W53（T4 lysozyme L99A + toluene）**，
 > 而 Atenolol 那条线的 `output_lrc_fix` 已于 2026-08-24 判定作废
-> （见 [../README_cn.md](../README_cn.md)《当前科学状态》）。
+> （见 [STATUS.md](STATUS.md)）。
 > 下面的**迁移原则和步骤本身与体系无关、仍然适用**，只有提到具体体系名的地方
 > 已按现状更正。
 
