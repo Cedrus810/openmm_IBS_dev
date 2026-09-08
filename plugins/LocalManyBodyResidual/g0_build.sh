@@ -26,7 +26,8 @@
 # install.
 set -euo pipefail
 
-CONDA_PREFIX="${CONDA_PREFIX:-/home/ruigengji/mambaforge/envs/openmm_dev}"
+# 没有激活 conda 环境就直接报错：默认值只会是别人机器上的路径，静默用错更糟。
+: "${CONDA_PREFIX:?请先 conda activate 装有 OpenMM 的环境（本脚本对着它的头文件编译）}"
 CUDA_HOME="${CUDA_HOME:-/opt/cuda}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD="$HERE/build"

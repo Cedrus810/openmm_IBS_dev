@@ -47,16 +47,14 @@ CI 跑的是哪些门见 [`.github/workflows/cpu-ci.yml`](../.github/workflows/c
 | 设计合同 / 提案的实施状态 | [design/README.md](design/README.md) 的状态表（**必须同步复核日期**） |
 | 发布阻塞项 | [RELEASE_READINESS_2026-08-31.md](RELEASE_READINESS_2026-08-31.md) |
 | 稳定用法 | [GETTING_STARTED.md](GETTING_STARTED.md) / [OUTPUTS_AND_RESUME.md](OUTPUTS_AND_RESUME.md) |
-| 新的科学结论、数值 | 见 docs/README.md 维护规则第 4 条：必须附来源、单位、符号、协议身份、有效性、是否可引用 |
+| 新的科学结论、数值 | [STATUS.md](STATUS.md)：必须附来源、单位、符号、协议身份、有效性、是否可引用 |
 
-`README.md`/`README_cn.md`/`README_en.md` 的科学状态日期戳由
-`tools/diagnostics/check_doc_staleness.py` 盯着，契约测试是
-`tests/test_doc_staleness_contract.py`。
+[STATUS.md](STATUS.md) 是本仓库**唯一**声明当前科学结论的文档——新数字、协议版本
+和有效性判据都只改那一份，三份 README 只留指向它的一行，别把表复制回去。
 
-> ⚠️ 那份契约测试里的 `test_snapshot_docs_are_not_stale` 带
-> `xfail(strict=True)`。**刷新三份 README 的日期戳时必须同时摘掉这个标记**，
-> 否则它会 XPASS 而 `strict=True` 把 XPASS 当失败报出来。这是刻意设计的握手：
-> 逼"文档已经刷新"被显式确认一次。
+它的整理日期戳由 `tools/diagnostics/check_doc_staleness.py` 盯着，协议版本表由
+同一份契约测试 `tests/test_doc_staleness_contract.py` 对着源码常量钉住。
+**改了任何 `*_PROTOCOL_VERSION` 常量，同一次改动里要把 STATUS.md 的表改掉。**
 
 ## 版本控制
 
@@ -75,8 +73,9 @@ CI 跑的是哪些门见 [`.github/workflows/cpu-ci.yml`](../.github/workflows/c
 完整规则见 [PROJECT_LAYOUT.md](../PROJECT_LAYOUT.md)《维护规则》。最常踩的三条：
 
 1. 新的自动化测试**只**放 `tests/`。
-2. 一次性诊断 → `tools/diagnostics/`；可复用修复 → `tools/repairs/`；
-   画图 → `tools/plots/`；验证 → `tools/validation/`。
+2. 一次性诊断 → `tools/diagnostics/`；验证 → `tools/validation/`。
+   **事故结案 = 它的诊断脚本也结案**：结论写进 `docs/`，脚本移到
+   `Atenolol-rank11/archive/from_mainline_<日期>/`，别留在主线烂掉。
 3. **旧源码副本、`*_bak`、`*_pre_patch` 一律不进本分支**，留在 `Atenolol-rank11`。
    `docs/archive/` 只放文档，且其中 `removed_*.md` 是防回归凭证
    （`tests/test_att27_dead_code_removed.py` 断言它们存在），**不能删**。

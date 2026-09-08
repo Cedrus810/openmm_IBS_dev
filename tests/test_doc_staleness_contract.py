@@ -7,26 +7,30 @@
   `check_doc_staleness.TRACKED_DOCS` 的正则没跟着改）。
 * `test_snapshot_docs_are_not_stale` —— **文档内容本身**是不是新鲜。
 
-## 2026-09-02：`xfail(strict=True)` 已摘
+* `test_status_doc_protocol_table_matches_source` —— `docs/STATUS.md` 的协议
+  版本表和源码常量是不是还对得上。
 
-第二条测试从 2026-08-24 新增起一直挂着 `xfail(strict=True)`，因为
-`README.md`/`README_cn.md`/`README_en.md` 的科学状态全部停在 2026-08-12，
-而 2026-08-31 的发布整理只合并了目录结构、**没有**替维护者定科学结论。
+## 2026-09-05：追踪对象从三份 README 换成 `docs/STATUS.md`
 
-2026-09-02 那三份文档的科学状态被真正改写了（主线体系 Atenolol → 4W53、
-旧 `output_lrc_fix` 的 `−23.1622` 标为已作废、协议版本号从转述改为直接读源码
-常量、日期戳刷到 09-02），检测器转全绿，于是标记按它自己 reason 里写的约定摘掉。
+科学状态、结果登记和协议版本表原来在 `README.md` / `README_cn.md` /
+`README_en.md` / `docs/README.md` 各存一份。四份手工同步的代价照例没人付：
+`THERMODYNAMIC_PATH_PROTOCOL_VERSION` 早已经是 22，四份里有三份还写着 21。
 
-**这两条现在都是普通测试。** 第二条红了就是三份 README 又落后于仓库前沿超过
-阈值——去更新文档，不要改测试、不要放宽 `threshold_days`。
+现在唯一声明科学状态的是 `docs/STATUS.md`，四份文档只留一行指向它。追踪表跟着
+换成那一份（阈值仍是 3 天，没放宽）；同时新增第三条测试，把那张协议版本表直接
+钉在源码常量上——**日期戳只能抓"整份文档忘了刷"，抓不到"表里某个数字烂了"。**
+
+**三条现在都是普通测试。** 红了就去更新文档，不要改测试、不要放宽阈值。
 """
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools" / "diagnostics"))
 
 import check_doc_staleness as staleness  # noqa: E402
@@ -47,16 +51,50 @@ def test_staleness_checker_finds_the_known_stale_docs():
 
 
 def test_snapshot_docs_are_not_stale():
-    """三份 README 的科学状态日期戳必须跟得上仓库前沿。
+    """`docs/STATUS.md` 的整理日期戳必须跟得上仓库前沿。
 
-    2026-09-02：`xfail(strict=True)` 标记已摘掉。原因是那三份文档的科学状态
-    在这一天被真正改写了——主线体系从 Atenolol 换成 4W53、旧
-    `output_lrc_fix` 的 `−23.1622` 标为已作废、协议版本号从转述改为直接
-    读源码常量、日期戳刷到 2026-09-02。此前这个测试挂 `xfail` 是因为
-    2026-08-31 的发布整理只合并了目录结构，**没有**替维护者定科学结论。
-
-    从现在起这是一条**普通测试**：它红了就说明三份 README 又落后于仓库前沿
-    超过阈值，去更新文档，不要来改这个测试或阈值。
+    红了就说明状态文档又落后于仓库前沿超过阈值，去更新文档，不要来改这个
+    测试或阈值。
     """
     result = staleness.run(ROOT, threshold_days=3)
     assert result.all_fresh, "\n" + result.render_report()
+
+
+def test_status_doc_protocol_table_matches_source():
+    """`docs/STATUS.md` 的协议版本表必须等于源码常量。
+
+    日期戳只能抓"整份文档忘了刷新"，抓不到"表里某个数字悄悄烂了"——2026-09-05
+    去重时就发现热力学路径版本在四份文档里有三份还写着 21，源码早是 22。
+    这条测试把那张表钉死：改了常量而没改表，这里红。
+    """
+    import abfe_preoptimizer
+    import ibs_engine
+
+    expected = {
+        "ibs_engine.IBS_BIAS_PROTOCOL_VERSION": ibs_engine.IBS_BIAS_PROTOCOL_VERSION,
+        "abfe_preoptimizer.THERMODYNAMIC_PATH_PROTOCOL_VERSION": (
+            abfe_preoptimizer.THERMODYNAMIC_PATH_PROTOCOL_VERSION
+        ),
+        "ibs_engine.TRADITIONAL_LJ_LRC_PROTOCOL_VERSION": (
+            ibs_engine.TRADITIONAL_LJ_LRC_PROTOCOL_VERSION
+        ),
+        "ibs_engine.WCA_ACCOUNTING_VERSION": ibs_engine.WCA_ACCOUNTING_VERSION,
+        "ibs_engine.ESS_GATE_PROTOCOL_VERSION": ibs_engine.ESS_GATE_PROTOCOL_VERSION,
+        "ibs_engine.LIGAND_COM_RESTRAINT_PROTOCOL_VERSION": (
+            ibs_engine.LIGAND_COM_RESTRAINT_PROTOCOL_VERSION
+        ),
+    }
+
+    text = (ROOT / "docs" / "STATUS.md").read_text(encoding="utf-8")
+    # 表格行形如：| IBS 偏置 | `ibs_engine.IBS_BIAS_PROTOCOL_VERSION` | 32 |
+    rows = dict(re.findall(r"\|\s*`([\w.]+)`\s*\|\s*(\d+)\s*\|", text))
+
+    assert set(rows) == set(expected), (
+        "docs/STATUS.md 的协议表和这条测试的清单对不上——"
+        f"文档里有 {sorted(rows)}，测试期望 {sorted(expected)}。"
+        "加了新协议常量就把两边一起加上。"
+    )
+    for name, value in expected.items():
+        assert int(rows[name]) == value, (
+            f"docs/STATUS.md 写 {name} = {rows[name]}，源码是 {value}——去更新文档。"
+        )

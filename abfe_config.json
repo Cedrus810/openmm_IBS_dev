@@ -84,7 +84,8 @@
   "gro": "solv_ions.gro",
   "top": "topol.top",
   "ligand": "MOL",
-  "gmx_path": "/home/ruigengji/gmx26.0C",
+  "_comment_gmx_path": "机器本地路径，必须每台机器自己填（GROMACS 安装前缀，不是 share/gromacs/top）。留空则回退到 GMXLIB/GMXDATA/PATH 自动探测。",
+  "gmx_path": "",
   "resume": false,
   "reset": false
 }

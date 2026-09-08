@@ -354,9 +354,12 @@ cache-only 的 `else` 分支，cache-only 路径 `include_dir` 留 `None`
 - 来源：2026-09-02 运行期记录（原文已归档到
   [archive/RUNTIME_ISSUES_2026-09-02.md](archive/RUNTIME_ISSUES_2026-09-02.md) BUG-1）。
 
-#### [ ] CFG-01（P2，配置）`abfe_config.json` 的 `gmx_path` 指向不存在的路径
+#### [x] CFG-01（P2，配置）`abfe_config.json` 的 `gmx_path` 指向不存在的路径
 
-- 现值 `/home/ruigengji/gmx26.0C`，**本机不存在**。
+- **2026-09-07 已修**：发布清理时清空为 `""`（机器本地键，见
+  `abfe_diagnostics._MACHINE_LOCAL_KEYS`），留空回退到 `GMXLIB`/`GMXDATA`/`PATH`
+  自动探测。下面是当时的记录。
+- 原值 `/home/ruigengji/gmx26.0C`，**本机不存在**。
 - 2026-09-01 那次实跑的 provenance 记的是
   `/home/ruigengji/gmx26.3/share/gromacs/top`，与 config 里的值不同 ⟹ 配置里的
   值从来没被那次运行用上（那次带了 `--openmm-cache-only`）。
