@@ -7,8 +7,11 @@ import pytest
 
 pytest.importorskip("openmm")
 
-from abfe_core import UnitFormatter  # noqa: E402
+from abfe_core import NumpyEncoder, UnitFormatter  # noqa: E402
 
+
+
+pytestmark = pytest.mark.cpu_only
 
 def test_format_boresch_json_casts_numpy_anchor_indices():
     params = {
@@ -93,3 +96,59 @@ def test_format_boresch_json_does_not_read_deg_as_rad():
     params["equilibrium_values"] = {"thetaA0_deg": 89.5}
     with pytest.raises(ValueError):
         UnitFormatter.format_boresch_json(params)
+
+
+# ---------------------------------------------------------------------------
+# NumpyEncoder：abfe_core 的这一份是**全局唯一**的那份
+# ---------------------------------------------------------------------------
+
+
+def test_numpy_encoder_keeps_integers_as_integers():
+    """`np.integer` 必须序列化成 JSON 整数，不能变成浮点。
+
+    2026-09-09 回归：`abfe_core.py` 里曾有三份**函数内嵌套**的 `NumpyEncoder`
+    （`OrbBoreschEstimator.estimate_from_trajectory` /
+    `.estimate_multiple_anchors_from_trajectory` / `OnlineConvergenceMonitor.
+    export_convergence_data`），它们把 `(np.integer, np.floating)` 一律映射成
+    `float`，于是原子索引、帧数、窗口号这类整数会落盘成 `5.0`；其中一份还漏了
+    `np.bool_`。它们**遮蔽**了模块级那份正确的实现。已删除三份嵌套定义。
+    """
+    payload = {
+        "index": np.int64(5),
+        "count": np.int32(7),
+        "value": np.float64(1.5),
+        "flag": np.bool_(True),
+        "array": np.array([1, 2, 3], dtype=np.int64),
+    }
+    loaded = json.loads(json.dumps(payload, cls=NumpyEncoder))
+
+    assert loaded["index"] == 5 and isinstance(loaded["index"], int)
+    assert loaded["count"] == 7 and isinstance(loaded["count"], int)
+    assert isinstance(loaded["value"], float) and loaded["value"] == 1.5
+    assert loaded["flag"] is True
+    assert loaded["array"] == [1, 2, 3]
+
+
+def test_abfe_core_defines_exactly_one_numpy_encoder_at_module_level():
+    """不允许再出现嵌套的 `NumpyEncoder` —— 嵌套定义会静默遮蔽模块级那份。
+
+    模块级那份是共享实现：`runabfe.py` 与 `ibs_engine.py` 都从 `abfe_core` 导入它，
+    `tools/validation/*` 用 `core.NumpyEncoder`。嵌套副本一旦漂移就只在局部产物里出错，
+    而且不会有任何报错。
+    """
+    import ast
+    import pathlib
+
+    source = (pathlib.Path(__file__).resolve().parents[1] / "abfe_core.py").read_text(
+        encoding="utf-8"
+    )
+    found = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.ClassDef) and node.name == "NumpyEncoder"
+    ]
+    assert len(found) == 1, f"abfe_core.py 里有 {len(found)} 份 NumpyEncoder，应当只有 1 份"
+    assert found[0].col_offset == 0, (
+        f"abfe_core.py:{found[0].lineno} 的 NumpyEncoder 是嵌套定义（缩进 "
+        f"{found[0].col_offset}），会遮蔽模块级那份"
+    )

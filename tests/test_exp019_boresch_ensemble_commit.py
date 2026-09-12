@@ -6,6 +6,10 @@ from openmm import unit
 from abfe_pipeline import ABFEPipeline
 
 
+import pytest
+
+pytestmark = pytest.mark.cpu_only
+
 def test_exp019_commits_ensemble_mean_and_only_records_last_frame_diagnostic(tmp_path):
     pipeline = ABFEPipeline.__new__(ABFEPipeline)
     pipeline.checkpoint_dir = str(tmp_path)

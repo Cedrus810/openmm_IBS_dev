@@ -10,6 +10,9 @@ from openmm import app, unit  # noqa: E402
 import abfe_pipeline as pipeline  # noqa: E402
 
 
+
+pytestmark = pytest.mark.cpu_only
+
 COION_A = {
     "schema_version": 1,
     "leg": "complex",

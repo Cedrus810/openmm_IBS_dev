@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import ast
 import os
+
+from abfe_core import frames_per_chunk
 import sys
 import types
 from pathlib import Path
@@ -23,8 +25,18 @@ from types import SimpleNamespace
 
 import pytest
 
+
+pytestmark = pytest.mark.cpu_only
+
 ROOT = Path(__file__).resolve().parents[1]
 PIPELINE_PATH = ROOT / "abfe_pipeline.py"
+
+# 🔑 [2026-09-09] `_is_traj_valid` 是被单独编译进一个**合成命名空间**里执行的，
+# 所以它在 `abfe_pipeline` 模块级引用到的每个名字都得在这里手动补上，
+# 否则运行时 NameError 会被它自己的外层 `except Exception` 吞掉、静默变成
+# "这条轨迹无效"——测试于是断在一个跟真实行为无关的地方。
+# （本仓踩过多次的同一个坑：合成命名空间替身缺符号。）
+_IS_TRAJ_VALID_NAMESPACE = {"os": os, "frames_per_chunk": frames_per_chunk}
 CORE_PATH = ROOT / "abfe_core.py"
 
 
@@ -52,7 +64,9 @@ def test_checkpoint_validator_rejects_large_seekable_garbage(tmp_path):
 
 
 def test_trajectory_validator_rejects_header_shaped_truncated_garbage(tmp_path):
-    validate = _compile_top_level_function(PIPELINE_PATH, "_is_traj_valid", {"os": os})
+    validate = _compile_top_level_function(
+        PIPELINE_PATH, "_is_traj_valid", _IS_TRAJ_VALID_NAMESPACE
+    )
     # Satisfies every shallow check in the current implementation but is not a
     # parseable DCD: there is no complete coordinate frame or closing record.
     header = bytearray(212)
@@ -91,7 +105,9 @@ def _install_fake_mdtraj_dcd_reader(monkeypatch, *, frame_count=3, raises=False)
 def test_trajectory_validator_accepts_complete_low_level_reader_without_topology(
     tmp_path, monkeypatch
 ):
-    validate = _compile_top_level_function(PIPELINE_PATH, "_is_traj_valid", {"os": os})
+    validate = _compile_top_level_function(
+        PIPELINE_PATH, "_is_traj_valid", _IS_TRAJ_VALID_NAMESPACE
+    )
     dcd = tmp_path / "complete.dcd"
     dcd.write_bytes(b"opaque-dcd")
     _install_fake_mdtraj_dcd_reader(monkeypatch, frame_count=3)
@@ -101,7 +117,9 @@ def test_trajectory_validator_accepts_complete_low_level_reader_without_topology
 
 
 def test_trajectory_validator_rejects_reader_reported_truncation(tmp_path, monkeypatch):
-    validate = _compile_top_level_function(PIPELINE_PATH, "_is_traj_valid", {"os": os})
+    validate = _compile_top_level_function(
+        PIPELINE_PATH, "_is_traj_valid", _IS_TRAJ_VALID_NAMESPACE
+    )
     dcd = tmp_path / "truncated-reader.dcd"
     dcd.write_bytes(b"opaque-dcd")
     _install_fake_mdtraj_dcd_reader(monkeypatch, raises=True)
@@ -112,7 +130,9 @@ def test_trajectory_validator_rejects_reader_reported_truncation(tmp_path, monke
 def test_trajectory_validator_uses_low_level_reader_without_topology(tmp_path, monkeypatch):
     """A topology-free DCD is accepted only after the real reader reads all frames."""
 
-    validate = _compile_top_level_function(PIPELINE_PATH, "_is_traj_valid", {"os": os})
+    validate = _compile_top_level_function(
+        PIPELINE_PATH, "_is_traj_valid", _IS_TRAJ_VALID_NAMESPACE
+    )
     dcd_path = tmp_path / "valid.dcd"
     dcd_path.write_bytes(b"nonempty; the fake reader below performs validation")
 
@@ -153,7 +173,9 @@ def test_trajectory_validator_uses_low_level_reader_without_topology(tmp_path, m
 def test_trajectory_validator_rejects_low_level_reader_truncation(tmp_path, monkeypatch):
     """A reader exception, such as a truncated DCD record, fails closed."""
 
-    validate = _compile_top_level_function(PIPELINE_PATH, "_is_traj_valid", {"os": os})
+    validate = _compile_top_level_function(
+        PIPELINE_PATH, "_is_traj_valid", _IS_TRAJ_VALID_NAMESPACE
+    )
     dcd_path = tmp_path / "truncated.dcd"
     dcd_path.write_bytes(b"nonempty")
 

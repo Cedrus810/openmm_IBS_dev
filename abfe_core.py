@@ -38,6 +38,40 @@ import tempfile
 # ============================================================================
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
+# ============================================================================
+# [MBAR-JAX-HOST-MEM] 同样必须在**任何** pymbar import 之前执行。
+#
+# 上面那行只关掉了 JAX 的**显存**预分配。JAX 后端本身对这个仓库的问题规模是
+# 纯负担：每个 MBAR 解都要付一次 XLA 编译（λ 表/帧数一变形状就变，编译缓存
+# 命不中），编译产物和 BFC 池又**从不归还**。
+#
+# 实测（2026-09-09，本机 openmm_dev，K=12 态 × N=9600 帧，
+# `relative_tolerance=1e-7, initialize="BAR", solver_protocol="default"`，
+# 即生产 11 个构造点用的同一组参数）：
+#
+#            wall     RSS       mmap 数    f_k
+#   JAX      6.30 s   887 MiB   1441       —
+#   numpy    0.37 s   120 MiB    891       max|Δf_k| = 8.9e-16
+#
+# 也就是 **慢 17 倍、胖 7 倍，答案在 double 舍入内逐位相同**。而且不可逆：
+# 一次 import + 一次解就把 RSS 抬到 ~860 MiB、VSZ 抬到 18.4 GiB，之后每解一次
+# 再涨 ~14 MiB，解完一个都不还（numpy 后端 12 次解 RSS 只从 100 涨到 109 MiB，
+# mmap 数 835→836，完全平的）。
+#
+# 后果就是宿主内存被解算器啃光，然后由**下游任何一次大分配**替它抛错——
+# 2026-09-09 cyclod_ligand1/rep1 是 Stage 1 第一个 replica 的
+# `XmlSerializer.deserializeSystem` 抛 `std::bad_alloc`（7.4 MB 的 XML、93 GB
+# 的机器、`ulimit -v unlimited`），离线复现那个崩点完全正常；同一天离线 MBAR
+# 的 16 个 spawn worker 则表现成三个互相矛盾的 `Unknown property` 解析错
+# （'sig' in 'Particle' / 'p3' in 'Angle' / 'eps' in 'Exception'）加
+# `double free or corruption` 加 `std::bad_alloc`——同一份 XML 在不同 worker
+# 里报不同的错，就是堆已经不可信的形状，不是 XML 的内容问题。
+#
+# 用 `setdefault`：想要回 JAX 的人显式导出 `PYMBAR_DISABLE_JAX=0` 即可
+# （pymbar 只认 "true"/"yes"/"1" 为真）。
+# ============================================================================
+os.environ.setdefault("PYMBAR_DISABLE_JAX", "1")
+
 import openmm
 from openmm import app, unit
 import numpy as np
@@ -2737,11 +2771,34 @@ def _iter_topology_lines(top_path: str, gmx_include_dir: Optional[str] = None):
         if real in seen:
             return
         seen.add(real)
+        # 🔑 [2026-09-10] 只为"这条 #include 是否可选"记一个 #ifdef 栈。
+        #
+        # 本解析器不求完整地展开预处理（见 parse_gromacs_topology），但
+        # `#ifdef POSRES / #include "posre.itp" / #endif` 是 `gmx pdb2gmx` 的
+        # **默认**产物，posre.itp 常常不在 .top 旁边。OpenMM 自己是
+        # `ignore = not all(self._ifStack)`、且 defines 默认为空 ⟹ 它根本不会去
+        # 展开这条 include。我们把"未解析的 include"当致命错误（preflight），
+        # 所以必须用同一套口径，否则一份 OpenMM 读得好好的拓扑会被预检打死。
+        #
+        # 口径与 OpenMM 对齐：没有任何 define ⟹ `#ifdef X` 一律不激活、
+        # `#ifndef X` 一律激活。只影响"要不要把未解析的 include 记下来"，
+        # 其余行照旧原样流出，不改任何原子计数。
+        if_stack: List[bool] = []
         with open(real, encoding="utf-8", errors="replace") as handle:
             for raw in handle:
                 line = raw.split(";", 1)[0].strip()
                 if not line:
                     continue
+                if line.startswith("#ifdef"):
+                    if_stack.append(False)
+                elif line.startswith("#ifndef"):
+                    if_stack.append(True)
+                elif line.startswith("#else"):
+                    if if_stack:
+                        if_stack[-1] = not if_stack[-1]
+                elif line.startswith("#endif"):
+                    if if_stack:
+                        if_stack.pop()
                 if line.startswith("#include"):
                     parts = line.split('"')
                     if len(parts) >= 2:
@@ -2750,6 +2807,10 @@ def _iter_topology_lines(top_path: str, gmx_include_dir: Optional[str] = None):
                                 parts[1], real, gmx_include_dir
                             )
                         except FileNotFoundError:
+                            if not all(if_stack):
+                                # 在一个不激活的 #ifdef 分支里 —— OpenMM 也不会读它，
+                                # 不是"拓扑不完整"，不记。
+                                continue
                             # 解析不到的 include 记录下来，由调用方决定是否致命：
                             # 有些体系的 posre.itp 是可选的。
                             yield (real, f"#unresolved_include {parts[1]}")
@@ -2964,6 +3025,258 @@ def molecule_atom_ranges(parsed: Dict[str, Any]) -> List[Dict[str, Any]]:
             )
             cursor += size
     return ranges
+
+
+def preflight_physical_inputs(
+    gro_path: str,
+    top_path: str,
+    ligand_molecule_name: str,
+    *,
+    gmx_include_dir: Optional[str] = None,
+    cutoff_nm: float = 1.0,
+    require_boresch: bool = False,
+    log=print,
+) -> Dict[str, Any]:
+    """开跑前把 `.gro`/`.top` 的物理输入过一遍（ATT-24 / GitHub issue #64）。
+
+    ## 为什么在这里判
+
+    这五类问题原来都要等到**建完 System、甚至跑起来之后**才以别的面目暴露：
+    未解析的 `#include` 变成"某个 moleculetype 找不到"、配体名打错变成
+    "ligand_indices 为空"、盒子太小变成一个没人报错的**错误静电**。
+    预检的意义就是把它们变成一条开跑前的、说得清怎么改的错误。
+
+    ## 判什么
+
+    1. **未解析的 `#include`** —— 拓扑不完整，后面一切分子计数都不可信。
+    2. **配体 moleculetype 存在** —— `--ligand` 打错时给出候选名，而不是让它
+       一路走到"配体 0 个原子"。
+    3. **原子数对账** —— `[ molecules ]` 展开出来的总数必须等于 `.gro` 的原子数。
+       对不上说明两个文件不是同一次建系的产物。
+    4. **盒子 ≥ 2×cutoff** —— minimum image 约定的硬性下限。违反时 PME 会算出
+       一个**不报错的错误静电**（同一对原子被自己的镜像重复作用），这是本函数
+       里唯一"不查就永远查不出来"的一条。
+    5. **Boresch 可构造性**（`require_boresch=True` 时）—— 配体至少 3 个原子、
+       且存在一个非水非离子的受体分子，否则六个锚点根本定义不出来。
+
+    **一次报全部**，不是遇到第一个就抛：输入错误往往成组出现，一次改完比来回五次好。
+
+    Returns
+    -------
+    dict
+        `{"n_atoms_topology", "n_atoms_gro", "box_nm", "min_box_edge_nm",
+          "ligand_n_atoms", "molecule_names"}`
+    """
+    problems: List[str] = []
+
+    for label, path in (("--gro", gro_path), ("--top", top_path)):
+        if not path or not os.path.isfile(path):
+            problems.append(f"{label} 文件不存在或不可读: {path!r}")
+    if problems:
+        raise ValueError("输入预检失败：\n  - " + "\n  - ".join(problems))
+
+    parsed = parse_gromacs_topology(top_path, gmx_include_dir=gmx_include_dir)
+
+    unresolved = parsed.get("unresolved_includes") or []
+    if unresolved:
+        problems.append(
+            f"拓扑里有 {len(unresolved)} 条未解析的 #include: {unresolved[:5]}。"
+            "缺力场目录时后面所有分子计数都不可信 —— 给 --gmx-path（GROMACS 安装"
+            "前缀，不是 share/gromacs/top），或设置 GMXLIB / GMXDATA。"
+        )
+
+    moleculetypes = parsed.get("moleculetypes") or {}
+    declared = [name for name, _count in (parsed.get("molecules") or [])]
+
+    # 🔑 [2026-09-10] `--ligand` 是**残基名**，不是 [ moleculetype ] 名。
+    #
+    # 本仓其余全部消费点都按残基名取（runabfe 的 7 处都是
+    # `atom.residue.name == ligand_resname`），而出厂 abfe_config.json 与所有
+    # 文档示例写的是 `MOL`。真实体系里这两个名字经常不同：memtest 那套的
+    # [ moleculetype ] 叫 `Atenolol-rank11`，[ atoms ] 第 4 列的 resname 才是 `MOL`。
+    # 预检原来只查 moleculetype 名 ⟹ 传 MOL 被预检打死、传 Atenolol-rank11 又会在
+    # 建系时"未在拓扑中找到配体残基"，两个值没有一个能同时过这两道门。
+    # 这里两种都认：先按 moleculetype 名，再按残基名唯一匹配。
+    ligand_moltype_name: Optional[str] = None
+    if ligand_molecule_name in moleculetypes:
+        ligand_moltype_name = ligand_molecule_name
+    else:
+        by_residue = [
+            name
+            for name, entry in moleculetypes.items()
+            if ligand_molecule_name in (entry.get("residue_names") or [])
+        ]
+        if len(by_residue) == 1:
+            ligand_moltype_name = by_residue[0]
+        elif len(by_residue) > 1:
+            problems.append(
+                f"--ligand {ligand_molecule_name!r} 作为残基名同时出现在多个 "
+                f"[ moleculetype ] 里：{sorted(by_residue)[:12]} —— 按序号取的原子"
+                "选择会指向哪一个是不确定的，请改用唯一的那个 moleculetype 名。"
+            )
+
+    ligand_n_atoms = None
+    if ligand_moltype_name is None:
+        if not problems or "--ligand" not in problems[-1]:
+            # 候选只列 moleculetype 名，外加**单残基** moleculetype 的残基名。
+            # 多残基的（蛋白、POPC=PA+PC+OL）的残基名不是合法的 --ligand 取值，
+            # 全列出来只会把真正的候选淹掉（一条蛋白链就是 20 个氨基酸名）。
+            candidates = sorted(
+                {
+                    str(nm)
+                    for name, entry in moleculetypes.items()
+                    for nm in (
+                        [name]
+                        + list(
+                            entry.get("residue_names") or []
+                            if len(entry.get("residue_names") or []) == 1
+                            else []
+                        )
+                    )
+                    if str(nm).strip().upper() not in WATER_MOLECULE_NAMES
+                    and _normalize_ion_name(nm) not in MONOATOMIC_ION_NAMES
+                }
+            )
+            problems.append(
+                f"--ligand {ligand_molecule_name!r} 在拓扑里既没有对应的 "
+                f"[ moleculetype ]、也没有对应的残基名。非水非离子的候选："
+                f"{candidates[:12]}"
+            )
+    elif ligand_moltype_name not in declared:
+        problems.append(
+            f"--ligand {ligand_molecule_name!r}（[ moleculetype ] "
+            f"{ligand_moltype_name!r}）有定义，"
+            "但没有出现在 [ molecules ] 里 —— 体系里其实没有这个分子。"
+        )
+    else:
+        entry = moleculetypes[ligand_moltype_name]
+        if ligand_moltype_name == ligand_molecule_name:
+            ligand_n_atoms = int(entry["n_atoms"])
+        else:
+            # 按残基名匹配时只数该残基的原子：一个 moleculetype 可以含多个残基
+            # （POPC = PA + PC + OL），整份 n_atoms 不是配体的原子数。
+            ligand_n_atoms = sum(
+                1
+                for atom in (entry.get("atoms") or [])
+                if atom.get("residue_name") == ligand_molecule_name
+            )
+
+    n_atoms_topology = None
+    if not unresolved:
+        try:
+            ranges = molecule_atom_ranges(parsed)
+            n_atoms_topology = ranges[-1]["stop"] if ranges else 0
+        except ValueError as exc:
+            problems.append(f"无法从拓扑展开原子区间: {exc}")
+
+    # 只读 `.gro` 的两行（第 2 行 = 原子数，末行 = 盒矢量）。
+    #
+    # 不用 `app.GromacsGroFile`：它在**全零盒子**的 `.gro` 上抛
+    # `ZeroDivisionError: float division by zero`（实测
+    # tests/fixtures/memtest/Atenolol-rank11.gro），而"盒子是全零"恰恰是本函数
+    # 要如实报告的一种输入，不该表现成一条看不懂的除零。格式本身是固定的，
+    # 自己读这两行比绕开那个异常更短也更准。
+    n_atoms_gro = None
+    box_nm = None
+    try:
+        with open(gro_path, "r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.read().splitlines()
+        # 🔑 [2026-09-10] 末尾空行不是错。以 "\n\n" 结尾的 .gro（gmx 工具链、
+        # 编辑器、cat 拼接都会产生）在这里会让 lines[-1] 变成 ""、进而报
+        # ".gro 末行有 0 个数"，而 OpenMM 的 GromacsGroFile 读同一个文件毫无问题。
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if len(lines) < 3:
+            raise ValueError(f".gro 只有 {len(lines)} 行，不是合法的 GROMACS 坐标文件")
+        n_atoms_gro = int(lines[1].strip())
+        box_fields = [float(x) for x in lines[-1].split()]
+        if len(box_fields) not in (3, 9):
+            raise ValueError(
+                f".gro 末行有 {len(box_fields)} 个数，GROMACS 盒矢量应当是 3 或 9 个"
+            )
+        if len(box_fields) == 3:
+            box_nm = [
+                [box_fields[0], 0.0, 0.0],
+                [0.0, box_fields[1], 0.0],
+                [0.0, 0.0, box_fields[2]],
+            ]
+        else:
+            # v1x v2y v3z v1y v1z v2x v2z v3x v3y
+            xx, yy, zz, xy, xz, yx, yz, zx, zy = box_fields
+            box_nm = [[xx, xy, xz], [yx, yy, yz], [zx, zy, zz]]
+    except Exception as exc:  # noqa: BLE001 —— 解析失败本身就是要报的问题
+        problems.append(f"读取 {gro_path} 失败: {type(exc).__name__}: {exc}")
+
+    if n_atoms_topology is not None and n_atoms_gro is not None:
+        if n_atoms_topology != n_atoms_gro:
+            problems.append(
+                f"原子数对不上：拓扑展开 {n_atoms_topology} 个，"
+                f".gro 里 {n_atoms_gro} 个。两个文件不是同一次建系的产物 —— "
+                "继续下去所有按序号取的原子选择（配体、co-ion、锚点）都会错位。"
+            )
+
+    min_edge = None
+    if box_nm is not None:
+        min_edge = min(
+            float(np.linalg.norm(np.asarray(row, dtype=float))) for row in box_nm
+        )
+        required = 2.0 * float(cutoff_nm)
+        if min_edge <= 0.0:
+            problems.append(
+                f"{gro_path} 的盒矢量是全零（末行 {box_nm}）—— 这个坐标文件没有"
+                "周期盒子，不能直接用于 PME/ABFE。它多半是**未溶剂化的配体单体**，"
+                "需要先建系（溶剂化 + 加离子）再跑。"
+            )
+        elif min_edge < required:
+            problems.append(
+                f"盒子最短边 {min_edge:.3f} nm < 2×cutoff = {required:.3f} nm，"
+                "违反 minimum image 约定。PME 在这种盒子上**不会报错**，"
+                "只会给出一个错误的静电（同一对原子被自己的周期镜像重复作用）。"
+                "要么加大盒子重新建系，要么调小 cutoff。"
+            )
+
+    if require_boresch:
+        if ligand_n_atoms is not None and ligand_n_atoms < 3:
+            problems.append(
+                f"配体只有 {ligand_n_atoms} 个原子，定义不出 Boresch 的三个配体锚点。"
+            )
+        receptor_like = [
+            name
+            for name, moltype in moleculetypes.items()
+            if name != (ligand_moltype_name or ligand_molecule_name)
+            and str(name).strip().upper() not in WATER_MOLECULE_NAMES
+            and _normalize_ion_name(name) not in MONOATOMIC_ION_NAMES
+            and int(moltype["n_atoms"]) >= 3
+            and name in declared
+        ]
+        if not receptor_like:
+            problems.append(
+                "体系里除配体之外找不到任何 ≥3 原子的非水非离子分子 —— "
+                "定义不出 Boresch 的三个受体锚点。溶剂腿不该传 --boresch。"
+            )
+
+    if problems:
+        raise ValueError(
+            "输入预检失败（一次列全，改完再跑）：\n  - " + "\n  - ".join(problems)
+        )
+
+    log(
+        f"  [输入预检] 通过：拓扑 {n_atoms_topology} 原子 = .gro {n_atoms_gro} 原子；"
+        f"配体 {ligand_molecule_name} {ligand_n_atoms} 原子；"
+        + (
+            f"盒子最短边 {min_edge:.3f} nm ≥ 2×cutoff {2.0 * float(cutoff_nm):.3f} nm。"
+            if min_edge is not None
+            else "（.gro 未声明盒矢量，跳过盒子检查）"
+        )
+    )
+    return {
+        "n_atoms_topology": n_atoms_topology,
+        "n_atoms_gro": n_atoms_gro,
+        "box_nm": box_nm,
+        "min_box_edge_nm": min_edge,
+        "ligand_n_atoms": ligand_n_atoms,
+        "molecule_names": sorted(moleculetypes),
+    }
 
 
 def classify_system_composition(
@@ -4636,6 +4949,302 @@ def run_membrane_quality_gate(
         return report
     emit(f"  [OK] 膜质量门通过（模式 {mode}）")
     return report
+
+
+# ============================================================================
+# 整分子周期回卷：连通性只信 System，不信 topology 的键
+# ============================================================================
+
+# 流式处理的分块预算：按 16 GB 机器给 1 GiB，一次只把这么多字节拉进内存。
+# 三处共用（DCD 校验读、回卷后复查、LJ 尾项外积），不要在调用点各搓一套。
+STREAMING_CHUNK_BUDGET_BYTES = 1 << 30
+
+
+def frames_per_chunk(
+    bytes_per_frame: int,
+    *,
+    minimum: int = 1,
+    maximum: int = 50000,
+    budget_bytes: int = STREAMING_CHUNK_BUDGET_BYTES,
+) -> int:
+    """一块放多少帧：`budget_bytes // bytes_per_frame`，夹在 [minimum, maximum]。
+
+    `bytes_per_frame` 非正/不可解释时返回 `minimum` —— 宁可慢，不要用一个
+    猜出来的大数去赌内存。
+    """
+    try:
+        per_frame = int(bytes_per_frame)
+    except (TypeError, ValueError):
+        return int(minimum)
+    if per_frame <= 0:
+        return int(minimum)
+    return int(max(minimum, min(maximum, budget_bytes // per_frame)))
+
+
+def system_molecule_grouping(system):
+    """按 **System** 求连通分子：`(molecules, sorted_bonds)`。
+
+    连通性取 `HarmonicBondForce` ∪ `CustomBondForce` ∪ `constraints`，与
+    `prune_topology_bonds_unsupported_by_system()` 用的是**同一套**判据。
+    `sorted_bonds` 是 BFS 生成树边 `[parent, child]`，语义与
+    `mdtraj.Trajectory._sort_bonds()` 的返回值一致，可以直接喂给
+    `image_molecules(sorted_bonds=...)`。
+
+    为什么不能用 topology 的键，见 `image_molecules_by_system` 的 docstring。
+
+    ## 为什么取宽（2026-09-09 更正）
+
+    原来只认 `HarmonicBondForce` + constraints，理由是"多一条边会把两个分子并成
+    一个"。方向反了：多一条边只是让两块一起平移（无害），**少**一条边会把一个
+    分子拆开、被 `image_molecules` 分别平移撕碎。而回卷后的复查只遍历
+    `sorted_bonds`（同一份邻接表长出来的），漏掉的边根本不在里面 ⟹ 对这种撕开
+    完全失明。`rbfe_core` 的 hybrid builder 就把 core–core 键全放在
+    `CustomBondForce` 里，窄判据下整个杂合配体会被当成一堆散原子。
+    """
+    import openmm as _mm
+
+    n_particles = int(system.getNumParticles())
+    adjacency = [[] for _ in range(n_particles)]
+    for force in system.getForces():
+        if not isinstance(force, (_mm.HarmonicBondForce, _mm.CustomBondForce)):
+            continue
+        for bond_index in range(force.getNumBonds()):
+            i, j = force.getBondParameters(bond_index)[:2]
+            adjacency[int(i)].append(int(j))
+            adjacency[int(j)].append(int(i))
+    for constraint_index in range(system.getNumConstraints()):
+        i, j, _distance = system.getConstraintParameters(constraint_index)
+        adjacency[int(i)].append(int(j))
+        adjacency[int(j)].append(int(i))
+
+    molecules = []
+    sorted_bonds = []
+    seen = bytearray(n_particles)
+    for root in range(n_particles):
+        if seen[root]:
+            continue
+        seen[root] = 1
+        component = [root]
+        queue = deque([root])
+        while queue:
+            current = queue.popleft()
+            for neighbour in adjacency[current]:
+                if seen[neighbour]:
+                    continue
+                seen[neighbour] = 1
+                component.append(neighbour)
+                queue.append(neighbour)
+                # 与 mdtraj._sort_bonds 一样：已定位的原子放在第 0 列，
+                # 每个分子因此是一棵生成树，不会有原子被回卷到两个不同镜像。
+                sorted_bonds.append((current, neighbour))
+        molecules.append(component)
+    return molecules, np.asarray(sorted_bonds, dtype=np.int32).reshape(-1, 2)
+
+
+def prune_topology_bonds_unsupported_by_system(topology, system, *, log=None):
+    """删掉 topology 里 **System 完全不认**的键，返回新的 `app.Topology`。
+
+    ## 为什么需要它（PBC-01，2026-09-09）
+
+    `app.PDBxFile` 往返会**凭空多造键**：写入端链 id 按
+    `chr(ord('A') + chainIndex % 26)` 循环（`pdbxfile.py:392/473`），读取端
+    `_struct_conn` 只按 `(seq_id, asym_id, atom_name)` 解析（`pdbxfile.py:218`），
+    链数一超过 26 就有歧义。brd4/ligand1（12549 条链）实测多出 3 条：
+
+        (0, 39543) ACE1.CH3 — HOH12582.H1
+        (0, 39544) ACE1.CH3 — HOH12582.H2
+        (1, 39542) ACE1.C   — HOH12582.O
+
+    真键一条不缺（读取端 `createStandardBonds()` 已补齐），所以这 3 条是**净多出**。
+    它们把一个水并进了蛋白那个"分子"，任何按 topology 的键归组的逻辑都会中招。
+
+    ## 判据故意取得**宽**
+
+    "System 认识的键" = `HarmonicBondForce` ∪ `CustomBondForce` ∪ `constraints`。
+    判据宽 = 顶多漏删一条假键 = 无害；判据窄才会误删真键 ⟹ 取宽。
+
+    ⚠️ [2026-09-09 更正] 这里原来写着"比 `system_molecule_grouping()` 宽一条
+    `CustomBondForce`，两处的安全方向相反"。那个论证是错的：归组漏一条边会把
+    分子拆开、回卷时被撕，比多一条边危险得多。两处现在用**同一套**判据，
+    理由见 `system_molecule_grouping()` 的 docstring。
+
+    一条都不用删时**原样返回传入的 topology**（同一个对象），
+    所以 mmCIF 干净的体系（链数 ≤ 26，例如溶剂腿）`_topology_hash()` 逐位不变。
+    """
+    import openmm as _mm
+
+    emit = log if callable(log) else (lambda message: None)
+
+    supported = set()
+    for force in system.getForces():
+        if isinstance(force, (_mm.HarmonicBondForce, _mm.CustomBondForce)):
+            for bond_index in range(force.getNumBonds()):
+                i, j = force.getBondParameters(bond_index)[:2]
+                supported.add((min(int(i), int(j)), max(int(i), int(j))))
+    for constraint_index in range(system.getNumConstraints()):
+        i, j, _distance = system.getConstraintParameters(constraint_index)
+        supported.add((min(int(i), int(j)), max(int(i), int(j))))
+
+    phantom = [
+        (bond[0], bond[1])
+        for bond in topology.bonds()
+        if (min(bond[0].index, bond[1].index), max(bond[0].index, bond[1].index))
+        not in supported
+    ]
+    if not phantom:
+        return topology
+
+    from openmm import app as _app
+
+    pruned = _app.Topology()
+    copied = {}
+    for chain in topology.chains():
+        new_chain = pruned.addChain(chain.id)
+        for residue in chain.residues():
+            new_residue = pruned.addResidue(
+                residue.name, new_chain, residue.id, residue.insertionCode
+            )
+            for atom in residue.atoms():
+                copied[atom.index] = pruned.addAtom(
+                    atom.name, atom.element, new_residue, atom.id
+                )
+    dropped = {(a.index, b.index) for a, b in phantom}
+    for atom_a, atom_b in topology.bonds():
+        if (atom_a.index, atom_b.index) in dropped:
+            continue
+        pruned.addBond(copied[atom_a.index], copied[atom_b.index])
+    box = topology.getPeriodicBoxVectors()
+    if box is not None:
+        pruned.setPeriodicBoxVectors(box)
+
+    emit(
+        f"  [WARN] 拓扑里有 {len(phantom)} 条 System 不认的键，已删除"
+        f"（最先一条：原子 {phantom[0][0].index}"
+        f"（{phantom[0][0].name} {phantom[0][0].residue.name}）–"
+        f"{phantom[0][1].index}"
+        f"（{phantom[0][1].name} {phantom[0][1].residue.name}））。"
+        "mmCIF 往返在链数 > 26 时会造假键，见 PBC-01。"
+    )
+    return pruned
+
+
+def image_molecules_by_system(traj, system, *, log=None):
+    """按 System 的连通性给 `traj` 做整分子回卷，回卷后逐对复查，坏了就 raise。
+
+    ## 为什么不能信 topology 的键（brd4 benchmark，2026-09-09）
+
+    `md.Trajectory.image_molecules()` 默认按 **topology 的键** 判断"什么算一个
+    分子"，而 topology 是可以带**假键**的：
+
+      * `app.PDBxFile` 写 `topology.cif` 时链 id 按
+        `chr(ord('A') + chainIndex % 26)` 循环（`pdbxfile.py:392/473`）；
+      * 读回时 `_struct_conn` 只按 `(seq_id, asym_id, atom_name)` 解析
+        （`pdbxfile.py:218`），**不含链序号**。
+
+    链数一超过 26 就有歧义。brd4/ligand1 有 12549 条链（每个水一条），
+    第一个残基 `ACE(A,1)` 的三条键被解析到某个同样落在 `(A,1)` 的水上：
+
+        (0, 39543) ACE1.CH3 — HOH12582.H1
+        (0, 39544) ACE1.CH3 — HOH12582.H2
+        (1, 39542) ACE1.C   — HOH12582.O
+
+    于是那个水被并进蛋白那个"分子"，`make_whole` 顺着假边把 H2 拽到原子 0 的
+    最近镜像 —— **一个原子被整整平移了一个盒长**（实测 O–H2 = 7.3564 nm，
+    盒长 7.3631 nm）。O–H2 这个 PME 排除对因此跨盒，attachment 腿起点体检
+    （`assert_starting_state_is_sane`）直接拒绝开跑。而修复函数自己报的是
+    `[OK]` —— 它从不复查自己的输出，所以从 2026-09-09 11:38 那次修复到崩，
+    中间没有任何一行日志说过它把体系弄坏了。
+
+    `System` 是唯一权威且必定存在的连通性来源：多一条假键都不会有，
+    刚性水的 O–H 也不会缺（它们只以**约束**存在，`topology.bonds()` 里 0 条，
+    见 MEM-15）。所以这里既不读 topology 的键，也不再往 topology 上补键。
+
+    ⚠️ 只回卷、不旋转、不缩放，分子内相对坐标一律不变。
+    """
+    emit = log if callable(log) else (lambda message: None)
+
+    # System 的原子序号下面被直接拿去索引 traj.topology：少一个原子才 IndexError，
+    # 多一个是静默错位（anchor 里混进不相干的原子），所以先对一次数。
+    if int(traj.n_atoms) != int(system.getNumParticles()):
+        raise RuntimeError(
+            f"轨迹 {int(traj.n_atoms)} 原子 ≠ System {int(system.getNumParticles())} 原子，"
+            "不是同一个体系，拒绝回卷（fail closed）。"
+        )
+
+    molecules, sorted_bonds = system_molecule_grouping(system)
+
+    # anchor 的挑法沿用 mdtraj `Topology.guess_anchor_molecules()` 的启发式，
+    # 只是喂给它的是 System 的分子划分。分子划分本身不含假键时两者同解，
+    # 所以对没触发过这个 bug 的体系，回卷结果与从前逐位相同。
+    by_size = sorted(molecules, key=len, reverse=True)
+    cutoff = max(len(by_size[int(0.1 * len(by_size))]), int(0.1 * len(by_size[0])))
+    md_atoms = list(traj.topology.atoms)
+    anchor = [{md_atoms[i] for i in mol} for mol in by_size if len(mol) > cutoff]
+    other = [{md_atoms[i] for i in mol} for mol in by_size if len(mol) <= cutoff]
+    if not anchor:
+        # mdtraj 在这种情况下直接 raise。体系只有一堆同样大的小分子时
+        # （纯水盒）挑最大的那个当 anchor 就够，没必要因此让整条流程停下。
+        anchor, other = [other[0]], other[1:]
+
+    traj.image_molecules(
+        inplace=True,
+        anchor_molecules=anchor,
+        other_molecules=other,
+        sorted_bonds=sorted_bonds,
+        make_whole=True,
+    )
+
+    # 复查：所有成键/约束对都必须在同一镜像内。半个最短盒边是极宽松的上界
+    # （真实键长 ≤ 0.25 nm），正常体系不可能触发，被撕开的必定触发。
+    # 这一步就是这个 bug 里唯一缺失的东西：修复报了 OK，却没人问过它对不对。
+    if sorted_bonds.size:
+        box = np.asarray(traj.unitcell_vectors, dtype=np.float64)
+        limit = 0.5 * float(np.min(np.linalg.norm(box, axis=2)))
+        # 🔑 [2026-09-09] 逐帧算，不再一次物化 (帧数 × 键数 × 3)。
+        #
+        # 原来这三行会同时开出五个全尺寸数组：两个 fancy-index 拷贝、它们的
+        # float32 差、`astype(np.float64)` 的双宽第四份、再加距离矩阵。
+        # `sorted_bonds` 含每个刚性水的约束，所以键数 ≈ 原子数；而最大的调用方是
+        # `ibs_engine.compute_u_kn`（`md.join` 了**所有窗口**的轨迹）。
+        # 45k 原子 × 11500 帧的量级下这一条语句就是 20 GB 以上的瞬时分配。
+        # 这道复查是 load-bearing 的（撕开的分子必须 fail closed），不能删，
+        # 只能不要一次全开。逐帧的峰值是 O(键数)，而且大多数情况下第一帧就返回。
+        src = sorted_bonds[:, 0]
+        dst = sorted_bonds[:, 1]
+        n_frames_total = int(traj.xyz.shape[0])
+        n_pairs = int(sorted_bonds.shape[0])
+        # 一帧的临时量约 = n_pairs × 3 × 8 B × 3 份（两个 gather + 差），再留一份余量。
+        block = frames_per_chunk(max(1, n_pairs * 3 * 8 * 4), minimum=1)
+        worst_distance = -1.0
+        worst_pair_index = 0
+        worst_frame = 0
+        for start in range(0, n_frames_total, block):
+            stop = min(start + block, n_frames_total)
+            block_xyz = np.asarray(traj.xyz[start:stop], dtype=np.float64)
+            block_distance = np.linalg.norm(
+                block_xyz[:, src, :] - block_xyz[:, dst, :], axis=2
+            )
+            flat = int(np.argmax(block_distance))
+            local_frame, local_pair = divmod(flat, n_pairs)
+            block_max = float(block_distance[local_frame, local_pair])
+            if block_max > worst_distance:
+                worst_distance = block_max
+                worst_pair_index = local_pair
+                worst_frame = start + local_frame
+            if worst_distance > limit:
+                break
+        if worst_distance > limit:
+            raise RuntimeError(
+                f"整分子回卷之后仍有成键/约束对跨周期镜像："
+                f"最远 {worst_distance:.3f} nm > 上限 {limit:.3f} nm"
+                f"（第 {worst_frame} 帧），"
+                f"最坏的一对是原子 {int(sorted_bonds[worst_pair_index, 0])}–"
+                f"{int(sorted_bonds[worst_pair_index, 1])}。\n"
+                "    输入构型坏到 image_molecules 也拼不回来（或盒矢量与坐标不匹配）。"
+                "拒绝把撕开的分子交给最小化 / PME（fail closed）。"
+            )
+    emit(f"  分子归组取自 System（{len(molecules)} 个连通分子），不读 topology 的键")
+    return molecules
 
 
 # ============================================================================
@@ -6914,13 +7523,35 @@ def subsample_series_by_autocorrelation(
     样本过少（< min_frames_for_subsampling）、序列本身没有涨落（比如恒定值）、
     或 pymbar 不可用时，原样返回全部索引、g=1.0（即不子采样）——对极短序列
     强行估计 g 噪声本身就很大，不如不做。
+
+    ## 两条原来 fail-open、现在 fail-closed 的路径（2026-09-09）
+
+    上面 docstring 自己写明了后果："n_k/有效样本数虚高，报告的误差棒因此系统性
+    偏小（常见 2-10 倍）"。而原实现有两处会**静默**造成正是这个后果：
+
+    1. 序列里出现非有限值 → 原来和"序列太短"走同一个 `return full_indices, 1.0`。
+       那等于**既把 NaN 帧原样交给 MBAR，又顺手关掉去相关**。非有限的约化能量
+       是上游 frame_finite 门应该已经拦住的东西，走到这里就是缺陷，不是"这段
+       序列恰好不相关"。
+    2. `except Exception` 把 pymbar 的真实失败也吞成同一个返回值。
+
+    这两种情况在输出上与"序列真的不相关"**完全无法区分**，而它们出现在生产路径上
+    （`ibs_engine` 的三处 MBAR 组装都调它）。现在都抛。
+    "太短 / 无涨落 / 没装 pymbar" 仍然按原样放行——那三种是真的不该子采样。
     """
     series = np.asarray(series, dtype=np.float64)
     n = series.shape[0]
     full_indices = np.arange(n)
     if not has_pymbar() or n < min_frames_for_subsampling:
         return full_indices, 1.0
-    if not np.all(np.isfinite(series)) or np.std(series) < 1e-12:
+    if not np.all(np.isfinite(series)):
+        n_bad = int(np.count_nonzero(~np.isfinite(series)))
+        raise RuntimeError(
+            f"去相关的输入序列里有 {n_bad}/{n} 个非有限值。原来这里会静默返回"
+            "全部索引 + g=1.0，等于把 NaN 帧交给 MBAR 的同时关掉去相关，"
+            "报告的误差棒会系统性偏小 2-10 倍且无从察觉。fail closed。"
+        )
+    if np.std(series) < 1e-12:
         return full_indices, 1.0
     try:
         from pymbar import timeseries
@@ -6931,8 +7562,12 @@ def subsample_series_by_autocorrelation(
         if indices.size < 2:
             return full_indices, g
         return indices, g
-    except Exception:
-        return full_indices, 1.0
+    except Exception as exc:
+        raise RuntimeError(
+            f"pymbar 去相关失败（{type(exc).__name__}: {exc}）。原来这里会静默退回"
+            "全部索引 + g=1.0，与'序列真的不相关'在输出上完全无法区分，"
+            "而后果是误差棒偏小 2-10 倍。fail closed。"
+        ) from exc
 
 
 def get_optimal_device_settings():
@@ -8926,18 +9561,7 @@ class OrbBoreschEstimator:
             "method": "orb_pocket_projection_v4.3",
         }
         if output_path:
-
-            class NumpyEncoder(json.JSONEncoder):
-                def default(self, obj):
-                    if isinstance(obj, (np.integer, np.floating)):
-                        return float(obj)
-                    if isinstance(obj, np.ndarray):
-                        return obj.tolist()
-                    if isinstance(obj, (np.bool_,)):
-                        return bool(obj)
-                    return super().default(obj)
-
-            with open(output_path, "w") as f:
+            with open(output_path, "w", encoding="utf-8") as f:
                 json.dump(result, f, indent=2, cls=NumpyEncoder)
         return result
 
@@ -9367,12 +9991,7 @@ class OrbBoreschEstimator:
 
         if output_path:
             import json
-            class NumpyEncoder(json.JSONEncoder):
-                def default(self, obj):
-                    if isinstance(obj, (np.integer, np.floating)): return float(obj)
-                    if isinstance(obj, np.ndarray): return obj.tolist()
-                    return super().default(obj)
-            with open(output_path, "w") as f:
+            with open(output_path, "w", encoding="utf-8") as f:
                 json.dump({"candidates": results}, f, indent=2, cls=NumpyEncoder)
             print(f"[OK] 结果已保存: {output_path}")
             
@@ -9506,7 +10125,7 @@ class SurrogateSystemBuilder:
         # 直接污染调用者传进来的 original_system —— 这会导致外部同时持有的“原始
         # 力场”引用实际上已经被替换成了这个 surrogate system。
         new_system = ensure_owned_system(
-            XmlSerializer.deserialize(XmlSerializer.serialize(original_system))
+            XmlSerializer.clone(original_system)
         )
         resolved_box_vectors = (
             box_vectors
@@ -9888,15 +10507,7 @@ class OnlineConvergenceMonitor:
     def export_convergence_data(self, path: str):
         import json
 
-        class NumpyEncoder(json.JSONEncoder):
-            def default(self, obj):
-                if isinstance(obj, (np.integer, np.floating)):
-                    return float(obj)
-                if isinstance(obj, np.ndarray):
-                    return obj.tolist()
-                return super().default(obj)
-
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(self.history, f, indent=2, cls=NumpyEncoder)
 
     def plot_convergence(self, output_path: str):
@@ -10314,7 +10925,7 @@ def auto_select_boresch_anchors_rmsf(
         
     print(f"[OK] 自动锚点选择完成: r0={best_config['equilibrium_r0']:.2f}nm, RMSF={best_config['rmsf_mean']:.3f}nm")
     if output_path:
-        with open(output_path, "w") as f:
+        with open(output_path, "w", encoding="utf-8") as f:
             json.dump(best_config, f, indent=2, cls=NumpyEncoder)
     return best_config
 
@@ -10330,7 +10941,6 @@ class ChunkedMBARAnalyzer:
     ✅ 兼容 pymbar >= 3.0.5
     """
     def __init__(self, max_memory_gb: float = 32.0, cache_dir: str = "./mbar_cache", temperature_k: float = 300.0):
-        import gc
         self.max_ram = max_memory_gb * 1e9
         self.cache_dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
@@ -11040,8 +11650,7 @@ def ensure_owned_system(system: openmm.System) -> openmm.System:
                 "System 声称由 Python 持有，但底层 OpenMM 对象已不可访问。"
             ) from exc
         return system
-    xml = XmlSerializer.serialize(system)
-    new_sys = XmlSerializer.deserialize(xml)
+    new_sys = XmlSerializer.clone(system)
     new_sys.thisown = 1
     _ = new_sys.getNumParticles()
     return new_sys
@@ -11096,7 +11705,43 @@ def sync_all_exclusions(system: openmm.System) -> int:
     total_synced = 0
     for c_force, existing in zip(eligible_forces, existing_per_force):
         missing = union_excl - existing
-        for p1, p2 in missing:
+        # 🔑 [EXP-031 路线 A] `sorted()` 不是整洁癖，是这一行本身值 1.162×。
+        #
+        # `missing` 是 set，迭代序由哈希决定，基本是随机的。OpenMM 的
+        # CustomNonbondedForce 对**排除表的写入顺序**敏感：乱序灌进去，它内部
+        # 按粒子组织的排除结构与邻居表就退化，每步都要多付一笔。
+        #
+        # 而且**随机打乱比 set 的哈希序还更慢** —— 所以要紧的是"升序"本身，
+        # 不只是"别用哈希序"；换成任何一种确定性顺序都不行。
+        #
+        # 受害的是那些**自己只带局部排除表**的力 —— 典型是 Group-2「恢复配体
+        # 内部非键」：interaction group 只有 41×41，却要被灌进全系统 120895 条
+        # 排除（本函数的全部意义就是"账本对齐"，见上面的 docstring）。
+        #
+        # ⚠️ IBS 的软核 CV 确实免疫，但**原因是结构性的，不是"missing 为空集"**：
+        # 它们嵌在 Group-1 的 CustomCVForce 内部（`ibs_engine` 加进 System 的是
+        # `ibs_wrapper.get_force()`，返回类型就是 `CustomCVForce`），而本函数只挑
+        # `system.getForces()` 里的 `CustomNonbondedForce` —— 嵌套的 CV 根本不在
+        # 候选集里，对它们 `missing` **从未被计算过**。同样的话 `ibs_engine.py`
+        # 里那段（"软核 CV…sync_all_exclusions 扫不到"）早就写对了。
+        #
+        # 不要写成"`full_softcore_excl` 本来就是全系统并集所以 missing 为空"。
+        # 那个说法会害两次：① 谁把某个 CV 提到顶层、或新增一个粒子数匹配的顶层
+        # CustomNonbondedForce，会以为"反正是全集所以安全"，实际它立刻开始收到
+        # 这条追加尾巴；② 它暗示"别动 full_softcore_excl 的全集性质，否则排序税
+        # 回来" —— 也是错的，动了它坏的是**正确性**（`current_excl != template_excl`
+        # 那个 raise 挡的东西），跟排序税无关。
+        #
+        # 为什么修在这里而不是各产地：各产地都已经 sorted() 过了，但那保护不了
+        # 本函数在后面**追加**的这条尾巴。
+        #
+        # 实测（EXP-031，abfe-ibs-cuda-d5）：真 Atenolol 膜体系 45354 原子、
+        # 三次独立测量 **1.162×**。⚠️ 早期文档里的 **1.45× 是水盒工作点的数字，
+        # 不可引用**（见 docs/EXP-031_GPU_OPTIMIZATION_2026-09-09.md）。
+        # 排除对的集合与条数完全不变，能量逐比特不变；变的只有写入顺序 ——
+        # 但那会改 System XML 里排除表的书写顺序 ⟹ `system_xml_sha256` 变，
+        # 既有窗口产物/resume 失配。"能量不变"≠"缓存能用"。
+        for p1, p2 in sorted(missing):
             c_force.addExclusion(p1, p2)
         total_synced += len(missing)
     return total_synced
@@ -11231,7 +11876,7 @@ def bake_global_parameter_into_fixed_nonbonded_force(
         )
 
     system = ensure_owned_system(
-        XmlSerializer.deserialize(XmlSerializer.serialize(system))
+        XmlSerializer.clone(system)
     )
 
     hits = _scan_forces_referencing_global_parameter(system, parameter_name)
@@ -12032,7 +12677,7 @@ class GeometricRestraintEstimator:
         ]
 
         if output_path:
-            with open(output_path, 'w') as f:
+            with open(output_path, 'w', encoding="utf-8") as f:
                 json.dump(result, f, indent=2, cls=NumpyEncoder)
 
         print(f"  最优锚点: 受体 {result['receptor_indices']} | 配体 {result['ligand_indices']}")

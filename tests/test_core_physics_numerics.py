@@ -693,20 +693,44 @@ def _kt_beta(temperature_k=BIAS_TEMP):
     return kt, 1.0 / kt
 
 
+def _omit_zero_rest_cvs():
+    """当前 Group-1 形态：是否**不**注册那 K 个恒零的 `cv_k_rest` 占位 CV。
+
+    [EXP-031 S1] 这个 helper 与下面的解析参考实现都必须**跟着形态走**，否则：
+      - omit 形态下 `addCollectiveVariable("cv_k_rest", ...)` 会被 IBSBiasForce
+        直接 raise（那是**刻意的** fail-closed：omit 形态的表达式根本不引用 rest，
+        注册一个就等于白付一次 inner-context 力求值，且会被 validate_wiring 判成
+        unexpected）；
+      - 解析参考若仍算 `(c_int + c_rest)`，就会跟一个不含 rest 项的表达式对比，
+        变成假失败。
+    本文件这几条测试验的是"表达式确实等于 −kT·log Σ exp(−βX_k)"这个恒等式，
+    而 X_k 的定义随形态变 —— 所以两边一起跟着形态走，测试在两种形态下都成立且都
+    有意义。v32 及以前默认形态是 legacy（`IBS_BIAS_OMIT_ZERO_REST_CVS = False`），
+    那时本 helper 的行为与改动前逐字符相同；**v33 起默认是 omit 形态**。
+    """
+    import ibs_engine
+
+    return bool(ibs_engine.IBS_BIAS_OMIT_ZERO_REST_CVS)
+
+
 def _build_bias_context(cv_coefficients, f_values, temperature_k=BIAS_TEMP):
     """把 IBSBiasForce 装进一个 3 粒子裸系统里，返回 (bias, context)。
 
     每个 CV 用 `CustomExternalForce("c*x")` 只作用在粒子 0 上 → CV 值 = c·x₀，
     完全可控且与坐标线性相关（力非零，顺带保证表达式可微）。
+
+    omit 形态下只注册 `cv_k_int`（见 `_omit_zero_rest_cvs` 的说明）。
     """
     n_states = len(cv_coefficients)
     system = openmm.System()
     for _ in range(3):
         system.addParticle(1.0 * unit.amu)
 
+    omit = _omit_zero_rest_cvs()
     bias = IBSBiasForce(n_states=n_states, temperature=temperature_k * unit.kelvin)
     for k, (c_int, c_rest) in enumerate(cv_coefficients):
-        for suffix, coeff in (("int", c_int), ("rest", c_rest)):
+        suffixes = (("int", c_int),) if omit else (("int", c_int), ("rest", c_rest))
+        for suffix, coeff in suffixes:
             cv_force = openmm.CustomExternalForce(f"{float(coeff)!r}*x")
             cv_force.addParticle(0, [])
             bias.addCollectiveVariable(f"cv_{k}_{suffix}", cv_force)
@@ -739,9 +763,12 @@ def _analytic_bias_energy(cv_coefficients, f_values, temperature_k=BIAS_TEMP):
     的测试里朴素写法本身就会溢出成 inf，参考实现必须先站得住。
     """
     kt, beta = _kt_beta(temperature_k)
+    # [EXP-031 S1] X_k 的定义随 Group-1 形态变：omit 形态里根本没有 rest 项。
+    # 与 `_build_bias_context` 用同一个开关，两边永远一致。
+    omit = _omit_zero_rest_cvs()
     x_values = np.array(
         [
-            (c_int + c_rest) * X0_NM - float(f_k)
+            (c_int if omit else (c_int + c_rest)) * X0_NM - float(f_k)
             for (c_int, c_rest), f_k in zip(cv_coefficients, f_values)
         ],
         dtype=float,

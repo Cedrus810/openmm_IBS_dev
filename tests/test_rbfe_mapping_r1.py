@@ -28,6 +28,9 @@ import pytest
 import rbfe_core as rc
 import runrbfe
 
+
+pytestmark = pytest.mark.cpu_only
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LIGAND_ITP = REPO_ROOT / "tests" / "fixtures" / "memtest" / "Atenolol-rank11.itp"
 MOLECULETYPE = "Atenolol-rank11"

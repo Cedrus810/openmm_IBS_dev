@@ -17,7 +17,12 @@ exclude = [
 ]
 
 [tool.ruff.lint]
-select = ["E9", "F63", "F7", "F82"]
+# E9/F63/F7/F82 = 语法错误、比较写错、断言/字符串误用、未定义名——纯正确性门。
+# 2026-09-09 追加 F811（重复定义）：`generate_overlapping_windows` 在
+# abfe_pipeline.py 里被 import 了 4 次、`NumpyEncoder` 在 abfe_core.py 里有
+# 3 份函数内嵌套副本并**遮蔽**了模块级那份（后者把 np.integer 错序列化成 float），
+# 两件事这道门原先都抓不到。F401（未用 import，83 处）暂未开，量级不同、另议。
+select = ["E9", "F63", "F7", "F82", "F811"]
 
 [tool.mypy]
 python_version = "3.12"

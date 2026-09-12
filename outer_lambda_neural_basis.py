@@ -53,6 +53,11 @@ class NeuralPathFrameError(RuntimeError):
     """一帧 target/bias/base 账本无法原子提交时抛出。"""
 
 
+# ORB/MACE 分解 Context 缓存的容量上限。每条 entry 持有 3 个带模型的
+# OpenMM Context，所以这个数直接决定显存占用上限；调大之前先量一个 entry 多大。
+_ORB_DECOMPOSITION_CACHE_MAX_ENTRIES = 4
+
+
 class TorchForceDeploymentError(RuntimeError):
     """独立 TorchForce 构建、序列化或 Context 验证失败时抛出。"""
 
@@ -1410,14 +1415,30 @@ class ExistingOrbMaceBasisAdapter:
                 environment_array,
                 number_array,
             )
+        # 🔑 [2026-09-09] key 里补上原子序数。
+        #
+        # 原来 key 只有 (标签, ligand 索引, environment 索引, device)，**不含
+        # `number_array`** —— 同一组索引配不同的原子序数会静默命中同一份缓存，
+        # 拿到为别的元素组成建的 ORB/MACE Context，算出一个不报错的错数。
         key = (
             "outer_lambda_orbv3_decomposition",
             tuple(int(value) for value in ligand_array),
             tuple(int(value) for value in environment_array),
+            tuple(int(value) for value in number_array),
             self.device,
         )
         cache = self._pipeline._orb_ctx_cache
         if key not in cache:
+            # 🔑 [2026-09-09] 给这个缓存加上限。
+            #
+            # 每个 miss 会建 **3 个** OpenMM Context，每个都带一个 GPU 上的
+            # ORB/MACE 模型，而这里原来既无淘汰也无容量上限。只要调用方在帧之间
+            # 变动 environment 选择（按距离选壳、逐窗口选择），就会无界增长到
+            # 显存耗尽；今天没炸只是因为现有调用方全程用同一份冻结选择。
+            # 用最简单的 FIFO：超了就把最早的一条连同它那 3 个 Context 一起丢。
+            while len(cache) >= _ORB_DECOMPOSITION_CACHE_MAX_ENTRIES:
+                evicted_key = next(iter(cache))
+                cache.pop(evicted_key, None)
             combined = np.concatenate(
                 [ligand_array, environment_array]
             )
@@ -1863,15 +1884,37 @@ class MaceDecompositionPythonComputation:
         import numpy as np
 
         self._load_model()
-        regions = {}
-        for label, indices in (
-            ("cplx", self.combined_indices),
-            ("lig", self.ligand_indices),
-            ("env", self.environment_indices),
+        # 🔑 [2026-09-10] 三个区域**共用同一次 minimum image**，再切片。
+        #
+        # 原来是每个区域各做一次 `_minimum_image_selected`，而那个函数把
+        # `selected[0]` 当锚点 —— cplx 和 lig 锚在 `ligand_indices[0]`，env 却锚在
+        # `environment_indices[0]`。离锚点超过半个盒长的原子会被选到**不同的**
+        # 周期镜像，于是 `E_cplx` 里的环境子几何 ≠ 单独算的 `E_env` 的几何，
+        # 差值 `E_cplx − E_lig − E_env` 吸收一个伪的胞内项。
+        #
+        # ⚠️ 关键是**三项用同一套镜像**，不是"镜像本身要物理"：只要三者坐标逐位
+        # 同源，这个分解就精确成立，哪怕环境壳大于 L/2、镜像看起来不漂亮。
+        # 别"好心地"把 env 按它自己的锚点重新 image 一遍——那正是这个 bug。
+        #
+        # `combined_indices == ligand_indices + environment_indices`（见 __init__），
+        # 所以切片位置是确定的；这里断言一次，防止哪天构造顺序被改。
+        n_ligand = len(self.ligand_indices)
+        if tuple(self.combined_indices) != tuple(self.ligand_indices) + tuple(
+            self.environment_indices
         ):
-            imaged = self._minimum_image_selected(
-                positions_nm, list(indices), box_nm
+            raise NeuralPathConfigError(
+                "combined_indices 不再是 ligand_indices + environment_indices 的拼接；"
+                "下面按位置切片的假设不成立，拒绝继续（会静默给出错误的分解能量）。"
             )
+        imaged_combined = self._minimum_image_selected(
+            positions_nm, list(self.combined_indices), box_nm
+        )
+        regions = {}
+        for label, imaged in (
+            ("cplx", imaged_combined),
+            ("lig", imaged_combined[:n_ligand]),
+            ("env", imaged_combined[n_ligand:]),
+        ):
             regions[label] = self._evaluate_region(label, imaged)
         energy = regions["cplx"][0] - regions["lig"][0] - regions["env"][0]
         full_forces = np.zeros(
@@ -3028,14 +3071,31 @@ def run_mace_decomposition_mts_arm(
             temperature * unit.kelvin, int(random_seed)
         )
         completed_inner = 0
-        outer_chunk = report_interval_inner_steps // mts_ratio
         path_mask = 1 << path_group
         base_mask = 1
         while completed_inner < n_inner_steps:
+            # 🔑 [2026-09-09] 最后一段要截断，不能整段照 report_interval 跑。
+            #
+            # 原来是固定 `integrator.step(report_interval_inner_steps // mts_ratio)`
+            # 再 `completed_inner += report_interval_inner_steps`。上游只校验
+            # `n_inner_steps` 和 `report_interval_inner_steps` 都能被 `mts_ratio`
+            # 整除，**没有**校验 interval 整除总步数（例如 10000 / 300）——于是循环
+            # 会超跑最多一个 report interval，而 `integration_seconds_per_inner_step`
+            # / `simulated_time_ps` / `ns_per_day` 全部按**请求的** `n_inner_steps`
+            # 计算 ⇒ `ns_per_day` 被系统性抬高。而 `ns_per_day` 正是
+            # `assess_mace_mts_matrix` 里 `minimum_n4_ns_per_day` 那道硬 go/no-go
+            # 门的输入。NVT 那个同胞循环用的就是下面这种截断写法，是对的。
+            remaining_inner = n_inner_steps - completed_inner
+            chunk_inner = min(report_interval_inner_steps, remaining_inner)
+            outer_chunk = chunk_inner // mts_ratio
+            if outer_chunk <= 0:
+                # 余量不足一个 outer step：再跑就必然超过 n_inner_steps。
+                # 与其偷偷多跑，不如如实停在这里（差额 < mts_ratio 个 inner step）。
+                break
             integration_started = time.perf_counter()
             integrator.step(outer_chunk)
             integration_seconds += time.perf_counter() - integration_started
-            completed_inner += report_interval_inner_steps
+            completed_inner += outer_chunk * mts_ratio
             diagnostic_started = time.perf_counter()
             base_state = context.getState(getEnergy=True, groups=base_mask)
             path_state = context.getState(
@@ -3151,7 +3211,15 @@ def run_mace_decomposition_mts_arm(
             for evaluation in sample["support_domain"]
         )
     )
-    simulated_ns = n_inner_steps * inner_dt * 1.0e-6
+    # 🔑 [2026-09-09] 速率一律按**实际跑完的** inner step 算，不按请求值。
+    #
+    # `report_interval_inner_steps` 不整除 `n_inner_steps` 时循环会截断（见上面
+    # 那段说明），实际步数可能少于请求值；反过来在修复之前是**多**跑。两种情况下
+    # 用 `n_inner_steps` 算 `ns_per_day` 都会给出与真实吞吐不符的数，而它是
+    # `assess_mace_mts_matrix` 里 `minimum_n4_ns_per_day` 硬门的输入。
+    # 同时把请求值和实际值都落进报告，差异一眼可见。
+    actual_inner_steps = int(completed_inner)
+    simulated_ns = actual_inner_steps * inner_dt * 1.0e-6
     return {
         "report_type": "outer_lambda_mace_mts_arm",
         "report_version": 1,
@@ -3161,8 +3229,11 @@ def run_mace_decomposition_mts_arm(
         "outer_timestep_fs": outer_timestep_fs,
         "mace_interval_fs": outer_timestep_fs,
         "n_inner_steps": n_inner_steps,
-        "n_outer_steps": n_inner_steps // mts_ratio,
-        "simulated_time_ps": n_inner_steps * inner_dt / 1000.0,
+        # 请求值与实际值分开落盘：report_interval 不整除总步数时两者会差
+        # 最多一个 outer step（`mts_ratio` 个 inner step）。
+        "n_inner_steps_completed": actual_inner_steps,
+        "n_outer_steps": actual_inner_steps // mts_ratio,
+        "simulated_time_ps": actual_inner_steps * inner_dt / 1000.0,
         "report_interval_inner_steps": report_interval_inner_steps,
         "temperature_target_kelvin": temperature,
         "lambda": lam,
@@ -3179,7 +3250,9 @@ def run_mace_decomposition_mts_arm(
         "integration_seconds": integration_seconds,
         "diagnostic_seconds": diagnostic_seconds,
         "integration_seconds_per_inner_step": (
-            integration_seconds / n_inner_steps
+            integration_seconds / actual_inner_steps
+            if actual_inner_steps > 0
+            else None
         ),
         "ns_per_day": (
             simulated_ns * 86400.0 / integration_seconds
@@ -3828,7 +3901,23 @@ class IBSSamplerNeuralPathAdapter:
             self._record_query(True)
             return relative_bias_cv
         except Exception as exc:
-            if isinstance(exc, RuntimeError) and "hard gate" in str(exc):
+            # 🔑 [2026-09-09] 这里要跟它所替换的
+            # `ibs_engine.IBSSampler.collect_energies` **逐条对齐**再抛，否则本适配器
+            # 会把生产路径明确规定要向上抛的错误悄悄降级成一个被丢掉的 NaN 帧。
+            #
+            # 补两类：
+            #   * `"LJ 长程尾项"` —— 生产 sampler 一直是 fail-closed 的（8154-8157），
+            #     这里原来只认 `"hard gate"`，于是 LRC 的 fail-closed 变成静默丢帧。
+            #   * `NeuralPathFrameError` —— 冻结安全包络
+            #     （max_abs_basis_energy_kj_mol / max_force_norm_kj_mol_nm /
+            #     非有限 basis 能量）的判定结果。丢掉它等于让最终系综"只由神经
+            #     basis 恰好没炸的那些帧"构成，且没有任何记录。
+            if isinstance(exc, NeuralPathFrameError):
+                raise
+            if isinstance(exc, RuntimeError) and (
+                "hard gate" in str(exc)
+                or "LJ 长程尾项" in str(exc)
+            ):
                 raise
             self._record_query(False, f"neural_path:{type(exc).__name__}")
             return np.full(len(self.lambdas), np.nan, dtype=np.float64)
@@ -8211,13 +8300,31 @@ def _run_cli_command(args: argparse.Namespace) -> dict[str, Any]:
             system = openmm.XmlSerializer.deserialize(
                 system_path.read_text(encoding="utf-8")
             )
+            # 🔑 [2026-09-09] 连通性不能只认 `HarmonicBondForce`。
+            #
+            # `discover_ligand_rotatable_torsions` 把 `bond_pairs` 当成拓扑键图的
+            # **替代品**（只有 `bond_pairs is None` 才回落拓扑），空列表会被当成
+            # "这个配体没有键"照单全收。两种真实体系会踩上：
+            #   * 配体分子内成键项放在 `CustomBondForce` 里
+            #     （`abfe_core.create_ligand_internal_force`、`rbfe_core` 的
+            #     `interp_bond` 产出的正是这种）⇒ bond_pairs 为空 ⇒ 报告里写
+            #     `ligand_rotatable_torsion_count: 0` 而不报错；
+            #   * `constraints=HBonds` 时 X–H 是**约束**不是 HarmonicBondForce
+            #     ⇒ 重原子的度数算错 ⇒ `outer_priority` 选出不同的外侧原子
+            #     ⇒ 得到与拓扑路径不同的 torsion 和 stable_id，一路带进
+            #     freeze-slow-variable / EXP-011 manifest。
+            # 判据与 `abfe_core.system_molecule_grouping` 统一，也与 OpenMM 自己的
+            # `findMolecules()` 一致（`CustomBondForceImpl::getBondedParticles()`）。
             bond_pairs = []
             for force_index in range(system.getNumForces()):
                 force = system.getForce(force_index)
-                if isinstance(force, openmm.HarmonicBondForce):
+                if isinstance(force, (openmm.HarmonicBondForce, openmm.CustomBondForce)):
                     for bond_index in range(force.getNumBonds()):
-                        left, right, _, _ = force.getBondParameters(bond_index)
-                        bond_pairs.append([int(left), int(right)])
+                        params = force.getBondParameters(bond_index)
+                        bond_pairs.append([int(params[0]), int(params[1])])
+            for constraint_index in range(system.getNumConstraints()):
+                left, right, _distance = system.getConstraintParameters(constraint_index)
+                bond_pairs.append([int(left), int(right)])
             system_sha = sha256_file(system_path)
         ligand_torsions = discover_ligand_rotatable_torsions(
             topology, ligand_indices, bond_pairs=bond_pairs
@@ -8233,8 +8340,13 @@ def _run_cli_command(args: argparse.Namespace) -> dict[str, Any]:
             ),
             pocket_cutoff_nm=args.pocket_cutoff_nm,
         )
+        # 🔑 [2026-09-09] 直接传 ndarray，不要先 `.tolist()`。两个被调方进门第一句
+        # 都是 `np.asarray(frames_nm, dtype=np.float64)`，而 `.tolist()` 会先造出
+        # N×n_atoms×3 个 Python float 对象（每个约 32 B 加 list 开销，约是 float32
+        # 数组的 15 倍）。默认 `--frames all` 下 73k 原子 × 1000 帧 ≈ 9 GB 的中间
+        # 列表，而且它和随后那份 float64 数组同时活着。
         report = screen_periodic_torsion_candidates(
-            loaded.xyz.tolist(),
+            loaded.xyz,
             (
                 loaded.unitcell_vectors.tolist()
                 if loaded.unitcell_vectors is not None
@@ -8243,7 +8355,7 @@ def _run_cli_command(args: argparse.Namespace) -> dict[str, Any]:
             ligand_torsions + sidechain_torsions,
         )
         report["hydration_candidate"] = screen_ligand_hydration_coordination(
-            loaded.xyz.tolist(),
+            loaded.xyz,
             (
                 loaded.unitcell_vectors.tolist()
                 if loaded.unitcell_vectors is not None
@@ -8882,7 +8994,13 @@ def _run_cli_command(args: argparse.Namespace) -> dict[str, Any]:
             )
             for frame_index in frame_indices
         ]
-        frames_nm = [frame.xyz[0].tolist() for frame in loaded_frames]
+        # 🔑 [2026-09-09] 先把需要的东西全抽出来，再把 mdtraj 的 Trajectory 列表放掉。
+        #
+        # 原来 `loaded_frames`（每帧一个完整 Trajectory 对象）在整个
+        # `benchmark_existing_orb_mace_basis` 期间一直被引用着，与 `frames_nm`
+        # （全量 Python 嵌套 list）以及该函数内部 `_normalize_frame_collection`
+        # 建的**第三份**（嵌套 tuple，约 180 B/原子/帧）同时驻留。
+        # 抽完就 del，能省掉三份里的一份。
         topology = loaded_frames[0].topology
         atomic_numbers = []
         for atom in topology.atoms:
@@ -8891,6 +9009,11 @@ def _run_cli_command(args: argparse.Namespace) -> dict[str, Any]:
                     f"topology atom {atom.index} 缺少元素"
                 )
             atomic_numbers.append(int(atom.element.atomic_number))
+        box_vectors_by_frame_nm = [
+            frame.unitcell_vectors[0].tolist() for frame in loaded_frames
+        ]
+        frames_nm = [frame.xyz[0].tolist() for frame in loaded_frames]
+        del loaded_frames
         selection_meta = _cli_read_json_mapping(
             args.selection_meta, "selection-meta"
         )
@@ -8910,10 +9033,7 @@ def _run_cli_command(args: argparse.Namespace) -> dict[str, Any]:
             ligand_indices=selection_meta["ligand_indices"],
             environment_indices=selection_meta["env_indices"],
             atomic_numbers=atomic_numbers,
-            box_vectors_by_frame_nm=[
-                frame.unitcell_vectors[0].tolist()
-                for frame in loaded_frames
-            ],
+            box_vectors_by_frame_nm=box_vectors_by_frame_nm,
         )
         report["ok"] = True
         report["command"] = "label-trajectory"

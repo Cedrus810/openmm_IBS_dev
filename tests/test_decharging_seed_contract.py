@@ -49,15 +49,6 @@ PIPELINE_PATH = ROOT / "abfe_pipeline.py"
 # ---------------------------------------------------------------------------
 
 
-class _EmptySystem:
-    def getForces(self):
-        return []
-
-
-class _EmptyTopology:
-    pass
-
-
 def _fingerprint(seed_contract, leg_hint="complex"):
     return pl._remd_sampling_fingerprint(
         stage_name="decharging",
@@ -154,8 +145,6 @@ def test_stage1_seeds_differ_between_legs_and_follow_repeat_seed():
 
 def test_remd_manager_rejects_leg_mismatch():
     """REMDManager 的 seed_leg 与 ledger.leg 不一致时 fail closed。"""
-    import inspect
-
     src = (ROOT / "ibs_engine.py").read_text(encoding="utf-8")
     assert 'seed_leg 与 EXP-019 seed ledger 不一致' in src, (
         "REMDManager 丢失了 seed_leg/ledger 一致性检查，P1-18 的接线就少了半边"

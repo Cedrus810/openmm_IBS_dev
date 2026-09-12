@@ -15,6 +15,9 @@ import free_energy_engine as fee
 import runabfe
 
 
+
+pytestmark = pytest.mark.cpu_only
+
 def _config(monkeypatch, argv_extra=(), config_payload=None, tmp_path=None):
     argv = ["runabfe.py", *argv_extra]
     if config_payload is not None:

@@ -15,6 +15,9 @@ import rbfe_core as rc
 import runrbfe
 
 
+
+pytestmark = pytest.mark.cpu_only
+
 def _write(tmp_path, name, payload):
     path = tmp_path / name
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")

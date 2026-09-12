@@ -13,6 +13,9 @@ from ibs_engine import (
 )
 
 
+
+pytestmark = pytest.mark.cpu_only
+
 SCORE_HASH = "a" * 64
 
 

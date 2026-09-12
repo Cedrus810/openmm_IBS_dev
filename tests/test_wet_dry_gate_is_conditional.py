@@ -18,6 +18,9 @@ from pathlib import Path
 
 import pytest
 
+
+pytestmark = pytest.mark.cpu_only
+
 REPO = Path(__file__).resolve().parents[1]
 
 
@@ -86,14 +89,57 @@ def test_failed_gate_still_blocks():
 
 
 def test_sampler_no_longer_raises_without_a_wet_seed():
+    """缺湿起点必须降级为 dry-only，不得 raise。
+
+    2026-09-09 重写。原实现两条都靠裸子串：
+      * `assert "reached_wet=False" not in body or "raise RuntimeError" not in
+        body.split("wet_available")[0][-600:]` —— 一个 OR，两半只要一半成立就通过，
+        而且 600 字符的切片位置随代码增删漂移；
+      * 而 `reached_wet=False` 现在**只出现在一句注释里**（"这里曾经在
+        reached_wet=False 时直接 raise。那是错的……"），任何裸子串判据都分不出
+        "注释里提到" 和 "代码里真的这么写"。
+    改成 AST：函数里任何 `raise` 都不得被"湿起点缺失"这个条件守着。
+    """
+    import ast
+
     src = (REPO / "ibs_engine.py").read_text(encoding="utf-8")
-    i = src.index("def run_independent_endpoint_states(")
-    j = src.index("def _reduced_energies_for_record(")
-    body = src[i:j]
-    assert "reached_wet=False" not in body or "raise RuntimeError" not in body.split(
-        "wet_available")[0][-600:], "湿起点缺失不得再 raise"
-    assert "wet_available" in body and 'active_modes' in body
-    assert '"wet_basin_found"' in body
+    tree = ast.parse(src, filename="ibs_engine.py")
+    fn = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef)
+         and n.name == "run_independent_endpoint_states"),
+        None,
+    )
+    assert fn is not None, "找不到 run_independent_endpoint_states"
+
+    parents = {}
+    for parent in ast.walk(fn):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
+
+    offenders = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Raise):
+            continue
+        ancestor = parents.get(node)
+        while ancestor is not None:
+            if isinstance(ancestor, ast.If):
+                test_src = ast.unparse(ancestor.test)
+                if "reached_wet" in test_src or "wet_seed" in test_src:
+                    offenders.append((node.lineno, test_src[:80]))
+                    break
+            ancestor = parents.get(ancestor)
+    assert not offenders, (
+        f"这些 raise 又被「湿起点缺失」守着：{offenders}。湿起点采不到时正解是"
+        "降级成 dry-only + 迟滞门未评估，不是让整段失败。"
+    )
+
+    # 降级路径本身必须存在（否则上面那条断言在"整个功能被删掉"时也会通过）。
+    body = ast.get_source_segment(src, fn) or ""
+    assert "wet_available" in body and "active_modes" in body, (
+        "dry-only 降级所需的 wet_available / active_modes 不见了"
+    )
+    assert '"wet_basin_found"' in body, "湿盆是否找到必须落盘，供迟滞门判是否可评估"
 
 
 def test_dryonly_and_wetdry_banks_do_not_share_cache():

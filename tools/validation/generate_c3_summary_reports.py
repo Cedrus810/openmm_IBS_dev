@@ -32,6 +32,7 @@ System 的 energy/force。它只做两件事：
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -44,7 +45,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import compare_charge_transfer_endpoints as cte  # noqa: E402
 import ibs_engine as ie  # noqa: E402
 
-RESULT_DIR = _REPO_ROOT / "tests" / "fixtures" / "validation" / "c3_real_endpoints_v2"
+# c2_lipid_slab_v11 那批 raw case 有 94 MB，不随本仓分发；取回后用
+# ABFE_VALIDATION_FIXTURES 指向它们的父目录（默认是仓内 tests/fixtures/validation）。
+_FIXTURES = Path(
+    os.environ.get(
+        "ABFE_VALIDATION_FIXTURES",
+        _REPO_ROOT / "tests" / "fixtures" / "validation",
+    )
+)
+
+RESULT_DIR = _FIXTURES / "c3_real_endpoints_v2"
 
 AB_CASES: Dict[str, Path] = {
     "C1_Na_large": RESULT_DIR / "c1_na_large_v2.json",
@@ -64,11 +74,11 @@ CD_CASES: Dict[str, Path] = {
 # case 名 -> raw case_dir（跟 docs/status/memtodolist.md/前面几轮 run-matrix-v2(-cd) 调用
 # 用的是同一批目录），只用来做只读结构核验，不碰轨迹/坐标。
 CASE_RAW_DIRS: Dict[str, Path] = {
-    "C1_Na_large": _REPO_ROOT / "tests" / "fixtures" / "validation" / "c1_waterbox" / "Na_large",
-    "Na_thin_pos0": _REPO_ROOT / "tests" / "fixtures" / "validation" / "c2_lipid_slab_v11" / "Na_thin_pos0",
-    "Na_thin_pos1": _REPO_ROOT / "tests" / "fixtures" / "validation" / "c2_lipid_slab_v11" / "Na_thin_pos1",
-    "Na_thick_pos0": _REPO_ROOT / "tests" / "fixtures" / "validation" / "c2_lipid_slab_v11" / "Na_thick_pos0",
-    "Na_thick_pos1": _REPO_ROOT / "tests" / "fixtures" / "validation" / "c2_lipid_slab_v11" / "Na_thick_pos1",
+    "C1_Na_large": _FIXTURES / "c1_waterbox" / "Na_large",
+    "Na_thin_pos0": _FIXTURES / "c2_lipid_slab_v11" / "Na_thin_pos0",
+    "Na_thin_pos1": _FIXTURES / "c2_lipid_slab_v11" / "Na_thin_pos1",
+    "Na_thick_pos0": _FIXTURES / "c2_lipid_slab_v11" / "Na_thick_pos0",
+    "Na_thick_pos1": _FIXTURES / "c2_lipid_slab_v11" / "Na_thick_pos1",
 }
 
 EXPECTED_AB_FRAMES_PER_CASE = 20
@@ -84,6 +94,11 @@ def _load_json(path: Path) -> Dict[str, Any]:
 
 def _sha256(path: Path) -> str:
     return cte.sha256_file(str(path))
+
+
+def _report_path(path: Path) -> str:
+    """仓内路径写相对，ABFE_VALIDATION_FIXTURES 指到仓外时原样写绝对。"""
+    return str(path.relative_to(_REPO_ROOT)) if path.is_relative_to(_REPO_ROOT) else str(path)
 
 
 def _collect_ab() -> Dict[str, Any]:
@@ -104,7 +119,7 @@ def _collect_ab() -> Dict[str, Any]:
         cases.append(
             {
                 "case": name,
-                "file": str(path.relative_to(_REPO_ROOT)),
+                "file": _report_path(path),
                 "sha256": _sha256(path),
                 "protocol_version": report.get("protocol_version"),
                 "n_frames": n_frames,
@@ -148,7 +163,7 @@ def _collect_cd() -> Dict[str, Any]:
         cases.append(
             {
                 "case": name,
-                "file": str(path.relative_to(_REPO_ROOT)),
+                "file": _report_path(path),
                 "sha256": _sha256(path),
                 "protocol_version": report.get("protocol_version"),
                 "n_frames": n_frames,

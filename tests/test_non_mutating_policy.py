@@ -26,6 +26,9 @@ import abfe_pipeline as ap
 import ibs_engine as ie
 
 
+
+pytestmark = pytest.mark.cpu_only
+
 def _good_result():
     # A canned result whose values pass every hard gate in
     # _assert_stage_result_sane (min_overlap here = importance-ESS ratio).

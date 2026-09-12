@@ -8,6 +8,9 @@ from openmm import unit  # noqa: E402
 import abfe_pipeline as pipeline  # noqa: E402
 
 
+
+pytestmark = pytest.mark.cpu_only
+
 def _fake_pipeline(run_config=None):
     pipe = pipeline.ABFEPipeline.__new__(pipeline.ABFEPipeline)
     pipe.system = openmm.System()
@@ -151,8 +154,10 @@ def test_legacy_broad_preopt_cache_migrates_only_under_original_hamiltonian(monk
         "temperature_K": fresh_payload["temperature_K"],
         "pressure_bar": 1.0,
         "ligand_indices": fresh_payload["ligand_indices"],
-        "system_xml_sha256": fresh_payload["system_xml_sha256"],
-        "topology_sha256": fresh_payload["topology_sha256"],
+        # 历史 on-disk 缓存里这两个键真的存在（当年有值）；2026-09-09 起生产恒写
+        # None。用 .get() 读，这样将来把键整个删掉也不会让本测试 KeyError。
+        "system_xml_sha256": fresh_payload.get("system_xml_sha256"),
+        "topology_sha256": fresh_payload.get("topology_sha256"),
         "preopt_code_sha256": "hash-from-before-b5-helper",
         "aces_softcore_params": fresh_payload["aces_softcore_params"],
         "thermodynamic_path_protocol_version": fresh_payload[

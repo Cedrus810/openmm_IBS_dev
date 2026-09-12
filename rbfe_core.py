@@ -3014,9 +3014,28 @@ def build_hybrid_system(
     bonded_stats = _add_bonded_forces(hybrid, system_a, system_b, layout, a_map, b_map)
     nonbonded_stats = _add_nonbonded_forces(hybrid, system_a, system_b, layout, a_map, b_map)
 
+    # 🔑 [2026-09-09] barostat 也要搬。原来只搬 `CMMotionRemover`，而
+    # `_assert_supported_forces` 明确把 `MonteCarloBarostat` 列为**支持的输入**，
+    # 于是一个 NPT 输入会静默产出 NVT 杂合 System：
+    #   * `verify_hybrid_endpoints` 查不出来（barostat 对势能贡献恒为 0），
+    #     所以 R1b 的验收面完全无感；
+    #   * `free_energy_engine` 那条路径是 fail-closed 的（"请求了 NPT 但 System
+    #     里没有 barostat"），会报错而不是采错系综；
+    #   * 但任何直接用 `build_hybrid_system` + 自己的 integrator 的调用方，
+    #     会在定容下采样，而 `compute_hybrid_u_kn` 照样加 βpV。
+    # 只搬 A 侧的（两侧 barostat 若不一致，_assert_supported_forces 之外还有
+    # env_bonded_signature 对账，这里不重复判）。
     for force in system_a.getForces():
         if isinstance(force, openmm.CMMotionRemover):
             hybrid.addForce(openmm.CMMotionRemover(force.getFrequency()))
+        elif isinstance(force, openmm.MonteCarloBarostat):
+            _copied_barostat = openmm.MonteCarloBarostat(
+                force.getDefaultPressure(),
+                force.getDefaultTemperature(),
+                force.getFrequency(),
+            )
+            _copied_barostat.setRandomNumberSeed(force.getRandomNumberSeed())
+            hybrid.addForce(_copied_barostat)
 
     provenance = {
         "builder": "rbfe_core.build_hybrid_system",

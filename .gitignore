@@ -16,7 +16,9 @@ __pycache__/
 *.o
 *.so
 *.a
-plugins/*/build/
-plugins/*/build_*/
+# 注意：`build` 在本机是指向 `build_exp026_a2` 的**符号链接**，不是目录，
+# 所以规则不能带尾斜杠（带斜杠只匹配目录）。
+plugins/*/build
+plugins/*/build_*
 .mypy_cache/
 .ruff_cache/

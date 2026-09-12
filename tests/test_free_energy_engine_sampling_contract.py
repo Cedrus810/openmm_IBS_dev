@@ -10,6 +10,9 @@ import pytest
 
 import free_energy_engine as fee
 
+
+pytestmark = pytest.mark.cpu_only
+
 LEGACY = fee.resolve_remd_backend("legacy")
 
 

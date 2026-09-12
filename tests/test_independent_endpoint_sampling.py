@@ -25,6 +25,9 @@ from ibs_engine import (
     solve_independent_endpoint_states,
 )
 
+
+pytestmark = pytest.mark.cpu_only
+
 KT = 0.008314462618 * 298.15
 
 
@@ -562,7 +565,9 @@ def test_stage2_wiring_excludes_the_endpoint_window_from_the_ibs_solve():
         encoding="utf-8"
     )
     assert "_independent_endpoint_enabled" in source
-    assert "excluded_local_windows={_endpoint_window_index}" in source
+    # 排除集现在是累加的（末窗口 + "本段没采的窗口"），不再是单元素字面量。
+    assert "_excluded_for_analysis.add(int(_endpoint_window_index))" in source
+    assert "excluded_local_windows=_excluded_for_analysis or None," in source
     assert "combine_ibs_and_independent_endpoint(" in source
 
 

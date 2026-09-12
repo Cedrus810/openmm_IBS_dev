@@ -16,6 +16,9 @@ from pathlib import Path
 
 import pytest
 
+
+pytestmark = pytest.mark.cpu_only
+
 REPO = Path(__file__).resolve().parents[1]
 
 
@@ -92,25 +95,24 @@ def test_built_window_system_has_no_group_five_force():
     from ibs_engine import build_ibs_dual_system
 
     positions = [openmm.Vec3(0.5 + 0.1 * i, 0.5, 0.5) for i in range(6)] * unit.nanometer
-    try:
-        built, _wrapper = build_ibs_dual_system(
-            system=system,
-            topology=None,
-            perturbed_indices=[0, 1],
-            lambdas_coul=[0.0, 0.0],
-            lambdas_vdw=[1.0, 0.5],
-            # 用生产自己的解析器构造，避免手写 dict 漏掉 alpha_convention 之类的
-            # 协议字段（builder 对它是 fail-closed 的）。
-            alchemical_params=_resolve_alchemical_params("softcore", None, [0, 1]),
-            potential_type="softcore",
-            temperature=298.15 * unit.kelvin,
-            reference_positions=positions,     # 旧实现正是靠它设绝对锚点
-            restraint_params=None,             # 无 Boresch ⟹ 旧实现会添加 Group 5
-            dispersion_protocol="legacy_uniform_density_lrc",
-            environment_type="soluble",
-        )
-    except (TypeError, ValueError, RuntimeError) as exc:
-        pytest.skip(f"最小体系不满足 builder 的前置条件，跳过端到端检查: {exc}")
-
+    # 2026-09-09：原来把 builder 的任何 TypeError/ValueError/RuntimeError 吞成
+    # pytest.skip —— 签名变更会让这条"Group 5 不得存在"的端到端检查静默消失。
+    # 实测当前代码下正常返回，那个 except 是死代码，已移除。
+    built, _wrapper = build_ibs_dual_system(
+        system=system,
+        topology=None,
+        perturbed_indices=[0, 1],
+        lambdas_coul=[0.0, 0.0],
+        lambdas_vdw=[1.0, 0.5],
+        # 用生产自己的解析器构造，避免手写 dict 漏掉 alpha_convention 之类的
+        # 协议字段（builder 对它是 fail-closed 的）。
+        alchemical_params=_resolve_alchemical_params("softcore", None, [0, 1]),
+        potential_type="softcore",
+        temperature=298.15 * unit.kelvin,
+        reference_positions=positions,     # 旧实现正是靠它设绝对锚点
+        restraint_params=None,             # 无 Boresch ⟹ 旧实现会添加 Group 5
+        dispersion_protocol="legacy_uniform_density_lrc",
+        environment_type="soluble",
+    )
     groups = {built.getForce(i).getForceGroup() for i in range(built.getNumForces())}
     assert 5 not in groups, f"仍存在 Group 5 力，force groups = {sorted(groups)}"

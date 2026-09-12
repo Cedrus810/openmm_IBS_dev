@@ -11,10 +11,24 @@ ABFE 计算命令行入口 (v3.0 - 完全重构版)
   - 修复多个已知 bug：配体索引提取、坐标类型转换、Boresch 参数清洗等
 """
 
+import faulthandler
 import os
 import sys
 import json
 import argparse
+
+# 🔑 [2026-09-10] SEGV 必须留下现场。
+#
+# 本进程里绝大部分时间跑在 OpenMM 的 C++/CUDA 里，那边一旦踩坏内存，Python 侧
+# 得到的是一个信号：终端上只会多一行 `SEGV`，**没有 traceback、没有行号、
+# 什么都没有**。2026-09-10 那次就是这样——从"跑不起来"到定位到
+# `XmlSerializer.serialize(win_sys)` 这一行，花了一整天，而全部信息量就是
+# "日志停在哪一条 print"。
+#
+# `faulthandler` 是 stdlib，enable() 之后 SIGSEGV/SIGBUS/SIGFPE/SIGABRT 会把
+# 当时的 Python 调用栈打到 stderr 再让进程死。它**不改变任何行为**：不拦截、
+# 不恢复、不吞信号，进程照样以同样的方式退出，只是多一段栈。零运行开销。
+faulthandler.enable()
 import logging
 import shutil
 import hashlib
@@ -31,6 +45,11 @@ from openmm import app, unit, Vec3, XmlSerializer
 # 删除 runabfe.py 中手写的 NumpyEncoder 类
 # 修改导入语句：
 from abfe_core import (
+    preflight_physical_inputs,
+    # [PBC-01] mmCIF 往返造出来的假键：唯一实现。
+    prune_topology_bonds_unsupported_by_system,
+    # 整分子周期回卷：连通性只信 System，不信 topology 的键（唯一实现）。
+    image_molecules_by_system,
     ACESoftcorePotential, UnitFormatter, calculate_boresch_analytical_correction,
     calc_boresch_from_last_frame, GeometricRestraintEstimator, OrbBoreschEstimator,
     DEXPSurrogatePotential, LambdaDependentBoreschForce, ensure_owned_system,
@@ -81,6 +100,7 @@ from abfe_core import (
 import free_energy_engine
 
 from abfe_pipeline import (
+    guard_run_directory,
     ABFEPipeline, TraditionalABFEPipeline, _collect_pipeline_provenance, _pme_u_kn_meta_payload,
     _pre_equilibration_fingerprint,
     # [P1-07] 外层完成判断的严格校验 helper：真实 DCD parser + 目标 Simulation
@@ -511,9 +531,27 @@ def _ligand_parameter_identity(
         else None
     )
     payload = {
-        "complex_system_xml_sha256": hashlib.sha256(
-            XmlSerializer.serialize(system).encode("utf-8")
-        ).hexdigest(),
+        # ===================== [2026-09-10] 已删除 =====================
+        # 原来这里是：
+        #     "complex_system_xml_sha256": hashlib.sha256(
+        #         XmlSerializer.serialize(system).encode("utf-8")).hexdigest()
+        #
+        # 为了写一个**全仓零读者**的字段，把整个 System（本体系 30710 原子）
+        # 序列化成一份多兆字节的字符串。grep 确认过：除了这一行的写入，
+        # 没有任何代码读 `complex_system_xml_sha256`。
+        #
+        # 它还与本文件自己的契约矛盾——见下方 `_main_cache_identity` 附近那条
+        # 注释：「身份只认用户输入（identity_sha256 来自 gro/top/config）」。
+        # 这里哈的却是**当次在内存里重建出来的 System**，是自产产物。
+        # `abfe_pipeline._system_xml_hash` 已经因为同一个理由被改成恒返回 None
+        # （见那里的说明：协议版本号已经承担"算法变了"的信号，sha256 是多余的
+        # 第二套机制），这一处是当时漏掉的同类。
+        #
+        # 真正的身份下面全都在：配体残基名 / 原子索引 / 原子数 / 净电荷 /
+        # 逐原子非键参数 / 用户 .top 与 include 文件的哈希。
+        #
+        # ⚠️ 代价：payload 少一个键 ⟹ `identity_sha256` 变 ⟹ **已有的溶剂腿缓存
+        # 会失配一次、需要重建**。这是一次性的。
         "ligand_resname": str(ligand_resname),
         "ligand_indices": indices,
         "ligand_atom_count": len(indices),
@@ -780,10 +818,6 @@ def system_cache_exists(
     matches = (
         recorded.get("protocol_version") == MAIN_SYSTEM_CACHE_PROTOCOL_VERSION
         and recorded.get("identity_sha256") == expected["identity_sha256"]
-        and recorded.get("system_xml_sha256") == _sha256_file(xml)
-        and recorded.get("ligand_indices_sha256") == _sha256_file(idx)
-        and recorded.get("topology_sha256") == _sha256_file(top)
-        and recorded.get("box_vectors_sha256") == _sha256_file(box)
         and route_matches
     )
     if str(effective_treatment) == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
@@ -833,9 +867,6 @@ def solvent_cache_exists(
         and bool(manifest.get("neutralize"))
         and expected_identity is not None
         and manifest.get("identity_sha256") == expected_identity.get("identity_sha256")
-        and manifest.get("system_xml_sha256") == _sha256_file(xml)
-        and manifest.get("ligand_indices_sha256") == _sha256_file(idx)
-        and manifest.get("topology_sha256") == _sha256_file(top)
         and manifest.get("charge_treatment") == charge_treatment
     )
     if str(charge_treatment) == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
@@ -895,7 +926,6 @@ def solvent_cache_exists(
     return bool(matches)
 
 
-_CHECKPOINT_PROBE_CACHE_ATTR = "_p1_07_checkpoint_probe_simulation"
 # 严格校验结果按 (path, size, mtime_ns) 记忆化：equilibrium_is_done 在一次
 # 运行里会被多处以同一份文件调用，而真实 DCD parser 要逐帧读到 EOF（膜体系
 # 轨迹在 NFS 上是几十 GB 量级），没必要重复付这个 I/O。文件一旦变化
@@ -911,16 +941,27 @@ def _checkpoint_probe_simulation(pipeline: "ABFEPipeline"):
     同一个 platform 建 Context——它能否加载，与下游 pre_equilibrate(resume)
     的行为一致：probe 加载失败的 checkpoint，真正的消费方同样加载不了。
     建不出来（platform 不可用等）时返回 None，调用方 fail closed。
+
+    ## 为什么不缓存（2026-09-09）
+
+    这里原本把建好的 probe `setattr` 到 pipeline 上当缓存，为的是同一个 pipeline
+    被查两次（`runabfe` 里 3576 与 6931）时省一次构建。代价是：一整个 30710 原子的
+    System + Context **从预平衡判定那一刻挂到整条腿跑完**，纯属白占。
+    而它省下的只有几秒，在一条跑几小时的腿上没有意义。
+
+    更坏的是失效方向：这块常驻占用不会报错，只会让后面 REMD 建 Context 时的
+    "显存不够" 变成一条假线索（正是 `step_guard.guarded_context` 那段错误信息
+    要提醒的"先看开跑前 used 是多少"）。
+
+    现在用完即走：调用方拿到的 probe 在 `equilibrium_is_done()` 返回后就没有
+    引用，随即回收。多出来的那次构建换掉一整条腿的常驻占用。
     """
-    cached = getattr(pipeline, _CHECKPOINT_PROBE_CACHE_ATTR, None)
-    if cached is not None:
-        return cached
     import openmm.app as _app
 
     try:
         # Match the consumer's System and Integrator, including the barostat
         # added by pre_equilibrate (checkpoint state depends on both).
-        probe_system = XmlSerializer.deserialize(XmlSerializer.serialize(pipeline.system))
+        probe_system = XmlSerializer.clone(pipeline.system)
         ensure_barostat_for_protocol(
             probe_system, pipeline.barostat_protocol,
             temperature=pipeline.temperature, pressure=pipeline.pressure,
@@ -935,7 +976,6 @@ def _checkpoint_probe_simulation(pipeline: "ABFEPipeline"):
     except Exception as exc:
         log.warning("[WARN] 无法为目标 platform 构建 checkpoint 校验 Simulation (%s)", exc)
         return None
-    setattr(pipeline, _CHECKPOINT_PROBE_CACHE_ATTR, probe)
     return probe
 
 
@@ -1000,27 +1040,50 @@ def equilibrium_is_done(
         return False
     if expected_fingerprint is None:
         return True
+    # ---- 指纹：只报告，不判定（2026-09-09）----
+    #
+    # 这三层以前都 `return False`。**它们从来没有保护过任何东西**：本函数返回
+    # False 之后，下游 `pre_equilibrate(resume=True)` 加载的正是同一个被判定
+    # 「不可信」的 checkpoint（见本文件上方 `_REENTER_NOTE` 记录的实测：连报两次
+    # 「拒绝复用」两次，紧接着 `已完成: 5000000 | 剩余: 0`，一步没跑）。
+    #   （此处刻意不引用那句旧文案原文 —— `test_equilibrium_rejection_does_not_claim_a_full_rerun`
+    #    按本函数源码文本 grep 它，正确地禁止它出现在这里。）
+    #
+    #   * 配置真的换了 → 拦不住，下游照样把旧 checkpoint 读回来；
+    #   * 配置没换、只是重建出的 System 序列化字节变了 → 误判，resume 被打断。
+    #
+    # 后者是实际发生的那一种：`system_xml_hash` 哈希的是当次在内存里重建的
+    # System，任何只改字节不改物理的改动（例如排除表灌入顺序换成 `sorted()`，
+    # 能量逐比特不变）都会让它翻脸。该字段已于同日从
+    # `_pre_equilibration_fingerprint()` 的 payload 中移除。
+    #
+    # 判定"是否已完成"的权威只有下面那一个：`pipeline_state.json` 的
+    # `equilibration.status == "completed"`（本函数自己的注释早就写着这句）。
+    # 指纹保留为**信息性日志**，用来提示"你可能复用了别的配置的 --output 目录"。
+    #
+    # ⚠️ 本注释最初写成"不再阻断 resume"，那是错的 —— 当时还有下一层
+    # `abfe_pipeline.pre_equilibrate()` 里的同名检查在 `resume = False`（丢 checkpoint、
+    # 从零重跑）。由同仓另一会话复核指出，已于同日一并改为只告警。两侧现在一致。
     fp_file = os.path.join(output_dir, "pre_equilibration_fingerprint.json")
     if not os.path.isfile(fp_file):
-        log.warning(
-            "[WARN] 预平衡轨迹/Checkpoint 存在，但缺少 pre_equilibration_fingerprint.json，"
-            "无法确认是否匹配当前 system/config（可能来自本次修复之前的旧运行），"
-            "保守视为未完成，将重新进入预平衡阶段" + _REENTER_NOTE + "。"
+        log.info(
+            "[INFO] 缺少 pre_equilibration_fingerprint.json（可能来自更早的运行）；"
+            "不影响判定，继续按 pipeline_state.json 的完成状态决定。"
         )
-        return False
-    try:
-        with open(fp_file) as f:
-            recorded = json.load(f).get("fingerprint")
-    except Exception as e:
-        log.warning("[WARN] 读取 pre_equilibration_fingerprint.json 失败 (%s)，保守视为未完成", e)
-        return False
-    if recorded != expected_fingerprint:
-        log.warning(
-            "[WARN] 已有预平衡轨迹的指纹与当前 system/config 不匹配（可能是换了 gro/top/ligand/"
-            "温度或目标步数但复用了同一个 --output 目录），拒绝把它判定为已完成，"
-            "将重新进入预平衡阶段" + _REENTER_NOTE + "。"
-        )
-        return False
+    else:
+        try:
+            with open(fp_file, encoding="utf-8") as f:
+                recorded = json.load(f).get("fingerprint")
+        except Exception as e:
+            log.info("[INFO] 读取 pre_equilibration_fingerprint.json 失败 (%s)；不影响判定。", e)
+        else:
+            if recorded != expected_fingerprint:
+                log.warning(
+                    "[WARN] 预平衡指纹与当前 system/config 不同（换了 gro/top/ligand/温度/"
+                    "目标步数，或复用了同一个 --output 目录）。**这不影响是否复用** —— "
+                    "完成与否只看 pipeline_state.json 的 equilibration.status。"
+                    "若你确实换了体系，请用 --reset 或换一个 --output。"
+                )
 
     # ---- 真的跑完了吗（MEM-09，2026-08-02）----
     #
@@ -1058,11 +1121,30 @@ def equilibrium_is_done(
             equil_state.get("status"),
         )
         return False
+    # 🔑 [2026-09-10] 读不到目标步数时**保守视为未完成**，不再当成 0。
+    #
+    # 原来这里 `except: recorded_target = 0`，而下面的门是
+    # `if recorded_target and achieved < recorded_target:` —— 0 是 falsy，
+    # 于是"fp 文件缺失/损坏"会把整条 MEM-09 门（短平衡冒充长平衡 + 连带跳过
+    # §9 膜质量门）**完全短路掉**，一次只跑了 40 ns 的中断运行会被判成
+    # "已完成 100 ns"。缺目标值恰恰是最该保守的情形，不是最该放行的。
+    # 保守的代价只是 --resume 从 checkpoint 续跑，不会白烧已完成的部分。
+    recorded_target = None
     try:
         with open(fp_file, encoding="utf-8") as handle:
-            recorded_target = int(json.load(handle).get("n_steps", 0))
-    except Exception:
-        recorded_target = 0
+            _recorded_n_steps = json.load(handle).get("n_steps")
+        if _recorded_n_steps is not None:
+            recorded_target = int(_recorded_n_steps)
+    except Exception as exc:
+        log.warning("[WARN] 读取预平衡目标步数失败 (%s)", exc)
+    if recorded_target is None:
+        log.warning(
+            "[WARN] 读不到预平衡的**目标**步数（%s 缺失或损坏），无法判断上一次是"
+            "跑满了还是中途被中断。保守视为未完成 —— 加 --resume 可从 Checkpoint "
+            "续跑，不会白烧已完成的部分。",
+            os.path.basename(fp_file),
+        )
+        return False
     achieved = int(equil_state.get("total_steps") or 0)
     # 🔑 [2026-09-03] 合法的**收敛早停**必须放行，否则会净亏。
     #
@@ -1181,26 +1263,11 @@ def validate_openmm_cache_only(output_dir: str, phase: str = "complex") -> Dict:
             raise RuntimeError(
                 f"--openmm-cache-only {phase} manifest identity is not self-consistent"
             )
-    actual_hashes = {
-        "system_xml_sha256": _sha256_file(paths["xml"]),
-        "topology_sha256": _sha256_file(paths["top"]),
-        "ligand_indices_sha256": _sha256_file(paths["idx"]),
-        "box_vectors_sha256": _sha256_file(paths["box"]),
-    }
-    for field in ("system_xml_sha256", "topology_sha256", "ligand_indices_sha256"):
-        recorded = manifest.get(field)
-        if not isinstance(recorded, str) or recorded != actual_hashes[field]:
-            raise RuntimeError(
-                f"--openmm-cache-only {phase} cache hash mismatch: {field}"
-            )
-    # Old solvent manifests did not bind box_vectors_solvent.npy.  We still
-    # validate its shape/finiteness below and record its current digest, while
-    # making the absent historical binding explicit in the audit.
-    recorded_box_hash = manifest.get("box_vectors_sha256")
-    if recorded_box_hash is not None and recorded_box_hash != actual_hashes["box_vectors_sha256"]:
-        raise RuntimeError(
-            f"--openmm-cache-only {phase} cache hash mismatch: box_vectors_sha256"
-        )
+    # 自产缓存文件（system_native.xml / topology.cif / ligand_indices.json /
+    # box_vectors.npy）的 sha256 **不做身份判据**：pipeline 自己合法改写它们
+    # （PBC-01 删假键、盒子更新、排除表书写顺序）就会让哈希变，缓存被判无效、
+    # 白重跑几百万步。身份只认用户输入（identity_sha256 来自 gro/top/config）。
+    # 内容正确性由下面的结构校验（原子数、shape、有限性）负责。
 
     with open(paths["xml"], encoding="utf-8") as handle:
         cached_system = XmlSerializer.deserialize(handle.read())
@@ -1248,9 +1315,7 @@ def validate_openmm_cache_only(output_dir: str, phase: str = "complex") -> Dict:
         "manifest_sha256": _sha256_file(manifest_path),
         "manifest_protocol_version": manifest.get("protocol_version"),
         "manifest_identity_sha256": manifest.get("identity_sha256"),
-        "box_hash_was_bound_by_manifest": recorded_box_hash is not None,
         "bonded_topology_reconstruction": "harmonic_bond_force_plus_constraints",
-        "artifact_hashes": actual_hashes,
         "n_particles": n_particles,
         "n_ligand_atoms": len(ligand_indices),
     }
@@ -1629,13 +1694,13 @@ def save_native_system(
     # 1. System XML (强制 Python 所有权)
     native_sys = ensure_owned_system(system)
     xml_path = os.path.join(output_dir, "system_native.xml")
-    with open(xml_path, "w") as f:
+    with open(xml_path, "w", encoding="utf-8") as f:
         f.write(XmlSerializer.serialize(native_sys))
     log.info("  [缓存] System XML 已保存: %s", xml_path)
 
     # 2. Ligand indices
     lig_path = os.path.join(output_dir, "ligand_indices.json")
-    with open(lig_path, "w") as f:
+    with open(lig_path, "w", encoding="utf-8") as f:
         json.dump({"ligand_indices": [int(i) for i in ligand_indices]}, f, indent=2)
     log.info("  [缓存] 配体索引已保存: %s", lig_path)
 
@@ -2110,10 +2175,10 @@ def build_and_cache_solvent_leg(
     sol_box = os.path.join(output_dir, "box_vectors_solvent.npy")
     sol_manifest = os.path.join(output_dir, "solvent_cache_manifest.json")
     
-    with open(sol_xml, "w") as f:
+    with open(sol_xml, "w", encoding="utf-8") as f:
         f.write(XmlSerializer.serialize(ensure_owned_system(system)))
     app.PDBxFile.writeFile(modeller.topology, modeller.positions, sol_cif)
-    with open(sol_idx, "w") as f:
+    with open(sol_idx, "w", encoding="utf-8") as f:
         json.dump({"ligand_indices": new_lig_indices}, f)
     
     box_vecs = modeller.topology.getPeriodicBoxVectors()
@@ -2218,14 +2283,14 @@ def load_native_system(
     log.info("从原生缓存加载系统 (%s): %s", phase, output_dir)
 
     # 1. System
-    with open(xml_path, "r") as f:
+    with open(xml_path, "r", encoding="utf-8") as f:
         xml_str = f.read()
     system = ensure_owned_system(XmlSerializer.deserialize(xml_str))
     log.info("  [OK] System 恢复 | 原子数: %d", system.getNumParticles())
 
     # 2. Ligand indices
     lig_path = paths["idx"]
-    with open(lig_path, "r") as f:
+    with open(lig_path, "r", encoding="utf-8") as f:
         lig_data = json.load(f)
     ligand_indices = lig_data["ligand_indices"]
     log.info("  [OK] 配体索引恢复: %d 原子", len(ligand_indices))
@@ -2279,6 +2344,14 @@ def load_native_system(
                 log.warning("  [WARN] mmCIF 拓扑原子数 (%d) 与 System (%d) 不匹配，已丢弃缓存", n_cif, n_sys)
                 topology = None
             else:
+                # 🔑 [PBC-01] 先删假键，再补缺键。mmCIF 往返两个方向都会错：
+                # 链数 > 26 时 `_struct_conn` 解析歧义会**多造**键（brd4/ligand1
+                # 实测 3 条，把一个水并进蛋白那个分子），而非标准残基的键会**丢**。
+                # 判据与安全方向见 `prune_topology_bonds_unsupported_by_system`。
+                # 一条都不用删时原样返回同一个对象 ⟹ 干净体系 topology_sha256 不变。
+                topology = prune_topology_bonds_unsupported_by_system(
+                    topology, system, log=log.warning
+                )
                 if reconstruct_bonds_from_system:
                     atoms = list(topology.atoms())
                     existing_pairs = {
@@ -2560,7 +2633,7 @@ def _load_config(config_path: str) -> dict:
     if ext in (".yaml", ".yml"):
         try:
             import yaml
-            with open(config_path) as f:
+            with open(config_path, encoding="utf-8") as f:
                 config = yaml.safe_load(f)
         except ImportError:
             raise ImportError(
@@ -2568,7 +2641,7 @@ def _load_config(config_path: str) -> dict:
                 "或使用 .json 格式的配置文件。"
             )
     else:
-        with open(config_path) as f:
+        with open(config_path, encoding="utf-8") as f:
             config = json.load(f)
     if not isinstance(config, dict):
         raise ValueError(
@@ -2865,6 +2938,12 @@ class RunConfig:
             preset["outer_lambda_local_residual_ibs"] = bool(
                 args.outer_lambda_local_residual_ibs
             )
+        if getattr(args, "element_coverage_model", None) is not None:
+            preset["element_coverage_model"] = str(args.element_coverage_model)
+        if getattr(args, "outer_lambda_resource_manifest", None) is not None:
+            preset["outer_lambda_resource_manifest"] = str(
+                args.outer_lambda_resource_manifest
+            )
 
         # ---- 膜体系（B1）。配置键按 memtodolist §3.1：顶层 system_type + 嵌套 membrane.* ----
         if _flag_present("--system-type"):
@@ -2957,6 +3036,8 @@ class RunConfig:
             "membrane_input_declaration": None,
             # Product switch: the legacy path remains byte-for-byte disabled.
             "outer_lambda_local_residual_ibs": False,
+            "element_coverage_model": None,
+            "outer_lambda_resource_manifest": None,
         }
         for key, value in defaults.items():
             preset.setdefault(key, value)
@@ -3004,10 +3085,25 @@ class RunConfig:
         return getattr(self.args, item, None)
 
     def get(self, key, default=None):
-        """兼容字典式获取"""
+        """兼容字典式获取。
+
+        🔑 [2026-09-09] argparse 的 dest **总是存在**，没给参数时值是 `None`，
+        所以原来的 `getattr(self.args, key, default)` 会返回 `None` 而不是调用方
+        写的 `default` —— 调用方的默认值形同虚设。
+
+        实例：`config.get("n_equil_steps", 5_000_000)`（runabfe 里 7 处）在既没有
+        `--n-equil-steps` 也没有配置文件 `n_equil_steps` 时返回 `None`，
+        随后 `pre_equilibrate(n_steps=None)` 在步数运算上 TypeError。
+        仓库自带的 abfe_config.json 写了这个键，所以只有纯 CLI / 手写配置会踩到。
+
+        注意区分两种 None：**配置文件里显式写 null**（`key in self.data` 为真）
+        仍然如实返回 None —— 那是用户明确表达的"不设"，不能被 default 顶掉。
+        只有"argparse 侧压根没给"才回落到 default。
+        """
         if key in self.data:
             return self.data[key]
-        return getattr(self.args, key, default)
+        value = getattr(self.args, key, None)
+        return default if value is None else value
 
     def as_dict(self) -> Dict:
         """Return a JSON-serializable snapshot of the resolved runtime config."""
@@ -3556,6 +3652,17 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
             n_steps=_n_equil_steps,
             save_traj=True,
             resume=config.resume and not config.reset,
+            # 🔑 [2026-09-09] 原来不传这个参数，于是走 `pre_equilibrate` 的默认
+            # `True`，`enable_equilibration_convergence_stop: false` 这个配置项
+            # **完全无效**。`run_full_pipeline` 那条路径是转发的
+            # （abfe_pipeline.py:10149），但真正跑满 5M 步基线预平衡的是**这一条**
+            # —— 到 run_full_pipeline 时 equilibrium_is_done 已经是 True、整段跳过。
+            # 结果：用户明确关掉早停，运行仍然在 4.25M/5M 步收敛早停，
+            # 而 `equilibrium_is_done` 又把它当"合法早停"接受，生产系综实际起自
+            # 一段比要求更短的平衡。
+            enable_convergence_stop=getattr(
+                pipeline, "enable_equilibration_convergence_stop", True
+            ),
         )
 
     # 传统文件来源
@@ -3563,7 +3670,7 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
         path = config.boresch_orb if source == "orb_ml" else config.boresch_anchors
         if not path or not os.path.exists(path):
             raise ValueError(f"Boresch 参数文件不存在: {path}")
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             params = json.load(f)
         log.info("[OK] 加载外部 Boresch 参数: %s", path)
         return _sanitize_boresch_params_strict(params)
@@ -3572,7 +3679,7 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
     boresch_file = os.path.join(output_dir, f"boresch_{source}.json")
     if config.resume and not config.reset and os.path.exists(boresch_file):
         log.info("从缓存加载 Boresch 参数: %s", boresch_file)
-        with open(boresch_file) as f:
+        with open(boresch_file, encoding="utf-8") as f:
             params = json.load(f)
         if source == "auto" and isinstance(params, dict) and isinstance(params.get("candidates"), list):
             candidates = params["candidates"]
@@ -3650,14 +3757,33 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
         raise ValueError(f"未识别的 Boresch 来源: {source}")
 
     # 用最后一帧更新平衡几何量
+    #
+    # 🔑 [2026-09-09] 这里要的是一份**未被估算器改过**的干净轨迹，所以确实要重
+    # 加载；但原来是直接 `traj = md.load(...)` 覆盖，CPython 会先把新 Trajectory
+    # 建出来再重绑名字 —— 峰值是**两份**全轨迹同时驻留
+    # （n_frames × n_atoms × 3 × 4 B 各一份，膜体系上是几十 GB 量级）。
+    # 先显式断掉旧引用（估算器可能也还攥着它）再重载，峰值降回一份。
+    import mdtraj as md
+    del traj, estimator
+    traj = md.load(traj_file, top=traj_top)
+    # [PBC-01] 连通性取自 System，不取 topology 的键（后者可能缺刚性水的 O–H、
+    # 也可能多出 mmCIF 往返造的假键）。
+    #
+    # ⚠️ 顺序不能动，且不能包进下面那个 try：
+    #   * 回卷必须在 superpose **之前**。`superpose` 只转坐标、不转
+    #     `unitcell_vectors`，转完之后坐标系和盒子已经错开，再拿这套盒矢量去做
+    #     minimum-image 平移就是在错的参照系里搬分子，r/θ/φ 全变。
+    #   * 它的回卷后复查（`abfe_core.image_molecules_by_system` 末尾）是
+    #     fail-closed 的，和 abfe_pipeline / ibs_engine 两处调用一致。放进下面
+    #     那个 `except Exception → is_fallback` 里会被降级成一条 warning，
+    #     撕开的构型照样喂给 assess_boresch_harmonicity。
+    image_molecules_by_system(traj, pipeline.system, log=log.warning)
+    protein_sel = traj.topology.select("protein and backbone")
+    if len(protein_sel) > 0:
+        traj.superpose(traj, 0, atom_indices=protein_sel)
+    traj.center_coordinates()
+
     try:
-        import mdtraj as md
-        traj = md.load(traj_file, top=traj_top)
-        protein_sel = traj.topology.select("protein and backbone")
-        if len(protein_sel) > 0:
-            traj.superpose(traj, 0, atom_indices=protein_sel)
-        traj.center_coordinates()
-        traj.image_molecules(inplace=True)
         last_frame_pos = traj.xyz[-1] * unit.nanometer
         new_eq = calc_boresch_from_last_frame(
             last_frame_pos, boresch["receptor_indices"], boresch["ligand_indices"]
@@ -3750,7 +3876,7 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
             if warning not in boresch["diagnostics"]["warnings"]:
                 boresch["diagnostics"]["warnings"].append(warning)
     # 保存
-    with open(boresch_file, "w") as f:
+    with open(boresch_file, "w", encoding="utf-8") as f:
         json.dump(boresch, f, indent=2, cls=NumpyEncoder)
     log.info("Boresch 参数已保存: %s", boresch_file)
     return _sanitize_boresch_params_strict(boresch)
@@ -3770,6 +3896,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="ABFE 计算流程控制器 (v3.0 重构版)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        # 🔑 [2026-09-09] 必须关掉参数缩写。
+        #
+        # argparse 默认 `allow_abbrev=True`，会把 `--outp` 解析成 `--output`、
+        # `--temp` 解析成 `--temperature` 并写进 `args`。而配置合并那一层用的是
+        # `_flag_present()`，它拿**原始 argv 的精确 token** 去比对 —— 缩写形式匹配
+        # 不上，于是那个已经解析成功的值被**静默丢弃**，运行改用 preset/配置文件
+        # 里的旧值。
+        # 净效果：`runabfe.py --outp ./run2 --temp 310 ...` 会在 300 K 下写进
+        # `./output`，读错缓存，且全程没有任何警告。
+        # 关掉之后 argparse 自己会对未知/歧义参数报错 —— fail closed。
+        allow_abbrev=False,
         epilog="""示例:
   # 首次运行（自动创建缓存并运行）
   python runabfe.py --gro complex.gro --top complex.top --ligand MOL \\
@@ -3857,6 +3994,28 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "REMD 采样后端：auto（默认，自动判定并可回退）/ legacy（始终用旧引擎）/ "
             "openmm（显式要求 OpenMM >= 8.6 官方采样器，不可用则报错）"
+        ),
+    )
+    parser.add_argument(
+        "--element-coverage-model",
+        dest="element_coverage_model",
+        default=None,
+        help=(
+            "启动期判定：体系的元素能不能被这个参考 ML 势表示。给 .model 路径或文件名"
+            "（可配 $ABFE_MACE_MODEL_DIR），z-table 直接从模型文件读。不覆盖就 fail-closed "
+            "并列全缺失元素。**不加载模型跑力、不训练任何东西**，只是一道覆盖判定。"
+            "推荐 MACE-omol-0-extra-large-1024（83 种元素，含 Na；MACE-OFF24 没有 Na）。"
+        ),
+    )
+    parser.add_argument(
+        "--outer-lambda-resource-manifest",
+        dest="outer_lambda_resource_manifest",
+        default=None,
+        help=(
+            "冻结 R1 资源 manifest 的路径。不给则用仓库默认的 "
+            "resources/outer_lambda_local_residual/manifest.json（出厂 Atenolol 那份）。"
+            "换配体重训出来的产物用这个显式指过去——只是指路，不放宽任何身份门："
+            "配体指纹、原子数、payload/weights sha、插件源码 sha 全部照常校验。"
         ),
     )
     parser.add_argument(
@@ -4480,7 +4639,7 @@ def run_post_analysis(args):
         ]:
             path = os.path.join(base_dir, json_name)
             if os.path.exists(path):
-                with open(path) as f:
+                with open(path, encoding="utf-8") as f:
                     return _sanitize_boresch_params(json.load(f))
         return None
 
@@ -4774,7 +4933,7 @@ def run_post_analysis(args):
         result.update(_production_qualification)
         result["production_qualification"] = dict(_production_qualification)
     out_path = os.path.join(output_dir, "final_results_postprocess.json")
-    with open(out_path, "w") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, cls=NumpyEncoder)
     log.info("结果已保存: %s", out_path)
 
@@ -5033,6 +5192,11 @@ def run_traditional_mode(config: RunConfig):
             n_steps=_trad_n_equil_steps,
             save_traj=True,
             resume=config.resume and not config.reset,
+            # [2026-09-09] 同 resolve_boresch_restraint 那处：不传就走默认 True，
+            # 配置里的 enable_equilibration_convergence_stop 形同虚设。
+            enable_convergence_stop=bool(
+                config.get("enable_equilibration_convergence_stop", True)
+            ),
         )
     positions = traditional_baseline.positions
     box_vectors = traditional_baseline.box_vectors
@@ -5153,6 +5317,10 @@ def run_traditional_mode(config: RunConfig):
             n_steps=_trad_n_equil_steps,
             save_traj=True,
             resume=config.resume and not config.reset,
+            # [2026-09-09] 同上。
+            enable_convergence_stop=bool(
+                config.get("enable_equilibration_convergence_stop", True)
+            ),
         )
     pos_solv = solvent_baseline.positions
     box_solv = solvent_baseline.box_vectors
@@ -5248,7 +5416,7 @@ def run_traditional_mode(config: RunConfig):
         "timestamp": datetime.now().isoformat(),
     }
     out_path = os.path.join(output_dir, "final_binding_results_traditional.json")
-    with open(out_path, "w") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         json.dump(final, f, indent=2, cls=NumpyEncoder)
     log.info("[OK] 传统 ABFE 完成: ΔG_bind = %.2f ± %.2f kJ/mol", delta_g_bind, total_err_bind)
     log.info("传统模式最终结果已保存: %s", out_path)
@@ -6010,6 +6178,161 @@ def dispatch_diagnostic_command(argv: List[str]) -> Optional[int]:
     return handlers[argv[0]](argv[1:])
 
 
+
+def _path_evolution_kwargs(config) -> dict:
+    """路径演化的两个开关，**只在配置里显式设置了才透传**。
+
+    不能无条件 `config.get(...)` 就往下传：那会往 run_config 里塞进一个键（哪怕值是
+    None），而 run_config 是逐字段进 stage 协议指纹的 —— 等于让所有现有缓存平白失配、
+    重跑 GPU（`ABFEPipeline._stage_protocol_key` 的注释记过这个代价：Stage 1 约 28
+    分钟 + 6 个 vanishing 窗口全部重采样）。没设置就一个键都不加，行为逐字不变。
+    """
+    out = {}
+    policy = config.get("sampling_repair_policy")
+    if policy is not None:
+        out["sampling_repair_policy"] = str(policy)
+    budget = config.get("max_path_insertions")
+    if budget is not None:
+        out["max_path_insertions"] = int(budget)
+    recal = config.get("stage2_recalibrate_f_k_on_rescue")
+    if recal is not None:
+        out["stage2_recalibrate_f_k_on_rescue"] = bool(recal)
+    shift = config.get("stage2_f_k_recalibration_min_shift")
+    if shift is not None:
+        out["stage2_f_k_recalibration_min_shift"] = float(shift)
+    # 🔑 [2026-09-11 实验开关，默认 False] 重标定出来的 f_k 进生产前不再被
+    # loose gate **拦住**（门照跑照记，只是不阻断）。见 ibs_engine 里
+    # accept_recalibrated_f_k_without_gate 的参数注释。
+    _accept_recal = config.get("stage2_accept_recalibrated_f_k_without_gate")
+    if _accept_recal is not None:
+        out["stage2_accept_recalibrated_f_k_without_gate"] = bool(_accept_recal)
+    ranges = config.get("stage2_window_ranges")
+    if ranges:
+        out["stage2_window_ranges"] = [[int(a), int(b)] for a, b in ranges]
+    criterion = config.get("stage2_window_partition")
+    if criterion is not None:
+        out["stage2_window_partition"] = str(criterion)
+    n_windows = config.get("stage2_n_windows")
+    if n_windows is not None:
+        out["stage2_n_windows"] = int(n_windows)
+    return out
+
+
+def _frozen_residual_manifest_covers_ligand(manifest_path, topology, ligand_indices, system) -> bool:
+    """冻结 manifest 声明的配体是不是当前这个。
+
+    判据用 loader 自己那把尺子（`ligand_chemical_identity`：配体局部原子序数序列 +
+    内部键图的 canonical-JSON SHA-256，跟蛋白无关），所以这里判 True 就等于
+    `build_outer_lambda_local_residual_runtime` 的身份闸门会放行。
+    判 False 不是错误 —— 是"这个配体要先重训"的信号。
+    """
+
+    from local_residual.openmm_plugin import (
+        _load_resource_manifest,
+        ligand_chemical_identity,
+    )
+
+    try:
+        manifest, _payload, _weights = _load_resource_manifest(manifest_path)
+    except Exception:  # noqa: BLE001 - 读不动/不存在都按"没覆盖"处理，交给重训
+        return False
+    expected = manifest.get("supported_ligand") or {}
+    ligand_ids = tuple(int(v) for v in ligand_indices)
+    if len(ligand_ids) != int(expected.get("atom_count", -1)):
+        return False
+    identity = ligand_chemical_identity(topology, ligand_ids, system=system)
+    return (
+        identity["atomic_numbers"] == expected.get("atomic_numbers")
+        and identity["internal_bonds"] == expected.get("internal_bonds")
+    )
+
+
+def _refit_outer_lambda_residual_for_this_ligand(
+    *, pipeline, config, output_dir, topology, system, ligand_indices, log,
+):
+    """换配体时的一次闭式重训（EXP-033 §5 P1），产出一份 run 内 manifest。
+
+    帧源写死 `<output_dir>/pre_equilibration.dcd` —— 名字是固定的，有多少帧用多少。
+    调用点必须在**基线预平衡之后**：那条轨迹到那时才存在。
+
+    为什么可以用 run 内的帧：`B_φ` 在 outer，**不进哈密顿量**（physical target 永远
+    不含残差），所以换哪个系综的帧都不改变 ΔG 的正确性，只改变这个采样增强项好不好用。
+    EXP-033 P1 item 1 原文写"用那次 run 自己的 stage2 产物"，是因为当时有 rerun1/2/3
+    三条平行实验、LORO 能按独立 run 分折；而新配体在跑 stage 2 之前根本没有那些产物。
+
+    ⚠️ 做 A/B 时不要走这条路：两臂各自重训会让 `sampling_score_sha256` 变成
+    run-dependent，两臂不再共用同一把尺子。A/B 要的是先离线冻一份、两臂共用
+    （`tools/retrain_local_residual_offline.py`），并按 EXP-027 U3 口径各自标定 f_k。
+    """
+
+    import numpy as np
+
+    from local_residual.refit import closed_form_refit, write_refit_payload
+
+    trajectory = os.path.join(output_dir, "pre_equilibration.dcd")
+    if not os.path.exists(trajectory):
+        raise RuntimeError(
+            f"闭式重训要用预平衡轨迹，但找不到 {trajectory}。"
+            "这条重训必须挂在基线预平衡之后 —— 挂错时序就会撞到这里。"
+        )
+    work_dir = os.path.join(output_dir, "outer_lambda_refit")
+    lam_max = float(config.get("outer_lambda_refit_lambda_max", 1.0))
+    lam_min = float(config.get("outer_lambda_refit_lambda_min", 0.5))
+    n_states = int(config.get("outer_lambda_refit_n_states", 8))
+    log.info(
+        "%s：当前配体不在冻结 manifest 的覆盖范围内 ⟹ 走 EXP-033 §5 P1 闭式重训"
+        "（帧源 pre_equilibration.dcd，λ_vdw %.3g→%.3g，%d 态）",
+        OUTER_LAMBDA_RESIDUAL_FEATURE_NAME, lam_max, lam_min, n_states,
+    )
+    result = closed_form_refit(
+        system=system,
+        topology=topology,
+        positions=pipeline.positions,
+        box_vectors=pipeline.box_vectors,
+        ligand_indices=ligand_indices,
+        trajectory_path=trajectory,
+        lambdas_vdw=np.linspace(lam_max, lam_min, n_states).tolist(),
+        temperature_kelvin=float(config.temperature),
+        platform_name=config.platform,
+        output_dir=work_dir,
+        ligand_name=str(config.ligand),
+        topology_cif=os.path.join(output_dir, "topology.cif"),
+        ligand_indices_path=os.path.join(output_dir, "ligand_indices.json"),
+        system_xml=os.path.join(output_dir, "system_native.xml"),
+        log=lambda message: log.info("%s", message),
+    )
+    resources = os.path.join(work_dir, "resources")
+    write_refit_payload(
+        result,
+        output_dir=resources,
+        ligand_topology_indices=sorted(int(v) for v in ligand_indices),
+        protocol_sha256=result["protocol_sha256"],
+        log=lambda message: log.info("%s", message),
+    )
+    manifest_path = os.path.join(resources, "manifest.json")
+    from scripts.write_local_residual_resource_manifest import main as write_manifest
+
+    write_manifest([
+        "--payload", os.path.join(resources, "r1_model_payload_v1.json"),
+        "--weights", os.path.join(resources, "r1_model_weights_f64.bin"),
+        "--topology", os.path.join(output_dir, "topology.cif"),
+        "--ligand-indices", os.path.join(output_dir, "ligand_indices.json"),
+        "--system", os.path.join(output_dir, "system_native.xml"),
+        "--ligand-name", str(config.ligand),
+        "--experiment-id", "EXP-033",
+        "--output", manifest_path,
+    ])
+    log.info(
+        "%s：闭式重训完成 | 相对改善 %.4f | tanh 改形 %.2f%% | manifest=%s"
+        " ⟹ 这是「值得上机的信号」，不是验收（验收口径见 EXP-033 §4）",
+        OUTER_LAMBDA_RESIDUAL_FEATURE_NAME,
+        result["fit_report"]["relative_improvement"],
+        100.0 * result["tanh_saturated_fraction"],
+        manifest_path,
+    )
+    return manifest_path
+
+
 def main():
     _diagnostic_exit = dispatch_diagnostic_command(sys.argv[1:])
     if _diagnostic_exit is not None:
@@ -6134,15 +6457,31 @@ def main():
             f"{OUTER_LAMBDA_RESIDUAL_FEATURE_NAME} 不能用于只跑 charging/attachment 的入口；"
             "该开关要求完整 dual_lambda 两腿流程"
         )
+    # 准备输出目录
+    output_dir = config.output
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 🔑 [ATT-23 / issue #142] 作业级防护：**SIGTERM/SIGINT 有序退出**。
+    #   默认行为是直接终止，`finally` 一个都不跑：Context 不销毁、reporter 不收尾、
+    #   日志里连"我被信号杀了"这句都没有。2026-09-09 那次作业就是这样消失的
+    #   （两个 log 停在同一行、无 traceback）。
+    #
+    # 这里**不再**取输出目录独占锁（见 abfe_pipeline.guard_run_directory 的
+    # docstring：锁文件在共享盘上判不出 stale，反而挡住 --resume）。代价是
+    # "两个 pipeline 写同一个 --output"不再有任何东西拦得住 —— 这条要靠调度侧
+    # 保证，别指望代码。
+    # ⚠️ SIGKILL（含 OOM killer）捕不到，那条路要靠内存预算本身，不是这里。
+    #
+    # 🔑 [2026-09-10] 装在 traditional 分流**之前**。原来它排在
+    # `if config.mode == "traditional": ...; return` 后面，于是 traditional
+    # 整条腿一个信号处理器都没装 —— 正是这条改动要修的那个"作业悄无声息消失"。
+    guard_run_directory(output_dir, log=log.info)
+
     # 分析模式已在 main 开头分流（[P1-04]：不被模拟输入校验阻断）
     # 传统模式单独处理
     if config.mode == "traditional":
         run_traditional_mode(config)
         return
-
-    # 准备输出目录
-    output_dir = config.output
-    os.makedirs(output_dir, exist_ok=True)
 
     # ----- 1. 系统加载：优先从缓存，否则 GROMACS 构建并立即落盘 -----
     #
@@ -6183,6 +6522,26 @@ def main():
         )
     else:
         include_dir = find_gmx_include_dir(config.gmx_path)
+        # 🔑 [ATT-24 / issue #64] 物理输入预检。放在这里是因为此刻 gro/top/ligand/
+        # include_dir 都已确定、而 System 还没建 —— 下面这五类问题原本都要等到
+        # 建完 System 甚至跑起来之后才以别的面目暴露：
+        #   未解析的 #include → "某个 moleculetype 找不到"
+        #   --ligand 打错     → "ligand_indices 为空"
+        #   gro/top 原子数不符 → 所有按序号取的原子选择静默错位
+        #   盒子 < 2×cutoff   → PME **不报错**，只是给出错误的静电
+        #   配体/受体太小     → Boresch 六个锚点定义不出来
+        # 一次列全所有问题再抛，不是遇到第一个就停。
+        # cutoff 用 1.0 nm：与本仓生产口径一致（MEM-00h 把 evaluation clone
+        # 归一化到 cutoff=1.0nm，softcore 探针 builder 的默认也是 1.0）。
+        preflight_physical_inputs(
+            config.gro,
+            config.top,
+            config.ligand,
+            gmx_include_dir=include_dir,
+            cutoff_nm=1.0,
+            require_boresch=bool(config.get("boresch")),
+            log=log.info,
+        )
         main_cache_identity = _main_cache_identity(
             config.gro, config.top, config.ligand, include_dir
         )
@@ -6286,6 +6645,20 @@ def main():
             require_bonded_topology=_require_bonded_topology,
         )
         log.info("已从缓存重新加载 System (使用落盘后对象)")
+
+    # 元素覆盖是**输入拓扑的性质**，不需要跑任何 MD 就能判，所以放在拿到拓扑的
+    # 第一时间。默认不做（配置键为 None 时整段跳过，不 import torch）。
+    _coverage_model = getattr(config, "element_coverage_model", None)
+    if _coverage_model:
+        from local_residual.element_coverage import check_topology_element_coverage
+
+        _elements, _table = check_topology_element_coverage(
+            topology, _coverage_model, system=system
+        )
+        log.info(
+            "元素覆盖检查通过 | 模型=%s（%d 种元素）| 体系 %d 种 %s",
+            _coverage_model, len(_table), len(_elements), list(_elements),
+        )
 
     # 坐标安全处理：转换为纯 numpy 再转为 Vec3 列表（防止类型问题）
     if hasattr(positions, "value_in_unit"):
@@ -6554,7 +6927,27 @@ def main():
             )
 
     outer_lambda_runtime = None
+    # 🔑 [EXP-033 §5 P1] 冻结 manifest 覆盖不到当前配体时，**不是**在这里失败，
+    # 而是推迟到基线预平衡之后做一次闭式重训——训练帧源 `pre_equilibration.dcd`
+    # 到那时才存在。覆盖得到就走原路，一个字节都不变。
+    _residual_refit_pending = False
+    # 🔑 本次运行**实际**用的那份 manifest。两条腿都必须读这一个变量：重训产出的
+    # manifest 只写在这里，溶剂腿若仍去读 `config.outer_lambda_resource_manifest`
+    # 就会拿冻结那份去建，新配体在那里撞身份闸门 —— 而且是在复合物腿跑完之后才炸。
+    # 权重**绑配体不绑体系**（docs/RETRAIN_LOCAL_RESIDUAL.md 的表：复合物腿↔溶剂腿
+    # 不用重训），所以一次重训的产物两条腿共用，不重训第二次。
+    _residual_resource_manifest = getattr(config, "outer_lambda_resource_manifest", None)
     if config.outer_lambda_local_residual_ibs:
+        _frozen_manifest = _residual_resource_manifest or (
+            os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "resources/outer_lambda_local_residual/manifest.json",
+            )
+        )
+        _residual_refit_pending = not _frozen_residual_manifest_covers_ligand(
+            _frozen_manifest, topology, ligand_indices, system
+        )
+    if config.outer_lambda_local_residual_ibs and not _residual_refit_pending:
         # This is the sole mainline plugin entry point.  It validates the
         # frozen source/model artifacts and loads all plugin libraries before
         # any residual XML Force can be deserialized by a window builder.
@@ -6568,6 +6961,7 @@ def main():
             ligand_indices_path=os.path.join(output_dir, "ligand_indices.json"),
             leg_name="complex",
             platform_name=config.platform,
+            resource_manifest=_residual_resource_manifest,
         )
         config.data["outer_lambda_local_residual_ibs_identity"] = (
             outer_lambda_runtime.provenance_payload()
@@ -6803,6 +7197,48 @@ def main():
     else:
         boresch_restraint = resolve_boresch_restraint(config, pipeline)
 
+    # ----- 4b. 换配体：闭式重训 outer-λ 局部残差（EXP-033 §5 P1） -----
+    # 位置是**刻意**选在这里：`resolve_boresch_restraint` 内部会无条件跑完基线预平衡，
+    # 所以 `pre_equilibration.dcd` 到这一行才保证存在；而 vanishing 采样还没开始，
+    # 残差要影响的正是它。绑定走 pipeline 的统一入口，与构造期共用同一段 fail-closed
+    # 校验（no_residual_twin / plugin identity 两道都不绕过）。
+    if _residual_refit_pending:
+        _residual_resource_manifest = _refit_outer_lambda_residual_for_this_ligand(
+            pipeline=pipeline, config=config, output_dir=output_dir,
+            topology=topology, system=system, ligand_indices=ligand_indices, log=log,
+        )
+        outer_lambda_runtime = build_outer_lambda_local_residual_runtime(
+            topology=topology,
+            ligand_indices=ligand_indices,
+            system=system,
+            temperature_kelvin=float(config.temperature),
+            potential_type=str(config.potential),
+            output_dir=output_dir,
+            ligand_indices_path=os.path.join(output_dir, "ligand_indices.json"),
+            leg_name="complex",
+            platform_name=config.platform,
+            resource_manifest=_residual_resource_manifest,
+        )
+        config.data["outer_lambda_local_residual_ibs_identity"] = (
+            outer_lambda_runtime.provenance_payload()
+        )
+        pipeline.attach_residual_sampling_runtime(
+            enabled=True,
+            basis_force_factory=outer_lambda_runtime.force_factory,
+            state_coefficients_factory=outer_lambda_runtime.state_coefficients_factory,
+            energy_offset_kj_mol=outer_lambda_runtime.energy_offset_kj_mol,
+            sampling_score_sha256=outer_lambda_runtime.sampling_score_sha256,
+            plugin_identity=outer_lambda_runtime.provenance_payload(),
+            em_policy=outer_lambda_runtime.em_policy,
+            feature_name=OUTER_LAMBDA_RESIDUAL_FEATURE_NAME,
+        )
+        log.info(
+            "%s 已延迟绑定 | score=%s | em_policy=%s",
+            OUTER_LAMBDA_RESIDUAL_FEATURE_NAME,
+            outer_lambda_runtime.sampling_score_sha256,
+            outer_lambda_runtime.em_policy,
+        )
+
     # ----- 5. 带限制力再平衡（如果启用） -----
     if boresch_restraint and not config.skip_rebalance:
         log.info("执行带 Boresch 限制力的再平衡...")
@@ -6863,6 +7299,23 @@ def main():
     _scope_pipeline_with_optional_outer_lambda_em(
         pipeline, outer_lambda_runtime is not None
     )
+    # 🔑 开关开着 ⟹ 要么真挂上了，要么**报错**。绝不静默跑 baseline。
+    #
+    # 缺冻结 manifest 是**正常初始状态**，不是错误状态 —— 输入的时候谁都没有这份
+    # 蒸馏出来的权重。所以 fail-closed 的位置从"资源缺失"挪到了这里："训完了仍然
+    # 没有"。中间那一步（EXP-033 P1 闭式重训）自己失败会当场抛，不会走到这。
+    #
+    # 这道断言防的是**未来重构**：`_residual_refit_pending` 的赋值、重训调用点、
+    # 腿的分支只要有一处挪位，开着开关的 run 就会拿 `residual_sampling_enabled=False`
+    # 造出来的 pipeline 一路跑完，报告里一切正常，而残差一次都没生效。
+    if config.outer_lambda_local_residual_ibs and outer_lambda_runtime is None:
+        raise RuntimeError(
+            f"{OUTER_LAMBDA_RESIDUAL_FEATURE_NAME} 开关是开的，但到开始采样时运行时"
+            "仍然没有绑上。这不该发生：冻结 manifest 覆盖不到当前配体时应该走自动"
+            "闭式重训（docs/EXP-033_P1_LANDED_2026-09-12.md）。"
+            "拒绝静默按 baseline 跑完 —— 那会产出一份看起来一切正常、而残差从未生效的结果。"
+        )
+
     complex_results = pipeline.run_full_pipeline(
         # 🔑 [2026-09-01] 质量门放行开关（见 --allow-untrusted-stage-results）。
         # 不传的话 _last_run_config 里就是 False，行为与之前完全一致（fail-closed）。
@@ -6901,6 +7354,7 @@ def main():
         ),
         stage2_window_min_states=config.get("stage2_window_min_states"),
         stage2_window_max_states=config.get("stage2_window_max_states"),
+        **_path_evolution_kwargs(config),
         stage2_free_energy_densify_points=config.get(
             "stage2_free_energy_densify_points"
         ),
@@ -6993,6 +7447,8 @@ def main():
             ligand_indices_path=os.path.join(output_dir, "ligand_indices_solvent.json"),
             leg_name="solvent",
             platform_name=config.platform,
+            # 见上面 `_residual_resource_manifest` 的说明：两段 vdW 共用同一份权重。
+            resource_manifest=_residual_resource_manifest,
         )
 
     solvent_out_dir = os.path.join(output_dir, "solvent_leg")
@@ -7095,6 +7551,13 @@ def main():
     _scope_pipeline_with_optional_outer_lambda_em(
         pipeline_solv, outer_lambda_runtime_solv is not None
     )
+    if config.outer_lambda_local_residual_ibs and outer_lambda_runtime_solv is None:
+        raise RuntimeError(
+            f"{OUTER_LAMBDA_RESIDUAL_FEATURE_NAME} 开关是开的，但溶剂腿的运行时没绑上。"
+            "两段 vdW 必须用同一份权重；只有一条腿挂上残差，两腿的 ligand–environment "
+            "口径就不一致，ΔG_bind = ΔG_solv − ΔG_cplx 的差值里会混进一个协议差。"
+        )
+
     solv_results = pipeline_solv.run_full_pipeline(
         decoupling_scheme=config.decoupling,
         potential_type=config.potential,
@@ -7126,6 +7589,7 @@ def main():
         ),
         stage2_window_min_states=config.get("stage2_window_min_states"),
         stage2_window_max_states=config.get("stage2_window_max_states"),
+        **_path_evolution_kwargs(config),
         stage2_free_energy_densify_points=config.get(
             "stage2_free_energy_densify_points"
         ),

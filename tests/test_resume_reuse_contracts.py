@@ -921,3 +921,74 @@ def test_second_reuse_path_also_rejects_v1_group5_windows(tmp_path, monkeypatch)
         "第二条窗口复用路径没有校验 Group5 协议版本"
     )
     assert "LIGAND_COM_RESTRAINT_PROTOCOL_VERSION" in body
+
+
+# ---------------------------------------------------------------------------
+# 路径形状键不属于「窗口采样身份」
+# ---------------------------------------------------------------------------
+# 末段插一个 λ 时，插点之前的窗口 λ 值逐位未变、物理上完全可复用；但路径形状键
+# （stage2_final_n_states / densify / window_min|max_states）此前留在
+# `_stage_window_sampling_identity` 里，会让这些窗口一并判失配、整窗重采。
+# 它们决定「有哪些窗口」，不决定「某个窗口采什么」——后者由该窗口自己的 λ 值
+# 决定，而那是 `lambdas_match` 单独在查的。
+
+def _stage_key(**kwargs_overrides):
+    kwargs = {
+        "stage2_final_n_states": 16,
+        "stage2_free_energy_densify_points": 2,
+        "stage2_window_min_states": 4,
+        "stage2_window_max_states": 5,
+        "final_min_ess_ratio": 0.1,
+    }
+    kwargs.update(kwargs_overrides)
+    return {"payload": {
+        "stage_name": "vanishing",
+        "potential_type": "aces",
+        "run_config": {"n_steps_per_window": 500000, "kwargs": kwargs},
+        "code_sha256": "deadbeef",
+    }}
+
+
+def test_path_shape_knobs_are_not_part_of_window_sampling_identity():
+    base = ie._stage_window_sampling_identity(_stage_key())
+    for key, changed in (
+        ("stage2_final_n_states", 17),          # 末段插一个 λ
+        ("stage2_free_energy_densify_points", 3),
+        ("stage2_window_min_states", 3),
+        ("stage2_window_max_states", 4),
+    ):
+        assert ie._stage_window_sampling_identity(_stage_key(**{key: changed})) == base, (
+            f"{key} 改变不应让已采好的窗口轨迹失配——它只决定有哪些窗口"
+        )
+
+
+def test_real_sampling_changes_still_invalidate_window_identity():
+    """收窄不能把真正改变采样的东西一起放过。"""
+    base = ie._stage_window_sampling_identity(_stage_key())
+    assert ie._stage_window_sampling_identity(
+        _stage_key(some_new_sampling_knob=True)
+    ) != base
+    hamiltonian_changed = _stage_key()
+    hamiltonian_changed["payload"]["potential_type"] = "dexp"
+    assert ie._stage_window_sampling_identity(hamiltonian_changed) != base
+
+
+def test_lambdas_match_is_still_an_and_term_of_usable():
+    """上面那个放宽的安全性依赖这一条：窗口自己的 λ 仍被单独校验。
+
+    若 `lambdas_match` 哪天不再是 `usable` 的 AND 项，路径形状键必须放回
+    `_stage_window_sampling_identity`，否则 λ 变了的窗口会被静默复用。
+    """
+    src = Path(ie.__file__).read_text(encoding="utf-8")
+    start = src.index("def _resume_cached_window_gate_status(")
+    body = src[start:src.index("\ndef ", start + 1)]
+    usable = body[body.index("usable = bool("):]
+    usable = usable[:usable.index("\n    )")]
+    assert "and lambdas_match" in usable or "lambdas_match" in usable.split("bool(")[1].split(")")[0]
+
+    # 真正的行为断言：λ 不同的缓存必须判不可复用。
+    conv = _matching_conv()
+    conv["lambdas_vdw"] = [v + 0.01 for v in LV_WIN]
+    status = _gate(conv)
+    assert status["lambdas_match"] is False
+    assert status["usable"] is False

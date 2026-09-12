@@ -29,22 +29,31 @@ REPO = Path(__file__).resolve().parents[1]
 
 
 def test_cdf_no_longer_double_counts_the_second_to_last_weight():
-    """`xp[-1] = 1.0` 覆盖式写法必须消失（两处副本），末端仍严格为 1.0。
+    """`xp[-1] = 1.0` 覆盖式写法必须消失（两处副本），改用"前 N-1 个权重当区间宽度"。
 
     旧写法：`xp = [0] + cumsum(w)[:-1]/sum(w)`，再把末元素覆盖成 1.0 —— 那个赋值
     同时覆盖了 c_{N-2}，最后一个区间宽度从 w[N-2] 变成 w[N-2]+w[N-1]。
+
+    ⚠️ 这是一条**源码契约**，不是行为测试，原因写在这里以免下一个人误以为它更强：
+    这段 CDF 构造埋在 `optimize_lambda_path_adaptive` /
+    `optimize_stage1_decharging` 两个大方法的中段，中间还夹着 MAX_RATIO 权重截断
+    和 min_spacing 去重回退。实测（2026-09-09）：改动 `std_dev_clipped[-1]` 会通过
+    截断/回退影响输出，所以"末节点权重不参与区间宽度"这个本应成立的不变量在端到端
+    输出上**观测不到**，无法据此写行为断言。
+    本测试原来在这里附了一段"把修好的公式在测试里再写一遍、然后断言它自己"的算术
+    （`xp = np.concatenate(([0.0], np.cumsum(iw)/np.sum(iw)))` 加四条 assert），
+    那是纯同义反复：production 一行都没跑到。已删除。
+
+    # ponytail: 源码契约兜底。要真正测出数值行为，得先把这段 CDF 构造提成
+    # 模块级 helper（两处调用共用），再直接对 helper 写断言 —— 那同时也消掉
+    # 下面 `count(...) == 2` 这条"两处副本"的脆弱计数。
     """
     src = (REPO / "abfe_preoptimizer.py").read_text(encoding="utf-8")
-    assert "xp[-1] = 1.0" not in src
-    assert src.count("interval_weights = np.asarray(density_weight") == 2
-
-    w = np.array([0.05, 0.10, 0.20, 0.40, 0.25])
-    iw = w[:-1]
-    xp = np.concatenate(([0.0], np.cumsum(iw) / float(np.sum(iw))))
-    assert xp[0] == pytest.approx(0.0)
-    assert xp[-1] == pytest.approx(1.0)
-    # 最后一段是 0.40/0.75 ≈ 0.533，不是旧写法的 0.65。
-    assert np.diff(xp)[-1] == pytest.approx(0.40 / 0.75)
+    assert "xp[-1] = 1.0" not in src, "覆盖式写法回来了：它会双重计入 w[N-2]"
+    assert src.count("interval_weights = np.asarray(density_weight") == 2, (
+        "CDF 构造的副本数变了（应为 optimize_lambda_path_adaptive 与 "
+        "optimize_stage1_decharging 各一处）；新增副本请一并接上本契约"
+    )
 
 
 def test_reduced_energies_indexes_lrc_by_physical_state_not_column_position():

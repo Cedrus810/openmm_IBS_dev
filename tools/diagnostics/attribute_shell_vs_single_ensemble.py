@@ -2,7 +2,7 @@
 """归因实验：stage2 的 +45 kJ/mol 误差，是**壳**还是**单系综重加权**？
 
 2026-09-02 已有 2×2 的两个角（见 docs/reference_data/ 与
-docs/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md §2.9）：
+docs/archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md §2.9）：
 
               | 逐态独立采样        | 单混合分布
     ----------+---------------------+------------------
@@ -256,6 +256,23 @@ def main():
     system = mm.XmlSerializer.deserialize(open(sys_xml).read())
     pdbx = app.PDBxFile(cif)
     box = np.load(boxf)
+    # 🛑 [2026-09-10] **这里用的建系盒密度是错的，出来的数不能直接跟生产比。**
+    #
+    # 建系盒（4W53 那次 43.950 nm^3）比 1 bar 平衡密度**大 3.15%**；生产 stage2 走 NVT，
+    # 用的是自己 NPT 预平衡末帧冻结的盒（42.747，与 1 bar 平衡一致）。
+    # 配对重跑实测（同 λ 表、同 seed，只换盒）：
+    #     43.9496 -> -6.594 +- 0.324     42.7468 -> -11.490 +- 0.342     差 -4.896
+    #     ==> dDeltaA_LJ/dV = 4.07 kJ/mol/nm^3 (68 bar)
+    # 光这一项就把对生产的判读从「差 5.5 sigma」翻成「差 0.72 sigma」。
+    #
+    # ⚠️ 09-09 这里写过 `0.71 +- 0.11 kJ/mol/nm^3 (12 bar) ==> -0.86，占残差 ~20%` ——
+    # 那个 100 帧有限差分**错了 5.7 倍**，别再引用。
+    #
+    # **要跟生产比就先备好生产盒的 root，再 --root 指过去**（不需要 --box 开关）：
+    #     python tools/diagnostics/probe_reference_box_density.py --lambda-subset 12
+    #     ... --root /home/ruigengji/ABFE_IBS/4W53/reference_at_npt_box
+    # 生产实际用的 V 可从产物反解：energies.npy - sampling_states.npy.T 是逐 λ 态常数
+    # = lrc_coeff[k]/V。详见 docs/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md。
     ligand_indices = json.load(open(ligf))["ligand_indices"]
 
     print(f"体系原子数 = {system.getNumParticles()}, 约束 = {system.getNumConstraints()}")

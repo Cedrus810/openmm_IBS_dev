@@ -7,8 +7,14 @@ openmm = pytest.importorskip("openmm")
 from openmm import NonbondedForce, Vec3, app, unit  # noqa: E402
 
 import abfe_core as core  # noqa: E402
-from abfe_preoptimizer import build_aces_probe_system_dual_lambda  # noqa: E402
+from abfe_preoptimizer import (  # noqa: E402
+    PREOPT_NATIVE_NONBONDED_FORCE_GROUP,
+    build_aces_probe_system_dual_lambda,
+)
 
+
+
+pytestmark = pytest.mark.cpu_only
 
 def _system_and_spec():
     topology = app.Topology()
@@ -74,7 +80,21 @@ def test_charge_transfer_probe_has_real_offsets_endpoint_charge_and_restraint():
     )
 
     nb = next(force for force in probe.getForces() if isinstance(force, NonbondedForce))
-    assert nb.getForceGroup() == 1
+    # 🔑 [2026-09-10] 原来断言 `== 1`（与软核力同组）。改成独立的
+    # `PREOPT_NATIVE_NONBONDED_FORCE_GROUP`：
+    #
+    # group 1 里那两项对 λ 的依赖不一样——软核 ACES 力同时带 lam_coul 和 lam_vdw，
+    # 而原生 NB 只带 lam_coul（B3 的 PME ParameterOffset 装在它上面）。两者同组时，
+    # Stage 2（固定 lam_coul=0、只差分 lam_vdw）会把这个 ~10^6 kJ/mol 的常数一起
+    # 读进有限差分，再除以 delta≈0.02 —— 灾难性相消，而 mixed precision 下两次
+    # 求值未必逐比特相同。分组之后由 `_metric_force_groups()` 按被差分的参数选：
+    # 差分 lam_coul 时计入（Stage 1 必须要它），差分 lam_vdw 时不计入。
+    #
+    # ⚠️ force group 只影响能量分解读数，**不影响积分的哈密顿量**——这条改动
+    # 不改变任何被采样的物理，只让度规估计不再在公共项上做相消。
+    assert nb.getForceGroup() == PREOPT_NATIVE_NONBONDED_FORCE_GROUP
+    # 且必须与软核力真的分开，否则上面那条相消又回来了。
+    assert PREOPT_NATIVE_NONBONDED_FORCE_GROUP != 1
     offsets = {
         int(nb.getParticleParameterOffset(i)[1]): float(
             nb.getParticleParameterOffset(i)[2]

@@ -58,6 +58,9 @@ from ibs_engine import (
 )
 
 
+
+pytestmark = pytest.mark.cpu_only
+
 def _state_paths(bank_dir, k):
     """Test helper: resolve one state's CURRENT generation-tagged paths."""
     generation = _read_fixed_h_probe_bank_state_generation(bank_dir, k)
@@ -544,7 +547,18 @@ def test_protocol_versions_reject_old_semantics():
     # 未偏移的 bias/base，增广矩阵里那个逐帧平移不再是全行公共量、不抵消，
     # 等于人为注入共模因子（4W53 实测 window 0 达 3.10 kT，比真实防护壳共模的
     # 0.95~2.40 kT 还大）。在线学习输入变了，缓存兼容集合收窄成只有 32。
-    assert IBS_BIAS_PROTOCOL_VERSION == 32
+    # 🔑 [EXP-031 S1 摘零 CV] 32->33：`IBS_BIAS_OMIT_ZERO_REST_CVS` 默认翻成 True，
+    # Group-1 的 CustomCVForce 不再注册那 K 个恒零的 `cv_k_rest` 占位 CV。
+    # **采样哈密顿量在数学上完全不变** —— `cv_k_rest` 是零粒子的
+    # `CustomExternalForce("0")`，对能量与力的贡献严格为 0，摘掉它是精确恒等变形；
+    # 三条独立路径实测 Group-1 能量逐比特相同（真 Atenolol 膜体系、
+    # `build_shadow_coul_ibs_system`、71262 原子水盒）。但表达式字符串与 CV 集合
+    # 变了 ⟹ system XML 变 ⟹ 旧 dual_window_*/ibs_state_* 里的 `_int_cv_indices`
+    # 与 CV 计数都对不上，必须被版本门控拒绝。缓存兼容集合同样收窄成只有 33。
+    # 收益：每步省 0.377 ms（真体系整步 1.2206x，三轮散度 1.80%）——那 0.377 ms
+    # 与 71262 原子水盒上省的完全一致，因为它是"每 CV 21-25 µs 的调度税"，
+    # 与体系大小无关。
+    assert IBS_BIAS_PROTOCOL_VERSION == 33
     assert THERMODYNAMIC_PATH_PROTOCOL_VERSION == 22
 
 
@@ -704,6 +718,18 @@ def test_vanishing_pilot_returns_few_state_subdomains_without_overlap_two():
         def getIntegrator(self):
             return self.integrator
 
+        # 🔑 [2026-09-10] Stage 2 pilot 现在逐 λ 快照 (坐标/速度/盒子)，
+        # 加密阶段要从相邻高 λ 端点 setState 续接（见
+        # `_refine_pilot_grid_in_steep_segments` 的说明）。替身补上这两个方法，
+        # 记录被恢复到哪个快照，好让"续接语义"本身也可断言。
+        def getState(self, **_kwargs):
+            return ("snapshot", dict(self.params))
+
+        def setState(self, state):
+            self.restored = getattr(self, "restored", [])
+            self.restored.append(state)
+            self.params.update(state[1])
+
     optimizer = DualLambdaPreOptimizer.__new__(DualLambdaPreOptimizer)
     optimizer.context = _FakeContext()
     optimizer.param_coul = "lam_coul"
@@ -765,6 +791,18 @@ def test_vanishing_pilot_adds_nodes_to_harder_tail_without_moving_anchors():
 
         def getIntegrator(self):
             return self.integrator
+
+        # 🔑 [2026-09-10] Stage 2 pilot 现在逐 λ 快照 (坐标/速度/盒子)，
+        # 加密阶段要从相邻高 λ 端点 setState 续接（见
+        # `_refine_pilot_grid_in_steep_segments` 的说明）。替身补上这两个方法，
+        # 记录被恢复到哪个快照，好让"续接语义"本身也可断言。
+        def getState(self, **_kwargs):
+            return ("snapshot", dict(self.params))
+
+        def setState(self, state):
+            self.restored = getattr(self, "restored", [])
+            self.restored.append(state)
+            self.params.update(state[1])
 
     optimizer = DualLambdaPreOptimizer.__new__(DualLambdaPreOptimizer)
     optimizer.context = _FakeContext()

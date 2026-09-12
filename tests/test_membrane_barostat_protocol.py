@@ -673,12 +673,20 @@ def test_bad_starting_state_fails_closed_after_minimization():
         "attachment 腿必须复用同一道起始态门 —— 2026-08-02 的 NaN 就是因为"
         "它开跑前什么都不量，只留下一个没有上下文的 Particle coordinate is NaN"
     )
-    # 锚点用"第一次 simulation.step("，而不是某个具体的步数表达式：
-    # 平衡段 2026-08-03 起改成分块步进（为了在崩之前留下监控行），
-    # 原先那个 `simulation.step(int(equil_steps_per_state))` 字面量已不存在。
-    assert leg_body.index("assert_starting_state_is_sane(") < leg_body.index(
-        "simulation.step("
-    ), "起点体检必须在第一次 step 之前"
+    # 锚点用"第一次步进"，而不是某个具体的步数表达式：平衡段 2026-08-03 起改成
+    # 分块步进（为了在崩之前留下监控行），原先那个
+    # `simulation.step(int(equil_steps_per_state))` 字面量已不存在；2026-09-09
+    # 又整体改走 `step_guard.guarded_step(simulation, ...)`（step() 抛的
+    # OpenMMException 必须带上下文）。所以这里认两种写法里最早出现的那个。
+    _first_step = min(
+        i for i in (
+            leg_body.find("simulation.step("),
+            leg_body.find("guarded_step(simulation"),
+        ) if i >= 0
+    )
+    assert leg_body.index("assert_starting_state_is_sane(") < _first_step, (
+        "起点体检必须在第一次 step 之前"
+    )
     # 监控必须在崩之前就有行落盘，否则又是"只有一个 traceback"。
     assert "stage0_attachment_monitor.csv" in leg_body
     assert "stage0_attachment_inputs.json" in leg_body
@@ -967,15 +975,149 @@ def test_torn_rigid_water_is_caught_before_dynamics(tmp_path):
         core.assert_starting_state_is_sane(context, topology, label="撕开的水")
 
 
-def test_pbc_repair_promotes_constraints_to_bonds_for_grouping():
-    """契约：PBC 修复必须把约束补成键，否则刚性水会被 image_molecules 撕开。"""
+def test_image_molecules_ignores_phantom_topology_bonds():
+    """契约：分子归组只信 System —— topology 少键或多键都不许影响回卷结果。
+
+    两个方向的错都真实发生过：
+
+      * **少键**（MEM-15，2026-08-03）：刚性水的 O–H 只以约束存在
+        （`topology.bonds()` 里 0 条水键），mdtraj 把每个水原子当独立分子逐原子
+        回卷 → 243 个水被撕开 → 约束求解器要在 5.9–12.4 nm 上解 0.0957 nm →
+        不到 1 ps 的 `Particle coordinate is NaN`。
+      * **多键**（2026-09-09，brd4 benchmark）：`topology.cif` 往返在链数 > 26 时
+        把某个水的 O/H1/H2 认成蛋白第一个残基 ACE 的原子（`pdbxfile.py` 写入端
+        链 id 按 `chr(ord('A') + chainIndex % 26)` 循环、读取端 `_struct_conn`
+        只按 `(seq_id, asym_id, atom_name)` 解析），假边把那个水的 H2 拽到一个
+        盒长以外（实测 O–H2 = 7.3564 nm / 盒长 7.3631 nm），attachment 腿起点
+        体检拒绝开跑，而修复自己报的是 [OK]。
+
+    这里同时造出这两种错：拓扑**一条真键都没有**（少键），却有一条把两个水
+    连起来的**假键**（多键）。只要归组走 System，两个水都必须完好。
+    """
+    import numpy as np
+    import mdtraj as md
+
+    from abfe_core import image_molecules_by_system, system_molecule_grouping
+
+    box = 2.0
+    system = openmm.System()
+    topology = app.Topology()
+    chain = topology.addChain()
+    atoms = []
+    for _ in range(2):
+        res = topology.addResidue("HOH", chain)
+        for name, element, mass in (
+            ("O", app.element.oxygen, 15.999),
+            ("H1", app.element.hydrogen, 1.008),
+            ("H2", app.element.hydrogen, 1.008),
+        ):
+            atoms.append(topology.addAtom(name, element, res))
+            system.addParticle(mass)
+    for base in (0, 3):
+        system.addConstraint(base + 0, base + 1, 0.09572 * unit.nanometer)
+        system.addConstraint(base + 0, base + 2, 0.09572 * unit.nanometer)
+        system.addConstraint(base + 1, base + 2, 0.15139 * unit.nanometer)
+    assert topology.getNumBonds() == 0, "刚性水本来就没有键——这正是「少键」那一半"
+    # 「多键」那一半：把 0 号水的 O 和 1 号水的 H2 用一条不存在的键连起来。
+    topology.addBond(atoms[0], atoms[5])
+
+    molecules, sorted_bonds = system_molecule_grouping(system)
+    assert len(molecules) == 2, "System 里就是两个水，假键不许把它们并成一个"
+    assert len(sorted_bonds) == 4, "每个水一棵 3 结点生成树 = 2 条边"
+
+    # 输入完好：两个水各自成团，1 号水贴着盒边（假键会把它的 H2 拽到 0 号水那边）。
+    intact = np.array([
+        [0.50, 0.50, 0.50], [0.59, 0.52, 0.50], [0.46, 0.58, 0.50],
+        [1.90, 1.50, 1.50], [1.99, 1.52, 1.50], [1.86, 1.58, 1.50],
+    ], dtype=np.float32)
+    traj = md.Trajectory(intact.reshape(1, -1, 3), md.Topology.from_openmm(topology))
+    traj.unitcell_vectors = (np.eye(3, dtype=np.float32) * box).reshape(1, 3, 3)
+    image_molecules_by_system(traj, system)
+
+    # 回卷只许整分子平移：任何一对原子间距离都不许变（撕开必然把某一对拉到 ~盒长）。
+    out = traj.xyz[0].astype(np.float64)
+    ref = intact.astype(np.float64)
+    for base in (0, 3):
+        for a, b in ((0, 1), (0, 2), (1, 2)):
+            before = float(np.linalg.norm(ref[base + a] - ref[base + b]))
+            after = float(np.linalg.norm(out[base + a] - out[base + b]))
+            assert abs(after - before) < 1.0e-5, (
+                f"水 {base // 3} 的 {a}-{b} 被撕开了："
+                f"{before:.4f} nm → {after:.4f} nm"
+            )
+
+
+def test_prune_drops_only_bonds_the_system_does_not_back():
+    """契约：`topology.cif` 往返造出的假键必须被删掉，真键一条都不许动。
+
+    实测（brd4/ligand1，12549 条链）：`.top` 27175 键，mmCIF 往返 27178 键，
+    多出的 3 条全是 `ACE(A,1)` 的键被解析到某个同样落在 `(A,1)` 的水上。
+    删完正好回到 `.top` 的键集。判据故意取宽（`HarmonicBondForce` ∪
+    `CustomBondForce` ∪ `constraints`）：漏删一条假键无害，误删一条真键致命。
+    """
+    from abfe_core import prune_topology_bonds_unsupported_by_system
+
+    system = openmm.System()
+    topology = app.Topology()
+    chain = topology.addChain("A")
+    residue = topology.addResidue("LIG", chain)
+    atoms = []
+    for name, element in (
+        ("C1", app.element.carbon),
+        ("C2", app.element.carbon),
+        ("H1", app.element.hydrogen),
+        ("O1", app.element.oxygen),
+    ):
+        atoms.append(topology.addAtom(name, element, residue))
+        system.addParticle(12.0)
+    topology.setPeriodicBoxVectors(
+        [openmm.Vec3(3, 0, 0), openmm.Vec3(0, 3, 0), openmm.Vec3(0, 0, 3)] * unit.nanometer
+    )
+
+    bond_force = openmm.HarmonicBondForce()
+    bond_force.addBond(0, 1, 0.15 * unit.nanometer, 1000.0)
+    system.addForce(bond_force)
+    # 只活在 CustomBondForce 里的真键：判据取宽就是为了它，绝不许被删。
+    custom = openmm.CustomBondForce("0.5*k*(r-r0)^2")
+    custom.addPerBondParameter("k")
+    custom.addPerBondParameter("r0")
+    custom.addBond(1, 3, [1000.0, 0.14])
+    system.addForce(custom)
+    system.addConstraint(0, 2, 0.11 * unit.nanometer)  # X–H 只以约束存在
+
+    for a, b in ((0, 1), (0, 2), (1, 3)):
+        topology.addBond(atoms[a], atoms[b])
+    topology.addBond(atoms[2], atoms[3])            # 假键：System 完全不认
+
+    pruned = prune_topology_bonds_unsupported_by_system(topology, system)
+    kept = {tuple(sorted((x.index, y.index))) for x, y in pruned.bonds()}
+    assert kept == {(0, 1), (0, 2), (1, 3)}, (
+        "只许删 System 不认的那一条；CustomBondForce 与 constraints 背书的都是真键"
+    )
+    assert pruned is not topology
+    assert (pruned.getNumAtoms(), pruned.getNumResidues(), pruned.getNumChains()) == (
+        topology.getNumAtoms(), topology.getNumResidues(), topology.getNumChains()
+    )
+    assert pruned.getPeriodicBoxVectors() is not None, (
+        "盒矢量丢了 DCD 就不写 unitcell（见 _load_system_from_native_cache 的说明）"
+    )
+
+    # 干净拓扑必须**原样返回同一个对象** —— 否则 topology_sha256 会无谓地变，
+    # 把没受影响的体系的 window 级 resume 也一起作废。
+    assert prune_topology_bonds_unsupported_by_system(pruned, system) is pruned
+
+
+def test_pbc_repair_groups_molecules_by_system_not_topology():
+    """契约：`repair_pbc_molecule_integrity` 不许再按 topology 的键归组。"""
     source = (ROOT / "abfe_pipeline.py").read_text(encoding="utf-8")
     body = source.split("def repair_pbc_molecule_integrity")[1].split("\n    def ")[0]
-    assert "getConstraintParameters" in body, (
-        "必须把 System 的约束补成键再交给 image_molecules() —— "
-        "刚性水的 O–H 只以约束存在（实测 topology.bonds() 里 0 个水键）"
+    assert "image_molecules_by_system(" in body, (
+        "归组必须走 abfe_core.image_molecules_by_system —— System 是唯一"
+        "既不缺刚性水约束、也不会凭空多出假键的连通性来源"
     )
-    assert "add_bond" in body
-    # 锚点用**实际调用** `traj.image_molecules(`，不是裸名字——docstring 里就提到了
-    # `image_molecules()`，用裸名字会命中说明文字而不是调用点。
-    assert body.index("getConstraintParameters") < body.index("traj.image_molecules(")
+    assert "add_bond" not in body, (
+        "不要再往 topology 上补键：补得了少的，挡不住多的（假键）"
+    )
+    assert "traj.image_molecules(" not in body, (
+        "裸调 image_molecules() 就是按 topology 的键归组，正是这个 bug 的根因"
+    )

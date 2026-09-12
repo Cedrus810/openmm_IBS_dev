@@ -17,7 +17,7 @@
 
 门槛是 min 绝对 ESS ≥ 20、top1% ≤ 0.35 ⟹ **两项判定都被翻转**。该窗口贡献
 +20.79 kJ/mol、占溶剂腿 stage2 误差一半以上，却报"全绿"。
-完整定位：`docs/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md` §2.5。
+完整定位：`docs/archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md` §2.5。
 
 本文件不测"数值等于多少"，只测那条不变量：**受门的 raw 量必须来自去相关之前
 的帧集**，以及旧口径必须仍然落盘（否则历史产物无法对账）。
@@ -28,6 +28,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+import ibs_engine
 from ibs_engine import (
     ESS_GATE_PROTOCOL_VERSION,
     _decorrelate_by_worst_target_state,
@@ -85,24 +86,60 @@ def test_decorrelating_by_the_weight_series_inflates_the_degeneracy_metrics():
 def test_gate_metrics_come_from_the_pre_decorrelation_frame_set():
     """受门的 raw 量必须等于**全帧集**上的值，不是抽稀子集上的值。
 
-    直接比对 `_ibs_reweighting_quality_diagnostics` 在两个帧集上的输出：
-    生产里受门的那一份（v5）必须与 `q_pre` 一致。这条不依赖 solve_stage_integrated
-    的合成夹具，因此不会被 λ 网格/窗口划分的无关改动搞脆。
+    2026-09-09 重写：原实现是
+        gated_ess = min(q_pre["raw_ess"])
+        assert gated_ess == pytest.approx(min(q_pre["raw_ess"]))
+    —— 一句 `x == x`。它从头到尾没读过任何**生产**算出来的门值，所以对 v5 想防的
+    回归（把受门量算在抽稀子集上）完全免疫。现在直接拿生产
+    `_solve_single_window_local_mbar` 落盘的 `raw_min_absolute_ess` /
+    `top1pct_raw_weight` 去比：必须等于 pre 口径，且必须**不等于** post 口径。
     """
     u, bias = _autocorrelated_degenerate_weights()
+    base = np.zeros(u.shape[1])
     sub, _g, _w = _decorrelate_by_worst_target_state(u, bias, KT)
+    assert sub.size < u.shape[1], "构造失败：去相关没有抽稀，本测试无从验起"
 
     q_pre = _ibs_reweighting_quality_diagnostics(u, bias, None, KT)
     q_post = _ibs_reweighting_quality_diagnostics(u[:, sub], bias[sub], None, KT)
 
-    gated_ess = min(q_pre["raw_ess"])
-    gated_top1 = max(q_pre["top1pct_raw_weight"])
+    pre_ess = float(min(q_pre["raw_ess"]))
+    post_ess = float(min(q_post["raw_ess"]))
+    pre_top1 = float(max(q_pre["top1pct_raw_weight"]))
+    post_top1 = float(max(q_post["top1pct_raw_weight"]))
+    # 两个口径必须实质不同，否则下面的断言分不出对错。
+    assert pre_ess != pytest.approx(post_ess, rel=1e-6)
+    assert pre_top1 != pytest.approx(post_top1, rel=1e-6)
 
-    # 受门值来自全帧集
-    assert gated_ess == pytest.approx(min(q_pre["raw_ess"]), rel=1e-12)
-    # 且与抽稀口径**确实不同** —— 否则这条测试什么也没钉住
-    assert gated_ess != pytest.approx(min(q_post["raw_ess"]), rel=1e-6)
-    assert gated_top1 != pytest.approx(max(q_post["top1pct_raw_weight"]), rel=1e-6)
+    f_k = np.zeros(u.shape[0])
+    res = ibs_engine._solve_single_window_local_mbar(
+        u, bias, base, list(range(u.shape[0])), KT,
+        f_k=f_k, sampled_distribution_row=0, w_idx=0,
+    )
+    assert "error" not in res, res.get("error")
+
+    # 受门量来自全帧集 ——
+    assert res["raw_min_absolute_ess"] == pytest.approx(pre_ess, rel=1e-9), (
+        "受门的 raw 绝对 ESS 不再来自去相关**之前**的帧集。抽稀用的序列就是权重的"
+        "指数，在抽稀后的子集上量权重退化是循环论证（v4 的缺陷）。"
+    )
+    # `top1pct_raw_weight` 落盘的是**逐态**列表，受门的是它的最大值。
+    np.testing.assert_allclose(
+        np.asarray(res["top1pct_raw_weight"], dtype=float),
+        np.asarray(q_pre["top1pct_raw_weight"], dtype=float),
+        rtol=1e-9,
+    )
+    assert max(res["top1pct_raw_weight"]) == pytest.approx(pre_top1, rel=1e-9)
+
+    # 且明确不是抽稀口径。
+    assert res["raw_min_absolute_ess"] != pytest.approx(post_ess, rel=1e-6)
+    assert max(res["top1pct_raw_weight"]) != pytest.approx(post_top1, rel=1e-6)
+
+    # 旧（抽稀）口径必须仍然落盘（历史产物对账要用），且门用的帧数不少于抽稀后的。
+    assert res["raw_min_ess_ratio_post_decorrelation"] == pytest.approx(
+        post_ess / sub.size, rel=1e-9
+    )
+    assert res["raw_gate_n_frames_pre_decorrelation"] >= res["n_frames_used"]
+    assert res["raw_gate_n_frames_pre_decorrelation"] == u.shape[1]
 
 
 def test_protocol_version_records_the_fix():

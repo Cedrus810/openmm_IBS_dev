@@ -20,6 +20,9 @@ from openmm import NonbondedForce, Vec3, app, unit
 import abfe_core as core
 
 
+
+pytestmark = pytest.mark.cpu_only
+
 ROOT = Path(__file__).absolute().parents[1]
 CT = core.CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER
 

@@ -32,6 +32,9 @@ from ibs_engine import (
     solve_stage_integrated,
 )
 
+
+pytestmark = pytest.mark.cpu_only
+
 KT = 0.008314462618 * 298.15
 
 

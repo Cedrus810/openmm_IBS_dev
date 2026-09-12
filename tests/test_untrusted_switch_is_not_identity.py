@@ -18,11 +18,14 @@ import pytest
 
 import abfe_pipeline as ap
 
+
+pytestmark = pytest.mark.cpu_only
+
 REPO = Path(__file__).resolve().parent.parent
 FLAG = "allow_untrusted_stage_results"
 
 
-def _run_config_after_identity_scrub(raw_config):
+def _run_config_after_identity_scrub(raw_config, stage_name="decharging"):
     """跑 `_stage_protocol_key` 里从 run_config 构造到剔除结束的那一段真实代码。"""
     import inspect
 
@@ -33,8 +36,17 @@ def _run_config_after_identity_scrub(raw_config):
 
     obj = object.__new__(ap.ABFEPipeline)
     obj._last_run_config = raw_config
-    scope = {"self": obj}
-    exec(body, {"getattr": getattr, "dict": dict, "isinstance": isinstance}, scope)
+    scope = {"self": obj, "stage_name": stage_name}
+    exec(
+        body,
+        {
+            "getattr": getattr,
+            "dict": dict,
+            "isinstance": isinstance,
+            "RESIDUAL_SAMPLING_STAGES": ap.RESIDUAL_SAMPLING_STAGES,
+        },
+        scope,
+    )
     return scope["run_config"]
 
 
@@ -140,3 +152,55 @@ def test_rescue_skip_is_off_by_default():
     assert 'int(kwargs.get("stage2_production_rescue_rounds", 2))' in src
     i = src.index("if _rescue_disabled_by_untrusted and production_rescue_rounds:")
     assert i > src.index('int(kwargs.get("stage2_production_rescue_rounds", 2))')
+
+
+# =============================================================================
+# 同型第二例：`residual_sampling` 只对 vanishing 是身份
+# =============================================================================
+# 残差项只改 vanishing 的 Hamiltonian（`_run_dual_lambda_stage` 的
+# `residual_for_stage` 判据就是 `RESIDUAL_SAMPLING_STAGES`），但它曾经**无条件**
+# 进 `_stage_protocol_key`：既走 run_config，也走显式插入的 `_residual_payload`。
+# 后果与上面那个开关完全同型 —— 打开残差会让压根没被它碰过的 decharging stage
+# 缓存失配、整段约 28 分钟白重跑。
+
+
+def _residual_config(enabled: bool):
+    cfg = {
+        "decoupling_scheme": "dual_lambda",
+        "potential_type": "softcore",
+        "n_states_per_stage": 16,
+        "kwargs": {"decharge_method": "pme"},
+    }
+    if enabled:
+        cfg["residual_sampling"] = {
+            "enabled": True,
+            "sampling_score_sha256": "a" * 64,
+            "residual_energy_offset_kj_mol": 0.0,
+        }
+    return cfg
+
+
+def test_residual_sampling_is_not_identity_for_decharging():
+    """开残差不得动 Stage 1 的身份。"""
+    on = _run_config_after_identity_scrub(_residual_config(True), "decharging")
+    off = _run_config_after_identity_scrub(_residual_config(False), "decharging")
+    assert "residual_sampling" not in on
+    assert json.dumps(on, sort_keys=True) == json.dumps(off, sort_keys=True)
+
+
+@pytest.mark.parametrize("stage_name", sorted(ap.RESIDUAL_SAMPLING_STAGES))
+def test_residual_sampling_stays_identity_where_it_actually_runs(stage_name):
+    """收窄不能收过头：残差真生效的 stage 必须仍然失配，否则是静默串协议。"""
+    on = _run_config_after_identity_scrub(_residual_config(True), stage_name)
+    off = _run_config_after_identity_scrub(_residual_config(False), stage_name)
+    assert on["residual_sampling"]["enabled"] is True
+    assert json.dumps(on, sort_keys=True) != json.dumps(off, sort_keys=True)
+
+
+def test_runtime_and_cache_read_the_same_stage_set():
+    """运行期判据与缓存身份判据必须是同一个集合 —— 漂开就是这个 bug 本身。"""
+    import inspect
+
+    src = inspect.getsource(ap.ABFEPipeline._run_dual_lambda_stage)
+    assert "stage_name in RESIDUAL_SAMPLING_STAGES" in src
+    assert ap.RESIDUAL_SAMPLING_STAGES == frozenset({"vanishing", "vanishing_rescue"})

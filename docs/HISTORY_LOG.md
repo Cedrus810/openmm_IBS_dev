@@ -341,6 +341,23 @@
 
 
 
+> ## ⚠️ 2026-09-12：这个决定已翻转，`resources/` **随首发**
+>
+> 下面整节是 2026-08-31 当时的判断原文，**不改**（按维护规则 3：用替代关系保留历史）。
+> 但它的前提已经不成立了：
+>
+> 当时不发的理由是「留着资源就等于发布一个能打开、只能跑 Atenolol、且永远没法
+> 换体系的开关」—— 因为换配体重训要走离线四步链，而训练栈已作为研究代码移出。
+> **EXP-033 P1（2026-09-12）把重训压成了流水线里的一次闭式求解**：配体指纹对不上
+> 冻结 manifest 时不再 fail，自动从 `pre_equilibration.dcd` 重训。
+> 「只能跑 Atenolol」不再是事实，于是不发的唯一理由没有了。
+>
+> 用户 2026-09-12 决定：**`resources/` 随首发。**
+> 配套的插件编译说明已补进 [GETTING_STARTED.md](GETTING_STARTED.md)《CUDA 插件》
+> （仓库仍然**不发 `.so`**，那个要用户自己编）。
+> 见 [EXP-033_P1_LANDED_2026-09-12.md](EXP-033_P1_LANDED_2026-09-12.md)、
+> [CHANGELOG.md](CHANGELOG.md)。
+
 ### 为什么移出：residual sampling 不随首发
 
 `resources/outer_lambda_local_residual/`

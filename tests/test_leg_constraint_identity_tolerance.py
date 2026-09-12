@@ -14,6 +14,10 @@ from openmm import unit
 import runabfe as R
 
 
+import pytest
+
+pytestmark = pytest.mark.cpu_only
+
 def _identity(masses, constraints, indices=None, tag=""):
     """手搓一份 constraint_identity（字段名与 constraint_identity_fingerprint 一致）。"""
     idx = list(indices if indices is not None else range(len(masses)))

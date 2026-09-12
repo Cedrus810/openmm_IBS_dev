@@ -17,6 +17,9 @@ pytest.importorskip("openmm")
 import abfe_core  # noqa: E402
 
 
+
+pytestmark = pytest.mark.cpu_only
+
 ANGLE_SLOTS = ((1, 0, 3), (0, 3, 4))
 
 

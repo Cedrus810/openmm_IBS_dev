@@ -1,0 +1,577 @@
+{
+  "architecture_facts_not_in_config": {
+    "aggregation": "raw = per_ligand.sum(dim=-1)  # SUM over the 41 ligand atoms, NOT a mean",
+    "envelope_formula": "quintic C2: 1 for r<=inner, 0 for r>=outer, 1-10x^3+15x^4-6x^5 for x=(r-inner)/(outer-inner) in between",
+    "hidden_rho": 16,
+    "pair_weight_shape": [
+      7,
+      7,
+      16
+    ],
+    "radial_basis_formula": "G_p(r) = exp(-0.5 * ((r - radial_centers[p]) / radial_width)^2)",
+    "rho_mlp_per_ligand_type": true,
+    "rho_mlp_shape": "Linear(1, hidden_rho) -> SiLU -> Linear(hidden_rho, hidden_rho) -> SiLU -> Linear(hidden_rho, 1)",
+    "type_count": 7,
+    "units": "distances/cutoffs in Angstrom (NOT nm) -- OpenMM-side positions must be multiplied by 10 before evaluating this payload"
+  },
+  "config": {
+    "b_max_reduced": 10.0,
+    "context_dim": 0,
+    "inner_cutoff_angstrom": 4.0,
+    "max_edges": 2048,
+    "max_environment_atoms": 320,
+    "max_neighbors_per_ligand": 80,
+    "n_channels": 1,
+    "n_ligand_atoms": 41,
+    "n_radial_basis": 16,
+    "no_contact_output": "exact_zero",
+    "outer_cutoff_angstrom": 5.0,
+    "pair_dim": 0,
+    "protocol_sha256": "bbc7dcf97bb635d9a97d890d0f7358eebdc4c4084146aed4829aafd5a06517e9",
+    "rung": "R1",
+    "schema_version": "exp019-softlift-v1",
+    "type_vocabulary": [
+      1,
+      6,
+      7,
+      8,
+      11,
+      16,
+      17
+    ]
+  },
+  "dataset_cross_check": {
+    "path": "output/outer_lambda_exp020_softlift/dataset/softlift_dataset_v1.npz",
+    "sha256": "24e5ce7ceb995b67ceddb08e5c7e5991c9a904356be743aecf55dc8d4ae260ab"
+  },
+  "experiment_id": "EXP-020",
+  "ligand_topology_indices": [
+    4583,
+    4584,
+    4585,
+    4586,
+    4587,
+    4588,
+    4589,
+    4590,
+    4591,
+    4592,
+    4593,
+    4594,
+    4595,
+    4596,
+    4597,
+    4598,
+    4599,
+    4600,
+    4601,
+    4602,
+    4603,
+    4604,
+    4605,
+    4606,
+    4607,
+    4608,
+    4609,
+    4610,
+    4611,
+    4612,
+    4613,
+    4614,
+    4615,
+    4616,
+    4617,
+    4618,
+    4619,
+    4620,
+    4621,
+    4622,
+    4623
+  ],
+  "schema_version": "exp025-g1-r1-reference-payload-v1",
+  "source_checkpoint": {
+    "held_out_run": 1,
+    "path": "output/outer_lambda_exp020_softlift_seedfixed001/r1_density/r1__direct_gap__fold_test_run1__seed0.pt",
+    "seed": 0,
+    "sha256": "8d7be055e16d9446d3ad126e08f35f54f658e7e6b0c578a788329c1e657c520c"
+  },
+  "tensor_manifest": [
+    {
+      "byte_count": 6272,
+      "byte_offset": 0,
+      "dtype": "float64_little_endian",
+      "name": "pair_weight",
+      "sha256": "d446c759dc01a0d4a6caeeff10b922f9da28722d18e41404ea8a8665ab57f7fc",
+      "shape": [
+        7,
+        7,
+        16
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 6272,
+      "dtype": "float64_little_endian",
+      "name": "radial_centers",
+      "sha256": "a327c868d78a228a1c0cc481adc0330a024be6370229b56e6af22376ee248c20",
+      "shape": [
+        16
+      ]
+    },
+    {
+      "byte_count": 8,
+      "byte_offset": 6400,
+      "dtype": "float64_little_endian",
+      "name": "radial_width",
+      "sha256": "fc769e0f1228015d80c297e67387e9b628941f4c465164b725acba8e688649b5",
+      "shape": []
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 6408,
+      "dtype": "float64_little_endian",
+      "name": "rho.0.0.bias",
+      "sha256": "eff6061a81a2654526ffa8ad035a173772a8fb3bbc5754a138fcfca4217bf0a0",
+      "shape": [
+        16
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 6536,
+      "dtype": "float64_little_endian",
+      "name": "rho.0.0.weight",
+      "sha256": "e061615844087bed14529737d7209ec707134b87c7bb43fc35ed2248c3ef1cab",
+      "shape": [
+        16,
+        1
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 6664,
+      "dtype": "float64_little_endian",
+      "name": "rho.0.2.bias",
+      "sha256": "f8092bc94cad384f74099a7c75cc0d77d805be5fc191856d7caf93a43086f65d",
+      "shape": [
+        16
+      ]
+    },
+    {
+      "byte_count": 2048,
+      "byte_offset": 6792,
+      "dtype": "float64_little_endian",
+      "name": "rho.0.2.weight",
+      "sha256": "d3271cad4f978d20b533903e17c8c46520199eec863e99bfabc49a7e78c36129",
+      "shape": [
+        16,
+        16
+      ]
+    },
+    {
+      "byte_count": 8,
+      "byte_offset": 8840,
+      "dtype": "float64_little_endian",
+      "name": "rho.0.4.bias",
+      "sha256": "b5c34cbf8b99f2e5a1cbbe3c34dde441f49499331200469d2c68bba8f0e0a3a8",
+      "shape": [
+        1
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 8848,
+      "dtype": "float64_little_endian",
+      "name": "rho.0.4.weight",
+      "sha256": "2c94f5e6b2796be97abbc37b1594efa3a5ce11fa8c0c123dd6a3f22e30b78ea5",
+      "shape": [
+        1,
+        16
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 8976,
+      "dtype": "float64_little_endian",
+      "name": "rho.1.0.bias",
+      "sha256": "fc26e675be4270bd670e4a4217ee7e49a7b06bf0773d89f381b5702b645d8f37",
+      "shape": [
+        16
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 9104,
+      "dtype": "float64_little_endian",
+      "name": "rho.1.0.weight",
+      "sha256": "780dceee3cdc02f33cfb60275cb95daec1d32d025214ebfcadccaff438bdf2fb",
+      "shape": [
+        16,
+        1
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 9232,
+      "dtype": "float64_little_endian",
+      "name": "rho.1.2.bias",
+      "sha256": "c62f44ac10eb222fcddc8df867b82b85852c35f6d6ebe09d3e0ac50cb73d3d80",
+      "shape": [
+        16
+      ]
+    },
+    {
+      "byte_count": 2048,
+      "byte_offset": 9360,
+      "dtype": "float64_little_endian",
+      "name": "rho.1.2.weight",
+      "sha256": "f62c5aff69b5b590eaf3d73cbc0a4813b0b752c29cdf99f1ebb3f13cf42842a1",
+      "shape": [
+        16,
+        16
+      ]
+    },
+    {
+      "byte_count": 8,
+      "byte_offset": 11408,
+      "dtype": "float64_little_endian",
+      "name": "rho.1.4.bias",
+      "sha256": "c7b55e1f8b3d798bc789e0b3dea158c84c242ad736d02d424d621aa421de64d5",
+      "shape": [
+        1
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 11416,
+      "dtype": "float64_little_endian",
+      "name": "rho.1.4.weight",
+      "sha256": "2486addec505c67066d02190117ea3005d26742a61aefdcb68f4ef18e2557a0d",
+      "shape": [
+        1,
+        16
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 11544,
+      "dtype": "float64_little_endian",
+      "name": "rho.2.0.bias",
+      "sha256": "3cf825ce51faf10288d00c0b1ff059a199bed58fabc663fff5f0772ce5d67c44",
+      "shape": [
+        16
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 11672,
+      "dtype": "float64_little_endian",
+      "name": "rho.2.0.weight",
+      "sha256": "9a8da31668be0911515ee95caef5c4a8c69ae0413b381ac66e01cdf900aa6e61",
+      "shape": [
+        16,
+        1
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 11800,
+      "dtype": "float64_little_endian",
+      "name": "rho.2.2.bias",
+      "sha256": "6f9fe4c42a31e41a7b6e53b1ce83273583a6441aa35a0088bdd887e572c5e7e4",
+      "shape": [
+        16
+      ]
+    },
+    {
+      "byte_count": 2048,
+      "byte_offset": 11928,
+      "dtype": "float64_little_endian",
+      "name": "rho.2.2.weight",
+      "sha256": "2be2ae30ff038adf985528a0f2e9475e60867a524a4aef7e7de7b040ca5cae7a",
+      "shape": [
+        16,
+        16
+      ]
+    },
+    {
+      "byte_count": 8,
+      "byte_offset": 13976,
+      "dtype": "float64_little_endian",
+      "name": "rho.2.4.bias",
+      "sha256": "ec33f479b6f899ee799584a09bf4c15ea7c5ef0d9f5c28682a87476f5d8ae2ad",
+      "shape": [
+        1
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 13984,
+      "dtype": "float64_little_endian",
+      "name": "rho.2.4.weight",
+      "sha256": "dc73629b490a19ba452aa692ca6a38fd1f6c2ce2b0ec512f6d02368f1607b494",
+      "shape": [
+        1,
+        16
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 14112,
+      "dtype": "float64_little_endian",
+      "name": "rho.3.0.bias",
+      "sha256": "6af70e701d7b3b5a00d2316c4d6e9c90e560a2c6434653ad1d54d64725eeca4a",
+      "shape": [
+        16
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 14240,
+      "dtype": "float64_little_endian",
+      "name": "rho.3.0.weight",
+      "sha256": "d20baf47c1657f66e29433eedd822bdd6e5f4bde198ea0a5ffb6b4aac40475b5",
+      "shape": [
+        16,
+        1
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 14368,
+      "dtype": "float64_little_endian",
+      "name": "rho.3.2.bias",
+      "sha256": "9ae076875b827663a98463a7fb1c54a1f429aec104e61605d145040d46a4f587",
+      "shape": [
+        16
+      ]
+    },
+    {
+      "byte_count": 2048,
+      "byte_offset": 14496,
+      "dtype": "float64_little_endian",
+      "name": "rho.3.2.weight",
+      "sha256": "9b0ad0388909c63fb25ca68123f92a54e71d9c2186d13fbd253cad2c095bb4fc",
+      "shape": [
+        16,
+        16
+      ]
+    },
+    {
+      "byte_count": 8,
+      "byte_offset": 16544,
+      "dtype": "float64_little_endian",
+      "name": "rho.3.4.bias",
+      "sha256": "3364cfe4a40b0ab51527b093151ed4aabcec1d7785958c28dce53668d2070018",
+      "shape": [
+        1
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 16552,
+      "dtype": "float64_little_endian",
+      "name": "rho.3.4.weight",
+      "sha256": "e04bfb9df8069e16a24615d65ad2471d6d48c9ab7163f459dab1dba97a43213a",
+      "shape": [
+        1,
+        16
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 16680,
+      "dtype": "float64_little_endian",
+      "name": "rho.4.0.bias",
+      "sha256": "faac2eba27e3088a8fb6e4e18210274d8c1a01b5e55ce894a85d2a7701fcd732",
+      "shape": [
+        16
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 16808,
+      "dtype": "float64_little_endian",
+      "name": "rho.4.0.weight",
+      "sha256": "266ecce1171a656a80e4605bd245cbde119bc8b26223d88704aa7841b5f17cc9",
+      "shape": [
+        16,
+        1
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 16936,
+      "dtype": "float64_little_endian",
+      "name": "rho.4.2.bias",
+      "sha256": "0dcf22d8e23e489bd77ffe43fc9a8bd7a0a1151913fe42cf1a329acfc3216d42",
+      "shape": [
+        16
+      ]
+    },
+    {
+      "byte_count": 2048,
+      "byte_offset": 17064,
+      "dtype": "float64_little_endian",
+      "name": "rho.4.2.weight",
+      "sha256": "45399131b8fb14321ab2ce3e76973c49329dedfb4a0f012b1399a3275ba67647",
+      "shape": [
+        16,
+        16
+      ]
+    },
+    {
+      "byte_count": 8,
+      "byte_offset": 19112,
+      "dtype": "float64_little_endian",
+      "name": "rho.4.4.bias",
+      "sha256": "68c055f1b902e13aadd43e36246d5622129ebf6bf6aa105dc8049f902b1accaa",
+      "shape": [
+        1
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 19120,
+      "dtype": "float64_little_endian",
+      "name": "rho.4.4.weight",
+      "sha256": "cd19538cd359ceb07fec1c36a81398b2a47d123b58c960c80863fda6e1828813",
+      "shape": [
+        1,
+        16
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 19248,
+      "dtype": "float64_little_endian",
+      "name": "rho.5.0.bias",
+      "sha256": "32210552a09a1079dcc148954bb6f5a3dbf11fe0aa0dfd2f38f4c10fc9572511",
+      "shape": [
+        16
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 19376,
+      "dtype": "float64_little_endian",
+      "name": "rho.5.0.weight",
+      "sha256": "ec6609d6f135499d9d3a3344fd0d9f4c4426173db7ad04986da0663bced2a550",
+      "shape": [
+        16,
+        1
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 19504,
+      "dtype": "float64_little_endian",
+      "name": "rho.5.2.bias",
+      "sha256": "58c86ca27fe6ebece0ecc8f1899f86fc99d4aab911cadc2de7d41f835044e739",
+      "shape": [
+        16
+      ]
+    },
+    {
+      "byte_count": 2048,
+      "byte_offset": 19632,
+      "dtype": "float64_little_endian",
+      "name": "rho.5.2.weight",
+      "sha256": "827ecde49edd2137c5c32d8f8d294ade51692c756e75268a4ad35d7e4acc7801",
+      "shape": [
+        16,
+        16
+      ]
+    },
+    {
+      "byte_count": 8,
+      "byte_offset": 21680,
+      "dtype": "float64_little_endian",
+      "name": "rho.5.4.bias",
+      "sha256": "c6f9f374c129314b3ab77fe81908cdc51fef53688209688d2c5fa4d8c2ea2f7f",
+      "shape": [
+        1
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 21688,
+      "dtype": "float64_little_endian",
+      "name": "rho.5.4.weight",
+      "sha256": "14d6f8401dfd668f352692f3f5bd074ddf9ccdbda4e238eb49d753a10bc84eca",
+      "shape": [
+        1,
+        16
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 21816,
+      "dtype": "float64_little_endian",
+      "name": "rho.6.0.bias",
+      "sha256": "c1f495d6d2877d8a043bb14df24d50c953867c4a7df44efaa695a906ef006f80",
+      "shape": [
+        16
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 21944,
+      "dtype": "float64_little_endian",
+      "name": "rho.6.0.weight",
+      "sha256": "e0136ab110279da23d36e795955cfee3fba597aa20b4e59d3193decad150d8bc",
+      "shape": [
+        16,
+        1
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 22072,
+      "dtype": "float64_little_endian",
+      "name": "rho.6.2.bias",
+      "sha256": "10a6e8910ae7fd5814e5544f712e838df4e4a7165f94c745044983ed59a61578",
+      "shape": [
+        16
+      ]
+    },
+    {
+      "byte_count": 2048,
+      "byte_offset": 22200,
+      "dtype": "float64_little_endian",
+      "name": "rho.6.2.weight",
+      "sha256": "5696b1a14de1e3260c2bc89044345a76ecc04a4de677497cb2ea3a8a4f0bb9f5",
+      "shape": [
+        16,
+        16
+      ]
+    },
+    {
+      "byte_count": 8,
+      "byte_offset": 24248,
+      "dtype": "float64_little_endian",
+      "name": "rho.6.4.bias",
+      "sha256": "c07bc4f17d5f80b578fe9de2d1e3be4bfcd87eed5993c3e0c6f195578413a6cc",
+      "shape": [
+        1
+      ]
+    },
+    {
+      "byte_count": 128,
+      "byte_offset": 24256,
+      "dtype": "float64_little_endian",
+      "name": "rho.6.4.weight",
+      "sha256": "51ef36f0dc8b0777b89f4c91f7c359a1d29b081a7c40ef78dffb367d7f830141",
+      "shape": [
+        1,
+        16
+      ]
+    }
+  ],
+  "weights_file": {
+    "byte_count": 24384,
+    "layout": "flat concatenation of tensors in the order listed in tensor_manifest, little-endian float64",
+    "name": "r1_model_weights_f64.bin",
+    "sha256": "c4492f9d56e53d985cd49e6350f18ec274e4cf67e2229f50508c13e625ec9f2b"
+  }
+}

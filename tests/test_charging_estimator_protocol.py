@@ -40,6 +40,9 @@ from ibs_engine import (
     stage1_ti_consistency_gate,
 )
 
+
+pytestmark = pytest.mark.cpu_only
+
 R_KJ = 0.008314462618
 T_K = 300.0
 KT = R_KJ * T_K

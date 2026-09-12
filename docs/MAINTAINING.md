@@ -3,7 +3,7 @@
 [返回项目首页](../README.md) · [目录约定](../PROJECT_LAYOUT.md) ·
 [测试说明](../tests/README.md) · [文档导航](README.md)
 
-更新日期：**2026-09-02**
+更新日期：**2026-09-12**
 
 ## 改完代码先跑什么
 
@@ -31,6 +31,29 @@ python runabfe.py self-test
 `self-test`（`runabfe.py:3275` `run_self_tests`）会在缺依赖时逐项 `SKIP` 而不是
 报错——**看到 PASS 之前先确认没有一片 SKIP**，否则它什么也没验证。
 
+**4. 发布前：clone 下来 import 得动吗（秒级，CPU）**
+
+```bash
+pytest tests/test_fresh_clone_imports.py
+```
+
+**这道门就是发布清单本身。** 它防的不是逻辑错，是**漏把新文件加进 git**——
+新模块在工作树里，本机跑得好好的，clone 下来当场 `ModuleNotFoundError`。
+分两层，因为后果不同：
+
+| 层 | 是什么 | 行为 |
+|---|---|---|
+| 硬门 | 已跟踪文件**模块级** import 未跟踪模块 | 红。clone 当场死 |
+| 软门 | 已跟踪文件**函数内惰性** import 未跟踪模块 | 只登记；出现**新的**未登记项才红 |
+
+软门的登记表就在那个测试里，每项写了为什么（哪些必须随发、哪些是默认关闭的
+可选功能）。加了新的惰性依赖，要么把它随发布带上，要么进登记表并写清理由。
+
+> 实测过一次：`step_guard.py` 未跟踪，而 `ibs_engine.py:34` 是模块级
+> `from step_guard import guarded_step` ⟹ `ibs_engine` / `abfe_pipeline` /
+> `abfe_preoptimizer` / `runabfe` 四个入口在 fake clone 里全部 `ModuleNotFoundError`；
+> 只补这一个文件，四个立刻全绿。
+
 > ⚠️ 语法检查通过 ≠ 端到端通过。GPU 相关行为（checkpoint 跨 platform 迁移、
 > CUDA 插件、REMD 显存）在 CPU 上一条都验不到。
 
@@ -43,6 +66,7 @@ CI 跑的是哪些门见 [`.github/workflows/cpu-ci.yml`](../.github/workflows/c
 
 | 改了什么 | 更新哪里 |
 |---|---|
+| **任何代码或协议改动** | [CHANGELOG.md](CHANGELOG.md) 加一行（规则见该文件末尾） |
 | 协议版本号、fail-closed 判据、物理口径 | 改动点的代码注释 + [TODO.md](TODO.md) 的《未关闭的代码缺陷》 |
 | 设计合同 / 提案的实施状态 | [design/README.md](design/README.md) 的状态表（**必须同步复核日期**） |
 | 发布阻塞项 | [RELEASE_READINESS_2026-08-31.md](RELEASE_READINESS_2026-08-31.md) |
@@ -76,6 +100,8 @@ CI 跑的是哪些门见 [`.github/workflows/cpu-ci.yml`](../.github/workflows/c
 2. 一次性诊断 → `tools/diagnostics/`；验证 → `tools/validation/`。
    **事故结案 = 它的诊断脚本也结案**：结论写进 `docs/`，脚本移到
    `Atenolol-rank11/archive/from_mainline_<日期>/`，别留在主线烂掉。
-3. **旧源码副本、`*_bak`、`*_pre_patch` 一律不进本分支**，留在 `Atenolol-rank11`。
+3. **新建的模块当场 `git add`。** 不是洁癖——`tests/test_fresh_clone_imports.py`
+   的硬门会红，而且漏了它 clone 下来直接 import 不动（见上面第 4 档）。
+4. **旧源码副本、`*_bak`、`*_pre_patch` 一律不进本分支**，留在 `Atenolol-rank11`。
    `docs/archive/` 只放文档，且其中 `removed_*.md` 是防回归凭证
    （`tests/test_att27_dead_code_removed.py` 断言它们存在），**不能删**。

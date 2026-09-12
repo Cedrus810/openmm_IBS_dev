@@ -34,6 +34,7 @@
 
 import ast
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -107,63 +108,83 @@ def _make_output_dir(tmp_path, provenance_cfg):
     return out
 
 
-def _run_recovery(tmp_path, provenance_cfg, argv, **arg_kwargs):
-    """直接执行 run_post_analysis 开头的恢复逻辑：让它在 Boresch 参数查找处
-    抛 FileNotFoundError（没有 traditional_complex 目录），我们只关心恢复后
-    的 args 字段——通过给 temp 换算留痕来观察。
+def _run_recovery(tmp_path, provenance_cfg, argv, caplog, **arg_kwargs):
+    """跑 run_post_analysis 开头的恢复逻辑，返回 (args, 日志文本)。
+
+    2026-09-09：原实现是 `except Exception: pass` + 只断言"args 上的值等于我构造
+    时给的值"。那让 `test_explicit_cli_override_wins` /
+    `test_missing_provenance_keeps_cli_values` 在 run_post_analysis **第一行就抛异常**、
+    甚至整个恢复功能被删掉的情况下照样通过 —— 它们断言的正是 `_ArgsStub` 的初始值。
+    现在把日志一起带出来：每条测试都必须证明恢复分支**真的执行过**，
+    否则"值没变"只是"什么都没跑"。
     """
     out = _make_output_dir(tmp_path, provenance_cfg)
     args = _ArgsStub(output=out, **arg_kwargs)
     old_argv = sys.argv
     sys.argv = argv
+    caplog.clear()
     try:
-        try:
-            runabfe.run_post_analysis(args)
-        except FileNotFoundError:
-            pass
-        except Exception:
-            pass
+        with caplog.at_level(logging.INFO, logger="runabfe"):
+            try:
+                runabfe.run_post_analysis(args)
+            except FileNotFoundError:
+                # 预期：没有 traditional_complex 目录，Boresch 参数查找处停下。
+                # 恢复逻辑在它**之前**，所以到这里已经跑完了。
+                pass
     finally:
         sys.argv = old_argv
-    return args
+    return args, caplog.text
 
 
-def test_temperature_recovered_from_provenance(tmp_path, monkeypatch):
-    args = _run_recovery(
+def test_temperature_recovered_from_provenance(tmp_path, caplog):
+    args, logs = _run_recovery(
         tmp_path,
         {"temperature": 310.0, "mode": "ibs", "decoupling": "dual_lambda"},
         ["runabfe.py"],
+        caplog,
         temperature=300.0,
     )
     assert float(args.temperature) == pytest.approx(310.0), (
         "原运行 310 K、本次未显式覆盖 ⟹ analyze-only 必须恢复 310 K（P1-04）"
     )
+    assert "恢复原运行的" in logs, "恢复必须留审计记录，不能静默改写 args"
 
 
-def test_explicit_cli_override_wins(tmp_path):
-    args = _run_recovery(
+def test_explicit_cli_override_wins(tmp_path, caplog):
+    args, logs = _run_recovery(
         tmp_path,
         {"temperature": 310.0, "mode": "ibs", "decoupling": "dual_lambda"},
         ["runabfe.py", "--temperature", "298.0"],
+        caplog,
         temperature=298.0,
     )
     assert float(args.temperature) == pytest.approx(298.0)
+    # 关键：必须证明恢复分支真的运行过并**主动选择**了不覆盖，而不是整段没执行。
+    assert "run_provenance.json" in logs, (
+        "恢复分支没有留下任何痕迹 —— 这条测试原来就是这样变成空断言的"
+    )
+    assert "覆盖" in logs, "显式覆盖必须留审计记录（P1-04 要求可追溯）"
 
 
-def test_missing_provenance_keeps_cli_values(tmp_path):
+def test_missing_provenance_keeps_cli_values(tmp_path, caplog):
     out = tmp_path / "out_noprov"
     out.mkdir()
     args = _ArgsStub(output=out, temperature=300.0)
     old_argv = sys.argv
     sys.argv = ["runabfe.py"]
+    caplog.clear()
     try:
-        try:
-            runabfe.run_post_analysis(args)
-        except Exception:
-            pass
+        with caplog.at_level(logging.INFO, logger="runabfe"):
+            try:
+                runabfe.run_post_analysis(args)
+            except FileNotFoundError:
+                pass
     finally:
         sys.argv = old_argv
     assert float(args.temperature) == pytest.approx(300.0)
+    # 缺 provenance 必须**明说**取的是本次命令/预设默认值，而不是悄悄沿用。
+    assert "run_provenance.json" in caplog.text
+    assert "temperature/mode/decoupling" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -280,29 +301,3 @@ def test_refine_rejects_missing_window_index(tmp_path, monkeypatch):
             temperature_k=300.0,
             stage_type="vdw",
         )
-
-
-# ---------------------------------------------------------------------------
-# 小工具：ast 辅助（独立命名，避免与本文件其它定义混淆）
-# ---------------------------------------------------------------------------
-
-
-def ast_parse(src: str):
-    import ast
-
-    return ast.parse(src)
-
-
-def ast_walk(node):
-    import ast
-
-    return ast.walk(node)
-
-
-ast_FunctionDef = None
-
-
-def ast_FunctionDef():  # noqa: F811 - 保持属性式引用可用
-    import ast
-
-    return ast.FunctionDef

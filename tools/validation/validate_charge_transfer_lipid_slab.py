@@ -3655,7 +3655,7 @@ def cmd_slab_quality_gate(args: argparse.Namespace) -> None:
 
 # v10 replacement for the v7/v8/v9 gate.  The older implementations remain above as
 # historical references, but this definition is the command actually exported.
-def cmd_slab_quality_gate(args: argparse.Namespace) -> None:
+def cmd_slab_quality_gate(args: argparse.Namespace) -> None:  # noqa: F811 — 见上方注释：v10 刻意覆盖 v7/v8/v9，旧实现留作历史参照
     import csv as csv_module
     import mdtraj as md
 

@@ -18,6 +18,9 @@ from pathlib import Path
 
 import pytest
 
+
+pytestmark = pytest.mark.cpu_only
+
 REPO = Path(__file__).resolve().parents[1]
 
 

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -113,8 +114,52 @@ def _extract_declared_date(path: Path, pattern: re.Pattern) -> date:
     return datetime.strptime(match.group(1), "%Y-%m-%d").date()
 
 
+def _git_frontier(root: Path) -> Optional[tuple[date, str]]:
+    """用 **git 提交日期**当"仓库活跃到哪天"的信号。
+
+    比 mtime 可靠的唯一理由：提交日期是内容派生的，跨 clone 稳定。mtime 不是 ——
+    见 `frontier_activity_date` 的说明。
+
+    git 不可用（不是仓库、没装 git、导出的 tarball）时返回 None，由调用方决定
+    是回退 mtime 还是跳过。
+    """
+    best: Optional[tuple[date, str]] = None
+    for pattern in _FRONTIER_GLOBS:
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(root), "log", "-1", "--format=%cs", "--", pattern],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if out.returncode != 0:
+            return None
+        stamp = out.stdout.strip()
+        if not stamp:
+            continue
+        try:
+            when = datetime.strptime(stamp, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if best is None or when > best[0]:
+            best = (when, f"git:{pattern}")
+    return best
+
+
 def frontier_activity_date(root: Path) -> tuple[date, str]:
-    """仓库里"当前活跃到哪天"的信号：生产源码与生产回归测试的最新 mtime。
+    """仓库里"当前活跃到哪天"的信号。
+
+    🔑 [2026-09-09] 优先用 **git 提交日期**，mtime 只作回退，且回退时在 source 里
+    打上 `mtime:` 前缀让调用方能识别。
+
+    为什么不能只用 mtime：mtime 不是内容派生的。`git clone` / `git checkout` /
+    rsync / 解压 tarball 都会把**所有**文件的 mtime 盖成当次操作的时间，于是
+    "仓库活跃到哪天"变成了"你什么时候取的代码"。后果是这个检查会在一次全新
+    clone 上**必然**失败（frontier = clone 当天，文档日期是几天前），而仓库内容
+    一个字节都没变；CI 每次都是新 clone，所以那是"必然红"，不是"过期了"。
+    编辑器保存、`touch`、甚至只读工具改 atime 的文件系统也会同样误触发。
 
     刻意不用 `output_*/run_provenance.json` 这类正在跑的产物目录做信号——活跃 run
     目录的内容和 mtime 在几小时内就会被跑着的进程改写，拿它当"文档该不该更新"的判据
@@ -126,6 +171,10 @@ def frontier_activity_date(root: Path) -> tuple[date, str]:
     直接把这个检查打成硬错误。现在改用**发布后仍然长期存在**的东西做信号：生产
     源码和 `tests/`。文档该不该刷新，本来就该跟着代码动，而不是跟着实验记录动。
     """
+    from_git = _git_frontier(root)
+    if from_git is not None:
+        return from_git
+
     candidates: list[tuple[float, Path]] = []
 
     for pattern in _FRONTIER_GLOBS:
@@ -140,7 +189,7 @@ def frontier_activity_date(root: Path) -> tuple[date, str]:
         )
 
     mtime, path = max(candidates, key=lambda item: item[0])
-    return datetime.fromtimestamp(mtime).date(), str(path.relative_to(root))
+    return datetime.fromtimestamp(mtime).date(), f"mtime:{path.relative_to(root)}"
 
 
 def run(root: Path, threshold_days: int = 3) -> StalenessResult:

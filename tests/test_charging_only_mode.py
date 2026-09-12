@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 import tempfile
@@ -6,6 +7,10 @@ from pathlib import Path
 
 import runabfe
 
+
+import pytest
+
+pytestmark = pytest.mark.cpu_only
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -109,27 +114,80 @@ class ChargingOnlySourceContractTests(unittest.TestCase):
         cls.pipeline = (ROOT / "abfe_pipeline.py").read_text(encoding="utf-8")
 
     def test_main_returns_before_full_pipeline_in_charging_only_mode(self):
-        branch = self.runner.index("if config.only_complex_charging:")
-        full_run = self.runner.index(
-            "complex_results = pipeline.run_full_pipeline(", branch
+        """`--only-complex-charging` 分支必须调完隔离入口就 return。
+
+        2026-09-09 重写：原实现在两个锚点之间的**源码文本**里搜 `"return"`。
+        `return` 这个词在 runabfe.py 的任意一段里几乎必然出现（任何嵌套函数、
+        任何注释），所以那条断言实际上不可能失败 —— 它没有测到"提前返回"。
+        现在用 AST：找到 `if config.only_complex_charging:` 那个 If，要求它的
+        分支体里既调用了隔离入口、又**以 Return 结束**。
+        """
+        tree = ast.parse(self.runner, filename="runabfe.py")
+        branches = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.If)
+            and "only_complex_charging" in ast.unparse(node.test)
+        ]
+        self.assertTrue(branches, "找不到 only_complex_charging 分支")
+
+        matched = []
+        for node in branches:
+            called = {
+                getattr(c.func, "attr", None) or getattr(c.func, "id", None)
+                for c in ast.walk(node) if isinstance(c, ast.Call)
+            }
+            if "_run_complex_charging_only" not in called:
+                continue
+            matched.append(node)
+            # 分支体的最后一条可执行语句必须是 return —— 这才是"不落进完整链路"。
+            self.assertIsInstance(
+                node.body[-1], ast.Return,
+                "only_complex_charging 分支没有以 return 结束，会继续落进 "
+                "run_full_pipeline（完整 dual_lambda 链路）",
+            )
+            # 且该分支内部不得直接触发完整链路。
+            self.assertNotIn(
+                "run_full_pipeline", called,
+                "隔离模式的分支里直接调了 run_full_pipeline",
+            )
+        self.assertTrue(
+            matched, "没有任何 only_complex_charging 分支调用 _run_complex_charging_only"
         )
-        between = self.runner[branch:full_run]
-        self.assertIn("_run_complex_charging_only(", between)
-        self.assertIn("return", between)
 
     def test_charging_only_bypasses_generic_boresch_resolver(self):
-        # [0831issue P2] 锚点从整行字面量改成函数名：该调用现在多行传
-        # expected_temperature_K（拒绝跨温度组装）。本测试要钉的是"frozen 分支在
-        # 通用 resolver 之前、且两者由 else: 分开"这个结构，不是调用的排版。
-        frozen_branch = self.runner.index(
-            "boresch_restraint = _load_frozen_stage2_boresch("
-        )
-        generic_resolver = self.runner.index(
-            "boresch_restraint = resolve_boresch_restraint(config, pipeline)",
-            frozen_branch,
-        )
-        between = self.runner[frozen_branch:generic_resolver]
-        self.assertIn("else:", between)
+        """frozen 分支与通用 resolver 必须是**同一个 if/else 的两个互斥支**。
+
+        2026-09-09 重写：原实现在两个锚点之间搜 `"else:"`。那段区间里任何一个
+        无关的 else（另一个 if、一个 try/except/else）都能满足它，所以"两者互斥"
+        这个真正的契约没有被测到。现在用 AST 直接确认它们分居同一个 If 的
+        body / orelse。
+        """
+        tree = ast.parse(self.runner, filename="runabfe.py")
+
+        def _calls(node):
+            return {
+                getattr(c.func, "attr", None) or getattr(c.func, "id", None)
+                for c in ast.walk(node) if isinstance(c, ast.Call)
+            }
+
+        exclusive = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.If) or not node.orelse:
+                continue
+            body_calls = set().union(*(_calls(n) for n in node.body)) if node.body else set()
+            else_calls = set().union(*(_calls(n) for n in node.orelse)) if node.orelse else set()
+            frozen_in_body = "_load_frozen_stage2_boresch" in body_calls
+            generic_in_else = "resolve_boresch_restraint" in else_calls
+            frozen_in_else = "_load_frozen_stage2_boresch" in else_calls
+            generic_in_body = "resolve_boresch_restraint" in body_calls
+            if (frozen_in_body and generic_in_else) or (frozen_in_else and generic_in_body):
+                exclusive.append(node.lineno)
+
+        self.assertTrue(exclusive, (
+            "找不到把 _load_frozen_stage2_boresch 与 resolve_boresch_restraint 放在"
+            "同一个 if/else 两支上的结构 —— 两者不再互斥，冻结 stage2 的 Boresch "
+            "可能被通用 resolver 覆盖"
+        ))
 
     def test_isolated_stage_forces_fresh_sampling(self):
         start = self.runner.index("def _run_complex_charging_only(")

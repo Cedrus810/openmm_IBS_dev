@@ -15,20 +15,34 @@
 | 任务 | 文档 |
 |---|---|
 | 查当前科学状态、结果能不能引用、协议版本 | [STATUS.md](STATUS.md) |
+| 查某天改了什么、协议版本为什么跳、破不破缓存 | [CHANGELOG.md](CHANGELOG.md)（全程缩略时间线） |
 | 查某一步实现的是哪篇文献的方法、怎么引用 | [METHODS.md](METHODS.md) |
 | 安装依赖、准备输入、首次运行 | [GETTING_STARTED.md](GETTING_STARTED.md) |
+| **用 local-residual 开关前必须自己编译 CUDA 插件**（仓库不发 `.so`） | [GETTING_STARTED.md](GETTING_STARTED.md)《CUDA 插件》 |
 | 理解输出、符号、缓存和续跑 | [OUTPUTS_AND_RESUME.md](OUTPUTS_AND_RESUME.md) |
 | 定位常见错误 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) |
 | 迁移到新蛋白–配体体系 | [MIGRATING_TO_A_NEW_SYSTEM.md](MIGRATING_TO_A_NEW_SYSTEM.md) |
 | 修改源码、运行最低验证 | [MAINTAINING.md](MAINTAINING.md) |
-| 查看未完成工作 | [TODO.md](TODO.md)（295 行；08-06 旧主表已归档） |
+| 查看未完成工作 | [TODO.md](TODO.md)（592 行；08-06 旧主表已归档） |
 | 判断能不能发布、还缺什么 | [RELEASE_READINESS_2026-08-31.md](RELEASE_READINESS_2026-08-31.md) |
 | 不确定度口径 | [PYMBAR_UNCERTAINTY_PROTOCOL.md](PYMBAR_UNCERTAINTY_PROTOCOL.md) |
 | 查某份历史材料写过什么 | [HISTORY_LOG.md](HISTORY_LOG.md) |
 | 看当前流程全貌（一张图） | [current-pipeline.svg](current-pipeline.svg) |
-| 查 stage2 为什么算错过、怎么定位的 | [STAGE2_ROOT_CAUSE_2026-08-28.md](STAGE2_ROOT_CAUSE_2026-08-28.md) → [BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md](BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md) |
+| stage2 溶剂腿那 5.5σ 去哪了（**已关闭 2026-09-10**：参照臂的盒错了） | [STAGE2_SOLVENT_LEG_ERROR_BUDGET.md](STAGE2_SOLVENT_LEG_ERROR_BUDGET.md) |
+| 查 stage2 的失效机制（仍是活的参考） | [STAGE2_ROOT_CAUSE_2026-08-28.md](STAGE2_ROOT_CAUSE_2026-08-28.md) |
+| 重新设计 stage2 控制流前先读（分窗口/分 λ/分采样量 三轴当前怎么耦合的） | [STAGE2_THREE_AXES_COUPLING_2026-09-11.md](STAGE2_THREE_AXES_COUPLING_2026-09-11.md) |
+| 路径最小修补的计划（Type I/II/III + 修补顺序；计划稿，未实现） | [PLAN_PATH_REPAIR_2026-09-11.md](PLAN_PATH_REPAIR_2026-09-11.md) |
+| **stage2 自治循环：现状 + 剩余 4 件活**（接手先读这份） | [STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md](STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md) |
+| stage2 自治闭环的**验收指标**（老板定案，唯一指标） | [AUTONOMOUS_STAGE2_LOOP_SPEC_2026-09-11.md](AUTONOMOUS_STAGE2_LOOP_SPEC_2026-09-11.md) |
+| stage2 分窗与多采样段：09-10/11 那八个 bug 改了什么 | [STAGE2_WINDOW_AND_SEGMENT_REDESIGN_2026-09-11.md](STAGE2_WINDOW_AND_SEGMENT_REDESIGN_2026-09-11.md) |
+| 2026-09-09 全仓审计原始记录（**不是待办**；7 条不修已进 TODO） | [AUDIT_2026-09-09_full_repo.md](AUDIT_2026-09-09_full_repo.md) |
+| 给新配体重训 local-residual R1 权重（操作手册） | [RETRAIN_LOCAL_RESIDUAL.md](RETRAIN_LOCAL_RESIDUAL.md) |
+| local-residual 换体系接线现状（**接线通了、模型没通**） | [HANDOFF_LOCAL_RESIDUAL_2026-09-11.md](HANDOFF_LOCAL_RESIDUAL_2026-09-11.md) |
+| 查 λ-WCA 壳为什么退役（已结案，历史） | [archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md](archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md) |
 | 拿独立参照真值对生产结果 | [reference_data/README.md](reference_data/README.md) |
-| 查 GPU 性能优化做过什么、结论是什么 | [EXP-031_GPU_OPTIMIZATION_2026-09-04.md](EXP-031_GPU_OPTIMIZATION_2026-09-04.md)（指路；正文与脚本在沙箱 `ABFE_IBS_CUDA`） |
+| 查 GPU 性能优化做过什么、结论是什么 | [EXP-031_GPU_OPTIMIZATION_2026-09-09.md](EXP-031_GPU_OPTIMIZATION_2026-09-09.md)（**取代 [09-04 那份](EXP-031_GPU_OPTIMIZATION_2026-09-04.md)，那份三条结论有两条已被推翻**；正文与脚本在沙箱 `ABFE_IBS_CUDA`） |
+| 换配体要重训 local-residual 模型：方案与证据（**P1 闭式重训已接主线 09-12，真机未跑**） | [EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md](EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md) |
+| **闭式重训到底落成什么样**（代码已落地、离线全绿、真机一次没跑） | [EXP-033_P1_LANDED_2026-09-12.md](EXP-033_P1_LANDED_2026-09-12.md) |
 
 ## 结果与有效性
 
@@ -75,32 +89,35 @@
 
 > ## 🛑 归档前必查：这两份被**代码注释**引用
 >
-> 上面那条「结案了就进 `archive/`」有两个例外。它们头部都写着"已修复/结案"，
-> 因此**最容易被判成一次性记录而归档**，但它们同时是源码注释的靶子：
+> 「结案了就进 `archive/`」有例外——下面这些是源码注释的靶子，
+> 移动它们**必须在同一次改动里把引用一起改**。
 >
-> | 文档 | 被引用处数 | 引用它的文件 |
+> | 文档 | 状态 | 为什么不能随手移 |
 > |---|---|---|
-> | [BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md](BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md) | 合计 **28**（与下一行共享计数） | `ibs_engine.py`(14)、`abfe_pipeline.py`(8)、`runabfe.py`(2)、`tools/diagnostics/`(4) |
-> | [reference_data/](reference_data/) | 同上 | 同上 |
+> | [reference_data/](reference_data/) | **live** | 真值数据本身；`attribute_stage2_solvent_leg_gap.py` 直接读它 |
+> | [STAGE2_SOLVENT_LEG_ERROR_BUDGET.md](STAGE2_SOLVENT_LEG_ERROR_BUDGET.md) | **live**（主题 09-10 已关闭，文档仍是 live 靶子） | 溶剂腿当前口径的唯一出处 |
+> | [STAGE2_ROOT_CAUSE_2026-08-28.md](STAGE2_ROOT_CAUSE_2026-08-28.md) | **live 参考** | §3.2/§3.3/§4/§8.2 被多处注释当作现行行为的依据 |
+> | [archive/BUG_LOCATION_…](archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md) | 已归档 | §2.9/§2.10 是「`WCA_SHIELD_RETIRED` 为什么是 True」「那段为什么是死代码」「三处断言方向为什么是反的」的**唯一**出处 |
 >
 > 复核命令：
 >
 > ```bash
-> grep -rn "BUG_LOCATION_stage2\|reference_data" *.py local_residual/*.py tools/*/*.py | wc -l
+> grep -rn "BUG_LOCATION_stage2\|STAGE2_ROOT_CAUSE\|STAGE2_SOLVENT_LEG\|reference_data" \
+>   *.py local_residual/*.py tools/*/*.py
 > ```
 >
-> 那 28 处不是随手写的出处，是**退役决定的依据链**——`WCA_SHIELD_RETIRED` 常量处
-> 的长注释、`build_ibs_dual_system` 里死代码分支、三处方向被反转的断言、
-> `bias_to_signal_ratio` 的注释，全都指向 `BUG_LOCATION…§2.10` 与 `reference_data/`。
-> 那是"这段代码为什么是死的""这个断言方向为什么是反的"的**唯一**解释。
+> **2026-09-09 已按这条约定做过一次**：`BUG_LOCATION_…` 移进 `archive/`，
+> 同一次改完全部 32 处引用（其中 6 处改指新的 live 文档），
+> `docs/` 内 143 条链接校验 0 坏链。
 >
-> **要移动它们，必须在同一次改动里把那 28 处引用一起改。**
+> ⚠️ 反面教材：`.py` 里现存 **28 处**指向 `docs/status/` / `docs/experiments/` /
+> `docs/handoffs/` 的引用（2026-09-09 实测，此前本节写的 14 是漏数），
+> **那些路径在本工程区分支已不存在**，原文在 `Atenolol-rank11`
+> （见 [HISTORY_LOG.md](HISTORY_LOG.md)）。那批当时刻意没改，成了永久的债 ——
+> 这就是为什么现在移动文档要当场改引用。
 >
-> ⚠️ 这不是假想风险，同样的病已经在本仓库发生过：顶层 `.py` 里现存 **14 处**
-> 指向 `docs/status/` / `docs/experiments/` / `docs/handoffs/` 的引用，
-> **那些路径在本工程区分支已不存在**（见 [HISTORY_LOG.md](HISTORY_LOG.md)）。
-> 那批当时刻意没改（移动已经发生，补救是零收益高风险 churn）。
-> 现在是**移动之前**，成本几乎为零——别再欠一笔。
+> `docs/` **内部**链接由 `tests/test_doc_staleness_contract.py::test_docs_internal_links_resolve`
+> 钉住（当前 147 条、0 坏链）；上面那 28 处是**代码注释里的路径**，不在该测试范围内。
 
 ## 还有一个子目录
 
@@ -131,6 +148,7 @@
 
 ## 文档维护规则
 
+0. 改了代码或协议，往 [CHANGELOG.md](CHANGELOG.md) 加**一行**（规则见该文件末尾）；
 1. 稳定用法写入教程；当前科学结论**只**写 [STATUS.md](STATUS.md)（唯一一份，
    别在 README 或别处复制它的表）；体系、日期和实验相关的过程材料写入
    [HISTORY_LOG.md](HISTORY_LOG.md) 或留在 `Atenolol-rank11`。
