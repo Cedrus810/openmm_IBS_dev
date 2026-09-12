@@ -16,6 +16,9 @@ from local_residual.geometry import (  # noqa: E402
 )
 
 
+
+pytestmark = pytest.mark.cpu_only
+
 DTYPE = torch.float64
 
 

@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import re
 import sys
+
+import pytest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +37,9 @@ sys.path.insert(0, str(ROOT / "tools" / "diagnostics"))
 
 import check_doc_staleness as staleness  # noqa: E402
 
+
+
+pytestmark = pytest.mark.cpu_only
 
 def test_staleness_checker_finds_the_known_stale_docs():
     """检测器本身必须一直能跑、一直能正确解析日期戳——这个测试不允许红。"""
@@ -55,8 +60,21 @@ def test_snapshot_docs_are_not_stale():
 
     红了就说明状态文档又落后于仓库前沿超过阈值，去更新文档，不要来改这个
     测试或阈值。
+
+    🔑 [2026-09-09] 前沿日期改成 **git 提交日期**（见
+    `check_doc_staleness.frontier_activity_date`）。原来用文件 mtime：mtime 不是
+    内容派生的，`git clone` / checkout / 解压 tarball 会把所有文件盖成当次操作
+    时间，于是这条测试在任何一次全新 checkout 上都**必然**失败（前沿 = clone 当天，
+    文档日期是几天前），而仓库内容一字未改 —— CI 每次都是新 clone，等于定时炸弹。
+    拿不到 git 元数据时**跳过**而不是拿 mtime 硬判：那种环境里这个判据没有意义。
     """
     result = staleness.run(ROOT, threshold_days=3)
+    if result.frontier_source.startswith("mtime:"):
+        pytest.skip(
+            "拿不到 git 提交日期（不是 git 仓库 / 无 git / 导出的 tarball），"
+            f"只能退回 mtime（{result.frontier_source}）。mtime 会被 clone/checkout "
+            "整体盖写，用它判过期只会误报，故跳过。"
+        )
     assert result.all_fresh, "\n" + result.render_report()
 
 
@@ -98,3 +116,24 @@ def test_status_doc_protocol_table_matches_source():
         assert int(rows[name]) == value, (
             f"docs/STATUS.md 写 {name} = {rows[name]}，源码是 {value}——去更新文档。"
         )
+
+
+def test_docs_internal_links_resolve():
+    """`docs/` 里所有相对 Markdown 链接必须指得到真实文件。
+
+    2026-09-09 加：那次把 `BUG_LOCATION_…` 移进 `archive/` 时要同步改 32 处引用，
+    漏一处就是坏链。`docs/README.md`《归档前必查》记着同类的病已经发生过一次
+    （`.py` 里 28 处指向 `docs/status/` 等不存在路径）。
+    **本测试只覆盖 `docs/` 内部链接**；代码注释里的路径不在范围内（那批是刻意留的债）。
+    """
+    import re
+
+    broken = []
+    for md in sorted((ROOT / "docs").rglob("*.md")):
+        for match in re.finditer(r"\[[^\]]*\]\(([^)]+)\)", md.read_text(encoding="utf-8")):
+            target = match.group(1).split("#")[0].strip()
+            if not target or target.startswith(("http://", "https://", "mailto:")):
+                continue
+            if not (md.parent / target).resolve().exists():
+                broken.append(f"{md.relative_to(ROOT)} -> {target}")
+    assert not broken, "docs/ 里有坏链：\n  " + "\n  ".join(broken)

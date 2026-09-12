@@ -5,8 +5,8 @@ usable as-is for the softcore VDW forces in ibs_engine.py / abfe_core.py?
 No project imports required -- this is meant to be dropped on a PBS/GPU node by
 itself and run with only openmm + numpy installed.
 
-    python test_lrc_interaction_group_compat.py --platform CUDA
-    python test_lrc_interaction_group_compat.py --platform CPU
+    python tools/diagnostics/probe_lrc_interaction_group_compat.py --platform CUDA
+    python tools/diagnostics/probe_lrc_interaction_group_compat.py --platform CPU
 
 Two independent questions are tested, because they are two independent ways
 this could fail:

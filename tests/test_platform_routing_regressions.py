@@ -8,6 +8,10 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 
 
+import pytest
+
+pytestmark = pytest.mark.cpu_only
+
 ROOT = Path(__file__).resolve().parents[1]
 PIPELINE = ROOT / "abfe_pipeline.py"
 PREOPT = ROOT / "abfe_preoptimizer.py"
@@ -210,16 +214,45 @@ def test_equilibrium_rejection_does_not_claim_a_full_rerun():
     实测（4W53 resume_v3.log）：连报两次"将重新执行预平衡"，紧接着却是
     `♻️ 从 Checkpoint 恢复 | 已完成: 5000000 | 剩余: 0`，一步没跑。
     旧文案让人以为烧掉 500 万步 GPU——不报错、不影响数值，只误导读日志的人。
+
+    2026-09-09：本测试原来在**整个函数源码**（含注释）里裸搜"将重新执行预平衡"，
+    于是有人在注释里引用旧文案解释"以前这里写错了"就会让它变红——测的是注释而不是
+    行为。现在只看**真正被发出去的**字符串字面量（logger/print 的实参），
+    与 test_boresch_anchor_and_pbc_fixes.py 里那条同类断言用同一手法。
     """
-    runabfe = (ROOT / "runabfe.py").read_text(encoding="utf-8")
-    tree = ast.parse(runabfe, filename="runabfe.py")
-    body = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "equilibrium_is_done":
-            body = ast.get_source_segment(runabfe, node)
-    assert body is not None
-    assert "将重新执行预平衡" not in body, "文案不得声称从零重跑"
-    assert "_REENTER_NOTE" in body, "拒绝复用时必须说明下游仍可能从 checkpoint 续跑"
+    runabfe_src = (ROOT / "runabfe.py").read_text(encoding="utf-8")
+    tree = ast.parse(runabfe_src, filename="runabfe.py")
+    fn = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef) and n.name == "equilibrium_is_done"),
+        None,
+    )
+    assert fn is not None, "找不到 equilibrium_is_done"
+
+    emitters = {"info", "warning", "error", "debug", "print", "_log"}
+    emitted = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+        if name not in emitters:
+            continue
+        for arg in list(node.args) + [kw.value for kw in node.keywords]:
+            for sub in ast.walk(arg):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                    emitted.append((node.lineno, sub.value))
+    assert emitted, "这个函数一条日志都不发？测试本身失效了"
+
+    offenders = [(line, text) for line, text in emitted if "将重新执行预平衡" in text]
+    assert not offenders, f"日志文案仍声称从零重跑：{offenders}"
+
+    # 拒绝复用时必须说明下游仍可能从 checkpoint 续跑：那句话在 `_REENTER_NOTE`
+    # 里，必须真的**被这个函数引用**（不是只在文件里存在）。
+    referenced = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}
+    assert "_REENTER_NOTE" in referenced, (
+        "equilibrium_is_done 不再引用 _REENTER_NOTE —— 拒绝复用的日志会重新变成"
+        "「看起来要从零重跑」"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -235,21 +268,28 @@ def test_equilibrium_rejection_does_not_claim_a_full_rerun():
 # 修法：坐标在构造期冻结（不受后续变换影响）+ 量化后再哈希，两侧走同一个入口。
 # ---------------------------------------------------------------------------
 
-def _identity_stub(positions, box, steps=5_000_000):
+def _identity_stub(
+    positions,
+    box,
+    steps=5_000_000,
+    temperature=300.0,
+    pressure=1.0,
+    ligand_indices=(1, 2, 3),
+):
     import abfe_pipeline as _P
     from openmm import unit as _u
 
     class _Stub:
-        pressure = 1.0 * _u.bar
-        temperature = 300.0 * _u.kelvin
         barostat_protocol = None
         system = None
-        ligand_indices = [1, 2, 3]
         pre_equilibration_identity_fingerprint = (
             _P.ABFEPipeline.pre_equilibration_identity_fingerprint
         )
 
     s = _Stub()
+    s.pressure = pressure * _u.bar
+    s.temperature = temperature * _u.kelvin
+    s.ligand_indices = list(ligand_indices)
     s._identity_positions = positions * _u.nanometer
     s._identity_box_vectors = box * _u.nanometer
     s.positions = s._identity_positions
@@ -288,15 +328,126 @@ def test_pre_equilibration_identity_survives_coordinate_transforms():
     assert _identity_stub(pos + 1.8e-15, box) == base
 
 
-def test_pre_equilibration_identity_still_catches_real_changes():
+def test_pre_equilibration_identity_is_immune_to_coordinate_changes():
+    """坐标/盒子**不再**参与预平衡身份 —— 改了它们，指纹必须**不变**。
+
+    ⚠️ 本测试 2026-09-09 从「坐标变了指纹必须变」**反转**而来。别改回去。
+
+    反转的理由不是"改动方觉得旧断言碍事"，而是旧契约与本项目自己的行为冲突：
+    坐标是**可变状态**，而管线会合法地改它 —— PBC-01（同日）按设计把被 mmCIF
+    假键撕开的分子拼回去，连带 ~0.005 nm 的整体质心平移。旧契约要求这种修复
+    必须让身份翻脸 ⟹ **PBC-01 一上线，所有已有 run 目录的预平衡 checkpoint 全部
+    作废、5M 步从零重跑**（2026-09-09 cyclod_ligand1/rep1 实测：管线前一秒说
+    "基线预平衡已完成、跳过重跑"，后一秒同一份产物被判"不可信"）。
+
+    换体系/换 pose 由 `runabfe.system_cache_exists()` 绑定当前 gro/top/ligand
+    输入负责；"到底跑完没有"由 `pipeline_state.json` 的
+    `equilibration.status == "completed"` 负责。都与哈希无关。
+    """
     rng = np.random.default_rng(0)
     pos = rng.normal(size=(2000, 3)) * 3.0
     box = np.eye(3) * 7.893
     base = _identity_stub(pos, box)
-    assert _identity_stub(pos + 2.0e-4, box) != base, "0.002 Å 的真实位移必须抓到"
-    assert _identity_stub(pos + 0.05, box) != base, "换 pose 必须抓到"
-    assert _identity_stub(pos, box * 1.01) != base, "换盒子必须抓到"
+    assert _identity_stub(pos + 2.0e-4, box) == base, (
+        "坐标微移不得改变身份 —— 往返浮点噪声、PBC 回卷都会造成它"
+    )
+    assert _identity_stub(pos + 0.05, box) == base, (
+        "整体平移不得改变身份 —— PBC-01 的分子回卷正是 ~0.005 nm 量级的质心平移"
+    )
+    assert _identity_stub(pos, box * 1.01) == base, "盒矢量不得参与身份"
+    # 真正属于身份的东西必须仍然抓得到：
+    assert _identity_stub(pos, box, steps=1_000_000) != base, (
+        "目标步数是身份的一部分（短平衡不得冒充长平衡），必须抓到"
+    )
+
+
+def test_pre_equilibration_identity_still_discriminates_every_field_it_owns():
+    """移除坐标/盒之后，剩下的四项必须**全部**仍有分辨力。
+
+    这是上面那条反转测试的必要配对：只断言"坐标不改变身份"的话，把整个指纹退化成
+    一个常量也能让它通过 —— 而那才是真正危险的状态（一份 300 K 的短 smoke 平衡
+    会冒充 310 K 的目标平衡）。这里逐项确认身份没有被顺手掏空。
+    """
+    rng = np.random.default_rng(0)
+    pos = rng.normal(size=(2000, 3)) * 3.0
+    box = np.eye(3) * 7.893
+    base = _identity_stub(pos, box)
+
     assert _identity_stub(pos, box, steps=1_000_000) != base, "换步数必须抓到"
+    assert _identity_stub(pos, box, temperature=310.0) != base, "换温度必须抓到"
+    assert _identity_stub(pos, box, pressure=1.5) != base, "换压力必须抓到"
+    assert _identity_stub(pos, box, ligand_indices=(1, 2, 4)) != base, (
+        "换配体原子必须抓到"
+    )
+
+
+def test_pose_coverage_moved_to_the_user_input_hash_and_was_not_just_deleted():
+    """坐标离开预平衡身份的前提：换 pose 仍然在**别处**被拦住。
+
+    `runabfe.system_cache_exists()` 绑定用户输入（gro/top/ligand_resname）的内容
+    哈希。它哈希的是**用户给的文件**，不是我们自己生成的中间产物，所以不会因为
+    我们改代码/按设计改坐标而翻脸 —— 这是这条覆盖的正确归属。
+    本测试防的是"坐标从身份里删掉了，而接手覆盖的那一层后来也被顺手删掉"。
+    """
+    runabfe_src = (ROOT / "runabfe.py").read_text(encoding="utf-8")
+    tree = ast.parse(runabfe_src, filename="runabfe.py")
+
+    fn = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef) and n.name == "system_cache_exists"),
+        None,
+    )
+    assert fn is not None, "system_cache_exists 不见了 —— 换 pose 现在无人拦"
+
+    params = [a.arg for a in fn.args.args + fn.args.kwonlyargs]
+    for needed in ("gro_file", "top_file", "ligand_resname"):
+        assert needed in params, (
+            f"system_cache_exists 不再接收 {needed}；换 pose/换体系的绑定断了"
+        )
+
+    called = {
+        getattr(n.func, "attr", None) or getattr(n.func, "id", None)
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call)
+    }
+    # ⚠️ [2026-09-10] 这里原来直接断言 `system_cache_exists` **自己**调
+    # `_sha256_file`。内容哈希后来下沉进 `_main_cache_identity()`，覆盖一点没少，
+    # 但按调用名逐字匹配的断言红了。**要跟着调用链走，不要钉实现在哪一层。**
+    assert called & {"_sha256_file", "_system_input_manifest", "_main_cache_identity"}, (
+        "system_cache_exists 既不自己哈希用户输入、也不再走 _main_cache_identity"
+        " —— 预平衡身份既不看坐标、这里又不看输入文件，换 pose 就彻底无人拦了"
+    )
+
+    # 真正要钉的是"**用户输入的内容**最终被哈希了"。跟进被调的那一层。
+    if "_main_cache_identity" in called and not (
+        called & {"_sha256_file", "_system_input_manifest"}
+    ):
+        identity_fn = next(
+            (n for n in ast.walk(tree)
+             if isinstance(n, ast.FunctionDef) and n.name == "_main_cache_identity"),
+            None,
+        )
+        assert identity_fn is not None, (
+            "system_cache_exists 调了 _main_cache_identity，但它不存在"
+        )
+        identity_calls = {
+            getattr(n.func, "attr", None) or getattr(n.func, "id", None)
+            for n in ast.walk(identity_fn)
+            if isinstance(n, ast.Call)
+        }
+        assert identity_calls & {
+            "_sha256_file", "_system_input_manifest", "_gromacs_dependency_hashes"
+        }, (
+            "_main_cache_identity 不再对用户的 gro/top 做内容哈希 —— "
+            "换 pose 无人拦"
+        )
+        identity_params = [
+            a.arg for a in identity_fn.args.args + identity_fn.args.kwonlyargs
+        ]
+        for needed in ("gro_file", "top_file", "ligand_resname"):
+            assert needed in identity_params, (
+                f"_main_cache_identity 不再接收 {needed}；换 pose/换体系的绑定断了"
+            )
 
 
 def test_both_sides_go_through_the_same_entry_point():

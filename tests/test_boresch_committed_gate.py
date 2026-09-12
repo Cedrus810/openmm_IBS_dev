@@ -245,34 +245,115 @@ def test_missing_dof_is_skipped():
 # ---------------------------------------------------------------------------
 
 
-def test_committed_payload_carries_identity(tmp_path):
-    """新格式必须带身份信息——裸 {"equilibrium_values": ...} 正是事故的载体。"""
-    from abfe_pipeline import _json_safe
+def _commit_stub(tmp_path, logs):
+    """一个只够跑提交/校验两个方法的 ABFEPipeline 替身。"""
+    from openmm import unit as _u
 
-    payload = _json_safe({
-        "schema_version": BORESCH_COMMITTED_SCHEMA_VERSION,
-        "equilibrium_values": MEASURED_POSE,
+    from abfe_pipeline import ABFEPipeline
+
+    pipeline = ABFEPipeline.__new__(ABFEPipeline)
+    pipeline.checkpoint_dir = str(tmp_path)
+    pipeline.temperature = T * _u.kelvin
+    pipeline._log = logs.append
+    pipeline._diagnose_boresch_last_frame = lambda params: {
+        "status": "DIAGNOSTIC_ONLY"
+    }
+    return pipeline
+
+
+def test_committed_payload_carries_identity(tmp_path):
+    """新格式必须带身份信息——裸 {"equilibrium_values": ...} 正是事故的载体。
+
+    2026-09-09 重写：原实现自己拼一份 payload、写盘、读回，再断言"我刚写进去的键
+    都在"。那是一次 json 往返自检，**不碰任何生产代码**，所以它对"写盘时漏掉
+    force_constants/锚点"这个它自己命名的回归完全免疫。现在跑真正的写入方
+    `ABFEPipeline._commit_ensemble_boresch_equilibrium`。
+    """
+    logs = []
+    pipeline = _commit_stub(tmp_path, logs)
+    path = tmp_path / "boresch_equilibrium_committed.json"
+
+    params = {
+        "equilibrium_values": dict(MEASURED_POSE),
         "receptor_indices": [1328, 1326, 1338],
         "ligand_indices": [4597, 4600, 4601],
-        "force_constants": FORCE_CONSTANTS,
-        "temperature_K": T,
-        "derived_at": "2026-07-27T00:00:00",
-    })
-    path = tmp_path / "boresch_equilibrium_committed.json"
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        "force_constants": dict(FORCE_CONSTANTS),
+    }
+    pipeline._commit_ensemble_boresch_equilibrium(params, str(path))
 
     back = json.loads(path.read_text(encoding="utf-8"))
     for key in ("schema_version", "receptor_indices", "ligand_indices",
-                "force_constants", "temperature_K", "derived_at"):
-        assert key in back, f"落盘缺少 {key}，将无法核对来源"
+                "force_constants", "temperature_K", "equilibrium_source"):
+        assert key in back, f"生产写出的 payload 缺 {key}，将无法核对来源"
     assert back["schema_version"] >= 2
+    assert back["receptor_indices"] == [1328, 1326, 1338]
+    assert back["ligand_indices"] == [4597, 4600, 4601]
+    assert back["temperature_K"] == pytest.approx(T)
+    # 力常数必须原样落盘：σ_i = sqrt(kT/k_i) 是偏差判据的分母，缺了就没法核对。
+    assert back["force_constants"]["kr"] == pytest.approx(FORCE_CONSTANTS["kr"])
+    # 末帧几何只能是诊断，绝不能覆盖 equilibrium_values。
+    assert back["equilibrium_values"] == MEASURED_POSE
+    assert back["reanchor_applied"] is False
 
 
-def test_legacy_bare_payload_is_recognisable():
-    """v1 裸格式（无 schema_version）必须能被识别出来并触发告警路径。"""
-    legacy = {"equilibrium_values": BAD_COMMITTED}
-    assert legacy.get("schema_version") is None
-    assert "receptor_indices" not in legacy
+def test_new_format_anchor_mismatch_is_refused(tmp_path):
+    """v2 payload 记了锚点 ⟹ 锚点变了必须 fail closed，不得静默复用。"""
+    from abfe_pipeline import ABFEPipeline
+
+    logs = []
+    pipeline = _commit_stub(tmp_path, logs)
+    committed_doc = {
+        "schema_version": BORESCH_COMMITTED_SCHEMA_VERSION,
+        "equilibrium_values": dict(MEASURED_POSE),
+        "receptor_indices": [1, 2, 3],
+        "ligand_indices": [4, 5, 6],
+        "force_constants": dict(FORCE_CONSTANTS),
+    }
+    with pytest.raises(RuntimeError, match="锚点"):
+        ABFEPipeline._assert_committed_boresch_still_matches_pose(
+            pipeline,
+            committed_doc=committed_doc,
+            committed_eq=committed_doc["equilibrium_values"],
+            boresch_params={
+                "receptor_indices": [1, 2, 99],   # 换了一个受体锚点
+                "ligand_indices": [4, 5, 6],
+                "force_constants": dict(FORCE_CONSTANTS),
+            },
+            committed_path=str(tmp_path / "boresch_equilibrium_committed.json"),
+        )
+
+
+def test_legacy_bare_payload_is_recognisable(tmp_path):
+    """v1 裸格式（无 schema_version）必须被识别出来并触发告警路径。
+
+    2026-09-09 重写：原实现是
+        legacy = {"equilibrium_values": BAD_COMMITTED}
+        assert legacy.get("schema_version") is None
+    —— 对一个自己刚构造、故意不含该键的字面量做断言，零生产代码参与。现在把这份
+    裸 payload 喂给真正的消费者 `_assert_committed_boresch_still_matches_pose`：
+    它必须**不 raise**（不能堵掉合法旧工件）、必须打出"旧格式"告警（否则没人知道
+    锚点来源无从核对），且必须继续走几何一致性校验那一支。
+    """
+    from abfe_pipeline import ABFEPipeline
+
+    logs = []
+    pipeline = _commit_stub(tmp_path, logs)
+    legacy_doc = {"equilibrium_values": dict(BAD_COMMITTED)}
+
+    ABFEPipeline._assert_committed_boresch_still_matches_pose(
+        pipeline,
+        committed_doc=legacy_doc,
+        committed_eq=legacy_doc["equilibrium_values"],
+        # 不给力常数 ⟹ 走"跳过几何校验"那一支，本用例只验旧格式识别。
+        boresch_params={"receptor_indices": [1, 2, 3], "ligand_indices": [4, 5, 6]},
+        committed_path=str(tmp_path / "boresch_equilibrium_committed.json"),
+    )
+
+    joined = "\n".join(logs)
+    assert "旧格式" in joined, "v1 裸格式没有被识别出来——锚点来源无从核对却无人告警"
+    assert "schema_version" in joined
+    # 且它确实没被当成致命错误（旧工件仍可复用）。
+    assert "拒绝复用" not in joined
 
 
 # ---------------------------------------------------------------------------

@@ -20,6 +20,9 @@ from packaging.version import InvalidVersion, Version
 import free_energy_engine as fee
 
 
+
+pytestmark = pytest.mark.cpu_only
+
 def _version(raw: str) -> fee.OpenMMVersionInfo:
     try:
         return fee.OpenMMVersionInfo(raw=raw, parsed=Version(raw))
@@ -307,9 +310,6 @@ def test_module_does_not_import_openmm_at_module_level():
 
     本测试文件本身就是证据——它在一个没装 openmm 的解释器里也能跑通。
     """
-    import sys
-
-    assert "openmm" not in sys.modules or True  # 不强制断言全局状态
     source = (__import__("pathlib").Path(fee.__file__)).read_text(encoding="utf-8")
     module_level = [
         line

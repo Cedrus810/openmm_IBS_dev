@@ -22,6 +22,9 @@ from ibs_engine import (  # noqa: E402
 )
 
 
+
+pytestmark = pytest.mark.cpu_only
+
 def _key(**over):
     base = dict(
         stage_type="vdw", common_system_xml="<System/>", cv_xml_decoupled="<CV/>",

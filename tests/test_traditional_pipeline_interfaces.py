@@ -31,6 +31,9 @@ from abfe_pipeline import (  # noqa: E402
 )
 
 
+
+pytestmark = pytest.mark.cpu_only
+
 def _traditional_class(tmp_path, charge=0.0):
     tree = ast.parse(PIPELINE_PATH.read_text(encoding="utf-8"), filename=str(PIPELINE_PATH))
     class_node = next(
@@ -109,9 +112,12 @@ def test_neutral_traditional_fresh_and_resume_have_complete_interfaces(tmp_path)
             "_all_remd_trajs_valid": lambda *args, **kwargs: False,
             "_protocol_fingerprint": _fingerprint,
             "_protocol_fingerprint_ignoring_code_hash": lambda value: value,
-            "_system_xml_hash": lambda _value: "system",
-            "_topology_hash": lambda _value: "topology",
-            "_positions_hash": lambda _value: "positions",
+            # [2026-09-09] 生产里这三个 helper 恒返回 None（自产产物的 sha256 不得
+            # 进缓存身份）。替身跟着返回 None，否则被 exec 的 run_leg 会走一条
+            # 生产不可能走到的分支。
+            "_system_xml_hash": lambda _value: None,
+            "_topology_hash": lambda _value: None,
+            "_positions_hash": lambda _value: None,
             "_lambda_signature": lambda value: list(value),
             "TRADITIONAL_LJ_LRC_PROTOCOL_VERSION": 1,
             "PME_DECHARGE_MODEL_VERSION": "test",

@@ -340,7 +340,10 @@ def test_analyze_only_complete_entry_accepts_recovered_leg_identities(recovery_l
 
 def test_extending_budget_keeps_physical_continuation_but_not_completed_reuse(tmp_path):
     from test_resume_reuse_contracts import _matching_conv, LC_WIN, LV_WIN, GOOD_SHAPE, EARLY_STOP_CONFIG, TARGET_STEPS, REPAIR_POLICY, LSE_TOL
-    old_payload = dict(system_xml_sha256="same-system", pme_decharge_model_version=1,
+    # [2026-09-09] 这里原来用 `system_xml_sha256` 当"换了哈密顿量"的旋钮。生产已
+    # 不再往身份里放自产产物的 sha256（恒 None），拿它当旋钮会让人以为那条机制还
+    # 在。改用仍然真的在身份里的 `pme_decharge_model_version`。
+    old_payload = dict(pme_decharge_model_version=1,
                        run_config=dict(n_steps_per_window=TARGET_STEPS, kwargs={}),
                        final_gate_thresholds={"final_min_absolute_ess": 50.})
     new_payload = copy.deepcopy(old_payload)
@@ -363,7 +366,7 @@ def test_extending_budget_keeps_physical_continuation_but_not_completed_reuse(tm
     _write_json(metadata, manifest)
     expected = dict(manifest, stage_protocol_key=new_key)
     assert ie._production_window_checkpoint_is_usable(str(tmp_path), "coul", 0, expected)
-    new_payload["system_xml_sha256"] = "different-Hamiltonian"
+    new_payload["pme_decharge_model_version"] = 2  # 真正换了哈密顿量
     expected["stage_protocol_key"] = pl._protocol_fingerprint(new_payload)
     assert not ie._production_window_checkpoint_is_usable(str(tmp_path), "coul", 0, expected)
 

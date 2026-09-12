@@ -23,6 +23,9 @@ pytest.importorskip("openmm")
 from ibs_engine import IBSSampler  # noqa: E402
 
 
+
+pytestmark = pytest.mark.cpu_only
+
 class _MinimalSampler:
     """只带 `_append_tmbar_batch_from_buffer` 真正读到的那几个属性。"""
 

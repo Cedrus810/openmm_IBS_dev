@@ -5,6 +5,10 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.cpu_only
+
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_MODULES = (
     ROOT / "abfe_core.py",

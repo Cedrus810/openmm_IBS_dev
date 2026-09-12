@@ -14,6 +14,9 @@ import pytest
 import rbfe_core as rc
 import rbfe_pipeline as rp
 
+
+pytestmark = pytest.mark.cpu_only
+
 _H = "a" * 64
 
 

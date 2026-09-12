@@ -20,6 +20,8 @@
 可选依赖：
 
 - CUDA 或 OpenCL，用于 GPU 运行。
+- **C++ 编译器 + CUDA toolkit**，仅在使用 `--outer-lambda-local-residual-ibs` 时需要 ——
+  那个开关依赖一个**必须自己编译**的 OpenMM native plugin，见下节。
 - GROMACS force-field include 目录，用于首次从 `.top` 构建系统。
 - OpenMM-ML、torch、MACE/ORB 相关依赖，仅在使用 `--boresch-source auto`、`orb_simple`、`orb_ml` 或相关 ML 功能时需要。
 
@@ -36,6 +38,70 @@
 
 实际跑的时候以运行产物 `<output>/run_provenance.json` 里记录的 `pymbar.__version__`
 为准 —— 那才是那次运行真正导入的版本。
+
+## CUDA 插件：**必须自己编译，仓库里不发编译产物**
+
+> 只在用 `--outer-lambda-local-residual-ibs` 时才需要。**默认生产路径不加载插件**
+> （开关默认 `false`），不用这个功能可以整节跳过。
+
+`LocalManyBodyResidual` 是一个 OpenMM native plugin。**本仓库不分发任何 `.so`** ——
+`.gitignore` 排除了 `plugins/*/build` 和 `plugins/*/build_*`，所以新 clone 下来
+默认加载路径 `plugins/LocalManyBodyResidual/build/` **根本不存在**，
+开关一打开就会报 `缺少 LocalManyBodyResidual 插件库: …`。
+
+### 怎么编
+
+```bash
+conda activate <装有 OpenMM 的环境>        # 脚本对 CONDA_PREFIX fail-closed，不给默认值
+
+# CUDA 头文件在哪就指哪。按 environment.yml 建的环境自带 CUDA toolkit，用这行：
+export CUDA_HOME="$CONDA_PREFIX/targets/x86_64-linux"
+# 用系统 CUDA 的话是 /opt/cuda（脚本默认值）或 /usr/local/cuda。
+
+bash plugins/LocalManyBodyResidual/g0_build.sh
+```
+
+> ⚠️ `g0_build.sh` 的 `CUDA_HOME` 默认值是 `/opt/cuda`，**但按 `environment.yml`
+> 建出来的环境里 CUDA 头文件不在那儿**，而在 `$CONDA_PREFIX/targets/x86_64-linux/include`
+> （环境里钉了 `cuda-nvcc=12.9.86`）。不设这个变量、机器上又没有 `/opt/cuda`，
+> 就会在第 3 步报找不到 `cuda_runtime.h`。
+
+产出三个 `.so` 到 `plugins/LocalManyBodyResidual/build/`：公有 API 层、Reference
+平台层、CUDA 平台层。脚本是手写 `g++`，不是 CMake，编译时间是秒级。
+
+### 为什么**换环境就必须重编**
+
+`.so` 是对着**你这一个 OpenMM 安装**编出来的，而且绑得很死：
+
+- 编译时吃 `$CONDA_PREFIX/include` 下的 OpenMM **公有 API + Reference 平台私有头
+  + CUDA/Common 平台私有头**（私有头没有 ABI 稳定性承诺）；
+- 链接 `-lOpenMM -lOpenMMCUDA`，`-rpath` 写死 `$CONDA_PREFIX/lib`。
+
+⟹ 换 OpenMM 版本、换 conda 环境、甚至同版本换一次 build，都要重新跑一遍
+`g0_build.sh`。**开发与验证用的是 OpenMM 8.5.2（`git_revision 36a30cb`）。**
+
+### 显卡型号不用操心
+
+插件只编译**宿主端 C++**，设备端 kernel 是 OpenMM 运行时用 NVRTC 现编的
+（`CudaContext::createModule()`），源码里没有 `.cu`、没有 `-arch`、没有预编译
+PTX/fatbin。所以**插件本身不锁定任何 SM 版本**。
+
+支持哪些卡**由 mamba/conda 环境决定** —— [`environment.yml`](../environment.yml)
+里钉的是 `cuda-version=12.9`（`cuda-nvrtc=12.9.86`），覆盖 **PTX sm_75 ~ sm_120**
+（Turing 到 Blackwell），对绝大多数在用的卡够了。按环境文件建环境就自动拿到这个范围；
+要支持更老的卡就在环境里换 CUDA 版本，不用改插件代码。
+
+### 编完自检
+
+```bash
+python plugins/LocalManyBodyResidual/cuda_smoke_test.py   # 需要 GPU
+```
+
+还有一道**源码身份门**：loader 会核对
+`platforms/cuda/src/CudaLocalManyBodyResidualKernels.cpp` 的 sha256 是否等于
+`KNOWN_PLUGIN_SOURCE_SHA256`，对不上直接拒绝启用开关。
+改了 kernel 源码就要同步更新那个常量（两处，见
+[RETRAIN_LOCAL_RESIDUAL.md](RETRAIN_LOCAL_RESIDUAL.md)）。
 
 ## 输入要求
 

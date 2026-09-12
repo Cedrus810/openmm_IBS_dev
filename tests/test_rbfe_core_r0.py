@@ -12,6 +12,9 @@ import pytest
 
 import rbfe_core as rc
 
+
+pytestmark = pytest.mark.cpu_only
+
 _HASH_A = "a" * 64
 _HASH_B = "b" * 64
 

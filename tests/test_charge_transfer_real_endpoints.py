@@ -450,15 +450,19 @@ def test_vanishing_lambda_zero_ligand_environment_is_algebraically_zero():
     assert report["max_abs_force_ligand_environment_kj_mol_nm"] == pytest.approx(0.0, abs=1e-6)
 
 
-@pytest.mark.xfail(
-    reason="P1-19（2026-08-30 登记）：v3 charging 口径下 seam 失配——charging λ=0 "
-    "已把 ordinary L-L 内部库仑湮灭，而 vanishing 侧 U_common(Group 2) 仍按"
-    "『逐 λ 恒定的物理值』重建配体内部静电，两端点差一个内部库仑常数"
-    "（实测 118.5 kJ/mol，中性 4 原子 fixture）。该常数逐 λ_vdw 不变 ⟹ ΔG_vdw "
-    "与 ΔG_bind 不受影响，但 seam『两端点同一 Hamiltonian』的记账恒等式被破坏，"
-    "需要单独定级并决定 U_common 是否随 v3 改写。修复后此标记应转 XPASS 并摘除。",
-    strict=False,
-)
+# P1-19（2026-08-30 登记）的 seam 失配已修好，xfail 标记于 2026-09-09 摘除（XFAIL-01）。
+# 原症状：charging λ=0 已把 ordinary L-L 内部库仑湮灭，而 vanishing 侧 U_common(Group 2)
+# 仍按『逐 λ 恒定的物理值』重建配体内部静电，两端点差一个内部库仑常数（实测 118.5 kJ/mol）。
+# 2026-09-02 实测（tools/diagnostics/probe_p119_charge_transfer_seam.py）：
+#   abs_delta_e = 3.632e-04 kJ/mol（小 5.5 个数量级）、rel = 1.807e-06（门 1e-05）、
+#   max|ΔF| 分量 = 2.526e-06 kJ/mol/nm（门 1e-03）。
+# 剩下的 3.6e-4 **不是 seam 残余**：见下方
+# test_bake_handoff_seam_matches_for_charged_ligand_with_realistic_geometry 上方的注释——
+# 紧凑几何（配体 4 原子挤在 <0.2 nm 内）自带一个与几何基本无关的 ~0.0005 kJ/mol 绝对残差，
+# 纯数值性，不是 Hamiltonian 构造错误。别再把它当 seam 问题去修。
+# fixture 没有绕过失效路径：LIGAND_CHARGES_NEUTRAL_E 逐原子非零，LIGAND_ORDINARY_PAIRS
+# 含真正的 ordinary L-L 对 (0, 3)（q_i·q_j = −0.2 e²，走标准 combining rule）⟹ 机制被触发。
+# 谁在哪次改动里修好的：未知，跨会话核对只能排除若干候选。不要把猜测写成结论。
 def test_vanishing_lambda_one_seam_matches_charging_lambda_zero():
     """C：vanishing λ_vdw=1 与 charging λ_coul=0 必须是同一个物理 Hamiltonian
     （两阶段接缝完全一致——两侧都是生产代码，测的是自洽性，不是独立 reference）。
@@ -630,13 +634,13 @@ def _write_synthetic_case_dir(tmp_path, *, system, topology, positions_nm, box_n
     return case_dir
 
 
-@pytest.mark.xfail(
-    reason="P1-19（2026-08-30 登记）：v3 charging 口径下 seam 失配（同 "
-    "test_vanishing_lambda_one_seam_matches_charging_lambda_zero 的 xfail 理由）"
-    "——C/D 门里的 gate1_reference_identity / gate3_mixed_production_vs_reference "
-    "依赖 charging λ=0 与 vanishing 侧 U_common 的 seam 恒等。修复后应转 XPASS 并摘除。",
-    strict=False,
-)
+# XFAIL-02（2026-09-09 关闭）：这两条以前挂着 xfail，reason 抄的是 P1-19 的 C seam
+# 失配——**那是错的**。实测（--runxfail）失败的从来是 `D:` 前缀，`C:` 一次都没出现过。
+# 真因：`cte.reference_vanishing_zero_system` 把配体粒子 epsilon 一律置零，顺手杀掉了
+# 普通（无 exception）L–L 对的内部 LJ，而生产侧的 U_common 正确地逐 λ_vdw 保留它。
+# 差值就是那一个对：U_LJ(0,3) = 22.0575 kJ/mol、原子 0 受力差 1143.13 kJ/mol/nm。
+# 已在参照 builder 侧修好（见该函数 docstring）。**与 co-ion 无关，与 PHY-03 无关，
+# 生产侧物理没有错**——旧 reason 会把人骗去修一个已经是对的东西。
 def test_run_protocol_v2_matrix_cd_wiring_passes_on_charged_fixture(tmp_path):
     system, topology, positions, box, spec = _case(1, n_dummies=1)
     positions_nm = _nm(_extend_ligand_geometry(positions))
@@ -819,12 +823,13 @@ def test_assert_mem00h_switching_convention_fails_closed_when_switch_still_enabl
         cte.assert_mem00h_switching_convention(system, context="test")
 
 
-@pytest.mark.xfail(
-    reason="P1-19（2026-08-30 登记）：v3 charging 口径下 seam 失配（同 "
-    "test_vanishing_lambda_one_seam_matches_charging_lambda_zero 的 xfail 理由）。"
-    "修复后应转 XPASS 并摘除。",
-    strict=False,
-)
+# XFAIL-02（2026-09-09 关闭）：这两条以前挂着 xfail，reason 抄的是 P1-19 的 C seam
+# 失配——**那是错的**。实测（--runxfail）失败的从来是 `D:` 前缀，`C:` 一次都没出现过。
+# 真因：`cte.reference_vanishing_zero_system` 把配体粒子 epsilon 一律置零，顺手杀掉了
+# 普通（无 exception）L–L 对的内部 LJ，而生产侧的 U_common 正确地逐 λ_vdw 保留它。
+# 差值就是那一个对：U_LJ(0,3) = 22.0575 kJ/mol、原子 0 受力差 1143.13 kJ/mol/nm。
+# 已在参照 builder 侧修好（见该函数 docstring）。**与 co-ion 无关，与 PHY-03 无关，
+# 生产侧物理没有错**——旧 reason 会把人骗去修一个已经是对的东西。
 def test_run_protocol_v2_matrix_cd_normalizes_c2_style_switch_before_c_seam(tmp_path):
     """端到端：`run_protocol_v2_matrix_cd` 内部自动归一化，即使传入的
     case_dir 的 raw system.xml 带着 C2 那种局部 switch，C seam 也必须干净
@@ -921,6 +926,51 @@ def test_compare_vanishing_zero_endpoint_fails_closed_on_platform_mismatch(monke
 # ---------------------------------------------------------------------------
 # 4. reference planner 独立性
 # ---------------------------------------------------------------------------
+
+
+def test_reference_vanishing_zero_keeps_ordinary_intra_ligand_lj():
+    """D 参照把配体粒子 epsilon 置零时，**不得**连普通 L–L 对的内部 LJ 一起杀掉。
+
+    XFAIL-02 的真因就是这个（2026-09-09）。普通对的 LJ 属于 U_common，逐 λ_vdw 恒定；
+    生产侧保留它，参照侧曾经因为「粒子 epsilon = 0」把它一起抹掉，D 门于是差一个
+    与 λ 无关的常数——而失败信息只说「D:gate1/gate3」，看不出是 LJ。这条测试直接对着
+    机制断言，坏了能一眼看懂。
+    """
+    system, _topology, _positions, _box, spec = _case(1, n_dummies=1)
+    ref = cte.reference_vanishing_zero_system(system, LIGAND_INDICES, spec)
+    nb_raw = cte._find_nonbonded_force(system)
+    nb_ref = cte._find_nonbonded_force(ref)
+
+    ref_pairs = {}
+    for e in range(nb_ref.getNumExceptions()):
+        p1, p2, _cp, sig, eps = nb_ref.getExceptionParameters(e)
+        ref_pairs[(min(int(p1), int(p2)), max(int(p1), int(p2)))] = (
+            sig.value_in_unit(unit.nanometer),
+            eps.value_in_unit(unit.kilojoule_per_mole),
+        )
+
+    for i, j in sorted(LIGAND_ORDINARY_PAIRS):
+        assert (i, j) in ref_pairs, (
+            f"普通 L–L 对 ({i},{j}) 在 D 参照里没有被冻结成 exception —— "
+            "配体粒子 epsilon 置零会把它的 LJ 一起杀掉，D 门会差一个 λ 无关常数。"
+        )
+        _q, si, ei = nb_raw.getParticleParameters(i)
+        _q, sj, ej = nb_raw.getParticleParameters(j)
+        want_sigma = 0.5 * (
+            si.value_in_unit(unit.nanometer) + sj.value_in_unit(unit.nanometer)
+        )
+        want_eps = math.sqrt(
+            ei.value_in_unit(unit.kilojoule_per_mole)
+            * ej.value_in_unit(unit.kilojoule_per_mole)
+        )
+        got_sigma, got_eps = ref_pairs[(i, j)]
+        assert got_sigma == pytest.approx(want_sigma, rel=1e-12)
+        assert got_eps == pytest.approx(want_eps, rel=1e-12)
+
+    # 配体粒子自身的 epsilon 仍必须是 0——否则配体–环境 LJ 没被删掉，D 就白做了。
+    for idx in LIGAND_INDICES:
+        _q, _s, eps = nb_ref.getParticleParameters(idx)
+        assert eps.value_in_unit(unit.kilojoule_per_mole) == 0.0
 
 
 def test_reference_builders_never_call_forbidden_production_functions():

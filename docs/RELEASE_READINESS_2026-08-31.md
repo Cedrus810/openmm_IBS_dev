@@ -148,6 +148,21 @@ ABFE_RANDOM_SEED 未设置时，main._repeat_seed = None
 
 ### residual sampling 还不是通用、已验证的默认加速功能
 
+> **2026-09-12 更新：走"随包发布"那一支。** 本节列的条件里，
+> 「包含资源」「插件构建/安装说明」已办（资源随首发；
+> [GETTING_STARTED.md](GETTING_STARTED.md)《CUDA 插件》一节）；
+> 「绑定 Atenolol」这条前提已被 EXP-033 P1 的闭式重训解掉。
+> **仍然欠着的**：
+> 1. CPU/CUDA 数值一致性与关闭时基线不变的随包测试证据；
+> 2. EXP-033 P2（这个闭式臂到底值不值得留）；
+> 3. ⚠️ **随发的文件还没配齐**——自动重训链踩在未跟踪的模块上：
+>    `runabfe.py:6313` 惰性 `from scripts.write_local_residual_resource_manifest import main`，
+>    而 `scripts/` 的 git 跟踪数是 **0**；`local_residual/` 只跟踪了 4/20，
+>    闭式重训还要 `softlift.py` / `softlift_dataset.py` / `refit.py`。
+>    以 `pytest tests/test_fresh_clone_imports.py` 的软门登记表为准。
+>
+> 下面是 08-31 的原文，不改。
+
 `resources/outer_lambda_local_residual/manifest.json` 明确绑定 Atenolol 的
 41 原子与键图。`local_residual/openmm_plugin.py:403` 依赖模型资源及原生插件，
 默认插件位置仍是源码树中的 build 目录。

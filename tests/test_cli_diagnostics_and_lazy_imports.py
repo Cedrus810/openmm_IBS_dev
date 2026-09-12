@@ -27,6 +27,9 @@ if REPO_ROOT not in sys.path:
 import abfe_diagnostics  # noqa: E402
 
 
+
+pytestmark = pytest.mark.cpu_only
+
 # ---------------------------------------------------------------------------
 # 惰性 import
 # ---------------------------------------------------------------------------

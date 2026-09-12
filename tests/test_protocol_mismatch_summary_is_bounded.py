@@ -16,6 +16,10 @@ import copy
 
 from abfe_pipeline import _summarize_protocol_mismatch
 
+import pytest
+
+pytestmark = pytest.mark.cpu_only
+
 _MAX_CHARS = 400
 
 _FLUCTUATION_DISTRIBUTION = [

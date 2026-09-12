@@ -18,6 +18,12 @@ from openmm import app, unit  # noqa: E402
 import ibs_engine  # noqa: E402
 from abfe_core import boresch_dihedral_rad  # noqa: E402
 
+# 2026-09-09：本文件此前只给三条短 MD 用例加了 @pytest.mark.cpu_only，模块级没有
+# pytestmark，于是另外 10 条纯逻辑用例（λ 阶梯、力组占用、退化几何 fail-closed、
+# BAR/TI 门）落在 `-m cpu_only` 之外。它们全部不需要 GPU，统一在模块级标注；
+# 下面几条用例自带的同名装饰器保留亦无害。
+pytestmark = pytest.mark.cpu_only
+
 
 # ---------------------------------------------------------------------------
 # 玩具体系：3 个"受体"锚点 + 3 个"配体"锚点，外加一个弱简谐笼子把它们关在

@@ -19,7 +19,8 @@ import json
 import re
 import shutil
 import time
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Sequence, Tuple, Optional
+from step_guard import guarded_step
 from abfe_core import (
     ACESoftcorePotential,
     CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER,
@@ -388,6 +389,23 @@ VANISHING_MIN_INTERVALS_PER_ENSEMBLE = 2
 # OpenMM CustomCVForce supports at most 32 CVs.  build_ibs_dual_system currently
 # adds two CVs per lambda state (interaction + zero restraint bookkeeping).
 VANISHING_MAX_STATES_PER_IBS_ENSEMBLE = 16
+
+
+# 探针系统里原生 NonbondedForce（PME）单独占一个 force group。
+#
+# 🔑 [2026-09-10] 它原来被塞进 group 1，和软核力混在一起，而度规的有限差分
+# 只读 group 1。问题是 group 1 里那两项对 λ 的依赖**不一样**：
+#   * 软核 ACES 力：同时带 lam_coul 和 lam_vdw；
+#   * 原生 NB（带电腿）：只带 lam_coul —— B3 的 PME ParameterOffset 装在它上面，
+#     所以 Stage 1 差分 lam_coul 时**必须**算上它。
+# Stage 2 固定 lam_coul=0、只差分 lam_vdw，此时原生 NB 是个与 lam_vdw 完全无关的
+# 常数，但量级在 ~10^6 kJ/mol：在它上面做差再除以 delta≈0.02，是灾难性相消，
+# 而 mixed precision 下两次求值未必逐比特相同。
+# 解法不是"把它挪去 group 0"（那会让 Stage 1 的 lam_coul 依赖整个消失），
+# 而是给它自己的 group，再由差分按**被差分的参数**选 group 集合。
+# 组号 3：探针里 0=默认、1=软核、2=配体内部、6=co-ion flat-bottom 限制，3 空着。
+# ⚠️ force group 只影响能量分解读数，不影响积分的哈密顿量。
+PREOPT_NATIVE_NONBONDED_FORCE_GROUP = 3
 
 
 def validate_single_shared_boundary_ranges(
@@ -992,6 +1010,88 @@ def redistribute_lambda_by_thermodynamic_length(
     return new_lambdas, cumulative, np.diff(targets)
 
 
+def recompute_vanishing_path_from_cached_pilot(
+    path_diagnostics: Dict,
+    *,
+    n_states: int,
+    final_state_count: int,
+    min_states_per_window: int,
+    max_states_per_window: int,
+    free_energy_densify_points: int,
+) -> Dict:
+    """从**已落盘的 pilot 测量**离线重算 λ 路径与窗口布局。**不跑任何 MD。**
+
+    ## 为什么需要它
+
+    preopt 缓存原来是一整块：`stage2_final_n_states` / `densify` /
+    `window_min|max_states` 这类**只影响布点与分窗**的参数一改，整份缓存失配，
+    连那份要跑几十分钟 GPU 的 pilot 测量一起作废重跑。
+
+    但 pilot→λ 这一步是**纯函数**（`redistribute_vanishing_lambda_subdomains`），
+    它需要的 `pilot_lambdas` / `metric_g` / 每点的 `mean_dU_dlambda_kJ_mol`
+    全都已经在缓存的 `path_diagnostics` 里。所以这类改动应当从旧 pilot
+    **离线重算**，而不是重烧 GPU。
+
+    这就是缓存两层拆分里的第 2 层（派生路径）。第 1 层（原始 pilot 测量：
+    Hamiltonian、采样步数、差分步长、遍历顺序、加密探针协议）变了才必须重跑。
+
+    Parameters
+    ----------
+    path_diagnostics
+        缓存里的 `path_diagnostics` 字典，必须含 `pilot_lambdas`、`metric_g`、
+        `pilot_points`。缺任何一项直接抛——**不猜**，猜出来的 λ 会静默改变生产态。
+
+    Returns
+    -------
+    dict
+        `{"lambdas_vdw", "window_ranges", "subdomain_allocation",
+          "cumulative_length", "optimized_edge_lengths"}`
+    """
+    for key in ("pilot_lambdas", "metric_g", "pilot_points"):
+        if not path_diagnostics.get(key):
+            raise ValueError(
+                f"缓存的 path_diagnostics 缺少 {key!r}，无法离线重算派生路径。"
+                "这份缓存太旧（早于 pilot 测量落盘），只能重跑 pilot。"
+            )
+    pilot_lambdas = [float(x) for x in path_diagnostics["pilot_lambdas"]]
+    metric_g = np.asarray(path_diagnostics["metric_g"], dtype=float)
+    if len(pilot_lambdas) != metric_g.size:
+        raise ValueError(
+            f"缓存的 pilot_lambdas ({len(pilot_lambdas)}) 与 metric_g "
+            f"({metric_g.size}) 长度不一致，拒绝据此重算。"
+        )
+    (
+        optimized_lambdas,
+        cumulative_length,
+        optimized_edge_lengths,
+        window_ranges,
+        subdomain_allocation,
+    ) = redistribute_vanishing_lambda_subdomains(
+        pilot_lambdas,
+        metric_g,
+        int(n_states),
+        first_ensemble_target_intervals=VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS,
+        final_state_count=int(final_state_count),
+        min_states_per_window=int(min_states_per_window),
+        max_states_per_window=int(max_states_per_window),
+        free_energy_densify_points=int(free_energy_densify_points),
+        pilot_mean_dU_dlambda=_pilot_mean_gradients_or_none(
+            path_diagnostics["pilot_points"]
+        ),
+    )
+    # 与 optimize_stage2_vanishing 里的后处理逐字一致：端点必须精确是 1 和 0。
+    optimized_lambdas = np.asarray(optimized_lambdas, dtype=float).ravel()
+    optimized_lambdas = np.clip(optimized_lambdas, 0.0, 1.0)
+    optimized_lambdas[0], optimized_lambdas[-1] = 1.0, 0.0
+    return {
+        "lambdas_vdw": optimized_lambdas,
+        "window_ranges": window_ranges,
+        "subdomain_allocation": subdomain_allocation,
+        "cumulative_length": cumulative_length,
+        "optimized_edge_lengths": optimized_edge_lengths,
+    }
+
+
 def redistribute_vanishing_lambda_subdomains(
     pilot_lambdas: np.ndarray,
     metric_g: np.ndarray,
@@ -1313,6 +1413,2725 @@ def split_window_from_ibs_lse_failure(
         "shared_global_state": int(middle),
         "inserted_lambda": None,
         "lse_balance": warmup_diagnostics.get("lse_balance"),
+    }
+
+
+def _pilot_arclength_of(lambda_value, pilot_lam_desc, pilot_s_asc):
+    """某个 λ 在 pilot 实测累计热力学坐标上的位置。pilot λ 递减、s 递增。"""
+    return float(np.interp(lambda_value, pilot_lam_desc[::-1], pilot_s_asc[::-1]))
+
+
+def metric_integral_cumulative(
+    lambdas: Sequence[float],
+    pilot_lambdas: Sequence[float],
+    metric_g: Sequence[float],
+) -> np.ndarray:
+    """把 pilot 的 ∫g dλ 累积到给定 λ 表上。
+
+    注意与热力学长度 ``∫√g dλ`` 的区别：等**弧长**布点均衡的是相邻态之间的重叠，
+    而 IBS 是一条轨迹重加权到窗口内**全部** K 个态，难度更接近窗口内的总方差
+    ``∫g dλ``。⚠️ 这是一个**有实验动机的候选指标，不是已证明的 IBS 难度**：柯西–
+    施瓦茨 ``∫g dλ >= L²/Δλ`` 只说明两者不等价，并没有证明 ∫g 预测 IBS 收敛；而且
+    热力学长度有 Fisher 度规基础、∫g dλ 则依赖 λ 的参数化方式（变量变换下会变）。
+    当前证据是"换上去之后布局更好、跑得通"，据此继续实验，不据此宣称机制。
+    经验上：**同样弧长的窗口，落在度规
+    尖峰上的那个 Δλ 很小、∫g 却大得多** —— 实测 4W53 cyclod 21 态五窗弧长大致
+    相等（2.28~3.29），∫g 却是 19/37/67/97/54，差 5 倍，而失败的正是 ∫g 最大那个。
+    """
+    pl = np.asarray(pilot_lambdas, dtype=float).ravel()
+    g = np.asarray(metric_g, dtype=float).ravel()
+    if pl.size != g.size or pl.size < 2:
+        raise ValueError("pilot_lambdas 与 metric_g 必须等长且至少两个点")
+    if not np.all(np.isfinite(g)) or np.any(g < 0.0):
+        raise ValueError("metric_g 含非有限值或负值")
+    cum = np.concatenate([[0.0], np.cumsum(0.5 * (g[:-1] + g[1:]) * np.abs(np.diff(pl)))])
+    return np.interp(np.asarray(lambdas, dtype=float), pl[::-1], cum[::-1])
+
+
+def partition_windows_by_metric_integral(
+    lambdas: Sequence[float],
+    pilot_lambdas: Sequence[float],
+    metric_g: Sequence[float],
+    *,
+    min_states_per_window: int = 4,
+    max_states_per_window: int = 8,
+    n_windows: Optional[int] = None,
+) -> Tuple[List[Tuple[int, int]], Dict[str, Any]]:
+    """按 ``∫g dλ`` 均衡划分 IBS 窗口（**尚未接入生产,独立函数**）。
+
+    相邻窗口共享且只共享一个边界态。先用 DP 最小化"最大窗 ∫g"，再在所有取得该
+    最小值的布局里最小化 ∫g 的平方和，得到确定性的、尽量均匀的结果。
+
+    为什么要放开 ``max_states_per_window``：卡住均衡的从来不是 ``min``（那是一条
+    **工程下限**，动机是窗口两端各有一个与邻窗共享的边界态、内部只剩 K-2 个自由
+    态；⚠️ 共享边界态并不意味着这两个态的 f_k 不能调整，所以这**不是**已证明的数学
+    必要条件，别当定理引用），而是 ``max``。它逼着**便宜的地方也只能用小窗**，白白多切几刀，却在贵的地方
+    切不动。实测（4W53 cyclod，21 态）：
+
+        max=5  强制 [5,5,5,5,5]  峰值 ∫g=97.0  不均衡 5.08
+        max=8  得到 [8,5,4,4,4]  峰值 ∫g=74.2  不均衡 2.36
+        max=12 且只要 4 个窗 [10,5,4,5] 峰值 75.3 不均衡 1.40
+
+    ``n_windows=None`` 时在所有可行窗口数里自动选：先比峰值 ∫g，再比窗口数（少
+    的省 GPU），最后比平方和。
+
+    ⚠️ 峰值有地板：它等于尖峰处一个**最小 4 态窗**的 ∫g（上例 74.2）。想再低只能
+    在尖峰那段**加 λ 态**，分窗解决不了。
+    """
+    lam = np.asarray(lambdas, dtype=float).ravel()
+    n = lam.size
+    lo, hi = int(min_states_per_window), int(max_states_per_window)
+    if lo < 2 or hi < lo:
+        raise ValueError(f"min/max_states_per_window 非法：{lo}/{hi}")
+    if n < lo:
+        raise ValueError(f"λ 表只有 {n} 个态，不足 min_states_per_window={lo}")
+    gcum = metric_integral_cumulative(lam, pilot_lambdas, metric_g)
+    cost = lambda a, b: abs(float(gcum[b - 1] - gcum[a]))
+
+    def _solve(w_target: int):
+        """(峰值, 平方和, ranges)；不可行返回 None。"""
+        INF = float("inf")
+        best = [[INF] * (w_target + 1) for _ in range(n)]
+        back = [[None] * (w_target + 1) for _ in range(n)]
+        best[0][0] = 0.0
+        for i in range(n):
+            for w in range(w_target):
+                if best[i][w] == INF:
+                    continue
+                for size in range(lo, hi + 1):
+                    j = i + size - 1
+                    if j > n - 1:
+                        break
+                    cand = max(best[i][w], cost(i, j + 1))
+                    if cand < best[j][w + 1]:
+                        best[j][w + 1] = cand
+                        back[j][w + 1] = (i, w)
+        peak = best[n - 1][w_target]
+        if peak == INF:
+            return None
+        # 第二遍：在"每个窗都不超过 peak"的约束下最小化平方和，结果确定且更均匀。
+        tol = peak * (1.0 + 1e-12) + 1e-12
+        ss = [[INF] * (w_target + 1) for _ in range(n)]
+        bk2 = [[None] * (w_target + 1) for _ in range(n)]
+        ss[0][0] = 0.0
+        for i in range(n):
+            for w in range(w_target):
+                if ss[i][w] == INF:
+                    continue
+                for size in range(lo, hi + 1):
+                    j = i + size - 1
+                    if j > n - 1:
+                        break
+                    c = cost(i, j + 1)
+                    if c > tol:
+                        continue
+                    cand = ss[i][w] + c * c
+                    if cand < ss[j][w + 1]:
+                        ss[j][w + 1] = cand
+                        bk2[j][w + 1] = (i, w)
+        if ss[n - 1][w_target] == INF:
+            return None
+        ranges, i, w = [], n - 1, w_target
+        while w > 0:
+            pi, pw = bk2[i][w]
+            ranges.append((pi, i + 1))
+            i, w = pi, pw
+        return peak, ss[n - 1][w_target], list(reversed(ranges))
+
+    if n_windows is not None:
+        got = _solve(int(n_windows))
+        if got is None:
+            raise RuntimeError(
+                f"{n} 个态在 [{lo},{hi}] 约束下切不出 {n_windows} 个窗口"
+            )
+        candidates = [(got[0], int(n_windows), got[1], got[2])]
+    else:
+        candidates = []
+        for w in range(1, n):
+            got = _solve(w)
+            if got is not None:
+                candidates.append((got[0], w, got[1], got[2]))
+        if not candidates:
+            raise RuntimeError(f"{n} 个态在 [{lo},{hi}] 约束下无可行窗口划分")
+    peak, w_used, ssq, ranges = min(candidates)
+
+    validate_single_shared_boundary_ranges(ranges, n)
+    per_window = [cost(a, b) for a, b in ranges]
+    return ranges, {
+        "criterion": "metric_integral_g",
+        "n_windows": int(w_used),
+        "sizes": [int(b - a) for a, b in ranges],
+        "metric_integral_per_window": [float(x) for x in per_window],
+        "peak_metric_integral": float(peak),
+        "imbalance_max_over_min": (
+            float(max(per_window) / min(per_window)) if min(per_window) > 0 else None
+        ),
+        "min_states_per_window": lo,
+        "max_states_per_window": hi,
+        "note": (
+            "峰值有地板：等于尖峰处一个最小窗的 ∫g；再低只能在尖峰段加 λ 态。"
+        ),
+    }
+
+
+def partition_tail_by_arclength(
+    arc_tail: Sequence[float],
+    min_states_per_window: int = 4,
+    max_states_per_window: int = 5,
+    *,
+    n_windows: Optional[int] = None,
+) -> List[Tuple[int, int]]:
+    """把**尚未采样的那一段**按热力学长度重新划成 few-state IBS 窗口。
+
+    只作用于给定的这一段（下标相对本段）。用途：失败窗口插 λ 之后，前缀（已经
+    采完的窗口）必须逐字冻结，而从失败窗口起到路径末尾的部分还没跑过、可以自由
+    重排 —— 但它**必须仍然是按热力学长度均衡的窗口**，不能只是把原来的边界往后
+    推一格。否则剩余布局就不再是热力学窗，只是"结构合法"而已。
+
+    窗口数由约束定死：相邻共享一个边界态 ⟹ ``L = Σsizes - (W-1)``，两侧都要落在
+    ``[min, max]`` ⟹ ``W = ceil((L-1)/(max-1))``，再校验 ``min*W - (W-1) <= L``。
+    切点在可行范围内取最接近等弧长的那个。
+    """
+    arc = np.asarray(arc_tail, dtype=float).ravel()
+    n = arc.size
+    lo, hi = int(min_states_per_window), int(max_states_per_window)
+    if hi < lo or lo < 2:
+        raise ValueError(f"min/max_states_per_window 非法：{lo}/{hi}")
+    if n < lo:
+        raise RuntimeError(f"尾段只有 {n} 个态，不足 min_states_per_window={lo}")
+    # 🔑 [2026-09-11] n_windows 从"自己按 max 算最少窗口数"改成可由调用方**硬指定**。
+    # 原来它无条件取 ceil((n-1)/(max-1))，也就是尽可能少切；插点补救时这会把尾段
+    # 原有的 3 个窗重新合并成 3 个大窗（max=8 之后尤其明显），于是"插了点、失败窗口
+    # 反而更大"。补救路径现在显式传 w_before+1，逼它真的多切一刀。
+    if n_windows is None:
+        if n <= hi:
+            return [(0, n)]
+        n_windows = int(np.ceil((n - 1) / (hi - 1)))
+    else:
+        n_windows = int(n_windows)
+        if n_windows < 1:
+            raise ValueError(f"n_windows 必须 >= 1，收到 {n_windows}")
+    if n_windows == 1:
+        if not lo <= n <= hi:
+            raise RuntimeError(f"尾段 {n} 个态装不进 1 个 [{lo},{hi}] 态窗口")
+        return [(0, n)]
+    if n_windows * (hi - 1) + 1 < n:
+        raise RuntimeError(
+            f"尾段 {n} 个态装不进 {n_windows} 个窗口（max_states_per_window={hi}）"
+        )
+    if lo * n_windows - (n_windows - 1) > n:
+        raise RuntimeError(f"尾段 {n} 个态切不出 {n_windows} 个 [{lo},{hi}] 态窗口")
+
+    span = float(arc[-1] - arc[0])
+    cuts = [0]
+    for w in range(n_windows - 1):
+        start = cuts[-1]
+        remaining = n_windows - w - 1
+        target = arc[0] + span * (w + 1) / n_windows
+        lo_cut, hi_cut = start + lo - 1, min(start + hi - 1, n - 1)
+        # 切完之后剩下的态数（含共享边界）必须还够剩余窗口各自满足 [lo,hi]
+        while hi_cut > lo_cut and (n - hi_cut) < lo * remaining - (remaining - 1):
+            hi_cut -= 1
+        while lo_cut < hi_cut and (n - lo_cut) > hi * remaining - (remaining - 1):
+            lo_cut += 1
+        if lo_cut > hi_cut:
+            raise RuntimeError(f"尾段无可行切点：start={start} n={n} W={n_windows}")
+        cand = np.arange(lo_cut, hi_cut + 1)
+        cuts.append(int(cand[int(np.argmin(np.abs(arc[cand] - target)))]))
+    cuts.append(n - 1)
+    ranges = [(cuts[i], cuts[i + 1] + 1) for i in range(len(cuts) - 1)]
+    if sorted({i for a, b in ranges for i in range(a, b)}) != list(range(n)):
+        raise RuntimeError(f"尾段切分未完整覆盖：{ranges}")
+    return ranges
+
+
+
+STAGE2_CONTROLLER_PROTOCOL_VERSION = 1
+
+
+def _ie_min_frames():
+    """去相关帧数下限（可达性预检的 T）。惰性读，避免顶层拖 ibs_engine。"""
+    try:
+        from ibs_engine import IBS_LOCAL_MBAR_GATE_MIN_FRAMES
+        return int(IBS_LOCAL_MBAR_GATE_MIN_FRAMES)
+    except Exception:
+        return 10
+
+
+
+def _ie_reach(*args, **kwargs):
+    """惰性转发到 `ibs_engine.validation_reachability_verdict`（别在顶层拖重依赖）。"""
+    from ibs_engine import validation_reachability_verdict
+    return validation_reachability_verdict(*args, **kwargs)
+
+
+SEALED_CANDIDATES_FILENAME = "stage2_fk_sealed_candidates.json"
+
+
+def _sealed_candidates_path(checkpoint_dir):
+    return os.path.join(checkpoint_dir, SEALED_CANDIDATES_FILENAME)
+
+
+def read_sealed_candidates(checkpoint_dir):
+    """读被统计驳回、**永不续验**的 f_k 候选台账。读不到返回空表。"""
+    try:
+        with open(_sealed_candidates_path(checkpoint_dir), encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    return list((payload or {}).get("sealed") or [])
+
+
+def seal_refuted_candidate(
+    checkpoint_dir,
+    *,
+    path_version,
+    window_idx,
+    lambdas_vdw,
+    f_k,
+    reason,
+    fingerprint=None,
+):
+    """封存一份被驳回的 f_k 候选：**永不续验**。
+
+    身份 = `path_version + window + λ 身份 + f_k 向量本身`。
+
+    ⚠️ **候选身份不用 hash。** 主线在快速反复变动，哈希里放什么一改，所有已封存
+    记录就全部失配、被驳回的候选会被当成新的重新试一遍 —— 正是"反复试到偶然
+    通过"。而且这是本仓库记录在案、**已经复发四次**的同一个坑：自产产物的
+    sha256 进身份。规则是「只有用户输入才配做身份」，而 f_k 是我们自己算出来的。
+    正解不是删掉身份，是改成**语义身份**：f_k 向量（mean-center 后比距离，
+    见 `ibs_engine.sealed_candidate_matches`）。
+    `fingerprint` 只作为可选的溯源线索留着，**不参与任何判定**。
+
+    ⚠️ 这里**只记录**，不决定下一步动作。统计驳回不得被解释成"λ 太稀"，
+    所以它永远不触发插 λ / 拆窗。
+    """
+    entries = read_sealed_candidates(checkpoint_dir)
+    record = {
+        "path_version": int(path_version),
+        "window_idx": int(window_idx),
+        "lambda_identity": [round(float(x), 10) for x in (lambdas_vdw or [])],
+        # **身份**：f_k 向量本身。判"实质上是不是同一份"在 f_k 空间里比距离
+        # （mean-center 后，见 ibs_engine.sealed_candidate_matches）。
+        "f_k_kJ_mol": [float(x) for x in (f_k or [])],
+        # 仅溯源，不参与判定。主线变动会让它失配，所以它不配做身份。
+        "candidate_fingerprint_PROVENANCE_ONLY": fingerprint,
+        "reason": reason,
+        "never_revalidate": True,
+    }
+    entries.append(record)
+    payload = {
+        "note": (
+            "被统计驳回的 f_k 候选。**永不续验**；每个 (path_version, window) "
+            "只允许一次替代候选（RELEARN_FK_EPOCH），防止反复试到偶然通过。"
+        ),
+        "sealed": entries,
+    }
+    tmp = _sealed_candidates_path(checkpoint_dir) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, ensure_ascii=False)
+    os.replace(tmp, _sealed_candidates_path(checkpoint_dir))
+    return record
+
+
+def relearn_epoch_used(checkpoint_dir, path_version, window_idx):
+    """这个 (path_version, window) 是否已经用掉了那**唯一一次**替代候选。
+
+    ⚠️ `REJECTED → RELEARN` 和 `UNREACHABLE → RELEARN` 共用同一个配额 ——
+    否则一个窗口能走两扇门拿两次 fresh Epoch，一次性护栏就形同虚设。
+    """
+    return any(
+        int(e.get("path_version", -1)) == int(path_version)
+        and int(e.get("window_idx", -1)) == int(window_idx)
+        and e.get("relearn_consumed")
+        for e in read_sealed_candidates(checkpoint_dir)
+    )
+
+
+def mark_relearn_epoch_consumed(checkpoint_dir, path_version, window_idx, detail=None):
+    """记下那唯一一次替代候选已被使用。找不到对应封存记录时补一条。"""
+    entries = read_sealed_candidates(checkpoint_dir)
+    hit = [
+        e for e in entries
+        if int(e.get("path_version", -1)) == int(path_version)
+        and int(e.get("window_idx", -1)) == int(window_idx)
+    ]
+    if not hit:
+        entries.append({
+            "path_version": int(path_version),
+            "window_idx": int(window_idx),
+            "reason": "relearn_without_sealed_candidate",
+        })
+        hit = [entries[-1]]
+    for e in hit:
+        e["relearn_consumed"] = True
+        if detail:
+            e["relearn_detail"] = detail
+    payload = {"note": "见 seal_refuted_candidate", "sealed": entries}
+    tmp = _sealed_candidates_path(checkpoint_dir) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, ensure_ascii=False)
+    os.replace(tmp, _sealed_candidates_path(checkpoint_dir))
+
+
+class Stage2RepairController:
+    """Stage-2 的统一控制器：**看状态 → 选一个动作 → 交执行器 → 回来重新判断。**
+
+    设计依据：``docs/PLAN_PATH_REPAIR_2026-09-11.md``（定位、三类修补、判别、可行性、
+    停止标准）。放在 `abfe_preoptimizer` 里、而且是**一个类**，是刻意的：
+
+      · **决策不许散开。** 现状是三层各用一种机制 —— `ibs_engine.run_all_windows`
+        尾部 4200 行函数里的 if/else（窗口内 f_k）、`abfe_pipeline` 的异常展开
+        （插 λ）、`abfe_pipeline:13027` 的 while 循环（补采）；状态写点 25 处、
+        分三个区，其中 resume 那一段是**第二套**从盘上推状态的规则。本类把这些
+        判断收到一处。
+      · 修补的判据（`insert_lambda_in_failed_ibs_window`、`feasible_repair_actions`）
+        本来就在本模块，决策跟它们同处一室，不必跨文件对齐。
+      · **状态唯一真源是盘。** 本类只读盘 + 纯判断，**不执行任何动作、不改任何文件**。
+        于是 resume 就等于"拿同一份盘上状态再 new 一次、再 decide 一次"，结构上
+        不可能长出第二套状态重建规则。
+
+    **本类不做**：任何数值计算。逐态 ESS / g 剖面、mixture 覆盖度这些量已经由
+    `ibs_engine` 落在 `*_convergence.json` / stage 结果里；这里只读汇总值。需要
+    重新算数的诊断另开脚本，别塞进控制器 —— 控制器一旦自己算数，就没法"拿历史
+    run 的产物离线重放决策"了。
+    """
+
+    # 动作：执行器能做的事。分两类 —— 不改结构的（前三个）与改结构的（后两个）。
+    ACTIONS = (
+        "CONTINUE_WARMUP",      # 继续学习 / 继续验证（同一个 Epoch，加预算）
+        "RUN_PRODUCTION",       # 跑/补生产帧（同一个 f_k，接着原段）
+        "RECALIBRATE_FK",       # 用生产帧重解 f_k → 新 Epoch，旧段保留
+        "INSERT_LAMBDA",        # 补 λ 缩窗跨度（model B；溢出落末窗）
+        "SPLIT_TAIL_WINDOW",    # 拆末窗（仅末窗，K ∈ [2lo−1, 2hi−1]）
+        "PROBE_CANDIDATE_FK",   # **非变异**：离线算候选 f_k + 评估，不切换
+        "PROBE_REANCHOR_EPOCH", # held-out **判不了**时：候选 f_k + 独立 burn-in + 一块
+        # 🔑 **与 RECALIBRATE_FK 科学语义不同，绝不合并。**
+        # RECALIBRATE_FK 是拿**已有生产帧**重解 f_k（信息来自旧轨迹）；
+        # RELEARN_FK_EPOCH 是**从头 LEARN**一份全新候选（fresh learn → 新 f_k →
+        # burn-in → 独立 held-out 验证），因为旧那份已经被统计驳回、永不续验。
+        "RELEARN_FK_EPOCH",     # 候选被驳回/不可达 ⟹ 全新 Epoch 从头学一份 f_k
+        "INSERT_LAMBDA",        # 候选也救不了 ⟹ 布局动作（缩窗跨度）
+        "ANALYZE",              # 只读：跑 stage 分析（MBAR + 生产质量门）
+        "DONE",
+    )
+    # 🔑🔑 [2026-09-11 老板改目标] **控制器是驱动，不是影子。**
+    # 「控制器必须自己诊断、自己换动作、自己继续跑，最终自动产出结果。
+    #   任何 LOCAL_* 都必须被主循环消费，**不能炸出流水线**。」
+    #
+    #     while not DONE:
+    #         evidence = read()
+    #         action   = decide(evidence, feasible_actions, global_budget)
+    #         execute(action)
+    #
+    # ⟹ 出口要分成两类。**只有这三种允许真正终止**，其余一律是**路由信号**
+    #    （被主循环消费、换个动作继续跑）：
+    TERMINAL_EXITS = (
+        "GLOBAL_BUDGET_EXHAUSTED",   # 全局预算真的没了（**局部**耗尽不算）
+        "NO_FEASIBLE_ACTION",        # 所有动作都不可行
+        "HALT_INVALID_INPUT",        # 输入 / Hamiltonian 无效
+        "DONE",
+        "DONE_UNTRUSTED",
+    )
+
+    # 出口：不是动作，是结局。每一个都必须说明"缺什么"或"下一步谁来做"。
+    EXITS = (
+        "DONE",
+        "DONE_UNTRUSTED",                    # 门未过但调用方显式放行
+        "HALT_BUDGET",                       # **全局**预算耗尽，动作本身可行
+        # ⚠️ 与 HALT_BUDGET **不是**同一回事：撞的是单周期的验证**批次上限**
+        # （IBS_LOCAL_MBAR_GATE_MAX_BATCHES），而全局预算**还有钱**。
+        # 实测 win4：批次打满、`global_budget_remaining = 760k`。
+        # 复用 HALT_BUDGET 会把"没钱"和"这一轮批次用完"混成一个归因。
+        "HALT_LOCAL_VALIDATION_CAP",
+        # ⚠️ 与 HALT_LOCAL_VALIDATION_CAP 的区别：那个是"这一轮批次用完了、
+        # 再给一轮也许行"；这个是**算术上证明了**在剩余预算内不可能凑够去相关
+        # 帧数（g 太大）。**它只改路由，不改 verdict** —— 证据仍是 UNMEASURED，
+        # 绝不因此变成 REJECTED，也绝不因此插 λ / 拆窗。
+        "HALT_VALIDATION_BUDGET_UNREACHABLE",
+        "HALT_NO_ATTRIBUTION",               # 测不动且归因不出来（合法结局）
+        "HALT_NO_FEASIBLE_ACTION",           # 归因成功但动作都不可行
+        "HALT_FK_REFUTED",                   # f_k 有证据被驳回（终态）
+        "HALT_LAMBDA_BUDGET_INSUFFICIENT",   # 溢出槽耗尽 ⟹ 输入 λ 总数不够
+        "HALT_TRUNCATED_PATH",               # 缺窗口 ⟹ 总和不是完整 ΔG
+        "HALT_INVALID_INPUT",                # 身份/输入不一致
+    )
+
+    # `bias_status` 六个值混了"还在流程中"（前三）与"已有裁决"（后三）。
+    # 拆开才知道是"在跑"还是"有结论了"。
+    _PHASE = {
+        "unconverged": "WARMUP_LEARN",
+        "calibrated_pending_validation": "WARMUP_VALIDATE",
+        "frozen_validation_indeterminate": "WARMUP_VALIDATE",
+        "converged": "PRODUCTION",
+        "failed": "TERMINAL",
+        "calibrated_validation_failed": "TERMINAL",
+    }
+    # f_k 证据 → verdict 词汇表。**三值不够**：只有 PASS/FAIL 时，"FAIL 但有预算
+    # → 再测一次"会退化成重试到碰巧通过。有统计功效的否决必须立刻换 Epoch。
+    # ⚠️ 低支撑**永远不是 FAIL**。"尚不可测"（INSUFFICIENT_DATA / HARD_INSUFFICIENT）
+    # 加预算；FAIL（STATISTICALLY_REJECTED）换 Epoch。混起来会退化成"再测一次直到
+    # 碰巧通过"。`ANALYSIS_ELIGIBLE` 只表示**可以进入分析**，不是通过验收 ——
+    # 最终 PASS 还要 endpoint CI、block 稳定性、全路径完整性。
+    _VERDICT = {
+        "verified": "VALID_PASS",
+        "calibrated": "INSUFFICIENT_DATA",
+        "indeterminate": "INSUFFICIENT_DATA",
+        "refuted": "STATISTICALLY_REJECTED",
+        "none": "INSUFFICIENT_DATA",
+    }
+
+    def __init__(
+        self,
+        run_dir: str,
+        stage_name: str = "vanishing",
+        stage_type: str = "vdw",
+        *,
+        min_states_per_window: Optional[int] = None,
+        max_states_per_window: Optional[int] = None,
+        max_path_insertions: Optional[int] = None,
+        allow_untrusted_stage_results: bool = False,
+    ):
+        self.run_dir = os.path.abspath(run_dir)
+        self.stage_name = str(stage_name)
+        self.stage_type = str(stage_type)
+        # 🔑 lo/hi **默认从 run 自己的 run_provenance.json 读**，不要求调用方记得传。
+        # 手动传错的后果很实在：可拆区间是 [2lo−1, 2hi−1]，4/5 是 7..9、4/8 是
+        # 7..15，判出来的"可不可行"会完全不同。run 自己记了它跑的是什么，就用那个。
+        _cfg = (self._json(os.path.join(self.run_dir, "run_provenance.json")) or {}).get("config") or {}
+        self.config_source = "run_provenance.json" if _cfg else "caller/default"
+        self.lo = int(min_states_per_window if min_states_per_window is not None
+                      else _cfg.get("stage2_window_min_states", 4))
+        self.hi = int(max_states_per_window if max_states_per_window is not None
+                      else _cfg.get("stage2_window_max_states", 5))
+        self.max_path_insertions = int(
+            max_path_insertions if max_path_insertions is not None
+            else _cfg.get("max_path_insertions", 3)
+        )
+        self.allow_untrusted = bool(allow_untrusted_stage_results)
+        self.stage_dir = os.path.join(self.run_dir, self.stage_name)
+        # 🔑 **多采样段有自己的 checkpoint 命名空间。** 约定见
+        # `abfe_pipeline._recalibrate_fk_and_resample_segment`：
+        #   段输出目录 = f"{stage_dir}_{segment_index}"       → `vanishing_2`
+        #   段 checkpoint = checkpoints/f"segment_{index}"     → `checkpoints/segment_2`
+        # 读错子目录的后果很具体：段 2 会读到段 1 的 ibs_state，把段 1 的
+        # frozen_validation_cumulative_steps（实测 205000）当成段 2 的
+        # （真值 0）报出来。路径版本链仍在顶层 checkpoints（λ 路径是全局的）。
+        _base_ckpt = os.path.join(self.run_dir, "checkpoints")
+        _m = re.match(r"^(.+)_(\d+)$", self.stage_name)
+        self.segment_index = int(_m.group(2)) if _m else None
+        self.checkpoint_dir = (
+            os.path.join(_base_ckpt, f"segment_{self.segment_index}")
+            if self.segment_index is not None else _base_ckpt
+        )
+        self.path_checkpoint_dir = _base_ckpt
+
+    # ---------------------------------------------------------------- 读盘
+
+    @staticmethod
+    def _json(path: str) -> Optional[Dict[str, Any]]:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return None
+
+    def _read_path(self) -> Dict[str, Any]:
+        """λ 路径版本 + 演化事件计数。事件必须数**整条链**，那才是跨 resume 的
+        累计轮数（`_run_stage2_with_path_evolution` 的 rounds_done 同口径）。"""
+        # λ 路径是**全局**的（不分段），版本链永远在顶层 checkpoints。
+        _pd = self.path_checkpoint_dir
+        cur = self._json(os.path.join(_pd, "path_current.json")) or {}
+        version = cur.get("version")
+        record = None
+        if version is not None:
+            record = self._json(
+                os.path.join(_pd, "path_versions", f"v{int(version)}.json")
+            )
+        events: Dict[str, int] = {}
+        for vf in sorted(glob.glob(os.path.join(_pd, "path_versions", "v*.json"))):
+            kind = (self._json(vf) or {}).get("kind")
+            if kind:
+                events[kind] = events.get(kind, 0) + 1
+        ranges = (record or {}).get("window_ranges")
+        return {
+            "version": version,
+            "events": events,
+            "n_states": len((record or {}).get("states", [])) or None,
+            "window_ranges": [tuple(int(x) for x in r) for r in ranges] if ranges else None,
+        }
+
+    def _read_stage_result(self) -> Optional[Dict[str, Any]]:
+        """stage 级结果（含生产质量门、缺窗口清单）。**只在 stage 跑完才存在。**"""
+        for f in sorted(glob.glob(os.path.join(self.path_checkpoint_dir, "stage2_*.json"))):
+            d = self._json(f)
+            if isinstance(d, dict) and ("converged" in d or "total_delta_G" in d):
+                return d
+        return None
+
+    def _read_window(self, idx: int) -> Dict[str, Any]:
+        conv = self._json(os.path.join(
+            self.stage_dir, f"dual_window_{idx}_{self.stage_type}_convergence.json"))
+        fail = self._json(os.path.join(
+            self.stage_dir, f"dual_window_{idx}_{self.stage_type}_warmup_failure.json"))
+        state = self._json(os.path.join(
+            self.checkpoint_dir, f"ibs_state_{self.stage_type}_window_{idx}.json"))
+        lam = (conv or {}).get("lambdas_vdw") or (state or {}).get("lambdas_vdw") or []
+        warm = (conv or {}).get("bias_warmup") or (fail or {}).get("bias_warmup") or fail or {}
+        ledger = warm.get("warmup_budget_ledger") or {}
+        # 🔑 [P2-9a+ / 老板第 3 条] **warmup 剖面是一等证据** ——
+        # 「哪个窗弱，就可以提前增加采样了」。上一跑的实测支持这条：两个
+        # occupancy 塌的窗口正是 coverage_ess 最低的两个，而 win3 拿到 2× 预算活了、
+        # win0 拿默认 1× 死了（去相关后只剩 6 帧）。win3/win4 那 2×/4× 是上一轮
+        # rescue **事后**补的，不是按 warmup 信号**提前**给的 —— 所以 win0 从来没
+        # 进过那个名单。⟹ 生产预算本可以在**生产开始之前**按该窗口自己的剖面配。
+        # ⚠️ 这里**只落盘 + 只排序，不给公式**：五个点不足以定"coverage_ess < X
+        # 就给 N× 预算"，拍一个就是引入未验证阈值（同 P3-9c 那条线）。
+        gate = (warm.get("local_mbar_loose_gate") or {}).get("last") or {}
+        # [P2-9c] 窗口跑完那一刻的自检：它自己的去相关帧数够不够。
+        # 与 `solve_stage_integrated` 判跳过用的**同一个量**（energies + 门槛 10），
+        # 只是提前到窗口刚跑完就算。**只报告**，不改预算、不碰放行判据。
+        selfchk = self._json(os.path.join(
+            self.stage_dir, f"dual_window_{idx}_{self.stage_type}_self_support.json"
+        )) or {}
+        bias_status = (state or {}).get("bias_status")
+        evid = (state or {}).get("f_k_evidence_status")
+        spent = (
+            sum(int(ledger.get(k, 0) or 0) for k in
+                ("learning_steps", "freeze_burn_in_steps", "frozen_validation_steps"))
+            if ledger else None
+        )
+        cap = ledger.get("cumulative_cap_steps") if ledger else None
+        prod = (conv or {}).get("cumulative_production_steps")
+        if prod is None:
+            prod = (conv or {}).get("actual_production_steps")
+        return {
+            "window_idx": idx,
+            "has_convergence": conv is not None,
+            "has_warmup_failure": fail is not None,
+            "n_states": len(lam) or None,
+            "lambda_span": (max(lam) - min(lam)) if lam else None,
+            "bias_status": bias_status,
+            "phase": (
+                # 身份对不上时，盘上的 converged 不算数 —— 那是另一个系综的结论。
+                "IDENTITY_MISMATCH"
+                if (
+                    (state or {}).get("stage_protocol_key") is not None
+                    and (conv or {}).get("stage_protocol_key") is not None
+                    and (state or {}).get("stage_protocol_key")
+                    != (conv or {}).get("stage_protocol_key")
+                )
+                else self._PHASE.get(bias_status or "", "UNKNOWN")
+            ),
+            "f_k_evidence_status": evid,
+            "verdict": self._VERDICT.get(evid or "", "INSUFFICIENT_DATA"),
+            "last_failure_reason": (state or {}).get("last_failure_reason"),
+            "last_gate_error": warm.get("last_gate_error") or (fail or {}).get("last_gate_error"),
+            "best_effort_acceptance": bool(warm.get("best_effort_acceptance")),
+            "best_effort_reason": warm.get("best_effort_acceptance_reason"),
+            "bias_update_count": warm.get("bias_update_count"),
+            # warmup 剖面（只报告；预算映射未定，见 PLAN P3）
+            "warmup_g": gate.get("statistical_inefficiency"),
+            "warmup_n_frames_used": gate.get("n_frames_used"),
+            "warmup_min_absolute_ess": gate.get("min_absolute_ess"),
+            "warmup_min_ess_ratio": gate.get("min_ess_ratio"),
+            "warmup_max_adjacent_delta_kJ_mol": gate.get("max_adjacent_delta_kJ_mol"),
+            "warmup_gate_threshold_kJ_mol": gate.get("gate_threshold_kJ_mol"),
+            # 生产后自检（P2-9c）
+            "self_n_frames_decorrelated": selfchk.get("n_frames_decorrelated"),
+            "self_min_frames": selfchk.get("min_frames_per_window"),
+            "self_sufficient": selfchk.get("sufficient"),
+            "self_verdict": selfchk.get("verdict"),
+            # 为什么是这个 verdict：solver_eligibility / min_n_eff_over_g /
+            # top1pct_veto。三者补救方向都是加采样，但归因不同，对账时要分得开。
+            "self_verdict_source": selfchk.get("verdict_source"),
+            "self_frames_short_by": selfchk.get("frames_short_by"),
+            # 验收量：N_eff,k / g_k（未抽稀帧上逐目标态 support ÷ 时间自相关）。
+            # ⚠️ occupancy **不是**验收判据 —— 它是 f_k 的训练目标；win1 段1 的
+            # occupancy_collapsed=True 但支撑健康，是实测假阳性。
+            "min_n_eff_over_g": selfchk.get("min_n_eff_over_g"),
+            # 生产侧累计 f_k 偏差（scope=production），由 solve_stage_integrated 落在
+            # stage 结果的 `cumulative_fk_residual_production` 里。
+            "cum_fk_span": None, "cum_fk_verdict": None,  # 在 read() 里按窗口填
+            "worst_state_by_n_eff": selfchk.get("worst_state_by_n_eff"),
+            # 早判：边际 N_eff 断崖（比固定节奏更准，实测脱轨点跨 4.5 倍）
+            "derail_at_trajectory_fraction": selfchk.get("derail_at_trajectory_fraction"),
+            "derailment_status": selfchk.get("derailment_status"),
+            "derail_block_index_single_block": selfchk.get("derail_block_index_single_block"),
+            # 身份：state 里持久化的采样身份 vs 本窗产物的身份。
+            # 不一致 ⟹ 盘上那个 bias_status=converged 是**另一个系综**的旧结论，
+            # 控制器不得据此报"已在生产"（同僚今天真机踩到过：能量缓存因身份不符
+            # 被拒、整窗重采，而 bias_converged=True 照样粘过去）。
+            "state_protocol_key": (state or {}).get("stage_protocol_key"),
+            "product_protocol_key": (conv or {}).get("stage_protocol_key"),
+            "n_eff_marginal_by_block": selfchk.get("n_eff_marginal_by_block"),
+            "warmup_steps_spent": spent,
+            "warmup_steps_cap": cap,
+            "warmup_steps_left": (
+                max(0, int(cap) - int(spent)) if (cap and spent is not None) else None
+            ),
+            # [2026-09-12] 验证**可达性**预检的原料。同一候选、连续数据上的
+            # 多个检查点（`insufficient_attempts` 每次都记一个 g），用来算保守
+            # 下界 g_L；再配上 T / Ncap / 剩余预算就能判"在算术上还可不可能"。
+            "validation_indeterminate": warm.get("validation_indeterminate"),
+            "validation_g_checkpoints": [
+                float(x) for x in (
+                    warm.get("validation_g_history")
+                    or [(warm.get("validation_indeterminate") or {}).get(
+                        "statistical_inefficiency")]
+                ) if x
+            ],
+            # 🔑 T = **去相关**帧数下限（触发 insufficient_frames_after_decorrelation
+            # 的那个），不是 `minimum_complete_validation_frames`（原始帧完整性要求）。
+            # 混掉会把 gcrit 算小 20 倍：win4 只差 26% 帧数却被判成差 7.5 倍不可达。
+            # 老产物没落这个字段时回退到常量，绝不回退到 200。
+            "validation_required_frames": (
+                (warm.get("validation_indeterminate") or {}).get(
+                    "decorrelated_frames_required")
+                or _ie_min_frames()
+            ),
+            "validation_completeness_frames_REPORT_ONLY": warm.get(
+                "minimum_complete_validation_frames"),
+            "validation_sample_count": (
+                (warm.get("validation_indeterminate") or {}).get("validation_sample_count")
+            ),
+            "frozen_validation_steps": (state or {}).get("frozen_validation_cumulative_steps"),
+            "frozen_validation_batches": (state or {}).get("frozen_validation_batches_done"),
+            "production_steps": prod,
+            "production_steps_target": (conv or {}).get("n_steps_per_window_effective"),
+            "n_production_segments": len((conv or {}).get("production_segments") or []) or None,
+            "n_frames": ((conv or {}).get("window_data") or {}).get("n_frames"),
+        }
+
+    def _read_single_stage(self) -> Dict[str, Any]:
+        """**单个段**的状态 + 证据 + 剩余预算。只读盘。
+
+        ⚠️ 物理 stage 的决策**不要**直接用它 —— 走 `for_physical_stage()` 的聚合
+        视图，否则同一个 stage 会被当成多个独立 stage 各判一次。
+        """
+        found: List[int] = []
+        for pat, rx in (
+            (f"dual_window_*_{self.stage_type}_convergence.json", r"dual_window_(\d+)_"),
+            (f"dual_window_*_{self.stage_type}_warmup_failure.json", r"dual_window_(\d+)_"),
+        ):
+            for f in glob.glob(os.path.join(self.stage_dir, pat)):
+                m = re.search(rx, os.path.basename(f))
+                if m and int(m.group(1)) not in found:
+                    found.append(int(m.group(1)))
+        # [P2-9a] join λ 两侧支撑：相邻窗口对**共享的那一个 λ** 各自的重要性支撑。
+        # 由 `ibs_engine.join_lambda_two_sided_support` 在每个窗口落盘后自动算并
+        # 落成 `dual_join_{up}_{down}_{type}_support.json`。**只报告、不参与放行。**
+        joins = []
+        for f in sorted(glob.glob(os.path.join(
+            self.stage_dir, f"dual_join_*_{self.stage_type}_support.json"
+        ))):
+            d = self._json(f)
+            if isinstance(d, dict):
+                joins.append(d)
+        joins.sort(key=lambda d: int(d.get("upstream_window", -1)))
+        # [P2-9h] f_k 重标定探针：在 rescue **之前**判"该重标定还是该加帧"。
+        # 位移（`max_adjacent_shift_kJ_mol`）是直接证据，偏斜（top1%）只是症状。
+        fk_probe = self._json(os.path.join(
+            self.path_checkpoint_dir, "stage2_fk_recalibration_probe.json"
+        )) or {}
+        path = self._read_path()
+        expected = len(path["window_ranges"] or []) or None
+        windows = [self._read_window(i) for i in sorted(found)]
+        # 生产侧累计 f_k 偏差在 **stage 结果**里（scope=production），逐窗填回。
+        # ⚠️ 必须在 `stage` 读出来**之后**做 —— 顺序写反过一次，UnboundLocalError。
+        _stage_for_cum = self._read_stage_result()
+        _cum_by_win = {
+            int(x.get("window_index", -1)): x
+            for x in ((_stage_for_cum or {}).get(
+                "cumulative_fk_residual_production") or [])
+        }
+        for _w in windows:
+            _c = _cum_by_win.get(int(_w["window_idx"])) or {}
+            _w["cum_fk_span"] = _c.get("cumulative_residual_span_kJ_mol")
+            _w["cum_fk_verdict"] = _c.get("verdict")
+            _h = self._json(os.path.join(
+                self.stage_dir,
+                f"dual_window_{_w['window_idx']}_{self.stage_type}_heldout.json",
+            )) or {}
+            _w["heldout_verdict"] = _h.get("verdict")
+            _w["heldout_worst_before"] = _h.get("worst_before")
+            _w["heldout_worst_after"] = _h.get("worst_after")
+        stage = self._read_stage_result()
+        # 缺窗口：布局里有、产物里没有。这是"截断的 ΔG"这类失效的直接信号，
+        # 现在只在日志里出现一次 WARN。stage 结果里的 skipped_windows 是另一种
+        # （产物在、但去相关后帧数不足被踢出协方差链），两者都要算进来。
+        missing = [i for i in range(expected) if i not in found] if expected else []
+        skipped = [
+            int(x.get("window_index", -1))
+            for x in ((stage or {}).get("skipped_windows") or [])
+        ]
+        return {
+            "protocol_version": STAGE2_CONTROLLER_PROTOCOL_VERSION,
+            "run_dir": self.run_dir,
+            "stage_name": self.stage_name,
+            "stage_type": self.stage_type,
+            "min_states_per_window": self.lo,
+            "max_states_per_window": self.hi,
+            "config_source": self.config_source,
+            "segment_index": self.segment_index,
+            "checkpoint_dir_used": self.checkpoint_dir,
+            # 插点是有**终身**预算的（rounds_done 从版本链累计，跨 resume 有效）。
+            "path_insertions_done": int(path["events"].get("insert_lambda", 0)),
+            # 尾段重分过几次 —— 崩溃恢复靠它判「已经重分过没有」，
+            # 没有它第二次启动会重新重分、把刚跑的新尾段作废。
+            "tail_repartitions_done": int(path["events"].get("tail_repartition", 0)),
+            "path_insertions_budget": self.max_path_insertions,
+            # 🔑🔑 [2026-09-11 更正] **不许把各窗余量求和当"全局预算"。**
+            #
+            # `cumulative_cap_steps` 是**逐窗**的（实测每窗 955k = max_bias_warmup
+            # 900k + burn-in 5k + 验证预留 50k），**没有任何全局池** ——
+            # 你不能拿 win0 的余额去给 win4 花。求和（实测 4.29M）是个**无意义的量**，
+            # 而且后果严重：它会让"全局还有钱"几乎永真 ⟹ 所有 HALT_BUDGET 都被判成
+            # **路由** ⟹ 主循环**永不终止**。
+            #
+            # 正确口径：
+            #   · 路由/终止用**相关窗口自己的**余量；
+            #   · "全局耗尽"在双层预算（PLAN 第 5 步 F）做出来之前**没有可靠数据源**，
+            #     这里实现成保守占位：**所有**窗口余量都为 0 才算全局耗尽。
+            "per_window_budget_remaining": {
+                int(w["window_idx"]): int(w.get("warmup_steps_left") or 0)
+                for w in windows
+            },
+            "all_windows_budget_exhausted": bool(
+                windows and all(
+                    int(w.get("warmup_steps_left") or 0) <= 0 for w in windows
+                )
+            ),
+            "global_budget_source": (
+                "placeholder: 逐窗 cap，无全局池；双层预算（F）未实现前的保守口径"
+            ),
+            "path_insertions_left": max(
+                0, self.max_path_insertions - int(path["events"].get("insert_lambda", 0))
+            ),
+            "path": path,
+            "n_windows_found": len(windows),
+            "n_windows_expected": expected,
+            "missing_windows": missing,
+            "skipped_windows": skipped,
+            "production_rescue_targets": (stage or {}).get("production_rescue_targets") or {},
+            "stage_converged": (stage or {}).get("converged"),
+            "stage_path_is_complete": (stage or {}).get("path_is_complete"),
+            "stage_total_delta_G": (stage or {}).get("total_delta_G"),
+            "has_stage_result": stage is not None,
+            "joins": joins,
+            "fk_probe": fk_probe,
+            "windows": windows,
+        }
+
+    # ------------------------------------------------------------ 可行性
+
+    def feasible(self, view: Optional[Dict[str, Any]] = None, n_insert: int = 1) -> Dict[str, Optional[str]]:
+        """结构性动作在当前布局下可不可行。
+
+        复用模块级的 `feasible_repair_actions` —— 那条规则
+        （可拆区间 `[2lo−1, 2hi−1]`、溢出槽上界）必须与
+        `insert_lambda_in_failed_ibs_window` 里的守卫**同一份**，不许各写一遍。
+        """
+        view = view or self.read()
+        ranges = view["path"]["window_ranges"]
+        n_states = view["path"]["n_states"]
+        if not ranges or not n_states:
+            return {
+                "insert_lambda": "读不到路径版本链，无法判断布局可行性",
+                "split_tail_window": "读不到路径版本链，无法判断布局可行性",
+            }
+        return feasible_repair_actions(
+            ranges, int(n_states),
+            min_states_per_window=self.lo, max_states_per_window=self.hi,
+            n_insert=int(n_insert),
+        )
+
+    # -------------------------------------------------------------- 决策
+
+    def decide(self, view: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """**纯函数式判断：下一步做什么。** 不执行、不落盘。
+
+        优先级是刻意排的，理由写在每一条里。核心一条：**`UNMEASURED`（没测出来）
+        永远不当 `FAIL`（测出来不合格）用** —— 前者加预算，后者换 Epoch；混起来
+        就会退化成"再测一次直到碰巧通过"。
+        """
+        view = view or self.read()
+        W = view["windows"]
+        feas = self.feasible(view)
+
+        def plan(action, reason, *, exit_=None, windows=None, missing=None,
+                 blocked=None, earliest=None):
+            """⚠️ `blocked` / `earliest` **必须显式传**，不许从闭包里取。
+
+            闭包引用会在**全新运行**上炸 NameError：分支 0（读不到任何窗口）在
+            `earliest` 被构造**之前**就 return，而 `plan()` 里引用了它。
+            而全新运行正是自治系统**必须首先支持**的路径 —— 路径写错只是把它
+            提前暴露出来。默认 None/[] 让每个调用点都能安全地不传。
+            """
+            blocked = list(blocked or [])
+            return {
+                "protocol_version": STAGE2_CONTROLLER_PROTOCOL_VERSION,
+                "action": action,
+                "exit": exit_,
+                "reason": reason,
+                "windows": windows or [],
+                "missing_evidence": missing or [],
+                "feasible_structural_actions": [k for k, v in feas.items() if v is None],
+                "infeasible_structural_actions": {k: v for k, v in feas.items() if v},
+                # 停止标准三维：执行状态 / 证据状态 / 可信级别，三件不同的事。
+                # `allow_untrusted_stage_results` **只能改 trust_level**，
+                # 不得把 evidence_status 改写成 CONVERGED。
+                "execution_status": (
+                    # 只有**真终止**才是 HALTED；路由信号仍然是 IN_PROGRESS ——
+                    # 控制器换个动作继续跑，流水线没有停。
+                    "HALTED" if (exit_ in self.TERMINAL_EXITS and action != "DONE")
+                    else ("COMPLETE" if action == "DONE" else "IN_PROGRESS")
+                ),
+                "evidence_status": self._evidence_status(view, action, exit_),
+                "trust_level": (
+                    "OVERRIDDEN_UNTRUSTED" if self.allow_untrusted else "STATISTICAL_ONLY"
+                ),
+                # **终止 vs 路由**：路由信号必须被主循环消费，不得炸出流水线。
+                # 被上游阻塞的窗口：不是"排队等"，而是**它们的证据前提可能已作废**
+                # （上游重锚会换掉共享态起点 / 末帧 lineage）。
+                "blocked_by_upstream": blocked if windows else [],
+                "blocked_by": (
+                    int(earliest) if (blocked and windows and earliest is not None)
+                    else None
+                ),
+                "terminal": bool(exit_ in self.TERMINAL_EXITS),
+                "routing": bool(exit_ is not None and exit_ not in self.TERMINAL_EXITS),
+                # ⚠️ **只是提示，不是动作。** 影子模式报"按 warmup 剖面谁最弱"，
+                # 好让"提前配预算"这件事先被看见；**不给阈值、不给倍数**，
+                # 剖面→预算的映射是未定项（PLAN P3）。
+                "warmup_weakness_ranking": self._warmup_weakness_ranking(view),
+            }
+
+        # 0) 读不到任何窗口 —— 还没开跑，或者路径/目录给错了。别猜。
+        if not W:
+            return plan(
+                "CONTINUE_WARMUP",
+                f"{self.stage_dir} 下没有任何窗口产物 —— stage 还没开始，或 "
+                "run_dir/stage_name 给错了。",
+                missing=["任一窗口的 convergence/warmup_failure 产物"],
+            )
+
+        # 🔑🔑 [2026-09-11 老板定案] **按因果依赖顺序处理"最早的未解决窗口"**，
+        # **不是**按错误类型设全局优先级、也不是"看见缺窗就补"。
+        #
+        #     for window_idx in stage_order:
+        #         if window is not ANALYSIS_ELIGIBLE:
+        #             return route_this_window(window_idx)
+        #     return RUN_NEXT_MISSING_WINDOW
+        #
+        # 实测 mismatch（replay 基线照出来的）：rep1 里 win3 支撑不足、win4 卡在
+        # local cap，而"缺窗口"分支优先级最高 ⟹ 目标被判成 **win5**，把 win3/win4
+        # 全盖住了。
+        #
+        # **物理理由，不只是调度洁癖**：win3 重锚会产生**新的末帧 / 共享态起点**，
+        # win4 当前的 warmup 属于**旧上游 lineage**。win3 成功之后才谈得上 win4 能
+        # 不能复用；若它的初始化依赖 win3，就得**重新开始 win4**，不能直接接旧 warmup。
+        # （这跟"所有窗口共用同一份起始坐标"是同一件事的两面。）
+        # ⚠️ **三态，不是两态。** 先前写成 `self_verdict != "ANALYSIS_ELIGIBLE"`，
+        # 于是**没有自检产物**的老 run（`self_verdict is None`）里每个窗口都被判成
+        # "未解决" ⟹ earliest 永远是 win0，动作永远落在第一个窗口上。
+        #
+        # "缺证据不是通过"是对的，但**缺证据也不等于「这个窗口有问题」** ——
+        # 它等于「不知道」。对「不知道」的正确动作是**去产出证据**（分析/自检），
+        # 不是重标定。混成一态会让控制器在毫无根据的窗口上换 Epoch。
+        _order = sorted(W, key=lambda x: int(x["window_idx"]))
+
+        def _window_state(x: Dict[str, Any]) -> str:
+            if x.get("phase") in ("IDENTITY_MISMATCH", "TERMINAL"):
+                return "PROBLEM"
+            if x.get("verdict") == "STATISTICALLY_REJECTED":
+                return "PROBLEM"
+            v = x.get("self_verdict")
+            if v in ("HARD_INSUFFICIENT", "INSUFFICIENT_DATA"):
+                return "PROBLEM"
+            if v == "ANALYSIS_ELIGIBLE":
+                return "ELIGIBLE"
+            # 还在预热/验证、或根本没有自检产物 ⟹ 不知道
+            if x.get("phase") in ("WARMUP_LEARN", "WARMUP_VALIDATE"):
+                return "PROBLEM"     # 在跑但没跑完，属于"这个窗口还没解决"
+            return "UNKNOWN"
+
+        _states = {int(x["window_idx"]): _window_state(x) for x in _order}
+        earliest = next(
+            (i for i in sorted(_states) if _states[i] == "PROBLEM"), None
+        )
+        unknown = [i for i in sorted(_states) if _states[i] == "UNKNOWN"]
+        blocked = (
+            [int(x["window_idx"]) for x in _order if int(x["window_idx"]) > earliest]
+            if earliest is not None else []
+        )
+        _window_states = dict(_states)
+
+        def _pick(items, key: Optional[str] = "window_idx"):
+            """**只路由 earliest 这一个窗口**：它不在本分支的候选里就不触发。"""
+            if earliest is None:
+                return []
+            idxs = [int(i) if key is None else int(i[key]) for i in items]
+            return [earliest] if earliest in idxs else []
+
+        # 🔑🔑 [2026-09-11 老板定的决策顺序] 选动作**之前先消费预算可行性**：
+        #
+        #     聚合同一物理 stage 的全部 Segment
+        #     → 找 earliest unresolved window
+        #     → **检查该窗口动作是否有预算**      ← 这一步
+        #     → 按证据选择 RECALIBRATE / PROBE / RESCUE
+        #     → 只有完整前缀全部 eligible，才运行下一个缺失窗口
+        #
+        # 实测 mismatch：`run2/vanishing_2` 在 555k/555k（零余量）时仍被判
+        # `RECALIBRATE_FK` —— 动作可行性没有先消费预算。零预算窗口开新 Epoch
+        # 只会得到一份**永远验不了**的 f_k（win2 连死三次就是这个形状）。
+        if earliest is not None:
+            _no_budget = self._epoch_validation_unaffordable(view, [earliest])
+            if _no_budget:
+                _all_dry = bool(view.get("all_windows_budget_exhausted"))
+                return plan(
+                    "RUN_PRODUCTION",
+                    f"最早未解决的是窗口 {earliest}，但它**付不起新 Epoch 的最低验证"
+                    f"额度**（{_no_budget}）⟹ **任何换 Epoch 的动作都不许启动**。"
+                    "启动之后才发现没预算验，正是 win2 连死三次的形状。"
+                    "低支撑/没预算永远是「尚不可测」，不是 FAIL。",
+                    exit_=("GLOBAL_BUDGET_EXHAUSTED" if _all_dry else "HALT_BUDGET"),
+                    windows=[earliest], blocked=blocked, earliest=earliest,
+                )
+
+        # 1b) **救援已经跑过、仍有窗口被踢出 ⟹ 预算耗尽，不是"结果差一点"。**
+        #     rescue 循环只在两种情况退出：converged，或轮数用完。所以
+        #     "有 rescue 目标 **且** 仍有 skipped_windows" = 轮数用完仍不够。
+        #     此时**必须**落成 HALT_BUDGET + INSUFFICIENT_DATA，**禁止静默缺窗**
+        #     然后把部分和端出去 —— 那正是老板划 ✗ 的结局。
+        _sel = _pick(view["skipped_windows"], key=None)
+        if _sel and view.get("production_rescue_targets"):
+            return plan(
+                "RUN_PRODUCTION",
+                f"窗口 {view['skipped_windows']} 在 rescue 跑过之后**仍然**被踢出"
+                f"协方差链（rescue 目标 {view['production_rescue_targets']}）⟹ "
+                "轮数已用完而支撑仍不足。这是**预算耗尽**，不是终态失败：低支撑永远是"
+                "「尚不可测」（INSUFFICIENT_DATA），不是 FAIL。"
+                "⚠️ **在此之前产出的总和缺窗口，不得当作 ΔG 使用。**"
+                "要继续必须显式增加预算（或按 §4 改走重标定）。",  # noqa: E501
+exit_=(
+                    "GLOBAL_BUDGET_EXHAUSTED"
+                    if view.get("all_windows_budget_exhausted")
+                    # **相关窗口自己**还有钱 ⟹ 路由；它自己没钱但别的窗口有 ⟹
+                    # 仍是路由（可以先去跑别的窗口），只有全部为 0 才终止。
+                    else "HALT_BUDGET"
+                ),
+                windows=_sel,
+                blocked=blocked, earliest=earliest,
+            )
+
+        # 2) f_k 被**有统计功效地**驳回 ⟹ 终态。不许"再测一次"。
+        refuted = _pick([w for w in W if w["verdict"] == "STATISTICALLY_REJECTED"])
+        if refuted:
+            _broke = self._epoch_validation_unaffordable(view, refuted)
+            if _broke:
+                return plan(
+                    "RUN_PRODUCTION",
+                    f"窗口 {refuted} 的 f_k 被驳回、本该重标定，但**付不起新 Epoch 的"
+                    f"最低验证额度**（{_broke}）⟹ **不启动重标定**。"
+                    "启动之后才发现没预算验，正是 win2 连死三次的形状："
+                    "循环一次都没进、却被标成「f_k 不收敛」。"
+                    "低支撑/没预算永远是「尚不可测」，不是 FAIL。",
+exit_=(
+                    "GLOBAL_BUDGET_EXHAUSTED"
+                    if view.get("all_windows_budget_exhausted")
+                    # **相关窗口自己**还有钱 ⟹ 路由；它自己没钱但别的窗口有 ⟹
+                    # 仍是路由（可以先去跑别的窗口），只有全部为 0 才终止。
+                    else "HALT_BUDGET"
+                ),
+                    windows=refuted,
+                    blocked=blocked, earliest=earliest,
+                )
+            return plan(
+                "RECALIBRATE_FK",
+                f"窗口 {refuted} 的 f_k 证据是 refuted（有统计功效的否决）⟹ 必须换 "
+                "Epoch 重标定，**不能**再加验证预算。"
+                "⚠️ 注意现状：这条路径在代码里抛 IBSFrozenCalibrationValidationError，"
+                "而**全仓库没有任何 except 捕获它** —— 现在会直接炸穿整个 run。",
+                exit_="HALT_FK_REFUTED", windows=refuted,
+            )
+
+        # 3) 还在预热、且预算有余 ⟹ 继续（学习或验证，按 phase 分）。
+        #    这是 UNMEASURED 的正确回应：加同类预算，**不换轴**。
+        warming = [w for w in W if w["phase"] in ("WARMUP_LEARN", "WARMUP_VALIDATE")]
+        with_budget = [w for w in warming if (w["warmup_steps_left"] or 0) > 0]
+
+        # 3a) **批次上限打满、但全局预算还有钱** ⟹ 这不是 HALT_BUDGET。
+        #     老板定的口径：`LOCAL_VALIDATION_CAP_EXHAUSTED`，
+        #     evidence = INSUFFICIENT_DATA，**不是** F_K_REFUTED（没有任何证据
+        #     驳回这份 f_k，只是这一轮没测出来）。
+        #     处置（老板给的，win4 是第一个真实用例）：
+        #       · **不扩大旧 warmup ladder**（15 批上限不动）
+        #       · 进 `PROVISIONAL_PRODUCTION`，**不是可信 PASS**
+        #       · **只给一个 +250k 诊断块**
+        #       · 块后立即判：N_eff/g 明显增长并达到 10 → 继续；
+        #         边际停滞/下降 或 far-end support 单调塌陷 → 关闭 Epoch、tail rewindow；
+        #         top1% 灾难性集中 → 停止同分布加帧
+        #     ⚠️ 实测块大小：win4 现在 N/g=4.19，+250k ≈ 1369 帧 ⟹ N/g ≈ 9.6，
+        #     **恰好达不到 10**。这不是坏事 —— 它让这一块成为**决定性诊断**：
+        #     g 若真已平台会稳步走到 ~9.6（再给一块即可）；g 若继续涨会明显低于 9.6
+        #     （转 tail rewindow）。两种结局数值上分得很开。
+        #     **别因为"差一点到 10"就自作主张给 +500k。**
+        try:
+            import ibs_engine as _ie_caps
+            _batch_cap = int(_ie_caps.IBS_LOCAL_MBAR_GATE_MAX_BATCHES)
+        except Exception:
+            _batch_cap = None
+        _cap_hit = [
+            w for w in with_budget
+            if _batch_cap is not None
+            and (w.get("frozen_validation_batches") or 0) >= _batch_cap
+        ]
+        # ── 验证**可达性**预检：在剩余预算内还有没有可能凑够去相关帧数 ──────
+        # ⚠️ 边界很重要。2026-09-11 已经否决过「周期**内**按 n_eff 外推提前判死」
+        # （见 ibs_engine 那段：g 只在 N ≫ τ 后才稳，区间内外推会把本来能测出来的
+        # 窗口提前判死）。这里**不违反**那条：
+        #   · 判定发生在**周期用尽之后**，决定要不要开**下一个**周期，不掐断本周期；
+        #   · `g_L` 取多检查点最小值，不是外推；
+        #   · 而且 g 还在随 N 涨这件事**加强**不可达的结论 —— 真 g ≥ 实测 g，
+        #     需要的帧数只会更多，缺口只会更大。
+        # ⚠️⚠️ **只改路由，不改 verdict**：证据仍是 UNMEASURED，绝不变成 REJECTED，
+        # 也绝不仅凭高 g 去插 λ / 拆窗。
+        _unreach = []
+        for w in _cap_hit:
+            gs = w.get("validation_g_checkpoints") or []
+            T = w.get("validation_required_frames")
+            ncap = w.get("validation_sample_count")
+            left = w.get("warmup_steps_left")
+            if not gs or not T or not ncap or left is None:
+                continue
+            r = _ie_reach(
+                gs,
+                required_decorrelated_frames=int(T),
+                cycle_frame_cap=int(ncap),
+                budget_remaining_steps=int(left),
+                frames_already=int(ncap),
+            )
+            if r.get("verdict") == "UNREACHABLE":
+                _unreach.append((w, r))
+        _un_sel = _pick([w for w, _ in _unreach])
+        if _un_sel:
+            _w, _r = next((w, r) for w, r in _unreach
+                          if int(w["window_idx"]) in _un_sel)
+            _wi = int(_w["window_idx"])
+            _relearned = relearn_epoch_used(
+                self.checkpoint_dir, int(view.get("path_version") or 0), _wi)
+            _need = int(_r["projected_steps_needed"])
+            _why = (
+                f"窗口 {_un_sel} 的冻结验证在剩余预算内**算术上不可达**："
+                f"g 检查点 {[round(x, 1) for x in _r['g_measurements']]} ⟹ "
+                f"保守下界 g_L={_r['g_lower_bound']:.1f}，"
+                f"而本周期阈值 gcrit_cycle={_r['gcrit_cycle']:.2f}、"
+                f"整预算阈值 gcrit_budget={_r['gcrit_budget']:.2f}。"
+                f"凑够 {int(_r['required_decorrelated_frames'])} 个去相关帧需要约 "
+                f"{int(_r['projected_raw_frames_needed'])} 原始帧 = {_need} 步，"
+                f"剩余仅 {_w.get('warmup_steps_left')} 步。"
+                "⚠️ 这是**预算**结论不是 f_k 结论：证据仍是 UNMEASURED，"
+                "**不得**改写成 REJECTED，**不得**因此插 λ / 拆窗，"
+                "**也不得**因为高 g 就接受一份未验证的 f_k。"
+            )
+            if not _relearned:
+                return plan(
+                    "RELEARN_FK_EPOCH",
+                    _why + "处置：这个窗口还没用过那**唯一一次**替代候选 ⟹ "
+                    "开一个全新 Epoch，从头 LEARN 一份 f_k（不是拿旧生产帧重解）。",
+                    exit_="HALT_VALIDATION_BUDGET_UNREACHABLE", windows=_un_sel,
+                )
+            return plan(
+                "DONE",
+                _why + "处置：替代候选**已经用过一次**（一个窗口只给一次，"
+                "否则就是反复试到偶然通过）⟹ NO_FEASIBLE_ACTION，"
+                "留完整诊断终止。",
+                exit_="NO_FEASIBLE_ACTION", windows=_un_sel,
+            )
+
+        _cap_sel = _pick(_cap_hit)
+        if _cap_sel:
+            _cap_hit = [w for w in _cap_hit if int(w["window_idx"]) in _cap_sel]
+            _idx = _cap_sel
+            return plan(
+                "RUN_PRODUCTION",
+                f"窗口 {_idx} 的单周期验证**批次上限**已打满"
+                f"（{[w.get('frozen_validation_batches') for w in _cap_hit]}/{_batch_cap} 批），"
+                f"而全局预算**还有钱**（剩 {[w.get('warmup_steps_left') for w in _cap_hit]} 步）"
+                " ⟹ 这是 `LOCAL_VALIDATION_CAP_EXHAUSTED`，**不是 HALT_BUDGET、"
+                "更不是 F_K_REFUTED**（没有任何证据驳回这份 f_k，只是这一轮没测出来）。"
+                "处置：**不扩大 15 批上限**；进 PROVISIONAL_PRODUCTION（**不是可信 PASS**）；"
+                "**只给一个 +250k 诊断块**，块后立即用 N_eff/g 的**边际增长**判 —— "
+                "达到 10 则继续；边际停滞/下降或 far-end support 单调塌陷则关闭 Epoch 走 "
+                "tail rewindow；top1% 灾难性集中则停止同分布加帧。"
+                "⚠️ 一块 +250k 预计到 N/g≈9.6、**恰好达不到 10**，这是有意的诊断设计，"
+                "**别因此改成 +500k**。"
+                "⚠️⚠️ **前提：当前布局不会被重分。** 若尾段即将 tail-only 重分，"
+                "这一块就是在**即将作废的布局上取证** —— 应**先重分再取证**，"
+                "把预算留给新尾段。",
+                exit_="HALT_LOCAL_VALIDATION_CAP", windows=_idx,
+            )
+
+        _wb_sel = _pick(with_budget)
+        if _wb_sel:
+            with_budget = [w for w in with_budget if int(w["window_idx"]) in _wb_sel]
+            idxs = _wb_sel
+            return plan(
+                "CONTINUE_WARMUP",
+                f"窗口 {idxs} 仍在 "
+                f"{sorted({w['phase'] for w in with_budget})}，且 warmup 预算有余"
+                f"（剩 {[w['warmup_steps_left'] for w in with_budget]} 步）。"
+                "证据是 INSUFFICIENT_DATA（没测出来），不是 FAIL —— 加同类预算，不换轴。",
+                windows=idxs,
+                blocked=blocked, earliest=earliest,
+            )
+
+        # 4) 预热预算耗尽、仍未收敛 ⟹ 需要归因。而归因要的三个量
+        #    （逐态 g 剖面 / mixture coverage / 逐边 δ）本控制器**不算数**，
+        #    只在 stage 结果里才有。没有就如实说"归因不出来"。
+        stuck = [w for w in warming if not (w["warmup_steps_left"] or 0) > 0]
+        _st_sel = _pick(stuck)
+        if _st_sel:
+            idxs = _st_sel
+            if not view["has_stage_result"]:
+                return plan(
+                    "CONTINUE_WARMUP",
+                    f"窗口 {idxs} 的 warmup 预算已耗尽且未收敛，但 stage 结果还没落盘 ⟹ "
+                    "归因需要的逐态 g 剖面 / mixture 覆盖度 / 逐边 δ 一个都读不到。"
+                    "**归因不出来是合法结局**，不许为了凑一个动作而编理由。"
+                    "要继续必须显式升档 warmup 预算，或先把 stage 分析跑完。",
+                    # [老板] 只有三种允许终止 ⟹ "归因不出来"本身**不是**终止条件。
+                    # 全局还有预算、或还有可行动作时，它是**路由信号**：主循环应该
+                    # 去跑最小诊断动作（tail-only 重分 / +250k 诊断块）。
+                    # 真的无路可走才 NO_FEASIBLE_ACTION。
+                    exit_=(
+                        "HALT_NO_ATTRIBUTION"
+                        if (not view.get("all_windows_budget_exhausted")
+                            or any(v is None for v in feas.values()))
+                        else "NO_FEASIBLE_ACTION"
+                    ),
+                    windows=idxs,
+                    missing=["stage2_*.json（逐窗 overlap/ESS 诊断）",
+                             "逐态 statistical_inefficiency 剖面",
+                             "逐边热力学长度 δ"],
+                )
+            return plan(
+                "INSERT_LAMBDA" if feas.get("insert_lambda") is None else "RECALIBRATE_FK",
+                f"窗口 {idxs} 的 warmup 预算已耗尽且未收敛。按 PLAN §3ter.4，窗口级"
+                "缺陷的对症动作依次是：重标定 f_k → 仍压不住则补 λ 缩跨度（model B）。"
+                + ("" if feas.get("insert_lambda") is None
+                   else f" ⚠️ 补 λ 当前不可行：{feas['insert_lambda']}"),
+                exit_=None if feas.get("insert_lambda") is None else "HALT_LAMBDA_BUDGET_INSUFFICIENT",
+                windows=idxs,
+                blocked=blocked, earliest=earliest,
+            )
+
+        # 5) 生产帧没攒够 ⟹ 接着跑（同一个 f_k、接着原段，不改任何结构）。
+        short = [
+            w for w in W
+            if w["production_steps_target"] and (w["production_steps"] or 0)
+            < int(w["production_steps_target"])
+        ]
+        _sh_sel = _pick(short)
+        if _sh_sel:
+            short = [w for w in short if int(w["window_idx"]) in _sh_sel]
+            idxs = _sh_sel
+            return plan(
+                "RUN_PRODUCTION",
+                f"窗口 {idxs} 的生产步数未达目标"
+                f"（{[(w['production_steps'], w['production_steps_target']) for w in short]}）。"
+                "同一个冻结 f_k、接着原段继续，不改结构、不丢已有帧。",
+                windows=idxs,
+                blocked=blocked, earliest=earliest,
+            )
+
+        # 5a) **f_k 明确不符 ⟹ 先重标定，不要先加帧。**
+        #     PLAN §4：「I 与 II 之间**不排序**：按判别结果直接选类型，不做『先便宜
+        #     后贵』的阶梯（证据表明 f_k 明显不符时先加帧是浪费）」。
+        #     加帧治不了偏斜是仓库自己的结论，本轮实测复现（win0 250k→1M：
+        #     N_decorrelated 40→182 变好，但 ESS_ratio 0.037→0.0264、
+        #     top1% 0.545→0.604 **变差**）。
+        #     ⚠️ 这一条**故意排在 5b/6（加帧）之前** —— 生产代码现在的顺序是
+        #     "rescue 加帧两轮之后才重标定"，所以影子在这里会与生产分歧，
+        #     那正是要被记录下来的对账数据。
+        # 0b) **身份不一致**：盘上的 converged 是另一个系综的结论，不得当依据。
+        _stale = _pick([w for w in W if w.get("phase") == "IDENTITY_MISMATCH"])
+        if _stale:
+            return plan(
+                "CONTINUE_WARMUP",
+                f"窗口 {_stale} 的 `stage_protocol_key` 在 ibs_state 与产物之间不一致 ⟹ "
+                "盘上那个 `bias_status=converged` 是**另一个系综**的旧结论，"
+                "不得据此声称已在生产。λ / Hamiltonian / box / 规范版本任一变化，"
+                "旧 PASS 都不能继续粘住。",
+                exit_="HALT_INVALID_INPUT", windows=_stale,
+            )
+
+        # 5a-0) **SUSPECTED_DERAILMENT（单块）⟹ 只做非变异的候选计算，不切换。**
+        #   老板定案：单块只产生"疑似"，触发廉价诊断；**连续两块**才允许关闭 Epoch。
+        #   ⚠️ 而且在 **held-out 反事实验收**接好之前，单块**一律不得**升级成真重标定 ——
+        #   否则就是"因一个震荡低块贸然切换到更差的 f_k"（win1 已经吃过这个亏）。
+        #   held-out 验收目前**未实现**，所以这一档现在只能到"算候选 + 报告"为止。
+        _suspected = _pick([
+            w for w in W
+            if w.get("derailment_status") == "SUSPECTED_DERAILMENT"
+        ])
+        _confirmed = [
+            w["window_idx"] for w in W
+            if w.get("derailment_status") == "CONFIRMED_DERAILMENT"
+        ]
+        if _suspected and not _confirmed:
+            return plan(
+                "PROBE_CANDIDATE_FK",
+                f"窗口 {_suspected} 单块边际 N_eff 低于前半程中位数 1/4 ⟹ "
+                "**SUSPECTED_DERAILMENT**：启动廉价的**非变异**诊断（离线算候选 f_k 并评估），"
+                "**不关闭 Epoch、不切换 f_k**。只有连续两块才允许进入动作决策。"
+                "⚠️ 并且 held-out 反事实验收（候选必须在未参与拟合的 block 上改善"
+                "最差态 N_eff/g）**尚未实现**，所以这一档现在到「算候选 + 报告」为止 —— "
+                "在它接通之前，单块预警不得升级成真重标定。",
+                windows=_suspected,
+                missing=["held-out 反事实验收（候选是否真的改善最差态 N_eff/g）"],
+            )
+
+        _probe = view.get("fk_probe") or {}
+        _recal = _pick(
+            [int(x) for x in (_probe.get("recalibration_recommended_windows") or [])],
+            key=None,
+        )
+        if _recal:
+            _broke = self._epoch_validation_unaffordable(view, _recal)
+            if _broke:
+                return plan(
+                    "RUN_PRODUCTION",
+                    f"探针判定窗口 {_recal} 该重标定，但**付不起新 Epoch 的最低验证"
+                    f"额度**（{_broke}）⟹ **不启动**。没钱验证就别开新 Epoch —— "
+                    "那会得到一份永远验不了的 f_k（win2 三次都是这么死的）。",
+exit_=(
+                    "GLOBAL_BUDGET_EXHAUSTED"
+                    if view.get("all_windows_budget_exhausted")
+                    # **相关窗口自己**还有钱 ⟹ 路由；它自己没钱但别的窗口有 ⟹
+                    # 仍是路由（可以先去跑别的窗口），只有全部为 0 才终止。
+                    else "HALT_BUDGET"
+                ),
+                    windows=_recal,
+                    blocked=blocked, earliest=earliest,
+                )
+            return plan(
+                "RECALIBRATE_FK",
+                f"f_k 探针判定窗口 {_recal} 的相邻位移超过 "
+                f"{_probe.get('min_adjacent_shift_kJ_mol')} kJ/mol ⟹ **先重标定 f_k，"
+                "不要先加帧**（PLAN §4：f_k 明显不符时先加帧是浪费；加帧只会往同一个"
+                "偏斜分布里加更多帧，绝对样本数涨、ESS 比值不动）。"
+                "⚠️ 生产代码当前把重标定挂在 rescue 两轮**之后**"
+                "（`stage2_recalibrate_f_k_on_rescue`），所以此处与生产分歧 —— "
+                "这是影子要记录的对账点，不是控制器在开车。",
+                windows=_recal,
+                blocked=blocked, earliest=earliest,
+            )
+
+        # 5a-1) **支撑不足时，先判累计 f_k 偏差，不要先加帧。**
+        #   老板给的路径第一步就是「win3 支撑不足 → **判断累计 f_k 偏差** → 生成候选」。
+        #   而"已经脱轨就禁止继续加帧"也是同一条：加帧治不了 f_k 偏斜
+        #   （实测 250k→1M 让 top1% 从 0.545 涨到 0.762）。
+        #   证据缺失时的正确动作是**把证据做出来**（跑分析落 cumulative 残差），
+        #   不是先烧 250k 去加帧再说。
+        _need_cum = [
+            w["window_idx"] for w in W
+            if earliest is not None and int(w["window_idx"]) == earliest
+            and w.get("self_verdict") in ("HARD_INSUFFICIENT", "INSUFFICIENT_DATA")
+            and w.get("cum_fk_verdict") is None
+        ]
+        if _need_cum:
+            return plan(
+                "ANALYZE",
+                f"窗口 {_need_cum} 支撑不足，但**累计 f_k 偏差证据还不存在**"
+                "（`cumulative_fk_residual_production` 缺失）⟹ 先把它算出来，"
+                "**不要先加帧**：加帧治不了 f_k 偏斜（实测 250k→1M 让 top1% 从 "
+                "0.545 涨到 0.762、ESS 比值反而变差），而累计偏差判据在**现有帧上**"
+                "就能算，零额外采样。",
+                windows=_need_cum, blocked=blocked, earliest=earliest,
+                missing=["cumulative_fk_residual_production（生产侧累计 f_k 残差）"],
+            )
+
+        # 5a-2) **累计 f_k 偏差已判 ⟹ 按 held-out 的三种结局分岔。**
+        #   老板给的链：判累计偏差 → 生成候选 → **held-out 可测则验收** →
+        #   **不可测则自动开 PROBE_REANCHOR_EPOCH** → 支撑改善则继续 →
+        #   **不改善则自动 tail-repartition / 插 λ**。
+        #   三种结局的处置**互不相同**，混起来就回到"用支撑换占据"那个老错：
+        #     ACCEPT     → 换 Epoch（候选确实在未参与拟合的块上改善了最差态）
+        #     UNMEASURED → **不是拒绝**，是"判不了" ⟹ 开有界的 PROBE_REANCHOR_EPOCH
+        #                  拿独立证据；**绝不回去给旧 f_k 加帧**
+        #     REJECT     → 候选救不了 ⟹ 转布局动作（拆末窗 / 插 λ）
+        _cum_bad = [
+            w for w in W
+            if earliest is not None and int(w["window_idx"]) == earliest
+            and w.get("cum_fk_verdict") in ("FAIL_CUMULATIVE_FK", "UNMEASURED")
+        ]
+        if _cum_bad:
+            _w0 = _cum_bad[0]
+            _hv = _w0.get("heldout_verdict")
+            if _hv == "ACCEPT":
+                return plan(
+                    "RECALIBRATE_FK",
+                    f"窗口 {earliest} 累计 f_k 偏差 span={_w0.get('cum_fk_span')}"
+                    f"（{_w0.get('cum_fk_verdict')}），且候选在 **held-out 连续时间块**上"
+                    f"把最差态 N_eff/g 从 {_w0.get('heldout_worst_before')} 提到 "
+                    f"{_w0.get('heldout_worst_after')}、没伤到健康态 ⟹ **换 Epoch**。",
+                    windows=[earliest], blocked=blocked, earliest=earliest,
+                )
+            if _hv == "REJECT":
+                _feas_split = feas.get("split_tail_window") is None
+                return plan(
+                    "SPLIT_TAIL_WINDOW" if _feas_split else "INSERT_LAMBDA",
+                    f"窗口 {earliest} 累计 f_k 偏差 span={_w0.get('cum_fk_span')}，"
+                    "但候选在 held-out 上**没有改善最差态**（或伤到了健康态）⟹ "
+                    "**f_k 救不了它，转布局动作**。"
+                    + ("拆末窗。" if _feas_split
+                       else f"拆窗不可行（{feas.get('split_tail_window')}）⟹ 插 λ 缩跨度。"),
+                    windows=[earliest], blocked=blocked, earliest=earliest,
+                )
+            # None（还没算）或 UNMEASURED（算了但判不了）：都走有界探针。
+            return plan(
+                "PROBE_REANCHOR_EPOCH",
+                f"窗口 {earliest} 累计 f_k 偏差 span={_w0.get('cum_fk_span')}"
+                f"（{_w0.get('cum_fk_verdict')}），而 held-out 验收"
+                + ("尚未进行" if _hv is None else "判不了（UNMEASURED）")
+                + " ⟹ 开一个**有界的** PROBE_REANCHOR_EPOCH：候选 f_k + 独立 burn-in"
+                " + 一个 +250k 块；新 Epoch 支撑改善才晋升，恶化则拒绝候选、走下一动作。"
+                "⚠️ **绝不回去给旧 f_k 加帧** —— 加帧治不了偏斜，那只会把同一个偏斜"
+                "分布采得更久。",
+                windows=[earliest], blocked=blocked, earliest=earliest,
+            )
+
+        # 5b) 窗口自检已经判出"帧数不够" ⟹ 补采。**这是 (6) 的提前版**：同一个量、
+        #     同一个门槛，只是在该窗口刚跑完那一刻就知道了，不用等全部窗口跑完
+        #     （实测浪费：5×250k=125 万步烧完才做第一次预算判断）。
+        #     verdict 是 INSUFFICIENT_DATA（还没测够）⟹ 加预算，不是换 Epoch。
+        short_self = _pick([w for w in W if w.get("self_sufficient") is False])
+        if short_self:
+            return plan(
+                "RUN_PRODUCTION",
+                f"窗口 {short_self} 的生产后自检判定去相关帧数不足"
+                f"（{[(w.get('self_n_frames_decorrelated'), w.get('self_min_frames')) for w in W if w.get('self_sufficient') is False]}）。"
+                "这不是终态 —— 语义是「这个窗口还需要加采样」（INSUFFICIENT_DATA ≠ FAIL）。"
+                "它们的 checkpoint 此刻还热，补采不作废任何已有帧。",
+                windows=short_self,
+                blocked=blocked, earliest=earliest,
+            )
+
+        # 6) 被踢出协方差链的窗口（去相关后帧数不足）⟹ 补采。
+        #    这条路径以前不可达：被跳过的窗口在生成 overlap 诊断**之前**就 continue 了，
+        #    于是进不了 rescue 候选名单（P0-2b 修的就是这个）。
+        _sk_sel = _pick(view["skipped_windows"], key=None)
+        if _sk_sel:
+            return plan(
+                "RUN_PRODUCTION",
+                f"窗口 {_sk_sel} 去相关后有效帧数不足、被踢出协方差链。"
+                "先补采（同一分布、接着原段）；这是最便宜且不作废任何已有帧的动作。",
+                windows=_sk_sel,
+                blocked=blocked, earliest=earliest,
+            )
+
+        # 6a) 没有任何 PROBLEM，但有窗口**证据缺失**（UNKNOWN）⟹ 先把证据做出来。
+        #     绝不能因为"不知道"就去换 Epoch —— 那是在毫无根据的窗口上烧 GPU。
+        if earliest is None and unknown:
+            return plan(
+                "ANALYZE",
+                f"窗口 {unknown} 没有自检证据（`self_verdict` 不存在）⟹ 状态是"
+                "**UNKNOWN，不是有问题**。对「不知道」的正确动作是**产出证据**"
+                "（跑 stage 分析、落自检产物），不是重标定。"
+                "⚠️ 缺证据同样**不等于通过** —— 在证据补齐之前不得判 DONE。",
+                windows=unknown, blocked=blocked, earliest=earliest,
+                missing=["逐窗自检产物 dual_window_*_self_support.json"],
+            )
+
+        # 6b) **前缀全部合格**之后，才轮到"缺窗口"。它此前是全局最高优先级，
+        #     会把上游未解决的窗口整个盖住（实测把 win3/win4 盖成 win5）。
+        #     缺窗**仍然**是硬约束——缺窗口的和不是 ΔG——只是正确位置在因果顺序之后。
+        if view["missing_windows"]:
+            _next_missing = min(view["missing_windows"])
+            return plan(
+                "RUN_PRODUCTION",
+                f"前缀窗口全部合格；布局里有 {view['n_windows_expected']} 个窗口、"
+                f"产物里只有 {view['n_windows_found']} 个，缺 {view['missing_windows']}。"
+                "**缺窗口的和不是 ΔG，禁止当结果使用**（不是「精度差一点」，是**另一个量**）。"
+                f"按因果顺序先跑 win{_next_missing}。",
+                windows=[_next_missing],
+                blocked=blocked, earliest=earliest,
+            )
+
+        # 7) stage 已判 converged ⟹ 完成。注意 DONE 的含义。
+        if view["stage_converged"] is True:
+            return plan(
+                "DONE",
+                "所有**已定义**的判据都通过了。⚠️ 这不等于答案正确 —— "
+                "STAGE2_ROOT_CAUSE_2026-08-28.md §2「所有收敛门对该失效模式失明」"
+                "仍然有效（该节被其自身的超越声明明确标为仍然有效）。",
+                exit_="DONE_UNTRUSTED" if self.allow_untrusted else "DONE",
+                blocked=blocked, earliest=earliest,
+            )
+
+        # 8) 窗口都跑完了但 stage 没判过 converged ⟹ 只差分析。
+        return plan(
+            "DONE" if view["has_stage_result"] else "ANALYZE",
+            "所有窗口的预热与生产都已完成"
+            + ("，但 stage 判据未通过（converged=%r）——"
+               "需要看 stage 结果里的生产质量门。" % (view["stage_converged"],)
+               if view["has_stage_result"] else
+               "，但 stage 分析还没跑（stage2_*.json 不存在）⟹ 先跑分析。"),
+            exit_=None if view["has_stage_result"] else None,
+            missing=[] if view["has_stage_result"] else ["stage2_*.json"],
+        )
+
+    @staticmethod
+    def first_untrusted_window(view: Dict[str, Any]) -> Optional[int]:
+        """**第一个不可信窗口**的下标 —— tail-only 重分的起点，由控制器自己算。
+
+        [老板] 「当前从 `first_untrusted_window` 开始重分；**不是让用户手选 anchor**。」
+        判据就是主验收量：verdict 不是 `ANALYSIS_ELIGIBLE` 的第一个窗口。
+        （本例是 win3，也是第一个 `min(N_eff/g) < 10` 的 —— 人选的 anchor 恰好同解，
+        但**机制必须是自动的**。）
+        """
+        for w in sorted(view.get("windows") or [], key=lambda x: int(x["window_idx"])):
+            v = w.get("self_verdict")
+            if v is not None and v != "ANALYSIS_ELIGIBLE":
+                return int(w["window_idx"])
+        return None
+
+    def tail_repartition_anchor(self, view: Dict[str, Any]) -> Optional[float]:
+        """`first_untrusted_window` 的**首态** λ —— 它就是与前一窗共享的那个节点。
+
+        冻结的是「anchor 之前」的窗口，所以从**不可信窗口自己的首态**切，
+        才能把这个已知弱的窗口一起重分掉；若从它的**末态**切，会把它永久保留。
+        """
+        idx = self.first_untrusted_window(view)
+        if idx is None or idx <= 0:
+            return None
+        ranges = (view.get("path") or {}).get("window_ranges")
+        lam = None
+        for w in view.get("windows") or []:
+            if int(w["window_idx"]) == idx:
+                lam = w.get("lambda_vdw_hi")
+        if not ranges or idx >= len(ranges):
+            return None
+        return float(lam) if lam is not None else None
+
+    @staticmethod
+    def _epoch_validation_unaffordable(
+        view: Dict[str, Any], windows: Sequence[int]
+    ) -> Optional[Dict[str, Any]]:
+        """**决定重标定之前，先确认新 Epoch 还付得起最低验证额度。**
+
+        [老板定案 F] 预算要拆两本账：
+            global_consumed_budget        永远继承，防止新段白送额度
+            epoch_validation_reservation  每个新候选**单独预留**
+
+        「**没钱验证就不启动重标定**」—— 不能启动动作之后才发现新 f_k 没预算验。
+        win2 **连续三次**死在这：位移触发把它拖进新 Epoch，新 f_k 要过验证门，
+        而账本已经 555000/555000、剩 0，于是循环一次都没进就被标成
+        `f_k 不收敛`（第三个变体：预算为零）。
+
+        最低额度用既有的冻结验证阶梯**第一档**，不新发明阈值。
+        返回 None = 付得起；否则返回一份说明（调用方据此走 HALT_BUDGET）。
+        """
+        try:
+            import ibs_engine as _ie
+            floor = int(_ie.FROZEN_VALIDATION_LADDER_SCHEDULE_STEPS[0])
+        except Exception:
+            return None  # 拿不到阈值就不假装判断（fail-open：只影响诊断）
+        by_idx = {int(w["window_idx"]): w for w in (view.get("windows") or [])}
+        broke = []
+        for i in windows:
+            w = by_idx.get(int(i))
+            if w is None:
+                continue
+            left = w.get("warmup_steps_left")
+            # ⚠️ **预算未知 = 不可行**（fail-closed）。以前 `left is None` 会跳过检查，
+            # 于是"账本读不到"的窗口能一路走到重标定 —— 而真实零预算窗口
+            # （555k/555k）正是这样漏过去的。不知道有没有钱，就不许开新 Epoch。
+            if left is None:
+                broke.append({
+                    "window_idx": int(i), "warmup_steps_left": None,
+                    "min_epoch_validation_reservation": floor,
+                    "reason": "budget_unknown_fail_closed",
+                })
+            elif int(left) < floor:
+                broke.append({
+                    "window_idx": int(i),
+                    "warmup_steps_left": int(left),
+                    "min_epoch_validation_reservation": floor,
+                })
+        if not broke:
+            return None
+        return {
+            "min_epoch_validation_reservation": floor,
+            "windows": broke,
+            "source": "ibs_engine.FROZEN_VALIDATION_LADDER_SCHEDULE_STEPS[0]",
+        }
+
+    @staticmethod
+    def _warmup_weakness_ranking(view: Dict[str, Any]) -> Dict[str, Any]:
+        """按 warmup 剖面给窗口**排序**（谁最可能在生产里撑不住）。
+
+        **刻意只排序、不打分、不给阈值。** 三个口径各排一次、不做加权合成 ——
+        合成就等于凭空发明一个权重。谁在多个口径上都排在最弱端，才是真信号。
+
+        口径与方向：
+          · ``warmup_g``（统计低效率）越大越弱
+          · ``warmup_n_frames_used``（gate 实际用上的去相关帧数）越小越弱
+          · ``warmup_min_absolute_ess`` 越小越弱
+        """
+        W = [w for w in view.get("windows") or []]
+        out: Dict[str, Any] = {
+            "note": ("只排序、不打分、不给阈值；剖面→生产预算的映射未定"
+                     "（PLAN P3）。三个口径不做加权合成。"),
+            "by_metric": {},
+            "weakest_overall": None,
+        }
+        specs = (("warmup_g", True), ("warmup_n_frames_used", False),
+                 ("warmup_min_absolute_ess", False))
+        score: Dict[int, int] = {}
+        for key, bigger_is_worse in specs:
+            vals = [(w["window_idx"], w.get(key)) for w in W if w.get(key) is not None]
+            if not vals:
+                continue
+            vals.sort(key=lambda t: float(t[1]), reverse=bigger_is_worse)
+            out["by_metric"][key] = [
+                {"window_idx": i, "value": float(v)} for i, v in vals
+            ]
+            for rank, (i, _v) in enumerate(vals):
+                score[i] = score.get(i, 0) + rank
+        if score:
+            out["weakest_overall"] = [
+                i for i, _ in sorted(score.items(), key=lambda t: t[1])
+            ]
+        return out
+
+    def _evidence_status(self, view, action, exit_) -> str:
+        """证据状态跟执行状态是两件事。`allow_untrusted` 不得影响这一维。
+
+        [老板定案 I] **缺窗与救援耗尽必须是 `INSUFFICIENT_DATA`，不是含糊的
+        `INCONCLUSIVE`** —— 前者明确说"证据不够、还能补"，后者容易被读成
+        "结果差一点"。禁止部分和冒充结果。
+        """
+        if any(w["verdict"] == "STATISTICALLY_REJECTED" for w in view["windows"]):
+            # REJECTED 优先：它是关于**某份 f_k** 的更强、更具体的结论，
+            # 即便同时还缺预算。
+            return "REJECTED"
+        # 预算耗尽**永远**是"还没测够" —— 老板把 HALT_BUDGET 与
+        # evidence_status=INSUFFICIENT_DATA 绑定。绝不是 FAIL。
+        if exit_ in ("HALT_BUDGET", "HALT_LOCAL_VALIDATION_CAP"):
+            return "INSUFFICIENT_DATA"
+        if view["missing_windows"] or view["skipped_windows"]:
+            return "INSUFFICIENT_DATA"
+        # 任一窗口的主验收量（N_eff/g）判不可分析 ⟹ 整条路径的证据就不够。
+        if any(
+            w.get("self_verdict") in ("HARD_INSUFFICIENT", "INSUFFICIENT_DATA")
+            for w in view["windows"]
+        ):
+            return "INSUFFICIENT_DATA"
+        if view["stage_converged"] is True:
+            return "CONVERGED"
+        return "INCONCLUSIVE"
+
+    # ----------------------------------------------------------- Segment 聚合
+
+    @classmethod
+    def for_physical_stage(
+        cls,
+        run_dir: str,
+        stage_base: str = "vanishing",
+        stage_type: str = "vdw",
+        **kwargs: Any,
+    ) -> "Stage2RepairController":
+        """同一**物理 stage** 的控制器（把 `vanishing` / `vanishing_2` / … 合起来）。
+
+        🔑 [2026-09-11 老板定案] **Segment 不是独立的 stage。**
+        先前每个段各起一个控制器各判一次 ⟹ 同一个物理 stage 出两个互相矛盾的动作，
+        而且 `vanishing_2` 缺 win0 会被判成"缺窗口"，其实 win0 在段 1 里是好的。
+
+        正确顺序的第一步就是它：
+
+            **聚合同一物理 stage 的全部 Segment**
+            → 找 earliest unresolved window
+            → 检查该窗口动作是否有预算
+            → 按证据选择动作
+            → 只有完整前缀全部 eligible，才运行下一个缺失窗口
+
+        本类只在 `read()` 上分叉：聚合视图逐窗取**最新有产物的那个段**的状态
+        （段号大的更新），其余（路径版本链、stage 结果、join、f_k 探针）本来就是
+        全局的，仍从基准 checkpoint 读。
+        """
+        obj = cls(run_dir, stage_base, stage_type, **kwargs)
+        obj._aggregate_segments = True
+        obj._stage_base = str(stage_base)
+        return obj
+
+    def _segment_stage_names(self) -> List[str]:
+        """同一物理 stage 的所有段目录名，按段号升序（基准段在最前）。"""
+        base = getattr(self, "_stage_base", self.stage_name)
+        names = []
+        for d in glob.glob(os.path.join(self.run_dir, base + "*")):
+            if not os.path.isdir(d):
+                continue
+            nm = os.path.basename(d)
+            if nm == base:
+                names.append((0, nm))
+            else:
+                suf = nm[len(base):].lstrip("_")
+                if suf.isdigit():
+                    names.append((int(suf), nm))
+        return [nm for _i, nm in sorted(names)]
+
+    def read_aggregated(self) -> Dict[str, Any]:
+        """把同一物理 stage 的全部段合成**一个**视图。
+
+        合并规则（刻意保守）：
+          · 逐窗取**段号最大且有 convergence 产物**的那份；都没有就取有任何产物的最新一份。
+          · `missing_windows` = 布局里有、但**所有段**都没有的窗口。
+            （先前按单段判，于是段 2 缺 win0 被当成缺窗口 —— 其实段 1 有。）
+          · 路径版本链 / stage 结果 / join / f_k 探针是全局的，从基准 checkpoint 读。
+        """
+        names = self._segment_stage_names() or [self.stage_name]
+        views = []
+        for nm in names:
+            sub = Stage2RepairController(
+                self.run_dir, nm, self.stage_type,
+                min_states_per_window=self.lo, max_states_per_window=self.hi,
+                max_path_insertions=self.max_path_insertions,
+                allow_untrusted_stage_results=self.allow_untrusted,
+            )
+            views.append((nm, sub.read()))
+        base_view = dict(views[0][1])
+
+        merged: Dict[int, Dict[str, Any]] = {}
+        provenance: Dict[int, str] = {}
+        for nm, v in views:          # 段号升序 ⟹ 后面的覆盖前面的
+            for w in v.get("windows") or []:
+                i = int(w["window_idx"])
+                if i not in merged or w.get("has_convergence"):
+                    merged[i] = dict(w, segment=nm)
+                    provenance[i] = nm
+        windows = [merged[i] for i in sorted(merged)]
+
+        expected = base_view.get("n_windows_expected")
+        missing = (
+            [i for i in range(int(expected)) if i not in merged] if expected else []
+        )
+        skipped = sorted({
+            int(x) for _nm, v in views for x in (v.get("skipped_windows") or [])
+        })
+        base_view.update({
+            "stage_name": getattr(self, "_stage_base", self.stage_name),
+            "aggregated_segments": names,
+            "window_provenance": provenance,
+            "windows": windows,
+            "n_windows_found": len(windows),
+            "missing_windows": missing,
+            "skipped_windows": skipped,
+            "per_window_budget_remaining": {
+                int(w["window_idx"]): int(w.get("warmup_steps_left") or 0)
+                for w in windows
+            },
+            "all_windows_budget_exhausted": bool(
+                windows and all(
+                    int(w.get("warmup_steps_left") or 0) <= 0 for w in windows
+                )
+            ),
+        })
+        return base_view
+
+    def read(self) -> Dict[str, Any]:  # noqa: F811 —— 覆盖：聚合模式走合并视图
+        if getattr(self, "_aggregate_segments", False):
+            return self.read_aggregated()
+        return self._read_single_stage()
+
+    # ------------------------------------------------------- 影子对账 replay
+
+    # 每类证据在产物里的身份：字段名 → 它来自哪、缺了意味着什么。
+    # 历史 run **没有**这些新字段，replay 必须如实标 ABSENT_IN_ARTIFACT，
+    # **绝不把缺失当通过**。
+    _EVIDENCE_KEYS = (
+        ("self_verdict", "窗口自检 verdict（N_eff/g 主验收量）"),
+        ("min_n_eff_over_g", "主验收量数值"),
+        ("derailment_status", "脱轨两档（单块=疑似/连续两块=确认）"),
+        ("warmup_g", "warmup 剖面 g"),
+        ("warmup_min_absolute_ess", "warmup 剖面 minESS"),
+        ("state_protocol_key", "采样身份（旧 PASS 能不能粘住）"),
+    )
+
+    def decision_trace(self, view: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """一次**只读**的决策轨迹：控制器**会**选什么、依据什么、缺什么证据。
+
+        🔑 [2026-09-11] 影子对账用。**不执行动作、不改预算、不写 run** ——
+        它复用同一个 `read()` / `decide()`，所以 replay 和生产**不会各判各的**
+        （分开实现就等于对账两个不同的东西，那对账本身就没意义了）。
+
+        老板指定的输出口径：run / window / evidence scope+gauge / verdict /
+        reason / selected action / target windows / budget view。
+        """
+        view = view or self.read()
+        plan = self.decide(view)
+        windows = []
+        for w in view.get("windows") or []:
+            avail = {}
+            for key, what in self._EVIDENCE_KEYS:
+                v = w.get(key)
+                avail[key] = {
+                    "present": v is not None,
+                    "value": v,
+                    "what": what,
+                    # ⚠️ 缺失**不是**通过。历史产物没有新字段是正常的，但那意味着
+                    # "这条证据不存在"，不意味着"这条证据判了通过"。
+                    "status": "present" if v is not None else "ABSENT_IN_ARTIFACT",
+                }
+            windows.append({
+                "window_idx": w["window_idx"],
+                # 别名：生产侧产物用的是 `window_index`，两个名字并存本身就是坑，
+                # 这里两个都给，读的人不必记住哪边用哪个。
+                "window_index": w["window_idx"],
+                "phase": w.get("phase"),
+                "verdict": w.get("self_verdict"),
+                "verdict_source": w.get("self_verdict_source"),
+                "min_n_eff_over_g": w.get("min_n_eff_over_g"),
+                "evidence_availability": avail,
+                "budget_view": {
+                    "warmup_spent": w.get("warmup_steps_spent"),
+                    "warmup_cap": w.get("warmup_steps_cap"),
+                    "warmup_left": w.get("warmup_steps_left"),
+                    "production_steps": w.get("production_steps"),
+                },
+            })
+        # 老板指定的措辞：「产物里有 5 个」不准确 —— 有 warmup 失败状态但没有
+        # production convergence 的窗口是"**已知但未完成**"，不是普通完成产物。
+        _known = len(view.get("windows") or [])
+        _prod_done = sum(
+            1 for w in (view.get("windows") or []) if w.get("has_convergence")
+        )
+        _never = list(view.get("missing_windows") or [])
+        n_absent = sum(
+            1 for w in windows for e in w["evidence_availability"].values()
+            if not e["present"]
+        )
+        return {
+            "protocol_version": STAGE2_CONTROLLER_PROTOCOL_VERSION,
+            "readonly": True,
+            "run_dir": view["run_dir"],
+            "stage_name": view["stage_name"],
+            # evidence scope + gauge：口径必须跟着轨迹走，否则对账时分不清
+            # "两次判得不同"是策略变了还是口径变了。
+            "evidence_scope": "on_disk_artifacts_only",
+            "evidence_gauge": {
+                "fk_residual": "sampling_states",
+                "support_metrics": "gauge_invariant",
+            },
+            "selected_action": plan["action"],
+            "exit": plan.get("exit"),
+            "terminal": plan.get("terminal"),
+            "routing": plan.get("routing"),
+            "target_windows": plan.get("windows"),
+            "reason": plan.get("reason"),
+            "missing_evidence": plan.get("missing_evidence"),
+            "execution_status": plan.get("execution_status"),
+            "evidence_status": plan.get("evidence_status"),
+            "trust_level": plan.get("trust_level"),
+            "budget_view": {
+                "per_window_remaining": view.get("per_window_budget_remaining"),
+                "all_windows_exhausted": view.get("all_windows_budget_exhausted"),
+                "source": view.get("global_budget_source"),
+            },
+            "path": {
+                "version": (view.get("path") or {}).get("version"),
+                "events": (view.get("path") or {}).get("events"),
+                "tail_repartitions_done": view.get("tail_repartitions_done"),
+            },
+            "known_window_states": _known,
+            "production_complete": _prod_done,
+            "never_started": _never,
+            "earliest_unresolved_window": self.first_untrusted_window(view),
+            "blocked_by_upstream": plan.get("blocked_by_upstream"),
+            "windows": windows,
+            "n_absent_evidence_fields": n_absent,
+        }
+
+    @classmethod
+    def replay(
+        cls,
+        run_dirs: Sequence[str],
+        stage_names: Optional[Sequence[str]] = None,
+        **kwargs: Any,
+    ) -> List[Dict[str, Any]]:
+        """在一批历史 run 上离线重放决策。**只读、零 GPU。**
+
+        缺字段的老产物必须**跑得起来**并如实标记，不能崩、也不能把缺失当通过 ——
+        所以每个 run 单独 try/except，失败只记错误、不打断整批。
+        """
+        out: List[Dict[str, Any]] = []
+        for rd in run_dirs:
+            # **按物理 stage 重放，不是按段** —— 段是同一个 stage 的多次采样，
+            # 分开判会得到两个互相矛盾的动作（实测：段 2 缺 win0 被判成"缺窗口"，
+            # 其实 win0 在段 1 里是好的）。
+            names = list(stage_names) if stage_names else ["vanishing"]
+            for st in names:
+                try:
+                    out.append(
+                        cls.for_physical_stage(rd, st, **kwargs).decision_trace()
+                    )
+                except Exception as err:  # noqa: BLE001 —— 一个 run 崩不该毁掉整批
+                    out.append({
+                        "readonly": True, "run_dir": os.path.abspath(rd),
+                        "stage_name": st, "error": repr(err),
+                        "selected_action": None,
+                    })
+        return out
+
+    @staticmethod
+    def render_replay(traces: Sequence[Dict[str, Any]]) -> str:
+        """人读的 mismatch 基线表。"""
+        out = ["决策轨迹 replay（**只读**：不执行动作、不改预算、不写 run）", ""]
+        hdr = (f"{'run':<26} {'stage':<13} {'action':<20} {'exit':<28} "
+               f"{'exec':<12} {'evidence':<18} {'缺证据':>6}")
+        out.append(hdr)
+        out.append("-" * len(hdr))
+        for t in traces:
+            if t.get("error"):
+                out.append(f"{os.path.basename(t['run_dir']):<26} "
+                           f"{t.get('stage_name',''):<13} **ERROR** {t['error'][:60]}")
+                continue
+            out.append(
+                f"{os.path.basename(t['run_dir']):<26} {t['stage_name']:<13} "
+                f"{str(t['selected_action']):<20} {str(t.get('exit') or '-'):<28} "
+                f"{str(t.get('execution_status')):<12} "
+                f"{str(t.get('evidence_status')):<18} "
+                f"{t.get('n_absent_evidence_fields', 0):>6}"
+            )
+        out.append("")
+        out.append("⚠️ 「缺证据」= 该 run 的产物里不存在的证据字段数。"
+                   "**缺失不是通过** —— 历史 run 没有新字段是正常的，但那意味着"
+                   "「这条证据不存在」，对账时必须当成一类 mismatch，不能读成「判了通过」。")
+        return "\n".join(out)
+
+    # -------------------------------------------------------------- 人读
+
+    def render(self, view: Optional[Dict[str, Any]] = None) -> str:
+        view = view or self.read()
+        plan = self.decide(view)
+        p = view["path"]
+        out: List[str] = []
+        out.append(f"run    : {view['run_dir']}")
+        out.append(f"stage  : {view['stage_name']} ({view['stage_type']})  "
+                   f"lo/hi={view['min_states_per_window']}/{view['max_states_per_window']}"
+                   f"  (来自 {view['config_source']})  可拆区间="
+                   f"[{2 * view['min_states_per_window'] - 1},"
+                   f"{2 * view['max_states_per_window'] - 1}]")
+        out.append(f"插点   : 已用 {view['path_insertions_done']}/"
+                   f"{view['path_insertions_budget']}  剩 {view['path_insertions_left']}"
+                   "（终身预算，从版本链累计，跨 resume 有效）")
+        out.append(f"path   : v{p['version']}  n_states={p['n_states']}  "
+                   f"events={p['events'] or '{}'}")
+        if view["segment_index"] is not None:
+            out.append(f"段     : segment_{view['segment_index']}  "
+                       f"ibs_state 读自 {view['checkpoint_dir_used']}")
+        line = f"windows: 找到 {view['n_windows_found']}"
+        if view["n_windows_expected"]:
+            line += f" / 布局 {view['n_windows_expected']}"
+        if view["missing_windows"]:
+            line += f"   ⚠️ 缺 {view['missing_windows']} —— 缺窗口的总和不是完整 ΔG"
+        if view["skipped_windows"]:
+            line += f"   ⚠️ 被踢出协方差链 {view['skipped_windows']}"
+        out.append(line)
+        out.append(f"stage  : converged={view['stage_converged']}  "
+                   f"ΔG={view['stage_total_delta_G']}  "
+                   f"(stage 结果{'已' if view['has_stage_result'] else '**未**'}落盘)")
+        out.append("")
+        hdr = (f"{'win':>3} {'K':>2} {'λ跨度':>8} {'phase':<16} {'verdict':<22} "
+               f"{'warmup':>15} {'验证':>8} {'生产':>9} {'段':>3} {'帧':>6}  note")
+        out.append(hdr)
+        out.append("-" * len(hdr))
+        for w in view["windows"]:
+            note = []
+            if w["best_effort_acceptance"]:
+                note.append(f"best-effort({w['best_effort_reason']})")
+            if w["last_gate_error"]:
+                note.append(f"gate={w['last_gate_error']}")
+            if w["last_failure_reason"]:
+                note.append(f"fail={w['last_failure_reason']}")
+            if w["has_warmup_failure"] and not w["has_convergence"]:
+                note.append("只有 warmup_failure，未产出 convergence")
+            if w.get("derail_at_trajectory_fraction") is not None:
+                note.append(
+                    f"f_k 在 {w['derail_at_trajectory_fraction']:.0%} 轨迹处脱轨"
+                    "（边际 N_eff 断崖）"
+                )
+            if w.get("min_n_eff_over_g") is not None:
+                note.append(f"N_eff/g={float(w['min_n_eff_over_g']):.2f}")
+            if w.get("self_verdict") and w.get("self_verdict") != "ANALYSIS_ELIGIBLE":
+                note.append(
+                    f"{w.get('self_verdict')}"
+                    f"(N_eff/g={w.get('min_n_eff_over_g')}, "
+                    f"n_decorr={w.get('self_n_frames_decorrelated')})"
+                )
+            wm = "-" if w["warmup_steps_spent"] is None else str(w["warmup_steps_spent"])
+            if w["warmup_steps_cap"]:
+                wm = f"{wm}/{w['warmup_steps_cap']}"
+            span = "-" if w["lambda_span"] is None else f"{w['lambda_span']:.4f}"
+            out.append(
+                f"{w['window_idx']:>3} {str(w['n_states'] or '-'):>2} {span:>8} "
+                f"{w['phase']:<16} {w['verdict']:<22} {wm:>15} "
+                f"{('-' if w['frozen_validation_steps'] is None else w['frozen_validation_steps']):>8} "
+                f"{('-' if w['production_steps'] is None else w['production_steps']):>9} "
+                f"{str(w['n_production_segments'] or '-'):>3} "
+                f"{('-' if w['n_frames'] is None else w['n_frames']):>6}  " + "; ".join(note)
+            )
+        _fp = view.get("fk_probe") or {}
+        if _fp:
+            out.append("")
+            out.append(
+                f"f_k 探针 : verdict={_fp.get('verdict')} "
+                f"建议重标定={_fp.get('recalibration_recommended_windows')} "
+                f"（阈值 {_fp.get('min_adjacent_shift_kJ_mol')} kJ/mol 相邻位移）"
+            )
+            for r in (_fp.get("windows") or []):
+                if r.get("max_adjacent_shift_kJ_mol") is None:
+                    out.append(f"           w{r.get('window')}: 跳过 {r.get('skipped')}")
+                else:
+                    out.append(
+                        f"           w{r.get('window')}: 相邻位移="
+                        f"{float(r['max_adjacent_shift_kJ_mol']):.3f} "
+                        f"绝对位移={float(r.get('max_abs_shift_kJ_mol') or 0):.3f} "
+                        f"n_used={r.get('n_frames_used')} "
+                        f"规范对账sd={r.get('f_k_consistency_sd_kJ_mol')}"
+                    )
+        _rank = plan.get("warmup_weakness_ranking") or {}
+        if _rank.get("by_metric"):
+            out.append("")
+            out.append("warmup 剖面（**只报告**：哪个窗口在生产前就显出弱相）"
+                       " —— 剖面→预算的映射未定，不据此做任何事")
+            wh = (f"{'win':>3} {'g':>8} {'n_used':>7} {'minESS':>8} "
+                  f"{'max_adj':>8} {'门槛':>6}")
+            out.append(wh)
+            out.append("-" * len(wh))
+            for w in view["windows"]:
+                f3 = lambda x, wd, pr=2: ("-".rjust(wd) if x is None
+                                          else f"{float(x):.{pr}f}".rjust(wd))
+                out.append(
+                    f"{w['window_idx']:>3} {f3(w.get('warmup_g'), 8)} "
+                    f"{str(w.get('warmup_n_frames_used') or '-'):>7} "
+                    f"{f3(w.get('warmup_min_absolute_ess'), 8)} "
+                    f"{f3(w.get('warmup_max_adjacent_delta_kJ_mol'), 8, 3)} "
+                    f"{f3(w.get('warmup_gate_threshold_kJ_mol'), 6, 1)}"
+                )
+            out.append(f"弱→强（三口径名次和，不加权）: {_rank.get('weakest_overall')}")
+        if view.get("joins"):
+            out.append("")
+            out.append("join λ 两侧支撑（相邻窗口对共享的那一个 λ 各自的 rawESS）"
+                       " —— **只报告，不参与放行**")
+            out.append("           ⚠️ 只证明**共享态自身**采得好；缺跨窗交叉能量 ⟹ "
+                       "下游强支撑进不了上游 local MBAR，**不构成上游 PASS**")
+            jh = (f"{'join λ':>8} {'上游':>5} {'rawESS':>9} {'g':>7} {'top1%':>6}  "
+                  f"{'下游':>5} {'rawESS':>9} {'g':>7} {'top1%':>6}  {'下/上':>7}  判读")
+            out.append(jh)
+            out.append("-" * len(jh))
+            for j in view["joins"]:
+                u, d = j.get("upstream") or {}, j.get("downstream") or {}
+                f2 = lambda x, w, p=1: ("-".rjust(w) if x is None
+                                        else f"{float(x):.{p}f}".rjust(w))
+                r = j.get("downstream_over_upstream_raw_ess")
+                # ⚠️ 判读只写**事实**，绝不写"可以兜底/可以参考下游"。
+                # 老板纠正：只保存了共享的那一个 λ、没有跨窗交叉能量 ⟹ 下游的强支撑
+                # **进不了上游的 local MBAR**，改善不了上游的相对自由能。所以
+                # 「上游端点弱、下游强」**不构成**上游可以 PASS —— 上游保持
+                # PENDING / INSUFFICIENT。（这句以前写成"端点值可参考下游"，是误用。）
+                verdict = "-"
+                if r is not None:
+                    verdict = ("上游端点弱、下游强 %.1f×（仅诊断：**不**构成上游放行）" % r
+                               if r > 2.0 else
+                               "下游端点弱、上游强 %.1f×（仅诊断）" % (1.0 / r) if r < 0.5 else
+                               "两侧相当（仅诊断）")
+                out.append(
+                    f"{f2(j.get('join_lambda_vdw'), 8, 4)} "
+                    f"{('w%d' % j.get('upstream_window', -1)):>5} "
+                    f"{f2(u.get('raw_ess'), 9)} {f2(u.get('tau_int'), 7, 2)} "
+                    f"{f2(u.get('top1pct_weight'), 6, 3)}  "
+                    f"{('w%d' % j.get('downstream_window', -1)):>5} "
+                    f"{f2(d.get('raw_ess'), 9)} {f2(d.get('tau_int'), 7, 2)} "
+                    f"{f2(d.get('top1pct_weight'), 6, 3)}  "
+                    f"{f2(r, 7, 2)}  {verdict}"
+                )
+        out.append("")
+        out.append("=" * 78)
+        out.append(f"下一步动作 : {plan['action']}" + (f"   出口: {plan['exit']}" if plan["exit"] else ""))
+        out.append(f"涉及窗口   : {plan['windows'] or '-'}")
+        out.append(f"理由       : {plan['reason']}")
+        if plan["missing_evidence"]:
+            out.append(f"缺什么证据 : {plan['missing_evidence']}")
+        out.append(f"结构动作   : 可行={plan['feasible_structural_actions']}")
+        for k, v in plan["infeasible_structural_actions"].items():
+            out.append(f"             {k} 不可行: {v}")
+        out.append(f"三维状态   : execution={plan['execution_status']}  "
+                   f"evidence={plan['evidence_status']}  trust={plan['trust_level']}")
+        return "\n".join(out)
+
+
+TAIL_REPARTITION_PROTOCOL_VERSION = 1
+
+
+def repartition_tail_from_anchor(
+    lambdas_var: Sequence[float],
+    window_ranges: Sequence[Sequence[int]],
+    anchor: float,
+    *,
+    min_states_per_window: int,
+    max_states_per_window: int,
+    anchor_atol: float = 1e-9,
+) -> Tuple[List[Tuple[int, int]], Dict[str, Any]]:
+    """**只重分尾段**：anchor 之前的窗口逐字冻结，只有 anchor 起的重新分配。
+
+    设计依据：``docs/PLAN_PATH_REPAIR_2026-09-11.md``。老板的原话是
+    「若当前实现要求全部从头重跑，那是路径版本/reuse 规则仍过粗，**不是物理上的
+    必要代价**」。
+
+    **为什么原来做不到**（查过，归因不在指纹）：
+      · ``stage2_window_max_states`` 在 ``_PREOPT_DERIVED_PATH_KEYS`` 里，属于
+        **第 2 层（派生路径）**；两层拆分的设计意图本来就是「第 1 层若匹配，
+        **仍可离线重算**」—— 指纹层不是阻塞点，改它**不需要重跑 pilot**。
+      · 真正作废前缀的是：窗口产物的复用键是**每个窗口自己的 λ 集合**
+        （``_window_lambda_key`` / ``_resume_cached_window_gate_status`` 的
+        ``np.allclose``），而改 max_states 会走**全局**分窗器
+        ``vanishing_subdomain_ranges_from_lambdas`` ⟹ **所有**窗口边界重排 ⟹
+        连健康的前缀也对不上。
+    ⟹ 缺的就是本函数：一个**只动尾段**的分窗操作。
+
+    老板给的验收条件，逐条在下面用断言钉住：
+      1. 不重新跑 pilot、**不改变 λ 表**（本函数只返回 ranges，λ 原样带回并断言相等）
+      2. anchor 必须是**现有共享态**
+      3. anchor 以前的 ranges **逐字相等**
+      4. 仅 anchor 起的尾段重新分配
+      5. **完整覆盖、无缺口**，相邻窗口恰好共享一个态
+      6. **确定性、幂等**（同输入同输出；对自身输出再跑一次不变）
+      7. 输出明确的 ``changed_windows`` 与**复用清单**
+      8. **只作废 anchor 以后的产物**
+      9. execution 层的 K + 难度检查 → 见 ``feasible_repair_actions(layer="execution")``
+     10. **先 shadow/preview，不自动启动 GPU** → 本函数是**纯函数**，不落盘、不采样
+
+    ``anchor`` 是 λ 值（不是下标）—— 调用方看到的是 λ，下标随布局变。
+    """
+    lam = [float(x) for x in lambdas_var]
+    ranges = [(int(a), int(b)) for a, b in window_ranges]
+    lo_n, hi_n = int(min_states_per_window), int(max_states_per_window)
+    if ranges != sorted(ranges):
+        raise ValueError(f"window_ranges 必须按起点升序: {ranges}")
+    if not ranges or ranges[-1][1] != len(lam):
+        raise ValueError(f"末窗 {ranges[-1] if ranges else None} 必须覆盖到最后一个态")
+
+    # ---- 验收 2：anchor 必须是现有的**共享**态 ----
+    shared_pre = sorted({b - 1 for _a, b in ranges[:-1]} & {a for a, _b in ranges[1:]})
+    cand = [i for i, v in enumerate(lam) if abs(v - float(anchor)) <= float(anchor_atol)]
+    if len(cand) != 1:
+        # 调用方最容易踩的是"传了四舍五入过的 λ" ⟹ 匹配 0 个。把**合法 anchor 全列出来**，
+        # 免得还要自己去翻 λ 表数小数位。
+        raise ValueError(
+            f"anchor λ={anchor!r} 在 λ 表里匹配到 {len(cand)} 个态（需恰好 1 个，"
+            f"容差 {anchor_atol}）。合法的 anchor（现有共享态）是："
+            + ", ".join(f"win{i+1}起点 λ={lam[j]!r}" for i, j in enumerate(shared_pre))
+        )
+    a_idx = cand[0]
+    shared = {b - 1 for _a, b in ranges[:-1]} & {a for a, _b in ranges[1:]}
+    if a_idx not in shared:
+        raise ValueError(
+            f"anchor λ={anchor}（下标 {a_idx}）不是现有共享态；"
+            f"现有共享态下标={sorted(shared)}。只允许在共享节点上冻结。"
+        )
+
+    prefix = [(a, b) for a, b in ranges if b - 1 <= a_idx]
+    if not prefix or prefix[-1][1] - 1 != a_idx:
+        raise ValueError(
+            f"anchor 下标 {a_idx} 不是任何窗口的末态；前缀={prefix}"
+        )
+
+    # ---- 尾段重分：复用既有分窗器，只喂给它 anchor 起的那段 λ ----
+    tail_lam = np.asarray(lam[a_idx:], dtype=float)
+    if tail_lam.size < lo_n:
+        raise RuntimeError(
+            f"anchor 之后只有 {tail_lam.size} 个态，不足 min_states_per_window={lo_n}"
+        )
+    tail_ranges_local = [
+        (int(x), int(y)) for x, y in vanishing_subdomain_ranges_from_lambdas(
+            tail_lam,
+            min_states_per_window=lo_n,
+            max_states_per_window=hi_n,
+        )
+    ]
+    tail_ranges = [(x + a_idx, y + a_idx) for x, y in tail_ranges_local]
+    new_ranges = list(prefix) + tail_ranges
+
+    # ---- 验收 1/3/4/5：λ 未变、前缀逐字相等、覆盖完整、单一共享边界 ----
+    if [float(x) for x in lambdas_var] != lam:
+        raise RuntimeError("λ 表被改动了 —— 本函数只重分窗口，不动 λ")
+    if new_ranges[: len(prefix)] != list(prefix):
+        raise RuntimeError("前缀 ranges 不再逐字相等")
+    validate_single_shared_boundary_ranges(new_ranges, len(lam))
+    # 🔑 ``validate_single_shared_boundary_ranges`` **只**校验覆盖与单一共享边界，
+    # **不**校验 [lo, hi]。少了这一条就可能返回一个"结构合法但每窗超限"的尾段
+    # （验证时实测踩到：尾段被并成 K=10 而 hi=8，居然一路通过）。
+    # ⚠️ 只校验**新产生的尾窗**：前缀是冻结带回来的历史布局，它可能是在别的
+    # min/max 下定的，不该因为本次参数变了就被判非法。
+    for a, b in tail_ranges:
+        if not (lo_n <= b - a <= hi_n):
+            raise RuntimeError(
+                f"重分后的尾窗 {(a, b)} 有 {b - a} 个态，越出 [{lo_n},{hi_n}]；"
+                "分窗器给了非法布局，拒绝返回。"
+            )
+
+    # ---- 验收 7/8：changed / reusable，按**λ 集合**判（复用真正的键就是它）----
+    def _key(rng):
+        a, b = rng
+        return tuple(round(float(x), 12) for x in lam[a:b])
+
+    old_keys = {i: _key(r) for i, r in enumerate(ranges)}
+    new_keys = {i: _key(r) for i, r in enumerate(new_ranges)}
+    reusable, changed = [], []
+    for ni, nk in new_keys.items():
+        hit = next((oi for oi, ok in old_keys.items() if ok == nk), None)
+        (reusable if hit is not None else changed).append(
+            {"new_window": ni, "old_window": hit, "n_states": len(nk)}
+        )
+    invalidated = sorted(
+        oi for oi, ok in old_keys.items() if ok not in set(new_keys.values())
+    )
+    if any(i <= len(prefix) - 1 for i in invalidated):
+        raise RuntimeError(
+            f"前缀窗口被作废了（{invalidated}），违反「只作废 anchor 以后产物」"
+        )
+
+    return new_ranges, {
+        "protocol_version": TAIL_REPARTITION_PROTOCOL_VERSION,
+        "source": "tail_only_repartition_from_shared_anchor",
+        "anchor_lambda_vdw": float(lam[a_idx]),
+        "anchor_state_index": int(a_idx),
+        "frozen_prefix_windows": [list(r) for r in prefix],
+        "old_ranges": [list(r) for r in ranges],
+        "new_ranges": [list(r) for r in new_ranges],
+        "n_windows_before": len(ranges),
+        "n_windows_after": len(new_ranges),
+        "reusable_windows": reusable,
+        "changed_windows": changed,
+        "invalidated_old_windows": invalidated,
+        "min_states_per_window": lo_n,
+        "max_states_per_window": hi_n,
+        "lambda_table_unchanged": True,
+        "note": (
+            "纯函数：不落盘、不采样、不启动 GPU。执行前还要过 "
+            "feasible_repair_actions(layer='execution')，它同时检查 K 与物理难度，"
+            "**缺难度证据时 fail-closed**。"
+        ),
+    }
+
+
+def record_tail_repartition_version(
+    checkpoint_dir: str,
+    lambdas_var: Sequence[float],
+    new_ranges: Sequence[Sequence[int]],
+    diag: Dict[str, Any],
+    *,
+    first_untrusted_window: Optional[int] = None,
+    reason: str = "tail_only_repartition_from_first_untrusted_window",
+) -> Dict[str, Any]:
+    """把一次尾段重分登记成**路径版本链事件**。这是 execute 通路的**前置**。
+
+    🔑 [2026-09-11] 为什么它不能等 J 一起做：没有版本链事件，**崩溃恢复分不清
+    「已经重分过没有」** —— 第二次启动会再重分一次，把刚跑完的新尾段又作废。
+    老板的话：「不能等 win4/win5 再次失败后才补。」
+
+    幂等由 `lambda_path_versions.append_version` 的确定性 event_id 保证：
+    同一个 (λ表, ranges, kind, detail) 重复登记不会产生第二个版本。
+
+    ⚠️ 本函数**只登记，不采样**。λ 表原样带回（尾段重分**不改 λ**）。
+    """
+    import lambda_path_versions as _lpv
+
+    lam = [float(x) for x in lambdas_var]
+    detail = {
+        "anchor_lambda_vdw": diag.get("anchor_lambda_vdw"),
+        "anchor_state_index": diag.get("anchor_state_index"),
+        "first_untrusted_window": (
+            None if first_untrusted_window is None else int(first_untrusted_window)
+        ),
+        "frozen_prefix_windows": diag.get("frozen_prefix_windows"),
+        "old_ranges": diag.get("old_ranges"),
+        "new_ranges": diag.get("new_ranges"),
+        "changed_windows": diag.get("changed_windows"),
+        "reused_windows": diag.get("reusable_windows"),
+        "invalidated_old_windows": diag.get("invalidated_old_windows"),
+        "n_windows_before": diag.get("n_windows_before"),
+        "n_windows_after": diag.get("n_windows_after"),
+        "min_states_per_window": diag.get("min_states_per_window"),
+        "max_states_per_window": diag.get("max_states_per_window"),
+        # 尾段重分**不动 λ 表** —— 登记这一条，好让读版本链的人不必去 diff λ。
+        "lambda_table_unchanged": True,
+    }
+    return _lpv.append_version(
+        checkpoint_dir,
+        [0.0] * len(lam), lam, [list(r) for r in new_ranges],
+        kind="tail_repartition",
+        reason=reason,
+        detail=detail,
+    )
+
+
+def render_tail_repartition_preview(diag: Dict[str, Any], lambdas_var: Sequence[float]) -> str:
+    """人读的 preview。**先看这个，再决定要不要跑 GPU。**"""
+    lam = [float(x) for x in lambdas_var]
+    out = [
+        "尾段重分预览（**纯计算，未启动任何采样**）",
+        f"  anchor : λ={diag['anchor_lambda_vdw']:.4f}（下标 {diag['anchor_state_index']}，现有共享态）",
+        f"  λ 表   : {len(lam)} 态，**未改动**",
+        f"  窗口数 : {diag['n_windows_before']} → {diag['n_windows_after']}",
+        "",
+        f"  {'窗口':>6} {'范围':>12} {'K':>3} {'λ 区间':>20}  处置",
+        "  " + "-" * 62,
+    ]
+    old = [tuple(r) for r in diag["old_ranges"]]
+    reuse_new = {d["new_window"]: d["old_window"] for d in diag["reusable_windows"]}
+    for i, r in enumerate(diag["new_ranges"]):
+        a, b = int(r[0]), int(r[1])
+        oi = reuse_new.get(i)
+        tag = (f"**复用**旧 win{oi}（λ 逐位相同）" if oi is not None
+               else "**重采**（新 λ 集合）")
+        out.append(
+            f"  {('win%d' % i):>6} {str((a, b)):>12} {b - a:>3} "
+            f"{f'{lam[a]:.4f}→{lam[b-1]:.4f}':>20}  {tag}"
+        )
+    out.append("")
+    out.append(f"  作废的旧窗口 : {diag['invalidated_old_windows']}（anchor 之前的一个都没有）")
+    out.append(f"  冻结的前缀   : {diag['frozen_prefix_windows']}")
+    out.append("  ⚠️ 执行前必须过 feasible_repair_actions(layer='execution')："
+               "同时检查 K 与物理难度，缺难度证据 fail-closed。")
+    return "\n".join(out)
+
+
+REPAIR_ACTIONS = ("insert_lambda", "split_tail_window")
+
+
+def feasible_repair_actions(
+    window_ranges: Sequence[Sequence[int]],
+    n_states: int,
+    *,
+    min_states_per_window: int,
+    max_states_per_window: int,
+    tail_exempt_from_max: bool = True,
+    n_insert: int = 1,
+    layer: str = "path_version",
+    tail_difficulty_ok: Optional[bool] = None,
+) -> Dict[str, Optional[str]]:
+    """哪些**结构性**修补动作在当前布局下可行。纯计算，零 GPU。
+
+    设计依据：``docs/PLAN_PATH_REPAIR_2026-09-11.md`` §2「可行性规则」。
+
+    返回 ``{动作名: None 表示可行 | str 表示不可行的理由}``。
+    调用方取可行集：``[k for k, v in d.items() if v is None]``。
+
+    **为什么要单独一个纯函数**：动作"不可行"必须以"不在候选集里"的形式呈现给
+    控制器，而不是以"调用下去抛异常"的形式。后者会让控制器看不见自己少了一档，
+    于是被迫用另一类动作去回答（这就是历史上"覆盖不足 → 插 λ"那个 type error
+    的机制）。
+
+    ``layer``：**豁免分两层，别混**（2026-09-11 老板定案）::
+
+        "path_version"  路径版本层：末窗**可以**暂时充当溢出槽（豁免 max）
+        "execution"     采样执行层：任何**实际要跑**的窗口都必须满足与普通窗口
+                        相同的物理难度约束 —— 末窗不例外
+
+    ⚠️ 执行层**不能只检查 ``K <= hi``**。实测反例：末窗 ``K=4`` 已经满足 max，
+    却仍然是全场最难的那个（预热就停了、g 22.8→143.3）。真正缺的是
+    ``max_states`` **加上** 热力学/动力学**难度上限**（Fisher / metric integral /
+    预测 support / 已有的 ``N_eff/g`` 剖面）。所以执行层要求调用方通过
+    ``tail_difficulty_ok`` 显式给出难度判定；**没给就 fail-closed**，
+    而不是拿 ``K <= hi`` 冒充"可执行"。
+    末窗超过难度上限时，应在**采样前**把 overflow materialize 成两个尾窗。
+
+    ``tail_exempt_from_max``：末窗是 model B 的溢出槽，**在被拆过之前豁免
+    ``max_states_per_window``**（仅路径版本层）。拆过之后两个孩子都受约束，溢出槽消失 ——
+    此后插点无处可去，唯一出口是报「输入 λ 数目不够」并退出进程（控制器
+    **不得**自行加总态数重跑 preopt：总态数是输入，属于 prescribed path 的定义）。
+    调用方应从路径版本链里数 ``split_tail_window`` 事件来决定这个标志。
+
+    只覆盖**结构性**动作。"延长采样 / 重标定 f_k"不改结构、永远可行，不在此列。
+    """
+    ranges = [(int(a), int(b)) for a, b in window_ranges]
+    if not ranges:
+        raise ValueError("window_ranges 不能为空")
+    if ranges != sorted(ranges):
+        raise ValueError(f"window_ranges 必须按起点升序: {ranges}")
+    lo_n = int(min_states_per_window)
+    hi_n = int(max_states_per_window)
+    n_ins = int(n_insert)
+    if n_ins < 1:
+        raise ValueError(f"n_insert 必须 >= 1，收到 {n_insert}")
+    if int(ranges[-1][1]) != int(n_states):
+        raise ValueError(
+            f"末窗 {ranges[-1]} 必须覆盖到最后一个态（n_states={n_states}）"
+        )
+
+    if layer not in ("path_version", "execution"):
+        raise ValueError(f"未知 layer {layer!r}；只接受 path_version / execution")
+    tail_lo, tail_hi = ranges[-1]
+    k_tail = tail_hi - tail_lo
+    out: Dict[str, Optional[str]] = {}
+
+    # ---- 执行层：末窗**取消**豁免，且必须另有难度判据 ----
+    # [老板] 「execution 层取消末窗豁免；overflow 只允许作为**内部路径记账状态**，
+    #        不能直接拿去采样。」
+    if layer == "execution":
+        # 执行层一律不豁免，调用方传什么都不算数。
+        tail_exempt_from_max = False
+        if k_tail > hi_n:
+            out["run_tail_window"] = (
+                f"执行层不豁免上限：末窗 K={k_tail} > max_states_per_window={hi_n}。"
+                "采样前必须先把 overflow materialize 成两个尾窗。"
+            )
+        elif tail_difficulty_ok is None:
+            # **不拿 K<=hi 冒充可执行。** 实测 K=4 的末窗满足 max 却仍是最难的那个。
+            out["run_tail_window"] = (
+                f"末窗 K={k_tail} 满足 max_states={hi_n}，但**没有提供难度判据**"
+                "（tail_difficulty_ok=None）⟹ fail-closed。K<=max 不足以说明可执行："
+                "实测 K=4 的末窗满足 max、却是全场最难的那个（预热就停了，"
+                "g 22.8→143.3）。执行层需要 max_states **加上** 热力学/动力学难度上限"
+                "（Fisher / metric integral / 预测 support / N_eff/g 剖面）。"
+            )
+        elif not tail_difficulty_ok:
+            out["run_tail_window"] = (
+                f"末窗 K={k_tail} 满足 max_states，但**超过难度上限** ⟹ "
+                "采样前把 overflow materialize 成两个尾窗。"
+            )
+        else:
+            out["run_tail_window"] = None
+
+    # ---- 插 λ（model B）：ranges 不动、末窗吸收 n 个溢出态 ----
+    tail_k_split_max = 2 * hi_n - 1
+    if tail_exempt_from_max and k_tail + n_ins > tail_k_split_max:
+        # 豁免上限 ≠ 可以无限长：超过 2·hi−1 之后末窗永远拆不开，而拆它正是
+        # 唯一的收尾动作。见 insert_lambda_in_failed_ibs_window 里同名守卫。
+        out["insert_lambda"] = (
+            f"末窗再吸收 {n_ins} 个态会到 K={k_tail + n_ins}，超过可拆上限 "
+            f"2·max−1={tail_k_split_max} ⟹ 此后永远切不出合法子窗，溢出槽变死胡同。"
+            f"先拆末窗（K 现在 {k_tail}，可拆区间 {2 * lo_n - 1}..{tail_k_split_max}），"
+            "或判 HALT_LAMBDA_BUDGET_INSUFFICIENT。"
+        )
+    elif tail_exempt_from_max:
+        out["insert_lambda"] = None
+    elif k_tail + n_ins <= hi_n:
+        out["insert_lambda"] = None
+    else:
+        out["insert_lambda"] = (
+            f"末窗已被拆过（不再豁免 max_states_per_window={hi_n}），"
+            f"当前 K_tail={k_tail}，再吸收 {n_ins} 个态会到 {k_tail + n_ins} > {hi_n}"
+            " —— 溢出槽已耗尽。这不是「再想个办法」的问题：**输入的 λ 总数从一开始"
+            "就不够**。应退出进程、由人工改输入文件的 λ 数目后重跑"
+            "（HALT_LAMBDA_BUDGET_INSUFFICIENT）。"
+        )
+
+    # ---- 拆末窗：两子窗共享一个边界态 ⟹ p + q − 1 = K，两侧都要落在 [lo, hi] ----
+    split_ok = any(
+        p + q - 1 == k_tail and lo_n <= p <= hi_n and lo_n <= q <= hi_n
+        for p in range(lo_n, hi_n + 1)
+        for q in range(lo_n, hi_n + 1)
+    )
+    if split_ok:
+        out["split_tail_window"] = None
+    else:
+        out["split_tail_window"] = (
+            f"末窗 K_tail={k_tail} 在 [{lo_n},{hi_n}] 下切不出两个合法子窗"
+            f"（需 p+q−1={k_tail} 且两侧都在区间内 ⟹ 最小可拆 K = {2 * lo_n - 1}）。"
+            "继续插 λ 让末窗长大即可到达；拆窗只是末窗溢出压不住时的收尾动作。"
+        )
+    return out
+
+
+def insert_lambda_in_failed_ibs_window(
+    lambdas_var: List[float],
+    window_ranges: List[Tuple[int, int]],
+    failed_range: Tuple[int, int],
+    pilot_lambdas: List[float],
+    pilot_cumulative_length: List[float],
+    *,
+    min_states_per_window: int = 4,
+    max_states_per_window: int = 5,
+    partition_criterion: str = "arclength",
+    pilot_metric_g: Optional[Sequence[float]] = None,
+    n_insert: Optional[int] = None,
+) -> Tuple[List[float], List[Tuple[int, int]], Dict]:
+    """在失败窗口内插 λ，**缩小该窗口的 λ 跨度**；多出来的态由**末窗**吸收。
+
+    ⚠️ 2026-09-11 重写。设计依据：``docs/PLAN_PATH_REPAIR_2026-09-11.md`` §2 更正
+    与 §3ter。两条关键改动，改前先读那份文档。
+
+    **记账口径 = model B：窗口的下标区间一律不动，只有末窗上界 += n。**
+
+    插一个 λ 之后，窗口区间"跟不跟着走"是两套记账，物理效果相反::
+
+        原始           win0 = (0,4) 装 {λ0,λ1,λ2,λ3}      跨度 λ0→λ3
+        model A        win0 = (0,5) 装 {λ0,λ1,λnew,λ2,λ3} 跨度 λ0→λ3 **不变**
+        model B(本函数) win0 = (0,4) 装 {λ0,λ1,λnew,λ2}    跨度 λ0→λ2 **缩了**
+
+    ``ΔF(λ0→λ3)`` 是物理量，与中间放几个点无关 —— 所以 **model A 插点之后 bias
+    要压平的总落差一分没少，对"窗口太宽"是无效动作**。只有 model B 真的缩小了
+    窗口要跨的自由能落差，这才是"补 λ 治窗口太宽"的机制。
+
+    代价与安全性：
+
+      · **前缀（插入点之前的窗口）λ 逐位不变** —— 已采完的窗口全部复用，后置断言保证。
+      · 下游窗口的 λ 内容左移一格。窗口是按 0,1,2… 顺序跑的，win_i 失败时
+        i+1..N **还没采**，所以顺序跑时这是零成本。
+      · resume 安全：``lambda_path_versions.append_version`` 同时记 λ 表与
+        window_ranges，``resolve_path`` 取回当前版本，``changed_windows()`` 给
+        可复用清单，插点事件带确定性 ID 防重复插。
+      · **末窗吸收溢出，因此豁免 ``max_states_per_window``。** 非末窗的态数永远
+        是布局期定的那个值（本函数不改，后置断言保证）。
+
+    **本函数不拆窗。** 拆窗只发生在末窗、只由"末窗 K 累积到 f_k 重标定后仍压不住"
+    触发，是另一条路径的事。旧实现在这里无条件就地拆窗，而且为了凑拆窗门槛
+    ``n = max(1, (2*lo−1) − K)`` 强行插点 —— 那些 λ 没有任何边级证据支持，纯粹是
+    成本（多几个态要采）。插点是**边级**工具，不该为窗口级簿记门槛服务。
+
+    ``n_insert``：
+
+      · 给了就用它（调用方按窗口级判据决定插几个，这是控制器的职责）。
+      · 不给则走**边级**判据：``n = Σ_边 max(0, ⌈L_edge / L_target⌉ − 1)``，
+        ``L_target`` = 全路径平均边长。窗内没有任何边超过 L_target 时**明着报错**，
+        不静默插 1 个 —— "边级证据不支持插点"是一个有意义的结论。
+
+    插点**位置** = 窗内最长边在**配置度量**下的中点（pilot 反插值）。
+    ``partition_criterion`` 贯穿"定 n / 选边 / 定位"三处：初始布局按哪个度量
+    定的布点，补救就按哪个 —— 旧实现里它只影响拆窗切点，拆窗一去掉就成了
+    无效参数，而"缺 metric_g 就 fail-closed"那条守卫正是为了防止这种悄悄换判据。
+
+    ⚠️ 措辞：这是**按 pilot 实测长度插值得到的候选加密位置**，不是本次 VALIDATE
+    已证实的故障边。调用方应把它标成"学习失败后的补救尝试"。
+    """
+    lambdas = [float(x) for x in lambdas_var]
+    ranges = [(int(a), int(b)) for a, b in window_ranges]
+    failed = (int(failed_range[0]), int(failed_range[1]))
+    if failed not in ranges:
+        raise RuntimeError(f"失败窗口 {failed} 不在当前窗口列表 {ranges} 中")
+    if ranges != sorted(ranges):
+        raise RuntimeError(f"window_ranges 必须按起点升序（model B 依赖末窗是最后一项）: {ranges}")
+    if ranges[-1][1] != len(lambdas):
+        raise RuntimeError(
+            f"末窗 {ranges[-1]} 必须覆盖到最后一个态（n_states={len(lambdas)}）"
+        )
+    lo_n, hi_n = int(min_states_per_window), int(max_states_per_window)
+    if failed[1] - failed[0] < 2:
+        raise RuntimeError(f"失败窗口 {failed} 不足两个态，无法在其中插点")
+
+    pilot_lam = np.asarray(pilot_lambdas, dtype=float).ravel()
+    pilot_s = np.asarray(pilot_cumulative_length, dtype=float).ravel()
+    if pilot_lam.size != pilot_s.size or pilot_lam.size < 2:
+        raise ValueError("pilot lambda 与累计热力学长度必须等长且至少含两个点")
+    if not np.all(np.diff(pilot_s) > 0.0):
+        raise ValueError("pilot 累计热力学长度必须严格递增")
+
+    criterion = str(partition_criterion).lower()
+    if criterion not in ("arclength", "metric_integral"):
+        raise ValueError(f"未知分窗判据 {partition_criterion!r}")
+    if criterion == "metric_integral" and pilot_metric_g is None:
+        # 初始布局按 ∫g 定的度量，补救却按 ∫√g 定 n，等于第一次自动补救就换了判据。
+        # 拿不到 metric_g 就明着拒绝，不静默退回等弧长。
+        raise ValueError(
+            "partition_criterion='metric_integral' 必须同时提供 pilot_metric_g；"
+            "拒绝静默退回等弧长——那会让补救悄悄换掉度量。"
+        )
+
+    start, end = failed
+    is_last = (failed == ranges[-1])
+    original_span = abs(lambdas[end - 1] - lambdas[start])
+    n_states_before = len(lambdas)
+    w_before = len(ranges)
+
+    # 🔑 **判据必须贯穿到底。** 旧实现里 partition_criterion 只影响拆窗切点，
+    # 选边与定位一律按弧长；拆窗一去掉，判据就变成完全无效的参数了 —— 而那条
+    # "缺 metric_g 就 fail-closed"的守卫存在的全部意义就是防止补救悄悄换判据。
+    # 所以这里把 pilot 的累计度量换成配置的那一个，选边（比较）和定位（反插值）
+    # 都用它。两个方向都只是对 (pilot_lam, pilot_measure) 做 np.interp。
+    if criterion == "metric_integral":
+        pilot_measure = np.asarray(
+            metric_integral_cumulative(list(pilot_lam), pilot_lambdas, pilot_metric_g),
+            dtype=float,
+        )
+        if not np.all(np.diff(pilot_measure) > 0.0):
+            raise ValueError(
+                "pilot 的 ∫g 累计度量不是严格递增，无法用于选边/反插值"
+            )
+    else:
+        pilot_measure = pilot_s
+
+    def _measure(vals) -> np.ndarray:
+        """把一串 λ 换算成配置度量下的累计坐标（用于比较边长）。"""
+        return np.asarray(
+            [_pilot_arclength_of(x, pilot_lam, pilot_measure) for x in vals],
+            dtype=float,
+        )
+
+    # ---- 插几个 ----
+    if n_insert is None:
+        cum_all = _measure(lambdas)
+        all_edges = np.abs(np.diff(cum_all))
+        if all_edges.size == 0 or not np.all(np.isfinite(all_edges)):
+            raise RuntimeError("全路径边长不可用，无法定 L_target")
+        l_target = float(np.mean(all_edges))
+        if not (l_target > 0.0):
+            raise RuntimeError(f"L_target={l_target} 非正，无法定插点数")
+        win_edges = np.abs(np.diff(cum_all[start:end]))
+        # 🔑 [2026-09-11] 必须留相对容差。L_target 是**全路径均值**，而生产布局
+        # 本来就是按热力学长度等分的 ⟹ 每条边都恰好≈均值，`e/L_target` 在 1 的
+        # 两侧抖 ~1e-15。裸 ceil 会把高出 1e-15 的那半数边判成"要插点"：实测
+        # 16 个等距 λ、边长逐位不等仅 1.5e-15，就算出 n_needed=3（应为 0）。
+        # 于是"边级证据不支持插点"这道守卫被浮点噪声整个击穿。
+        _rel_tol = 1e-9
+        n_needed = int(
+            sum(
+                max(0, int(np.ceil(float(e) / l_target - _rel_tol)) - 1)
+                for e in win_edges
+            )
+        )
+        if n_needed == 0:
+            raise RuntimeError(
+                f"失败窗口 {failed} 内没有任何一条边超过全路径平均热力学长度 "
+                f"L_target={l_target:.4f}（窗内各边 "
+                f"{[round(float(e), 4) for e in win_edges]}）—— **边级证据不支持插点**。"
+                "这个窗口的缺陷是窗口级的（跨度 / 混合 / f_k），插几个点必须由调用方"
+                "按窗口级判据给出 n_insert；本函数不替它猜，也不静默插 1 个。"
+                "见 docs/PLAN_PATH_REPAIR_2026-09-11.md §3ter.4。"
+            )
+    else:
+        n_needed = int(n_insert)
+        if n_needed < 1:
+            raise ValueError(f"n_insert 必须 >= 1，收到 {n_insert}")
+
+    # ---- 插在哪：窗内最长边的 pilot 弧长中点（与重写前逐字一致） ----
+    inserted: List[float] = []
+    inserted_edges: List[List[int]] = []
+    for _ in range(n_needed):
+        arc = [_pilot_arclength_of(lambdas[i], pilot_lam, pilot_measure)
+               for i in range(start, end)]
+        edges = [abs(arc[i + 1] - arc[i]) for i in range(len(arc) - 1)]
+        if not edges or max(edges) <= 0.0:
+            raise RuntimeError(f"窗口 {(start, end)} 内各边度量长度为零，无法选插点")
+        worst = int(np.argmax(edges))
+        left = start + worst
+        lam_mid = float(
+            np.interp(0.5 * (arc[worst] + arc[worst + 1]), pilot_measure, pilot_lam)
+        )
+        a_lo, a_hi = sorted((lambdas[left], lambdas[left + 1]))
+        if not a_lo < lam_mid < a_hi:
+            raise RuntimeError(
+                f"热力学中点未严格落在边内部：{lambdas[left]}, {lam_mid}, {lambdas[left + 1]}"
+            )
+        lambdas.insert(left + 1, lam_mid)
+        inserted.append(lam_mid)
+        inserted_edges.append([int(left), int(left + 1)])
+        # 🔑 **ranges 不动。** 插入之后 lambdas[start:end] 的内容整体左移一格，
+        # 失败窗口的跨度因此缩小；被挤出去的那个态归下一个窗口。
+
+    # ---- 末窗吸收溢出；其余区间逐字不变 ----
+    # 🔑 [2026-09-11] **溢出槽有上界，别让它变成死胡同。**
+    # 末窗豁免 max_states_per_window，但"能一分为二"这件事本身有区间：
+    # 两子窗共享一个边界态 ⟹ p+q−1=K，两侧都要落在 [lo,hi] ⟹ 可拆的 K 只有
+    # ``2*lo−1 .. 2*hi−1``（4/5 配置下就是 7..9，只有三个值宽）。末窗一旦被插到
+    # K > 2*hi−1 就**永远拆不开**了，溢出槽从此是死胡同：既不能再吸收（迟早
+    # 压不住），也不能拆（切不出合法子窗），而唯一的收尾动作恰恰是拆它。
+    # 当前默认 max_insertions=3 只是**巧合**地把 K 压在 5+3=8 ≤ 9 以内
+    # （`_run_stage2_with_path_evolution` 的 rounds_done 是跨 resume 累计的），
+    # 那是巧合不是守卫 —— 谁把 max_insertions 调大就会踩进去。所以这里 fail-closed。
+    _tail_k_after = (ranges[-1][1] + n_needed) - ranges[-1][0]
+    _tail_k_split_max = 2 * hi_n - 1
+    if _tail_k_after > _tail_k_split_max:
+        raise RuntimeError(
+            f"末窗 {ranges[-1]}（当前 {ranges[-1][1] - ranges[-1][0]} 态）再吸收 "
+            f"{n_needed} 个溢出态会到 K={_tail_k_after}，超过**可拆上限** "
+            f"2·max−1={_tail_k_split_max}（可拆区间 "
+            f"{2 * lo_n - 1}..{_tail_k_split_max}）—— 此后末窗永远切不出两个落在 "
+            f"[{lo_n},{hi_n}] 的子窗，溢出槽变成死胡同。"
+            + (
+                f"⚠️ 这次的 n={n_needed} 是**边级判据**算出来的（窗内有边长到需要"
+                f"这么多点），而溢出预算只有 {_tail_k_split_max - (ranges[-1][1] - ranges[-1][0])} "
+                "个态 —— 两者之间没有任何约束保证前者 ≤ 后者。一条边长到平均的几倍，"
+                "本身说明**初始布点**就不对（度规布点不该产生这种边），那是布局期的"
+                "问题，不是运行时修补能补的。"
+                if n_insert is None else
+                "这次的 n 是调用方给的（窗口级判据）。"
+            )
+            + "正确处置二选一：(a) 趁 K 还在可拆区间内**先拆末窗**，拆完的右孩子重新"
+            "成为溢出槽（注意：孩子受 hi 约束，只能再腾出很少几个）；"
+            "(b) 承认这是 HALT_LAMBDA_BUDGET_INSUFFICIENT —— 输入的 λ 总数从一开始"
+            "就不够，退出进程、人工改输入文件的 λ 数目。**不要把 n 封顶到预算**，"
+            "那会静默产出一个不满足触发它那份证据的布局；理由见 "
+            "docs/PLAN_PATH_REPAIR_2026-09-11.md §2。"
+        )
+    new_ranges = list(ranges[:-1]) + [(ranges[-1][0], ranges[-1][1] + n_needed)]
+    validate_single_shared_boundary_ranges(new_ranges, len(lambdas))
+
+    # ---- 后置断言：model B 的三条不变量 ----
+    if len(lambdas) != n_states_before + n_needed:
+        raise RuntimeError(
+            f"插点后态数应为 {n_states_before + n_needed}，实得 {len(lambdas)}"
+        )
+    # (1) 前缀（插入点之前、可能已经采完的窗口）λ 必须逐位不变。
+    for (a0, b0) in ranges:
+        if b0 <= start + 1:
+            before_vals = [round(float(x), 12) for x in list(lambdas_var)[a0:b0]]
+            after_vals = [round(float(x), 12) for x in lambdas[a0:b0]]
+            if before_vals != after_vals:
+                raise RuntimeError(
+                    f"前缀窗口 {(a0, b0)} 装的 λ 被改动了（model B 要求逐位不变）：\n"
+                    f"  before={before_vals}\n  after ={after_vals}"
+                )
+    # (2) 非末窗的态数必须一个都没变（溢出只许落末窗）。
+    for (a0, b0), (a1, b1) in zip(ranges[:-1], new_ranges[:-1]):
+        if (b1 - a1) != (b0 - a0):
+            raise RuntimeError(
+                f"非末窗 {(a0, b0)} → {(a1, b1)} 的态数变了；溢出只允许由末窗吸收"
+            )
+        if (b1 - a1) > hi_n:
+            raise RuntimeError(
+                f"非末窗 {(a1, b1)} 有 {b1 - a1} 个态，超过 max_states_per_window={hi_n}"
+            )
+    if (new_ranges[-1][1] - new_ranges[-1][0]) != (ranges[-1][1] - ranges[-1][0]) + n_needed:
+        raise RuntimeError("末窗没有吸收全部溢出态")
+    # (3) 失败窗口的 λ 跨度必须真的变小 —— 除非它本身就是末窗（末窗是溢出槽，
+    #     它的正常行为是**变大**，缩不了；那种情况下该做的是拆末窗，不是插点）。
+    new_span = abs(lambdas[new_ranges[-1][1] - 1] - lambdas[start]) if is_last \
+        else abs(lambdas[end - 1] - lambdas[start])
+    if not is_last and not (new_span < original_span - 1e-12):
+        raise RuntimeError(
+            f"插点没有缩小失败窗口的 λ 跨度（{original_span:.6f} → {new_span:.6f}），"
+            "拒绝返回。"
+        )
+
+    return lambdas, new_ranges, {
+        "source": "ibs_failed_window_pilot_interpolated_midpoint_insertion",
+        "accounting": "model_B_fixed_ranges_tail_absorbs_overflow",
+        "note": "pilot 插值候选加密位置，非本次 VALIDATE 证实的故障边",
+        "failed_global_state_range": [int(failed[0]), int(failed[1])],
+        "failed_window_is_last": bool(is_last),
+        "n_inserted": int(n_needed),
+        "n_insert_source": "caller" if n_insert is not None else "edge_length",
+        "inserted_lambdas": [float(x) for x in inserted],
+        "inserted_lambda": float(inserted[-1]) if inserted else None,
+        "inserted_global_edges": inserted_edges,
+        "failed_global_edge": list(inserted_edges[0]) if inserted_edges else None,
+        "partition_criterion": criterion,
+        "n_windows_before": int(w_before),
+        "n_windows_after": int(len(new_ranges)),
+        "failed_window_span_before": float(original_span),
+        "failed_window_span_after": float(new_span),
+        "tail_window_before": list(ranges[-1]),
+        "tail_window_after": list(new_ranges[-1]),
+        "frozen_prefix_windows": [list(r) for r in ranges if r[1] <= start + 1],
+        "min_states_per_window": lo_n,
+        "max_states_per_window": hi_n,
+        "max_states_per_window_exempt": "tail_window",
     }
 
 
@@ -2207,7 +5026,7 @@ def refine_stage_lambda_path_from_data(
     """
     from ibs_engine import solve_stage_integrated
 
-    with open(preopt_path, "r") as f:
+    with open(preopt_path, "r", encoding="utf-8") as f:
         preopt = json.load(f)
     lambdas_var = preopt["lambdas_var"]
     window_ranges = preopt["window_ranges"]
@@ -2293,7 +5112,7 @@ def refine_stage_lambda_path_from_data(
 
     backup_path = preopt_path + ".bak"
     shutil.copy(preopt_path, backup_path)
-    with open(preopt_path, "w") as f:
+    with open(preopt_path, "w", encoding="utf-8") as f:
         json.dump(new_preopt, f, indent=2)
 
     return new_preopt
@@ -2309,14 +5128,14 @@ def _sample_group1_energies(context, total_steps, sample_interval=50):
     full_batches, remainder = divmod(int(total_steps), int(sample_interval))
 
     for _ in range(full_batches):
-        integrator.step(sample_interval)
+        guarded_step(integrator, sample_interval, "Group1 能量采样")
         state = context.getState(getEnergy=True, groups={1})
         energies.append(
             state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
         )
 
     if remainder:
-        integrator.step(remainder)
+        guarded_step(integrator, remainder, "Group1 能量采样（余数段）")
         state = context.getState(getEnergy=True, groups={1})
         energies.append(
             state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
@@ -2493,7 +5312,7 @@ class ABFEPreOptimizer:
             
         if param_exists:
             print(f"  设置初始 {active_p}={initial_lam:.2f} 进行预平衡...")
-            self.context.getIntegrator().step(25000)
+            guarded_step(self.context.getIntegrator(), 25000, "单 λ 路径优化：初始预平衡")
 
         variance_data = []
         mean_energy = []
@@ -2507,7 +5326,7 @@ class ABFEPreOptimizer:
                 raise
 
             # 先平衡 500 步再采样
-            self.context.getIntegrator().step(500)
+            guarded_step(self.context.getIntegrator(), 500, "单 λ 路径优化：采样前平衡")
 
             energies = []
             nan_count = 0
@@ -3145,9 +5964,27 @@ class DualLambdaPreOptimizer:
         except Exception as e: print(f"  [SCAN] Context 读取失败: {e}")
         return None
 
-    def _group1_energy_at(self, parameter_name: str, lam: float) -> float:
+    def _metric_force_groups(self, parameter_name: str) -> set:
+        """差分 `parameter_name` 时要计入哪些 force group。
+
+        规则只有一条：**把该参数的依赖项全部算进来，且只算这些**。
+
+        * 软核 ACES 力（group 1）同时带 lam_coul 与 lam_vdw ⟹ 永远计入。
+        * 原生 NonbondedForce（`PREOPT_NATIVE_NONBONDED_FORCE_GROUP`，只在带电腿
+          存在）只带 lam_coul（B3 的 PME ParameterOffset）⟹ **只在差分 lam_coul
+          时**计入。差分 lam_vdw 时它是个 ~10^6 kJ/mol 的常数，算进来就是在巨大
+          公共项上做差再除以 delta≈0.02，纯灾难性相消。
+        * 中性腿本来就没有力在那个 group 里，集合多写一个空 group 无副作用。
+        """
+        if self.param_coul is not None and parameter_name == self.param_coul:
+            return {1, PREOPT_NATIVE_NONBONDED_FORCE_GROUP}
+        return {1}
+
+    def _metric_energy_at(self, parameter_name: str, lam: float) -> float:
         self.context.setParameter(parameter_name, float(lam))
-        state = self.context.getState(getEnergy=True, groups={1})
+        state = self.context.getState(
+            getEnergy=True, groups=self._metric_force_groups(parameter_name)
+        )
         return state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
 
     def _finite_difference_derivative_1d(
@@ -3162,14 +5999,14 @@ class DualLambdaPreOptimizer:
         hi = min(1.0, lam + float(delta))
         try:
             if hi > lam and lo < lam:
-                e_hi = self._group1_energy_at(parameter_name, hi)
-                e_lo = self._group1_energy_at(parameter_name, lo)
+                e_hi = self._metric_energy_at(parameter_name, hi)
+                e_lo = self._metric_energy_at(parameter_name, lo)
                 return (e_hi - e_lo) / (hi - lo)
-            e_0 = self._group1_energy_at(parameter_name, lam)
+            e_0 = self._metric_energy_at(parameter_name, lam)
             if hi > lam:
-                return (self._group1_energy_at(parameter_name, hi) - e_0) / (hi - lam)
+                return (self._metric_energy_at(parameter_name, hi) - e_0) / (hi - lam)
             if lo < lam:
-                return (e_0 - self._group1_energy_at(parameter_name, lo)) / (lam - lo)
+                return (e_0 - self._metric_energy_at(parameter_name, lo)) / (lam - lo)
             raise RuntimeError(f"lambda={lam} 没有可用的有限差分邻点")
         finally:
             self.context.setParameter(parameter_name, lam)
@@ -3210,7 +6047,7 @@ class DualLambdaPreOptimizer:
             batches.append(remainder)
         for batch_steps in batches:
             with _timed(point_timers, "integration_s"):
-                self.context.getIntegrator().step(batch_steps)
+                guarded_step(self.context.getIntegrator(), batch_steps, "pilot 标量度量采样")
             with _timed(point_timers, "finite_difference_s"):
                 derivative = self._finite_difference_derivative_1d(
                     parameter_name, lam, delta
@@ -3277,7 +6114,7 @@ class DualLambdaPreOptimizer:
                 
         self.context.setParameter(self.param_coul, 1.0)
         print(f"[STAGE1] 设置初始 λ_coul = 1.0")
-        self.context.getIntegrator().step(5000)
+        guarded_step(self.context.getIntegrator(), 5000, "Stage1 pilot 起始预平衡")
 
         variance_data = []
         lambdas = np.linspace(1.0, 0.0, n_states)
@@ -3287,7 +6124,7 @@ class DualLambdaPreOptimizer:
             self.context.setParameter(self.param_coul, float(lam))
             if self.param_vdw is not None:  # ✅ 修复：增加 None 守卫，确保 Stage1 安全
                 self.context.setParameter(self.param_vdw, 1.0)
-            self.context.getIntegrator().step(500)
+            guarded_step(self.context.getIntegrator(), 500, f"Stage1 pilot λ_coul={lam:.4f} 预平衡")
             energies = [
                 e for e in _sample_group1_energies(self.context, n_steps_per_state, sample_interval=50)
                 if not (np.isnan(e) or np.isinf(e))
@@ -3334,6 +6171,7 @@ class DualLambdaPreOptimizer:
         extra_points_per_segment: int = 4,
         max_rounds: int = 2,
         shadow_checkpoint_steps: Optional[List[int]] = None,
+        pilot_states=None,
     ):
         """[THERMODYNAMIC_PATH_PROTOCOL_VERSION=15] Probe additional points
         strictly inside whichever single coarse pilot segment dominates the
@@ -3359,6 +6197,36 @@ class DualLambdaPreOptimizer:
         as the inputs, just more entries -- every downstream consumer already
         works generically on however many pilot points it receives.
         """
+        # 🔑 [2026-09-10] 加密点必须从**相邻的高 λ 端点**续接采样，不能从上一个
+        # 主 pilot 点（λ=0，配体已完全解耦）直接跳回 λ≈0.99。
+        #
+        # 主 pilot 是 λ=1 → 0 顺序走的，跑完才进这个函数。原来这里直接
+        # `setParameter(λ_vdw, 0.99)` 然后只给 500 步预平衡就开测 —— 那是在
+        # "配体突然重新长回一个已经塌陷的空腔"的**非平衡**构型上测 dU/dλ，
+        # mean 和 Var 都被系统性抬高。而这批点恰恰是 λ 布点与 f_k 种子的输入，
+        # 同时也是崩溃源（重新耦合方向的 500 步很容易在 guarded_step 里抛 NaN）。
+        #
+        # 现在要求调用方把每个主 pilot λ 的 (坐标, 速度, 盒子) 快照一并传进来：
+        # 细化某段之前先恢复该段**高 λ 端点**的状态，再向低 λ 顺序采；新插入点
+        # 自己的状态也存回列表，供下一轮从它续接。这样加密点的采样历史与主网格
+        # 同类，500 步预平衡才站得住。
+        #
+        # ⚠️ 这改变了 pilot 的采样语义 ⟹ 旧 preopt 缓存不能冒充等价，必须由
+        # 上游的 layer-1 采样语义字段挡住（不是靠版本号）。
+        if pilot_states is None:
+            raise ValueError(
+                "pilot 网格加密需要每个主 pilot λ 的 endpoint states（坐标/速度/盒子快照）："
+                "加密点必须从相邻高 λ 端点续接采样，不能从 λ=0 的完全解耦构型跳回去。"
+                "调用方未提供 pilot_states —— 拒绝在没有续接状态的情况下加密（fail closed）。"
+            )
+        pilot_states = list(pilot_states)
+        if len(pilot_states) != len(list(pilot_lambdas)):
+            raise ValueError(
+                "endpoint states 数量与 pilot λ 数量不一致："
+                f"{len(pilot_states)} != {len(list(pilot_lambdas))}。"
+                "两者必须逐位对应，否则会从错误的构型续接。"
+            )
+
         pilot_lambdas = [float(x) for x in pilot_lambdas]
         metric_g = list(metric_g)
         pilot_points = list(pilot_points)
@@ -3386,11 +6254,15 @@ class DualLambdaPreOptimizer:
             )
 
             insert_at = worst_idx + 1
+            # 恢复该段**高 λ 端点**的状态，然后向低 λ 顺序采（new_lams 已是 hi→lo）。
+            # 只在进入这一段时恢复一次；段内各点自然地一个接一个续下去，
+            # 与主 pilot 的遍历方向一致。
+            self.context.setState(pilot_states[worst_idx])
             for lam in new_lams:
                 self.context.setParameter(self.param_vdw, float(lam))
                 if self.param_coul is not None and self.param_coul in current_params:
                     self.context.setParameter(self.param_coul, 0.0)
-                self.context.getIntegrator().step(500)
+                guarded_step(self.context.getIntegrator(), 500, f"pilot 网格加密 λ_vdw={lam:.4f} 预平衡")
                 g_lam, point_diag = self._sample_scalar_metric(
                     self.param_vdw,
                     float(lam),
@@ -3410,6 +6282,14 @@ class DualLambdaPreOptimizer:
                 pilot_lambdas.insert(insert_at, float(lam))
                 metric_g.insert(insert_at, g_lam)
                 pilot_points.insert(insert_at, point_diag)
+                # 新点自己的状态存回同一位置：下一轮若选中与它相邻的段，
+                # 就从这里续接，而不是回退到更高的 λ。
+                pilot_states.insert(
+                    insert_at,
+                    self.context.getState(
+                        getPositions=True, getVelocities=True, getParameters=True
+                    ),
+                )
                 insert_at += 1
 
         return np.asarray(pilot_lambdas, dtype=float), metric_g, pilot_points
@@ -3461,7 +6341,7 @@ class DualLambdaPreOptimizer:
         if self.param_coul is not None and self.param_coul in current_params:
             self.context.setParameter(self.param_coul, 0.0)
         self.context.setParameter(self.param_vdw, 1.0)
-        self.context.getIntegrator().step(5000)
+        guarded_step(self.context.getIntegrator(), 5000, "Stage2 pilot 起始预平衡")
 
         # Probe a conventional grid for diagnostics.  Production lambda
         # placement keeps the v19 quadratic base so the lambda~0 tail cannot
@@ -3470,11 +6350,17 @@ class DualLambdaPreOptimizer:
         pilot_lambdas = human_vanishing_initial_lambdas(int(n_states))
         metric_g = []
         pilot_points = []
+        # 🔑 [2026-09-10] 逐 λ 存一份 (坐标, 速度, 盒子) 快照。
+        #
+        # 加密阶段（`_refine_pilot_grid_in_steep_segments`）要从**相邻高 λ 端点**
+        # 续接采样，而不是从这个循环结束时的 λ=0（配体完全解耦）构型跳回 λ≈0.99。
+        # 没有这些快照它会 fail closed，理由见那个函数的说明。
+        pilot_states = []
         for lam in pilot_lambdas:
             self.context.setParameter(self.param_vdw, float(lam))
             if self.param_coul is not None and self.param_coul in current_params:
                 self.context.setParameter(self.param_coul, 0.0)
-            self.context.getIntegrator().step(500)
+            guarded_step(self.context.getIntegrator(), 500, f"Stage2 pilot λ_vdw={lam:.4f} 预平衡")
             g_lam, point_diag = self._sample_scalar_metric(
                 self.param_vdw,
                 float(lam),
@@ -3485,6 +6371,11 @@ class DualLambdaPreOptimizer:
             point_diag["is_refinement_point"] = False
             metric_g.append(g_lam)
             pilot_points.append(point_diag)
+            pilot_states.append(
+                self.context.getState(
+                    getPositions=True, getVelocities=True, getParameters=True
+                )
+            )
             _timing = point_diag.get("timing_s", {})
             print(
                 f"    [preopt λ={float(lam):.4f}] "
@@ -3495,6 +6386,7 @@ class DualLambdaPreOptimizer:
             pilot_lambdas,
             metric_g,
             pilot_points,
+            pilot_states=pilot_states,
             n_steps_per_state=n_steps_per_state,
             finite_difference_delta=finite_difference_delta,
             shadow_checkpoint_steps=shadow_checkpoint_steps,
@@ -3631,7 +6523,7 @@ from abfe_core import (
     create_ligand_internal_force,
     AlchemicalPotentialFactory,
 )
-from openmm import XmlSerializer
+
 
 
 def _create_softcore_force_dual_lambda(
@@ -3721,7 +6613,11 @@ def build_aces_probe_system_dual_lambda(
     it does not re-derive a second charge-transfer formula.
     """
     system = ensure_owned_system(system)
-    new_sys = ensure_owned_system(XmlSerializer.deserialize(XmlSerializer.serialize(system)))
+    # 🔑 [2026-09-10] 全仓 serialize→deserialize 深拷贝改 `XmlSerializer.clone()` 时
+    # 漏了这一处，而它在 Stage 2 preopt 的活路径上（build_aces_probe_system_dual_lambda
+    # 每次都走）。clone() 直接走 SerializationNode，不生成那份 7.7 MB 中间字符串
+    # ——实测的 `char const *` typemap 崩溃现场就是这种大字符串往返。
+    new_sys = ensure_owned_system(XmlSerializer.clone(system))
     num_atoms = new_sys.getNumParticles()
     perturbed_set = set(perturbed_indices)
     env_idx = [i for i in range(num_atoms) if i not in perturbed_set]
@@ -3786,10 +6682,12 @@ def build_aces_probe_system_dual_lambda(
                 default_lam = 1.0 if fixed_lam_coul is None else float(fixed_lam_coul)
                 nb.setGlobalParameterDefaultValue(idx, default_lam)
                 break
-        # Dual-lambda pilot diagnostics sample force group 1.  Include the
-        # native PME/NonbondedForce there so finite differences see the same
-        # λ-dependent Coulomb energy that the offsets just installed control.
-        nb.setForceGroup(1)
+        # Dual-lambda pilot diagnostics difference the native PME/Nonbonded
+        # Force only when the Coulomb lambda is the one being varied -- that is
+        # where B3's ParameterOffset installs the real λ_coul dependence.
+        # 它因此有自己的 force group（见 PREOPT_NATIVE_NONBONDED_FORCE_GROUP），
+        # 由 `_metric_force_groups()` 按被差分的参数决定要不要计入。
+        nb.setForceGroup(PREOPT_NATIVE_NONBONDED_FORCE_GROUP)
 
     zero_q = 0.0 * unit.elementary_charge
     zero_sig = 0.1 * unit.nanometer  # 保留极小半径防除零，但能量为0
@@ -3882,10 +6780,18 @@ def _safe_lambda_delta(base: float, trial: float) -> float:
     return max(0.0, min(1.0, float(trial))) - float(base)
 
 
-def _sample_group1_energy(context, lam_coul: float, lam_vdw: float) -> float:
+def _sample_metric_energy(context, lam_coul: float, lam_vdw: float, axis: str) -> float:
+    """2D 度规路径的能量读数。`axis` 决定计入哪些 force group。
+
+    与 `DualLambdaPreOptimizer._metric_force_groups()` 同一条规则：原生
+    NonbondedForce（带电腿的 PME ParameterOffset）只带 lam_coul 依赖，
+    所以只有沿 coul 轴差分时才计入；沿 vdw 轴差分时它是个 ~10^6 kJ/mol 的常数，
+    算进去就是灾难性相消。中性腿那个 group 是空的，多写无副作用。
+    """
     context.setParameter("lam_coul", float(lam_coul))
     context.setParameter("lam_vdw", float(lam_vdw))
-    return context.getState(getEnergy=True, groups={1}).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+    groups = {1, PREOPT_NATIVE_NONBONDED_FORCE_GROUP} if axis == "coul" else {1}
+    return context.getState(getEnergy=True, groups=groups).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
 
 
 def _finite_difference_on_safe_region(context, lc: float, lv: float, axis: str, delta: float) -> float:
@@ -3904,17 +6810,17 @@ def _finite_difference_on_safe_region(context, lc: float, lv: float, axis: str, 
 
     e0 = None
     if plus_ok and minus_ok:
-        e_plus = _sample_group1_energy(context, *plus)
-        e_minus = _sample_group1_energy(context, *minus)
+        e_plus = _sample_metric_energy(context, *plus, axis=axis)
+        e_minus = _sample_metric_energy(context, *minus, axis=axis)
         return (e_plus - e_minus) / (2.0 * delta)
     if plus_ok:
-        e_plus = _sample_group1_energy(context, *plus)
-        e0 = _sample_group1_energy(context, lc, lv)
+        e_plus = _sample_metric_energy(context, *plus, axis=axis)
+        e0 = _sample_metric_energy(context, lc, lv, axis=axis)
         step = _safe_lambda_delta(lc if axis == "coul" else lv, plus[0] if axis == "coul" else plus[1])
         return (e_plus - e0) / max(step, 1e-8)
     if minus_ok:
-        e_minus = _sample_group1_energy(context, *minus)
-        e0 = _sample_group1_energy(context, lc, lv)
+        e_minus = _sample_metric_energy(context, *minus, axis=axis)
+        e0 = _sample_metric_energy(context, lc, lv, axis=axis)
         step = _safe_lambda_delta(lc if axis == "coul" else lv, minus[0] if axis == "coul" else minus[1])
         return (e0 - e_minus) / max(abs(step), 1e-8)
     raise RuntimeError(
@@ -4352,3 +7258,55 @@ def dijkstra_monotonic_geodesic(
         ci, cj = parent
     path.append((lam_c_grid[0], lam_v_grid[0]))
     return path[::-1]
+
+
+if __name__ == "__main__":
+    # 只读入口：看 stage-2 现在什么状态、控制器会选什么动作。**不执行任何动作。**
+    #   python abfe_preoptimizer.py <run_dir> [stage_name] [--json]
+    # lo/hi 与插点预算默认从 <run_dir>/run_provenance.json 的 config 读，不用手传。
+    import argparse as _ap
+
+    _p = _ap.ArgumentParser(
+        description="Stage-2 统一控制器的只读视图（状态 + 证据 + 下一步动作）"
+    )
+    _p.add_argument("run_dir")
+    _p.add_argument("stage_name", nargs="?", default=None,
+                    help="默认列出所有 vanishing* 段（多采样段只看一个会漏）")
+    _p.add_argument("--json", action="store_true")
+    _p.add_argument(
+        "--replay", nargs="*", metavar="RUN_DIR",
+        help="影子对账：在这些 run 上**只读**重放决策（不执行、不改预算、不写 run）。"
+             "不给路径时把 run_dir 本身当唯一 corpus。",
+    )
+    _p.add_argument("--allow-untrusted", action="store_true",
+                    help="只改 trust_level，**不**把 evidence_status 改写成 CONVERGED")
+    _a = _p.parse_args()
+
+    if _a.replay is not None:
+        _corpus = list(_a.replay) or [_a.run_dir]
+        _traces = Stage2RepairController.replay(_corpus)
+        if _a.json:
+            print(json.dumps(_traces, indent=2, ensure_ascii=False))
+        else:
+            print(Stage2RepairController.render_replay(_traces))
+        raise SystemExit(0)
+
+    _stages = [_a.stage_name] if _a.stage_name else sorted(
+        os.path.basename(d)
+        for d in glob.glob(os.path.join(_a.run_dir, "vanishing*"))
+        if os.path.isdir(d)
+    ) or ["vanishing"]
+
+    _out = []
+    for _st in _stages:
+        _c = Stage2RepairController(
+            _a.run_dir, _st, allow_untrusted_stage_results=_a.allow_untrusted
+        )
+        _v = _c.read()
+        if _a.json:
+            _out.append({"view": _v, "plan": _c.decide(_v)})
+        else:
+            print(_c.render(_v))
+            print()
+    if _a.json:
+        print(json.dumps(_out if len(_out) > 1 else _out[0], indent=2, ensure_ascii=False))

@@ -107,18 +107,35 @@ def test_no_module_level_openmm_platform_access(module):
 
 
 def test_lazy_device_accessors_exist_and_are_memoized():
+    """惰性访问器必须存在，且**只探测一次**。
+
+    2026-09-09 重写：原实现把整段断言包在
+    `if abfe_core._DEVICE_SETTINGS_CACHE is None:` 里面。全量跑的时候别的测试早就
+    把这个缓存填上了，于是这条测试只剩两句 `hasattr` —— 它名字里的 "memoized"
+    从来没被验证过（顺序依赖的空测试）。现在显式把缓存清空再测，并在结束时恢复，
+    这样它与测试执行顺序无关。
+
+    "import 期不得求值"这一条由 `test_abfe_core_has_no_module_level_device_probe`
+    （AST 扫模块顶层调用）负责，不再依赖"缓存此刻是不是空的"这种全局状态。
+    """
     import abfe_core
 
     assert hasattr(abfe_core, "get_global_device")
     assert hasattr(abfe_core, "supports_tf32")
-    # 未调用前缓存必须是空的，否则说明还是 import 期就求值了。
-    # （若本进程中已有别的测试调过，跳过而不是误报。）
-    if abfe_core._DEVICE_SETTINGS_CACHE is None:
+
+    saved = abfe_core._DEVICE_SETTINGS_CACHE
+    try:
+        abfe_core._DEVICE_SETTINGS_CACHE = None
         assert abfe_core.get_global_device() in ("cpu", "cuda")
         first = abfe_core._DEVICE_SETTINGS_CACHE
-        assert first is not None
+        assert first is not None, "调用过 get_global_device() 之后缓存仍为空"
         abfe_core.supports_tf32()
         assert abfe_core._DEVICE_SETTINGS_CACHE is first, "结果必须缓存，不能反复探测"
+        # 同一个对象 ⟹ 第二个访问器没有重新探测设备。
+        assert abfe_core.get_global_device() in ("cpu", "cuda")
+        assert abfe_core._DEVICE_SETTINGS_CACHE is first
+    finally:
+        abfe_core._DEVICE_SETTINGS_CACHE = saved
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +174,75 @@ def test_jax_preallocation_is_disabled_before_pymbar_is_imported():
     # 用 setdefault 而不是直接赋值：外部显式指定的值必须优先。
     assert 'os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] =' not in source, (
         "必须用 setdefault，让外部（例如显式导出 JAX_PLATFORMS=cpu 的人）能覆盖"
+    )
+
+
+def test_jax_backend_is_disabled_before_pymbar_is_imported():
+    """`PYMBAR_DISABLE_JAX=1` 必须在 import pymbar **之前**设好。
+
+    实测（2026-09-09，K=12 态 × N=9600 帧，生产那组 solver 参数）：
+
+               wall     RSS       mmap 数    f_k
+      JAX      6.30 s   887 MiB   1441       —
+      numpy    0.37 s   120 MiB    891       max|Δf_k| = 8.9e-16
+
+    JAX 后端慢 17 倍、胖 7 倍，答案逐位相同（每次解都要重新 XLA 编译，λ 表/
+    帧数一变形状就变，编译缓存命不中；编译产物和 BFC 池从不归还）。留着它 =
+    宿主内存被解算器啃光，然后由下游任何一次大分配替它抛 `std::bad_alloc`
+    （2026-09-09 cyclod_ligand1/rep1：7.4 MB XML、93 GB 机器，崩在
+    `XmlSerializer.deserializeSystem`）。
+    """
+    source = (REPO_ROOT / "abfe_core.py").read_text(encoding="utf-8")
+
+    setter = source.find('os.environ.setdefault("PYMBAR_DISABLE_JAX"')
+    assert setter >= 0, (
+        "abfe_core.py 里不再设置 PYMBAR_DISABLE_JAX=1。去掉它 = 每次 MBAR 解都"
+        "付一次 XLA 编译并永久留下几百 MiB，宿主内存耗尽后由下游随便哪次大分配"
+        "抛无法归因的 std::bad_alloc（MBAR-JAX-HOST-MEM）。"
+    )
+    pymbar_import = source.find("import pymbar")
+    assert pymbar_import >= 0
+    assert setter < pymbar_import, (
+        "PYMBAR_DISABLE_JAX 的设置跑到 import pymbar 之后了——pymbar 只在"
+        "`mbar_solvers` 被 import 时读一次这个变量，设晚了等于没设。"
+    )
+
+    # 用 setdefault 而不是直接赋值：想要回 JAX 的人必须能用环境变量覆盖。
+    assert 'os.environ["PYMBAR_DISABLE_JAX"] =' not in source, (
+        "必须用 setdefault，让外部显式导出 PYMBAR_DISABLE_JAX=0 能要回 JAX"
+    )
+
+
+def test_pymbar_actually_runs_without_jax_after_importing_abfe_core():
+    """光看源码不够：真的 import 进去，pymbar 必须落在 numpy 后端上。
+
+    `mbar_solvers.force_no_jax` 是 pymbar 自己记录"我被要求不用 JAX"的标志；
+    它为真时 `sys.modules` 里不该出现 `jax`（JAX 一旦初始化，那 18.4 GiB VSZ
+    和几百 MiB RSS 就再也拿不回来了）。
+    """
+    script = (
+        "import sys; sys.path.insert(0, %r)\n"
+        "import os\n"
+        "assert 'PYMBAR_DISABLE_JAX' not in os.environ, '外部已设，测不了默认行为'\n"
+        "import abfe_core\n"
+        "from pymbar import mbar_solvers\n"
+        "print(mbar_solvers.force_no_jax, 'jax' in sys.modules)\n"
+    ) % str(REPO_ROOT)
+
+    env = dict(os.environ)
+    env.pop("PYMBAR_DISABLE_JAX", None)
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        cwd=str(REPO_ROOT),
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip().splitlines()[-1] == "True False", (
+        f"pymbar 没有落在 numpy 后端上（force_no_jax, 'jax' in sys.modules）="
+        f"{proc.stdout.strip().splitlines()[-1]!r}"
     )
 
 

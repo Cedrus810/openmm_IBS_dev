@@ -13,11 +13,16 @@ import ast
 import json
 from pathlib import Path
 from types import SimpleNamespace
+
+from step_guard import guarded_step
 from typing import Any, Dict, Optional
 from datetime import datetime
 
 import pytest
 
+
+
+pytestmark = pytest.mark.cpu_only
 
 ROOT = Path(__file__).resolve().parents[1]
 PIPELINE_PATH = ROOT / "abfe_pipeline.py"
@@ -50,6 +55,10 @@ def _compile_pipeline_method(name: str):
         "Any": object,
         "List": list,
         "Tuple": tuple,
+        # 2026-09-09：预平衡的步进改走 step_guard.guarded_step（step() 抛的
+        # OpenMMException 必须带上下文）。这里给真货而不是桩，免得替身把真实
+        # 行为遮掉 —— guarded_step 只需要对象有 .step()，桩体也照样能跑。
+        "guarded_step": guarded_step,
     }
     exec(compile(module, str(PIPELINE_PATH), "exec"), namespace)
     return namespace[name]
@@ -64,7 +73,10 @@ def _compile_pipeline_top_level(name: str):
     )
     module = ast.Module(body=[function], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"Any": Any, "Dict": Dict, "Optional": Optional, "List": list, "Tuple": tuple}
+    namespace = {
+        "Any": Any, "Dict": Dict, "Optional": Optional, "List": list, "Tuple": tuple,
+        "guarded_step": guarded_step,
+    }
     exec(compile(module, str(PIPELINE_PATH), "exec"), namespace)
     return namespace[name]
 
@@ -161,6 +173,10 @@ def _pre_equilibration_namespace():
 
         @staticmethod
         def deserialize(_xml):
+            return SimpleNamespace(thisown=0, getNumParticles=lambda: 2)
+
+        @staticmethod
+        def clone(_system):
             return SimpleNamespace(thisown=0, getNumParticles=lambda: 2)
 
     class _Platform:
@@ -375,7 +391,9 @@ def test_successful_checkpoint_resume_starts_a_new_segment_without_appending_old
     assert dcd_reporter.kwargs["append"] is False
     archived = tmp_path / "pre_equilibration.segment-0001.dcd"
     assert archived.read_bytes() == old_bytes
-    assert not old_dcd.exists() or result["trajectory_file"] == str(old_dcd)
+    # 2026-09-09：原来是 `not old_dcd.exists() or <下一行同样的断言>`。文件存在的
+    # 那一支才是本用例构造的场景，OR 的前半只是让断言在另一支里失去作用。
+    assert result["trajectory_file"] == str(old_dcd)
     manifest = json.loads((tmp_path / "pre_equilibration_segments.json").read_text())
     active = manifest["active_segment"]
     assert active["start_checkpoint_step"] == 2

@@ -31,7 +31,10 @@ import functools
 from contextlib import contextmanager
 from scipy.integrate import quad as _scipy_quad
 from typing import Dict, List, Tuple, Optional, Any, Sequence
+from step_guard import guarded_step, step_with_chunk_rollback
 from abfe_core import (
+    # 整分子周期回卷：连通性只信 System，不信 topology 的键（唯一实现）。
+    image_molecules_by_system,
     ACESoftcorePotential,
     # §3.0 空腔填充迟滞：正反向 / 双起点 stage2 的 ΔF 差 <= 2σ。
     # 这个常量此前**只被写进 provenance、从未被任何代码执行过**；
@@ -462,6 +465,39 @@ def _stage_window_sampling_identity(protocol_key):
         "early_stop_max_delta_g_drift_kJ_mol", "early_stop_max_uncertainty_kJ_mol",
     ):
         kwargs.pop(key, None)
+    # 🔑 [2026-09-10] 路径形状键同理：它们决定**有哪些窗口**，不决定**某个窗口采什么**。
+    # 一个窗口采样的哈密顿量完全由它自己的 λ 值 + 该窗口 System 决定，而这两者都
+    # 已经被单独校验（`_resume_cached_window_gate_status` 里 `lambdas_match` 是
+    # `usable` 的 AND 项；原生续算另查完整 window System 与冻结 f_k）。把它们留在
+    # 窗口采样身份里的后果是：在末段插一个 λ 时，前面 λ 值逐位未变、物理上完全可
+    # 复用的窗口也会被判失配而整窗重采（实测代价见 `_stage_protocol_key` 注释：
+    # Stage 1 约 28 分钟 + 6 个 vanishing 窗口全部重采样）。这与本函数已经摘掉
+    # 预算/门槛是同一条原则，只是原来没贯彻到路径形状上。
+    # ⚠️ stage **结果**缓存不受影响：它仍要求完整 protocol key，另外还叠了
+    # `lambda_path_fingerprint` 全路径门（abfe_pipeline.py stage2 resume 处），
+    # 所以路径一变，总 ΔG 绝不会被静默复用。这里放宽的只有窗口轨迹的复用。
+    # ⚠️ 本放宽的安全性**依赖** `lambdas_match` 继续是 `usable` 的 AND 项；
+    # 若哪天它被摘掉，这几个键必须同时放回来。见 test_resume_reuse_contracts.py。
+    for key in (
+        "stage2_final_n_states",
+        "stage2_free_energy_densify_points",
+        "stage2_window_min_states",
+        "stage2_window_max_states",
+        "stage2_refine_extra_points_per_segment",
+        # 采样修复策略同理：它决定路径**怎么演化**，不决定某个窗口采什么。窗口层面
+        # 另有 `repair_policy_match` 按等价类单独判（non_mutating_v1 与
+        # path_evolution_v1 同类，legacy_mutating 自成一类）。
+        "sampling_repair_policy",
+        # 路径演化 / f_k 重标定的**执行策略**：它们决定要不要演化路径、要不要另开
+        # 一段采样，不决定某个已落盘窗口采的是什么。被重标定的那段写在独立目录
+        # （vanishing_2/）里、自带 checkpoint 树，原目录的窗口逐帧未变。
+        # 不摘掉的后果：任何人一旦打开这两个开关，就会让**已有的全部窗口缓存失配、
+        # 静默重采**（实测代价见 `_stage_protocol_key` 注释）。
+        "max_path_insertions",
+        "stage2_recalibrate_f_k_on_rescue",
+        "stage2_f_k_recalibration_min_shift",
+    ):
+        kwargs.pop(key, None)
     # Preserve the original schema's presence/absence of unrelated fields.
     if "kwargs" in config:
         config["kwargs"] = kwargs
@@ -759,6 +795,16 @@ def _load_validated_joint_score_ledgers(
         # convention used by physical ``u_kn``.
         "sampling_state_energies": arrays["sampling_states"].T.copy(),
         "residual_basis": arrays["residual_basis"].copy(),
+        # 🔑 [2026-09-09] 显式标记"这个窗口属于 residual 臂"。
+        #
+        # 下游 `solve_stage_integrated` 原来是拿
+        # `sampling_gauge_required = sampling_kj is not None` 当守卫 —— 用**被守护
+        # 的那个数组自己**推导要不要守护它，是个恒真的循环，永远不会触发。
+        # 它要防的情形（residual 臂的窗口拿不到 sampling_state_energies，于是 ESS /
+        # occupancy / common_mode 全部退回物理规范却照样过门）恰好是它测不出来的
+        # 那一种。在线调用方一直是对的（从 `ibs_wrapper.residual_enabled` 读），
+        # 只有 stage-final 这条不是。这里给它一个不依赖数组本身的判据。
+        "residual_sampling_arm": True,
     }
 
 
@@ -1735,7 +1781,7 @@ def _prepare_pme_coulomb_leg_system(
     box_vectors=None,
     co_alchemical_ion_spec: Optional[Dict[str, Any]] = None,
 ) -> openmm.System:
-    prepared = openmm.XmlSerializer.deserialize(openmm.XmlSerializer.serialize(system_template))
+    prepared = openmm.XmlSerializer.clone(system_template)
     prepared.thisown = 1
     configure_pme_ligand_charge_offsets(
         prepared,
@@ -2231,7 +2277,7 @@ def run_boresch_attachment_leg(
     kt = 0.008314462618 * float(temperature_k)
     K = int(lam.size)
 
-    work = openmm.XmlSerializer.deserialize(openmm.XmlSerializer.serialize(system))
+    work = openmm.XmlSerializer.clone(system)
     work.thisown = 1
     _assert_force_group_is_free(work, BORESCH_ATTACHMENT_FORCE_GROUP)
     if not add_scalable_boresch_restraint(work, restraint_params):
@@ -2546,12 +2592,12 @@ def run_boresch_attachment_leg(
                 else ATTACHMENT_MONITOR_INTERVAL
             )
             _chunk = min(_interval, _remaining)
-            simulation.step(_chunk)
+            guarded_step(simulation, _chunk, f"attachment 腿 λ 态 {k} 预平衡")
             _remaining -= _chunk
             _cumulative += _chunk
             _monitor_row(_cumulative, k, lam[k], "equil")
         for s in range(n_samples):
-            simulation.step(int(steps_per_sample))
+            guarded_step(simulation, int(steps_per_sample), f"attachment 腿 λ 态 {k} 采样")
             _cumulative += int(steps_per_sample)
             if s % max(1, ATTACHMENT_MONITOR_INTERVAL // int(steps_per_sample)) == 0:
                 _monitor_row(_cumulative, k, lam[k], "sample")
@@ -3031,6 +3077,50 @@ def _split_platform_spec(platform_name: str) -> Tuple[str, Optional[str]]:
 _REMD_CONTEXT_VRAM_FLOOR_MIB = 700.0
 
 
+def _available_host_mib() -> Optional[float]:
+    """/proc/meminfo 的 MemAvailable，MiB；拿不到就返回 None。
+
+    用 MemAvailable 而不是 MemFree：page cache 是可回收的，MemFree 会把一台
+    正常工作的机器误判成"没内存了"。
+    """
+    try:
+        with open("/proc/meminfo", "r", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return float(line.split()[1]) / 1024.0
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _host_memory_mib() -> Optional[Tuple[int, int]]:
+    """(当前 RSS, 进程峰值 RSS) MiB；拿不到就返回 None。
+
+    ## 为什么加这个
+
+    全仓在阶段边界打了 8 处**显存**（`_gpu_memory_mib`），**宿主内存一处都没有**。
+    于是宿主侧内存耗尽只能表现成一句无法归因的
+    `OpenMMException: std::bad_alloc` —— 2026-09-09 cyclod_ligand1/rep1 就是这样：
+    崩在 Stage 1 第一个 replica 的 `XmlSerializer.deserializeSystem` 上，而那份
+    XML 只有 7.4 MB、机器 93 GB、`ulimit -v unlimited`、当时只有这一个进程。
+    崩点本身离线复现完全正常（8 个 replica 峰值 708 MiB），所以内存是在**进
+    Stage 1 之前**被吃掉的，但日志里没有任何一个数能说是哪一段吃的。
+
+    当前 RSS 和峰值都要：只有峰值是单调的，看不出某一段跑完有没有还回去。
+    """
+    try:
+        import resource
+
+        peak_raw = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        # Linux/FreeBSD 的 ru_maxrss 是 KiB，macOS 是 bytes。
+        peak = peak_raw / (1024.0 * 1024.0 if sys.platform == "darwin" else 1024.0)
+        with open("/proc/self/statm", "r", encoding="ascii") as fh:
+            current = float(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1024.0 / 1024.0
+    except (ImportError, OSError, ValueError, IndexError, AttributeError):
+        return None
+    return int(current), int(peak)
+
+
 def _gpu_memory_mib() -> Optional[Tuple[int, int, int]]:
     """(used, free, total) MiB；拿不到就返回 None。
 
@@ -3100,7 +3190,6 @@ def _build_platform_properties(
 # ensure_owned_system, sync_all_exclusions, create_ligand_internal_force 已从 abfe_core 导入
 # ================= ibs_engine.py / abfe_core.py =================
 import openmm
-from openmm import app, unit
 import numpy as np
 
 def charging_charge_conservation_report(
@@ -3867,6 +3956,31 @@ def generate_overlapping_windows(
     if windows and windows[-1][1] < n_states:
         windows[-1] = (max(0, n_states - effective_pts), n_states)
 
+    # 🔑 [2026-09-09] 去掉重复窗口。
+    #
+    # 调用方给了显式 `n_windows` 且 `max_start < n_windows - 1` 时，
+    # `linspace` 取整必然产生重复起点。实例（config 可达，
+    # `abfe_pipeline` 把 `kwargs.get("n_windows")` 原样透传）：
+    #   n_states=8, n_windows=6, pts_per_window=6, overlap=2
+    #   → effective_pts=6, max_start=2, linspace(0,2,6) → [0,0,1,1,2,2]
+    #   → [(0,6),(0,6),(1,7),(1,7),(2,8),(2,8)]
+    # 下面的覆盖性检查只看并集，重复窗口照样放行；而每个重复窗口随后都会成为
+    # 自己的 `local_idx`、有自己的能量文件（`load_ibs_window_outputs_from_dir`
+    # 纯按位置索引），并作为**独立窗口**进入协方差链 —— 同一段 λ 的 ΔF 被走两遍。
+    deduped = []
+    for window in windows:
+        if window not in deduped:
+            deduped.append(window)
+    if len(deduped) != len(windows):
+        logger.warning(
+            "[窗口划分] n_states=%d, n_windows=%s, pts_per_window=%d, overlap=%d "
+            "产生了 %d 个重复窗口（linspace 起点取整重合），已去重：%d → %d 个窗口。"
+            "如果需要更多窗口，减小 pts_per_window 或增大 n_states。",
+            n_states, n_windows, pts_per_window, overlap,
+            len(windows) - len(deduped), len(windows), len(deduped),
+        )
+    windows = deduped
+
     # 验证覆盖性
     covered = set()
     for s, e in windows:
@@ -3917,18 +4031,42 @@ def _lj_tail_correction_sigma_resolved_moments(
     eps_env = np.array(
         [all_params[j][2].value_in_unit(unit.kilojoule_per_mole) for j in environment_indices], dtype=np.float64
     )
-    sigma_ij = (0.5 * (sigma_lig[:, None] + sigma_env[None, :])).ravel()
-    eps_ij = np.sqrt(eps_lig[:, None] * eps_env[None, :]).ravel()
-    # 1e-9 nm 的分组容差远小于任何物理 sigma 差异，只用来把浮点上完全等价的取值合并。
-    sigma_key = np.round(sigma_ij, 9)
-    sigma_nm, inverse = np.unique(sigma_key, return_inverse=True)
-    n_bins = sigma_nm.shape[0]
-    s6_per_sigma = np.bincount(
-        inverse, weights=eps_ij * sigma_ij ** 6, minlength=n_bins
+    # 🔑 [2026-09-09] 逐 ligand 行累加，不再物化 n_ligand × n_environment 的稠密外积。
+    #
+    # 原来一次开出六个全尺寸数组：`sigma_ij`、`eps_ij`、`sigma_key`、`inverse`
+    # 以及两个权重数组。41 原子配体 × 73k 环境实测进程峰值约 219 MiB
+    # （基线 34 MiB）；100 原子 × 100k 膜盒按同比例约 700 MiB。而真正需要的只是
+    # 每个 distinct sigma 的两个矩。逐行版实测峰值约 37 MiB、耗时相同。
+    #
+    # **这段改写与旧实现逐位等价**，`tests/test_lj_tail_sigma_moments_bit_identical.py`
+    # 冻结了旧 dense 实现当 oracle、用 `.tobytes()` 比对。等价性依赖下面这些顺序，
+    # 动任何一条都会破：
+    #   * ligand 外层、environment 内层 —— 决定累加次序；
+    #   * 分组键仍是 `round(..., 9)`；
+    #   * 权重用**未 round** 的 sigma；
+    #   * bin 仍是 `np.unique` 的升序输出；
+    #   * 按原始 pair 次序累加（`np.bincount` 就是按输入下标顺序累加的，
+    #     逐行 `np.add.at` 只有在行序与行内序都保持时才等价）。
+    #
+    # bin 集合不需要遍历所有 pair：sigma_ij 只取决于 (distinct sigma_lig,
+    # distinct sigma_env) 的外和，力场里这两个集合都很小。每个候选都被某个真实
+    # pair 取到、每个真实键也都是候选，所以与"对全量 key 取 unique"同集合同序。
+    unique_sigma_lig = np.unique(sigma_lig)
+    unique_sigma_env = np.unique(sigma_env)
+    sigma_nm = np.unique(
+        np.round(
+            0.5 * (unique_sigma_lig[:, None] + unique_sigma_env[None, :]), 9
+        ).ravel()
     )
-    s12_per_sigma = np.bincount(
-        inverse, weights=eps_ij * sigma_ij ** 12, minlength=n_bins
-    )
+    s6_per_sigma = np.zeros(sigma_nm.shape[0], dtype=np.float64)
+    s12_per_sigma = np.zeros(sigma_nm.shape[0], dtype=np.float64)
+    for row in range(sigma_lig.shape[0]):
+        sigma_row = 0.5 * (sigma_lig[row] + sigma_env)
+        eps_row = np.sqrt(eps_lig[row] * eps_env)
+        # 1e-9 nm 的分组容差远小于任何物理 sigma 差异，只用来把浮点上完全等价的取值合并。
+        bin_index = np.searchsorted(sigma_nm, np.round(sigma_row, 9))
+        np.add.at(s6_per_sigma, bin_index, eps_row * sigma_row ** 6)
+        np.add.at(s12_per_sigma, bin_index, eps_row * sigma_row ** 12)
     return (
         sigma_nm.astype(np.float64),
         s6_per_sigma.astype(np.float64),
@@ -4025,9 +4163,14 @@ LIGAND_COM_RESTRAINT_PROTOCOL_VERSION = 2
 #       无壳          | -6.581±0.256 / -7.324±0.258 |   —
 #       有壳          | +36.889±0.068               | +38.724（生产）
 #
-#     壳         +44.21  (98%)
-#     单混合     + 1.83  ( 4%)
+#     壳         +44.21   ← 干净：两条臂都不含 LRC，相减无口径问题
+#     单混合     + 1.83   ← ⚠️ 2026-09-09 更正：**错的**，正确是 -0.99
 #     统计残差   - 0.74
+#
+# ⚠️ [2026-09-09 更正] 上面 `单混合 +1.83 (4%)` 有 **LRC 口径错误**：它是
+# `38.724（生产，含 LJ 尾项）- 36.889（臂，不含）`。对齐后（尾项减在生产侧）
+# 是 **-0.99**；`total_error` 45.30 同理应为 42.48。壳那 +44.21 不受影响
+# （两条臂都不含尾项）⟹ **本常量的退役依据完全成立，不要因为这条去翻它**。
 #
 # 两次独立实现的"无壳+独立采样"互差 0.744 = 2.05σ ⟹ 归因可信，且**无壳能正常采样**。
 # 逐窗口壳贡献 1.20/2.17/5.40/7.90/16.53/11.02 随 `bias_to_signal_ratio`
@@ -4044,8 +4187,15 @@ LIGAND_COM_RESTRAINT_PROTOCOL_VERSION = 2
 # 这与 `ibs_engine.py` 约 10978-11020 的要求 #1 完全一致 ——
 # 「**正式采样不得保留 Group-4 WCA 防护壳** …… 它把水挡在空腔外，正是本模块要采的
 # 那个构型」。区别只是：那里的正解是 `stage2_independent_endpoint`（逐态独立轨迹，
-# ~90 分钟/腿，2026-09-01 因成本关掉），而本实验证明**独立采样只值 4%** ——
-# 保留 IBS 单混合分布、只移除壳，可得 ~98% 收益、额外成本近零。
+# ~90 分钟/腿，2026-09-01 因成本关掉），而本实验当时的结论是**独立采样只值 4%**
+# ⟹ 保留 IBS 单混合分布、只移除壳。
+#
+# ⚠️ [2026-09-09 更正] 「独立采样只值 4%」**不成立**，两处：(1) 那个 +1.83 带
+# LRC 口径错误，对齐后是 -0.99；(2) 它是**带壳**测的。壳退役后同一个量是
+# **-3.57 kJ/mol**（放大 3.6 倍），而且它就是壳退役后剩下的**全部**残差
+# （生产 -10.898 vs 逐态独立 -7.324 / 真值 -6.581，即 -3.57 ~ -4.32，5.5σ）。
+# ⟹ 「只移除壳」这一步是对的且已完成，但**不能**据此认为独立采样没有价值。
+# 逐项消元证据见 docs/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md。
 #
 # 退役方式是**死代码而非删除**：`build_ibs_dual_system` 里构造壳的整段留在一个
 # 永久为假的分支里；`_estimate_wca_shield_parameters` 等函数体一字未改、仍可导入。
@@ -4060,7 +4210,7 @@ LIGAND_COM_RESTRAINT_PROTOCOL_VERSION = 2
 #   · `WCA_ACCOUNTING_VERSION` 2→3：Group 4 现为**恒空组**，e_bias 实际只有 {1}。
 #     `getState(groups={1,4})` 保持不变（空组贡献 0，且复活时仍正确）。
 #
-# 完整证据：docs/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md §2.10、
+# 完整证据：docs/archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md §2.10、
 # 数据 docs/reference_data/stage2_vanishing_truth_toluene_2026-09-02.json。
 # ============================================================================
 WCA_SHIELD_RETIRED = True
@@ -4695,8 +4845,17 @@ def diagnose_softcore_cv_values(
             except Exception as e:
                 print(f"  CV 读取失败: {e}")
                 return
-            idx_int = 2 * k
-            e_int = cv_vals[idx_int] if idx_int < len(cv_vals) else float("nan")
+            # [EXP-031 S1] 不再按 2*k 硬算 —— 那个假设在 residual_enabled（前面先
+            # 注册了 exp025_residual_basis，整体偏移 1）和 omit 形态（每态只有 1 个
+            # CV）下都是错的，而 CustomCVForce 读错索引不会报错、只会静默给错数。
+            # `_int_cv_indices` 是 addCollectiveVariable() 的**真实返回值**表，且与
+            # `_evaluate_interaction_energies_live()` 用的是同一份，形态无关。
+            int_cv_indices = getattr(ibs_wrapper, "_int_cv_indices", None) or []
+            if k < len(int_cv_indices):
+                idx_int = int(int_cv_indices[k])
+                e_int = cv_vals[idx_int] if idx_int < len(cv_vals) else float("nan")
+            else:
+                e_int = float("nan")
         e_rest = 0.0
         interaction_values.append(float(e_int))
         e_tot = e_base + e_int + e_rest if np.isfinite(e_base) else float("nan")
@@ -4732,7 +4891,7 @@ def _serialize_ibs_common_system(window_system: openmm.System) -> str:
     calibration purposes; see ``_serialize_ibs_common_plus_wca_system`` for
     that (production's real sampled ensemble includes the WCA shield).
     """
-    common = XmlSerializer.deserialize(XmlSerializer.serialize(window_system))
+    common = XmlSerializer.clone(window_system)
     removed = {1: 0, 4: 0}
     for force_index in reversed(range(common.getNumForces())):
         group = int(common.getForce(force_index).getForceGroup())
@@ -4782,7 +4941,7 @@ def _serialize_ibs_common_plus_wca_system(window_system: openmm.System) -> str:
     ensemble it needs to reweight, once the caller sets ``lambda_shield`` to
     the same value production used for this window.
     """
-    common_plus_wca = XmlSerializer.deserialize(XmlSerializer.serialize(window_system))
+    common_plus_wca = XmlSerializer.clone(window_system)
     removed = {1: 0}
     for force_index in reversed(range(common_plus_wca.getNumForces())):
         group = int(common_plus_wca.getForce(force_index).getForceGroup())
@@ -4831,6 +4990,78 @@ IBS_DUAL_MAX_LAMBDA_STATES = (
 )
 
 
+# 🔑 [EXP-031 S1, 2026-09-04] Group-1 偏置力形态开关：是否**不再注册**那 K 个恒零的
+# `cv_k_rest` 占位 CV。
+#
+# 为什么它们恒零：`cv_k_rest` 是 `openmm.CustomExternalForce("0")`，**一个粒子都没
+# 往里加过**（见 build_ibs_dual_system / build_shadow_coul_ibs_system 的注册处）。
+# 它只是论文 Eq.8 里"限制项"的占位槽；真正的物理 Boresch 限制在 Group 3 的独立力上
+# （`_add_physical_boresch_restraint`），`diagnose_softcore_cv_values` 里的
+# `e_rest = 0.0` 也是写死的。也就是说这 K 个 CV 对能量和力的贡献严格为 0。
+#
+# 为什么值得摘：`CustomCVForce` 是**每个 CV 一次串行的 inner-context 力求值**，每个
+# CV 恒定花 21-25 µs，且**与体系大小无关**（EXP-031 S0 实测 6282 / 24498 / 71262
+# 三个尺寸：21.3 / 21.4 / 25.2 µs 每 CV）。生产 K=16 时 32 个 CV 里有一半是纯占位，
+# 实测占整步 15%：71262 原子水盒、PME 1.0 nm、2 fs、CUDA/mixed 下，16 个恒零
+# `cv_k_rest` 单独就要 +0.414 ms/step（生产形态 2.691 ms/step，无偏置基线
+# 0.753 ms/step）。证据：experiments/EXP-031_ibs_bias_fusion/results/s0_b1_cv_scaling.log
+#
+# ⚠️ 翻这个开关会改变 Group-1 的 CustomCVForce **表达式字符串与 CV 集合**，因此
+# system XML 指纹变化 → `dual_window_*` / resume 产物全部失配。默认保持 False
+# （legacy 形态），既有测试与"与主线逐字节相同"的回归因此全部不受影响。真要在生产
+# 里打开，必须同时升 `IBS_BIAS_PROTOCOL_VERSION` 并显式写出缓存作废代价。
+#
+# ⚠️ 打开它**不等于**把单窗口 λ 态数上限从 16 抬到 32：CV 预算确实从 2K≤32 松到
+# K≤32，但探针路径的 `PROBE_MAX_LAMBDA_STATES = 16` 来自**力组**上限
+# （`OPENMM_MAX_FORCE_GROUP - PROBE_FORCE_GROUP_BASE + 1`），是另一条**独立**约束，
+# 本开关碰不到它。生产实际可用态数是两者的较小值。
+#
+# 🔑 [2026-09-05] 默认值 False → **True**（用户决定）。依据：
+#   收益  真 Atenolol 膜体系（45354 原子、41 原子真配体、K=16、CUDA/mixed）实测
+#         整步 2.086 → 1.709 ms/step，**1.2206×**（三轮 1.2128/1.2206/1.2348，
+#         轮间散度 1.80%，闸门 5%）。省下的 0.377 ms 与 71262 原子水盒上省的
+#         0.377 ms **完全一致** —— 印证它就是"每 CV 21-25 µs 的调度税"，与体系
+#         大小无关。
+#   物理  Group-1 能量在**三条独立路径**上逐比特相同：真配体膜体系、
+#         `build_shadow_coul_ibs_system`（`tests/test_shadow_coul_ibs_builder.py`）、
+#         以及 71262 原子水盒（S1 原验证，Reference/CUDA 三档 24 行全 bitwise）。
+#   测试  legacy 与 omit 两形态各 1830 passed；翻默认值前先解除了两条零覆盖：
+#         `tests/test_core_physics_numerics.py::_build_bias_context` 改成形态感知、
+#         shadow-coul builder 补齐首份覆盖。
+#   代价  见下面 IBS_BIAS_PROTOCOL_VERSION 的 v33 说明：system XML 变 ⟹ 现有全部
+#         dual_window_*/resume 产物失配、需重跑 GPU。
+# 完整记录：experiments/EXP-031_ibs_bias_fusion/PLAN_EXP-031_ibs_bias_fusion.md §10/§12
+IBS_BIAS_OMIT_ZERO_REST_CVS = True
+
+def ibs_dual_cvs_per_lambda_state(omit_zero_rest_cvs: Optional[bool] = None) -> int:
+    """每个 λ 态在 Group-1 `CustomCVForce` 里真正占掉的 CV 个数。
+
+    `omit_zero_rest_cvs=None` 表示"按当前模块级形态开关取值"。传显式布尔值是为了让
+    调用方（和测试）能在不改全局开关的前提下问"另一种形态下是多少"。
+
+    注意：`IBS_DUAL_CVS_PER_LAMBDA_STATE` / `IBS_DUAL_MAX_LAMBDA_STATES` 这两个
+    **模块常量的默认值刻意不随开关变化**（`tests/test_probe_and_hysteresis_limits.py`
+    断言 `PROBE_MAX_LAMBDA_STATES == IBS_DUAL_MAX_LAMBDA_STATES == 16`，那条断言检查
+    的是"两条数值巧合相同的独立限制没有被混为一谈"）。需要按形态取值的地方一律走这
+    两个 helper。
+    """
+    if omit_zero_rest_cvs is None:
+        omit_zero_rest_cvs = IBS_BIAS_OMIT_ZERO_REST_CVS
+    return 1 if omit_zero_rest_cvs else IBS_DUAL_CVS_PER_LAMBDA_STATE
+
+
+def ibs_dual_max_lambda_states(omit_zero_rest_cvs: Optional[bool] = None) -> int:
+    """当前（或指定）形态下，单个 IBS ensemble 的 CV 预算允许的最大 λ 态数。
+
+    这**只是** `CustomCVForce` 的 32-CV 预算算出来的上限，不是 λ 态数的物理上限，
+    也不是探针路径的上限（见 `IBS_BIAS_OMIT_ZERO_REST_CVS` 的第二条 ⚠️）。
+    """
+    return OPENMM_CUSTOM_CV_MAX_VARIABLES // ibs_dual_cvs_per_lambda_state(
+        omit_zero_rest_cvs
+    )
+
+
+
 def build_ibs_dual_system(
     system: openmm.System,
     topology,
@@ -4867,10 +5098,15 @@ def build_ibs_dual_system(
         raise ValueError("lambdas_coul 与 lambdas_vdw 必须等长")
     if len(lambdas_coul) < 2:
         raise ValueError("IBS dual-lambda ensemble 至少需要两个状态")
-    if len(lambdas_vdw) > IBS_DUAL_MAX_LAMBDA_STATES:
+    # [EXP-031 S1] CV 预算按 Group-1 的**当前形态**算：摘掉恒零 cv_k_rest 后每态只占
+    # 1 个 CV。legacy 形态下 ibs_dual_* helper 返回的就是 2 / 16，与改动前逐值相同。
+    _omit_zero_rest_cvs = IBS_BIAS_OMIT_ZERO_REST_CVS
+    _cvs_per_state = ibs_dual_cvs_per_lambda_state(_omit_zero_rest_cvs)
+    _max_lambda_states = ibs_dual_max_lambda_states(_omit_zero_rest_cvs)
+    if len(lambdas_vdw) > _max_lambda_states:
         raise RuntimeError(
             "单个 IBS ensemble 的 lambda 状态过多："
-            f"K={len(lambdas_vdw)}, 每态 {IBS_DUAL_CVS_PER_LAMBDA_STATE} 个 CV，"
+            f"K={len(lambdas_vdw)}, 每态 {_cvs_per_state} 个 CV，"
             f"将超过 OpenMM CustomCVForce 的 {OPENMM_CUSTOM_CV_MAX_VARIABLES}-CV 上限。"
             "请把 vanishing 域划为多个物理子区间；禁止使用单一 [0:K] ensemble。"
             "\n\n[WARN] 这条限制来自 **Group-1 IBS 混合偏置力**（CustomCVForce 一次最多引用 "
@@ -4879,10 +5115,10 @@ def build_ibs_dual_system(
             "混合偏置力——它只需要 λ 无关的 U_common 和逐态的 _int_cv_force_xmls[k]。"
             "若你要的是独立采样而非 IBS，请按 <=%d 态分块调用本函数、再把各块的 "
             "CV/LRC 拼起来（重叠态可用来校验同一 λ 在不同块建出的 CV 逐字节相同），"
-            "不要为了绕过这条限制去改 IBS 偏置力的结构。" % IBS_DUAL_MAX_LAMBDA_STATES
+            "不要为了绕过这条限制去改 IBS 偏置力的结构。" % _max_lambda_states
         )
     system = ensure_owned_system(system)
-    new_sys = ensure_owned_system(XmlSerializer.deserialize(XmlSerializer.serialize(system)))
+    new_sys = ensure_owned_system(XmlSerializer.clone(system))
     resolved_box = _resolve_periodic_box_vectors(box_vectors, topology=topology, system=new_sys)
     if _system_requires_periodic_box(new_sys):
         if resolved_box is None:
@@ -5026,7 +5262,7 @@ def build_ibs_dual_system(
     # （+44.21 / +45.30 kJ/mol）——壳幅度 4λ(1−λ) 在 λ→0 只线性衰减，而物理 LJ 是
     # λ²，比值 4(1−λ)/λ 发散 ⟹ 目标态无壳而系综带壳，水贴近配体的构型从未被采到。
     # 见该常量处的长注释与
-    # docs/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md §2.10。
+    # docs/archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md §2.10。
     # 翻 `WCA_SHIELD_RETIRED = False` 即整段复活。
     #
     # 已退役 ⟹ **不打任何日志**。壳根本不进生产采样系统，每次建系再报一遍"它没参与"
@@ -5122,7 +5358,7 @@ def build_ibs_dual_system(
     }
 
     # ---------- 7.5 🔑 LJ 长程色散尾项：手算解析修正（不走 OpenMM 内建 LRC） ----------
-    # 已用 test_lrc_interaction_group_compat.py 实测确认：CustomNonbondedForce.
+    # 已用 tools/diagnostics/probe_lrc_interaction_group_compat.py 实测确认：CustomNonbondedForce.
     # setUseLongRangeCorrection(True) 配合 addInteractionGroup 在电荷=0 的纯 LJ
     # 情形下工作正常（截断误差消除 ~88%，lambda_vdw=1.0 与 0.5 结果一致）；但本
     # 项目的软核表达式把 LJ 和 Coulomb 拼在同一个 CustomNonbondedForce 里，真实
@@ -5214,8 +5450,12 @@ def build_ibs_dual_system(
         ibs_wrapper.addCollectiveVariable(f"cv_{k}_int", int_f_cv)
 
         # Boresch CV 保持零力（物理限制已在 Group 3）
-        rest_f_cv = openmm.CustomExternalForce("0")
-        ibs_wrapper.addCollectiveVariable(f"cv_{k}_rest", rest_f_cv)
+        # [EXP-031 S1] omit 形态下整槽不建：这个 CustomExternalForce("0") 从未被加过
+        # 任何粒子，却要每步付一次 inner-context 力求值（实测 21-25 µs/CV，K=16 时
+        # 合计 +0.414 ms/step = 整步 15%）。见 IBS_BIAS_OMIT_ZERO_REST_CVS。
+        if not ibs_wrapper.omit_zero_rest_cvs:
+            rest_f_cv = openmm.CustomExternalForce("0")
+            ibs_wrapper.addCollectiveVariable(f"cv_{k}_rest", rest_f_cv)
 
     # EXP-025 G4 Layer-2: fail closed HERE, before the Force ever enters the
     # System/before any Context can be created, if the per-state loop above
@@ -5235,7 +5475,35 @@ def build_ibs_dual_system(
     ibs_wrapper._common_system_xml = _serialize_ibs_common_system(new_sys)
     # 供 bias 校准探针使用（保留 Group 4 WCA，见该函数 docstring 里对两种用途的
     # 区分说明）——不能用上面那份缺 WCA 的 U_common 去校准 f_k。
-    ibs_wrapper._common_plus_wca_system_xml = _serialize_ibs_common_plus_wca_system(new_sys)
+    #
+    # 🔑 [2026-09-09] 防护壳退役后，两个序列化器的产物**逐字节相同**：
+    # `_serialize_ibs_common_system` 剥 Group 1 与 4，
+    # `_serialize_ibs_common_plus_wca_system` 只剥 Group 1，而 Group 4 已经不存在。
+    # 原来这里照样做**第二次**完整 serialize→deserialize→serialize 往返，再把同样
+    # 的字节当成第二份常驻字符串挂在 wrapper 上。被序列化的是**已装配的窗口
+    # System**（Group-1 的 CustomCVForce 里装着 K 个 softcore CustomNonbondedForce，
+    # 每个都带完整的 per-particle 参数和整张排除表），大体系上是上百 MB 的瞬时
+    # 峰值加一份等长常驻。
+    #
+    # 等价性在这里**当场验证**、不是假设：直接扫 new_sys 的 force group，
+    # 确认没有 Group 4 才复用；有的话说明壳被复活了而这段没跟上，fail closed。
+    # 原来那条断言在 `_serialize_ibs_common_plus_wca_system` 里，语义一并搬过来。
+    if WCA_SHIELD_RETIRED:
+        _stray_group4 = [
+            int(i)
+            for i in range(new_sys.getNumForces())
+            if int(new_sys.getForce(i).getForceGroup()) == 4
+        ]
+        if _stray_group4:
+            raise RuntimeError(
+                "WCA_SHIELD_RETIRED=True 但装配好的窗口 System 里仍存在 Group 4 "
+                f"(force index {_stray_group4}) —— 生产采样已不含防护壳，"
+                "探针含壳会采到生产从不采的系综，拒绝继续。"
+                "若要复活防护壳，翻 WCA_SHIELD_RETIRED 而不是绕过本断言。"
+            )
+        ibs_wrapper._common_plus_wca_system_xml = ibs_wrapper._common_system_xml
+    else:
+        ibs_wrapper._common_plus_wca_system_xml = _serialize_ibs_common_plus_wca_system(new_sys)
     new_sys.thisown = 1
     _ = new_sys.getNumParticles()
     print(f"[IBS System] 构建完成，共 {new_sys.getNumForces()} 个力对象 (Group 0 已彻底剥离 λ 依赖)")
@@ -5585,10 +5853,13 @@ def build_shadow_coul_ibs_system(
         raise ValueError("Shadow-Coulomb 至少需要一个 lambda 状态")
     if len(lambdas_shadow_coul) < 2:
         raise ValueError("Shadow-Coulomb 至少需要两个 lambda 状态以定义去电荷腿")
-    if len(lambdas_shadow_coul) > IBS_DUAL_MAX_LAMBDA_STATES:
+    # [EXP-031 S1] 同 build_ibs_dual_system：按当前形态算 CV 预算上限。
+    _omit_zero_rest_cvs = IBS_BIAS_OMIT_ZERO_REST_CVS
+    _max_lambda_states = ibs_dual_max_lambda_states(_omit_zero_rest_cvs)
+    if len(lambdas_shadow_coul) > _max_lambda_states:
         raise ValueError(
             f"Shadow-Coulomb lambda 状态数 {len(lambdas_shadow_coul)} 超过 CustomCVForce "
-            f"32 变量上限对应的 {IBS_DUAL_MAX_LAMBDA_STATES} 态上限"
+            f"{OPENMM_CUSTOM_CV_MAX_VARIABLES} 变量上限对应的 {_max_lambda_states} 态上限"
         )
     lambda_values = np.asarray(lambdas_shadow_coul, dtype=float)
     if not np.all(np.isfinite(lambda_values)):
@@ -5606,7 +5877,7 @@ def build_shadow_coul_ibs_system(
     if np.any(lambda_diffs > 0.0) and np.any(lambda_diffs < 0.0):
         raise ValueError("Shadow-Coulomb lambda 必须单调（允许 1 -> 0 或 0 -> 1）")
     system = ensure_owned_system(system)
-    new_sys = ensure_owned_system(XmlSerializer.deserialize(XmlSerializer.serialize(system)))
+    new_sys = ensure_owned_system(XmlSerializer.clone(system))
     resolved_box = _resolve_periodic_box_vectors(box_vectors, topology=topology, system=new_sys)
     if _system_requires_periodic_box(new_sys):
         if resolved_box is None:
@@ -5634,17 +5905,51 @@ def build_shadow_coul_ibs_system(
     # ---------- 1. 主 NonbondedForce：只关掉配体的电荷 (VdW 保持满强度) ----------
     original_params = _zero_ligand_environment_charge_in_background(nb, perturbed_indices)
 
-    # ---------- 2. 配体内部力 (Group 2)：与 build_ibs_dual_system 同一套，保持 U_common ----------
+    # ---------- 2. 配体内部力 (Group 2)：**只补普通库仑** ----------
+    #
+    # 🔑 [2026-09-10] 这里原来照抄 build_ibs_dual_system（连 σ/ε 带 1-4 全额重建），
+    # 但两个 builder 的背景处理**根本不同**，照抄就是双计：
+    #
+    #   dual  ：把配体 σ/ε 压成 (0.1nm, 0)、清掉所有沾配体的 exception
+    #           ⇒ 主 NB 不出任何 L–L，Group 2 全额重建，×1 ✓
+    #   shadow：`_zero_ligand_environment_charge_in_background()` 只清**粒子电荷**
+    #           和**跨组** exception 的 chargeProd；配体 σ/ε 与 L–L exception
+    #           **原样保留**（有意的：VdW 在 shadow 腿全程满强度、属于 U_common）
+    #
+    # 于是照抄之后：
+    #   L–L 普通库仑  主 NB 0（电荷已清） + Group 2 补回        = ×1 ✓
+    #   L–L 普通 LJ   主 NB 仍在          + Group 2 又一份      = ×2 ✗
+    #   L–L 1-4       主 NB 仍在          + ll_14_force 又一份  = ×2 ✗（LJ 与库仑都翻倍）
+    #
+    # "与 λ 无关所以在 ΔF 里相消"是错的：它在同一构型的能量差里确实消失，
+    # 但它改变构型的 Boltzmann 权重 ⟹ 改变采样系综；翻倍的 r⁻¹² 芯还是不稳定源。
+    #
+    # 正确划分（与 shadow 自己的设计一致）：
+    #   * 背景 NB 负责 L–L 普通 LJ + 全部 L–L exception（1-4 的 LJ 与库仑）；
+    #   * Group 2 只补 L–L 普通库仑 —— 传进去的参数把配体 ε 压成 0（σ 留 0.1nm
+    #     防除零），并且**不再挂 ll_14_force**。
+    #   * `create_ligand_internal_force` 本来就排除 1-2/1-3/1-4，正好与背景的
+    #     exception 互补，不重不漏。
+    #
+    # 由 `tests/test_shadow_coul_no_double_counted_ligand_internals.py` 钉住：
+    # 全体零电荷时 group 0+2 必须逐位等于原体系总能量与力（修复前实测偏大一倍）。
     internal_ref_excl = [(p1, p2) for p1, p2 in ref_excl if p1 in perturbed_set and p2 in perturbed_set]
-    ll_f, ll_14_f = create_ligand_internal_force(
-        nb, perturbed_indices, original_params, internal_ref_excl, num_atoms, system=new_sys
+    coulomb_only_params = list(original_params)
+    for idx in perturbed_indices:
+        q, _sig, _eps = coulomb_only_params[int(idx)]
+        coulomb_only_params[int(idx)] = (
+            q,
+            0.1 * unit.nanometer,
+            0.0 * unit.kilojoule_per_mole,
+        )
+    ll_f, _ll_14_f_unused = create_ligand_internal_force(
+        nb, perturbed_indices, coulomb_only_params, internal_ref_excl, num_atoms, system=new_sys
     )
     ll_f.setForceGroup(2)
-    if ll_14_f:
-        ll_14_f.setForceGroup(2)
     new_sys.addForce(ll_f)
-    if ll_14_f:
-        new_sys.addForce(ll_14_f)
+    # ⚠️ 刻意**不加** `_ll_14_f_unused`：1-4 已经完整留在背景 NB 的 exception 里。
+    # `create_ligand_internal_force` 仍然返回它（该函数为 dual builder 而写，
+    # 那边的背景已经被清空、确实需要它），这里只是不消费。
 
     # ---------- 3. 物理 Boresch 限制力 (Group 3)，与 build_ibs_dual_system 一致 ----------
     if _has_valid_boresch_restraint(restraint_params):
@@ -5684,9 +5989,18 @@ def build_shadow_coul_ibs_system(
         if current_excl != template_excl:
             raise RuntimeError(f"Shadow CV {k} 排除表不一致，将破坏 IBS 邻居表复用条件。")
         ibs_wrapper.addCollectiveVariable(f"cv_{k}_int", int_f_cv)
-        rest_f_cv = openmm.CustomExternalForce("0")
-        ibs_wrapper.addCollectiveVariable(f"cv_{k}_rest", rest_f_cv)
+        # [EXP-031 S1] 同 build_ibs_dual_system：omit 形态下不建恒零占位槽。
+        if not ibs_wrapper.omit_zero_rest_cvs:
+            rest_f_cv = openmm.CustomExternalForce("0")
+            ibs_wrapper.addCollectiveVariable(f"cv_{k}_rest", rest_f_cv)
 
+    # 🔑 [2026-09-09] 与 `build_ibs_dual_system` 对齐：在 Force 进 System 之前
+    # fail closed。这个 builder 原来**没有**这道校验，而它和 dual builder 一样是
+    # 靠调用方在上面那个循环里逐个 `addCollectiveVariable` 来满足表达式里引用的
+    # `cv_k_int`/`cv_k_rest` —— 漏一个的后果不是报错，是 `CustomCVForce` 引用未注册
+    # 符号后**静默给出一个有限但错误的能量**（EXP-025 G4 Layer-1 实测差 2.27 kJ/mol，
+    # 那次就是靠"每个输入独立验证"才发现的）。纯防御性检查，不改变有效哈密顿量。
+    ibs_wrapper.validate_wiring()
     new_sys.addForce(ibs_wrapper.get_force())
 
     sync_all_exclusions(new_sys)
@@ -5718,7 +6032,7 @@ def build_shadow_bridge_system(
     返回 (new_sys, "lambda_bridge_s", diagnostics)。
     """
     system = ensure_owned_system(system)
-    new_sys = ensure_owned_system(XmlSerializer.deserialize(XmlSerializer.serialize(system)))
+    new_sys = ensure_owned_system(XmlSerializer.clone(system))
     resolved_box = _resolve_periodic_box_vectors(box_vectors, topology=topology, system=new_sys)
     if _system_requires_periodic_box(new_sys):
         if resolved_box is None:
@@ -5748,17 +6062,28 @@ def build_shadow_bridge_system(
     # ---------- 1. 主 NonbondedForce：只关掉配体的电荷 (VdW 保持满强度) ----------
     original_params = _zero_ligand_environment_charge_in_background(nb, perturbed_indices)
 
-    # ---------- 2. 配体内部力 (Group 2)，与 Shadow-IBS 一致，保持 U_common ----------
+    # ---------- 2. 配体内部力 (Group 2)：**只补普通库仑**，与 Shadow-IBS 一致 ----------
+    #
+    # 🔑 [2026-09-10] 同 `build_shadow_coul_ibs_system` 的那处双计（完整推导见那里）。
+    # 这条 bridge 腿的背景处理与 Shadow-IBS 逐字相同 —— 都是
+    # `_zero_ligand_environment_charge_in_background()`，只清粒子电荷和跨组
+    # exception，配体 σ/ε 与 L–L exception 原样保留 —— 所以照抄 dual builder 的
+    # 全额重建同样会把 L–L 普通 LJ 和 1-4（LJ 与库仑）各算两遍。
     internal_ref_excl = [(p1, p2) for p1, p2 in ref_excl if p1 in perturbed_set and p2 in perturbed_set]
-    ll_f, ll_14_f = create_ligand_internal_force(
-        nb, perturbed_indices, original_params, internal_ref_excl, num_atoms, system=new_sys
+    coulomb_only_params = list(original_params)
+    for idx in perturbed_indices:
+        q, _sig, _eps = coulomb_only_params[int(idx)]
+        coulomb_only_params[int(idx)] = (
+            q,
+            0.1 * unit.nanometer,
+            0.0 * unit.kilojoule_per_mole,
+        )
+    ll_f, _ll_14_f_unused = create_ligand_internal_force(
+        nb, perturbed_indices, coulomb_only_params, internal_ref_excl, num_atoms, system=new_sys
     )
     ll_f.setForceGroup(2)
-    if ll_14_f:
-        ll_14_f.setForceGroup(2)
     new_sys.addForce(ll_f)
-    if ll_14_f:
-        new_sys.addForce(ll_14_f)
+    # ⚠️ 刻意不加 `_ll_14_f_unused`：1-4 完整留在背景 NB 的 exception 里。
 
     # ---------- 3. 物理 Boresch 限制力 (Group 3) ----------
     if _has_valid_boresch_restraint(restraint_params):
@@ -5914,6 +6239,11 @@ class IBSBiasForce:
         # 每个 "_int" CV 在主 CustomCVForce (self.force) 里的真实注册索引，供
         # IBSSampler._evaluate_interaction_energies_live() 用
         # getCollectiveVariableValues() 一次性取全部值，不必重建 probe System。
+        # [EXP-031 S1] 形态在**构造时**冻结到实例上，之后一切按 self.omit_zero_rest_cvs
+        # 走：注册点、_state_expr、validate_wiring、CV 预算检查必须看同一个值，否则
+        # 中途翻模块开关会造出"表达式引用了没注册的 CV"这种静默给错数的 Force
+        # （EXP-025 G4 Layer-1 就是这个失败模式）。
+        self.omit_zero_rest_cvs = bool(IBS_BIAS_OMIT_ZERO_REST_CVS)
         self._int_cv_indices: List[int] = []
         self._residual_basis_cv_index: Optional[int] = None
         self.residual_enabled = residual_basis_force is not None
@@ -5944,13 +6274,17 @@ class IBSBiasForce:
             # at some later, less predictable point (matches the EXP-025 G4
             # Layer-1 lesson: a wiring contract violation must be caught by an
             # explicit check, not "it didn't throw so it must be fine").
-            required_cv_count = 2 * n_states + 1
+            # [EXP-031 S1] per-state CV count follows the Group-1 form: 1 when the
+            # identically-zero cv_k_rest placeholders are omitted, 2 otherwise. The
+            # "+1" is the single shared exp025_residual_basis CV either way.
+            cvs_per_state = ibs_dual_cvs_per_lambda_state(self.omit_zero_rest_cvs)
+            required_cv_count = cvs_per_state * n_states + 1
             if required_cv_count > OPENMM_CUSTOM_CV_MAX_VARIABLES:
                 raise ValueError(
                     f"IBSBiasForce: enabling the native residual basis needs {required_cv_count} collective "
-                    f"variables (2*n_states+1) for n_states={n_states}, exceeding the hard ceiling of "
-                    f"{OPENMM_CUSTOM_CV_MAX_VARIABLES} -- i.e. n_states must be <= "
-                    f"{(OPENMM_CUSTOM_CV_MAX_VARIABLES - 1) // 2} with the residual basis enabled"
+                    f"variables ({cvs_per_state}*n_states+1) for n_states={n_states}, exceeding the hard "
+                    f"ceiling of {OPENMM_CUSTOM_CV_MAX_VARIABLES} -- i.e. n_states must be <= "
+                    f"{(OPENMM_CUSTOM_CV_MAX_VARIABLES - 1) // cvs_per_state} with the residual basis enabled"
                 )
         self.residual_state_coefficients = (
             [float(c) for c in residual_state_coefficients] if self.residual_enabled else None
@@ -6018,15 +6352,26 @@ class IBSBiasForce:
         # EM 时稳定贡献真实力的物理 softcore-state 混合项一起关掉，不是同一个
         # Hamiltonian。s_residual 只切残差项，EM 时物理软核混合力保持跟 baseline
         # 一样活跃。
+        # [EXP-031 S1] `_rest_term(k)` is the ONLY difference between the two
+        # Group-1 forms. In the legacy form it is exactly the literal
+        # " + cv_{k}_rest", so both branches below reproduce the pre-EXP-031
+        # expression strings BYTE-FOR-BYTE; in the omit form the identically-zero
+        # placeholder simply disappears from the expression (and from the CV set),
+        # which is an exact algebraic identity because cv_k_rest is a
+        # CustomExternalForce("0") with zero particles -- see
+        # IBS_BIAS_OMIT_ZERO_REST_CVS for the measured cost of keeping them.
+        def _rest_term(k: int) -> str:
+            return "" if self.omit_zero_rest_cvs else f" + cv_{k}_rest"
+
         def _state_expr(k: int) -> str:
             if self.residual_enabled and self.residual_state_coefficients[k] != 0.0:
                 coeff = self.residual_state_coefficients[k]
                 offset = self.residual_energy_offset_kj_mol
                 return (
-                    f"(cv_{k}_int + cv_{k}_rest + {prefix}_s_residual*({coeff:.17g})*"
+                    f"(cv_{k}_int{_rest_term(k)} + {prefix}_s_residual*({coeff:.17g})*"
                     f"(exp025_residual_basis - ({offset:.17g})) - {prefix}_f_{k})"
                 )
-            return f"(cv_{k}_int + cv_{k}_rest - {prefix}_f_{k})"
+            return f"(cv_{k}_int{_rest_term(k)} - {prefix}_f_{k})"
 
         logit_exprs = {}
         for k in range(1, n_states):
@@ -6083,6 +6428,19 @@ class IBSBiasForce:
                 "IBSBiasForce: the 'exp025_residual_basis' collective variable name is reserved "
                 "(registered automatically by __init__ when residual_basis_force is provided)"
             )
+        # [EXP-031 S1] Fail closed: in the omit form this Force's own expression
+        # does NOT reference any cv_k_rest, so registering one would (a) silently
+        # cost a full inner-context force evaluation per step (21-25 us each,
+        # measured; that is the entire point of the omit form) and (b) be reported
+        # as `unexpected` by validate_wiring() below. Do not "tolerate" it.
+        if self.omit_zero_rest_cvs and name.endswith("_rest"):
+            raise ValueError(
+                f"IBSBiasForce: refusing to register the collective variable {name!r} -- this Force was "
+                "constructed with IBS_BIAS_OMIT_ZERO_REST_CVS=True, so its energy expression contains no "
+                "cv_k_rest term at all. Registering one would pay a per-step inner-context force "
+                "evaluation for an identically-zero contribution. Flip the module-level switch back to "
+                "False if a caller genuinely needs the legacy placeholder slots."
+            )
         self._cv_keeper.append(cv_force)
         # 索引必须是 self.force.addCollectiveVariable() 的**真实返回值**，不能事后按
         # 位置算（比如 2*k）——residual_enabled 时 __init__ 已经先注册了
@@ -6134,7 +6492,11 @@ class IBSBiasForce:
         per-state CVs, before creating any Context.
         """
         expected_cv_names = {f"cv_{k}_int" for k in range(self.n_states)}
-        expected_cv_names |= {f"cv_{k}_rest" for k in range(self.n_states)}
+        # [EXP-031 S1] the omit form's expression references no cv_k_rest, so they
+        # must be absent, not merely optional -- an extra one is `unexpected` and
+        # rejected below (see addCollectiveVariable's matching fail-closed check).
+        if not self.omit_zero_rest_cvs:
+            expected_cv_names |= {f"cv_{k}_rest" for k in range(self.n_states)}
         if self.residual_enabled:
             expected_cv_names.add("exp025_residual_basis")
 
@@ -6796,13 +7158,23 @@ def _early_stop_configs_match(cached_cfg: Optional[Dict], current_cfg: Dict) -> 
 # 这与 v31 同类：**在线学习/冻结判定的输入变了**，旧 f_k 不能当作 v32 的有效
 # 热启动或冻结验证结果续用。按 v30/v31 的既有处理方式，兼容集合收窄成只有
 # v32 自己，代价是所有臂都多冷启动一次。
-IBS_BIAS_PROTOCOL_VERSION = 32
+# v33（2026-09-05，EXP-031 S1）：`IBS_BIAS_OMIT_ZERO_REST_CVS` 默认翻成 True ——
+# Group-1 的 CustomCVForce 不再注册那 K 个恒零的 `cv_k_rest` 占位 CV。
+# **采样哈密顿量在数学上完全不变**：`cv_k_rest` 是零粒子的
+# `CustomExternalForce("0")`，对能量与力的贡献严格为 0，摘掉它是精确恒等变形
+# （三条独立路径实测 Group-1 能量逐比特相同，见开关处的说明）。
+# 但**表达式字符串与 CV 集合变了** ⟹ system XML 变 ⟹ `system_xml_sha256` 变，
+# 因此旧的 dual_window_* / ibs_state_* / convergence.json 一律不能续用：
+# 它们产自一个 CV 布局不同的 System，`_int_cv_indices` 与 CV 计数都对不上。
+# 这与 v30/v31/v32 同类处理：兼容集合收窄成只有 v33 自己，代价是所有臂多冷启动
+# 一次。收益是每步省 0.377 ms（真体系整步 1.2206×）。
+IBS_BIAS_PROTOCOL_VERSION = 33
 
 # v28/v29 都只改过 warmup 的停止/诊断控制，没有改变 production Hamiltonian、
 # f_k 符号约定或生产采样方式，所以那次是把 27/28/29 都放进同一个兼容集合。
-# v30/v31/v32 都是真正的断裂点（分别见上面各自的版本说明），缓存兼容集合只留
+# v30/v31/v32/v33 都是真正的断裂点（分别见上面各自的版本说明），缓存兼容集合只留
 # 最新版本自己。
-IBS_BIAS_CACHE_COMPATIBLE_PROTOCOL_VERSIONS = frozenset((32,))
+IBS_BIAS_CACHE_COMPATIBLE_PROTOCOL_VERSIONS = frozenset((33,))
 
 
 def _ibs_bias_protocol_version_is_cache_compatible(value: Any) -> bool:
@@ -6951,7 +7323,16 @@ def _resume_cached_window_gate_status(
     # 🔑 [non_mutating_v1] 采样修复策略必须匹配：旧的变异策略缓存（其 f_k 可能被
     # fixed-H 累计 ΔF 就地覆盖过，属于不同参考系）绝不能被非变异策略的 run 复用。
     # 旧缓存没有这个字段（None），与 "non_mutating_v1" 不相等，因此自动判无效。
-    repair_policy_match = cached_conv.get("sampling_repair_policy") == repair_policy
+    # 🔑 [path_evolution_v1] 按**等价类**比，不按字面值：path_evolution_v1 与
+    # non_mutating_v1 产出的窗口轨迹同样干净（都没就地改过 f_k），插点时不该
+    # 因为策略名变了就把前面所有已完成窗口判废。legacy_mutating 仍自成一类。
+    try:
+        repair_policy_match = (
+            repair_policy_cache_class(str(cached_conv.get("sampling_repair_policy")))
+            == repair_policy_cache_class(repair_policy)
+        )
+    except ValueError:
+        repair_policy_match = False   # 缺字段/旧值/拼错一律判不可复用
 
     # EXP-030: completed-window reuse happens before IBSSampler.load_ibs_state,
     # so the immutable score-family identity must be checked at this early gate.
@@ -7247,6 +7628,47 @@ IBS_UPDATE_ADAPTIVE_RESIDUAL_COLLAPSE = 70.0
 # 不等 f_k 稳定、不设 warmup ESS 四联门——见 run_all_windows 里的收敛状态机。
 IBS_LOCAL_MBAR_GATE_MAX_ADJACENT_DELTA_KJ_MOL = 10.0
 IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES = 5
+# 🔑 [2026-09-11] 数据不足时的**分级求解**预算。第一次在 SLIDING_BATCHES 批尝试；
+# 若是 insufficient_frames*（根本没求出 Δf−ΔF），保持同一份冻结 f_k、保留已有批次
+# 继续累计，到 2×/3× 批再试一次，MAX_BATCHES 是单个冻结周期的硬上限。它同时受
+# warmup 总步数 full_bias_step_budget 约束（循环条件本身就在数 steps_at_full_bias，
+# freeze burn-in 也计在内），哪个先到算哪个；多次冻结不会各自再赠送一份总预算。
+#
+# ⚠️ 15 是**工程预算，不是"统计充分"的阈值**。到上限仍然样本不足叫**无法判定**：
+# 既没有理由改 f_k，也没有依据插 λ。见 IBSValidationBudgetIndeterminateError。
+IBS_LOCAL_MBAR_GATE_MAX_BATCHES = 15
+
+# local-MBAR 验证门的 error 分类。三类后果完全不同，混在一起就是把"没测出来"
+# 当成"f_k 错了"——那正是插 λ 补救被误触发的入口。
+# local-MBAR 门要求的**去相关**帧数下限，也就是可达性预检里的 T。
+# ⚠️ 与 `minimum_complete_validation_frames`（原始帧完整性要求，实测 200）是
+# **两个量**。混掉会把 gcrit 算小 20 倍 —— 实测后果：win4 只差 26% 帧数
+# （600 → 需要 773），却被判成"差 7.5 倍、预算内不可达"。
+IBS_LOCAL_MBAR_GATE_MIN_FRAMES = 10
+
+_LOCAL_MBAR_INSUFFICIENT_DATA_ERRORS = frozenset((
+    "insufficient_frames",
+    "insufficient_frames_after_decorrelation",
+))
+
+
+def classify_local_mbar_gate_error(error) -> str:
+    """``'solved'`` / ``'insufficient_data'`` / ``'unsolvable'`` / ``'input_identity'``。
+
+    · ``solved``：解出了 Δf−ΔF（过不过门是另一回事）。
+    · ``insufficient_data``：去相关之后帧数不够，**没测出来**。继续采样可能有救。
+    · ``unsolvable``：解了但 f 是 NaN/形状不对。算 f_k/重叠的负面信号，退回 learning。
+    · ``input_identity``：形状不一致、能量含 NaN、sampled_row≠0 之类的结构性错误。
+      继续采样不会让它消失，必须明着报错，不能当成"数据不足"。
+    """
+    if error is None:
+        return "solved"
+    text = str(error)
+    if text in _LOCAL_MBAR_INSUFFICIENT_DATA_ERRORS:
+        return "insufficient_data"
+    if text == "nan_or_shape_mismatch_in_local_mbar_f":
+        return "unsolvable"
+    return "input_identity"
 
 # 落盘格式的独立版本号：只管 fixed-H 探针轨迹库 checkpoint/manifest 的文件
 # 结构（不是采样/校准协议本身），见 probe_adjacent_path_overlap_bank 等函数。
@@ -7281,6 +7703,180 @@ IBS_EARLY_PROBE_TRIGGER_ENABLED = True
 # run_all_windows 内部"调用方未提供覆盖字典时"的阶梯档位回退依据——见
 # effective_frozen_validation_budget/is_final_rung 的计算处注释。
 FROZEN_VALIDATION_LADDER_SCHEDULE_STEPS = (50_000, 150_000, 300_000)
+
+# 🔑 [2026-09-11] warmup 预算账本。三个概念**分开**，别再让一个布尔同时管三件事：
+#   · resume_frozen_validation：要不要恢复同一份 f_k + 验证数据、暂不重新学习/校准。
+#     "暂不重校准"是为了**把对当前候选的测量做完**，不是认可这个候选。
+#   · f_k_evidence_status：这份候选目前有什么证据（见 F_K_EVIDENCE_*）。
+#   · warmup_budget_ledger：实际累计消耗 + 当前档位的**累计上限**，决定本次还能跑多少步。
+#
+# 预算一律是**累计上限**语义：当前上限 B、已消耗 S ⟹ 本次可用 max(0, B − S)。
+# 显式升档到 B₂ 才有新增可用 max(0, B₂ − S)。**普通 resume 既不升档也不刷新额度**
+# —— 绝不写成 S + 默认 warmup_steps（那是每次 resume 白送一份预算）。
+# learning / freeze burn-in / frozen validation 三项分开记账，但共同受同一个总上限约束。
+WARMUP_LEDGER_BUCKETS = ("learning_steps", "freeze_burn_in_steps", "frozen_validation_steps")
+
+F_K_EVIDENCE_NONE = "none"                  # 还没有冻结候选
+F_K_EVIDENCE_INDETERMINATE = "indeterminate"  # 有候选，但 Δf−ΔF 没测出来 ⟹ 无结论
+F_K_EVIDENCE_CALIBRATED = "calibrated"      # legacy MBAR 校准路径给过的"已校准"证据
+F_K_EVIDENCE_REFUTED = "refuted"            # 测出来了，被判否
+F_K_EVIDENCE_VERIFIED = "verified"          # 通过 loose gate
+
+
+def new_warmup_budget_ledger(cumulative_cap_steps: int = 0) -> Dict:
+    return {
+        "learning_steps": 0,
+        "freeze_burn_in_steps": 0,
+        "frozen_validation_steps": 0,
+        "cumulative_cap_steps": int(cumulative_cap_steps),
+        "budget_rung": None,
+        # False ⟹ 账本是从缺累计步数的旧 checkpoint 迁移来的，消耗可能被低估。
+        # 这种账本**不得**用来论证升档。
+        "complete": True,
+    }
+
+
+def warmup_ledger_total_steps(ledger: Optional[Dict]) -> int:
+    if not ledger:
+        return 0
+    return sum(int(ledger.get(k, 0) or 0) for k in WARMUP_LEDGER_BUCKETS)
+
+
+def warmup_ledger_remaining_steps(ledger: Optional[Dict]) -> int:
+    """本次还能跑多少步 = max(0, 累计上限 − 已消耗)。"""
+    if not ledger:
+        return 0
+    return max(
+        0,
+        int(ledger.get("cumulative_cap_steps", 0) or 0)
+        - warmup_ledger_total_steps(ledger),
+    )
+
+
+def frozen_candidate_fingerprint(f_k) -> Optional[str]:
+    """当前冻结候选的指纹。验证批次额度绑定它：换了 f_k 可以重建批次记录，
+    但账本里的**总消耗永远不清零**。
+
+    🔑 **f_k 有 gauge 自由度，必须先规范化再哈希。** 混合权重
+    ``∝ exp(−(F_k − f_k)/kT)`` 在归一化之后与 f_k 的公共常数无关，所以
+    ``f_k`` 与 ``f_k + c`` 是**同一个采样分布、同一个候选**。逐位哈希会把它们算成
+    两个候选，白白重建一次批次记录（并让 :15519 那处"指纹是否仍匹配"的判断误判）。
+    减去均值后再哈希；``round(...) + 0.0`` 把 -0.0 归一成 0.0，与
+    ``lambda_path_versions._q`` 同一口径。
+    """
+    if f_k is None:
+        return None
+    vals = [float(x) for x in f_k]
+    if vals:
+        mean = sum(vals) / len(vals)
+        vals = [round(v - mean, 6) + 0.0 for v in vals]
+    payload = ",".join(f"{v:.6f}" for v in vals)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def warmup_ledger_bucket_for_mode(mode: str) -> str:
+    if mode == "learning":
+        return "learning_steps"
+    if mode == "freeze_burn_in":
+        return "freeze_burn_in_steps"
+    return "frozen_validation_steps"
+
+
+def base_checkpoint_dir_for(checkpoint_dir: str, max_levels: int = 3) -> Optional[str]:
+    """从一个**子命名空间**的 checkpoint 目录找回基准 checkpoint 目录。
+
+    stage-2 有多种子命名空间，形状不一样，别只认一种：
+        多采样段   ``<base>/segment_{N}``                （`_recalibrate_fk_and_resample_segment`）
+        生产 rescue ``<base>/vanishing_rescue/{plan_id}`` （两层）
+
+    锚点用 ``path_current.json`` —— λ 路径是**全局**的，只有基准目录有它。
+    自己就是基准目录（或往上 ``max_levels`` 层都找不到锚点）时返回 None。
+    """
+    cur = os.path.normpath(checkpoint_dir)
+    if os.path.exists(os.path.join(cur, "path_current.json")):
+        return None  # 自己就是基准目录，没有"上一层"可继承
+    for _ in range(int(max_levels)):
+        parent = os.path.dirname(cur)
+        if not parent or parent == cur:
+            return None
+        if os.path.exists(os.path.join(parent, "path_current.json")):
+            return parent
+        cur = parent
+    return None
+
+
+def inherit_warmup_ledger_across_segments(
+    checkpoint_dir: str,
+    stage_type: str,
+    window_idx: int,
+    default_cap_steps: int,
+) -> Optional[Dict]:
+    """在 checkpoint 子命名空间里开工时，**继承基准目录那一份 warmup 消耗**。
+
+    不是子命名空间、或基准目录里没有这个窗口的 ibs_state，就返回 None。
+
+    🔑 [2026-09-11] 修的是一个实测到的预算漏洞。多采样段有自己的 checkpoint
+    命名空间（``checkpoints/segment_2/``），段内 ``ibs_state`` 从零开始，于是
+    ``warmup_budget_ledger`` 也是空的 —— 每开一个段就**白送一整份完整额度**。
+
+    实测（cyclod_ligand2/rep1_evidence 的 window 4，cap=555000）::
+
+        vanishing    learning 110k + burn-in 15k + validation 350k = 475k，剩  80k
+        vanishing_2  learning  10k + burn-in  5k + validation  50k =  65k，剩 490k
+                                                     ← 实际跨段烧了 540k
+
+    这与两处既有约定直接矛盾：``migrate_warmup_budget_ledger`` 的
+    "绝不默认『已耗 0 步』再按默认上限赠送一整份额度"，以及
+    ``frozen_candidate_fingerprint`` 的"账本里的**总消耗永远不清零**"。
+
+    **继承什么**：只继承三个消耗桶（learning / freeze burn-in / frozen validation）。
+    **不继承** f_k / 冻结候选 / ``frozen_validation_cumulative_steps`` —— 新段是
+    **新的 f_k Epoch**，那份候选的验证进度本来就该从 0 开始（实测段 2 的该字段
+    确实是 0，那是对的）。
+
+    上限用**本次**的 ``default_cap_steps``（预算政策属于本次运行），所以语义是
+    "这个窗口**终身** warmup 消耗 ≤ B"。段 2 因此可能只剩很少甚至 0 步 —— 那是
+    刻意的：要更多就走显式升档（``_explicit_frozen_validation_rung`` /
+    ``FROZEN_VALIDATION_LADDER_SCHEDULE_STEPS``），不靠开新段偷额度。
+    """
+    base = base_checkpoint_dir_for(checkpoint_dir)
+    if base is None:
+        return None
+    prior_path = os.path.join(base, f"ibs_state_{stage_type}_window_{window_idx}.json")
+    try:
+        with open(prior_path, "r", encoding="utf-8") as fh:
+            state = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    prior_ledger = state.get("warmup_budget_ledger")
+    if not isinstance(prior_ledger, dict):
+        # 基准目录连账本都没有 ⟹ 消耗不可知。**不能**当成 0，走既有的迁移路径，
+        # 它会把 complete 标成 False（那种账本不得用来论证升档）。
+        return migrate_warmup_budget_ledger(state, int(default_cap_steps))
+    ledger = new_warmup_budget_ledger(int(default_cap_steps))
+    for bucket in WARMUP_LEDGER_BUCKETS:
+        ledger[bucket] = int(prior_ledger.get(bucket, 0) or 0)
+    ledger["complete"] = bool(prior_ledger.get("complete", True))
+    ledger["inherited_from"] = os.path.basename(base)
+    return ledger
+
+
+def migrate_warmup_budget_ledger(state: Dict, default_cap_steps: int) -> Dict:
+    """旧 checkpoint 没有账本时，**优先从已保存的运行记录恢复**，恢复不了就标记不完整。
+
+    绝不默认"已耗 0 步"再按默认上限赠送一整份额度。能恢复的只有
+    ``frozen_validation_cumulative_steps``（v12 起就持久化的那份冻结验证累计步数）；
+    learning / burn-in 的历史消耗没有任何持久记录，所以只要走到迁移这一步，
+    ``complete`` 一律为 False，并在诊断里如实标出来。
+    """
+    ledger = new_warmup_budget_ledger(default_cap_steps)
+    recovered = int(state.get("frozen_validation_cumulative_steps", 0) or 0)
+    ledger["frozen_validation_steps"] = recovered
+    ledger["complete"] = False
+    ledger["migrated_from"] = (
+        "frozen_validation_cumulative_steps" if recovered else "nothing_recoverable"
+    )
+    return ledger
 
 
 def _resolve_frozen_validation_budget_for_window(
@@ -7336,6 +7932,117 @@ class IBSWarmupConvergenceError(RuntimeError):
         self.diagnostics = diagnostics
 
 
+def validation_reachability_verdict(
+    g_measurements,
+    *,
+    required_decorrelated_frames,
+    cycle_frame_cap,
+    budget_remaining_steps,
+    frame_stride_steps=IBS_WARMUP_FRAME_STRIDE_STEPS,
+    frames_already=0,
+):
+    """冻结验证在**算术上**还有没有可能凑够去相关帧数。
+
+    ⚠️ **只改路由，不改 verdict。** 不可达是**预算**问题，绝不等于 f_k 被驳回：
+    `UNMEASURED` 永远不许因为这个被改写成 `REJECTED`。也不许仅凭高 g 去插 λ
+    或拆窗 —— 证据类型到动作集合是固定映射，不得跨类回答。
+
+    判据（T = 要求的去相关帧数，Ncap = 本周期最多原始帧）::
+
+        gcrit_cycle  = Ncap / T
+        gcrit_budget = (已有帧 + 剩余预算 / 每帧步数) / T
+
+    `g_L` 取**多个检查点里的最小值**，不是 bootstrap：同一候选上的连续检查点是
+    **嵌套**的（400 帧包含 200 帧），bootstrap 的独立性前提不成立、会低估方差，
+    那样算出来的"保守下界"是假的。取最小值才是嵌套数据下真正的保守下界。
+
+    方向很重要：只有当**乐观下界都超阈值**（`g_L > gcrit_budget`）时才敢判不可达，
+    所以不会因为 g 在小样本下的一次涨落误杀一份好 f_k。
+    """
+    gs = [float(x) for x in (g_measurements or []) if x is not None and float(x) > 0]
+    T = float(required_decorrelated_frames)
+    if T <= 0 or not gs:
+        return {"verdict": "INDETERMINATE", "reason": "no_g_measurements"}
+    stride = max(1, int(frame_stride_steps))
+    budget_frames = float(frames_already) + float(budget_remaining_steps) / stride
+    gcrit_cycle = float(cycle_frame_cap) / T
+    gcrit_budget = budget_frames / T
+    g_lo, g_hi = min(gs), max(gs)
+    out = {
+        "g_measurements": gs,
+        "g_lower_bound": g_lo,
+        "g_upper": g_hi,
+        "g_lower_bound_method": "min_over_checkpoints_nested_samples",
+        "required_decorrelated_frames": T,
+        "cycle_frame_cap": float(cycle_frame_cap),
+        "budget_frames_available": budget_frames,
+        "gcrit_cycle": gcrit_cycle,
+        "gcrit_budget": gcrit_budget,
+        "projected_raw_frames_needed": T * g_hi,
+        "projected_steps_needed": T * g_hi * stride,
+        "may_be_used_to_reject_f_k": False,
+    }
+    if len(gs) < 2:
+        out.update(verdict="INDETERMINATE",
+                   reason="need_at_least_two_checkpoints_on_same_candidate")
+        return out
+    if g_lo > gcrit_budget:
+        # 乐观下界都不够 ⟹ 这份候选在剩余预算内**不可能**验完。
+        out.update(verdict="UNREACHABLE", reason="g_lower_bound_exceeds_budget_gcrit")
+        return out
+    if g_hi <= gcrit_cycle:
+        out.update(verdict="REACHABLE_THIS_CYCLE", reason="g_upper_within_cycle_gcrit")
+        return out
+    if g_hi <= gcrit_budget:
+        out.update(verdict="REACHABLE_WITHIN_BUDGET",
+                   reason="cycle_too_short_but_budget_may_suffice")
+        return out
+    # 区间跨过阈值：最多再给**一个** +250k 诊断块，之后必须裁决，不许再循环。
+    out.update(verdict="INDETERMINATE", reason="uncertainty_straddles_gcrit_budget")
+    return out
+
+
+def sealed_candidate_matches(f_k_new, f_k_sealed, *, tol_kJ_mol=0.5):
+    """新候选是不是**实质上还是被驳回的那一份**（mean-center 后逐态比较）。
+
+    不能用 fingerprint 相等来判：fingerprint 是哈希，fresh LEARN 出来的 f_k 在
+    浮点上永不会逐比特相同，精确相等这条护栏**永远不触发**。真正要挡的是"换了
+    一份但其实还是同一份 f_k"，那是 f_k 空间里的**距离**问题。
+
+    容差复用仓库已有的 `min_adjacent_shift_kJ_mol` 口径（0.5 kJ/mol）——
+    同一个常量在别处的含义就是"f_k 到底动没动"，不另造阈值。
+    """
+    a = [float(x) for x in (f_k_new or [])]
+    b = [float(x) for x in (f_k_sealed or [])]
+    if not a or len(a) != len(b):
+        return False
+    ma, mb = sum(a) / len(a), sum(b) / len(b)
+    return max(abs((x - ma) - (y - mb)) for x, y in zip(a, b)) <= float(tol_kJ_mol)
+
+
+class IBSValidationBudgetIndeterminateError(RuntimeError):
+    """冻结验证预算耗尽，但一直**样本不足**——Δf−ΔF 从来没被求出来过。
+
+    与 ``IBSWarmupConvergenceError`` 的区别是决定性的，别合并：那个是"测出来了、
+    f_k 不对"（⟹ λ 太稀），这个是"**没测出来**，对 f_k 无结论"。所以它**不是**修改
+    f_k 或退回 SGD 的理由。
+
+    ⚠️ 它**不触发拆窗**，`_run_stage2_with_path_evolution` 故意不捕获它。
+    拆窗的依据只有"f_k 压不平"（IBSWarmupConvergenceError）；去相关后有效帧数
+    不够是**采样问题，拆窗治不了**——拆完照样测不出来，只会每轮拆一次直到预算
+    耗尽，还白白改掉实验布局。这里的结局就是报"无法判定"，交人决定。
+
+    例外：resume 前就 ``bias_status=converged`` 的窗口（复验路径）不走这条 ——
+    已经通过过的结论不能被"没测出来"否定，见 run_all_windows 里那个分支。
+
+    冻结 f_k、已累计的批数和已耗预算都已落盘，resume 接着验。
+    """
+
+    def __init__(self, message: str, diagnostics: Dict):
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
+
 class ExistingEnsembleRequiresRescueAudit(RuntimeError):
     """On-disk data for this window was produced under a DIFFERENT sampling
     repair policy (e.g. the deprecated mutating path that could rewrite f_k in
@@ -7354,13 +8061,49 @@ class ExistingEnsembleRequiresRescueAudit(RuntimeError):
 # Any unrecognized value (e.g. a typo) MUST raise — never silently fall back to
 # mutation. This is the single decision point used by run_all_windows so the
 # behavior is testable without a GPU (see test_non_mutating_policy.py).
-_VALID_SAMPLING_REPAIR_POLICIES = ("non_mutating_v1", "legacy_mutating")
+# 🔑 [path_evolution_v1 / 2026-09-10] 第三个策略：**路径演化**。
+# 与 legacy_mutating 的本质区别：它从不就地重写 f_k、也从不把相邻态 fixed-H
+# overlap 当收敛仲裁（那是 ATT-27 移除那 881 行循环的设计错误，别搬回来）。它只在
+# f_k 真的调不动时（IBSWarmupConvergenceError）在失败区间插一个 λ，登记成新的路径
+# 版本，后面的状态顺延；已完成、λ 逐位未变的窗口照常复用。
+# 因此对**窗口轨迹缓存**而言它与 non_mutating_v1 同类：两者产出的 f_k 都没有被
+# 就地污染过。只有 legacy_mutating 自成一类。
+_VALID_SAMPLING_REPAIR_POLICIES = (
+    "non_mutating_v1", "path_evolution_v1", "legacy_mutating",
+)
+_NON_MUTATING_POLICY_CLASS = frozenset(("non_mutating_v1", "path_evolution_v1"))
+
+
+def repair_policy_cache_class(repair_policy: str) -> str:
+    """窗口轨迹缓存的等价类。同类之间可以互相复用。
+
+    仅用于判断"已采好的窗口能不能复用"，不决定任何执行行为——后者一律走
+    `should_run_legacy_repair` / `should_run_path_evolution`。
+    """
+    if repair_policy in _NON_MUTATING_POLICY_CLASS:
+        return "non_mutating"
+    if repair_policy == "legacy_mutating":
+        return "legacy_mutating"
+    raise ValueError(
+        f"unknown sampling repair_policy {repair_policy!r}; expected one of "
+        f"{_VALID_SAMPLING_REPAIR_POLICIES}."
+    )
+
+
+def should_run_path_evolution(repair_policy: str) -> bool:
+    """True only for 'path_evolution_v1'; raise for anything unrecognized."""
+    if repair_policy not in _VALID_SAMPLING_REPAIR_POLICIES:
+        raise ValueError(
+            f"unknown sampling repair_policy {repair_policy!r}; expected one of "
+            f"{_VALID_SAMPLING_REPAIR_POLICIES}. Refusing to guess — fail closed."
+        )
+    return repair_policy == "path_evolution_v1"
 
 
 def should_run_legacy_repair(repair_policy: str) -> bool:
     """Return True only for the explicit deprecated 'legacy_mutating' policy;
-    False for 'non_mutating_v1'; raise ValueError for anything else."""
-    if repair_policy == "non_mutating_v1":
+    False for 'non_mutating_v1' / 'path_evolution_v1'; raise for anything else."""
+    if repair_policy in _NON_MUTATING_POLICY_CLASS:
         return False
     if repair_policy == "legacy_mutating":
         return True
@@ -7483,6 +8226,26 @@ class IBSSampler:
         # 不是"累计到这么多步"，导致真实总步数变成 50k+150k+300k=500k 而不是
         # 阶梯设计意图的"累计延长到 300k"。
         self.frozen_validation_cumulative_steps = 0
+        # 🔑 [2026-09-11] 第五态 "frozen_validation_indeterminate"：冻结验证一直
+        # **样本不足**、Δf−ΔF 从未被求出来，单周期批次预算用尽。它跟
+        # "calibrated_validation_failed" 的区别是"测出来了 f_k 不对" vs "没测出来"；
+        # 跟 "calibrated_pending_validation" 的区别是后者断言这份 f_k 已被证明物理
+        # 正确（那是已弃用的变异校准路径才产生的状态，non_mutating 下见到即 fail）。
+        # 这一态下 frozen_f_k_pending 存冻结 f_k、frozen_validation_batches_done 存
+        # 已经累计到第几批：resume 必须接着验同一份 f_k、接着用同一份批次，
+        # **不重新领一份批次额度**。批次数据本身随 tmbar_history 一起落盘。
+        self.frozen_validation_batches_done = 0
+        # 🔑 [2026-09-11] 三概念拆分之二/之三。bias_status 仍是 resume 分支用的状态机；
+        # f_k_evidence_status 单独回答"这份候选有什么证据"，不跟"要不要恢复冻结验证"
+        # 混在一起——无法判定态要恢复冻结验证（把测量做完），但**不继承"f_k 已正确"**。
+        self.f_k_evidence_status = F_K_EVIDENCE_NONE
+        # 累计消耗 + 当前档位累计上限；None 表示还没建（首次 save 时建）。
+        self.warmup_budget_ledger = None
+        # 验证批次额度绑定**当前冻结候选**：换了 f_k 可以重建批次记录，但账本里的
+        # 总消耗永远不清零。存候选指纹用来判断批次记录还属不属于这份 f_k。
+        self.frozen_candidate_fingerprint = None
+        # 载入的采样身份（旧 PASS 只在同一身份下有效）；没载入过就是 None。
+        self.loaded_stage_protocol_key = None
         # 🔑 [2026-08-27，见 docs/experiments/EXP-030_FROZEN_SNAPSHOT_TIMING_BUG_2026-08-26.md]
         # 只在 run_all_windows 真正进入生产采样这一刻被设置一次，随
         # save_ibs_state/load_ibs_state 落盘/恢复。None 表示这份冻结 f_k
@@ -8757,12 +9520,35 @@ class IBSSampler:
             # 🔑 见 IBSSampler.__init__ 里的注释——这份冻结 f_k 累计已经花在冻结
             # 验证上的步数，跨越同一份校准 f_k 的多次 resume/阶梯升级累加。
             "frozen_validation_cumulative_steps": int(self.frozen_validation_cumulative_steps),
+            # 🔑 [2026-09-11] frozen_validation_indeterminate 下已累计的固定-f_k
+            # 验证批数；resume 据此接着累计，不重新领额度。见 __init__ 注释。
+            "frozen_validation_batches_done": int(
+                getattr(self, "frozen_validation_batches_done", 0)
+            ),
+            # 🔑 [2026-09-11] 见 new_warmup_budget_ledger 的注释。
+            "f_k_evidence_status": str(
+                getattr(self, "f_k_evidence_status", F_K_EVIDENCE_NONE)
+            ),
+            "warmup_budget_ledger": (
+                dict(self.warmup_budget_ledger)
+                if getattr(self, "warmup_budget_ledger", None) else None
+            ),
+            "frozen_candidate_fingerprint": getattr(
+                self, "frozen_candidate_fingerprint", None
+            ),
             "ibs_bias_protocol_version": IBS_BIAS_PROTOCOL_VERSION,
             "warmup_update_protocol_version": IBS_WARMUP_UPDATE_PROTOCOL_VERSION,
             # 🔑 [non_mutating_v1] 记录产出这份 f_k 状态的采样修复策略。旧的变异
             # 策略可能就地重校准过 f_k（不同参考系）；load 时据此 fail-closed。
             "sampling_repair_policy": getattr(self, "sampling_repair_policy", None),
             "sampling_score_sha256": getattr(self, "sampling_score_sha256", None),
+            # 🔑 [2026-09-11] 采样身份（λ / Hamiltonian / box / 口径版本…）。
+            # 老板定案：「"已收敛窗口不降级"应限定为**同一个完整 ensemble
+            # fingerprint**；如果 λ、Hamiltonian、box 或规范版本变化，旧 PASS 不能
+            # 继续粘住。」实测这个洞真发生过：能量缓存因 stage_protocol_key 不符被
+            # 拒、整窗重采，而这份状态里的 bias_converged=True 照样粘了过去，于是
+            # 窗口跳过 learning 只做"只读复验"—— 复验的是一个**不同系综**的旧结论。
+            "stage_protocol_key": getattr(self, "stage_protocol_key", None),
             "residual_sampling_protocol_version": (
                 IBS_RESIDUAL_SAMPLING_PROTOCOL_VERSION
                 if getattr(self, "sampling_score_sha256", None) is not None
@@ -8825,7 +9611,7 @@ class IBSSampler:
         if not os.path.exists(filepath):
             return False
         try:
-            with open(filepath, "r") as f:
+            with open(filepath, "r", encoding="utf-8") as f:
                 state = json.load(f)
             if state.get("n_states") != self.n_states:
                 print(
@@ -9062,6 +9848,20 @@ class IBSSampler:
             )
             self.eta_penalty = float(cached_eta_penalty)
 
+            # 🔑 [2026-09-11] 账本：有就原样恢复；缺就从已保存的运行记录迁移并标记
+            # 不完整（migrate_warmup_budget_ledger），**绝不默认已耗 0 步**。
+            _cached_ledger = state.get("warmup_budget_ledger")
+            if isinstance(_cached_ledger, dict):
+                self.warmup_budget_ledger = dict(_cached_ledger)
+            else:
+                self.warmup_budget_ledger = migrate_warmup_budget_ledger(state, 0)
+            self.f_k_evidence_status = str(
+                state.get("f_k_evidence_status", F_K_EVIDENCE_NONE)
+            )
+            self.frozen_candidate_fingerprint = state.get("frozen_candidate_fingerprint")
+            # 采样身份：给 skip_warmup_entirely 判"旧 PASS 还算不算数"用。
+            self.loaded_stage_protocol_key = state.get("stage_protocol_key")
+
             cached_status = state.get("bias_status", "unconverged")
             cached_pending_f_k = state.get("frozen_f_k_pending")
             if (
@@ -9074,6 +9874,23 @@ class IBSSampler:
                 self.frozen_f_k_pending = [float(x) for x in cached_pending_f_k]
                 self.frozen_validation_cumulative_steps = int(
                     state.get("frozen_validation_cumulative_steps", 0)
+                )
+            elif (
+                cached_status == "frozen_validation_indeterminate"
+                and cached_pending_f_k is not None
+                and len(cached_pending_f_k) == self.n_states
+                and np.all(np.isfinite(np.asarray(cached_pending_f_k, dtype=float)))
+            ):
+                # 🔑 [2026-09-11] 上次是"验证预算耗尽、无法判定"：对 f_k 没有任何
+                # 反面证据，所以既不重新 SGD、也不当成终态。恢复同一份冻结 f_k、
+                # 同一份已耗批数/步数，接着验。
+                self.bias_status = "frozen_validation_indeterminate"
+                self.frozen_f_k_pending = [float(x) for x in cached_pending_f_k]
+                self.frozen_validation_cumulative_steps = int(
+                    state.get("frozen_validation_cumulative_steps", 0)
+                )
+                self.frozen_validation_batches_done = int(
+                    state.get("frozen_validation_batches_done", 0)
                 )
             elif cached_status == "calibrated_validation_failed":
                 # 🔑 终态：冻结验证累计预算已经用到最后一档仍未通过，不再是
@@ -9283,15 +10100,28 @@ def probe_bidirectional_overlap(
         return simulation
 
     def _collect_frames(simulation):
-        simulation.step(int(burn_in_steps))
+        guarded_step(simulation, int(burn_in_steps), "重叠探针 burn-in")
         frames = []
         n_samples = int(sample_steps) // int(sample_interval)
         for _ in range(n_samples):
-            simulation.step(int(sample_interval))
+            guarded_step(simulation, int(sample_interval), "重叠探针采样")
             state = simulation.context.getState(getPositions=True)
-            frames.append((state.getPositions(), state.getPeriodicBoxVectors()))
+            # 🔑 [2026-09-09] `asNumpy=True`：不加时 getPositions() 返回的是一个
+            # 装着 N 个 Python `Vec3` 对象的 list —— 73k 原子 ≈ 每帧几百万个小对象、
+            # 约 10 MB，而这里要把**两个系综的全部帧**都囤起来再统一求能量
+            # （校准探针的 sample_steps 会按 20000→40000→80000 阶梯重试，
+            # 单条边峰值可达数百帧）。obmalloc 的 arena 之后也不还给 OS。
+            # 新的 bank 路径（`_extend_state_trajectory`）是逐帧求值只留 K 个 float，
+            # 这两个遗留探针没跟上。改成 ndarray 后同样的帧数占用降一个量级，
+            # 且 `setPositions` 接受 Quantity(ndarray)，下游行为不变。
+            frames.append(
+                (state.getPositions(asNumpy=True), state.getPeriodicBoxVectors())
+            )
         return frames
 
+    # 🔑 [2026-09-09] 预置成 None，好让下面的 finally 能无条件断引用
+    # （原来 finally 只 clear 那个 list，见其中的说明）。
+    sim_i = sim_j = evaluator = frames_by_ensemble = None
     try:
         sim_i = _build_fixed_simulation(state_i, 0)
         simulations.append(sim_i)
@@ -9367,6 +10197,16 @@ def probe_bidirectional_overlap(
         })
         return result
     finally:
+        # 🔑 [2026-09-09] 原来只有 `simulations.clear()` —— 那是**空转**：
+        # sim_i / sim_j / frames_by_ensemble 仍然绑在本函数栈帧上，而
+        # evaluator.context 还是 sim_i.context 的第三个引用。于是两个动力学
+        # Context + 一个探针 Context + 整堆采样帧一直活到栈帧销毁，而不是被
+        # 这句 gc.collect() 回收。本文件其它所有持有 Context 的地方都是
+        # `del sim; gc.collect()` 的写法，bank 变体还额外做 `evaluator.context
+        # = None`（那里的注释写的就是这个隐患），只有这两个遗留探针两样都没做。
+        if evaluator is not None and hasattr(evaluator, "context"):
+            evaluator.context = None
+        sim_i = sim_j = evaluator = frames_by_ensemble = None
         simulations.clear()
         gc.collect()
 
@@ -9464,15 +10304,6 @@ def probe_bidirectional_overlap_for_bias_calibration(
                 "burn-in/采样。"
             )
 
-    def _step_with_nan_guard(simulation, n_steps: int, label: str) -> None:
-        try:
-            simulation.step(int(n_steps))
-        except openmm.OpenMMException as exc:
-            raise RuntimeError(
-                f"[bias 校准探针] {label}：积分过程中出现非有限坐标"
-                f"（原始异常: {exc}）。"
-            ) from exc
-
     def _build_fixed_simulation(state_index: int, seed_offset: int):
         label = f"state_index={state_index}（edge state_i={state_i}, state_j={state_j}）"
         fixed_system = ensure_owned_system(XmlSerializer.deserialize(common_plus_wca_system_xml))
@@ -9533,22 +10364,35 @@ def probe_bidirectional_overlap_for_bias_calibration(
         # 出的问题，而不是让 OpenMM 的裸 traceback 直接冒出来。
         for ramp_dt_fs, ramp_steps in _RAMP_STAGES_FS_STEPS:
             simulation.integrator.setStepSize(ramp_dt_fs * unit.femtosecond)
-            _step_with_nan_guard(simulation, ramp_steps, f"{label} ramp {ramp_dt_fs} fs")
+            guarded_step(simulation, ramp_steps, f"[bias 校准探针] {label} ramp {ramp_dt_fs} fs")
             _finite_check(simulation, f"{label} ramp {ramp_dt_fs} fs 后")
         return simulation
 
     def _collect_frames(simulation, state_index: int):
         label = f"state_index={state_index}（edge state_i={state_i}, state_j={state_j}）"
-        _step_with_nan_guard(simulation, burn_in_steps, f"{label} burn-in")
+        guarded_step(simulation, burn_in_steps, f"[bias 校准探针] {label} burn-in")
         _finite_check(simulation, f"{label} burn-in 后")
         frames = []
         n_samples = int(sample_steps) // int(sample_interval)
         for _ in range(n_samples):
-            _step_with_nan_guard(simulation, sample_interval, f"{label} 采样")
+            guarded_step(simulation, sample_interval, f"[bias 校准探针] {label} 采样")
             state = simulation.context.getState(getPositions=True)
-            frames.append((state.getPositions(), state.getPeriodicBoxVectors()))
+            # 🔑 [2026-09-09] `asNumpy=True`：不加时 getPositions() 返回的是一个
+            # 装着 N 个 Python `Vec3` 对象的 list —— 73k 原子 ≈ 每帧几百万个小对象、
+            # 约 10 MB，而这里要把**两个系综的全部帧**都囤起来再统一求能量
+            # （校准探针的 sample_steps 会按 20000→40000→80000 阶梯重试，
+            # 单条边峰值可达数百帧）。obmalloc 的 arena 之后也不还给 OS。
+            # 新的 bank 路径（`_extend_state_trajectory`）是逐帧求值只留 K 个 float，
+            # 这两个遗留探针没跟上。改成 ndarray 后同样的帧数占用降一个量级，
+            # 且 `setPositions` 接受 Quantity(ndarray)，下游行为不变。
+            frames.append(
+                (state.getPositions(asNumpy=True), state.getPeriodicBoxVectors())
+            )
         return frames
 
+    # 🔑 [2026-09-09] 预置成 None，好让下面的 finally 能无条件断引用
+    # （原来 finally 只 clear 那个 list，见其中的说明）。
+    sim_i = sim_j = evaluator = frames_by_ensemble = None
     try:
         sim_i = _build_fixed_simulation(state_i, 0)
         simulations.append(sim_i)
@@ -9610,6 +10454,16 @@ def probe_bidirectional_overlap_for_bias_calibration(
         })
         return result
     finally:
+        # 🔑 [2026-09-09] 原来只有 `simulations.clear()` —— 那是**空转**：
+        # sim_i / sim_j / frames_by_ensemble 仍然绑在本函数栈帧上，而
+        # evaluator.context 还是 sim_i.context 的第三个引用。于是两个动力学
+        # Context + 一个探针 Context + 整堆采样帧一直活到栈帧销毁，而不是被
+        # 这句 gc.collect() 回收。本文件其它所有持有 Context 的地方都是
+        # `del sim; gc.collect()` 的写法，bank 变体还额外做 `evaluator.context
+        # = None`（那里的注释写的就是这个隐患），只有这两个遗留探针两样都没做。
+        if evaluator is not None and hasattr(evaluator, "context"):
+            evaluator.context = None
+        sim_i = sim_j = evaluator = frames_by_ensemble = None
         simulations.clear()
         gc.collect()
 
@@ -10546,7 +11400,7 @@ def _extend_state_trajectory(
     if sample_interval <= 0 or additional_steps < sample_interval:
         raise ValueError("fixed-H 轨迹库单次延长的步数不足一个 sample_interval")
     if needs_burn_in:
-        simulation.step(int(burn_in_steps))
+        guarded_step(simulation, int(burn_in_steps), "fixed-H 轨迹库 burn-in")
         record["segments"].append({
             "burn_in_steps": int(burn_in_steps),
             "sample_steps": 0,
@@ -10561,7 +11415,7 @@ def _extend_state_trajectory(
     new_volumes = []
     new_observations = []
     for _ in range(n_new_samples):
-        simulation.step(int(sample_interval))
+        guarded_step(simulation, int(sample_interval), "fixed-H 轨迹库采样")
         frame_state = simulation.context.getState(getPositions=True)
         frame_positions = frame_state.getPositions()
         frame_box = frame_state.getPeriodicBoxVectors()
@@ -11157,15 +12011,29 @@ def probe_adjacent_bias_calibration_bank(
 #
 # ⚠️ [2026-09-02 归因更正] 这段原文写的是"根因见……"，并用 4W53 溶剂腿
 # window 2 的 -14.85 真值 / 生产 +4.64 / 错 +19.49 当定量依据。**那个幅度归因
-# 是错的**：docs/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md（2026-09-02
+# 是错的**：docs/archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md（2026-09-02
 # 结案）把该误差的 **98% 定罪为 λ-WCA 防护壳（Group 4）**——壳退役
 # （`WCA_SHIELD_RETIRED = True`）后溶剂腿 stage2 从 +38.59 变成 ≈ -8.3
 # （独立参考真值 -6.58 ± 0.26，no-LRC 口径），ΔG_bind 从 +12.75 变成
 # -21.36 ± 0.93。上面那些逐窗口数字都是**壳还在时**测的，已被污染。
 #
-# 本模块描述的单系综机制**没有被证伪**，但它现在只是残余 1.7~4.2 kJ/mol
-# 缺口（≈4%）的候选解释之一，另一个候选是 LRC 口径。所以：保留这条独立端点
-# 采样路径的理由是机制上仍然成立，**不是**"它能解释那 +32"。
+# ⚠️ [2026-09-09 再更正] 上一版这里写"只是残余 1.7~4.2 kJ/mol（≈4%）的候选
+# 解释之一，另一个候选是 LRC 口径"——**两句都不对**。LRC 不是候选，它是**掩护**：
+# 生产含 LJ 尾项、参考真值不含，尾项 +2.823 与真实误差 -4.318 符号相反、相消成
+# -1.494，把 5.5σ 伪装成 1.9σ。口径对齐后（尾项减在生产侧，数值从
+# `energies.npy - sampling_states.npy.T` 直接读，那是逐 λ 态严格常数）：
+# 生产 -10.898 vs 真值 -6.581±0.256 ⟹ 残差 **-4.318 kJ/mol，5.5σ**。
+# 拆分：**密度差 -0.86 ± 0.13（20%）+ 采样协议 ≈-3.46（80%）**。
+#   · 密度差：生产 stage2 走 NVT，用**自己 NPT 预平衡末帧冻结的盒**（42.747 nm^3），
+#     而参考臂固定用建系盒（43.950）且拒绝恒压器 ⟹ 生产密度高 2.81%。
+#     实测 ∂ΔA_LJ/∂V = P_coup - P_dec = +0.71 ± 0.11 kJ/mol/nm^3（≈12 bar）。
+#     ⚠️ 用水的压缩率粗估会大 5~8 倍，别用。
+#   · 其余十一项 Hamiltonian/估计器级候选已逐条实测排除（估计器、ESS 门、σ、链式接缝、
+#     端点、系综、cutoff、软核约定、residual 臂、窗口内漂移、有限样本偏差），
+#     **剩下 80% 就是本模块描述的这个机制**：残差全在 λ<0.578 的下降支（空腔塌缩区），
+#     win4 一个窗口占 50%。
+# 所以保留这条独立端点采样路径的理由不只是"机制成立"，
+# 而是**它针对的正是壳退役后剩下误差的主体**。见 docs/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md。
 #
 # 决定性的一点：window 2 的相邻 <ΔU> 只有 0.4~0.6 kT，**任何基于能量的重叠
 # 判据都会说"完美"**。所以这不是"窗口太宽/重叠不足/统计噪声"，加窗、插 λ、
@@ -11300,8 +12168,11 @@ _INDEPENDENT_ENDPOINT_WALKER_STRIDE = 1_009
 # STAGE2_ROOT_CAUSE_2026-08-28.md §8.2 提出的采样设计层修法，与干/湿无关。
 # ⚠️ [2026-09-02 归因更正] 原文写"针对 **+32 kJ/mol 根因**的修复"——**错了**。
 # 那 +32 的 98% 是 λ-WCA 防护壳，已于 2026-09-02 退役定案（见
-# docs/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md）。独立端点采样
-# 针对的是单系综重加权这个**机制**，它现在只对残余 ≈4% 负责。
+# docs/archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md）。独立端点采样
+# 针对的是单系综重加权这个**机制**。
+# ⚠️ [2026-09-09 更正] 上一版这里写"只对残余 ≈4% 负责"——**作废**（那个 4% 带
+# LRC 口径错误且是带壳测的）。壳退役后该机制对应 **-2.7 ~ -3.5 kJ/mol，
+# 即残差的约 80%**（另 20% 是生产/参考的盒体积差 2.81%，实测 -0.86 ± 0.13）。见 docs/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md。
 # 去掉的只是"从湿构型再起一组"这个诊断装置。
 # 要恢复双起点，先把探针锚点从配体换成蛋白腔壁参考原子，让它重新成为状态函数；
 # 在那之前恢复它只会再烧一轮 GPU 得到同样无判别力的结果。
@@ -11775,7 +12646,7 @@ def prepare_wet_cavity_seed(
         best_state = None
         while steps_done < int(equilibration_steps):
             chunk = min(int(check_interval), int(equilibration_steps) - steps_done)
-            simulation.step(int(chunk))
+            guarded_step(simulation, int(chunk), "湿腔种子预平衡")
             steps_done += chunk
             state = simulation.context.getState(getPositions=True, getVelocities=True)
             pos_nm = np.asarray(
@@ -12336,7 +13207,7 @@ def _decorrelate_independent_record(
     STAGE2_ROOT_CAUSE_2026-08-28.md §3.2 已经实测出这个模态在能量上几乎不
     可见（window 2 相邻 <ΔU> 仅 0.4~0.6 kT）。⚠️ [2026-09-02] 原文这里还写着
     该窗口"贡献 ~21 kJ/mol 的 TΔS"——那个幅度是**壳还在时**推出来的，已随
-    λ-WCA 壳退役作废（见 docs/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md）。
+    λ-WCA 壳退役作废（见 docs/archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md）。
     但本函数的取舍与幅度无关：慢模态在能量上不可见这一点仍然成立，所以只用
     能量序列估自相关时间会系统性低估 g，从而高估独立样本数——正是"稳定地
     收敛到错值"那类失效的统计学版本。取两者中样本更少的那个，宁可保守。
@@ -12406,7 +13277,7 @@ def _decorrelate_independent_record(
     # （STAGE2_ROOT_CAUSE_2026-08-28.md §3.2/§3.3）。
     # ⚠️ [2026-09-02 归因更正] 原文写"正是 **+32 kJ/mol 根因**所依赖的量"——
     # 那 +32 的 98% 已定罪为 λ-WCA 防护壳（见
-    # docs/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md）。这个诊断量
+    # docs/archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md）。这个诊断量
     # 仍然有意义（残余 ≈4% 的候选解释），只是不再对应那个幅度。
     #
     # ⚠️ 同样**只报告、不设门**：0 次转变既可能是"卡住"、也可能是"该 λ 真是单相"
@@ -13223,7 +14094,11 @@ class IBSWindowManagerDualLambda:
         断点续传/TMBAR 落盘逻辑——这些逻辑只依赖 (win_sys, ibs_wrap) 这两个
         返回值和 lc_win 的长度，不关心 CV 具体代表哪种物理量。
         """
-        win_sys_xml = XmlSerializer.serialize(self.system_template)
+        # 🔑 [2026-09-10] serialize→deserialize 往返 → clone()。
+        # 这是 2026-09-09 那批迁移漏掉的一半。clone() 走 SerializationNode，
+        # 不生成中间字符串；原写法每个窗口都要在堆上开一份多兆字节的 str
+        # （大体系上是几十 MB），紧接着就是 build_ibs_dual_system 里
+        # 30k 原子 × getParticleParameters 的分配风暴。
         residual_kwargs = {}
         if self.residual_basis_force_factory is not None:
             coefficients = [
@@ -13246,7 +14121,7 @@ class IBSWindowManagerDualLambda:
                 "residual_energy_offset_kj_mol": self.residual_energy_offset_kj_mol,
             }
         return build_ibs_dual_system(
-            ensure_owned_system(XmlSerializer.deserialize(win_sys_xml)),
+            ensure_owned_system(XmlSerializer.clone(self.system_template)),
             self.topology,
             self.ligand_indices,
             lc_win,
@@ -13372,6 +14247,29 @@ class IBSWindowManagerDualLambda:
         min_bias_updates: int = 12,
         max_bias_updates: int = 50,
         required_consecutive_bias_updates: int = 3,
+        # 🔑 [2026-09-10] 逐窗口 f_k 热启动种子（{window_idx: f_k}）。优先于 pilot-TI
+        # 种子。用途：拿**上一段生产帧**重解出的 f_k 作为下一段的起点
+        # （见 `recalibrate_f_k_from_production`）—— warmup 的 loose gate 只用 200 帧
+        # 判、只要求 <10 kJ/mol，留下的偏置可能让混合塌向少数态；生产帧多几个数量级。
+        # 这里只是**种子**，不是"已冻结"：预热照常学习并过同一个 loose gate 才冻结，
+        # 所以不绕过任何现有门，只是起点好得多。
+        initial_f_k_by_window: Optional[Dict[int, Sequence[float]]] = None,
+        # 🔑 [2026-09-11，实验开关，默认 False = 行为逐字不变] 用生产帧重标定出来的
+        # f_k，进生产前不再**被** loose gate 拦住。
+        # 理由（老板拍板，PLAN 9k）：证据强度是倒挂的 —— 新 f_k 由该窗口几千帧生产
+        # 数据解出，却要用 5 批×40=200 帧 warmup 样本去"验证"它；实测 win2 就死在
+        # 这一步（g=67 凑不出去相关样本，烧光 180k 步一次都没解出来，然后中止整个 run）。
+        # 而坏 f_k 的段只会**少贡献信息、不会把答案带偏**（MBAR 会给它该有的权重），
+        # 所以事前拦一道对正确性没有增益。
+        # ⚠️ 门**照跑照记**，只是不再阻断/抛异常 —— "过一下看看"保留，"拦着"去掉。
+        # ⚠️ 仍然要求真的做过 burn-in（steps_at_full_bias>0），绝不零平衡进生产。
+        accept_recalibrated_f_k_without_gate: bool = False,
+        # 🔑 [2026-09-10] 只跑这些窗口（None = 全跑，逐字保持原行为）。
+        # 用途：f_k 重标定判定完就已经知道**哪几个窗口**的偏置真的偏了，没有理由
+        # 把没被重播种的窗口也从零重采一遍 —— 那既浪费 GPU，又因为新段序列更短而
+        # 让它在 g/ESS 诊断上显得更好（实测：段 1 的 w3 全长 1000 帧 g=202.9，
+        # 截到 500 帧变 13.9/31.0）。未跑的窗口在分析时沿用上一段的产物。
+        only_window_indices: Optional[Sequence[int]] = None,
         # 🔑 [窗口预热状态机重构 Stage 1a] 改名 max_bias_warmup_steps →
         # max_bias_learning_steps：这个参数从来控制的都是"learning 阶段的步数
         # 预算"（sgd_step_budget/full_bias_step_budget 都从它派生），跟真正的
@@ -13567,7 +14465,24 @@ class IBSWindowManagerDualLambda:
             )
 
         warmup_results = []
+        _only = (
+            None if only_window_indices is None
+            else {int(x) for x in only_window_indices}
+        )
+        if _only is not None:
+            _unknown = _only - set(range(len(self.ranges)))
+            if _unknown:
+                raise ValueError(
+                    f"only_window_indices 含不存在的窗口 {sorted(_unknown)}；"
+                    f"本阶段只有 {len(self.ranges)} 个窗口。拒绝静默忽略。"
+                )
+            print(
+                f"  [窗口子集] 本次只跑窗口 {sorted(_only)}（共 {len(self.ranges)} 个）；"
+                "其余窗口不重采，分析时沿用上一段产物。"
+            )
         for window_idx, (start, end) in enumerate(self.ranges):
+            if _only is not None and window_idx not in _only:
+                continue
             lc_win = self.lambdas_coul[start:end]
             lv_win = self.lambdas_vdw[start:end]
             print(f"\n{'='*80}")
@@ -13793,11 +14708,25 @@ class IBSWindowManagerDualLambda:
             main_ckpt_path, main_manifest_path = _main_window_checkpoint_paths(
                 self.checkpoint_dir, stage_type, window_idx
             )
+            # 🔑 [2026-09-10] 整个窗口只序列化 win_sys **一次**。
+            #
+            # 下面生产 checkpoint manifest 那处（原来是
+            # `win_sys_xml_for_prod_ckpt = openmm.XmlSerializer.serialize(win_sys)`）
+            # 序列化的是同一个对象，而两处之间 `win_sys` 只被只读方法碰过
+            # （getNumConstraints / getForce / getNumParticles），没有任何
+            # addForce/removeForce/set*，所以两次的字节逐字相同。
+            #
+            # 重复那一次不是"多花点时间"：被序列化的是装配好的窗口 System
+            # （Group-1 的 CustomCVForce 里装着 K 个 softcore CustomNonbondedForce，
+            # 每个都带完整 per-particle 参数和整张排除表），大体系上是几十 MB 的
+            # 瞬时峰值，而且它发生在整段 CUDA 预热之后。2026-09-10 的 SEGV 就落在
+            # 第二次这一调用里（ibs_engine.py:16540），第一次同样的调用是过的。
+            win_sys_xml = openmm.XmlSerializer.serialize(win_sys)
             expected_main_manifest = _build_main_window_checkpoint_manifest(
                 stage_type,
                 window_idx,
                 len(lc_win),
-                openmm.XmlSerializer.serialize(win_sys),
+                win_sys_xml,
                 lc_win,
                 lv_win,
                 (float(np.mean(lv_win)) if _system_has_global_parameter(win_sys, "lambda_shield") else None),
@@ -13815,7 +14744,12 @@ class IBSWindowManagerDualLambda:
             )
             attempt_checkpoint_restore = bool(
                 resume
-                and _peek_ibs_bias_status(ibs_state_file) == "calibrated_pending_validation"
+                and _peek_ibs_bias_status(ibs_state_file) in (
+                    "calibrated_pending_validation",
+                    # 🔑 [2026-09-11] 无法判定态也要恢复 Context：否则会先走一次
+                    # freeze_burn_in，把上次累计的验证批次冲掉、等于重新领额度。
+                    "frozen_validation_indeterminate",
+                )
                 and _main_window_checkpoint_is_usable(
                     self.checkpoint_dir, stage_type, window_idx, expected_main_manifest
                 )
@@ -13920,6 +14854,22 @@ class IBSWindowManagerDualLambda:
                     )
                 print(f"  [OK] Boresch 几何检查通过：r0={r0_chk*10:.2f}Å，θA={thA_chk:.1f}°，θB={thB_chk:.1f}°")
 
+            # 分段回退（_step_with_chunk_rollback）耗尽步长下限时统一打这套诊断。
+            # 热化和偏置预热共用一份，不各写一遍。
+            def _nan_diagnostics(label: str) -> None:
+                prefix = f"窗口{window_idx}_NaN_{label}"
+                diagnose_force_groups_detailed(sim.context, win_sys, prefix=prefix)
+                diagnose_force_breakdown(sim.context, win_sys, prefix=prefix)
+                try:
+                    diagnose_top_force_atoms(
+                        sim.context, win_sys,
+                        topology=self.topology,
+                        ligand_indices=self.ligand_indices,
+                        prefix=prefix,
+                    )
+                except Exception as diag_exc:
+                    print(f"    [WARN] 原子级定位诊断失败：{diag_exc}")
+
             pre_test_breakdown = None
             if debug_mode:
                 diagnose_force_groups_detailed(sim.context, win_sys, prefix=f"窗口{window_idx}_最小化后")
@@ -13972,74 +14922,16 @@ class IBSWindowManagerDualLambda:
                 _CHUNK = 500                       # 一"帧"= 检查粒度，也是回退粒度
                 _MIN_DT_PS = 1.0e-5                # 减半下限 0.01 fs，到这儿还炸就是真坏了
 
-                def _chunk_is_finite():
-                    st = sim.context.getState(
-                        getEnergy=True, getForces=True, getPositions=True
-                    )
-                    e = st.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-                    f = st.getForces(asNumpy=True).value_in_unit(
-                        unit.kilojoule_per_mole / unit.nanometer
-                    )
-                    fmax = float(np.max(np.linalg.norm(f, axis=1))) if f.size else 0.0
-                    pos = st.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-                    ok = (
-                        np.isfinite(e)
-                        and np.isfinite(fmax)
-                        and not np.any(~np.isfinite(pos))
-                    )
-                    return ok, e, fmax
-
-                _rescued = 0
-                _done = 0
-                while _done < _THERMALIZE_STEPS:
-                    n = min(_CHUNK, _THERMALIZE_STEPS - _done)
-                    # 只为这一段留一个回滚点，段过了就丢，不留全程快照。
-                    before = sim.context.getState(getPositions=True, getVelocities=True)
-                    dt_here = sim.integrator.getStepSize()
-                    while True:
-                        sim.step(n)
-                        ok, e, fmax = _chunk_is_finite()
-                        if ok:
-                            break
-                        halved = dt_here.value_in_unit(unit.picoseconds) * 0.5
-                        if halved < _MIN_DT_PS:
-                            print("    [ERR] 步长已减半至下限仍出现非有限值，打印诊断：")
-                            diagnose_force_groups_detailed(
-                                sim.context, win_sys,
-                                prefix=f"窗口{window_idx}_热化NaN",
-                            )
-                            diagnose_force_breakdown(
-                                sim.context, win_sys,
-                                prefix=f"窗口{window_idx}_热化NaN",
-                            )
-                            try:
-                                diagnose_top_force_atoms(
-                                    sim.context, win_sys,
-                                    topology=self.topology,
-                                    ligand_indices=self.ligand_indices,
-                                    prefix=f"窗口{window_idx}_热化NaN",
-                                )
-                            except Exception as diag_exc:
-                                print(f"    [WARN] 原子级定位诊断失败：{diag_exc}")
-                            sim.integrator.setStepSize(original_dt)
-                            raise RuntimeError(
-                                f"窗口 {window_idx} 热化：步长降到 "
-                                f"{halved*1000:.3f} fs 仍出现非有限坐标/能量/力"
-                            )
-                        # 回退这一段，减半重做
-                        sim.context.setState(before)
-                        dt_here = halved * unit.picoseconds
-                        sim.integrator.setStepSize(dt_here)
-                        _rescued += 1
-                        print(
-                            f"    ↩️ 第 {_done}-{_done+n} 步出现非有限值，已回退该段，"
-                            f"步长降至 {halved*1000:.2f} fs 重做"
-                        )
-                    sim.integrator.setStepSize(original_dt)
-                    _done += n
-
+                _rescued = step_with_chunk_rollback(
+                    sim,
+                    _THERMALIZE_STEPS,
+                    f"窗口 {window_idx} 热化",
+                    chunk=_CHUNK,
+                    min_dt_ps=_MIN_DT_PS,
+                    on_exhausted=_nan_diagnostics,
+                )
                 if _rescued:
-                    print(f"  [OK] 热化完成（{_rescued} 次分段回退救回）")
+                    print(f"  [OK] 热化完成（回退重做 {_rescued} 次）")
 
                 sim.integrator.setStepSize(original_dt)
                 print(f"  [OK] 测试步进通过，恢复步长 {original_dt.value_in_unit(unit.picoseconds):.3f} ps")
@@ -14058,8 +14950,10 @@ class IBSWindowManagerDualLambda:
                     original_dt = 0.001 * unit.picoseconds
                     sim.integrator.setStepSize(original_dt)
                     sim.minimizeEnergy(maxIterations=5000, tolerance=10.0)
-                    for _ in range(10):
-                        sim.step(200)
+                    step_with_chunk_rollback(
+                        sim, 2000, f"窗口 {window_idx} 死锁缓解松弛",
+                        chunk=200, on_exhausted=_nan_diagnostics,
+                    )
                     if debug_mode:
                         diagnose_force_breakdown(sim.context, win_sys, prefix=f"窗口{window_idx}_死锁缓解后")
     
@@ -14214,6 +15108,8 @@ class IBSWindowManagerDualLambda:
             if (
                 is_resumed_ibs
                 and not legacy_repair
+                and getattr(sampler, "bias_status", "unconverged")
+                != "frozen_validation_indeterminate"
                 and (
                     getattr(sampler, "bias_status", "unconverged") == "calibrated_pending_validation"
                     or sampler.frozen_f_k_pending is not None
@@ -14245,7 +15141,31 @@ class IBSWindowManagerDualLambda:
             # 收敛判据下才会被置位并落盘的）时才真正跳过；否则一律走下面的收敛
             # 判定循环——已恢复的 f_k 只是被当成一个更好的热启动起点，不是免检的
             # 通行证。
-            skip_warmup_entirely = bool(is_resumed_ibs and sampler.bias_converged)
+            # 🔑 [2026-09-11] 旧 PASS 只在**同一个采样身份**下有效。
+            # 用 _stage_window_sampling_identity 比对（它刻意剥掉预算/门限这些
+            # 可以变的项，只留"采的是不是同一个 Hamiltonian"）。
+            # 身份不符、或旧状态根本没记身份 ⟹ **不给 skip_warmup_entirely**。
+            # 注意这不是把状态整份丢掉：f_k 仍然作为热启动种子走
+            # `is_resumed_ibs and not bias_converged` 那条路，只是不再能声称
+            # "已经收敛、只需只读复验"。
+            _cached_stage_identity = getattr(sampler, "loaded_stage_protocol_key", None)
+            _current_stage_identity = getattr(self, "stage_protocol_key", None)
+            _identity_matches = (
+                _current_stage_identity is not None
+                and _cached_stage_identity is not None
+                and _stage_window_sampling_identity(_cached_stage_identity)
+                == _stage_window_sampling_identity(_current_stage_identity)
+            )
+            skip_warmup_entirely = bool(
+                is_resumed_ibs and sampler.bias_converged and _identity_matches
+            )
+            if is_resumed_ibs and sampler.bias_converged and not _identity_matches:
+                print(
+                    f"  [WARN] 窗口 {window_idx} 载入的 IBS 状态标记为已收敛，但采样身份"
+                    f"{'缺失' if _cached_stage_identity is None else '与当前不符'}"
+                    "（λ / Hamiltonian / box / 口径版本任一变化即算不同系综）。"
+                    "旧 PASS 不再粘住：f_k 仍作热启动，但要重新走完整收敛判定。"
+                )
             # 🔑 [IBS_BIAS_PROTOCOL_VERSION=7] 缓存的 bias_converged=True 只能证明这个
             # f_k 曾经在旧构型下有效，不能证明本次新建 Context 的当前构型已经在这个
             # 固定偏置下平衡过——旧代码在这里直接跳过整个预热块进生产，等于零平衡就
@@ -14286,6 +15206,26 @@ class IBSWindowManagerDualLambda:
                     "冻结 f_k 的 burn-in + 只读验证（不重新学习权重，也不重新校准）。"
                 )
                 resumed_frozen_f_k = [float(x) for x in sampler.frozen_f_k_pending]
+            elif (
+                is_resumed_ibs
+                and getattr(sampler, "bias_status", "unconverged")
+                == "frozen_validation_indeterminate"
+                and sampler.frozen_f_k_pending is not None
+            ):
+                # 🔑 [2026-09-11] 上次是"验证预算耗尽、无法判定"（数据不足，Δf−ΔF
+                # 从未求出）。这对 f_k 不是反面证据：不重新 SGD、不重新校准，恢复
+                # 同一份冻结 f_k 接着验；已耗批数从 frozen_validation_batches_done
+                # 恢复，不重新领一份批次额度。
+                sim.context.setParameter(f"{self.prefix}_bias_scale", 1.0)
+                for k, f_val in enumerate(sampler.frozen_f_k_pending):
+                    sim.context.setParameter(f"{self.prefix}_f_{k}", float(f_val))
+                print(
+                    "  检测到上次'验证预算耗尽、无法判定'的历史状态：恢复同一份冻结"
+                    f" f_k 接着验（已累计 "
+                    f"{getattr(sampler, 'frozen_validation_batches_done', 0)} 批），"
+                    "不重新学习、不重新领批次额度。"
+                )
+                resumed_frozen_f_k = [float(x) for x in sampler.frozen_f_k_pending]
             elif is_resumed_ibs and not sampler.bias_converged:
                 print(
                     "  检测到 IBS 历史状态，但此前预热未判定收敛——"
@@ -14320,6 +15260,25 @@ class IBSWindowManagerDualLambda:
             resumed_calibration_pending = bool(
                 resumed_frozen_f_k is not None and is_resumed_ibs
                 and getattr(sampler, "bias_status", "unconverged") == "calibrated_pending_validation"
+            )
+            # 🔑 [2026-09-11] 概念拆分。`resumed_calibration_pending` 以前同时表达
+            # 三件事：要不要恢复冻结验证、这份 f_k 有没有校准证据、用哪份预算。
+            # 无法判定态需要**第一件**（把对当前候选的测量做完），但绝不能继承
+            # 第二件（"f_k 已正确"）——所以只有动作那一层共用。
+            resume_frozen_validation = bool(
+                resumed_frozen_f_k is not None and is_resumed_ibs
+                and getattr(sampler, "bias_status", "unconverged") in (
+                    "calibrated_pending_validation",
+                    "frozen_validation_indeterminate",
+                )
+            )
+            # 只有调用方**显式**给了这个窗口一个新的累计上限才算升档。以前没有持久
+            # 账本，所以 resolver 在 override 缺失时按已耗步数往上找一档兜底——那等于
+            # 每次 --resume 自动升一档、白送额度。现在上限随账本持久化，兜底取消。
+            _explicit_frozen_validation_rung = (
+                int(frozen_validation_step_overrides[window_idx])
+                if window_idx in (frozen_validation_step_overrides or {})
+                else None
             )
             # 🔑 [跨进程阶梯状态修复] frozen_validation_step_overrides/
             # frozen_validation_is_final_rung 只存在调用方 abfe_pipeline.py 一次
@@ -14382,24 +15341,34 @@ class IBSWindowManagerDualLambda:
                 # ready-to-use convention for exp[-beta*(U_k-f_k)].  Do not
                 # infer this sign from instantaneous occupancy: occupancy-high
                 # states are lowered by the separate online negative feedback.
-                from abfe_preoptimizer import estimate_f_k_from_pilot_ti
-                warm_start_seed = estimate_f_k_from_pilot_ti(
-                    getattr(self, "pilot_lambdas", None),
-                    getattr(self, "pilot_mean_dU_dlambda", None),
-                    target_lambdas=lv_win,
-                )
+                # 显式给的逐窗口种子优先于 pilot-TI：它来自上一段的**生产帧**，
+                # 比 pilot 探针准得多。长度不符一律忽略（下面统一走长度校验）。
+                _explicit_seed = None
+                if initial_f_k_by_window:
+                    _explicit_seed = initial_f_k_by_window.get(int(window_idx))
+                if _explicit_seed is not None:
+                    warm_start_seed = np.asarray(_explicit_seed, dtype=np.float64).ravel()
+                    _seed_source = "production_recalibration"
+                else:
+                    from abfe_preoptimizer import estimate_f_k_from_pilot_ti
+                    warm_start_seed = estimate_f_k_from_pilot_ti(
+                        getattr(self, "pilot_lambdas", None),
+                        getattr(self, "pilot_mean_dU_dlambda", None),
+                        target_lambdas=lv_win,
+                    )
+                    _seed_source = "pilot"
                 if warm_start_seed is not None and len(warm_start_seed) == len(lv_win):
                     for k in range(len(lv_win)):
                         sim.context.setParameter(f"{self.prefix}_f_{k}", float(warm_start_seed[k]))
                     f_k_warm_started = True
-                    sampler.seed_source = "pilot"
+                    sampler.seed_source = _seed_source
                     print(
-                        f"  [pilot TI 热启动] 窗口 {window_idx} f_k 初始值（非冷启动 0.0）: "
+                        f"  [{_seed_source} 热启动] 窗口 {window_idx} f_k 初始值（非冷启动 0.0）: "
                         f"{[round(float(x), 3) for x in warm_start_seed]} kJ/mol"
                     )
                 elif warm_start_seed is not None:
                     print(
-                        f"  [WARN] [pilot TI 热启动] 窗口 {window_idx} 估计出的种子长度 "
+                        f"  [WARN] [{_seed_source} 热启动] 窗口 {window_idx} 估计出的种子长度 "
                         f"({len(warm_start_seed)}) 与本窗口态数 ({len(lv_win)}) 不符，"
                         "拒绝注入，回退 f_k=0.0 冷启动"
                     )
@@ -14411,28 +15380,57 @@ class IBSWindowManagerDualLambda:
 
                 sim.context.setParameter(f"{self.prefix}_bias_scale", 0.0)
 
+                # 🔑 [2026-09-09] 补上 1.0 这一档。原来爬坡停在 0.7，然后在下面
+                # （`bias_scale` 设 1.0 处）直接跳到满偏置：**最后也是最大的一次
+                # 增量既没有弛豫档、也没有分段回退保护**，跳完之后第一段动力学
+                # 是裸的 `guarded_step`（偏置学习循环）——而 pilot 种子存在时
+                # `f_k_warm_started=True`，中间那段自举 TI 采样整块跳过，所以那
+                # 一步就是跳到 1.0 之后的第一次积分。
+                #
+                # 配上 pilot TI 种子的量级（实测窗口 0 是 ±36 kJ/mol ≈ 29 kT），
+                # Group-1 的 log-sum-exp 会塌到单态、施加的偏置力就是那个态的完整
+                # softcore 力。2026-09-09 的 OpenFF benchmark 里 10 个 run 全部死在
+                # 这一跳，最后一行日志正是上面那句 pilot 种子打印。
+                #
+                # 爬坡那半边当天已经接上分段回退，1.0 这半边没有。补齐后整条爬坡
+                # 每一档都受同一套保护，且 0.7→1.0 这个最大增量也有弛豫。
                 ramp_stages = [
                     (0.2, 2000),  # 可以适当增加每一步的步数，让系统充分弛豫
                     (0.3, 2000),
                     (0.5, 2000),
                     (0.7, 2000),
+                    (1.0, 2000),
                 ]
                 sampler.energy_buffer = []
                 sampler.energy_history = []
-                sampler.bias_history = []
                 sampler.base_energy_history = []
+                sampler.bias_history = []
+                # 🔑 [2026-09-09] 这两条必须跟上面四条一起清。它们与
+                # `energy_history` 受 `collect_energies()` 里**同一个** frame_finite
+                # 门同步 append（8121-8129），而 `_append_tmbar_batch_from_buffer`
+                # (8176) 取的是 `sampling_state_energy_history[-m0:]` 并只校验尾部
+                # 长度 —— 那是个尾部检查，测不出前面已经错位。少清这两条，
+                # 下一批 tmbar entry 的 u_kn 就会对错 bias/base energies。
+                sampler.sampling_state_energy_history = []
+                sampler.residual_basis_history = []
                 sampler.ema_mean_p = None
                 for target_scale, steps in ramp_stages:
                     sim.context.setParameter(f"{self.prefix}_bias_scale", target_scale)
                     print(f"    → Bias Scale 设为 {target_scale}, 运行 {steps} 步...", end="", flush=True)
 
-                    for ramp_step in range(0, steps, 200):   # 每 200 步检查一次
-                        sim.step(200)
-
-                    state = sim.context.getState(getEnergy=True)
-                    if not np.isfinite(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)):
-                        raise RuntimeError(f"偏置预热阶段在 scale={target_scale} 时能量 NaN")
-                    print(" 完成")
+                    # 🔑 [2026-09-09] 这里原来是 for + sim.step(200)，注释写着
+                    # "每 200 步检查一次"但循环体里根本没有检查，唯一的有限性
+                    # 检查在整段跑完之后——而 NaN 是从 step() 内部抛出来的，那个
+                    # 检查永远走不到，窗口直接炸穿。现在复用热化那段同一个分段
+                    # 回退：炸了就回滚这一小段、步长减半重做。
+                    _ramp_rescued = step_with_chunk_rollback(
+                        sim,
+                        steps,
+                        f"窗口 {window_idx} 偏置预热 scale={target_scale}",
+                        chunk=200,
+                        on_exhausted=_nan_diagnostics,
+                    )
+                    print(" 完成" + (f"（回退重做 {_ramp_rescued} 次）" if _ramp_rescued else ""))
             # ---- bias_scale=1.0：两阶段严格收敛判据（learning -> freeze -> validate）----
             # 🔑 [IBS_BIAS_PROTOCOL_VERSION=7] v6 判据有个更深的问题：一轮"连续
             # N 次通过"里，每一次通过用的 mean_p_batch/ema_mean_p 都是从
@@ -14489,7 +15487,7 @@ class IBSWindowManagerDualLambda:
                     len(sampler.energy_buffer) < _boot_target
                     and _boot_guard < _boot_target * 4
                 ):
-                    sim.step(check_chunk)
+                    guarded_step(sim, check_chunk, f"窗口 {window_idx} 自举 TI 种子采样", on_error=_nan_diagnostics)
                     sampler.collect_energies()
                     _boot_guard += 1
                 _boot_u = (
@@ -14562,13 +15560,85 @@ class IBSWindowManagerDualLambda:
             # Frozen burn-in/validation is a distinct read-only phase.  Give it
             # its own reserve instead of stealing that reserve from learning;
             # otherwise update 50 can never be frozen and validated.
-            full_bias_step_budget = (
+            _default_cap_steps = (
                 int(max_bias_learning_steps)
                 + int(frozen_burn_in_steps)
                 + int(frozen_validation_reserved_steps)
             )
-            if resumed_calibration_pending:
-                # 🔑 [IBS_BIAS_PROTOCOL_VERSION=12] 续验已经冻结的校准 f_k 时，
+            # 🔑 [2026-09-11] 预算统一成**累计上限**：可用 = max(0, B − S)。
+            # learning / freeze burn-in / frozen validation 分开记账，共受同一个 B。
+            _ledger = getattr(sampler, "warmup_budget_ledger", None)
+            if not _ledger:
+                # 🔑 新采样段（checkpoints/segment_N/）的 ibs_state 从零开始，但
+                # warmup 消耗**不得清零** —— 否则每开一个段白送一整份额度
+                # （实测 window 4 跨段共烧 540k，而段 2 的账本报"剩 490k"）。
+                _ledger = inherit_warmup_ledger_across_segments(
+                    self.checkpoint_dir, stage_type, window_idx, _default_cap_steps
+                )
+                if _ledger is None:
+                    _ledger = new_warmup_budget_ledger(_default_cap_steps)
+                else:
+                    print(
+                        f"  [预算] 窗口 {window_idx} 继承上一采样段的 warmup 消耗："
+                        f"{warmup_ledger_total_steps(_ledger)} 步已耗、"
+                        f"剩 {warmup_ledger_remaining_steps(_ledger)} 步"
+                        f"（上限 {_ledger.get('cumulative_cap_steps')}）。"
+                        "新段是新的 f_k Epoch，但账本里的总消耗不清零。"
+                    )
+                sampler.warmup_budget_ledger = _ledger
+            _ledger_consumed = warmup_ledger_total_steps(_ledger)
+            _stored_cap = int(_ledger.get("cumulative_cap_steps", 0) or 0)
+            if _stored_cap <= 0:
+                _stored_cap = _default_cap_steps
+            elif _default_cap_steps > _stored_cap:
+                # 🔑 [2026-09-11 二修] 用户**改 config 抬高 max_bias_warmup_steps**
+                # 本身就是"显式升档"，必须生效。原来只认调用方的 per-window rung
+                # override，于是已经有账本的窗口永远停在旧上限 —— 实测：config 从
+                # 500000 改到 900000（上限 555k→955k）之后，日志仍然打
+                # "累计上限 555000"，改动完全没生效。
+                # ⚠️ 只升不降：config 调小时用 max() 保住已记录的上限，不追溯缩水
+                # （那会把已经花掉的步数变成"超支"）。"不自动升档"针对的是 resolver
+                # 按已耗步数自己往上找一档的兜底，不是用户的显式配置。
+                _ledger["budget_rung"] = int(_default_cap_steps)
+                print(
+                    f"  [预算升档] 窗口 {window_idx} 累计上限 {_stored_cap} → "
+                    f"{_default_cap_steps}（来自 config 的 max_bias_warmup_steps 等项）。"
+                )
+                _stored_cap = int(_default_cap_steps)
+            if (
+                _explicit_frozen_validation_rung is not None
+                and int(_explicit_frozen_validation_rung) > _stored_cap
+            ):
+                # 显式升档：新增可用 = max(0, B₂ − S)。普通 resume 走不到这里。
+                _ledger["budget_rung"] = int(_explicit_frozen_validation_rung)
+                _stored_cap = int(_explicit_frozen_validation_rung)
+            _ledger["cumulative_cap_steps"] = int(_stored_cap)
+            full_bias_step_budget = max(0, _stored_cap - _ledger_consumed)
+            # 本次 attempt 的分项消耗，循环里按 mode 计，退出时并进账本。
+            _attempt_ledger = {k: 0 for k in WARMUP_LEDGER_BUCKETS}
+            if not _ledger.get("complete", True):
+                print(
+                    f"  [WARN] 窗口 {window_idx} 的 warmup 预算账本**不完整**"
+                    f"（migrated_from={_ledger.get('migrated_from')}）：旧 checkpoint 只能"
+                    " 恢复冻结验证累计步数，learning/burn-in 的历史消耗无持久记录，"
+                    "实际已耗可能被低估。不据此升档。"
+                )
+            if _ledger_consumed:
+                print(
+                    f"  [预算账本] 累计已耗 {_ledger_consumed} 步"
+                    f"（learning={_ledger.get('learning_steps', 0)}, "
+                    f"burn_in={_ledger.get('freeze_burn_in_steps', 0)}, "
+                    f"validation={_ledger.get('frozen_validation_steps', 0)}），"
+                    f"累计上限 {_stored_cap}，本次可用 {full_bias_step_budget} 步。"
+                )
+            # 🔑 [2026-09-11] 上提到 if 之外：这份冻结 f_k 进入本次 attempt 之前
+            # 已累计的验证步数。原来只在 resumed_calibration_pending 分支里定义，
+            # 下面"验证预算耗尽、无法判定"的落盘分支对全新窗口也要用它。
+            prior_cumulative_steps = int(
+                getattr(sampler, "frozen_validation_cumulative_steps", 0)
+            )
+            if resume_frozen_validation:
+                # 🔑 [IBS_BIAS_PROTOCOL_VERSION=12] 续验已经冻结的 f_k 时，
                 # 从一开始就 mode="freeze_burn_in"，永远不会进入 learning，
                 # 不需要也不应该套用"给 learning 大部分预算、只留
                 # mbar_calibration_reserved_steps 给校准验证"的拆分——这里的
@@ -14586,20 +15656,19 @@ class IBSWindowManagerDualLambda:
                 # 这一轮只跑差值——如果从主窗口 checkpoint 续算（见
                 # MAIN_WINDOW_CHECKPOINT_PROTOCOL_VERSION），差值步数接的就是
                 # 上次中断的真实动力学轨迹，不是重新烧一遍。
-                prior_cumulative_steps = int(getattr(sampler, "frozen_validation_cumulative_steps", 0))
-                remaining_budget_this_attempt = max(
-                    int(effective_frozen_validation_budget) - prior_cumulative_steps,
-                    int(check_chunk),
-                )
+                # 🔑 [2026-09-11] 剩余预算现在由账本统一给出（上面已算好
+                # full_bias_step_budget = max(0, B − S)），这里不再自己减一次——
+                # 原来那份只看 frozen_validation_cumulative_steps，learning/burn-in
+                # 的消耗完全不在账内。sgd_step_budget 在续验路径上不会被用到
+                # （永远不进 learning），保持一个不小于 burn-in 的值即可。
                 sgd_step_budget = max(
-                    remaining_budget_this_attempt,
+                    int(full_bias_step_budget),
                     int(frozen_burn_in_steps) + check_chunk,
                 )
                 frozen_validation_reserved_steps = 0
-                full_bias_step_budget = int(sgd_step_budget)
             validation_attempt_budget_steps = (
                 int(full_bias_step_budget)
-                if resumed_calibration_pending
+                if resume_frozen_validation
                 else max(
                     int(frozen_validation_reserved_steps),
                     int(required_consecutive_bias_updates) * 20 * int(check_chunk),
@@ -14682,10 +15751,19 @@ class IBSWindowManagerDualLambda:
             # updates_since_freeze/have_frozen_once 控制"首次冻结前累计 min_bias_
             # updates 次更新、此后每次门失败只需再更新一轮就重新冻结复检"。
             frozen_mbar_batches = []
+            validation_solve_at_batches = IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES
+            validation_insufficient_attempts = 0
+            # [2026-09-12] 同一候选、连续数据上每次「样本不足」时的 g。
+            # **只记录不判定** —— 提前外推判死在 2026-09-11 已被否决（见下方
+            # `不做"没救了"的提前外推` 那段）。可达性判定在控制器做，
+            # 而且只在**周期用尽之后**决定要不要开下一个周期。
+            validation_g_history: List[float] = []
             updates_since_freeze = 0
             have_frozen_once = False
             local_mbar_gate_history = []
             last_local_mbar_gate = None
+            # 非 None 表示本窗口以"验证预算耗尽、无法判定"退出（见下方分级求解）。
+            validation_indeterminate_diag = None
             if resumed_frozen_f_k is not None:
                 # 🔑 [MAIN_WINDOW_CHECKPOINT_PROTOCOL_VERSION] 从主窗口 checkpoint
                 # 续算时不需要 freeze_burn_in：checkpoint 保存的那一刻本身就已经
@@ -14694,6 +15772,37 @@ class IBSWindowManagerDualLambda:
                 # 没有可用 checkpoint 时（缺失/不兼容/首次校准刚失败一次）保持
                 # 原有行为：先走一次 freeze_burn_in 再进入 validating。
                 mode = "validating" if restored_from_window_checkpoint else "freeze_burn_in"
+                # 🔑 [2026-09-11] 上次是"验证预算耗尽、无法判定"且 Context 完整恢复
+                # 时，接着上次的批次继续累计（批次数据本身在 tmbar_history 里，f_k
+                # 全程没变、Hamiltonian 也没变，这些帧仍是同一分布的合法样本）。
+                # 不恢复的话 resume 等于重新领一份批次额度。
+                if (
+                    restored_from_window_checkpoint
+                    and getattr(sampler, "bias_status", "unconverged")
+                    == "frozen_validation_indeterminate"
+                    and int(getattr(sampler, "frozen_validation_batches_done", 0)) > 0
+                    and getattr(sampler, "frozen_candidate_fingerprint", None)
+                    == frozen_candidate_fingerprint(sampler.frozen_f_k_pending)
+                ):
+                    _n_done = min(
+                        int(sampler.frozen_validation_batches_done),
+                        len(sampler.tmbar_history),
+                        IBS_LOCAL_MBAR_GATE_MAX_BATCHES,
+                    )
+                    frozen_mbar_batches = list(sampler.tmbar_history[-_n_done:])
+                    validation_batch_count = _n_done
+                    validation_insufficient_attempts = max(
+                        1, _n_done // IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES
+                    )
+                    validation_solve_at_batches = min(
+                        IBS_LOCAL_MBAR_GATE_MAX_BATCHES,
+                        _n_done + IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES,
+                    )
+                    print(
+                        f"  恢复上次已累计的 {_n_done} 批固定-f_k 验证数据，"
+                        f"下一次求解在第 {validation_solve_at_batches} 批"
+                        f"（单周期上限 {IBS_LOCAL_MBAR_GATE_MAX_BATCHES} 批）。"
+                    )
                 frozen_f_k_snapshot = resumed_frozen_f_k
                 sampler.energy_buffer = []
                 sampler.ema_mean_p = None
@@ -14718,8 +15827,9 @@ class IBSWindowManagerDualLambda:
                 if mode == "learning" and bias_update_count >= int(max_bias_updates):
                     break
                 with _timed(warmup_timers, "integration_s"):
-                    sim.step(check_chunk)
+                    guarded_step(sim, check_chunk, f"窗口 {window_idx} 偏置学习", on_error=_nan_diagnostics)
                 steps_at_full_bias += check_chunk
+                _attempt_ledger[warmup_ledger_bucket_for_mode(mode)] += check_chunk
                 with _timed(warmup_timers, "cv_probe_s"):
                     sampler.collect_energies()
 
@@ -14790,6 +15900,9 @@ class IBSWindowManagerDualLambda:
                         updates_since_freeze = 0
                         freeze_burn_in_done = 0
                         frozen_mbar_batches = []
+                        validation_solve_at_batches = IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES
+                        validation_insufficient_attempts = 0
+                        validation_g_history = []
                         sampler._last_dominant_k = None
                         sampler.energy_buffer = []
                         sampler.ema_mean_p = None
@@ -14803,6 +15916,9 @@ class IBSWindowManagerDualLambda:
                     if freeze_burn_in_done >= frozen_burn_in_steps:
                         mode = "validating"
                         frozen_mbar_batches = []
+                        validation_solve_at_batches = IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES
+                        validation_insufficient_attempts = 0
+                        validation_g_history = []
                         validation_batch_count = 0
                         validation_sample_count = 0
                         validation_steps_this_freeze = 0
@@ -14826,7 +15942,14 @@ class IBSWindowManagerDualLambda:
                 if n_appended <= 0:
                     continue
                 frozen_mbar_batches.append(sampler.tmbar_history[-1])
-                if len(frozen_mbar_batches) > IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES:
+                # 🔑 [2026-09-11] 只在**还没遇到数据不足**时保持"最近 5 批"的滑窗。
+                # 一旦解出 insufficient_frames*，继续采样却仍然只留最近 5 批 = 新批
+                # 进来旧批被挤掉，用于这次求解的总帧数根本不增长，相关时间长的窗口
+                # 会永远不足。进入累计模式后不再裁剪，直到解出来或撞 MAX_BATCHES。
+                if (
+                    validation_insufficient_attempts == 0
+                    and len(frozen_mbar_batches) > IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES
+                ):
                     frozen_mbar_batches = frozen_mbar_batches[
                         -IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES:
                     ]
@@ -14850,7 +15973,26 @@ class IBSWindowManagerDualLambda:
                 # 全部 ~200 帧验证预算即可判定、退回 bounded-occupancy learning。
                 # 纯路由决策——不设置 gate_ok/bias_converged，占据本身对生产入口门
                 # 依旧只是诊断，不参与放行。
-                if len(frozen_mbar_batches) < IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES:
+                # 🔑 但"不参与放行"必须是真的：早退每次都在完整 gate 求解（下面那次
+                # _solve_single_window_local_mbar + validation_attempts += 1）之前
+                # continue 回 learning，所以只要它每个 freeze cycle 都命中，本窗口就
+                # 一次生产入口判据都评不到，占据事实上变成了唯一的放行门——正是 v29
+                # 注释里"否则会把这个宽松 10 kJ/mol 门偷偷变成严格收敛门"要禁止的。
+                # 实测 4/4 撞 IBSWarmupConvergenceError 的 vanishing 窗口 validation_
+                # attempts≈0（其中一个 local_mbar_gate_history 为空），失败全部由这里
+                # 产生，且失败后本该接手的 3-way router / damped 直接重验分支从未执行。
+                # 因此本窗口拿到至少一次完整 gate 评估之前不允许早退：只多烧
+                # (SLIDING_BATCHES-1) 批 minibatch 一次，换回"每个窗口至少被真正的
+                # 判据评一次"。之后的 freeze cycle 仍照常享受这个早退优化。
+                # 纯 warmup 路由/停止动力学，不动 production Hamiltonian、f_k 约定、
+                # 采样方式或训练输入口径，故与 v28/v29 同类：协议版本保持 33、缓存兼容。
+                if (
+                    ever_completed_a_validate_attempt
+                    # 🔑 [2026-09-11] 正在为"数据不足"扩充验证数据时不得早退：
+                    # 早退会退回 learning 并清空批次，等于把刚攒的数据丢掉重来。
+                    and validation_insufficient_attempts == 0
+                    and len(frozen_mbar_batches) < IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES
+                ):
                     _f_frozen_probe = np.asarray(
                         [
                             sim.context.getParameter(f"{self.prefix}_f_{k}")
@@ -14906,6 +16048,9 @@ class IBSWindowManagerDualLambda:
                         validate_direct_retry_pending = False
                         updates_since_freeze = 0
                         frozen_mbar_batches = []
+                        validation_solve_at_batches = IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES
+                        validation_insufficient_attempts = 0
+                        validation_g_history = []
                         sampler._last_dominant_k = None
                         sampler.ema_mean_p = None
                         sampler.energy_buffer = []
@@ -14914,8 +16059,9 @@ class IBSWindowManagerDualLambda:
                         validation_batch_count = 0
                         validation_steps_this_freeze = 0
                         continue
-                # 只看最近 IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES 批：攒齐再解一次。
-                if len(frozen_mbar_batches) < IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES:
+                # 攒齐 validation_solve_at_batches 批再解一次（分级：5 → 10 → 15）。
+                # 数据不足时不是每来一批就重复求解，而是跳到下一档。
+                if len(frozen_mbar_batches) < validation_solve_at_batches:
                     continue
                 u_kn_gate = np.concatenate(
                     [
@@ -14992,6 +16138,10 @@ class IBSWindowManagerDualLambda:
                     gate_situation = {"error": repr(_situ_err)}
                 max_adjacent_gap_kJ_mol = float("inf")
                 adjacent_gaps = None
+                adjacent_gaps_signed = None
+                cumulative_residual = None
+                cumulative_span = None
+                cumulative_span_sigma = None
                 gate_error = gate_solver_error
                 if gate_solver_error is None:
                     f_mbar = np.asarray(gate_mbar.get("f"), dtype=np.float64)
@@ -14999,8 +16149,47 @@ class IBSWindowManagerDualLambda:
                         if K > 1:
                             df_current = np.diff(f_frozen_now)
                             dF_mbar = np.diff(f_mbar)
-                            adjacent_gaps = np.abs(df_current - dF_mbar)
+                            # 🔑 [2026-09-11] **带符号残差必须一并落盘。**
+                            # 绝对值只够判"局部最大误差"这道门；判不了老板要的
+                            # "**端到端累计偏差**" —— 那要求知道逐边残差是否**同号**。
+                            # 实测 win3 逐边 |Δ| = [2.897, 3.634, 4.548]，每条都远低于
+                            # 门槛 10，但窗内和 11.08 **已超门槛本身**；而 11.08 只是
+                            # "若同号"的上界，没有符号就没法确认。
+                            adjacent_gaps_signed = df_current - dF_mbar
+                            adjacent_gaps = np.abs(adjacent_gaps_signed)
                             max_adjacent_gap_kJ_mol = float(np.max(adjacent_gaps))
+                            # 🔑🔑 [2026-09-11 老板规格] **端到端累计偏差**。
+                            #
+                            # C_j = Σ_{i<j} r_i 而 r_i = (f_{i+1}−f_i)−(F̂_{i+1}−F̂_i)
+                            # ⟹ 望远镜求和后 **C_j = (f_j − f_0) − (F̂_j − F̂_0)**。
+                            # f 是**冻结**的（无误差），所以
+                            #     σ(C_j) = σ(F̂_j − F̂_0) = ddf_phys[0, j]
+                            # **不需要任何误差传播**：直接读同一次 MBAR 拟合的矩阵元，
+                            # 相邻差累加起来误差**不是**独立相加（有协方差）。
+                            #
+                            # 门看 **span = max(C) − min(C)**，因为它 **gauge-free**、
+                            # 不依赖选哪个端点作锚；**只看终点会漏掉"中间先偏后抵消"**。
+                            #
+                            # 实测（生产帧，四窗**全部同号、零抵消**，Σ|r| = |Σr|）：
+                            #   win0 span 7.19  win1 6.52  win2 3.30  win3 **11.92**
+                            # win3 = 4.81 kT，e^4.81≈123，而它末/首支撑比 0.019≈1/53
+                            # —— 同一量级。而每条边 |r_i| 最大才 4.15，
+                            # **现有 max adjacent < 10 的门完全看不见它**。
+                            _c_cum = np.concatenate(
+                                ([0.0], np.cumsum(adjacent_gaps_signed))
+                            )
+                            cumulative_residual = _c_cum
+                            cumulative_span = float(np.max(_c_cum) - np.min(_c_cum))
+                            _ddf_phys = gate_mbar.get("ddf_physical_matrix_kJ_mol")
+                            cumulative_span_sigma = None
+                            if _ddf_phys is not None:
+                                _m = np.asarray(_ddf_phys, dtype=float)
+                                if _m.shape == (K, K):
+                                    _a = int(np.argmax(_c_cum))
+                                    _b = int(np.argmin(_c_cum))
+                                    # σ(span) = σ(C_a − C_b) = σ(F̂_a − F̂_b)
+                                    # = 矩阵元本身，**不是** sqrt(σ_a²+σ_b²)。
+                                    cumulative_span_sigma = float(_m[_b, _a])
                         else:
                             max_adjacent_gap_kJ_mol = 0.0
                     else:
@@ -15021,6 +16210,81 @@ class IBSWindowManagerDualLambda:
                     "adjacent_delta_kJ_mol": (
                         [float(x) for x in adjacent_gaps]
                         if adjacent_gaps is not None else None
+                    ),
+                    # **带符号**的 Δf_k − ΔF^MBAR，用于端到端累计偏差判读：
+                    # 同号累积 ⟹ 门只约束局部最大误差、缺累计偏差门；
+                    # 符号交替但转移单向 ⟹ 动力学/初始化方向性。两者处置不同。
+                    "adjacent_delta_signed_kJ_mol": (
+                        [float(x) for x in adjacent_gaps_signed]
+                        if adjacent_gaps_signed is not None else None
+                    ),
+                    "adjacent_delta_signed_sum_kJ_mol": (
+                        float(np.sum(adjacent_gaps_signed))
+                        if adjacent_gaps_signed is not None else None
+                    ),
+                    "adjacent_delta_abs_sum_kJ_mol": (
+                        float(np.sum(adjacent_gaps))
+                        if adjacent_gaps is not None else None
+                    ),
+                    # ---- 端到端累计偏差（老板规格 v1）----
+                    "signed_adjacent_residual_kJ_mol": (
+                        [float(x) for x in adjacent_gaps_signed]
+                        if adjacent_gaps_signed is not None else None
+                    ),
+                    "signed_cumulative_residual_from_first_kJ_mol": (
+                        [float(x) for x in cumulative_residual]
+                        if cumulative_residual is not None else None
+                    ),
+                    "cumulative_residual_span_kJ_mol": cumulative_span,
+                    "cumulative_residual_span_sigma_kJ_mol": cumulative_span_sigma,
+                    "endpoint_signed_residual_kJ_mol": (
+                        float(cumulative_residual[-1])
+                        if cumulative_residual is not None else None
+                    ),
+                    # 三档：**沿用现有 loose tolerance，且不随边数增长**
+                    # （老板明确："不能写成 (K−1)×10"）。
+                    "cumulative_residual_verdict": (
+                        None if (cumulative_span is None) else (
+                            "UNMEASURED" if cumulative_span_sigma is None else (
+                                "PASS" if cumulative_span + 2.0 * cumulative_span_sigma
+                                < float(IBS_LOCAL_MBAR_GATE_MAX_ADJACENT_DELTA_KJ_MOL)
+                                else "FAIL" if cumulative_span - 2.0 * cumulative_span_sigma
+                                >= float(IBS_LOCAL_MBAR_GATE_MAX_ADJACENT_DELTA_KJ_MOL)
+                                else "UNMEASURED"   # CI 跨过门槛
+                            )
+                        )
+                    ),
+                    "cumulative_residual_threshold_kJ_mol": float(
+                        IBS_LOCAL_MBAR_GATE_MAX_ADJACENT_DELTA_KJ_MOL
+                    ),
+                    # 🔑🔑 [2026-09-11 老板要求] **累计 f_k 残差的口径必须明写。**
+                    #
+                    # 这里的 u_kn_gate 来自 tmbar_history entry，存的是**未偏移的
+                    # sampling_state_energies**（见上方调用点注释），与
+                    # f_frozen_now 同口径 ⟹ `sampling_states`。**这是正确的那个。**
+                    #
+                    # ⚠️ **绝不能用 `energies`**：它比 sampling_states 多一个**逐 λ 态
+                    # 常数**（LRC 长程尾项，实测 std 精确为 0）。逐态常数本身无害，
+                    # 但它的**逐边差是正的、单调递减** ⟹ 会**凭空伪造出**"全负号、
+                    # 单调递增"的残差形状。实测污染幅度：win0 的 span 被抬高 2.2 倍
+                    # （3.27 → 7.19），win3 几乎没变（11.47 → 11.92，因为那段 LRC
+                    # 边差本来就小）—— 于是还会伪造出"span 越大末/首比越小"的
+                    # 假单调关系。
+                    #
+                    # ⚠️ 注意与 `N_eff/g` 的区别：**支撑量不受影响**（逐态常数在
+                    # 归一化里被除掉，两口径逐位相同）。**只有 f_k 残差这一类会被污染。**
+                    "energy_gauge": "sampling_states",
+                    "energy_gauge_required": "sampling_states",
+                    "energy_gauge_note": (
+                        "累计 f_k 残差**只能**用 sampling_states。energies 多一个逐 λ 态"
+                        "常数（LRC），其逐边差会伪造出单调同号的残差形状。"
+                        "支撑量（N_eff/g）不受影响，两口径逐位相同。"
+                    ),
+                    "adjacent_delta_all_same_sign": (
+                        bool(np.all(adjacent_gaps_signed > 0)
+                             or np.all(adjacent_gaps_signed < 0))
+                        if (adjacent_gaps_signed is not None
+                            and np.size(adjacent_gaps_signed)) else None
                     ),
                     "gate_threshold_kJ_mol": float(
                         IBS_LOCAL_MBAR_GATE_MAX_ADJACENT_DELTA_KJ_MOL
@@ -15049,7 +16313,14 @@ class IBSWindowManagerDualLambda:
                 # completed local-MBAR gate evaluation (pass or fail) --
                 # counted once here regardless of outcome, distinct from the
                 # cheap early-exit probe above which never reaches this line.
-                ever_completed_a_validate_attempt = True
+                # 🔑 [2026-09-11] 只有**真的解出** Δf−ΔF 才算"完整评估过一次"。
+                # 原来无论 gate_error 是什么都置 True，于是第一次
+                # insufficient_frames_after_decorrelation（根本没求出数）之后，
+                # 占据早退在后续每个 freeze cycle 又重新可用，本窗口可以一路早退、
+                # 永远拿不到一次真正的判据评估 —— 正是这道守卫本来要堵的事。
+                # validation_attempts 保持原语义（含求解失败的尝试），只改这个标志。
+                if np.isfinite(max_adjacent_gap_kJ_mol):
+                    ever_completed_a_validate_attempt = True
                 sampler.validation_attempts = (
                     int(getattr(sampler, "validation_attempts", 0)) + 1
                 )
@@ -15066,7 +16337,113 @@ class IBSWindowManagerDualLambda:
                         "冻结 f_k 进生产，最终绝对 ESS/误差/自由能交生产后 MBAR"
                     )
                     break
-                # 未过（gap≥阈值，或 MBAR 不可解/NaN）。abs_ess/占据只在现场里打印，
+
+                # 🔑 [2026-09-11] 四路分诊。以前这里只有两路（解出没过 / "暂不可解"），
+                # 后者把"结构性输入错误"和"根本没测出来"一起塞进 learning，于是
+                #   · 输入/能量身份不一致被当成暂时现象，一直重试到预算耗尽；
+                #   · 数据不足被当成 f_k 的问题，清空批次退回 learning，下个周期
+                #     重新攒同样大小的数据集，大概率再次不足；最终以
+                #     f_not_converged 收场，还可能触发插 λ —— 把误判推迟而已。
+                _gate_error_class = classify_local_mbar_gate_error(gate_error)
+                if _gate_error_class == "input_identity":
+                    raise RuntimeError(
+                        f"窗口 {window_idx} 的 local-MBAR 验证门收到**结构性**错误："
+                        f"{gate_error}。这是输入/能量身份不一致，不是数据不足，"
+                        "继续采样不会让它消失；拒绝当成'暂不可解'退回 learning 烧完预算。"
+                    )
+                if _gate_error_class == "insufficient_data":
+                    # 数据不足只说明**目前无法判断 f_k**：既没有理由修改它，也没有
+                    # 依据插 λ。保持同一份冻结 f_k、保留已有批次继续累计，到下一档
+                    # 再解一次；不清空、不退回 learning、不计入
+                    # learning_to_validation_cycles（那是"退回 learning 的次数"）。
+                    # 相关性/有效样本量由求解器在**拼接后的整份**固定-f_k 数据集上
+                    # 重新估计（_decorrelate_by_worst_target_state 作用在
+                    # np.concatenate 之后的数组上），不是把每批 ESS 相加。
+                    validation_insufficient_attempts += 1
+                    _g_now = gate_mbar.get("statistical_inefficiency")
+                    if _g_now is not None:
+                        validation_g_history.append(float(_g_now))
+                    _n_now = len(frozen_mbar_batches)
+                    # 🔑 [2026-09-11] **不做"没救了"的提前外推。** ESS 本来就跟采样
+                    # 量走：n_eff = N/g，而 g 只有在 N ≫ τ 之后才稳定。实测
+                    # window 4 的 g 还在随 N 涨（200 帧 38.5 → 400 帧 66.9），说明
+                    # 估计器远没饱和 —— 在这个区间拿 n_eff 线性外推去判"再攒也不够"
+                    # 是无效的，只会把本来能测出来的窗口提前判死。
+                    # 该做的就是按预算老老实实攒到上限（5 → 10 → 15 批）。
+                    if _n_now >= IBS_LOCAL_MBAR_GATE_MAX_BATCHES:
+                        # 🔑 [2026-09-11] 这份 f_k 上一次 attempt 已经**真正通过过**
+                        # loose gate（bias_status=converged，走的是 skip_warmup_
+                        # entirely 复验分支）。本次复验的目的只是"别零平衡就进生产"，
+                        # burn-in 已经跑过了。测不出来**不是反面证据** —— 不得据此把
+                        # 一个已验证的窗口降级，更不得中止整个 run 把已经采到的帧作废。
+                        if skip_warmup_entirely:
+                            bias_converged = True
+                            last_failure_reason = None
+                            print(
+                                f"    [复验未能测出] 窗口 {window_idx} 是 resume 前就已经"
+                                f"通过验证的窗口（bias_status=converged）。本次复验在 "
+                                f"{_n_now} 批 / {validation_sample_count} frames 下仍然 "
+                                f"{gate_error}（g="
+                                f"{gate_mbar.get('statistical_inefficiency')}）：**没测出来，"
+                                "不是测出来不合格**。保持原有 f_k 与已验证结论进生产，"
+                                "burn-in 已完成、不是零平衡。真实 ESS/误差/自由能仍交生产后 "
+                                "MBAR 与 _assert_stage_result_sane 把关。"
+                            )
+                            break
+                        validation_indeterminate_diag = {
+                            "reason": "validation_budget_exhausted_indeterminate",
+                            "n_batches": int(_n_now),
+                            "max_batches": int(IBS_LOCAL_MBAR_GATE_MAX_BATCHES),
+                            "validation_sample_count": int(validation_sample_count),
+                            "insufficient_attempts": int(validation_insufficient_attempts),
+                            "last_gate_error": str(gate_error),
+                            "statistical_inefficiency": gate_mbar.get(
+                                "statistical_inefficiency"
+                            ),
+                            # 可达性预检要的是**多个检查点**，不是单点：单点在小样本
+                            # 下会误杀。嵌套样本（400 帧含 200 帧）不满足 bootstrap
+                            # 的独立性前提，所以下界取最小值而不是 bootstrap。
+                            "validation_g_history": [
+                                float(x) for x in validation_g_history
+                            ],
+                            # 🔑 T = 触发 `insufficient_frames_after_decorrelation`
+                            # 的那个下限，也就是 `_solve_single_window_local_mbar`
+                            # 的 `min_frames`（默认 10）。
+                            # ⚠️ **不是** `minimum_complete_validation_frames`（200）——
+                            # 那管的是"这次 attempt 攒够**原始**帧没有"，是完整性
+                            # 要求，跟去相关下限是两回事。混掉会把 gcrit 算小 20 倍，
+                            # 把一个只差 26% 帧数的窗口判成"差 7.5 倍不可达"。
+                            "decorrelated_frames_required": int(
+                                IBS_LOCAL_MBAR_GATE_MIN_FRAMES
+                            ),
+                            "n_frames_used": int(_gate_n_used),
+                            "steps_at_full_bias": int(steps_at_full_bias),
+                            "frozen_f_k_kJ_mol": [float(x) for x in f_frozen_now],
+                        }
+                        print(
+                            f"    [无法判定] 单周期验证预算用尽（{_n_now}/"
+                            f"{IBS_LOCAL_MBAR_GATE_MAX_BATCHES} 批、"
+                            f"{validation_sample_count} frames）仍然 {gate_error}："
+                            "Δf−ΔF 从未被求出，对这份 f_k **无结论**。不改 f_k、"
+                            "不退回 SGD、不插 λ；冻结状态与数据保留，交上层决定是否"
+                            "延长预算。"
+                        )
+                        break
+                    validation_solve_at_batches = min(
+                        IBS_LOCAL_MBAR_GATE_MAX_BATCHES,
+                        _n_now + IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES,
+                    )
+                    print(
+                        f"    ⏸ 验证数据不足（{gate_error}，{_n_now} 批 / "
+                        f"{validation_sample_count} frames，g="
+                        f"{gate_mbar.get('statistical_inefficiency')}）："
+                        "**没测出来 ≠ f_k 错了**。保持冻结 f_k 与已有批次继续累计到 "
+                        f"{validation_solve_at_batches} 批再解一次（单周期上限 "
+                        f"{IBS_LOCAL_MBAR_GATE_MAX_BATCHES} 批，另受 warmup 总步数封顶）。"
+                    )
+                    continue
+
+                # 未过（gap≥阈值，或 MBAR 解出 NaN）。abs_ess/占据只在现场里打印，
                 # 不参与判定——gate_ok 的定义完全不变。
                 learning_to_validation_cycles += 1
                 if gate_error is None:
@@ -15139,6 +16516,9 @@ class IBSWindowManagerDualLambda:
                 updates_since_freeze = 0
                 freeze_burn_in_done = 0
                 frozen_mbar_batches = []
+                validation_solve_at_batches = IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES
+                validation_insufficient_attempts = 0
+                validation_g_history = []
                 sampler._last_dominant_k = None
                 sampler.ema_mean_p = None
                 sampler.energy_buffer = []
@@ -15476,7 +16856,7 @@ class IBSWindowManagerDualLambda:
             if (
                 legacy_repair
                 and not bias_converged
-                and not resumed_calibration_pending
+                and not resume_frozen_validation
                 and K <= 4
                 and stage_type == "vdw"
             ):
@@ -15545,7 +16925,7 @@ class IBSWindowManagerDualLambda:
 
             if (
                 not bias_converged
-                and not resumed_calibration_pending
+                and not resume_frozen_validation
                 and overlap_probe.get("all_passed")
                 and asymmetric_bottleneck is None
             ):
@@ -15611,8 +16991,9 @@ class IBSWindowManagerDualLambda:
                     # 起如果调用方通过 frozen_validation_step_overrides 给这个窗口
                     # 累计延长过预算（上一轮校准好但验证未通过），这里用那个更大的值。
                     while calibration_steps_used < int(effective_frozen_validation_budget):
-                        sim.step(check_chunk)
+                        guarded_step(sim, check_chunk, f"窗口 {window_idx} 冻结验证", on_error=_nan_diagnostics)
                         steps_at_full_bias += check_chunk
+                        _attempt_ledger["frozen_validation_steps"] += check_chunk
                         calibration_steps_used += check_chunk
                         sampler.collect_energies()
                         if calibration_burn_in_done < frozen_burn_in_steps:
@@ -15721,6 +17102,121 @@ class IBSWindowManagerDualLambda:
                             "问题，需要人工检查，不再自动重试。"
                         )
 
+            # 🔑 [2026-09-11] 累计上限已经用完、这次一步都没跑，而候选的证据状态仍是
+            # "无法判定"：结局必须还是无法判定。否则会掉进下面的普通未收敛分支，被
+            # 报成 f_not_converged —— 那是"测出来了 f_k 不对"的语义，还会触发插 λ。
+            # 🔑 [2026-09-11 二修] 原来这道守卫只认两种情形：(a) 攒满
+            # MAX_BATCHES 仍不足（在循环里判），(b) resume 时剩余预算已为 0 且
+            # 证据状态已是 indeterminate。漏掉了最常见的第三种：**正在分档累计的
+            # 途中，步数预算先耗尽**。实测 window 2 段2：gate 跑了 2 次、两次都是
+            # insufficient_frames_after_decorrelation（从没测出过数），攒到 10 批时
+            # 180000/180000 步用光，于是掉进普通未收敛分支、被写成 f_not_converged
+            # 抛 IBSWarmupConvergenceError —— 正是"没测出来"被改写成"f_k 错了"。
+            # 判据：本周期进过累计模式(validation_insufficient_attempts>0) 且
+            # 从未解出过一次 Δf−ΔF(ever_completed_a_validate_attempt False)。
+            _never_measured = bool(
+                validation_insufficient_attempts > 0
+                and not ever_completed_a_validate_attempt
+            )
+            # 🔑 [2026-09-11 三修] 第三个变体：**可用预算为 0 ⟹ 循环一次都没进**。
+            # 实测 win2 连死三次，最后一次 steps_at_full_bias=0、gate history 空，
+            # 却被标成 f_not_converged。这既不是"f_k 不收敛"也不是"测了没测出来"——
+            # 是**根本没开始**。老板定案：这类走 HALT_BUDGET + INSUFFICIENT_DATA。
+            # 跟上面两个变体的区别：这里 frozen_f_k_snapshot 可能是 None（还没冻结过
+            # 任何候选），所以不能挂在"必须有候选"那个前提下。
+            _no_budget_at_all = bool(
+                steps_at_full_bias == 0
+                and full_bias_step_budget <= 0
+                and not ever_completed_a_validate_attempt
+            )
+            if (
+                not bias_converged
+                and validation_indeterminate_diag is None
+                and (
+                    _never_measured
+                    or _no_budget_at_all
+                    or (
+                        full_bias_step_budget <= 0
+                        and getattr(sampler, "f_k_evidence_status", F_K_EVIDENCE_NONE)
+                        == F_K_EVIDENCE_INDETERMINATE
+                    )
+                )
+                and (frozen_f_k_snapshot is not None or _no_budget_at_all)
+            ):
+                validation_indeterminate_diag = {
+                    "reason": "validation_budget_exhausted_indeterminate",
+                    "n_batches": int(
+                        getattr(sampler, "frozen_validation_batches_done", 0)
+                    ),
+                    "max_batches": int(IBS_LOCAL_MBAR_GATE_MAX_BATCHES),
+                    "validation_sample_count": 0,
+                    "insufficient_attempts": 0,
+                    "last_gate_error": "no_budget_remaining_on_resume",
+                    "statistical_inefficiency": None,
+                    "n_frames_used": 0,
+                    "steps_at_full_bias": 0,
+                    "frozen_f_k_kJ_mol": (
+                        [float(x) for x in frozen_f_k_snapshot]
+                        if frozen_f_k_snapshot is not None else None
+                    ),
+                    "never_measured_mid_accumulation": bool(_never_measured),
+                    # HALT_BUDGET：可用预算为 0，连一步动力学都没跑
+                    "halt_budget_no_steps_available": bool(_no_budget_at_all),
+                    "cumulative_cap_steps": int(
+                        _ledger.get("cumulative_cap_steps", 0) or 0
+                    ),
+                    "cumulative_consumed_steps": warmup_ledger_total_steps(_ledger),
+                    "n_batches_when_budget_ran_out": int(len(frozen_mbar_batches)),
+                }
+                print(
+                    f"  [无法判定] 窗口 {window_idx} 累计预算已用尽"
+                    f"（上限 {_ledger.get('cumulative_cap_steps')}、已耗 "
+                    f"{warmup_ledger_total_steps(_ledger)}），本次可用 0 步。"
+                    "候选仍未被测量，保持无法判定；要继续必须显式升档。"
+                )
+
+            # 🔑 [2026-09-11，实验开关] 重标定 f_k 不再被 loose gate 拦住。
+            # 见 accept_recalibrated_f_k_without_gate 的参数注释。门已经在上面跑过
+            # 并记进 local_mbar_gate_history / validation_indeterminate_diag，这里
+            # 只是不让它阻断。
+            if (
+                not bias_converged
+                and accept_recalibrated_f_k_without_gate
+                and getattr(sampler, "seed_source", None) == "production_recalibration"
+                and steps_at_full_bias > 0      # 绝不零平衡进生产
+            ):
+                bias_converged = True
+                best_effort_acceptance = True
+                best_effort_acceptance_reason = (
+                    "recalibrated_f_k_accepted_without_gate"
+                )
+                validation_indeterminate_diag = None
+                last_failure_reason = None
+                _gate_note = (
+                    last_local_mbar_gate.get("error")
+                    or last_local_mbar_gate.get("max_adjacent_delta_kJ_mol")
+                    if last_local_mbar_gate else "门从未评估"
+                )
+                print(
+                    f"  [重标定 f_k 直放] 窗口 {window_idx}：这份 f_k 由生产帧重标定"
+                    f"而来，按实验开关不再被 loose gate 拦住（门的结果仍已记录："
+                    f"{_gate_note}）。已完成 {steps_at_full_bias} 步冻结动力学，"
+                    "不是零平衡进生产。真实 ESS/误差/自由能交生产后 MBAR 与 "
+                    "_assert_stage_result_sane 把关。"
+                )
+
+            # 🔑 [2026-09-11] 所有耗步的循环都结束了，把本次分项消耗并进持久账本。
+            # 必须在任何 save_ibs_state 之前，且只并一次（下面三条退出路径共用）。
+            for _bucket in WARMUP_LEDGER_BUCKETS:
+                _ledger[_bucket] = int(_ledger.get(_bucket, 0) or 0) + int(
+                    _attempt_ledger[_bucket]
+                )
+            sampler.warmup_budget_ledger = _ledger
+            bias_warmup_diag["warmup_budget_ledger"] = dict(_ledger)
+            bias_warmup_diag["warmup_budget_remaining_steps"] = (
+                warmup_ledger_remaining_steps(_ledger)
+            )
+
             if bias_converged:
                 # [IBS_BIAS_PROTOCOL_VERSION=29] 收敛报告改用 local-MBAR loose gate
                 # 的相邻态残差（max|Δf_k−ΔF^MBAR|），不再打印已移除的占据 LSE 残差。
@@ -15754,6 +17250,7 @@ class IBSWindowManagerDualLambda:
                     )
                 sampler.bias_converged = True
                 sampler.bias_status = "converged"
+                sampler.f_k_evidence_status = F_K_EVIDENCE_VERIFIED
                 sampler.frozen_f_k_pending = None
                 sampler.last_failure_reason = None
                 sampler.save_ibs_state(
@@ -15786,6 +17283,60 @@ class IBSWindowManagerDualLambda:
                     self.output_dir,
                     f"dual_window_{window_idx}_{stage_type}_warmup_failure.json",
                 )
+                if validation_indeterminate_diag is not None:
+                    # 🔑 [2026-09-11] 第四类结局：**无法判定**。冻结验证一直样本不足，
+                    # Δf−ΔF 从未被求出来。这既不是"f_k 收敛"也不是"f_k 不对"——
+                    # 不得据此插 λ / 拆窗 / 退回 SGD（那只是把误判推迟 10 万步），
+                    # 所以走一个独立异常，路径演化循环故意不捕获它。
+                    # 冻结 f_k、已累计批数、已耗步数全部落盘，resume 接着验。
+                    bias_warmup_diag["status"] = "validation_budget_exhausted_indeterminate"
+                    bias_warmup_diag["validation_indeterminate"] = (
+                        validation_indeterminate_diag
+                    )
+                    sampler.bias_status = "frozen_validation_indeterminate"
+                    # 无法判定 ≠ 已校准。恢复冻结验证是为了把测量做完，不是认可候选。
+                    sampler.f_k_evidence_status = F_K_EVIDENCE_INDETERMINATE
+                    # HALT_BUDGET 那一支可能连一个冻结候选都没有（循环没进过），
+                    # 此时不要伪造一份 f_k_pending —— 没有候选就是没有。
+                    _pending_fk = validation_indeterminate_diag.get("frozen_f_k_kJ_mol")
+                    sampler.frozen_f_k_pending = (
+                        [float(x) for x in _pending_fk] if _pending_fk else None
+                    )
+                    sampler.frozen_validation_batches_done = int(
+                        validation_indeterminate_diag["n_batches"]
+                    )
+                    sampler.frozen_candidate_fingerprint = frozen_candidate_fingerprint(
+                        sampler.frozen_f_k_pending
+                    )
+                    sampler.frozen_validation_cumulative_steps = int(
+                        prior_cumulative_steps + steps_at_full_bias
+                    )
+                    sampler.last_failure_reason = (
+                        "halt_budget_no_steps_available"
+                        if validation_indeterminate_diag.get(
+                            "halt_budget_no_steps_available")
+                        else "validation_budget_exhausted_indeterminate"
+                    )
+                    sampler.bias_converged = False
+                    _atomic_write_json(failure_path, bias_warmup_diag)
+                    sampler.save_ibs_state(
+                        ibs_state_file, lc_win, lv_win, stage_type=stage_type
+                    )
+                    _atomic_save_openmm_checkpoint(sim, main_ckpt_path)
+                    _atomic_write_json(main_manifest_path, expected_main_manifest)
+                    raise IBSValidationBudgetIndeterminateError(
+                        f"窗口 {window_idx} 的冻结验证在单周期 "
+                        f"{validation_indeterminate_diag['n_batches']}/"
+                        f"{IBS_LOCAL_MBAR_GATE_MAX_BATCHES} 批（"
+                        f"{validation_indeterminate_diag['validation_sample_count']} frames、"
+                        f"{validation_indeterminate_diag['steps_at_full_bias']} 步）内始终 "
+                        f"{validation_indeterminate_diag['last_gate_error']}："
+                        "Δf−ΔF 从未被求出，对这份 f_k **无结论**（既非收敛也非不收敛）。"
+                        "不改 f_k、不退回 SGD、不插 λ。冻结状态/批次/已耗预算已落盘，"
+                        f"resume 会接着验；完整诊断在 {failure_path}。"
+                        "要继续请延长该窗口的冻结验证预算，或先处理相关时间过长的根因。",
+                        diagnostics=bias_warmup_diag,
+                    )
                 # 🔑 [IBS_BIAS_PROTOCOL_VERSION=12] 区分两种不同的"未收敛"：
                 # (a) 这次（或之前 resume 续验的那次）已经用 MBAR 校准探针给出过
                 #     一份 fixed-H overlap 证实过 λ 网格没问题、且校准探针自身
@@ -15851,11 +17402,13 @@ class IBSWindowManagerDualLambda:
                         # 绝不能存成 calibrated_pending_validation（那会让下次
                         # resume 看起来还能继续自动续验），frozen_f_k_pending 清空。
                         sampler.bias_status = "calibrated_validation_failed"
+                        sampler.f_k_evidence_status = F_K_EVIDENCE_REFUTED
                         sampler.frozen_f_k_pending = None
                         bias_warmup_diag["calibration_pending_validation"] = False
                         bias_warmup_diag["calibration_validation_terminally_failed"] = True
                     else:
                         sampler.bias_status = "calibrated_pending_validation"
+                        sampler.f_k_evidence_status = F_K_EVIDENCE_CALIBRATED
                         sampler.frozen_f_k_pending = [float(x) for x in pending_f_k]
                         bias_warmup_diag["calibration_pending_validation"] = True
                         bias_warmup_diag["frozen_f_k_kJ_mol"] = list(sampler.frozen_f_k_pending)
@@ -15890,8 +17443,10 @@ class IBSWindowManagerDualLambda:
                         "local_mbar_gap_exceeded_after_retry",
                     ):
                         sampler.bias_status = "failed"
+                        sampler.f_k_evidence_status = F_K_EVIDENCE_REFUTED
                     else:
                         sampler.bias_status = "unconverged"
+                        sampler.f_k_evidence_status = F_K_EVIDENCE_NONE
                     sampler.frozen_f_k_pending = None
                     sampler.frozen_validation_cumulative_steps = 0
                 sampler.last_failure_reason = last_failure_reason
@@ -15917,13 +17472,36 @@ class IBSWindowManagerDualLambda:
                     "    reported mean_p[k]（若进入验证则为固定 f_k 累计均值；"
                     f"否则为 raw EMA 诊断）= {ema_mean_p_values}"
                 )
-                _tmbar_diag = sampler.last_update_diagnostics.get("tmbar_update", {})
+                # 🔑 [2026-09-10] 这里原来打的是
+                #   `TMBAR: n_entries=…, converged=…, min_overlap=…, min_absolute_ess=…`
+                # 后三个字段读的是 `last_update_diagnostics["tmbar_update"]`，
+                # 而它的**唯一**写入方是 `IBSSampler.update_weights()` —— 该方法自
+                # Candidate-first / Validate-or-Learn v1 起已**零调用点**。于是这三项
+                # 在生产日志里永远打印 `None`（`min_overlap`/`min_absolute_ess` 更是
+                # 连写入方都没写过这两个键，双重死）。
+                #
+                # 这不是无害的噪声：2026-09-09 那批失败 run 的日志里满屏
+                # `converged=None`，读的人（包括排查的人）会据此认为"收敛判据坏了、
+                # 门永远判不过"，而真实情况是占据塌陷、门根本没轮到上场。
+                # 只打真正活着的两项：TMBAR 历史条数，和**真正决定放行的**
+                # local-MBAR loose gate。
                 print(
-                    f"    TMBAR: n_entries={len(sampler.tmbar_history)}, "
-                    f"converged={_tmbar_diag.get('converged')}, "
-                    f"min_overlap={_tmbar_diag.get('min_overlap')}, "
-                    f"min_absolute_ess={_tmbar_diag.get('min_absolute_ess')}"
+                    f"    TMBAR 历史条数 n_entries={len(sampler.tmbar_history)}"
+                    "（仅计数，不参与任何判据）"
                 )
+                if last_local_mbar_gate is not None:
+                    print(
+                        "    放行判据 local-MBAR loose gate: "
+                        f"max_adjacent_delta="
+                        f"{last_local_mbar_gate.get('max_adjacent_delta_kJ_mol')} kJ/mol, "
+                        f"situation={last_local_mbar_gate.get('situation')}"
+                    )
+                else:
+                    print(
+                        "    放行判据 local-MBAR loose gate: 从未被评估过 —— "
+                        "说明失败发生在更前面（占据从未平坦到可冻结，或刚冻结即被"
+                        "早退探针判定塌陷退回），不是这道门判否的。"
+                    )
                 _weight_diag = sampler.last_update_diagnostics.get("weight_update", {})
                 if _weight_diag:
                     print(
@@ -16036,8 +17614,18 @@ class IBSWindowManagerDualLambda:
                     sampler._probe_integrator = None
                 del sampler
                 del sim.context
-                del sim
-                del win_sys
+                # 这里不用 `del sim`：嵌套的 `_chunk_is_finite()` 闭包引用 sim，而 ruff 的
+                # 延迟作用域模型看到的是外层结束时 sim 已被 del ⟹ 报 F821。那是误报
+                # （两处 del 都在紧跟 continue / 循环结束的清理路径上，闭包早已用完），
+                # 但 CI 的 ruff 门会因此变红。`= None` 的引用计数效果与 del 相同。
+                sim = None
+                # 🔑 [2026-09-10] 与正常收尾路径同一处修复，理由见那里的长注释：
+                # 释放 System 之前先断掉 `ibs_wrap.force` 与 `_nan_diagnostics`
+                # 闭包这两条指向它内部 Force 的引用，否则代理会悬垂到下一个窗口，
+                # 而且 System 根本不在这里析构。
+                ibs_wrap = None
+                _nan_diagnostics = None
+                win_sys = None
                 gc.collect()
                 continue
 
@@ -16089,7 +17677,9 @@ class IBSWindowManagerDualLambda:
             production_frozen_f_k = [
                 float(sim.context.getParameter(f"{self.prefix}_f_{k}")) for k in range(len(lc_win))
             ]
-            win_sys_xml_for_prod_ckpt = openmm.XmlSerializer.serialize(win_sys)
+            # 复用窗口开头算好的那份（见那里的说明）：同一个 win_sys，中间未被修改，
+            # 字节逐字相同。原来这里再序列化一次，SEGV 就落在这一调用上。
+            win_sys_xml_for_prod_ckpt = win_sys_xml
             expected_production_manifest = _build_production_window_checkpoint_manifest(
                 stage_type, window_idx, len(lc_win), win_sys_xml_for_prod_ckpt, lc_win, lv_win,
                 (float(np.mean(lv_win)) if _system_has_global_parameter(win_sys, "lambda_shield") else None),
@@ -17115,6 +18705,114 @@ class IBSWindowManagerDualLambda:
             # _invalidate_production_window_checkpoint 的调用点）。
             _atomic_save_openmm_checkpoint(sim, production_ckpt_path)
             _atomic_write_json(production_manifest_path, expected_production_manifest)
+
+            # 🔑 [2026-09-11 / PLAN P2-9c] **每个窗口跑完就判一次它自己够不够。**
+            # 老板原话："每个窗口跑完就判一次，这不是更早判定吗"。
+            # 实测浪费：5×250k=125 万步全部烧完才做第一次预算判断，然后五个一起
+            # 翻倍重来 —— 而判据（该窗口去相关后剩几帧）在它刚跑完这一刻就算得出来。
+            # **只判不动手**：落盘 + 打印，不改 production_step_overrides、
+            # 不碰 converged / rescue 的任何既有判据。
+            try:
+                _self = window_self_support_check(
+                    self.output_dir, stage_type, window_idx, self.kt,
+                )
+                if _self is None:
+                    print(
+                        f"  [自检] 窗口 {window_idx} 的支撑自检不可用"
+                        "（产物缺失或形状不符），跳过；不影响采样。"
+                    )
+                else:
+                    _atomic_write_json(
+                        window_self_support_path(
+                            self.output_dir, stage_type, window_idx
+                        ),
+                        _self,
+                    )
+                    # ⚠️ **两个判据不许拼进同一句。** 原来 `_mark`（来自
+                    # `sufficient = verdict == ANALYSIS_ELIGIBLE`，是**支撑度**判据）
+                    # 被接在"去相关帧数 vs 门槛"后面，于是真机印出
+                    # 「去相关后 21/1000 帧（门槛 10）⟹ **不够**」—— 21 ≥ 10，
+                    # 去相关这一关明明过了。把病因指错的后果是实打实的：
+                    # 读的人去加帧，而真正不达标的是 min N_eff/g，加帧只会更糟
+                    # （实测 win4 500→1000 帧，min N_eff/g 3.44→2.29、g 15.1→49.2）。
+                    _dec_ok = (
+                        int(_self["n_frames_decorrelated"])
+                        >= int(_self["min_frames_per_window"])
+                    )
+                    print(
+                        f"  [自检] 窗口 {window_idx} 求解器资格："
+                        f"去相关后 {_self['n_frames_decorrelated']}"
+                        f"/{_self['n_frames_total']} 帧 vs 下限 "
+                        f"{_self['min_frames_per_window']} ⟹ "
+                        f"{'够' if _dec_ok else '**不够**'}；"
+                        f"g={_self['statistical_inefficiency']}"
+                    )
+                    print(
+                        f"  [自检] 窗口 {window_idx} **验收量** min N_eff/g="
+                        f"{_self.get('min_n_eff_over_g')}（门 10）"
+                        f" 最差态 local={_self['worst_target_state_local']}"
+                        f" λ={_self['worst_target_lambda_vdw']}"
+                        f" | verdict={_self['verdict']}"
+                    )
+                    if not _self["sufficient"]:
+                        _short = _self.get("frames_short_by")
+                        _why = (
+                            f"去相关帧数还差 {_short} 帧"
+                            if _short else
+                            "**不是帧数不够**（去相关下限已达标）——"
+                            "差的是目标态的有效样本 min N_eff/g。"
+                            "同分布加帧治不了偏斜：对症动作是换 f_k（重加权）"
+                            "或缩窗跨度（插 λ），不是更多帧"
+                        )
+                        print(
+                            f"  [自检] ⚠️ 窗口 {window_idx}：{_why}。"
+                            "INSUFFICIENT_DATA ≠ FAIL：这是「还没测够」，不是「不合格」。"
+                            "本检查只判不动手。"
+                        )
+            except Exception as _self_err:  # noqa: BLE001 —— 诊断不得中断采样
+                print(f"  [自检] 计算失败（不影响采样）：{_self_err!r}")
+
+            # 🔑 [2026-09-11 / PLAN P2-9a] **join λ 两侧支撑：自动做掉。**
+            # 老板的原话是"我要的是 win0、win1、**win0+win1 验证** —— 自动的"。
+            # 前两个本来就自动（各自的 loose gate），第三个此前完全不存在 ——
+            # 那些 join 数字一直是人手算的。
+            #
+            # 触发点定在这里：本窗口的产物（energies/bias/sampling_states/
+            # convergence + manifest）**全部持久化之后**，与**前一个**窗口比一次。
+            # 只比两边共享的那一个 λ，滑动相邻对、不做累积前缀（§3bis.3）。
+            #
+            # 只报告、不设门、失败不中断采样 —— 它是证据不是裁决。
+            if window_idx > 0:
+                try:
+                    _join = join_lambda_two_sided_support(
+                        self.output_dir, stage_type,
+                        window_idx - 1, window_idx, self.kt,
+                    )
+                    if _join is None:
+                        print(
+                            f"  [join λ] 窗口 {window_idx-1}↔{window_idx} 暂不可比"
+                            "（上游产物缺失或两窗不共享 λ），跳过；不影响采样。"
+                        )
+                    else:
+                        _atomic_write_json(
+                            join_support_path(
+                                self.output_dir, stage_type, window_idx - 1, window_idx
+                            ),
+                            _join,
+                        )
+                        _u, _d = _join["upstream"], _join["downstream"]
+                        print(
+                            f"  [join λ={_join['join_lambda_vdw']:.4f}] "
+                            f"上游 win{window_idx-1}: rawESS={_u['raw_ess']}"
+                            f"/{_u['n_finite']} g={_u['tau_int']}"
+                            f" | 下游 win{window_idx}: rawESS={_d['raw_ess']}"
+                            f"/{_d['n_finite']} g={_d['tau_int']}"
+                            f" | 下游/上游={_join['downstream_over_upstream_raw_ess']}"
+                            f"（{_join['asymmetry_direction']}，口径 {_join['gauge']}）"
+                            " —— 只报告，不参与放行。"
+                        )
+                except Exception as _join_err:  # noqa: BLE001 —— 诊断不得中断采样
+                    print(f"  [join λ] 计算失败（不影响采样）：{_join_err!r}")
             # 🔑 [2026-08-27，见 docs/experiments/EXP-030_FROZEN_SNAPSHOT_TIMING_BUG_2026-08-26.md
             # 补验收] 生产结束时必须再存一次 IBS JSON：这是下游冻结检查唯一会
             # 读取的文件（见 exp030_window_state_machine.py 的 state_path），
@@ -17139,8 +18837,31 @@ class IBSWindowManagerDualLambda:
                 sampler._probe_integrator = None
             del sampler
             del sim.context
-            del sim
-            del win_sys
+            sim = None  # 同 warmup_only 分支：不用 del，理由见那里的注释
+            # 🔑 [2026-09-10] 释放 System **之前**必须先断掉所有指向它内部 Force 的
+            # Python 代理，否则那些代理会悬垂到下一个窗口。
+            #
+            # 原来这里只有 `win_sys = None`，漏了两样：
+            #
+            #   1. `ibs_wrap` 持有 `self.force` —— 那个 `CustomCVForce` 是
+            #      `new_sys.addForce()` 进去的，所有权归 C++ System。System 一析构，
+            #      它的 Force 全被删掉，而 `ibs_wrap.force` 这个 SWIG 代理还指着
+            #      已释放的内存。`ibs_wrap` 要到下一轮循环开头
+            #      `win_sys, ibs_wrap = self._build_window_system(...)` 才被重新绑定，
+            #      也就是说它**带着悬垂代理活过了整个窗口切换**。
+            #   2. `_nan_diagnostics` 闭包同样引用 `win_sys`（上一行注释自己写了
+            #      这句，却只是因此改用 `= None` 而没有解开引用）。所以
+            #      `win_sys = None` 在这里**什么都没释放**：System 一直活到下一个
+            #      窗口重新定义那个闭包时才真正析构 —— 正好落在窗口 1 建系/序列化
+            #      的当口，而彼时上面那个悬垂代理还在。
+            #
+            # 2026-09-10 的 SEGV 时序与此逐段吻合：窗口 0 完整跑完 → 收尾（并未真的
+            # 释放）→ 窗口 1 一开始建系就死在 `XmlSerializer.serialize`。
+            #
+            # 顺序不能换：先断代理（ibs_wrap / 闭包），最后才是 System 本身。
+            ibs_wrap = None
+            _nan_diagnostics = None
+            win_sys = None
             gc.collect()
 
         print(f"\n{'='*80}")
@@ -17171,7 +18892,7 @@ class IBSWindowManagerDualLambda:
         original_dt = sim.integrator.getStepSize()
         for dt_ps in [0.0005, 0.001, 0.002]:
             sim.integrator.setStepSize(dt_ps * unit.picoseconds)
-            sim.step(5000)
+            guarded_step(sim, 5000, f"dt 扫描 {dt_ps} ps")
 
             if debug_mode:
                 state = sim.context.getState(getEnergy=True, getForces=True, getPositions=True)
@@ -17227,7 +18948,7 @@ class IBSWindowManagerDualLambda:
 
         for s in scales:
             sim.context.setParameter("lambda_boresch_scale", float(s))
-            sim.step(n_steps)
+            guarded_step(sim, n_steps, f"Boresch scale 扫描 s={s}")
 
             state = sim.context.getState(getEnergy=True)
             e = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
@@ -17320,9 +19041,13 @@ class IBSWindowManagerShadowCoul(IBSWindowManagerDualLambda):
         self.lambdas_shadow_coul = self.lambdas_coul
 
     def _build_window_system(self, lc_win, lv_win, resolved_box, positions):
-        win_sys_xml = XmlSerializer.serialize(self.system_template)
+        # 🔑 [2026-09-10] serialize→deserialize 往返 → clone()。
+        # 这是 2026-09-09 那批迁移漏掉的一半。clone() 走 SerializationNode，
+        # 不生成中间字符串；原写法每个窗口都要在堆上开一份多兆字节的 str
+        # （大体系上是几十 MB），紧接着就是 build_ibs_dual_system 里
+        # 30k 原子 × getParticleParameters 的分配风暴。
         return build_shadow_coul_ibs_system(
-            ensure_owned_system(XmlSerializer.deserialize(win_sys_xml)),
+            ensure_owned_system(XmlSerializer.clone(self.system_template)),
             self.topology,
             self.ligand_indices,
             lc_win,
@@ -17621,7 +19346,7 @@ PROBE_MAX_LAMBDA_STATES = OPENMM_MAX_FORCE_GROUP - PROBE_FORCE_GROUP_BASE + 1  #
 # 都会说"完美"，却错得最多——因为失效模式是结构性的（"该采的构型一次都没采到"），
 # 不是"采到的构型之间散布不够"。这个教训与幅度无关，仍然成立。
 #
-# ⚠️ [2026-09-02 更正两点]（见 docs/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md）
+# ⚠️ [2026-09-02 更正两点]（见 docs/archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md）
 #   1. 原文把该窗口的错量写成 +19.49 kJ/mol 并当作单系综重加权的定量依据。
 #      那是**壳还在时**测的：该误差的 98% 已定罪为 λ-WCA 防护壳。
 #   2. 原文列的第三条修法"把 lambda_WCA 变成显式热力学维度并让 lambda_WCA=0
@@ -17782,7 +19507,7 @@ def _ibs_reweighting_quality_diagnostics(
     # Pearson r = 0.9836、Spearman = 1.0000 —— 所以这不是拟合出来的巧合，
     # 是 λ 缩放不匹配的直接后果。根因与正解见
     # `ibs_engine.py` 约 10978-11020 行的长注释（生产动力学不得保留 Group-4）
-    # 与 docs/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md §2.8。
+    # 与 docs/archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md §2.8。
     #
     # ⚠️ **刻意不设门。** 阈值该定在哪没有实测依据（只有 6 个窗口、一个体系），
     # 而本项目的历史教训是"把一个只在某些假设下成立的度量提成硬门"会反复咬人
@@ -17862,12 +19587,552 @@ def _ibs_reweighting_quality_diagnostics(
     return out
 
 
+WINDOW_SELF_SUPPORT_PROTOCOL_VERSION = 1
+
+
+def window_self_support_path(output_dir: str, stage_type: str, idx: int) -> str:
+    return os.path.join(
+        output_dir, f"dual_window_{int(idx)}_{stage_type}_self_support.json"
+    )
+
+
+def window_self_support_check(
+    output_dir: str,
+    stage_type: str,
+    window_idx: int,
+    kt: float,
+    *,
+    min_frames_per_window: int = 10,
+) -> Optional[Dict[str, Any]]:
+    """窗口**自己**的支撑够不够 —— 在它刚跑完那一刻就判，不等全部窗口跑完。
+
+    设计依据：``docs/PLAN_PATH_REPAIR_2026-09-11.md`` P2-9c。
+    老板原话：「每个窗口跑完就判一次，这不是更早判定吗」。
+
+    **为什么值得做** —— 实测浪费（cyclod_ligand2/rep1 的 launch.log 顺序）::
+
+        [窗口 4] ... 生产采样 (250000 步)
+        [OK] 所有窗口采样完成                  ← 5×250k = 125 万步全部烧完
+          [WARN] 窗口 4 去相关后 7 帧 < 10，跳过
+          [WARN] 窗口 3 ... 5 帧，跳过
+          [WARN] 窗口 2 ... 5 帧，跳过
+          rescue round 1/2: 仅追加窗口 [0,1,2,3,4] → 全部 500000
+
+    判断依据（该窗口去相关后剩几帧）在**它自己刚跑完那一刻**就算得出来，不需要
+    任何别的窗口。win0 在第 4、第 5 个窗口跑的时候，它自己那份数据早就确定不够了，
+    只是没有任何东西去看。
+
+    **与事后判定逐字同量**，否则"提前判"和"事后判"会给不同答案：
+      · 数组用 ``energies.npy``（分析器 `load_ibs_window_outputs_from_dir` 读的就是它，
+        作为 ``u_kj_raw``），**不是** ``sampling_states.npy``。g 本身对逐态常数不变，
+        但口径要跟判跳过的那一处对齐、可审计。
+      · 分段用 ``convergence.json`` 的 ``production_segments``（分析器
+        ``_decorr_segments = w.get("production_segments")``）。
+      · 门槛默认 10 = ``solve_stage_integrated`` 的 ``min_frames_per_window``。
+
+    **只判不动手。** 结果只落盘 + 打印，**不**改 ``production_step_overrides``、
+    **不**碰 ``converged`` 或 rescue 的任何既有判据。把预算加给谁是 `decide()` 的活，
+    而 `decide()` 还不存在；在钩子里塞一条会自己改预算的旁路只会让归因更难。
+
+    **"帧数不足"不是终态**（老板更正：``剩 6 帧 → 整窗丢掉`` ✗、``剩 6 帧 → +250k`` ✓）。
+    所以 verdict 用 ``INSUFFICIENT_DATA``（≠ ``FAIL``：样本不够是"还没测够"，
+    不是"测出来不合格"）。补多少是待定口径（加法一个 ``n_steps_per_window`` 基础单位
+    vs 现在 rescue 的 ``growth=2.0`` 乘法，PLAN P3-9f），本函数**不给数字**。
+
+    读不到文件等情况返回 None —— 这是诊断，不许因此中断采样。
+    """
+    conv_path = os.path.join(
+        output_dir, f"dual_window_{int(window_idx)}_{stage_type}_convergence.json"
+    )
+    try:
+        with open(conv_path, "r", encoding="utf-8") as fh:
+            conv = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    try:
+        u = np.asarray(np.load(os.path.join(
+            output_dir, f"dual_window_{int(window_idx)}_{stage_type}_energies.npy"
+        )), dtype=np.float64)
+        bias = np.asarray(np.load(os.path.join(
+            output_dir, f"dual_window_{int(window_idx)}_{stage_type}_bias.npy"
+        )), dtype=np.float64).ravel()
+    except (OSError, ValueError):
+        return None
+    if u.ndim != 2 or u.shape[1] != bias.size:
+        return None
+
+    segments = conv.get("production_segments") or None
+    seg_diag: List[Dict[str, Any]] = []
+    g_per_state: List[float] = []
+    try:
+        sub_idx, g_val, g_worst = _decorrelate_by_worst_target_state(
+            u, bias, float(kt), segments=segments,
+            segment_diagnostics=seg_diag, per_state_g_out=g_per_state,
+        )
+    except Exception:
+        return None
+
+    # 🔑 [2026-09-11 / 老板方法论定位] **验收量是 `N_eff,k / g_k`，不是 occupancy。**
+    #
+    # 能不能恢复 p_k，问的是 ``w_kn ∝ e^{-βU_k(x_n)} / q_IBS(x_n)`` 有没有足够
+    # support，**不是 IBS mixture 内部的 component occupancy 漂不漂亮**。
+    # 判例：win1 段1 ``occupancy_collapsed=True`` 但支撑健康 ⟹ occupancy 是**假阳性**。
+    # ⟹ occupancy 是 **f_k 的训练目标**，不是**结果的验收判据**。
+    #
+    # 而 ``N_eff,k`` 单独也不够 —— 它把帧当独立的。真正的量是 ``N_eff,k / g_k``
+    # （未抽稀帧上的逐目标态 support ÷ 该态的时间自相关）。实测差距极大：
+    #     win2  853/50  ≈ 17        （健康）
+    #     win0  27.5/126 ≈ **0.2**  （几乎没有独立的有效样本）
+    #
+    # 这里在**未抽稀**帧上逐态算 ——  抽稀之后再算等于把 g 除了两遍。
+    n_eff_per_state: List[Optional[float]] = []
+    top1_per_state: List[Optional[float]] = []
+    for _k in range(u.shape[0]):
+        _ser = (u[_k] - bias) / float(kt)
+        _fin = np.isfinite(_ser)
+        if not _fin.any():
+            n_eff_per_state.append(None)
+            top1_per_state.append(None)
+            continue
+        _sr = _ser[_fin]
+        # 减最小值只为数值稳定；ESS 对 w 的公共因子不变。
+        _w = np.exp(-(_sr - _sr.min()))
+        _sw, _sw2 = float(_w.sum()), float((_w * _w).sum())
+        n_eff_per_state.append((_sw * _sw / _sw2) if _sw2 > 0.0 else None)
+        _nt = max(1, int(round(0.01 * _sr.size)))
+        top1_per_state.append(
+            float(np.sort(_w)[-_nt:].sum() / _sw) if _sw > 0.0 else None
+        )
+    n_eff_over_g: List[Optional[float]] = []
+    for _k, _ne in enumerate(n_eff_per_state):
+        _g = g_per_state[_k] if _k < len(g_per_state) else None
+        n_eff_over_g.append(
+            float(_ne) / float(_g) if (_ne is not None and _g and _g > 0.0) else None
+        )
+    _finite_ratio = [x for x in n_eff_over_g if x is not None]
+
+    # 🔑 [2026-09-11] **边际 N_eff 序列 + 脱轨点** —— 早判的判据本身。
+    #
+    # 冻结的 f_k 会随轨迹越采越偏（"乒乓球效应"），所以累计 N_eff 一定亚线性；
+    # 真正有用的信号是它的**导数**：健康时每块增量大致持平，脱轨后断崖。
+    # 实测（段2 win0，10 块）::
+    #
+    #   60.4  91.6  89.0  37.8  79.3  70.2  73.3  23.1  **2.3**  3.0   ← 30 倍断崖
+    #
+    # 这种落差不需要精细阈值。判据：**本块边际 < 前半程中位数的 1/4**。
+    #
+    # ⚠️ 早判比固定节奏**更准**：实测脱轨点跨 0.40~1.80 ns（**4.5 倍**）——
+    # 固定 1 ns 对段2 win1（0.4 ns 就该换）太晚、对段2 win0（1.8 ns 才需要）偏早。
+    # 两者不冲突：固定节奏当**上限兜底**，边际断崖当**提前触发**，谁先到用谁。
+    #
+    # 定义与同僚手算口径逐条对齐（对不上先查这四条）：
+    #   · w_kn = exp(-(u_kn - bias_n)/kT)，u 用 energies.npy、bias 用 bias.npy
+    #   · **未抽稀**，不走 _decorrelate_by_worst_target_state
+    #   · N_eff,k = (Σw)²/Σw²；最差态 = 整段 N_eff 最小的那个 k
+    #   · 数值上先减 max(log w) 再 exp —— 这里的 exp(-(s - s.min())) 就是它
+    #     （log w = −s ⟹ max(log w) = −min(s)），不是另一个式子。
+    n_blocks = 10
+    marginal: List[Optional[float]] = []
+    cumulative: List[Optional[float]] = []
+    derail_block = None
+    derail_block_single = None
+    derail_threshold = None
+    worst_k = (
+        int(min(range(len(n_eff_per_state)),
+                key=lambda i: (n_eff_per_state[i] is None, n_eff_per_state[i])))
+        if any(x is not None for x in n_eff_per_state) else None
+    )
+    if worst_k is not None and bias.size >= n_blocks:
+        _ser = (u[worst_k] - bias) / float(kt)
+        _prev = 0.0
+        for _b in range(1, n_blocks + 1):
+            _cut = int(round(bias.size * _b / n_blocks))
+            _sr = _ser[:_cut]
+            _sr = _sr[np.isfinite(_sr)]
+            if _sr.size == 0:
+                cumulative.append(None)
+                marginal.append(None)
+                continue
+            _w = np.exp(-(_sr - _sr.min()))
+            _sw, _sw2 = float(_w.sum()), float((_w * _w).sum())
+            _cum = (_sw * _sw / _sw2) if _sw2 > 0.0 else 0.0
+            cumulative.append(float(_cum))
+            marginal.append(float(_cum - _prev))
+            _prev = _cum
+        _early = [x for x in marginal[: n_blocks // 2] if x is not None]
+        if _early:
+            _med = float(np.median(_early))
+            _thr = _med / 4.0
+            # 老板定的触发规格是「**连续两个** block < 前半程中位数的 1/4」——
+            # 比"第一个低于即判"严，能挡掉单块噪声造成的假阳性。
+            for _i in range(len(marginal) - 1):
+                _a, _b2 = marginal[_i], marginal[_i + 1]
+                if (_a is not None and _a < _thr
+                        and _b2 is not None and _b2 < _thr):
+                    derail_block = _i
+                    break
+            # 单块口径**同时保留**（仅报告）：两者在实测数据上会分歧，
+            # 需要能并排看。实测差异：段1 win0 的边际是
+            # [5.6,5.4,2.7,3.4,3.6,2.2,1.8,0.0,1.6,1.1]、阈值 0.90 ——
+            # 只有 block 7（0.0）低于阈值、其后 1.6/1.1 又回到阈值之上，
+            # 所以**单块口径判 0.80 脱轨、连续两块口径判未脱轨**。
+            for _i, _m in enumerate(marginal):
+                if _m is not None and _m < _thr:
+                    derail_block_single = _i
+                    break
+            derail_threshold = _thr
+
+    n_dec = int(np.asarray(sub_idx).size)
+    floor = int(min_frames_per_window)
+
+    # 🔑🔑 [2026-09-11 / 老板定案 A+H] **验收真源是 `N_eff/g`，不是 `n_decorr >= 10`。**
+    #
+    # 先前这里用 `n_dec >= 10` 判 `VALID_PASS` —— 那是"求解器有没有资格尝试"的
+    # 门槛，被当成了"目标态能不能被恢复"的验收，两件事。四种量的分工现在写死：
+    #
+    #   n_decorr            求解器**是否有资格尝试**（够不够喂进 MBAR）
+    #   N_eff,k / g_k       目标态能否被恢复 —— **主验收量**
+    #   top1% weight        重尾 / 单帧支配的**否决警报**
+    #   occupancy、coverage/mixture ESS
+    #                       **只诊断 f_k 训练**，不决定最终 ΔG 是否有效
+    #
+    # 协议安全下限（老板定；五个窗口不足以拟合"科学最优阈值"，但足够定下限）::
+    #
+    #     min(N_eff/g) < 1     HARD_INSUFFICIENT     物理上不到一个独立有效贡献
+    #     1 <= ... < 10        INSUFFICIENT_DATA
+    #     >= 10                ANALYSIS_ELIGIBLE
+    #
+    # ⚠️ `>= 10` 只表示"**可以进入分析**"，**不是 `VALID_PASS`**。最终 PASS 仍需
+    #    endpoint CI、block 稳定性、全路径完整性 —— 那些不在本函数的视野里。
+    # ⚠️ **低支撑永远不叫 FAIL。** 它是"尚不可测"（INSUFFICIENT_DATA）。只有支撑
+    #    充分之后结果明确违反统计门，才轮得到 FAIL。把两者混起来会退化成
+    #    "再测一次直到碰巧通过"。
+    _ratio = min(_finite_ratio) if _finite_ratio else None
+    _top1_worst = max((x for x in top1_per_state if x is not None), default=None)
+    if _ratio is None:
+        verdict = "INSUFFICIENT_DATA"      # 连主验收量都算不出来
+    elif _ratio < 1.0:
+        verdict = "HARD_INSUFFICIENT"
+    elif _ratio < 10.0:
+        verdict = "INSUFFICIENT_DATA"
+    else:
+        verdict = "ANALYSIS_ELIGIBLE"
+    # top1% 是**否决警报**，不是主判据：支撑看着够、却被单帧支配时压回不可分析。
+    # 阈值用既有的 TARGET_SUPPORT_MAX_TOP1PCT_WEIGHT（生产支撑度门本来就用它），
+    # 不新发明。
+    top1_veto = bool(
+        _top1_worst is not None
+        and _top1_worst > float(TARGET_SUPPORT_MAX_TOP1PCT_WEIGHT)
+    )
+    if top1_veto and verdict == "ANALYSIS_ELIGIBLE":
+        verdict = "INSUFFICIENT_DATA"
+        verdict_source = "top1pct_veto"
+    else:
+        verdict_source = "min_n_eff_over_g"
+
+    # 🔑 [2026-09-11 补] **`n_decorr` 的角色必须真正参与，不能只落盘不生效。**
+    #
+    # 四量分工里 `n_decorr` = "**求解器是否有资格尝试**"，这是比 `N_eff/g` **更前置**
+    # 的一层：连喂进 MBAR 的去相关样本都不够时，`N_eff/g` 算出来的任何数都不该被
+    # 当成结论。先前这里只把 `solver_eligible` 落了盘、没让它影响 verdict，实测
+    # `min_frames_per_window` 从 1 调到 10000 对 verdict **零影响** —— 两者碰巧同向
+    # 所以没暴露（tight 组 n_decorr=3 不够，但 verdict 是 N_eff/g=2.28 给的）。
+    #
+    # 处置：不够资格 ⟹ `HARD_INSUFFICIENT`（这一档本来就是留给"连一个独立有效
+    # 贡献都没有"的），并且**它压过 N_eff/g 的分档** —— 更前置的失效优先。
+    # 但 **`verdict_source` 要把"为什么"分开记**：帧数不够 ≠ 支撑不够，
+    # 补救方向虽然都是加采样，事后归因却不能混。
+    # ⚠️ 仍然**不叫 FAIL**：没资格尝试是"尚不可测"，不是"测出来不合格"。
+    solver_eligible = n_dec >= floor
+    if not solver_eligible:
+        verdict = "HARD_INSUFFICIENT"
+        verdict_source = "solver_eligibility"
+    sufficient = verdict == "ANALYSIS_ELIGIBLE"
+    lam = [float(x) for x in (conv.get("lambdas_vdw") or [])]
+    return {
+        "protocol_version": WINDOW_SELF_SUPPORT_PROTOCOL_VERSION,
+        "window_idx": int(window_idx),
+        "gauge": "energies",
+        "checked_at": "window_production_complete",
+        "n_frames_total": int(bias.size),
+        "n_frames_decorrelated": n_dec,
+        "min_frames_per_window": floor,
+        "statistical_inefficiency": (
+            None if not np.isfinite(g_val) else float(g_val)
+        ),
+        "worst_target_state_local": int(g_worst),
+        "worst_target_lambda_vdw": (
+            float(lam[g_worst]) if 0 <= g_worst < len(lam) else None
+        ),
+        # 逐态 g 剖面：远端单调衰减（窗口跨度太大）与整体偏低（采样不够）在单个 g
+        # 上长得一模一样，而两者的对症动作完全不同。
+        "statistical_inefficiency_per_lambda": [float(x) for x in g_per_state],
+        # 🔑 验收量（未抽稀帧上逐目标态）。occupancy **不在**这里 —— 它是 f_k 的
+        # 训练目标，不是结果的验收判据（win1 的 occupancy_collapsed 是假阳性）。
+        "n_eff_per_state": [None if x is None else float(x) for x in n_eff_per_state],
+        "top1pct_weight_per_state": [
+            None if x is None else float(x) for x in top1_per_state
+        ],
+        "n_eff_over_g_per_state": [
+            None if x is None else float(x) for x in n_eff_over_g
+        ],
+        "min_n_eff_over_g": (min(_finite_ratio) if _finite_ratio else None),
+        "worst_state_by_n_eff_over_g": (
+            int(min(range(len(n_eff_over_g)),
+                    key=lambda i: (n_eff_over_g[i] is None, n_eff_over_g[i])))
+            if _finite_ratio else None
+        ),
+        # 边际序列 = N_eff,k 的时间分辨版本，也是"早判"的判据本身。
+        "worst_state_by_n_eff": worst_k,
+        "n_eff_cumulative_by_block": cumulative,
+        "n_eff_marginal_by_block": marginal,
+        "n_blocks": n_blocks,
+        "derail_block_index": derail_block,
+        # 脱轨点表示为**轨迹比例**（该块的末端）；不换算成 ns，因为这里拿不到
+        # 可靠的 dt，换算留给读的人。None = 整段未脱轨。
+        "derail_at_trajectory_fraction": (
+            None if derail_block is None else (derail_block + 1) / float(n_blocks)
+        ),
+        "derail_criterion": (
+            "**连续两个** block 的边际 N_eff < 前半程中位数的 1/4（老板定的触发规格；"
+            "比单块严，挡掉单块噪声假阳性）"
+        ),
+        "derail_threshold": derail_threshold,
+        # 🔑 [2026-09-11 老板定案] **脱轨判据是两档，不是二选一。**
+        #
+        #   单块 < 1/4      → SUSPECTED_DERAILMENT：触发**非变异**探针 / 候选计算
+        #   连续两块 < 1/4  → CONFIRMED_DERAILMENT：才允许关闭 Epoch、进入动作决策
+        #
+        # ⚠️ **在 held-out 反事实验收接好之前，单块不得直接触发重标定。**
+        # 理由（老板原话）：这样段2 win1 虽然正式动作会晚到 0.90，但 **0.40 时
+        # 已经启动廉价诊断**；不会再因一个震荡低块贸然切换到更差的 f_k。
+        # 待 held-out 接通后，单块预警可以立即评估候选，只有确认支撑改善才切换。
+        "derail_block_index_single_block": derail_block_single,
+        "derailment_status": (
+            "CONFIRMED_DERAILMENT" if derail_block is not None
+            else "SUSPECTED_DERAILMENT" if derail_block_single is not None
+            else "NONE"
+        ),
+        "derailment_tiers": {
+            "SUSPECTED_DERAILMENT": "单块 < 前半程中位数 1/4 ⟹ 只触发非变异探针/候选计算",
+            "CONFIRMED_DERAILMENT": "连续两块 < 1/4 ⟹ 才允许关闭 Epoch、进入动作决策",
+        },
+        "n_segments": len(segments) if segments else 1,
+        "segment_diagnostics": seg_diag,
+        # `sufficient` 现在的含义是 **ANALYSIS_ELIGIBLE**（可以进入分析），
+        # **不是** "通过验收"。
+        "sufficient": bool(sufficient),
+        "solver_eligible": bool(solver_eligible),
+        "solver_eligibility_criterion": "n_decorrelated >= min_frames_per_window",
+        # ⚠️ INSUFFICIENT_DATA / HARD_INSUFFICIENT **都不是 FAIL**。低支撑是
+        # "尚不可测"，加预算；FAIL 是"支撑够了但违反统计门"，换 Epoch。
+        "verdict": verdict,
+        # 为什么是这个 verdict：solver_eligibility（帧数不够，连尝试的资格都没有）/
+        # min_n_eff_over_g（主验收量）/ top1pct_veto（单帧支配）。三者补救方向都是
+        # 加采样，但归因不同，不能混。
+        "verdict_source": verdict_source,
+        "verdict_thresholds": {"hard_insufficient_below": 1.0,
+                               "analysis_eligible_at_or_above": 10.0},
+        "top1pct_veto": top1_veto,
+        "top1pct_veto_threshold": float(TARGET_SUPPORT_MAX_TOP1PCT_WEIGHT),
+        "worst_top1pct_weight": _top1_worst,
+        "quantity_roles": {
+            "n_decorrelated": "求解器是否有资格尝试",
+            "n_eff_over_g": "目标态能否被恢复 —— 主验收量",
+            "top1pct_weight": "重尾/单帧支配的否决警报",
+            "occupancy_and_coverage_ess": "只诊断 f_k 训练，不决定 ΔG 是否有效",
+        },
+        # ⚠️ 这是**去相关帧数**的缺口，只在去相关这一关真的没过时才有意义。
+        # 去相关过了、却因 min N_eff/g 不达标而 insufficient 时它是 0 ——
+        # 真机印出过「还差 0 帧」这种自相矛盾的话。所以那种情况给 None，
+        # 让调用方明确区分"缺帧"和"缺有效样本"。
+        "frames_short_by": (max(0, floor - n_dec) if n_dec < floor else None),
+        "remedy": None if sufficient else (
+            "这个窗口还需要加采样（它的 checkpoint 此刻还热）。加多少是待定口径："
+            "加法一个 n_steps_per_window 基础单位 vs 现在 rescue 的 growth=2.0 乘法"
+            "（PLAN P3-9f）。本检查**只判不动手**，由既有 rescue 通路去加。"
+        ),
+        "note": "只报告、不设门；不改 production_step_overrides、不碰 converged。",
+    }
+
+
+JOIN_SUPPORT_PROTOCOL_VERSION = 1
+
+
+def join_lambda_two_sided_support(
+    output_dir: str,
+    stage_type: str,
+    upstream_idx: int,
+    downstream_idx: int,
+    kt: float,
+    *,
+    gauge: str = "sampling_states",
+    lambda_atol: float = 1e-9,
+) -> Optional[Dict[str, Any]]:
+    """相邻两个窗口对它们**共享的那一个 λ** 各自给出的重要性支撑。
+
+    设计依据：``docs/PLAN_PATH_REPAIR_2026-09-11.md`` §3bis（跨窗累加）+ P2-9a。
+
+    **为什么需要它**：IBS 窗口的样本本来就能跨窗累加（每个窗口是一个已知的采样
+    分布，MBAR 天生处理多个采样分布），所以"某个 λ 到底采够没有"这个问题**不该只问
+    拥有它的那一个窗口**。上一跑实测的不对称是系统性的 —— 每个 join 上，**结束**于
+    该 λ 的窗口总是比**起始**于它的那个差（rawESS）::
+
+        join λ    上游    下游
+        0.6079     16      332
+        0.4847    163      270
+        0.3852    205      838
+        0.3032     91      138
+
+    用单窗判据问，答案是"整个 win0 不可用"（它因去相关后只剩 6 帧被整窗踢出
+    ΔG 求和）；用两侧判据问，答案是"win0 的**内部**态缺支撑，它的**端点**没问题
+    （下游采得好 20 倍）"。后者才是可执行的诊断。
+
+    **只报告、不设门。** 放行判据一律不动 —— 这一条是证据，不是裁决。
+
+    **递推单元是滑动相邻对，不是累积前缀**：相邻窗口只共享**一个** λ，非相邻窗口的
+    λ 集合完全不相交，所以 ``win0+win1+win2`` 相比两次 pairwise join 不多任何信息
+    （§3bis.3）。⚠️ 这**不是**被否决的那个设计（把相邻 λ 态之间的 fixed-H overlap
+    当 IBS 正确性仲裁）：这里比的是两个**独立系综**对**同一个** λ 态的重要性支撑，
+    是同一个量的两份独立估计。
+
+    **口径（gauge）**：``sampling_states.npy`` 是 (N, K)、与 ``bias.npy`` 同口径；
+    ``energies.npy`` 是 (K, N) 的**物理**能量，两者差一个**逐态常数**（LRC，实测
+    win0 是 −8.08…−2.99、std=0.000）。⚠️ 注意两份数组**转置方向相反**。
+    ESS 与 g 对逐态常数都是不变量 —— ``ESS=(Σw)²/Σw²`` 在 ``w→aw`` 下不变、
+    自相关对平移不变（同僚实测 g 逐位相同）—— 所以用哪份都行，**但不许混用**，
+    而且落盘必须写清用的是哪一份。默认用 ``sampling_states``（它才是 bias 的口径）。
+    **绝不**拿 ``energies`` 去重建 bias（那样会差 7.5 kJ/mol）。
+
+    读不到文件、两窗不共享 λ 等情况一律返回 None（这是诊断，不许因此中断采样）。
+    """
+    if gauge not in ("sampling_states", "energies"):
+        raise ValueError(f"未知口径 {gauge!r}；只接受 sampling_states / energies")
+
+    def _load(idx: int):
+        conv_path = os.path.join(
+            output_dir, f"dual_window_{idx}_{stage_type}_convergence.json"
+        )
+        try:
+            with open(conv_path, "r", encoding="utf-8") as fh:
+                lam = [float(x) for x in (json.load(fh).get("lambdas_vdw") or [])]
+        except (OSError, ValueError):
+            return None
+        try:
+            bias = np.load(
+                os.path.join(output_dir, f"dual_window_{idx}_{stage_type}_bias.npy")
+            ).ravel()
+            if gauge == "sampling_states":
+                # (N, K) —— 与 bias 同口径
+                u = np.load(os.path.join(
+                    output_dir, f"dual_window_{idx}_{stage_type}_sampling_states.npy"
+                )).T
+            else:
+                # (K, N) —— 物理能量
+                u = np.load(os.path.join(
+                    output_dir, f"dual_window_{idx}_{stage_type}_energies.npy"
+                ))
+        except (OSError, ValueError):
+            return None
+        u = np.asarray(u, dtype=np.float64)
+        if u.ndim != 2 or u.shape[0] != len(lam) or u.shape[1] != bias.size:
+            return None
+        return lam, u, bias
+
+    up, down = _load(int(upstream_idx)), _load(int(downstream_idx))
+    if up is None or down is None:
+        return None
+    lam_up, u_up, bias_up = up
+    lam_dn, u_dn, bias_dn = down
+    if not lam_up or not lam_dn:
+        return None
+    # 共享态：上游的**末**态 == 下游的**首**态（单一共享边界约定）
+    if abs(lam_up[-1] - lam_dn[0]) > float(lambda_atol):
+        return None
+    join_lambda = float(lam_dn[0])
+
+    def _side(u: np.ndarray, bias: np.ndarray, k: int) -> Dict[str, Any]:
+        series = (u[k] - bias) / float(kt)
+        finite = np.isfinite(series)
+        n_total = int(series.size)
+        if not finite.any():
+            return {"n_frames": n_total, "n_finite": 0, "raw_ess": None,
+                    "raw_ess_ratio": None, "tau_int": None,
+                    "top1pct_weight": None}
+        sr = series[finite]
+        # 减最小值只为数值稳定；ESS 对 w 的公共因子不变，结果不受影响。
+        w = np.exp(-(sr - sr.min()))
+        sw, sw2 = float(w.sum()), float((w * w).sum())
+        ess = (sw * sw / sw2) if sw2 > 0.0 else None
+        try:
+            _idx, g = subsample_series_by_autocorrelation(sr)
+            g = float(g)
+        except Exception:
+            g = None
+        top = None
+        if sw > 0.0:
+            n_top = max(1, int(round(0.01 * sr.size)))
+            top = float(np.sort(w)[-n_top:].sum() / sw)
+        return {
+            "n_frames": n_total,
+            "n_finite": int(finite.sum()),
+            "raw_ess": None if ess is None else float(ess),
+            "raw_ess_ratio": None if ess is None else float(ess) / float(sr.size),
+            "tau_int": g,
+            "top1pct_weight": top,
+        }
+
+    side_up = _side(u_up, bias_up, len(lam_up) - 1)
+    side_dn = _side(u_dn, bias_dn, 0)
+    ratio = None
+    if side_up["raw_ess"] and side_dn["raw_ess"]:
+        ratio = float(side_dn["raw_ess"]) / float(side_up["raw_ess"])
+    return {
+        "protocol_version": JOIN_SUPPORT_PROTOCOL_VERSION,
+        "gauge": gauge,
+        "note": (
+            "只报告、不设门。ESS/g 对逐态常数（LRC）是不变量，所以 gauge 选哪个"
+            "都行；但不许混用，也绝不拿 energies 去重建 bias。"
+        ),
+        # 🔑🔑 [2026-09-11 老板纠正] **这份证据的作用范围，别越界。**
+        "scope_limitation": (
+            "本产物只能证明**共享态自身**采得好不好，**不能**作为上游窗口放行的依据。"
+            "只保存了两窗共享的那一个 λ、没有把下游帧在上游其余 λ 上的交叉能量落盘 ⟹ "
+            "下游的强支撑**进不了上游的 local MBAR**、改善不了上游的相对自由能。"
+            "所以「上游端点弱、下游强」**不构成**上游可以 PASS。"
+            "要真正兜住需二选一：给下游帧补齐上游各态的 reduced potentials；"
+            "或保存相邻窗口 union 的交叉能量做多系综 MBAR。在那之前上游保持 "
+            "PENDING / INSUFFICIENT，不许提前宣布健康。"
+        ),
+        "may_be_used_to_pass_upstream": False,
+        "join_lambda_vdw": join_lambda,
+        "upstream_window": int(upstream_idx),
+        "downstream_window": int(downstream_idx),
+        "upstream_state_index": len(lam_up) - 1,
+        "downstream_state_index": 0,
+        "upstream": side_up,
+        "downstream": side_dn,
+        "downstream_over_upstream_raw_ess": ratio,
+        "asymmetry_direction": (
+            None if ratio is None
+            else ("downstream_better" if ratio > 1.0 else "upstream_better")
+        ),
+    }
+
+
+def join_support_path(output_dir: str, stage_type: str, up: int, down: int) -> str:
+    return os.path.join(
+        output_dir, f"dual_join_{int(up)}_{int(down)}_{stage_type}_support.json"
+    )
+
+
 def _decorrelate_by_worst_target_state(
     u_kj_raw: np.ndarray,
     bias_kj: np.ndarray,
     kt: float,
     segments: Optional[List[Dict[str, Any]]] = None,
     segment_diagnostics: Optional[List[Dict[str, Any]]] = None,
+    per_state_g_out: Optional[List[float]] = None,
 ) -> Tuple[np.ndarray, float, int]:
     """Subsample using the slowest-decorrelating *reweighting* series.
 
@@ -17888,6 +20153,12 @@ def _decorrelate_by_worst_target_state(
     per-state pattern at the offline ``u_kn[k, start:end]`` call site.
 
     Returns ``(indices, g, worst_state_index)``.
+
+    ``per_state_g_out``（可选）被就地填成**逐目标态**的 g 向量。函数内部本来就
+    逐态算了 ``g_k``、只留最大的那个；把整条剖面交出来才能区分"远端单调衰减"
+    （窗口跨度太大）与"整体偏低"（采样不够）—— 只看一个整窗 g 会把这两种
+    完全不同的失效混成一个数。用 out 参数而不是加第 4 个返回值，是为了不动
+    既有 10 余处 3 元组解包的调用点。
     """
     u_kj_raw = np.asarray(u_kj_raw, dtype=np.float64)
     bias_kj = np.asarray(bias_kj, dtype=np.float64).ravel()
@@ -17902,9 +20173,18 @@ def _decorrelate_by_worst_target_state(
                     segment_diagnostics.append(dict(segment, n_decorrelated=0,
                         statistical_inefficiency=None, reason_excluded="too_short"))
                 continue
+            _seg_g: List[float] = []
             idx, g, worst = _decorrelate_by_worst_target_state(
-                u_kj_raw[:, start:end], bias_kj[start:end], kt
+                u_kj_raw[:, start:end], bias_kj[start:end], kt,
+                per_state_g_out=_seg_g if per_state_g_out is not None else None,
             )
+            if per_state_g_out is not None and _seg_g:
+                # 逐态取各段的最大 g —— 跟"最保守的那个态驱动共享抽稀"同一口径。
+                if not per_state_g_out:
+                    per_state_g_out.extend(_seg_g)
+                else:
+                    for _i, _v in enumerate(_seg_g[:len(per_state_g_out)]):
+                        per_state_g_out[_i] = max(per_state_g_out[_i], _v)
             if segment_diagnostics is not None:
                 segment_diagnostics.append(dict(segment, n_decorrelated=int(idx.size),
                     statistical_inefficiency=float(g), worst_target_state=int(worst)))
@@ -17921,11 +20201,372 @@ def _decorrelate_by_worst_target_state(
     for k in range(u_kj_raw.shape[0]):
         series = (u_kj_raw[k] - bias_kj) / float(kt)
         idx_k, g_k = subsample_series_by_autocorrelation(series)
+        if per_state_g_out is not None:
+            per_state_g_out.append(float(g_k))
         if float(g_k) > best_g:
             best_g = float(g_k)
             best_idx = np.asarray(idx_k, dtype=int)
             worst_k = int(k)
     return best_idx, best_g, worst_k
+
+
+def recalibrate_f_k_from_production(
+    u_kj_raw: np.ndarray,
+    bias_kj: np.ndarray,
+    base_kj: np.ndarray,
+    win_lams: List[int],
+    kt: float,
+    f_k_current: np.ndarray,
+    *,
+    w_idx: int = 0,
+    min_frames: int = IBS_LOCAL_MBAR_GATE_MIN_FRAMES,
+    sampling_kj: Optional[np.ndarray] = None,
+    max_consistency_sd_kJ_mol: float = 1.0e-3,
+) -> Dict[str, Any]:
+    """拿**已落盘的生产帧**重解这个窗口的 f_k，供"重置偏置后再采一段"使用。
+
+    为什么需要它：warmup 判 f_k 用的是 loose gate —— 只要求
+    ``max_k|Δf_k − ΔF^MBAR| < 10 kJ/mol ≈ 4 kT``，而且只看 200 帧
+    （5 批 × IBS_TMBAR_LEARNING_MINIBATCH_FRAMES）。差几 kJ/mol 完全合法，却足以
+    让混合系综塌向少数态：实测 window 3 的 ``top1%_raw_weight`` 到 0.38–0.49，
+    单帧扛掉四成权重。在这种 f_k 下继续加帧只是往同一个偏斜分布里加更多帧 ——
+    绝对样本数涨、ESS **比值**不动，正是两轮 rescue 实测到的形状。
+
+    生产帧比 warmup 那 200 帧多几个数量级，用它重解出来的 f_k 准得多。
+
+    **目标 f_k 就是各态自由能本身**：混合权重 ∝ exp(−(F_k − f_k)/kT)，占据平坦
+    ⟺ f_k = F_k + 常数。所以直接取局部 MBAR 解出的 F，再按跟
+    `_apply_pairwise_cap` 同一个规范（均值归零）定规范。
+
+    这里**刻意不加步长上限**：`IBS_MAX_APPLIED_PAIRWISE_STEP_KT` 那类 cap 是给
+    在线学习用的（防止低重叠 MBAR 的一大步打崩占据），而这里是拿远多于 warmup
+    的数据做一次性重标定，之后要重新平衡再采样，不存在"打崩当前轨迹"的问题。
+
+    ⚠️ 用它换来的 f_k 采出的帧，跟原来那段**不是同一个采样分布**。两段要么各自
+    独立分析，要么合并时必须把交叉能量补齐（用 u_kn 对两个 f_k 各算一次
+    mixture 能量）——直接把两段记录的 `bias_energies` 摞起来当一个采样态是错的，
+    合成实验实测偏差 +0.12 kJ/mol、RMSE 2.6 倍。
+    """
+    f_current = np.asarray(f_k_current, dtype=np.float64).ravel()
+
+    # 🔑 规范自洽核对，**fail-closed**。落盘的 bias_energies 是 OpenMM 逐帧读出的
+    # 真实 Group-1 能量，所以下面这条恒等式必须成立到机器精度：
+    #     bias(x) == -kT * logsumexp_k(-(u_k(x) - f_k)/kT)
+    #
+    # ⚠️ 这里的 u 必须是**采样规范**的能量（sampling_states），不是 energies。两者相差
+    # 一个**逐 λ 态的常数**（LJ 长程尾项：它在分析侧的目标能量里，不在采样哈密顿量里）。
+    # 逐态常数不是共模，会改变 logsumexp 的形状。真实产物实测（cyclod rep1，4 个窗口）：
+    #     用 sampling_states → sd = 0.0000（逐比特成立）
+    #     用 energies       → sd = 0.7351 / 0.3734 / 0.1816 / 0.0941（随解耦单调变小，
+    #                              那正是尾项随配体消失而缩小）
+    # 而 `_load_ibs_window_outputs_from_dir` 只在 residual 臂返回 sampling_state_energies，
+    # baseline 臂拿不到 —— 于是很容易在错误规范下解出一个"看起来正常"的 f_k。
+    # 所以这条不再只是诊断：对不上就拒绝返回 f_k。宁可不重标定，也不拿一个错规范下解出
+    # 的偏置去驱动几十万步采样。
+    _u_for_bias = np.asarray(
+        sampling_kj if sampling_kj is not None else u_kj_raw, dtype=np.float64
+    )
+    consistency_sd = None
+    try:
+        if _u_for_bias.ndim == 2 and _u_for_bias.shape[0] == f_current.size:
+            recon = -float(kt) * _logsumexp_rows(
+                -(_u_for_bias - f_current[:, None]) / float(kt), axis=0
+            )
+            resid = np.asarray(bias_kj, dtype=np.float64).ravel() - recon
+            if resid.size:
+                # 公共常数不重要（规范自由度），只看逐帧离散度。
+                consistency_sd = float(np.std(resid - float(np.mean(resid))))
+    except Exception:
+        consistency_sd = None
+
+    if consistency_sd is None or not np.isfinite(consistency_sd) or (
+        consistency_sd > float(max_consistency_sd_kJ_mol)
+    ):
+        return {
+            "error": "f_k_bias_gauge_mismatch",
+            "f_k": None,
+            "f_k_consistency_sd_kJ_mol": consistency_sd,
+            "max_consistency_sd_kJ_mol": float(max_consistency_sd_kJ_mol),
+            "hint": (
+                "传进来的 u 与 bias_energies 不同规范。生产侧必须传 sampling_states "
+                "（采样规范），不能传 energies（含逐 λ 态的 LJ 尾项常数）。"
+            ),
+        }
+
+    solved = _solve_single_window_local_mbar(
+        u_kj_raw, bias_kj, base_kj, list(win_lams), float(kt),
+        f_k=f_current, sampled_distribution_row=0, w_idx=int(w_idx),
+        min_frames=int(min_frames), sampling_kj=sampling_kj,
+    )
+    if solved.get("error"):
+        return {"error": solved["error"], "f_k": None}
+    f_new = np.asarray(solved.get("f"), dtype=np.float64).ravel()
+    if f_new.size != f_current.size or not np.all(np.isfinite(f_new)):
+        return {"error": "nan_or_shape_mismatch_in_local_mbar_f", "f_k": None}
+
+    f_new = f_new - float(np.mean(f_new))
+    f_ref = f_current - float(np.mean(f_current))
+    delta = f_new - f_ref
+    adjacent_shift = (
+        float(np.max(np.abs(np.diff(delta)))) if delta.size > 1 else 0.0
+    )
+    return {
+        "error": None,
+        "f_k": f_new,
+        "f_k_previous_centered": f_ref,
+        "delta_f_k_kJ_mol": delta,
+        # gauge 无关的"这次重标定改动了多少"：相邻差的最大变化。
+        "max_adjacent_shift_kJ_mol": adjacent_shift,
+        "max_abs_shift_kJ_mol": float(np.max(np.abs(delta))) if delta.size else 0.0,
+        "n_frames_used": int(solved.get("n_frames_used", 0) or 0),
+        "statistical_inefficiency": solved.get("statistical_inefficiency"),
+        "min_ess_ratio": solved.get("min_ess_ratio"),
+        # 传入的 f_k 与落盘 bias_energies 的逐帧自洽度（sd，kJ/mol）。接近 0 说明
+        # 这份 f_k 确实是采样时生效的那份；明显非零说明它过期了，重标定的参照错了。
+        "f_k_consistency_sd_kJ_mol": consistency_sd,
+    }
+
+
+HELDOUT_CANDIDATE_PROTOCOL_VERSION = 1
+
+
+def heldout_candidate_verdict(
+    sampling_kj: np.ndarray,
+    bias_kj: np.ndarray,
+    base_kj: np.ndarray,
+    win_lams: Sequence[int],
+    kt: float,
+    f_current: np.ndarray,
+    *,
+    n_blocks: int = 4,
+    train_blocks: int = 2,
+    w_idx: int = 0,
+) -> Dict[str, Any]:
+    """候选 f_k 的**反事实验收**：在**未参与拟合**的块上，它真的改善了吗？
+
+    🔑 [2026-09-11] 老板的规格：离线生成候选 f_k，**只有候选满足以下条件才真正重标定**
+    —— 在 held-out blocks 上提高最差态的 `N_eff/g`、不显著伤害原本健康的状态、
+    口径一致、**优化目标是 target support 而不是 occupancy 平坦**。
+
+    ⚠️ **必须用连续时间块，不能随机拆帧。** 帧是时间相关的，随机拆会让 held-out
+    和 train 共享同一段慢模态 ⟹ 验收虚高（这跟"短轨迹低估慢相关"是同一个陷阱）。
+    前 `train_blocks` 块训练，其余块 held-out。
+
+    ⚠️ 口径与累计残差一致：**只能是 `sampling_states`**。
+
+    返回 verdict：
+      · `ACCEPT`      held-out 上最差态 `N_eff/g` 改善，且没有健康态被显著伤害
+      · `REJECT`      没改善，或伤到了原本健康的态
+      · `UNMEASURED`  held-out 上算不出来（帧太少 / MBAR 解不动）—— **不是拒绝**，
+                      它意味着"这份候选在现有数据上判不了"，应转 PROBE_REANCHOR_EPOCH
+    """
+    u = np.asarray(sampling_kj, dtype=np.float64)
+    bias = np.asarray(bias_kj, dtype=np.float64).ravel()
+    base = np.asarray(base_kj, dtype=np.float64).ravel()
+    K, N = u.shape
+    if N < n_blocks * 4 or K < 2:
+        return {"verdict": "UNMEASURED", "error": "too_few_frames_or_states"}
+
+    edges = [int(round(N * i / n_blocks)) for i in range(n_blocks + 1)]
+    tr = slice(edges[0], edges[int(train_blocks)])
+    ho = slice(edges[int(train_blocks)], edges[-1])
+    if ho.stop - ho.start < 4:
+        return {"verdict": "UNMEASURED", "error": "heldout_too_small"}
+
+    # ---- 训练：只用前面的连续块重解候选 ----
+    cand = recalibrate_f_k_from_production(
+        u[:, tr], bias[tr], base[tr], list(win_lams), float(kt),
+        np.asarray(f_current, dtype=np.float64), w_idx=int(w_idx),
+        sampling_kj=u[:, tr],
+    )
+    if cand.get("error") or cand.get("f_k") is None:
+        return {"verdict": "UNMEASURED", "error": cand.get("error") or "no_candidate"}
+    f_new = np.asarray(cand["f_k"], dtype=np.float64).ravel()
+
+    def _support(f_k: np.ndarray, sl: slice) -> Optional[List[float]]:
+        """held-out 块上逐态 N_eff/g。**这就是验收目标：target support，不是占据平坦。**"""
+        out = []
+        uu, bb = u[:, sl], bias[sl]
+        for k in range(K):
+            ser = (uu[k] - bb - float(f_k[k])) / float(kt)
+            fin = np.isfinite(ser)
+            if not fin.any():
+                return None
+            sr = ser[fin]
+            w = np.exp(-(sr - sr.min()))
+            sw, sw2 = float(w.sum()), float((w * w).sum())
+            if sw2 <= 0.0:
+                return None
+            ne = sw * sw / sw2
+            try:
+                _i, g = subsample_series_by_autocorrelation(sr)
+                g = float(g)
+            except Exception:
+                g = None
+            out.append(float(ne) / g if (g and g > 0.0) else None)
+        return out
+
+    old_s = _support(np.asarray(f_current, dtype=np.float64), ho)
+    new_s = _support(f_new, ho)
+    if old_s is None or new_s is None or any(x is None for x in old_s + new_s):
+        return {"verdict": "UNMEASURED", "error": "heldout_support_not_computable",
+                "candidate_f_k": [float(x) for x in f_new]}
+
+    old_worst, new_worst = min(old_s), min(new_s)
+    # "不显著伤害原本健康的状态"：健康 = 旧值 >= 10（协议安全下限），
+    # 伤害 = 掉到下限以下。不用比例阈值 —— 那又要拍一个数。
+    harmed = [
+        k for k in range(K)
+        if old_s[k] >= 10.0 and new_s[k] < 10.0
+    ]
+    improved = new_worst > old_worst
+    verdict = "ACCEPT" if (improved and not harmed) else "REJECT"
+    return {
+        "protocol_version": HELDOUT_CANDIDATE_PROTOCOL_VERSION,
+        "verdict": verdict,
+        "error": None,
+        "energy_gauge": "sampling_states",
+        "split": "contiguous_time_blocks",
+        "n_blocks": int(n_blocks), "train_blocks": int(train_blocks),
+        "train_frames": [int(edges[0]), int(edges[int(train_blocks)])],
+        "heldout_frames": [int(edges[int(train_blocks)]), int(edges[-1])],
+        "heldout_n_eff_over_g_before": old_s,
+        "heldout_n_eff_over_g_after": new_s,
+        "worst_before": float(old_worst), "worst_after": float(new_worst),
+        "improved_worst_state": bool(improved),
+        "harmed_states": harmed,
+        "candidate_f_k": [float(x) for x in f_new],
+        "candidate_max_adjacent_shift_kJ_mol": cand.get("max_adjacent_shift_kJ_mol"),
+        "note": (
+            "验收目标是 **target support**（held-out 最差态 N_eff/g），"
+            "**不是 occupancy 平坦** —— 后者正是 win1 被『用支撑换占据』的原因。"
+            "UNMEASURED ≠ REJECT：判不了就转 PROBE_REANCHOR_EPOCH 拿独立证据。"
+        ),
+    }
+
+
+CUMULATIVE_FK_RESIDUAL_PROTOCOL_VERSION = 1
+
+
+def cumulative_fk_residual(
+    sampling_kj: np.ndarray,
+    bias_kj: np.ndarray,
+    base_kj: np.ndarray,
+    win_lams: Sequence[int],
+    kt: float,
+    f_frozen: np.ndarray,
+    *,
+    energy_gauge: str = "sampling_states",
+    threshold_kJ_mol: float = IBS_LOCAL_MBAR_GATE_MAX_ADJACENT_DELTA_KJ_MOL,
+    w_idx: int = 0,
+) -> Dict[str, Any]:
+    """**端到端累计 f_k 偏差**（老板规格 v1）。只算，不设门、不改任何执行。
+
+    ``r_i = (f_{i+1} − f_i) − (F̂_{i+1} − F̂_i)``，``C_j = Σ_{i<j} r_i``。
+    望远镜求和 ⟹ ``C_j = (f_j − f_0) − (F̂_j − F̂_0)``；``f`` 是**冻结**的（无误差），
+    所以 ``σ(C_j) = σ(F̂_j − F̂_0) = ddf[0, j]``，**直接读同一次 MBAR 拟合的协方差
+    矩阵元，不做任何平方相加** —— 相邻差高度相关，平方相加会系统性算错
+    （仓库在 ``endpoint_diff_uncertainty`` 处已经记过这个坑一次）。
+
+    门看 **span = max(C) − min(C)**：它 **gauge-free**、不依赖选哪个端点作锚，
+    而**只看终点会漏掉「中间先偏后抵消」**。三档（**不随边数增长**，
+    老板明确"不能写成 (K−1)×10"）::
+
+        span + 2σ <  threshold   PASS
+        span − 2σ >= threshold   FAIL
+        否则                      UNMEASURED（CI 跨过门槛，或 MBAR 精度不足）
+
+    ⚠️ **口径只能是 sampling_states，传 energies 直接拒绝**（见
+    ``assert_sampling_gauge_for_fk_residual`` 的长注释：energies 多一个逐 λ 态常数，
+    其**逐边差**会凭空伪造出「全负号、单调」的残差形状，实测把某窗 span 抬高 2.2 倍）。
+    """
+    assert_sampling_gauge_for_fk_residual(energy_gauge)
+    f_frozen = np.asarray(f_frozen, dtype=np.float64).ravel()
+    K = len(list(win_lams))
+    if f_frozen.size != K or K < 2:
+        return {"error": f"f_k 长度 {f_frozen.size} 与窗口 {K} 态不匹配，或 K<2"}
+    solved = _solve_single_window_local_mbar(
+        np.asarray(sampling_kj, dtype=np.float64),
+        np.asarray(bias_kj, dtype=np.float64),
+        np.asarray(base_kj, dtype=np.float64),
+        list(win_lams), float(kt), f_k=f_frozen, w_idx=int(w_idx),
+    )
+    if solved.get("error") or solved.get("f") is None:
+        return {"error": solved.get("error") or "no_f"}
+    f_mbar = np.asarray(solved["f"], dtype=np.float64).ravel()
+    if f_mbar.size != K or not np.all(np.isfinite(f_mbar)):
+        return {"error": "mbar_f_shape_or_nan"}
+
+    # 两侧都减均值 ⟹ gauge-free（f_k 的公共常数不改变采样分布，也不该改变残差）
+    f_ref = f_frozen - float(np.mean(f_frozen))
+    f_hat = f_mbar - float(np.mean(f_mbar))
+    r = np.diff(f_ref) - np.diff(f_hat)
+    c = np.concatenate(([0.0], np.cumsum(r)))
+    span = float(np.max(c) - np.min(c))
+    a_i, b_i = int(np.argmax(c)), int(np.argmin(c))
+
+    sigma = None
+    ddf = solved.get("ddf_physical_matrix_kJ_mol")
+    if ddf is not None:
+        m = np.asarray(ddf, dtype=float)
+        if m.shape == (K, K) and np.isfinite(m[b_i, a_i]):
+            sigma = float(m[b_i, a_i])
+
+    thr = float(threshold_kJ_mol)
+    if sigma is None:
+        verdict = "UNMEASURED"
+    elif span + 2.0 * sigma < thr:
+        verdict = "PASS"
+    elif span - 2.0 * sigma >= thr:
+        verdict = "FAIL_CUMULATIVE_FK"
+    else:
+        verdict = "UNMEASURED"
+
+    return {
+        "protocol_version": CUMULATIVE_FK_RESIDUAL_PROTOCOL_VERSION,
+        "error": None,
+        "energy_gauge": energy_gauge,
+        "signed_adjacent_residual_kJ_mol": [float(x) for x in r],
+        "signed_cumulative_residual_from_first_kJ_mol": [float(x) for x in c],
+        "cumulative_residual_span_kJ_mol": span,
+        "cumulative_residual_span_sigma_kJ_mol": sigma,
+        "cumulative_residual_span_argmax_state": a_i,
+        "cumulative_residual_span_argmin_state": b_i,
+        "endpoint_signed_residual_kJ_mol": float(c[-1]),
+        "all_same_sign": bool(np.all(r > 0) or np.all(r < 0)) if r.size else None,
+        "abs_sum_kJ_mol": float(np.sum(np.abs(r))),
+        "verdict": verdict,
+        "threshold_kJ_mol": thr,
+        "threshold_note": "沿用现有 loose tolerance，**不随边数增长**（不是 (K−1)×门槛）",
+        "sigma_method": (
+            "σ(span)=ddf_physical[argmin, argmax]，同一次 MBAR 拟合的协方差矩阵元；"
+            "**不做平方相加**。通用 max(C)−min(C) 的 block bootstrap CI 尚未实现。"
+        ),
+        "n_frames_used": solved.get("n_frames_used"),
+        "statistical_inefficiency": solved.get("statistical_inefficiency"),
+    }
+
+
+def assert_sampling_gauge_for_fk_residual(gauge: str) -> None:
+    """累计 f_k 残差的口径守卫：**不是 sampling_states 就直接拒绝**（fail-closed）。
+
+    🔑 [2026-09-11] 老板要求：「若输入是 `energies`，累计 f_k gate **直接拒绝**」。
+
+    `energies` 比 `sampling_states` 多一个**逐 λ 态常数**（LRC 长程尾项；实测
+    两者之差的 std **精确为 0**）。逐态常数本身无害，但它的**逐边差是正的、
+    单调递减** ⟹ 会凭空伪造出「全负号、单调」的残差形状。实测污染：win0 的
+    cumulative span 被抬高 **2.2 倍**（3.27 → 7.19），而 win3 几乎没变
+    （11.47 → 11.92）—— 于是还会伪造出「span 越大末/首支撑比越小」的假单调关系。
+
+    ⚠️ 与支撑量的区别要记清：**`N_eff/g` 不受影响**（逐态常数在归一化里被除掉，
+    两口径**逐位相同**）。**只有 f_k 残差这一类会被污染。**
+    """
+    if str(gauge) != "sampling_states":
+        raise ValueError(
+            f"累计 f_k 残差的口径必须是 sampling_states，收到 {gauge!r}。"
+            "energies 多一个逐 λ 态常数（LRC），其逐边差会伪造出单调同号的残差形状"
+            "（实测 win0 的 span 被抬高 2.2 倍）。fail-closed，拒绝计算。"
+        )
 
 
 def _solve_single_window_local_mbar(
@@ -17937,7 +20578,7 @@ def _solve_single_window_local_mbar(
     f_k: Optional[np.ndarray] = None,
     sampled_distribution_row: int = 0,
     w_idx: int = 0,
-    min_frames: int = 10,
+    min_frames: int = IBS_LOCAL_MBAR_GATE_MIN_FRAMES,
     production_segments: Optional[List[Dict[str, Any]]] = None,
     sampling_kj: Optional[np.ndarray] = None,
     sampling_gauge_required: bool = False,
@@ -18026,7 +20667,7 @@ def _solve_single_window_local_mbar(
     # `n_frames_used=76`（=200/2.63）、`min_absolute_ess=55.75`、
     # `min_ess_ratio=0.734` —— 一片健康；而同一个窗口的生产重加权在未抽稀的
     # 500 帧上 raw ESS 只有 3.58、top-1% 权重 0.601。
-    # 见 docs/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md §2.5/§2.6。
+    # 见 docs/archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md §2.5/§2.6。
     _u_kj_pre_decorr = u_kj_raw
     _bias_kj_pre_decorr = bias_kj
     _sampling_kj_pre_decorr = sampling_kj
@@ -18192,6 +20833,15 @@ def _solve_single_window_local_mbar(
         "lambdas": list(int(x) for x in win_lams),
         "f": f_phys_kj,
         "df": df_phys_kj,
+        # 🔑 [2026-09-11] **物理态之间**的不确定度子阵（kJ/mol）。
+        # `df` 是各物理态**相对采样态**的边际不确定度，合并它们会系统性算错
+        # （同一次 MBAR 拟合、同一批样本，彼此有协方差）—— 这个坑上面
+        # endpoint_diff_uncertainty 的注释已经记过一次。
+        # 端到端累计偏差门需要 σ(F̂_j − F̂_0) 和 σ(F̂_a − F̂_b)，**直接读这个矩阵**，
+        # 不做任何平方相加。物理态在增广矩阵里占 1..n_lams 行。
+        "ddf_physical_matrix_kJ_mol": (
+            np.asarray(ddf_matrix[1:n_lams + 1, 1:n_lams + 1], dtype=float) * float(kt)
+        ),
         "endpoint_diff_uncertainty_kJ_mol": endpoint_diff_uncertainty_kj,
         "n_frames_used": int(n_k_local[sampled_row]),
         "global_offset": global_offset,
@@ -18289,8 +20939,13 @@ class GlobalMBARAnalyzer:
         valid_windows.sort(key=lambda d: min(d.get("lambda_indices", [10**9])))
 
         local_results = []
+        skipped_windows: List[Dict[str, Any]] = []
         window_g_values = []          # 每个窗口自相关子采样得到的统计非效率 g（诊断用）
         window_overlap_records = []   # 每个窗口的重加权有效样本比例（真实 overlap 诊断，见 #2）
+        # 🔑 [2026-09-11] **生产侧的端到端累计 f_k 偏差，与 warmup gate 分开存。**
+        # warmup gate 那份只有 200~600 帧、口径也不同；两边现在对不上，
+        # 合并会互相盖掉。这里是 scope="production" 的独立记录。
+        cumulative_fk_records: List[Dict[str, Any]] = []
 
         for w_idx, w in enumerate(valid_windows):
             source_window_idx = int(w.get("window_index", w_idx))
@@ -18307,6 +20962,10 @@ class GlobalMBARAnalyzer:
             # _ibs_reweighting_quality_diagnostics 的 docstring。这个数组必须跟着
             # 下面的去相关子采样一起走，否则分子分母来自不同帧子集。baseline 窗口和
             # tmbar_history entry 没有这个键 → None → 沿用物理口径，逐位不变。
+            # residual 臂标记由生产者显式写入（落盘侧见
+            # `_load_validated_joint_score_ledgers`，在线侧见 run_all_windows）。
+            # 它是下面 `sampling_gauge_required` 的唯一判据。
+            _residual_arm = bool(w.get("residual_sampling_arm"))
             sampling_kj = w.get("sampling_state_energies")
             if sampling_kj is not None:
                 sampling_kj = np.asarray(sampling_kj, dtype=np.float64)
@@ -18372,7 +21031,7 @@ class GlobalMBARAnalyzer:
             # 更糟的是形状：逐态单调崩塌从 68 倍（241.93→3.58）被抹平到 2.5 倍
             # （116.69→47.01）—— 门要探测的信号本身被消掉了。
             # 该窗口贡献 +20.79 kJ/mol、占溶剂腿 stage2 误差的一半以上，却全绿。
-            # 完整定位见 docs/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md §2.5。
+            # 完整定位见 docs/archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md §2.5。
             #
             # 修法：去相关照旧（MBAR 需要），但**门改在去相关之前的帧集上算**。
             # 两份都落盘：`raw_*`（受门，去相关前）与
@@ -18383,10 +21042,33 @@ class GlobalMBARAnalyzer:
             _bias_kj_pre_decorr = bias_kj
             _sampling_kj_pre_decorr = sampling_kj
 
+            # 🔑 [多采样段] 逐段去相关。多段窗口的两段是**两条独立轨迹**，不能当一条
+            # 连续序列估 g；用来源标签切出段边界交给已有的 segments 机制。
+            _seg_source_id = w.get("sampling_source_id")
+            _seg_f_ks = w.get("sampling_segment_f_k")
+            _is_multi_segment = bool(
+                _seg_source_id is not None and _seg_f_ks is not None and len(_seg_f_ks) > 1
+            )
+            _decorr_segments = w.get("production_segments")
+            if _is_multi_segment:
+                _sid = np.asarray(_seg_source_id, dtype=np.int64).ravel()
+                _bounds, _cur = [], 0
+                for _s in range(len(_seg_f_ks)):
+                    _n = int(np.count_nonzero(_sid == _s))
+                    if _n:
+                        _bounds.append({
+                            "start_frame": _cur, "end_frame": _cur + _n,
+                            "n_frames": _n, "session_id": f"sampling_segment_{_s}",
+                            "reason": "multi_sampling_segment",
+                        })
+                        _cur += _n
+                _decorr_segments = _bounds
             segment_diagnostics = []
+            _g_per_state: List[float] = []
             sub_idx, g_val, g_worst_state = _decorrelate_by_worst_target_state(
-                u_kj_raw, bias_kj, self.kt, segments=w.get("production_segments"),
+                u_kj_raw, bias_kj, self.kt, segments=_decorr_segments,
                 segment_diagnostics=segment_diagnostics,
+                per_state_g_out=_g_per_state,
             )
             for segment in segment_diagnostics:
                 start = segment["start_frame"]
@@ -18400,8 +21082,46 @@ class GlobalMBARAnalyzer:
                 n_frames = int(sub_idx.size)
             window_g_values.append(float(g_val))
             if n_frames < min_frames_per_window:
+                # 🔑 跳过的窗口必须被**显式记录**：这个总和缺了一段路径，却照样会被
+                # 当成 stage 的 total_delta_G 打印和比较。实测踩过一次：段 1 的 w3
+                # 因去相关后只剩 5 帧被跳过，86.42 是个部分和，跟段 2 的 52.75 并排
+                # 摆出来时看着像"两次采样差 33.7 kJ/mol"，其实是缺了一个窗口。
                 print(f"  [WARN] 窗口 {w_idx} 去相关子采样后有效帧数 ({n_frames}) < {min_frames_per_window}，跳过")
+                skipped_windows.append({
+                    "window_index": int(source_window_idx),
+                    "lambda_indices": [int(x) for x in win_lams],
+                    "n_frames_after_decorrelation": int(n_frames),
+                    "min_frames_per_window": int(min_frames_per_window),
+                    "statistical_inefficiency": float(g_val),
+                    # 🔑 逐态 g 剖面。被跳过的窗口恰恰是"整窗一个 g"最误导的那一格：
+                    # 远端单调衰减（跨度太大）与整体偏低（采样不够）在单个 g 上
+                    # 长得一模一样，而两者的对症动作完全不同。
+                    "statistical_inefficiency_per_lambda": [
+                        float(x) for x in _g_per_state
+                    ],
+                    "reason": "insufficient_frames_after_decorrelation",
+                })
                 continue
+
+            # 🔑 [多采样段] 帧集**已经定下来**了，现在才做自洽塌缩：抽帧改变了各段
+            # 计数，用全帧解出的混合权重切片后不再精确（实测差 0.178 kJ/mol）。
+            _multi_seg = None
+            if _is_multi_segment:
+                if sampling_kj is None:
+                    raise ValueError(
+                        f"窗口 {w_idx} 是多采样段，但缺 sampling_state_energies。"
+                        "交叉能量必须从采样规范重建，不能用含逐 λ 态尾项的 energies 代替。"
+                    )
+                import multi_segment_analysis as _msa
+                _sid_sub = np.asarray(_seg_source_id, dtype=np.int64).ravel()[sub_idx]
+                _cross_sub = np.vstack([
+                    _msa.mixture_energy(sampling_kj, np.asarray(_f, dtype=np.float64), self.kt)
+                    for _f in _seg_f_ks
+                ])
+                _multi_seg = _msa.collapse_segments(
+                    _cross_sub, _sid_sub, u_kj_raw, self.kt, n_segments=len(_seg_f_ks)
+                )
+                bias_kj = _multi_seg["bias_mix_kJ_mol"]
 
             # ------------------------------------------------------------------
             # 🔑 修复 1: 全局能量偏移 (Global Offset)
@@ -18561,7 +21281,10 @@ class GlobalMBARAnalyzer:
                                 None if _sampling_kj_pre_decorr is None
                                 else _sampling_kj_pre_decorr[:, _pre_finite]
                             ),
-                            sampling_gauge_required=_sampling_kj_pre_decorr is not None,
+                            # 🔑 [2026-09-09] 判据取自窗口自带的 residual 臂标记，
+                            # 不再用 `_sampling_kj_pre_decorr is not None` —— 那是拿被
+                            # 守护的数组自己推导要不要守护它，恒真、永不触发。
+                            sampling_gauge_required=_residual_arm,
                         )
                         _pre_denom = max(int(np.count_nonzero(_pre_finite)), 1)
                         if quality_pre.get("raw_ess") is not None:
@@ -18591,8 +21314,33 @@ class GlobalMBARAnalyzer:
                             None if sampling_kj is None
                             else sampling_kj[:, valid_mask]
                         ),
-                        sampling_gauge_required=sampling_kj is not None,
+                        # 同上：不用 `sampling_kj is not None` 自证。
+                        sampling_gauge_required=_residual_arm,
                     )
+                    if _multi_seg is not None:
+                        # 🔑 [多采样段] 覆盖度/占据必须按**合并的混合分布**算：
+                        # 每帧先算它属于各采样分布的后验 r_s(n)，再混合各段的 λ
+                        # 成员概率 p_{k|s}（用该段冻结的 f_k 与采样态能量，与
+                        # `_ibs_reweighting_quality_diagnostics` 同口径）。
+                        # 逐段最差只落诊断、不当门：合并 ESS 既不保证严格相加也不
+                        # 保证单调增，拿最差段的绝对 ESS 配两段总帧数更是分子分母
+                        # 不匹配。原来那份单组 f_k 的结果在多段下没有意义。
+                        import multi_segment_analysis as _msa
+                        _merged_cov = _msa.merged_coverage_diagnostics(
+                            _multi_seg["responsibility"][:, valid_mask],
+                            sampling_kj[:, valid_mask],
+                            [
+                                _seg_f_ks[int(i)]
+                                for i in _multi_seg["active_segments"]
+                            ],
+                            self.kt,
+                        )
+                        quality["mixture_ess"] = _merged_cov["coverage_ess"]
+                        quality["mixture_ess_ratio"] = _merged_cov["coverage_ess_ratio"]
+                        quality["mixture_occupancy_normalized"] = (
+                            _merged_cov["occupancy_normalized"]
+                        )
+                        quality["multi_segment_merged_coverage"] = True
                     if quality.get("mixture_ess") is not None:
                         mix_ess = np.asarray(quality["mixture_ess"], dtype=float)
                         mix_ratio = mix_ess / denom
@@ -18645,6 +21393,12 @@ class GlobalMBARAnalyzer:
                     # 去相关前的原始帧数）——跟下面 n_k_local[sampled_row]<10 的
                     # 门槛用的是同一个量。
                     "n_frames_decorrelated": int(n_k_local[sampled_row]),
+                    # 🔑 逐态 g 剖面（诊断用，不设门）。与已有的
+                    # raw_ess_ratio_per_lambda 配成一对：一个答"这个态的重要性
+                    # 权重有多少支撑"，一个答"这个态的序列去相关有多慢"。
+                    "statistical_inefficiency_per_lambda": [
+                        float(x) for x in _g_per_state
+                    ],
                     # ---- 只报告、不设门 ----
                     "ess_gate_protocol_version": int(ESS_GATE_PROTOCOL_VERSION),
                     "ess_gate_metric": "mixture_coverage_ess_common_mode_removed",
@@ -18724,6 +21478,13 @@ class GlobalMBARAnalyzer:
                 # 通常我们关心的是窗口内各 lambda 之间的相对差值。
                 # 由于所有态都减去了同一个 global_offset，且参考态一致，相对差值是准确的。
                 
+                if _multi_seg is not None:
+                    import multi_segment_analysis as _msa
+                    _msa.assert_collapse_matches_multistate(
+                        np.asarray(f_phys_kj, dtype=np.float64)[None, :]
+                        - np.asarray(f_phys_kj, dtype=np.float64)[:, None],
+                        _multi_seg["target_delta_f_kJ_mol"],
+                    )
                 local_results.append({
                     # 🔑 [P0-8] 真实来源窗口号；下面 chain_segments 里那个
                     # "window_index" 其实是 local_results 的位置下标，两者在有窗口被
@@ -18733,8 +21494,11 @@ class GlobalMBARAnalyzer:
                     "f": f_phys_kj.astype(float), # 相对于采样参考点的绝对 F
                     "df": df_phys_kj.astype(float),
                     "dDelta_f": (
-                        np.asarray(ddf_matrix[1:, 1:], dtype=np.float64)
-                        * self.kt
+                        # 🔑 [多采样段] σ 必须来自真正的 S+K 解。塌缩后的单态解把
+                        # **估计出来的**混合权重当已知常数用，σ 会偏小。
+                        _multi_seg["target_dDelta_f_kJ_mol"]
+                        if _multi_seg is not None
+                        else np.asarray(ddf_matrix[1:, 1:], dtype=np.float64) * self.kt
                     ),
                     "weight": int(n_k_local[0]),
                     "global_offset": global_offset # 记录偏移量，用于调试
@@ -18742,6 +21506,73 @@ class GlobalMBARAnalyzer:
                 # [0831issue P2] 同一原子块：只有这个窗口真的进了协方差链，它的
                 # overlap 诊断才进落盘统计。
                 window_overlap_records.append(_overlap_record)
+
+                # ---- 生产侧累计 f_k 残差（scope=production）----
+                # ⚠️ **必须用 sampling gauge 另解一次 local MBAR**：这里的
+                # `u_kj_raw` 是 `energies`（物理目标态，ΔG 用它），而 f_k 残差用它会被
+                # 逐 λ 态常数（LRC）污染 —— 实测把某窗 span 抬高 2.2 倍。
+                # 代价是每窗多一次 CPU MBAR，无 GPU。
+                try:
+                    _fk_eff = w.get("f_k")
+                    if _fk_eff is None:
+                        # ⚠️ **不要在这里兜 `bias_warmup.frozen_f_k_at_last_freeze`。**
+                        # 试过，是错的：多段窗口的帧采自**两份不同偏置**，
+                        # `_load_ibs_window_outputs_merged` 因此显式
+                        # `base.pop("f_k")` 并把两份都放进 `sampling_segment_f_k`。
+                        # 兜一份冻结值等于拿某一段的 f_k 冒充全体帧的偏置 ——
+                        # 正是那行 pop 要防的误用。
+                        # 单段窗口（如本跑的 win4/win5）本来就有 `f_k`，走正常路径。
+                        #
+                        # 代价是真的：**累计 f_k 残差门对多段窗口结构性不适用**，
+                        # 而循环一旦用换 Epoch 修好某个窗口，那个窗口就永久失去这项
+                        # 证据。这是设计缺口、不是实现 bug，需要单独定口径
+                        # （逐段残差不与合并后的 ΔF 直接望远镜相消）。
+                        _cum = {"error": "no_effective_f_k_for_these_frames"}
+                    elif sampling_kj is None:
+                        _cum = {"error": "no_sampling_state_energies"}
+                    else:
+                        _cum = cumulative_fk_residual(
+                            sampling_kj, bias_kj, base_kj, win_lams, self.kt,
+                            np.asarray(_fk_eff, dtype=np.float64),
+                            w_idx=int(source_window_idx),
+                        )
+                    _segs = w.get("production_segments") or []
+                    _fk_arr = (
+                        None if _fk_eff is None
+                        else np.asarray(_fk_eff, dtype=np.float64).ravel()
+                    )
+                    _cum.update({
+                        "scope": "production",
+                        "window_index": int(source_window_idx),
+                        "lambdas": list(win_lams),
+                        "n_frames_in_frameset": int(u_kj_raw.shape[1]),
+                        # frameset 身份：帧数 + 分段边界。够用来判"这份残差是从哪批帧
+                        # 算出来的"，而且不把自产数组的 sha256 当身份
+                        # （那是本仓库已复发 4 次的坑）。
+                        "frameset_id": "n%d_segs%s" % (
+                            int(u_kj_raw.shape[1]),
+                            "-".join(
+                                str(int(x.get("start_frame", -1))) for x in _segs
+                            ) or "single",
+                        ),
+                        "segment_ids": [
+                            x.get("session_id") for x in _segs
+                        ] or None,
+                        # 与 frozen_candidate_fingerprint 同口径（**已减均值**），
+                        # 否则同一份 f_k 会在两处算出两个指纹。
+                        "f_k_fingerprint": (
+                            None if _fk_arr is None
+                            else frozen_candidate_fingerprint(_fk_arr)
+                        ),
+                        "energy_gauge": "sampling_states",
+                    })
+                    cumulative_fk_records.append(_cum)
+                except Exception as _cum_err:  # noqa: BLE001 —— 诊断不得中断分析
+                    cumulative_fk_records.append({
+                        "scope": "production",
+                        "window_index": int(source_window_idx),
+                        "error": repr(_cum_err),
+                    })
                 
             except Exception as e:
                 print(f"  [WARN] 局部 TMBAR 窗口 {w_idx} (Lams {win_lams}) 失败: {e}")
@@ -19030,7 +21861,7 @@ class GlobalMBARAnalyzer:
                 "（'该采的构型一次都没采到'），不是'采到的构型之间散布不够'。"
                 "[2026-09-02] 该窗口原先标注的 +19.49 kJ/mol 是壳还在时测的幅度，"
                 "其中 98% 已定罪为 lambda-WCA 防护壳并随壳退役消失；教训本身不变。"
-                "根治见 docs/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md。"
+                "根治见 docs/archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md。"
             ),
         }
 
@@ -19141,6 +21972,15 @@ class GlobalMBARAnalyzer:
             "max_endpoint_uncertainty_kJ_mol_threshold": float(final_max_uncertainty_kJ_mol),
             "lambda_spacing_max_step_kJ_mol": lambda_spacing_max_step,
             "window_overlap_diagnostics": window_overlap_records,
+            # **与 warmup gate 的那份分开**：scope=production，帧集/分段/f_k 指纹
+            # /口径/路径版本全部自带，不许互相覆盖。
+            "cumulative_fk_residual_production": cumulative_fk_records,
+            # 🔑 被跳过的窗口必须显式出现在结果里。此前只有一行 WARN，而
+            # total_delta_G 照样按"完整路径"返回：实测踩过一次，段 1 的 w3 因去
+            # 相关后只剩 5 帧被跳过，86.42 是个部分和，却被跟段 2 的 52.75 并排
+            # 打印成"两次采样差 33.7 kJ/mol"。缺窗口的总和不是完整 ΔG。
+            "skipped_windows": list(skipped_windows),
+            "path_is_complete": not bool(skipped_windows),
             "statistical_inefficiency_per_window": window_g_values,
             "method": "Local-TMBAR covariance-chain (ESS-overlap-checked)",
             "uncertainty_note": (
@@ -19186,6 +22026,49 @@ def _slice_window_frames(window: Dict, lo_frac: float, hi_frac: float) -> Option
     if u_kn.ndim != 2:
         return None
     n_frames = u_kn.shape[1]
+
+    # 🔑 [多采样段] 多段窗口的帧是 段1|段2 拼接的，直接取连续前半会几乎全是段 1、
+    # 一帧段 2 都没有 —— 那不是"前半程"，是"段 1"。必须**在每段内部**各取前/后半，
+    # 再重新拼接并同步重建来源标签。每半程之后会各自去相关、各自重新塌缩，
+    # 绝不继承全程的混合权重（各半的段计数不同，权重也不同）。
+    _sid = window.get("sampling_source_id")
+    if _sid is not None:
+        _sid = np.asarray(_sid, dtype=np.int64).ravel()
+        if _sid.size != n_frames:
+            return None
+        _take = []
+        for _s in np.unique(_sid):
+            _pos = np.flatnonzero(_sid == _s)
+            _n = _pos.size
+            _a = max(0, min(int(lo_frac * _n), _n))
+            _b = max(_a, min(int(hi_frac * _n), _n))
+            if _b > _a:
+                _take.append(_pos[_a:_b])
+        if not _take:
+            return None
+        _idx = np.sort(np.concatenate(_take))
+        if _idx.size < 2:
+            return None
+        sliced = dict(window)
+        sliced["u_kn"] = u_kn[:, _idx]
+        for _key in ("bias_energies", "base_energies"):
+            _v = window.get(_key)
+            if _v is None:
+                return None
+            sliced[_key] = np.asarray(_v, dtype=np.float64)[_idx]
+        _ss = window.get("sampling_state_energies")
+        if _ss is None:
+            return None          # 多段必须有采样规范能量，否则塌缩无从做起
+        _ss = np.asarray(_ss, dtype=np.float64)
+        if _ss.ndim != 2 or _ss.shape[1] != n_frames:
+            return None
+        sliced["sampling_state_energies"] = _ss[:, _idx]
+        sliced["sampling_source_id"] = _sid[_idx]
+        # 逐窗口循环会按新的来源标签重建去相关分段；旧的 production_segments
+        # 帧号已经失效，留着只会让校验器误判。
+        sliced.pop("production_segments", None)
+        return sliced
+
     lo = max(0, min(int(lo_frac * n_frames), n_frames))
     hi = max(lo, min(int(hi_frac * n_frames), n_frames))
     if hi - lo < 2:
@@ -19198,6 +22081,21 @@ def _slice_window_frames(window: Dict, lo_frac: float, hi_frac: float) -> Option
     sliced["u_kn"] = u_kn[:, lo:hi]
     sliced["bias_energies"] = np.asarray(bias, dtype=np.float64)[lo:hi]
     sliced["base_energies"] = np.asarray(base, dtype=np.float64)[lo:hi]
+    # 🔑 [2026-09-09] residual 臂上 loader 会带一个 (K, N) 的
+    # `sampling_state_energies`。原来 `dict(window)` 把它整份抄过来却不切，于是半窗
+    # 携带全长 (K, N) 去对 (K, N/2) 的 u_kn，`solve_stage_integrated` 抛形状错，
+    # 再被 `split_half_drift_diagnostics` 外层的裸 `except Exception` 吞成
+    # `available=False` —— **整条 residual 臂的 split-half 漂移诊断永久是暗的**，
+    # 而那是本文件里唯一对帧时序敏感的门。fail-open，不是 fail-closed。
+    sampling_states = window.get("sampling_state_energies")
+    if sampling_states is not None:
+        sampling_states = np.asarray(sampling_states, dtype=np.float64)
+        if sampling_states.ndim == 2 and sampling_states.shape[1] == n_frames:
+            sliced["sampling_state_energies"] = sampling_states[:, lo:hi]
+        else:
+            # 形状本来就对不上 u_kn —— 这不是切片能修的，交给上游去发现，
+            # 不要在这里悄悄塞一个半对的数组。
+            return None
     if "production_segments" in window:
         _validate_production_segments(window["production_segments"], n_frames)
         sliced["production_segments"] = [
@@ -20141,6 +23039,14 @@ class REMDManager:
                 self.n_replicas, resolved_platform,
                 _vram_baseline[0], _vram_baseline[1], _vram_baseline[2], props,
             )
+        # 宿主内存同样要打：这一段里第一个大分配是 `_prepare_pme_coulomb_leg_system`
+        # 的 XML 往返，宿主侧耗尽会表现成 `std::bad_alloc` 而不是任何显存信息。
+        _host_baseline = _host_memory_mib()
+        if _host_baseline:
+            logger.info(
+                "[REMD] 建 replica 之前宿主内存: RSS=%d MiB (进程峰值 %d MiB)",
+                _host_baseline[0], _host_baseline[1],
+            )
 
         try:
             if (
@@ -20178,8 +23084,9 @@ class REMDManager:
                         co_alchemical_ion_spec=self.co_alchemical_ion_spec,
                     )
                 else:
-                    sys_xml = openmm.XmlSerializer.serialize(system_template)
-                    replica_sys = openmm.XmlSerializer.deserialize(sys_xml)
+                    # [2026-09-10] 同上：往返 → clone()。这一处在 per-replica 循环体内，
+                    # 每个 replica 都要开一份完整 System 的字符串。
+                    replica_sys = openmm.XmlSerializer.clone(system_template)
                     replica_sys.thisown = 1
                     nb = [f for f in replica_sys.getForces() if isinstance(f, openmm.NonbondedForce)][0]
                     _restore_ligand_internal_nonbonded(
@@ -20224,8 +23131,31 @@ class REMDManager:
             # ⚠️ 显存必须在 `_clear_replica_contexts()` **之前**读——释放之后再读就
             # 只剩一个"失败后已回收"的数，判不了当时到底是不是不够用。
             _vram_at_failure = _gpu_memory_mib()
+            # 同理，宿主内存也必须在释放之前读。`std::bad_alloc` 只说"分配失败"，
+            # 不说是谁占着——没有这个数就分不清"体系太大"和"前面某段泄漏"。
+            _host_at_failure = _host_memory_mib()
+            if _host_at_failure:
+                logger.error(
+                    "[REMD] 建 replica 失败瞬间宿主内存: RSS=%d MiB (进程峰值 %d MiB)"
+                    "%s",
+                    _host_at_failure[0], _host_at_failure[1],
+                    (
+                        f"，建 replica 之前是 RSS={_host_baseline[0]} MiB"
+                        if _host_baseline else ""
+                    ),
+                )
             _n_built = len(self.contexts)
             self._clear_replica_contexts()
+            # 🔑 [2026-09-09] `_clear_replica_contexts()` 只清那三个 list —— 失败那一轮
+            # 的循环局部量 `ctx` / `integ` / `replica_sys` 仍然绑在**本函数的栈帧**上。
+            # 而下面的 CPU 回退重建就跑在同一个 except 帧里（`_build_replicas(...,
+            # allow_platform_fallback=False)`），于是"最后一个 GPU Context + 一份完整
+            # System"会与 N 个新建的 CPU Context 同时存在 —— 恰好是内存已经不够的时刻，
+            # 也恰好是日志刚打完"已释放已创建的 replica contexts"的时刻。
+            ctx = None
+            integ = None
+            replica_sys = None
+            gc.collect()
             if (
                 allow_platform_fallback
                 and str(resolved_platform).upper() in {"CUDA", "OPENCL"}
@@ -20738,151 +23668,161 @@ class REMDManager:
             app.DCDReporter(f, save_interval, append=append_mode, enforcePeriodicBox=False)
             for f in traj_files
         ]
-        print(f"\n启动传统 REMD (单卡懒加载极速版) | {self.n_replicas} 副本 | 交换间隔={exchange_interval}")
+        # 🔑 [2026-09-09] 整段包进 try/finally。原来 `reporters.clear()` 只在
+        # 成功路径执行，而交换循环的失败按设计一律重抛
+        # （`_step_context_with_diagnostics`）—— 于是每次中止都把 N 个 DCDReporter
+        # 连同它们持有的打开文件留给 GC 去收，落盘时机不确定，留下的是半截 DCD；
+        # 而 resume 侧只看文件在不在，`append_mode` 又完全由进程内的
+        # `_steps_completed` 决定，那些截断文件于是被再截断一次而不是修复。
+        # 放进 finally 至少让收尾变成确定性的、且异常路径与成功路径一致。
+        try:
+            print(f"\n启动传统 REMD (单卡懒加载极速版) | {self.n_replicas} 副本 | 交换间隔={exchange_interval}")
         
-        # 预热
-        if not self._is_warmed_up:
-            print("  [REMD] 预热前执行能量/受力 preflight...")
-            for ctx_idx in range(self.n_replicas):
-                self._preflight_context(ctx_idx)
-                self._relax_context_before_preheat(ctx_idx)
-            for ctx_idx in range(self.n_replicas):
-                self._preheat_context_gently(
-                    ctx_idx,
-                    5000,
-                    f"{stage_name}:preheat",
-                )
-            self._is_warmed_up = True
+            # 预热
+            if not self._is_warmed_up:
+                print("  [REMD] 预热前执行能量/受力 preflight...")
+                for ctx_idx in range(self.n_replicas):
+                    self._preflight_context(ctx_idx)
+                    self._relax_context_before_preheat(ctx_idx)
+                for ctx_idx in range(self.n_replicas):
+                    self._preheat_context_gently(
+                        ctx_idx,
+                        5000,
+                        f"{stage_name}:preheat",
+                    )
+                self._is_warmed_up = True
             
-        exchange_log = []
-        # 🔑 [2026-09-03] 逐**边**接受率。`exchange_log`/`mean_acceptance` 是逐
-        # **轮**的（一轮里所有相邻对一起平均），`min_acceptance` 是最差那一轮而
-        # 不是最差那条边——于是"哪条 λ 边太稀"这个信息一直拿不到，而定态数的
-        # 约束恰恰是最差那条边（δ_max），不是平均。
-        # 只统计真正执行过 Metropolis 判定的尝试：下面能量非有限的分支 `continue`
-        # 掉，那不是一次"被拒绝"，不能计入分母。
-        edge_accepts = [0] * max(0, self.n_replicas - 1)
-        edge_attempts = [0] * max(0, self.n_replicas - 1)
+            exchange_log = []
+            # 🔑 [2026-09-03] 逐**边**接受率。`exchange_log`/`mean_acceptance` 是逐
+            # **轮**的（一轮里所有相邻对一起平均），`min_acceptance` 是最差那一轮而
+            # 不是最差那条边——于是"哪条 λ 边太稀"这个信息一直拿不到，而定态数的
+            # 约束恰恰是最差那条边（δ_max），不是平均。
+            # 只统计真正执行过 Metropolis 判定的尝试：下面能量非有限的分支 `continue`
+            # 掉，那不是一次"被拒绝"，不能计入分母。
+            edge_accepts = [0] * max(0, self.n_replicas - 1)
+            edge_attempts = [0] * max(0, self.n_replicas - 1)
 
-        for step in range(n_exchanges):
-            # 1. 批量提交步进任务 (GPU 会在底层自动流水线并发，无需 Python 干预)
-            prev_steps = self._steps_completed
-            for ctx_idx in range(self.n_replicas):
-                state_idx, _, _ = self._context_lambda_label(ctx_idx)
-                self._step_context_with_diagnostics(
-                    ctx_idx,
-                    exchange_interval,
-                    f"{stage_name}:exchange_round={step}:state={state_idx}",
-                )
-            self._steps_completed += exchange_interval
-                
-            # 2. 轨迹落盘
-            if self._crossed_save_boundary(prev_steps, self._steps_completed, save_interval):
-                for state_idx, ctx_idx in enumerate(self._state_to_context):
-                    ctx = self.contexts[ctx_idx]
-                    state = ctx.getState(getPositions=True, enforcePeriodicBox=True)
-                    reporters[state_idx].report(
-                        self._ReporterSimulationView(
-                            self.topology, self._steps_completed, ctx.getIntegrator().getStepSize()
-                        ), state,
+            for step in range(n_exchanges):
+                # 1. 批量提交步进任务 (GPU 会在底层自动流水线并发，无需 Python 干预)
+                prev_steps = self._steps_completed
+                for ctx_idx in range(self.n_replicas):
+                    state_idx, _, _ = self._context_lambda_label(ctx_idx)
+                    self._step_context_with_diagnostics(
+                        ctx_idx,
+                        exchange_interval,
+                        f"{stage_name}:exchange_round={step}:state={state_idx}",
                     )
+                self._steps_completed += exchange_interval
                 
-            accepted = 0
+                # 2. 轨迹落盘
+                if self._crossed_save_boundary(prev_steps, self._steps_completed, save_interval):
+                    for state_idx, ctx_idx in enumerate(self._state_to_context):
+                        ctx = self.contexts[ctx_idx]
+                        state = ctx.getState(getPositions=True, enforcePeriodicBox=True)
+                        reporters[state_idx].report(
+                            self._ReporterSimulationView(
+                                self.topology, self._steps_completed, ctx.getIntegrator().getStepSize()
+                            ), state,
+                        )
+                
+                accepted = 0
             
-            # 3. 交换状态映射而非整份坐标/速度，避免接受交换时的大对象搬运
-            for state_i in range(self.n_replicas - 1):
-                state_j = state_i + 1
-                ctx_idx_i = self._state_to_context[state_i]
-                ctx_idx_j = self._state_to_context[state_j]
-                ctx_i = self.contexts[ctx_idx_i]
-                ctx_j = self.contexts[ctx_idx_j]
+                # 3. 交换状态映射而非整份坐标/速度，避免接受交换时的大对象搬运
+                for state_i in range(self.n_replicas - 1):
+                    state_j = state_i + 1
+                    ctx_idx_i = self._state_to_context[state_i]
+                    ctx_idx_j = self._state_to_context[state_j]
+                    ctx_i = self.contexts[ctx_idx_i]
+                    ctx_j = self.contexts[ctx_idx_j]
                 
-                # --- 阶段 A: 仅获取能量 (极快，PCIe 传输量仅几字节，不阻塞 GPU) ---
-                U_i_i = ctx_i.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-                U_j_j = ctx_j.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+                    # --- 阶段 A: 仅获取能量 (极快，PCIe 传输量仅几字节，不阻塞 GPU) ---
+                    U_i_i = ctx_i.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+                    U_j_j = ctx_j.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
                 
-                # --- 阶段 B: 计算交叉能量 (通过修改参数，GPU 原地重算) ---
-                self._set_context_state(ctx_idx_i, state_j)
-                U_i_j = ctx_i.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-                
-                self._set_context_state(ctx_idx_j, state_i)
-                U_j_i = ctx_j.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-                
-                # 恢复原始参数
-                self._set_context_state(ctx_idx_i, state_i)
-                self._set_context_state(ctx_idx_j, state_j)
-
-                if not np.all(np.isfinite([U_i_i, U_j_j, U_i_j, U_j_i])):
-                    print(
-                        f"  [WARN] [REMD] 交换能量非有限: pair=({state_i},{state_j}) "
-                        f"Uii={U_i_i}, Ujj={U_j_j}, Uij={U_i_j}, Uji={U_j_i}"
-                    )
-                    self._diagnose_context_failure(
-                        ctx_idx_i,
-                        f"{stage_name}:exchange_energy_state{state_i}_{state_j}",
-                    )
-                    self._diagnose_context_failure(
-                        ctx_idx_j,
-                        f"{stage_name}:exchange_energy_state{state_i}_{state_j}",
-                    )
-                    # 刻意不 edge_attempts[state_i] += 1：这一对根本没做判定，
-                    # 计入分母会把"探针坏了"混成"这条边重叠差"。
-                    continue
-                
-                # --- 阶段 C: Metropolis 判定 ---
-                delta = self.beta * (U_i_j + U_j_i - U_i_i - U_j_j)
-                if not np.isfinite(delta):
-                    accept = bool(np.isneginf(delta))
-                else:
-                    accept = delta < 0 or self.rng.random() < np.exp(-delta)
-                
-                # --- 阶段 D: 仅交换状态分配，Context 本身保持连续推进 ---
-                if accept:
-                    self._state_to_context[state_i], self._state_to_context[state_j] = (
-                        ctx_idx_j,
-                        ctx_idx_i,
-                    )
-                    self._context_to_state[ctx_idx_i], self._context_to_state[ctx_idx_j] = (
-                        state_j,
-                        state_i,
-                    )
+                    # --- 阶段 B: 计算交叉能量 (通过修改参数，GPU 原地重算) ---
                     self._set_context_state(ctx_idx_i, state_j)
-                    self._set_context_state(ctx_idx_j, state_i)
-                    accepted += 1
-                edge_attempts[state_i] += 1
-                if accept:
-                    edge_accepts[state_i] += 1
-                    
-            # A one-replica REMD run is valid (it is simply a single-state
-            # simulation), but has no exchange pairs. Avoid 0/0 and record a
-            # well-defined zero acceptance rate.
-            exchange_log.append(accepted / max(1, self.n_replicas - 1))
-            if step % 50 == 0:
-                print(f"  [REMD] 交换轮次 {step}/{n_exchanges} | 接受率: {exchange_log[-1]:.2f}")
-
-        if remaining_steps > 0:
-            prev_steps = self._steps_completed
-            for ctx_idx in range(self.n_replicas):
-                state_idx, _, _ = self._context_lambda_label(ctx_idx)
-                self._step_context_with_diagnostics(
-                    ctx_idx,
-                    remaining_steps,
-                    f"{stage_name}:remaining:state={state_idx}",
-                )
-            self._steps_completed += remaining_steps
-            if self._crossed_save_boundary(prev_steps, self._steps_completed, save_interval):
-                for state_idx, ctx_idx in enumerate(self._state_to_context):
-                    ctx = self.contexts[ctx_idx]
-                    state = ctx.getState(getPositions=True, enforcePeriodicBox=True)
-                    reporters[state_idx].report(
-                        self._ReporterSimulationView(
-                            self.topology, self._steps_completed, ctx.getIntegrator().getStepSize()
-                        ),
-                        state,
-                    )
+                    U_i_j = ctx_i.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
                 
-        # OpenMM 的 DCDReporter 没有公共 close()；对象释放时会完成底层文件收尾。
-        reporters.clear()
+                    self._set_context_state(ctx_idx_j, state_i)
+                    U_j_i = ctx_j.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+                
+                    # 恢复原始参数
+                    self._set_context_state(ctx_idx_i, state_i)
+                    self._set_context_state(ctx_idx_j, state_j)
+
+                    if not np.all(np.isfinite([U_i_i, U_j_j, U_i_j, U_j_i])):
+                        print(
+                            f"  [WARN] [REMD] 交换能量非有限: pair=({state_i},{state_j}) "
+                            f"Uii={U_i_i}, Ujj={U_j_j}, Uij={U_i_j}, Uji={U_j_i}"
+                        )
+                        self._diagnose_context_failure(
+                            ctx_idx_i,
+                            f"{stage_name}:exchange_energy_state{state_i}_{state_j}",
+                        )
+                        self._diagnose_context_failure(
+                            ctx_idx_j,
+                            f"{stage_name}:exchange_energy_state{state_i}_{state_j}",
+                        )
+                        # 刻意不 edge_attempts[state_i] += 1：这一对根本没做判定，
+                        # 计入分母会把"探针坏了"混成"这条边重叠差"。
+                        continue
+                
+                    # --- 阶段 C: Metropolis 判定 ---
+                    delta = self.beta * (U_i_j + U_j_i - U_i_i - U_j_j)
+                    if not np.isfinite(delta):
+                        accept = bool(np.isneginf(delta))
+                    else:
+                        accept = delta < 0 or self.rng.random() < np.exp(-delta)
+                
+                    # --- 阶段 D: 仅交换状态分配，Context 本身保持连续推进 ---
+                    if accept:
+                        self._state_to_context[state_i], self._state_to_context[state_j] = (
+                            ctx_idx_j,
+                            ctx_idx_i,
+                        )
+                        self._context_to_state[ctx_idx_i], self._context_to_state[ctx_idx_j] = (
+                            state_j,
+                            state_i,
+                        )
+                        self._set_context_state(ctx_idx_i, state_j)
+                        self._set_context_state(ctx_idx_j, state_i)
+                        accepted += 1
+                    edge_attempts[state_i] += 1
+                    if accept:
+                        edge_accepts[state_i] += 1
+                    
+                # A one-replica REMD run is valid (it is simply a single-state
+                # simulation), but has no exchange pairs. Avoid 0/0 and record a
+                # well-defined zero acceptance rate.
+                exchange_log.append(accepted / max(1, self.n_replicas - 1))
+                if step % 50 == 0:
+                    print(f"  [REMD] 交换轮次 {step}/{n_exchanges} | 接受率: {exchange_log[-1]:.2f}")
+
+            if remaining_steps > 0:
+                prev_steps = self._steps_completed
+                for ctx_idx in range(self.n_replicas):
+                    state_idx, _, _ = self._context_lambda_label(ctx_idx)
+                    self._step_context_with_diagnostics(
+                        ctx_idx,
+                        remaining_steps,
+                        f"{stage_name}:remaining:state={state_idx}",
+                    )
+                self._steps_completed += remaining_steps
+                if self._crossed_save_boundary(prev_steps, self._steps_completed, save_interval):
+                    for state_idx, ctx_idx in enumerate(self._state_to_context):
+                        ctx = self.contexts[ctx_idx]
+                        state = ctx.getState(getPositions=True, enforcePeriodicBox=True)
+                        reporters[state_idx].report(
+                            self._ReporterSimulationView(
+                                self.topology, self._steps_completed, ctx.getIntegrator().getStepSize()
+                            ),
+                            state,
+                        )
+                
+        finally:
+            # OpenMM 的 DCDReporter 没有公共 close()；对象释放时会完成底层文件收尾。
+            reporters.clear()
+            gc.collect()
         exchange_summary = {
             "stage_name": stage_name,
             "n_replicas": int(self.n_replicas),
@@ -21026,8 +23966,9 @@ class BoreschAttachmentREMDManager(REMDManager):
         platform = openmm.Platform.getPlatformByName(resolved_platform)
         try:
             for i in range(self.n_replicas):
-                sys_xml = openmm.XmlSerializer.serialize(system_template)
-                replica_sys = openmm.XmlSerializer.deserialize(sys_xml)
+                # [2026-09-10] 同上：往返 → clone()。这一处在 per-replica 循环体内，
+                # 每个 replica 都要开一份完整 System 的字符串。
+                replica_sys = openmm.XmlSerializer.clone(system_template)
                 replica_sys.thisown = 1
                 integ = openmm.LangevinMiddleIntegrator(
                     self.temperature, 1.0 / unit.picosecond, 0.002 * unit.picosecond
@@ -21151,8 +24092,8 @@ def compute_boresch_attachment_u_kn(
     """
     import mdtraj as md
 
-    sys_xml = openmm.XmlSerializer.serialize(attachment_system)
-    eval_sys = openmm.XmlSerializer.deserialize(sys_xml)
+    # [2026-09-10] 同上：往返 → clone()。
+    eval_sys = openmm.XmlSerializer.clone(attachment_system)
     eval_sys.thisown = 1
     integrator = openmm.VerletIntegrator(0.001 * unit.picosecond)
     resolved_platform, props = _build_platform_properties(platform_name)
@@ -21337,8 +24278,9 @@ class ShadowBridgeREMDManager(REMDManager):
         platform = openmm.Platform.getPlatformByName(resolved_platform)
         try:
             for i in range(self.n_replicas):
-                sys_xml = openmm.XmlSerializer.serialize(system_template)
-                replica_sys = openmm.XmlSerializer.deserialize(sys_xml)
+                # [2026-09-10] 同上：往返 → clone()。这一处在 per-replica 循环体内，
+                # 每个 replica 都要开一份完整 System 的字符串。
+                replica_sys = openmm.XmlSerializer.clone(system_template)
                 replica_sys.thisown = 1
                 integ = openmm.LangevinMiddleIntegrator(self.temperature, 1.0 / unit.picosecond, 0.002 * unit.picosecond)
                 integrator_seed = self._seed_for(
@@ -21415,8 +24357,8 @@ def compute_shadow_bridge_u_kn(
     if len(traj_files) != n_states:
         raise ValueError(f"traj_files 数量 ({len(traj_files)}) 与 lambdas_bridge_s 数量 ({n_states}) 不一致")
 
-    sys_xml = openmm.XmlSerializer.serialize(bridge_system)
-    eval_sys = openmm.XmlSerializer.deserialize(sys_xml)
+    # [2026-09-10] 同上：往返 → clone()。
+    eval_sys = openmm.XmlSerializer.clone(bridge_system)
     eval_sys.thisown = 1
     integrator = openmm.VerletIntegrator(0.001 * unit.picosecond)
     resolved_platform, props = _build_platform_properties(platform_name)
@@ -21428,8 +24370,18 @@ def compute_shadow_bridge_u_kn(
     n_k = []
     all_xyz = []
     all_box = []
+    # 🔑 [2026-09-09] 循环里原来是 `top=topology if not isinstance(topology, str)
+    # else topology` —— 两个分支完全一样的死条件，实际总是把 OpenMM 的
+    # `app.Topology` 原样递给 mdtraj，而 mdtraj 的 `_parse_topology` 对它只会落到
+    # catch-all 抛 `TypeError: A topology is required`。两个同胞函数
+    # （`compute_u_kn`、attachment 腿那份）都正确地先 `from_openmm`。后果是
+    # shadow-bridge 腿在付完整个 REMD GPU 代价**之后**才死在分析步。
+    # 顺带把转换提到循环外：每个 traj 重做一次纯属白费。
+    md_top = (
+        topology if isinstance(topology, md.Topology) else md.Topology.from_openmm(topology)
+    )
     for traj_path in traj_files:
-        traj = md.load_dcd(traj_path, top=topology if not isinstance(topology, str) else topology)
+        traj = md.load_dcd(traj_path, top=md_top)
         n_k.append(traj.n_frames)
         all_xyz.append(traj.xyz)
         if traj.unitcell_vectors is not None:
@@ -21725,13 +24677,14 @@ class TraditionalMBARAnalyzer:
         self._last_n_k = n_k
         # ✅ 在其下方紧跟着插入 PBC 解包逻辑：
         # 🔑 核心修复：强制 PBC 分子完整性解包，消除跨盒“假撕裂”导致的能量 Spike
-        try:
-            # image_molecules 会根据拓扑连通性，将跨越边界的分子重新拼合
-            # anchor_molecules 确保配体和受体不会在解包时被分到不同的镜像盒子
-            traj.image_molecules(inplace=True)
-            print("  [OK] 轨迹 PBC 分子完整性已修复 (image_molecules)，消除撕裂隐患")
-        except Exception as e:
-            print(f"  [WARN] PBC 修复失败: {e}，将使用原始坐标（存在跨盒撕裂导致 Energy Spike 的风险）")    
+        # 🔑 [PBC-01] 连通性取自 **System**，不取 topology 的键。这里原来是裸的
+        # `traj.image_molecules(inplace=True)`：既没补刚性水的约束（O–H 只以约束
+        # 存在 ⟹ 跨边界的水被逐原子回卷撕开，MEM-15），也挡不住 mmCIF 往返在链数
+        # > 26 时造出来的假键（假边把水拽出一个盒长，2026-09-09 brd4 benchmark）。
+        # 而且外面那层 `except → warning` 是 fail-open：撕开的坐标照样进 u_kn，
+        # PME 排除对跨盒会给出完全错的能量。回卷失败现在直接抛。
+        image_molecules_by_system(traj, system_template, log=print)
+        print("  [OK] 轨迹 PBC 分子完整性已修复（按 System 归组），消除撕裂隐患")
         n_frames = traj.n_frames
         n_states = len(lambdas_coul)
         u_kn = np.zeros((n_states, n_frames))
@@ -21767,10 +24720,24 @@ class TraditionalMBARAnalyzer:
                 "charge_square_sum_e2": float(ligand_charge_square_sum),
                 "source": "ligand_particle_charges_before_offset_preparation",
             })
-        xyz_all = np.asarray(traj.xyz, dtype=np.float64)
+        # 🔑 [MBAR-HOST-MEM 2026-09-09] 坐标全程留在 float32。mdtraj 的
+        # `Trajectory.xyz` 恒为 float32（setter 里 `ensure_type(value, np.float32,
+        # ...)`），DCD 在磁盘上也是 4 字节/坐标——原来这个 `dtype=np.float64` 一分
+        # 精度都换不到，只是在宿主内存里把整条轨迹又复制一份并放大一倍（而且是
+        # 在上面 `del traj_list, traj` 把别的份都还掉**之后**唯一留下的那份）。
+        # 现在 `np.asarray` 是零拷贝。worker 侧仍按 chunk 升到 float64
+        # （`_compute_u_kn_chunk` 第一行），那份只有 chunk_size 帧，是有界的。
+        xyz_all = np.asarray(traj.xyz, dtype=np.float32)
         box_all = None
         if traj.unitcell_vectors is not None and len(traj.unitcell_vectors) > 0:
             box_all = np.asarray(traj.unitcell_vectors, dtype=np.float64)
+        # 🔑 [2026-09-09] 到这里为止 `traj_list`（每个文件一份 float32）和 `traj`
+        # （join 出来的第二份 float32）已经被 `xyz_all`/`box_all` 完整取代，
+        # 但它们仍然被局部名字压着、活到函数结束——而函数后半段正是要 spawn
+        # N 个 worker 的地方。n_k 早在 21954 就取走了，没有别的消费者。
+        # 三份全量坐标同时驻留是白占，这里显式断掉。
+        del traj_list, traj
+        gc.collect()
 
         # BeutlerSoftcoreBuilder uses a CutoffPeriodic L-E force with no OpenMM
         # long-range correction.  For every leg containing that force, add the
@@ -21872,6 +24839,32 @@ class TraditionalMBARAnalyzer:
         chunk_size = max(25, min(250, int(math.ceil(n_frames / max(1, cpu_count * 2)))))
         n_chunks = max(1, int(math.ceil(n_frames / chunk_size)))
         n_workers = min(cpu_count, n_chunks)
+        # 🔑 [2026-09-09] worker 数原来**只按 CPU 数**定，完全不看内存。
+        #
+        # 这条 Pool 用的是 `spawn`：每个子进程都要重新 import 整条 ibs_engine
+        # （连带 openmm / mdtraj / numpy / torch / pymbar-JAX）、反序列化整份
+        # System、再建一个全体系的 OpenMM Context。也就是说**每个 worker 的常驻
+        # 成本大致就是父进程当前的 RSS**，而不是"一个 chunk 的坐标"。
+        # 实测 2026-09-09 cyclod_ligand1/rep1：`400 帧 × 8 态 | workers=16` 之后
+        # 子进程抛 `terminate called after throwing an instance of 'std::bad_alloc'`
+        # ——不是体系大，是 16 份全量运行时同时驻留。
+        #
+        # 按"可用内存 / 单 worker 估算成本"再压一次，估算成本直接取父进程 RSS
+        # （spawn 子进程要把同样的东西再付一遍），留一半余量给 chunk 传输和
+        # 各 Context 自己的临时分配。拿不到内存读数时不改变原有行为。
+        _host_now = _host_memory_mib()
+        _avail = _available_host_mib()
+        if _host_now and _avail:
+            _per_worker_mib = max(256.0, float(_host_now[0]))
+            _budget = max(1, int((0.5 * _avail) // _per_worker_mib))
+            if _budget < n_workers:
+                logger.warning(
+                    "[u_kn] worker 数按内存下调 %d → %d（可用 %d MiB，"
+                    "单 worker 估算 %.0f MiB —— spawn 子进程要重新 import 全套依赖 "
+                    "+ 反序列化整份 System + 建 Context，成本≈父进程 RSS）",
+                    n_workers, _budget, int(_avail), _per_worker_mib,
+                )
+                n_workers = _budget
         # 🔑 [性能修复：进程×线程过度并行] 每个 worker 进程的 OpenMM CPU
         # Context 之前不设线程上限，默认想用满所有物理核——n_workers 个进程
         # 同时这么干就是经典的过度并行。这里按"总物理核数 / worker 进程数"
@@ -21982,7 +24975,7 @@ class TraditionalMBARAnalyzer:
             system_xml = openmm.XmlSerializer.serialize(prepared_system)
             del prepared_system
         else:
-            eval_sys = openmm.XmlSerializer.deserialize(openmm.XmlSerializer.serialize(system_template))
+            eval_sys = openmm.XmlSerializer.clone(system_template)
             eval_sys.thisown = 1
             nb = [f for f in eval_sys.getForces() if isinstance(f, openmm.NonbondedForce)][0]
             _restore_ligand_internal_nonbonded(
@@ -22005,42 +24998,56 @@ class TraditionalMBARAnalyzer:
             f"\n开始离线能量重算 | {n_frames} 帧 × {n_states} 态 | workers={n_workers} | "
             f"chunk_size={chunk_size} | cpu_threads_per_worker={cpu_threads_per_worker}"
         )
-        tasks = []
-        for frame_offset in range(0, n_frames, chunk_size):
-            frame_end = min(frame_offset + chunk_size, n_frames)
-            tasks.append(
-                {
-                    "frame_offset": frame_offset,
-                    "xyz": xyz_all[frame_offset:frame_end].copy(),
-                    "box_vectors": None if box_all is None else box_all[frame_offset:frame_end].copy(),
-                    "system_xml": system_xml,
-                    "ligand_indices": list(ligand_indices),
-                    "lambdas_coul": lambdas_coul_arr,
-                    "lambdas_vdw": lambdas_vdw_arr,
-                    "platform_name": platform_name,
-                    "cpu_threads": cpu_threads_per_worker,
-                    "kt": self.kt,
-                    "use_total_energy": use_total_energy,
-                    "apply_pme_self_correction": apply_pme_self_correction,
-                    "ligand_charge_square_sum": ligand_charge_square_sum,
-                    "pme_self_correction_metadata": pme_self_metadata,
-                    "lj_tail_lrc_coeff_kj_mol": (
-                        None
-                        if lj_tail_lrc_coeff is None
-                        else lj_tail_lrc_coeff.copy()
-                    ),
-                    "traditional_lj_lrc_protocol_version": (
-                        TRADITIONAL_LJ_LRC_PROTOCOL_VERSION
-                    ),
-                }
-            )
+        # 🔑 [2026-09-09] 原来这里把**所有** chunk task 提前物化进 `tasks`，每个
+        # task 带一份 `xyz_all[a:b].copy()` —— 合起来就是全部坐标的又一整份
+        # float64 副本，在 Pool 起来之前就已经驻留，然后 `pool_tasks` 再把这批
+        # dict 浅拷一遍。改成按需生成：父进程任何时刻只压着一个 chunk。
+        # 串行回退路径同样走这个生成器，行为不变（只是不再预先建表）。
+        _frame_offsets = list(range(0, n_frames, chunk_size))
 
-        if n_workers == 1:
-            for task in tasks:
-                frame_offset, u_chunk = _compute_u_kn_chunk(task)
+        def _make_task(frame_offset: int, *, with_context_fields: bool) -> Dict[str, Any]:
+            frame_end = min(frame_offset + chunk_size, n_frames)
+            task = {
+                "frame_offset": frame_offset,
+                "xyz": xyz_all[frame_offset:frame_end].copy(),
+                "box_vectors": None if box_all is None else box_all[frame_offset:frame_end].copy(),
+                "ligand_indices": list(ligand_indices),
+                "lambdas_coul": lambdas_coul_arr,
+                "lambdas_vdw": lambdas_vdw_arr,
+                "kt": self.kt,
+                "use_total_energy": use_total_energy,
+                "apply_pme_self_correction": apply_pme_self_correction,
+                "ligand_charge_square_sum": ligand_charge_square_sum,
+                "pme_self_correction_metadata": pme_self_metadata,
+                "lj_tail_lrc_coeff_kj_mol": (
+                    None if lj_tail_lrc_coeff is None else lj_tail_lrc_coeff.copy()
+                ),
+                "traditional_lj_lrc_protocol_version": (
+                    TRADITIONAL_LJ_LRC_PROTOCOL_VERSION
+                ),
+            }
+            if with_context_fields:
+                # 串行路径（n_workers==1 / 多进程失败回退）自己建 Context，
+                # 需要这三个字段；多进程路径由 `_mbar_worker_init` 在 worker
+                # 启动时建好并复用，不必逐 chunk 再传一遍。
+                task["system_xml"] = system_xml
+                task["platform_name"] = platform_name
+                task["cpu_threads"] = cpu_threads_per_worker
+            return task
+
+        def _run_serial(reason: Optional[str] = None) -> None:
+            if reason:
+                print(f"  [WARN] 多进程重算失败，回退单进程: {reason}")
+            for offset in _frame_offsets:
+                frame_offset, u_chunk = _compute_u_kn_chunk(
+                    _make_task(offset, with_context_fields=True)
+                )
                 frame_end = frame_offset + u_chunk.shape[1]
                 u_kn[:, frame_offset:frame_end] = u_chunk
                 print(f"  → 帧 {frame_end}/{n_frames} 完成")
+
+        if n_workers == 1:
+            _run_serial()
         else:
             try:
                 # 🔑 [性能修复：worker Context 复用 + 不重复传输 System XML]
@@ -22049,32 +25056,83 @@ class TraditionalMBARAnalyzer:
                 # 后续通过 imap_unordered 拉到的所有 chunk 都复用它——不再
                 # 像之前那样每个 chunk 都重新反序列化+重建。既然 Context 已
                 # 经在 worker 启动时用 system_xml/platform_name/cpu_threads
-                # 建好了，pool_tasks 就不用再让每个 chunk 各自带一份（这三
-                # 个字段在一次 compute_u_kn 调用里对所有 chunk 都相同）——
-                # 省掉一份不必要的重复 IPC 序列化开销。任务失败回退到下面
-                # except 分支时用的还是原来完整的 `tasks`（带 system_xml），
-                # 保证串行回退路径行为不变。
-                pool_tasks = [
-                    {k: v for k, v in task.items() if k not in ("system_xml", "platform_name", "cpu_threads")}
-                    for task in tasks
-                ]
+                # 建好了，chunk task 就不用再各自带一份（这三个字段在一次
+                # compute_u_kn 调用里对所有 chunk 都相同）——省掉一份不必要的
+                # 重复 IPC 序列化开销。串行回退路径用带这三个字段的版本，
+                # 行为不变。
+                #
+                # 🔑 [2026-09-09] 喂给 imap_unordered 的是**生成器**，不是预先
+                # 建好的列表：父进程任何时刻只压着一个 chunk 的坐标副本，而不是
+                # 全部 chunk 的副本（那等于全轨迹又一整份 float64）。
+                # 🔑 [2026-09-09] 必须带超时地取结果，否则这一步会**永远挂住**。
+                #
+                # `multiprocessing.Pool` 检测不到 worker 死亡：
+                #   * 子进程被 OOM killer SIGKILL ⇒ `imap_unordered` 永不返回；
+                #   * `initializer`（这里是 `_mbar_worker_init`，要反序列化整份
+                #     System 再建 Context）在子进程里抛异常 ⇒ Pool **无限重生**
+                #     失败的 worker。
+                # 两种都不会给父进程任何输出，表现就是打完"开始离线能量重算"
+                # 之后一行都没有（2026-09-09 cyclod_ligand1/rep1 实况）。
+                # `concurrent.futures.ProcessPoolExecutor` 会抛 `BrokenProcessPool`，
+                # `Pool` 不会 —— 所以这里自己加时限：超时抛出去，由下面的
+                # `except` 转成单进程回退，宁可慢也不要静默挂死。
+                #
+                # 时限按"一个 chunk 该花多久"给足余量：worker 冷启动要重新 import
+                # 整套依赖再建 Context，第一个结果本来就慢，所以首个结果单独给一份
+                # 更长的预算。
+                _first_chunk_timeout_s = float(
+                    os.environ.get("ABFE_UKN_FIRST_CHUNK_TIMEOUT_S", 900.0)
+                )
+                _chunk_timeout_s = float(
+                    os.environ.get("ABFE_UKN_CHUNK_TIMEOUT_S", 600.0)
+                )
                 ctx = mp.get_context("spawn")
                 with ctx.Pool(
                     processes=n_workers,
                     initializer=_mbar_worker_init,
                     initargs=(system_xml, platform_name, cpu_threads_per_worker),
                 ) as pool:
-                    for frame_offset, u_chunk in pool.imap_unordered(_compute_u_kn_chunk, pool_tasks):
+                    _pool_tasks = (
+                        _make_task(offset, with_context_fields=False)
+                        for offset in _frame_offsets
+                    )
+                    _results = pool.imap_unordered(_compute_u_kn_chunk, _pool_tasks)
+                    print(
+                        f"  {n_workers} 个 worker 已提交，等待第一个 chunk"
+                        f"（worker 冷启动含 import + 反序列化 System + 建 Context；"
+                        f"首个结果超时 {_first_chunk_timeout_s:.0f}s，"
+                        f"其后每个 {_chunk_timeout_s:.0f}s）...",
+                        flush=True,
+                    )
+                    _done_chunks = 0
+                    while True:
+                        try:
+                            frame_offset, u_chunk = _results.next(
+                                timeout=(
+                                    _first_chunk_timeout_s
+                                    if _done_chunks == 0
+                                    else _chunk_timeout_s
+                                )
+                            )
+                        except StopIteration:
+                            break
+                        except mp.TimeoutError as _timeout_exc:
+                            raise RuntimeError(
+                                f"离线能量重算卡住：已完成 {_done_chunks}/{len(_frame_offsets)} "
+                                f"个 chunk 后超过时限仍无新结果。"
+                                "multiprocessing.Pool 检测不到 worker 死亡——"
+                                "worker 被 OOM killer 杀掉、或 _mbar_worker_init 在子进程里"
+                                "抛异常（Pool 会无限重生它），都会让这里永远等下去。"
+                                f"当前宿主内存：{_host_memory_mib()}（RSS, 峰值 MiB）、"
+                                f"可用 {_available_host_mib()} MiB。"
+                                "下面回退单进程；要调时限用 ABFE_UKN_CHUNK_TIMEOUT_S。"
+                            ) from _timeout_exc
                         frame_end = frame_offset + u_chunk.shape[1]
                         u_kn[:, frame_offset:frame_end] = u_chunk
+                        _done_chunks += 1
                         print(f"  → 帧 {frame_end}/{n_frames} 完成")
             except Exception as exc:
-                print(f"  [WARN] 多进程重算失败，回退单进程: {exc}")
-                for task in tasks:
-                    frame_offset, u_chunk = _compute_u_kn_chunk(task)
-                    frame_end = frame_offset + u_chunk.shape[1]
-                    u_kn[:, frame_offset:frame_end] = u_chunk
-                    print(f"  → 帧 {frame_end}/{n_frames} 完成")
+                _run_serial(reason=str(exc))
 
         self._last_pme_self_correction_metadata = pme_self_metadata
         self._last_lj_lrc_metadata = lj_lrc_metadata

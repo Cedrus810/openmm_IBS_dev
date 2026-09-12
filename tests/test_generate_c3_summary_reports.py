@@ -42,7 +42,14 @@ _SKIP_IF_NO_FIXTURES = pytest.mark.skipif(
     ),
 )
 
-pytestmark = [pytest.mark.cpu_only, _SKIP_IF_NO_FIXTURES]
+# 🔑 [2026-09-09] 这道 skip 原来挂在 `pytestmark` 上，于是**整份文件**（含 C3
+# 端点闭环那 150 帧的数字）在缺任何一个 fixture 时一起消失。实测本 checkout 里
+# `c1_waterbox` / `c3_real_endpoints_v2` 都在、只缺 94 MB 的 `c2_lipid_slab_v11`，
+# 而后者只有 MEM-00h 那半边需要 —— C3 端点汇总只读
+# `c3_real_endpoints_v2/*.json`。现在按需分别标注：`generate()` 会遍历
+# `CASE_RAW_DIRS`（含 c2 raw），所以调它的用例仍然需要全套；只走
+# `_collect_ab`/`_collect_cd` 的用例不需要。
+pytestmark = pytest.mark.cpu_only
 
 _MODULE_PATH = ROOT / "tools" / "validation" / "generate_c3_summary_reports.py"
 _spec = importlib.util.spec_from_file_location("generate_c3_summary_reports", _MODULE_PATH)
@@ -55,6 +62,7 @@ _MISSING_INPUTS = [
 ]
 
 
+@_SKIP_IF_NO_FIXTURES
 @pytest.mark.skipif(
     bool(_MISSING_INPUTS),
     reason=f"依赖真实 GPU 产物，本环境缺失：{_MISSING_INPUTS}",
@@ -96,6 +104,7 @@ def test_generate_reports_from_real_data_passes_and_is_internally_consistent():
     assert mem00h["passed"] is True
 
 
+@_SKIP_IF_NO_FIXTURES
 @pytest.mark.skipif(
     bool(_MISSING_INPUTS),
     reason=f"依赖真实 GPU 产物，本环境缺失：{_MISSING_INPUTS}",
@@ -135,3 +144,35 @@ def test_generate_reports_fails_closed_if_any_case_reports_failure(monkeypatch):
         assert result["summary"]["status"] == "incomplete"
     finally:
         shutil.rmtree(tampered_dir, ignore_errors=True)
+
+
+@pytest.mark.skipif(
+    bool(_MISSING_INPUTS),
+    reason=f"依赖真实 GPU 产物，本环境缺失：{_MISSING_INPUTS}",
+)
+def test_c3_endpoint_closure_numbers_are_reproducible_without_the_c2_raw_fixture():
+    """C3 端点闭环那 150 帧必须在**本仓库自带的** fixture 上可复核。
+
+    这半边只读 `c3_real_endpoints_v2/*.json`（10 份汇总，几十 KB，随仓分发），
+    不需要 94 MB 的 `c2_lipid_slab_v11` raw 目录 —— 后者只有 MEM-00h 的结构核验
+    用得上。原来两条测试都调 `generate()`，而 `generate()` 会遍历 c2 raw 目录，
+    于是 C3 关闭时依据的那组数字在本 checkout 里**一条都没被验过**。
+    """
+    ab = gen._collect_ab()
+    cd = gen._collect_cd()
+
+    assert ab["n_frames"] == 100, "A/B 端点应为 100 真实帧（C3 关闭时的口径）"
+    assert ab["n_failed"] == 0
+    assert ab["passed"] is True
+    assert cd["n_frames"] == 50, "C/D 端点应为 50 真实帧"
+    assert cd["n_failed"] == 0
+    assert cd["passed"] is True
+    assert ab["n_frames"] + cd["n_frames"] == 150
+
+    # 五个 case 全在，不能只跑通一两个就宣称闭环。
+    assert {c["case"] for c in ab["cases"]} == set(gen.AB_CASES)
+    assert {c["case"] for c in cd["cases"]} == set(gen.CD_CASES)
+    # 每份汇总都带内容哈希，事后可复核用的就是这批文件本身。
+    for case in ab["cases"] + cd["cases"]:
+        assert len(case["sha256"]) == 64
+        assert case["protocol_version"] == 2

@@ -78,9 +78,16 @@ def _prepare_case(tmp_path: Path, *, truncate: bool, random_chk: bool, completed
     _make_dcd(output_dir / "pre_equilibration.dcd", truncate=truncate)
     chk = output_dir / "checkpoints" / "pre_equil.chk"
     if random_chk:
+        # 垃圾字节：真实 loadCheckpoint 必须拒绝它。
         chk.write_bytes(os.urandom(512))
     else:
-        chk.write_bytes(os.urandom(512))
+        # 2026-09-09：这两支原来是**逐字相同**的 `os.urandom(512)`，也就是
+        # `random_chk` 参数完全没有作用 —— 每个用例拿到的都是垃圾 checkpoint，
+        # "有效 vs 无效 checkpoint"这个本意从未被实现。真正的有效 checkpoint 由
+        # 调用方用 `simulation.saveCheckpoint()` 覆盖写入（见
+        # test_valid_complete_case_is_done）；这里放一个空文件，让"非空即有效"
+        # 这种弱判据无处藏身。
+        chk.write_bytes(b"")
     return output_dir
 
 

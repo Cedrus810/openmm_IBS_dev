@@ -8,10 +8,16 @@ from typing import Any, Dict, Tuple
 
 import numpy as np
 
+import pytest
+
+pytestmark = pytest.mark.cpu_only
+
 try:
     from abfe_preoptimizer import estimate_f_k_from_pilot_ti
     from abfe_pipeline import ABFEPipeline, _protocol_fingerprint
     from ibs_engine import (
+        IBSSampler,
+        IBS_TMBAR_UPDATE_DAMPING,
         TRADITIONAL_LJ_LRC_PROTOCOL_VERSION,
         LJ_TAIL_LRC_R_SWITCH_NM,
         LJ_TAIL_LRC_R_CUTOFF_NM,
@@ -25,6 +31,8 @@ except ModuleNotFoundError as exc:  # CPU-only lint hosts may not have OpenMM.
     estimate_f_k_from_pilot_ti = None
     ABFEPipeline = None
     _protocol_fingerprint = None
+    IBSSampler = None
+    IBS_TMBAR_UPDATE_DAMPING = None
     TRADITIONAL_LJ_LRC_PROTOCOL_VERSION = None
     LJ_TAIL_LRC_R_SWITCH_NM = None
     LJ_TAIL_LRC_R_CUTOFF_NM = None
@@ -155,9 +163,22 @@ class SourceContractTests(unittest.TestCase):
         # 31->32（2026-08-31，0831issue.md P1）：修掉逐帧 e_offset 泄漏进
         # tmbar_history 的 u_kn。在线学习/冻结判定的输入变了，按 v30/v31 的既有
         # 处理方式，兼容集合收窄成只有 v32 自己。
-        self.assertIn("IBS_BIAS_PROTOCOL_VERSION = 32", self.engine)
+        #
+        # 32->33（2026-09-05，EXP-031 S1）：`IBS_BIAS_OMIT_ZERO_REST_CVS` 默认翻成
+        # True —— Group-1 不再注册那 K 个恒零的 `cv_k_rest` 占位 CV。采样哈密顿量
+        # 在数学上不变（`cv_k_rest` 是零粒子的 `CustomExternalForce("0")`，贡献严格
+        # 为 0，三条独立路径实测 Group-1 能量逐比特相同），但**表达式字符串与 CV
+        # 集合变了** ⟹ system XML 变 ⟹ 旧的 dual_window_*/ibs_state_* 的
+        # `_int_cv_indices` 与 CV 计数都对不上，不能续用。同样按 v30/v31/v32 的
+        # 处理方式把兼容集合收窄成只有 v33 自己。收益：每步省 0.377 ms
+        # （真 Atenolol 膜体系整步 1.2206x）。
+        #
+        # ⚠️ 这两个常量必须**一起**改：只升版本号而不改兼容集合，会让新版本与它
+        # 自己都判不兼容，resume 全线失效（本次实测 27 条测试因此变红，正是这条
+        # 断言存在的意义）。
+        self.assertIn("IBS_BIAS_PROTOCOL_VERSION = 33", self.engine)
         self.assertIn(
-            "IBS_BIAS_CACHE_COMPATIBLE_PROTOCOL_VERSIONS = frozenset((32,))",
+            "IBS_BIAS_CACHE_COMPATIBLE_PROTOCOL_VERSIONS = frozenset((33,))",
             self.engine,
         )
         self.assertIn(
@@ -291,15 +312,39 @@ class SourceContractTests(unittest.TestCase):
         )
         self.assertIn("IBS_LOCAL_MBAR_GATE_SLIDING_BATCHES = 5", self.engine)
         self.assertIn("gate_mbar = _solve_single_window_local_mbar(", self.engine)
-        self.assertIn(
-            "adjacent_gaps = np.abs(df_current - dF_mbar)", self.engine
-        )
+        # 2026-09-11：拆成带符号 + 绝对值两步。带符号那份是端到端累计偏差门的输入 ——
+        # 只存绝对值会在这一步丢掉符号，累计就只剩 Σ|r| 的上界，判不出"单向累积"
+        # 还是"先偏后抵消"。实测 win3：Σ|r| 与 |Σr| 相等（零抵消）、span=11.47 超门，
+        # 而单边最大仅 4.03、现有 max-adjacent 门完全看不见。
+        self.assertIn("adjacent_gaps_signed = df_current - dF_mbar", self.engine)
+        self.assertIn("adjacent_gaps = np.abs(adjacent_gaps_signed)", self.engine)
         self.assertIn('"phase": "frozen_local_mbar_loose_gate"', self.engine)
         # 现场诊断：饿死态/边 + global 索引 + 原始 softcore Δu，供预算耗尽接受时
         # 判"是可恢复的慢弛豫还是需要插 λ/拆窗的硬瓶颈"。
         self.assertIn("def _diagnose_local_mbar_situation(", self.engine)
         self.assertIn("gate_situation = _diagnose_local_mbar_situation(", self.engine)
         self.assertIn("starved_global_state", self.engine)
+
+    def test_occupancy_early_exit_cannot_preempt_the_first_gate_evaluation(self):
+        # 占据早退是纯路由优化，但它 continue 回 learning 的位置在完整 gate 求解
+        # （validation_attempts += 1）之前。若它在本窗口首次完整评估之前就能命中，
+        # 每个 freeze cycle 都会被它截胡，占据就事实上成了唯一的生产放行门——实测
+        # 4/4 失败的 vanishing 窗口 validation_attempts≈0 即由此而来，且失败后本该
+        # 接手的 3-way router / damped 直接重验分支从未执行过。故 gate 至少被真正
+        # 评估一次之前不得早退。
+        start = self.engine.index('# mode == "validating"')
+        end = self.engine.index("gate_mbar = _solve_single_window_local_mbar(", start)
+        validate_block = self.engine[start:end]
+        guard = validate_block.index("ever_completed_a_validate_attempt\n")
+        probe = validate_block.index("_early_exit_collapsed = bool(")
+        self.assertLess(
+            guard,
+            probe,
+            "占据早退必须被 ever_completed_a_validate_attempt 守住，否则本窗口可能"
+            "一次 local-MBAR loose gate 都评不到就烧完预算",
+        )
+        # 计数只发生在完整 gate 求解之后；早退路径绝不能让它 +1，否则守卫会被自解锁。
+        self.assertNotIn("sampler.validation_attempts = (", validate_block)
 
     def test_production_entry_is_pure_delta_f_gate_ess_diagnostic_only(self):
         # [IBS_BIAS_PROTOCOL_VERSION=29] 生产入口门 = 纯 max|Δf_k−ΔF^MBAR| < 阈值：
@@ -397,56 +442,42 @@ class SourceContractTests(unittest.TestCase):
         # 收敛门已换成 run_all_windows 里的 local-MBAR loose gate）。
         self.assertIn("tmbar_self_consistent", update_body)
 
-    def test_v9_tmbar_damping_reaches_expected_fraction_in_ten_updates(self):
-        tree = ast.parse(self.engine)
-        sampler_class = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.ClassDef) and node.name == "IBSSampler"
-        )
-        update_method = next(
-            node
-            for node in sampler_class.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "_damped_tmbar_absolute_update"
-        )
-        module = ast.fix_missing_locations(
-            ast.Module(body=[update_method], type_ignores=[])
-        )
-        namespace = {
-            "np": np,
-            "Any": Any,
-            "Dict": Dict,
-            "Tuple": Tuple,
-            "IBS_TMBAR_UPDATE_DAMPING": 0.20,
-        }
-        exec(compile(module, "extracted_v9_tmbar_update", "exec"), namespace)
-        dummy = type(
-            "DummySampler",
-            (),
-            {
-                "n_states": 5,
-                "f_history": [],
-            },
-        )()
+    def test_v9_tmbar_damping_reaches_the_production_fraction_in_ten_updates(self):
+        """跑**生产的**方法与**生产的**阻尼常数，不注入测试自己的值。
+
+        原实现把 `_damped_tmbar_absolute_update` 用 AST 抽出来、在
+        `namespace = {..., "IBS_TMBAR_UPDATE_DAMPING": 0.20}` 里 exec，于是被测
+        函数的默认参数绑到 0.20，断言 `1-0.8**10` 与 `effective_damping == 0.20`。
+        生产常数是 0.10（本文件另一条测试自己 grep 着 "= 0.10"），所以那条断言
+        钉的是一个生产永远不会产生的收敛速率，且对生产常数的任何改动免疫。
+        现在直接调真方法、从真常数推期望值：改了 0.10 这里就会跟着变，
+        而"十次更新走完 1-(1-d)^10"这个几何收敛律仍然被钉住。
+        """
+        if _IMPORT_ERROR is not None:
+            self.skipTest(f"project runtime unavailable: {_IMPORT_ERROR}")
+
+        damping = float(IBS_TMBAR_UPDATE_DAMPING)
+        self.assertTrue(0.0 < damping <= 1.0, "生产阻尼必须落在 (0, 1]")
+
+        dummy = type("DummySampler", (), {"n_states": 5, "f_history": []})()
         target = np.array([-20.0, -10.0, 0.0, 10.0, 20.0])
         current = np.zeros(5, dtype=float)
         diagnostics = None
         for _ in range(10):
-            current, diagnostics = namespace["_damped_tmbar_absolute_update"](
-                dummy,
-                current,
-                target,
+            current, diagnostics = IBSSampler._damped_tmbar_absolute_update(
+                dummy, current, target
             )
-        expected_fraction = 1.0 - 0.8 ** 10
+        expected_fraction = 1.0 - (1.0 - damping) ** 10
         np.testing.assert_allclose(
-            current,
-            expected_fraction * target,
-            rtol=0.0,
-            atol=1.0e-12,
+            current, expected_fraction * target, rtol=0.0, atol=1.0e-12
         )
         self.assertEqual(diagnostics["method"], "damped_absolute_tmbar_v9")
-        self.assertAlmostEqual(diagnostics["effective_damping"], 0.20)
+        self.assertAlmostEqual(diagnostics["effective_damping"], damping)
+        # 若哪天有人把默认阻尼改成 1.0（一步到位），这条几何律测试就失去分辨力。
+        self.assertLess(
+            expected_fraction, 1.0 - 1.0e-9,
+            "阻尼为 1.0 时十次更新与一次等价，本测试不再有分辨力",
+        )
 
     def test_physical_free_energy_seeds_are_not_sign_inverted(self):
         pilot_start = self.preoptimizer.index("def estimate_f_k_from_pilot_ti(")
@@ -468,8 +499,11 @@ class SourceContractTests(unittest.TestCase):
             "[-f_by_lambda[k] for k in range(self.n_states)]", tmbar_body
         )
 
-    def test_fixed_h_probe_cache_protocol_version_is_explicit(self):
-        self.assertIn("FIXED_H_PROBE_CACHE_PROTOCOL_VERSION = 3", self.engine)
+    # [2026-09-09] test_fixed_h_probe_cache_protocol_version_is_explicit 已删除：
+    # tests/test_warmup_overlap_protocol.py:820 有同名测试，断言的是**导入的常量**
+    # (`assert FIXED_H_PROBE_CACHE_PROTOCOL_VERSION == 3`)。那一份严格更强 ——
+    # 不依赖源码里 " = 3" 的排版，重新格式化不会假失败。这里这份是同一契约的
+    # 文本重复，删掉不损失覆盖。
 
     def test_production_section_keeps_f_k_read_only(self):
         production = self.engine[
@@ -747,8 +781,53 @@ class SourceContractTests(unittest.TestCase):
         self.assertLess(writer.index("os.fsync(handle.fileno())"), writer.index("os.replace("))
 
     def test_first_base_energy_failure_checks_positions_and_forces(self):
-        self.assertIn("getPositions=True", self.engine)
-        self.assertIn("getForces=True", self.engine)
+        """**首次** e_base 读取失败时必须立刻连坐标和受力一起查。
+
+        2026-09-09 重写：原实现是两条无作用域的全文件 grep
+        （`assertIn("getPositions=True", self.engine)`）。这两个字符串在
+        ibs_engine.py 里分别出现 29 / 20 次，所以把这段代码整段删掉它照样通过 ——
+        它测不到任何东西。真正的位置是 `IBSSampler.collect_energies` 里
+        `self._consecutive_base_failures == 1` 那一支：区分"偶发一帧读不到"与
+        "轨迹已经 NaN"，靠的就是立刻补查坐标/受力，而不是再等五个 MD chunk。
+        现在用 AST 把断言钉在那一支上。
+        """
+        tree = ast.parse(self.engine)
+        fn = next(
+            (n for n in ast.walk(tree)
+             if isinstance(n, ast.FunctionDef) and n.name == "collect_energies"),
+            None,
+        )
+        self.assertIsNotNone(fn, "找不到 collect_energies")
+
+        branches = [
+            node for node in ast.walk(fn)
+            if isinstance(node, ast.If)
+            and "_consecutive_base_failures" in ast.unparse(node.test)
+            and "1" in ast.unparse(node.test)
+        ]
+        self.assertTrue(
+            branches,
+            "collect_energies 里找不到"
+            " `self._consecutive_base_failures == 1` 这一支 —— 首次失败的即时"
+            "诊断被删掉了，或判据改了名（改了请同步本测试）",
+        )
+
+        for node in branches:
+            requested = set()
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call):
+                    continue
+                if getattr(call.func, "attr", None) != "getState":
+                    continue
+                requested |= {
+                    kw.arg for kw in call.keywords
+                    if isinstance(kw.value, ast.Constant) and kw.value.value is True
+                }
+            self.assertIn("getPositions", requested, (
+                "首次 e_base 失败没有立刻查坐标 —— 区分不了"
+                "「偶发一帧读不到」和「轨迹已经 NaN」"
+            ))
+            self.assertIn("getForces", requested, "首次 e_base 失败没有立刻查受力")
 
     def test_owned_system_early_return_validates_swig_object(self):
         core = (ROOT / "abfe_core.py").read_text(encoding="utf-8")
@@ -805,19 +884,11 @@ class SourceContractTests(unittest.TestCase):
         # 覆盖式写法必须彻底消失（两处都是）。
         self.assertNotIn("xp[-1] = 1.0", self.preoptimizer)
 
-        # 数值不变量（与生产实现同一算式，纯 numpy，不需要导入 OpenMM）。
-        weights = np.array([0.05, 0.10, 0.20, 0.40, 0.25])
-        interval_weights = weights[:-1]
-        interval_total = max(1e-10, float(np.sum(interval_weights)))
-        xp = np.concatenate(([0.0], np.cumsum(interval_weights) / interval_total))
-        self.assertEqual(len(xp), len(weights))
-        self.assertAlmostEqual(float(xp[0]), 0.0, places=12)
-        self.assertAlmostEqual(float(xp[-1]), 1.0, places=12)
-        self.assertTrue(np.all(np.diff(xp) > 0.0), "CDF 必须严格单调递增")
-        # 每个区间宽度 == 归一化后的对应权重：没有任何一个被计两次。
-        np.testing.assert_allclose(
-            np.diff(xp), interval_weights / interval_total, rtol=0, atol=1e-12
-        )
+        # 2026-09-09：这里原本紧跟一段"在测试里把修好的公式重写一遍、再断言它
+        # 自己"的算术（xp/interval_total/np.diff 四条 assert）。那是同义反复，
+        # production 一行都没跑到，且与
+        # tests/test_0831issue_p2_batch.py::test_cdf_no_longer_double_counts_...
+        # 逐字重复。已删除；为什么无法改成行为断言，见那条测试的 docstring。
 
     def test_analyze_only_apbs_correction_reads_provenance_not_raw_cli_attr(self):
         # todolist.md P1: --analyze-only used to read the lower-case CLI dest
@@ -864,10 +935,22 @@ class SourceContractTests(unittest.TestCase):
             "if protocol_match and (len(cached_lambdas) == stage1_states or is_verified_auto_repair):",
             self.pipeline,
         )
+        # [2026-09-10] Stage 2 的态数校验对的是**最终生产态数**
+        # (stage2_final_n_states)，不是 pilot 探针密度 stage2_states —— 两者
+        # 允许不同（生产 config 就是 17 探针 / 18 生产态），拿探针数校验会在每次
+        # resume 上误判「状态数不匹配」并重烧一整轮 pilot。protocol_match /
+        # anchor_contract_match 这两个必须条件不变。
         self.assertIn(
             "if protocol_match and anchor_contract_match and (\n"
-            "                        len(cached_lambdas) == stage2_states or is_verified_auto_repair\n"
+            "                        len(cached_lambdas) == _expected_final_states\n"
+            "                        or is_verified_auto_repair\n"
             "                    ):",
+            self.pipeline,
+        )
+        self.assertIn(
+            '_expected_final_states = _resolve(\n'
+            '                        "stage2_final_n_states", "final_state_count"\n'
+            '                    )',
             self.pipeline,
         )
 
@@ -1137,3 +1220,170 @@ class SwitchingAwareLJTailLRCTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# [2026-09-09] 结构性守卫：缓存身份里不得出现"自产产物的哈希"——按**形状**判，
+# 不按 helper 名字判。
+#
+# 已有的 test_todo_verified_fixes.py::test_no_self_generated_hash_may_enter_a_
+# cache_identity 断的是那五个 helper（_code_hash / _system_xml_hash /
+# _topology_hash / _positions_hash / _box_vectors_hash）恒返回 None。那条是对的，
+# 但它按**名字**枚举，抓不到第六条用别的函数名走同一件事的路径 —— 本次静态审计
+# 就找到了一条：`_build_top_level_protocol_key` 里
+#
+#     "preopt_cache_sha256": {
+#         "decharging": _file_sha256(os.path.join(self.checkpoint_dir, "preopt_dual_decharging...json")),
+#         "vanishing":  _file_sha256(os.path.join(self.checkpoint_dir, "preopt_dual_vanishing...json")),
+#     }
+#
+# `_file_sha256` 没有被中性化，哈希的是**本管线自己写出来的** preopt 缓存文件，
+# 而它进的是顶层最终结果缓存身份。形状与已复发三次的那条完全一致（code_sha256
+# 2026-08-24；system_xml_hash + positions_sha256 2026-09-09）：任何让 preopt 缓存
+# 字节变化（键序、多一个诊断字段、浮点 repr）而物理不变的改动，都会作废用户已经
+# 算完的最终结果。而 λ 路径本身在同一个 payload 里已经由 `stage1_protocol_key` /
+# `stage2_protocol_key` 覆盖，这个文件哈希是多余的第二套机制。
+# ---------------------------------------------------------------------------
+
+_CACHE_IDENTITY_BUILDERS = (
+    "_remd_sampling_fingerprint",
+    "_rebalance_fingerprint",
+    "_pre_equilibration_fingerprint",
+    "_stage_protocol_key",
+    "_preopt_protocol_key",
+    "_build_top_level_protocol_key",
+    "_build_sampling_protocol_key",
+    "_build_geodesic_path_protocol_key",
+)
+
+
+def _byte_hashing_functions(tree):
+    """名字无关地找出"读文件字节 → 取哈希"的函数。
+
+    判据是**行为**：函数体里同时出现 `open(..., "rb")` 和一次 hashlib/sha256 调用。
+    `abfe_pipeline._file_sha256` 就是这个形状。按行为认而不是按名字枚举，所以
+    改名、或者有人新写一个同形状的 helper，都还在网里。
+
+    🔑 不要把"对**语义值**取哈希"一起算进来。`ABFEPipeline._lambda_path_fingerprint`
+    内部也算 sha256，但它哈希的是四舍五入后的 λ 数组（内存里的值），不是我们生成的
+    文件字节 —— 那是**正确的**身份，删掉会开真洞（见下面测试的 docstring）。
+    """
+    found = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = ast.dump(node)
+        opens_binary = any(
+            isinstance(c, ast.Call)
+            and (getattr(c.func, "id", None) == "open")
+            and any(
+                isinstance(a, ast.Constant) and isinstance(a.value, str) and "b" in a.value
+                for a in c.args[1:]
+            )
+            for c in ast.walk(node)
+        )
+        hashes = "hashlib" in body or "sha256" in body
+        if opens_binary and hashes:
+            found.add(node.name)
+    return found
+
+
+def _self_product_byte_hashes_in_cache_identities(source=None):
+    """返回 [(builder, lineno, 片段)]：缓存身份里对**文件字节**取哈希的调用。
+
+    `source` 可传源码字符串，供自检用**同一份**判据 —— 不另抄一遍逻辑
+    （抄一遍就变成"测试自己的副本"，正是本文件今天修掉的那类问题）。
+
+    [2026-09-09 第二版] 第一版的判据是「函数名含 sha256/hash 且实参里出现
+    checkpoint_dir/output_dir/…」。那个判据两头都漏：
+      * 漏坏的 —— 把哈希调用挪进一个名字不含 hash 的 helper 就看不见了；
+      * 漏好的 —— 一个读 JSON **内容**、只对语义值取哈希的 helper（现在
+        `_build_top_level_protocol_key` 里的 `_preopt_lambda_identity` 正是如此）
+        同样会用到 `self.checkpoint_dir`，按目录名判会误报，逼后人把正确的绑定删掉。
+    现在改成两段式：先按行为找出"读字节→哈希"的函数集合，再看缓存身份里有没有调它。
+    """
+    if source is None:
+        source = (ROOT / "abfe_pipeline.py").read_text(encoding="utf-8")
+    tree = ast.parse(source, filename="abfe_pipeline.py")
+    byte_hashers = _byte_hashing_functions(tree)
+    if not byte_hashers:
+        return []
+
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or node.name not in _CACHE_IDENTITY_BUILDERS:
+            continue
+        for call in ast.walk(node):   # ast.walk 会进嵌套 def，嵌套 helper 也在网里
+            if not isinstance(call, ast.Call):
+                continue
+            name = getattr(call.func, "attr", None) or getattr(call.func, "id", None)
+            if name in byte_hashers:
+                offenders.append((node.name, call.lineno, ast.unparse(call)[:120]))
+    return offenders
+
+
+def test_no_hash_of_our_own_artifact_bytes_enters_a_cache_identity():
+    """缓存身份里不得对**我们自己生成的文件的字节**取哈希。
+
+    已复发四次（code_sha256 2026-08-24；system_xml + positions 2026-09-09；
+    `_file_sha256(preopt 缓存)` 同日）。字节哈希会让任何"物理不变、字节变了"的
+    改动作废用户已经烧掉的 GPU 时间：键序、多一个诊断字段、浮点 repr、
+    甚至排除表灌入顺序换成 sorted() 都够了。
+
+    ⚠️ **对语义值取哈希是对的，别一起清掉。** 两个必须留着的例子：
+      * `runabfe._sha256_file` 绑用户给的 gro/top/box —— 用户输入才配做身份；
+      * `ABFEPipeline._lambda_path_fingerprint` 对四舍五入后的 λ 数组取 sha256，
+        `_build_top_level_protocol_key` 的 `preopt_lambda_path` 正是用它。
+        **λ 值不在任何 stage protocol key 里**（那两个键只有 `requested_n_states`），
+        λ 路径是预优化器运行期算出来的、只落在 `preopt_dual_*.json` 里。所以这一项
+        不是多余的：删掉它，一条改过的同长度 λ 路径会命中旧的最终结果缓存。
+        （本条 2026-09-09 由 `review project todo list` 会话核实纠正 —— 我先前
+        断言"已被 stage1/stage2 覆盖、是多余的"，那是**错的**。）
+    """
+    offenders = _self_product_byte_hashes_in_cache_identities()
+    assert not offenders, (
+        "这些缓存身份里对**我们自己生成的文件的字节**取了哈希：\n  "
+        + "\n  ".join(f"abfe_pipeline.py:{line} {fn}: {src}" for fn, line, src in offenders)
+        + "\n只有**用户输入**的字节、或**语义值**才配做身份。"
+        "\n正解不是加一层更精细的字节哈希，是改成读内容取语义身份"
+        "（参考 _build_top_level_protocol_key 里的 _preopt_lambda_identity）。"
+    )
+
+
+def test_the_byte_hash_detector_distinguishes_bytes_from_semantic_values():
+    """探测器必须两头都准：报得出字节哈希，且**不**误报语义哈希。
+
+    用**同一个** `_self_product_byte_hashes_in_cache_identities` 跑三段合成源码。
+    第三段是关键：它就是生产现在的写法（读 JSON 内容 → 对语义值取指纹），必须
+    判干净 —— 否则这条测试会逼着后人把 `preopt_lambda_path` 删掉，而那会让改过的
+    λ 路径命中旧的最终结果缓存（真洞）。
+    """
+    dirty = (
+        "import hashlib\n"
+        "def _file_sha256(path):\n"
+        "    with open(path, 'rb') as h:\n"
+        "        return hashlib.sha256(h.read()).hexdigest()\n"
+        "def _stage_protocol_key(self):\n"
+        "    return {'x': _file_sha256(os.path.join(self.checkpoint_dir, 'a.json'))}\n"
+    )
+    renamed = dirty.replace("_file_sha256", "_totally_innocent_name")
+    semantic = (
+        "import hashlib\n"
+        "def _stage_protocol_key(self):\n"
+        "    def _identity(filename):\n"
+        "        with open(os.path.join(self.checkpoint_dir, filename), encoding='utf-8') as h:\n"
+        "            payload = json.load(h)\n"
+        "        return ABFEPipeline._lambda_path_fingerprint(payload.get('lambdas_var'), None)\n"
+        "    return {'x': _identity('preopt_dual_vanishing.json')}\n"
+    )
+
+    assert _self_product_byte_hashes_in_cache_identities(dirty), (
+        "对一段明确的字节哈希都报不出来——探测器坏了，上面那条测试没有意义"
+    )
+    assert _self_product_byte_hashes_in_cache_identities(renamed), (
+        "换个不含 hash 的函数名就躲过去了——判据又退回按名字枚举了"
+    )
+    assert _self_product_byte_hashes_in_cache_identities(semantic) == [], (
+        "对'读内容→语义指纹'的正确写法误报了。按这个误报去删，改过的 λ 路径就会"
+        "命中旧的最终结果缓存 —— 那是真洞，不是整洁问题。"
+    )

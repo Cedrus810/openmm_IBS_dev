@@ -2,7 +2,8 @@
 
 [项目入口](../README.md) · [文档导航](README.md)
 
-> **本页整理截至 2026-09-05**（协议版本一栏当天逐个对过源码常量）。
+> **本页整理截至 2026-09-12**（协议版本一栏当天逐个对过源码常量，六个值与 09-09 相同）。
+> 逐日变更看 [CHANGELOG.md](CHANGELOG.md)。
 >
 > 这是本仓库**唯一**声明"当前科学结论"的文档。三份 README 只对外讲用法，
 > 不再复制这里的任何表格——2026-09-05 之前同样的三张表在 `README.md`、
@@ -31,7 +32,7 @@ Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS
 4W53 那一行的对照：实验值 **−23.10 kJ/mol**（`−5.52 ± 0.04 kcal/mol`），
 差 **0.41 kcal/mol、1.83σ 内**；质量门同时转健康（溶剂腿 stage2 raw ESS
 2.93 → 173.33，top1% 0.828 → 0.047）。逐项证据见
-[BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md](BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md)。
+[archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md](archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md)。
 
 文件名包含 `final` 不代表结果可以引用。Atenolol 那三行的原始 artifact 和机器可读
 登记表（`RESULT_REGISTRY.csv`）在 `Atenolol-rank11` 工作区，不在本分支；
@@ -39,9 +40,14 @@ Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS
 
 ## 仍开放（不阻塞，但必须随数字一起说）
 
-- 溶剂腿 stage2 是唯一有独立参考真值的一项：实测 ≈ **−8.3**，真值
-  **−6.58 ± 0.26**（no-LRC 口径，见 [reference_data/README.md](reference_data/README.md)），
-  差 1.7~4.2 kJ/mol 尚未归因。
+- ~~**溶剂腿 stage2** 与真值差 −4.318 kJ/mol（5.5σ）~~ **→ 2026-09-10 已关闭。**
+  那 5.5σ **100% 是参照臂的盒错了**：参照一直跑在**建系盒** 43.950 nm³，
+  而它比 1 bar 平衡密度大 **3.15%**。配对重跑（同 λ 表、同 seed，只换盒）
+  −6.594 → **−11.490 ± 0.342**，残差变 **+0.592（0.72σ）**。
+  ⚠️ 09-09 写的「密度 20% + 单混合重加权 80%」**两半都作废**——
+  单混合效应同盒重测后为零。
+  ⚠️ 比较前仍**必须先对齐 LRC**，否则得 −1.49（1.9σ）的假象。
+  证据与复现见 [STAGE2_SOLVENT_LEG_ERROR_BUDGET.md](STAGE2_SOLVENT_LEG_ERROR_BUDGET.md)。
 - 独立重复、随机种子账本、时间相关不确定度**仍未闭合**。
 
 ## 协议身份
@@ -51,7 +57,7 @@ Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS
 
 | 协议 | 常量 | 值 |
 |---|---|---|
-| IBS 偏置 | `ibs_engine.IBS_BIAS_PROTOCOL_VERSION` | 32 |
+| IBS 偏置 | `ibs_engine.IBS_BIAS_PROTOCOL_VERSION` | 33 |
 | 热力学路径 | `abfe_preoptimizer.THERMODYNAMIC_PATH_PROTOCOL_VERSION` | 22 |
 | LJ 长程修正 | `ibs_engine.TRADITIONAL_LJ_LRC_PROTOCOL_VERSION` | 3 |
 | WCA 记账 | `ibs_engine.WCA_ACCOUNTING_VERSION` | 3 |
@@ -60,6 +66,14 @@ Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS
 
 `ibs_engine.WCA_SHIELD_RETIRED = True`（λ-WCA 防护壳已退役——这就是上面 4W53
 那个数字从 +12.75 变成 −21.36 的原因）。
+
+> **2026-09-09：`IBS_BIAS_PROTOCOL_VERSION` 32 → 33**（EXP-031 路线 A+B 并入主线，
+> 详见 [EXP-031_GPU_OPTIMIZATION_2026-09-09.md](EXP-031_GPU_OPTIMIZATION_2026-09-09.md)；
+> 融合内核本轮不接）。兼容集合已收窄成 `frozenset((33,))`。
+>
+> ⚠️ `system_xml_sha256` 随之改变 ⟹ **既有 `dual_window_*` / `ibs_state_*` /
+> `convergence.json` 全部失配，必须重跑，不要试图复用。**
+> 这不作废上表里已经登记的数字——那些是已完成运行的记录；失配影响的是 resume/缓存复用。
 
 ## 状态词
 

@@ -25,8 +25,11 @@ from outer_lambda_neural_basis import (
 SCHEMA_VERSION = 2
 FROZEN_SKIN_ANGSTROM = 1.0
 FROZEN_CANDIDATE_LIST_CAPACITY = 8192
+# 2026-09-10 重钉：主线迁移时给插件源码加了 15 行 MIT/NOTICE 版权头，源码正文
+# 与 rank11 冻结版逐字节相同（`diff` 只有那段注释），因此这里连同 manifest 一起
+# 换成新 sha，而不是放宽这道门。旧值 10afff53...b5b0be（无版权头）。
 KNOWN_PLUGIN_SOURCE_SHA256 = (
-    "10afff53ef85aba99b024e4ce5f9a66927cbc0bf9bb392537663934327b5b0be"
+    "b2e730c95ffe643bc1000478f651bb8b34d0fd7fae7d0afa7432e16581b7b154"
 )
 FEATURE_NAME = "Outer-Lambda Local Residual for IBS"
 EM_POLICY = "no_residual_twin"
@@ -115,21 +118,67 @@ def _canonical_json_sha256(value: Mapping[str, Any]) -> str:
     ).hexdigest()
 
 
-def _topology_atomic_numbers(topology, ligand_ids: Sequence[int]) -> list[int]:
-    atoms = list(topology.atoms())
-    n_atoms = len(atoms)
+def topology_atomic_numbers(topology, system=None) -> list[int]:
+    """整条拓扑的原子序数；拓扑没写元素时按"名字 + 质量两个独立来源必须一致"补。
+
+    为什么需要：`GromacsTopFile` 对某些离子不赋元素（4W53 的 45 个 Na 就是
+    `atom.element is None`，写进 `topology.cif` 就是 `type_symbol = ?`）。原来这里
+    直接抛"要求拓扑每个原子都有元素序号"，等于整个 residual 特性在这类体系上不可用。
+
+    补法是**双源一致**才认，任何一边对不上就 fail-closed：原子名当元素符号能解析出
+    元素 **且** System 里那个粒子的质量与该元素相符（0.5 amu 内）。单看名字会把
+    蛋白里的原子名认错，单看质量会被 HMR 骗（重氢化把 H 抬到 3~4 amu、重原子相应
+    变轻），两个一起对上才安全。
+
+    ⚠️ 别改成"从 mdtraj 拓扑读"：mdtraj 对未知元素给的是 `element.virtual`，
+    `atomic_number = 0` —— 不抛错，直接把 0 混进类型词表。
+    """
+
+    from openmm import app, unit
+
+    numbers: list[int] = []
+    unresolved: list[str] = []
+    for index, atom in enumerate(topology.atoms()):
+        element = atom.element
+        if element is not None and element.atomic_number is not None:
+            numbers.append(int(element.atomic_number))
+            continue
+        guess = None
+        try:
+            guess = app.element.Element.getBySymbol(str(atom.name).strip().capitalize())
+        except Exception:
+            guess = None
+        mass_ok = False
+        if guess is not None and system is not None and index < system.getNumParticles():
+            actual = system.getParticleMass(index).value_in_unit(unit.dalton)
+            expected = guess.mass.value_in_unit(unit.dalton)
+            mass_ok = abs(actual - expected) <= 0.5
+        if guess is not None and mass_ok:
+            numbers.append(int(guess.atomic_number))
+            continue
+        unresolved.append(
+            f"#{index} name={atom.name!r} res={atom.residue.name!r}"
+        )
+    if unresolved:
+        raise RuntimeError(
+            "LocalManyBodyResidual 要求拓扑每个原子都有元素序号，下列原子既没有元素、"
+            "也无法由\"原子名 + 质量\"一致推出（共 "
+            f"{len(unresolved)} 个，前 5 个）: {unresolved[:5]}"
+        )
+    return numbers
+
+
+def _topology_atomic_numbers(topology, ligand_ids: Sequence[int], system=None) -> list[int]:
+    n_atoms = topology.getNumAtoms()
     ids = [int(value) for value in ligand_ids]
     if not ids or len(set(ids)) != len(ids) or min(ids) < 0 or max(ids) >= n_atoms:
         raise RuntimeError(
             "LocalManyBodyResidual 的 ligand_indices 必须是拓扑范围内不重复的原子序号"
         )
-    atomic_numbers = []
-    for index in ids:
-        atom = atoms[index]
-        if atom.element is None or atom.element.atomic_number is None:
-            raise RuntimeError("LocalManyBodyResidual 要求配体每个原子都有元素序号")
-        atomic_numbers.append(int(atom.element.atomic_number))
-    return atomic_numbers
+    # 与整拓扑走同一条补元素的路径（见 topology_atomic_numbers），避免配体侧和
+    # 环境侧对"没有元素"给出两种不同的判定。
+    all_numbers = topology_atomic_numbers(topology, system=system)
+    return [all_numbers[index] for index in ids]
 
 
 def _internal_bonds_from_topology(topology, ligand_ids: Sequence[int]) -> set[tuple[int, int]]:
@@ -184,7 +233,7 @@ def ligand_chemical_identity(
     used and an incomplete graph will fail the frozen-model comparison.
     """
     ligand_ids = tuple(int(value) for value in ligand_indices)
-    atomic_numbers = _topology_atomic_numbers(topology, ligand_ids)
+    atomic_numbers = _topology_atomic_numbers(topology, ligand_ids, system=system)
     topology_bonds = _internal_bonds_from_topology(topology, ligand_ids)
     system_bonds = _internal_bonds_from_system(system, ligand_ids) if system is not None else set()
     internal_bonds = system_bonds or topology_bonds
@@ -201,19 +250,23 @@ def ligand_chemical_identity(
     return identity
 
 
-#: 缺少冻结模型资源时的说明。资源只对 Atenolol 有效（manifest 硬绑 41 个原子
-#: 和具体键图），换体系用不上，因此 2026-08-31 发布整理时没有随工程区分支分发。
+#: 缺少冻结模型资源时的说明。一份资源只对它训练的那个配体有效（manifest 绑死
+#: 原子序数序列与内部键图），换配体必须重训。
 RESOURCE_MISSING_HINT = (
-    "Outer-Lambda Local Residual for IBS 的冻结 R1 模型资源不在本仓库中：\n"
+    "Outer-Lambda Local Residual for IBS 的 R1 模型资源不在这个路径上：\n"
     "  {path}\n"
-    "这份资源只对 Atenolol 有效（manifest 硬绑 41 个原子与具体内部键图），"
-    "换体系用不上，所以不随本工程区分支分发。\n"
-    "要在 Atenolol 上启用 outer_lambda_local_residual_ibs，从 Atenolol-rank11 "
-    "工作区取回 resources/outer_lambda_local_residual/ 整个目录，或用 "
-    "resource_manifest= 显式指定一份 manifest。\n"
-    "换成别的配体不能只换 manifest：R1 是按配体训练的模型，必须重训，"
-    "而训练/部署栈（softlift*、student*、teacher_graph、loss、atom_mapping 等）"
-    "同样不随本分支分发，也在 Atenolol-rank11。\n"
+    "一份资源只对它训练的那个配体有效（manifest 绑死配体的原子序数序列与内部"
+    "键图），换配体不能只换 manifest。\n"
+    "已有资源：用 resource_manifest= 指向它，或放回默认位置 "
+    "resources/outer_lambda_local_residual/。\n"
+    "走 runabfe 主线时通常**不该看到这条**：EXP-033 P1 落地后，manifest 缺失或覆盖"
+    "不到当前配体会走自动闭式重训（基线预平衡之后，帧源 pre_equilibration.dcd），"
+    "见 docs/EXP-033_P1_LANDED_2026-09-12.md。看到这条说明 loader 被直接调用了，"
+    "或者那条自动重训本身失败了。\n"
+    "要手工冻一份（做 A/B 时两臂必须共用同一份）：按 docs/RETRAIN_LOCAL_RESIDUAL.md "
+    "重训，再用 scripts/write_local_residual_resource_manifest.py 生成 manifest。"
+    "训练栈已在本仓（local_residual/softlift*、student、loss、environment、"
+    "mace_graph、atom_mapping + scripts/ 下的 exp019/exp020 入口）。\n"
     "不需要该功能时保持该开关为 false 即可（默认值）。"
 )
 
@@ -230,8 +283,12 @@ def _load_resource_manifest(manifest_path: str | Path) -> tuple[dict[str, Any], 
     if doc.get("feature") != FEATURE_NAME:
         raise RuntimeError("LocalManyBodyResidual resource manifest feature 不匹配")
     supported = doc.get("supported_ligand")
-    if not isinstance(supported, Mapping) or supported.get("name") != "Atenolol":
-        raise RuntimeError("冻结 R1 模型的 supported_ligand 必须明确声明为 Atenolol")
+    # 2026-09-10：原来这里硬写 `!= "Atenolol"`。真正的安全属性是"模型只能用在它
+    # 训练的那个配体上"，而那是靠下面的 fingerprint 自洽 + 建 runtime 时拿当前拓扑
+    # 的指纹逐项比对来保证的，不是靠这个字符串。训练栈搬进主线后要能给新配体重训
+    # 出自己的 manifest，所以这里只要求"明确声明了一个配体名"。
+    if not isinstance(supported, Mapping) or not str(supported.get("name", "")).strip():
+        raise RuntimeError("冻结 R1 模型的 supported_ligand 必须明确声明配体名")
     expected_fingerprint = _canonical_json_sha256({
         "atomic_numbers": supported.get("atomic_numbers"),
         "internal_bonds": supported.get("internal_bonds"),
@@ -262,12 +319,17 @@ def atom_type_index_for_topology(
     atomic_numbers: Sequence[int], type_vocabulary: Sequence[int]
 ) -> list[int]:
     type_map = {int(value): index for index, value in enumerate(type_vocabulary)}
-    try:
-        return [type_map[int(number)] for number in atomic_numbers]
-    except KeyError as exc:
+    numbers = [int(number) for number in atomic_numbers]
+    # 一次报**全部**缺失元素。原来是 try/KeyError，只报撞上的第一个 —— 一个膜体系
+    # 同时缺 P/K/Mg 时要连吃三次失败才知道全貌。
+    missing = sorted({number for number in numbers if number not in type_map})
+    if missing:
         raise ValueError(
-            f"拓扑包含不在 LocalManyBodyResidual 固定词表中的元素: {exc.args[0]}"
-        ) from exc
+            f"拓扑包含不在 LocalManyBodyResidual 固定词表中的元素: {missing}"
+            f"（词表 {sorted(type_map)}）。换配体/换体系请用 --outer-lambda-autofit "
+            "按本体系重训一份，词表会跟着体系走。"
+        )
+    return [type_map[number] for number in numbers]
 
 
 def _encode_double_array(values: np.ndarray) -> str:
@@ -369,6 +431,7 @@ class OuterLambdaLocalResidualRuntime:
     ligand_identity: dict[str, Any]
     ligand_indices_sha256: str
     leg_name: str
+    supported_ligand: str
 
     @property
     def energy_offset_kj_mol(self) -> float:
@@ -402,7 +465,7 @@ class OuterLambdaLocalResidualRuntime:
             "plugin": dict(self.plugin_identity),
             "model": {
                 "source_checkpoint_sha256": self.payload.source_checkpoint_sha256,
-                "supported_ligand": "Atenolol",
+                "supported_ligand": self.supported_ligand,
                 "ligand_identity_protocol": LIGAND_IDENTITY_PROTOCOL,
                 "trained_ligand_topology_indices": list(
                     self.payload.ligand_topology_indices
@@ -479,7 +542,9 @@ def build_outer_lambda_local_residual_runtime(
     ) != payload.source_checkpoint_sha256:
         raise RuntimeError("冻结 R1 payload 与 resource manifest 的训练 checkpoint 身份不一致")
     if len(payload.ligand_topology_indices) != int(expected_ligand["atom_count"]):
-        raise RuntimeError("冻结 R1 payload 的 ligand atom count 与 Atenolol manifest 不一致")
+        raise RuntimeError(
+            f"冻结 R1 payload 的 ligand atom count 与 {expected_ligand['name']} manifest 不一致"
+        )
     ligand_ids = tuple(int(value) for value in ligand_indices)
     if len(ligand_ids) != len(payload.ligand_topology_indices):
         raise RuntimeError(
@@ -494,17 +559,13 @@ def build_outer_lambda_local_residual_runtime(
         or ligand_identity["internal_bonds"] != expected_ligand["internal_bonds"]
     ):
         raise RuntimeError(
-            "冻结 LocalManyBodyResidual R1 模型只支持 Atenolol；"
-            "当前配体的局部原子序列或内部键图与 Atenolol 不一致，"
+            f"冻结 LocalManyBodyResidual R1 模型只支持 {expected_ligand['name']}；"
+            "当前配体的局部原子序列或内部键图与它不一致，"
             "拒绝把模型静默用于任意新配体。"
             f" expected_fingerprint={expected_ligand['fingerprint_sha256']},"
             f" actual_fingerprint={ligand_identity['fingerprint_sha256']}"
         )
-    atomic_numbers = []
-    for atom in topology.atoms():
-        if atom.element is None or atom.element.atomic_number is None:
-            raise RuntimeError("LocalManyBodyResidual 要求拓扑每个原子都有元素序号")
-        atomic_numbers.append(int(atom.element.atomic_number))
+    atomic_numbers = topology_atomic_numbers(topology, system=system)
     atom_types = tuple(atom_type_index_for_topology(atomic_numbers, payload.type_vocabulary))
     if ligand_indices_path is None:
         if output_dir is None:
@@ -598,4 +659,5 @@ def build_outer_lambda_local_residual_runtime(
         ligand_identity=ligand_identity,
         ligand_indices_sha256=ligand_indices_sha256,
         leg_name=str(leg_name),
+        supported_ligand=str(expected_ligand["name"]),
     )

@@ -10,6 +10,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
+
+pytestmark = pytest.mark.cpu_only
+
 ROOT = Path(__file__).resolve().parents[1]
 CORE = ROOT / "abfe_core.py"
 RUNABFE = ROOT / "runabfe.py"

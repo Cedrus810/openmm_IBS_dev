@@ -443,13 +443,59 @@ def reference_vanishing_zero_system(
     没对上前者，说明生产端的软核表达式在 λ_vdw=0 处有残留（比如指数用错、
     符号用错），而不是真的把相互作用关掉了。
 
-    配体内部 LJ 不受影响：它已经在 `reference_charging_endpoint_system` 里被
-    冻结成带真实 epsilon 的显式 exception，这里只改主 NonbondedForce 里配体
-    粒子自身的 epsilon，不碰那些 exception。
+    配体内部 LJ 必须原样保留——它是 `U_common` 的一部分，逐 λ_vdw 恒定。
+    但"把配体粒子的 epsilon 设成 0"会连**普通（无 exception）L–L 对**的 LJ 一起
+    杀掉，因为那些对是走 combining rule 从粒子参数现算的。所以置零之前，先把每个
+    普通 L–L 对冻结成显式 exception，把它的 combining-rule LJ 原样搬进去。
+
+    ⚠️ 这段以前不需要，是 v3 [P0-01] 的连带后果：v2 时
+    `reference_charging_endpoint_system` 会把所有内部对补成 exception，
+    LJ 顺带被保住了；v3 停掉补对（对**库仑**是正确的——普通 L–L 库仑必须随粒子
+    电荷线性湮灭），于是普通对的 **LJ** 失去了庇护。2026-09-09 实测：4 原子
+    fixture 的唯一普通对 (0,3) 让 D 门差 22.0575 kJ/mol、原子 0 受力差
+    1143.13 kJ/mol/nm，与手算 `U_LJ(0,3)=22.057512` / `|F|=1143.129513`
+    六位有效数字吻合。**这是参照侧的构造缺陷，不是生产侧的物理错误**，
+    也与 co-ion 无关。
+
+    chargeProd 取当前粒子电荷的乘积：λ=0 时配体电荷已经是 0，所以恒为 0，
+    库仑逐比特不变（PME 的 exception 倒扣项同样正比于 q_i·q_j ⟹ 也是 0）。
+
+    这里只补**普通对**；raw 拓扑自带的 excluded/1-4 exception 一个不动，
+    因此 P0-01 那条"不得增删既有 exception"的约束没有被触碰。
     """
     system = reference_charging_endpoint_system(raw_system, ligand_indices, spec, lam=0.0)
     nb = _find_nonbonded_force(system)
     ligand_set = set(int(i) for i in ligand_indices)
+
+    existing_pairs = set()
+    for exc_idx in range(nb.getNumExceptions()):
+        p1, p2, _cp, _s, _e = nb.getExceptionParameters(exc_idx)
+        existing_pairs.add((min(int(p1), int(p2)), max(int(p1), int(p2))))
+
+    ordered = sorted(ligand_set)
+    for a_pos, i in enumerate(ordered):
+        qi, si, ei = nb.getParticleParameters(i)
+        for j in ordered[a_pos + 1:]:
+            if (i, j) in existing_pairs:
+                continue
+            qj, sj, ej = nb.getParticleParameters(j)
+            sigma = 0.5 * (
+                si.value_in_unit(unit.nanometer) + sj.value_in_unit(unit.nanometer)
+            )
+            epsilon = math.sqrt(
+                ei.value_in_unit(unit.kilojoule_per_mole)
+                * ej.value_in_unit(unit.kilojoule_per_mole)
+            )
+            charge_prod = (
+                qi.value_in_unit(unit.elementary_charge)
+                * qj.value_in_unit(unit.elementary_charge)
+            )
+            nb.addException(
+                i, j,
+                charge_prod * unit.elementary_charge**2,
+                sigma * unit.nanometer,
+                epsilon * unit.kilojoule_per_mole,
+            )
 
     for idx in sorted(ligand_set):
         q, sigma, _epsilon = nb.getParticleParameters(idx)
@@ -1056,6 +1102,16 @@ def load_case_raw_inputs(case_dir) -> Dict[str, Any]:
     `assert_system_not_alchemically_configured`）。
     """
     case_dir = Path(case_dir)
+    # c2_lipid_slab_v11 那批 fixture 有 94 MB，发布整理时没进本仓（tests/fixtures/
+    # validation 现在只剩 c1_waterbox 和 c3_real_endpoints_v2）。所有走这个 loader
+    # 的工具原先都直接抛裸 FileNotFoundError，看不出是"少了数据"还是"路径写错"。
+    if not (case_dir / "system.xml").is_file():
+        raise SystemExit(
+            f"case 目录不可用：{case_dir}\n"
+            "  c2_lipid_slab_v11 这批 fixture 不随本仓分发（94 MB），需要从 "
+            "Atenolol-rank11 工地取回，\n"
+            "  再用 ABFE_VALIDATION_FIXTURES 指向它们的父目录。"
+        )
     with open(case_dir / "system.xml", "r", encoding="utf-8") as fh:
         system = openmm.XmlSerializer.deserialize(fh.read())
     topology = app.PDBxFile(str(case_dir / "topology.cif")).topology

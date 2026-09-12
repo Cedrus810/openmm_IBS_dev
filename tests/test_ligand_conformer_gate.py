@@ -94,7 +94,11 @@ def test_reason_names_the_intervals_and_forbids_widening_the_gate():
     reason = report["reason"]
     assert reason.startswith("cross_leg_conformer_ensembles_do_not_overlap")
     assert "1.338" in reason and "0.707" in reason, "理由里必须带上实测区间"
-    assert "不是**放宽本判据" in reason or "不是" in reason
+    # 2026-09-09：原来是 `... or "不是" in reason`。第二个候选几乎匹配任何中文句子，
+    # 等于把这条断言废掉了。只保留真正要钉的那句。
+    assert "不是**放宽本判据" in reason, (
+        "reason 必须明写「正解不是放宽本判据」——否则下一个人看到门红了会先去调阈值"
+    )
 
 
 def test_missing_summary_is_recorded_as_not_evaluated_not_as_passed():

@@ -5,12 +5,18 @@
 而重训需要的训练栈同样不在本分支）。因此下面所有真正去加载模型的用例改成
 **缺资源时 skip**，而不是删掉——把资源拷回来它们就该重新变绿。
 开关本身的配置契约（不需要资源那几条）继续无条件运行。
+
+2026-09-10：资源已从 Atenolol-rank11 接回本仓，`requires_frozen_r1_resource`
+因此全部通过；标记保留，资源再被移走时它们会重新变成 skip 而不是红。
 """
 
 import json
 from pathlib import Path
 
 import pytest
+
+
+pytestmark = pytest.mark.cpu_only
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _RESOURCE_MANIFEST = _REPO_ROOT / "resources/outer_lambda_local_residual/manifest.json"
@@ -68,13 +74,15 @@ def test_formal_loader_builds_fresh_cpu_plugin_force_without_writing_output():
         build_outer_lambda_local_residual_runtime,
     )
 
+    # 用 fixtures 里的溶剂腿体系：复合物腿那三份冻结产物（topology.cif 9 MB +
+    # system_native.xml 17 MB）不适合当仓库 fixture，而这条断言的是"加载器从
+    # resources/ 取模型、不碰 output/"，跟哪条腿的体系无关。索引直接显式传，
+    # 于是连 output_dir 都不需要——本用例名字里的 "without writing output"。
     root = Path(__file__).resolve().parents[1]
-    topology_path = root / "output/topology.cif"
-    indices_path = root / "output/ligand_indices.json"
-    if not topology_path.is_file() or not indices_path.is_file():
-        pytest.skip("冻结 production artifacts 不在当前 checkout")
-    topology = app.PDBxFile(str(topology_path)).topology
-    system = XmlSerializer.deserialize((root / "output/system_native.xml").read_text())
+    fixtures = root / "tests/fixtures/output"
+    topology = app.PDBxFile(str(fixtures / "topology_solvent.cif")).topology
+    system = XmlSerializer.deserialize((fixtures / "system_solvent.xml").read_text())
+    indices_path = fixtures / "ligand_indices_solvent.json"
     ligand_indices = json.loads(indices_path.read_text())["ligand_indices"]
     runtime = build_outer_lambda_local_residual_runtime(
         topology=topology,
@@ -82,7 +90,7 @@ def test_formal_loader_builds_fresh_cpu_plugin_force_without_writing_output():
         system=system,
         temperature_kelvin=300.0,
         potential_type="softcore",
-        output_dir=root / "output",
+        ligand_indices_path=indices_path,
         platform_name="CPU",
     )
     assert FEATURE_NAME in runtime.provenance_payload()["feature"]
@@ -116,7 +124,9 @@ def test_formal_loader_binds_solvent_indices_to_the_solvent_leg():
         system=system,
         temperature_kelvin=300.0,
         potential_type="softcore",
-        output_dir=root / "output",
+        # 索引文件跟拓扑/System 一样取自 fixtures：仓库的 output/ 在发布整理时
+        # 已经清空，而这条断言只关心 loader 会不会把腿名拼进文件名。
+        output_dir=root / "tests/fixtures/output",
         platform_name="CPU",
         leg_name="solvent",
     )
@@ -200,7 +210,7 @@ def test_formal_pipeline_em_scope_is_canonical_and_exception_safe(monkeypatch):
     assert [name for name, _kwargs in calls] == ["complex", "complex", "solvent"]
 
 
-def test_missing_frozen_resource_fails_closed_with_an_actionable_message():
+def test_missing_frozen_resource_fails_closed_with_an_actionable_message(tmp_path):
     """资源不在时必须说清"为什么没有、怎么拿回来"，不能只抛一个裸路径。
 
     真实场景：2026-08-31 把 `resources/` 移出工程区分支后，
@@ -213,17 +223,21 @@ def test_missing_frozen_resource_fails_closed_with_an_actionable_message():
         _load_resource_manifest,
     )
 
-    missing = _REPO_ROOT / "resources/outer_lambda_local_residual/manifest.json"
-    if missing.is_file():
-        pytest.skip("资源在本 checkout 里，这条只在资源缺失时有意义")
+    # 指一个确定不存在的路径，而不是仓库里那份：这条测的是"缺资源时的错误
+    # 文案"，跟资源当下在不在 checkout 里无关（2026-09-10 资源接回来之后，
+    # 原来那个 `if missing.is_file(): skip` 让它永久失效了）。
+    missing = tmp_path / "resources/outer_lambda_local_residual/manifest.json"
 
     with pytest.raises(FileNotFoundError) as excinfo:
         _load_resource_manifest(missing)
 
     message = str(excinfo.value)
-    # 说清"是什么、为什么没有、怎么拿回来、不用时怎么办"
-    assert "只对 Atenolol 有效" in message
-    assert "Atenolol-rank11" in message
-    assert "必须重训" in message
+    # 说清"是什么、为什么没有、怎么拿回来、不用时怎么办"。
+    # 2026-09-10 训练栈搬进主线后改了口径：不再说"去 rank11 拿训练栈"，改成
+    # 指向仓库内的重训手册；模型的适用范围也不再写死 Atenolol。
+    assert "只对它训练的那个配体有效" in message
+    assert "resource_manifest=" in message
+    assert "docs/RETRAIN_LOCAL_RESIDUAL.md" in message
     assert "false" in message
+    assert (ROOT_DOCS := _REPO_ROOT / "docs/RETRAIN_LOCAL_RESIDUAL.md").is_file(), ROOT_DOCS
     assert "{path}" not in RESOURCE_MISSING_HINT.format(path=str(missing))

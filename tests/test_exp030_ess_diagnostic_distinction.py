@@ -46,6 +46,10 @@ if str(ROOT) not in sys.path:
 from ibs_engine import _ibs_reweighting_quality_diagnostics  # noqa: E402
 
 
+import pytest
+
+pytestmark = pytest.mark.cpu_only
+
 class EssDiagnosticDistinctionTests(unittest.TestCase):
     def setUp(self):
         rng = np.random.default_rng(20260827)

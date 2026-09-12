@@ -28,6 +28,9 @@ import free_energy_engine as fe
 import rbfe_core as rc
 from test_rbfe_hybrid_r1b import POSITIONS, make_mapping, make_system
 
+
+pytestmark = pytest.mark.cpu_only
+
 BOX = [
     openmm.Vec3(3, 0, 0) * unit.nanometer,
     openmm.Vec3(0, 3, 0) * unit.nanometer,
