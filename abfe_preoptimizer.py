@@ -1960,6 +1960,12 @@ class Stage2RepairController:
             "events": events,
             "n_states": len((record or {}).get("states", [])) or None,
             "window_ranges": [tuple(int(x) for x in r) for r in ranges] if ranges else None,
+            # 当前布局的 λ 表。判"某份证据是不是这个布局产出的"要靠它。
+            "lambdas_vdw": [
+                float(st.get("lambda_vdw"))
+                for st in ((record or {}).get("states") or [])
+                if st.get("lambda_vdw") is not None
+            ] or None,
         }
 
     def _read_stage_result(self) -> Optional[Dict[str, Any]]:
@@ -2011,6 +2017,9 @@ class Stage2RepairController:
             "has_convergence": conv is not None,
             "has_warmup_failure": fail is not None,
             "n_states": len(lam) or None,
+            # 这份证据**是在哪套 λ 上产出的**。布局一变它就不再描述这个窗口 ——
+            # 用它做身份，比拿段号/mtime 猜新旧可靠。
+            "lambdas_vdw": [float(x) for x in lam] or None,
             "lambda_span": (max(lam) - min(lam)) if lam else None,
             "bias_status": bias_status,
             "phase": (
@@ -2346,6 +2355,12 @@ class Stage2RepairController:
             if x.get("phase") in ("IDENTITY_MISMATCH", "TERMINAL"):
                 return "PROBLEM"
             if x.get("verdict") == "STATISTICALLY_REJECTED":
+                return "PROBLEM"
+            # 🔑 **"证据被我们自己作废" ≠ "还不知道"。**
+            # 布局一变（插 λ / 拆末窗），旧证据描述的是另一个窗口几何、已被剔除。
+            # 那是**确定的未解决**，不是 UNKNOWN —— 必须挡住下游，否则就会
+            # 「跳过前面的窗口去跑后面的」，正是要防的那个失败模式。
+            if x.get("stale_layout_evidence_only"):
                 return "PROBLEM"
             v = x.get("self_verdict")
             if v in ("HARD_INSUFFICIENT", "INSUFFICIENT_DATA"):
@@ -2804,6 +2819,34 @@ exit_=(
                 windows=[earliest], blocked=blocked, earliest=earliest,
             )
 
+        # ── 边际增长判据：同分布加帧已经被证伪就别再加 ──────────────────
+        # cap 分支的原话：「达到 10 则继续；**边际停滞/下降**或 far-end support
+        # 单调塌陷则关闭 Epoch」。这里只落**无歧义的那一半**：主验收量
+        # `min N_eff/g` **没有上升**。不自造"停滞"阈值。
+        # 真机 win4：3.44 → 2.29 → 2.01 → 1.62，g 15.1 → 168.8，
+        # 每加一次帧/换一次 Epoch 都更糟，而控制器仍在返回 RUN_PRODUCTION。
+        _hist = view.get("min_n_eff_over_g_history") or {}
+        _no_gain = []
+        for w in W:
+            h = [float(v) for _nm, v in (_hist.get(int(w["window_idx"])) or [])]
+            if len(h) >= 2 and max(h[1:]) <= h[0]:
+                _no_gain.append(w)
+        _ng_sel = _pick(_no_gain)
+        if _ng_sel:
+            _h = _hist.get(int(_ng_sel[0])) or []
+            return plan(
+                "INSERT_LAMBDA",
+                f"窗口 {_ng_sel} 的主验收量 min N_eff/g **没有随采样上升**"
+                f"（逐段 {[(nm, round(float(v), 2)) for nm, v in _h]}）⟹ "
+                "同分布加帧已被本窗口自己的数据证伪，**不得再加**。"
+                "瓶颈不是帧数而是这个窗口的跨度：轨迹在不同时间块占据不同 λ 区域，"
+                "连续采样再多也摊不平（窗口内不遍历）。"
+                "对症动作是**缩小跨度**（model B 插 λ，溢出落末窗），"
+                "不是更多帧、也不是再换一份 f_k —— 换 Epoch 同样在同一个跨度上采样。"
+                "⚠️ 这条只在**有至少两段证据**时触发，单段不判。",
+                windows=_ng_sel,
+            )
+
         # 5b) 窗口自检已经判出"帧数不够" ⟹ 补采。**这是 (6) 的提前版**：同一个量、
         #     同一个门槛，只是在该窗口刚跑完那一刻就知道了，不用等全部窗口跑完
         #     （实测浪费：5×250k=125 万步烧完才做第一次预算判断）。
@@ -3105,14 +3148,68 @@ exit_=(
             views.append((nm, sub.read()))
         base_view = dict(views[0][1])
 
+        # 🔑 [2026-09-12] **先按 λ 身份剔除过期证据，再谈段号。**
+        # 原来只按"段号最大且有 convergence"取，等于拿**段号当新旧的代理**。
+        # 那在"段只往前开、基准段从不重跑"时成立；但循环现在会往基准段写
+        # （补采按证据来源路由）、布局变更时整段重跑 —— 基准段反而常常最新。
+        # 真机后果：win4 在基准段已经 43.25 通过，却被 45 分钟前废弃 Epoch 里
+        # 那份 1.62 盖住，于是循环接着去"修"一个已经好了的窗口。
+        #
+        # 判据不是 mtime（脆弱），是**语义身份**：这份证据是在哪套 λ 上产出的。
+        # 对不上当前布局 ⟹ 它描述的是另一个窗口几何，直接丢弃。
+        _path_now = self._read_path()
+        _cur_lam = list(_path_now.get("lambdas_vdw") or [])
+        _cur_rng = [tuple(r) for r in (_path_now.get("window_ranges") or [])]
+
+        def _layout_matches(w) -> bool:
+            got = w.get("lambdas_vdw")
+            i = int(w["window_idx"])
+            if not got or not _cur_lam or i >= len(_cur_rng):
+                return True                     # 缺信息不判死，交下游
+            a, b = _cur_rng[i]
+            want = _cur_lam[a:b]
+            if len(want) != len(got):
+                return False
+            return all(abs(float(x) - float(y)) <= 1e-9 for x, y in zip(want, got))
+
         merged: Dict[int, Dict[str, Any]] = {}
         provenance: Dict[int, str] = {}
+        stale: Dict[int, List[str]] = {}
+        stale_tpl: Dict[int, Dict[str, Any]] = {}
         for nm, v in views:          # 段号升序 ⟹ 后面的覆盖前面的
             for w in v.get("windows") or []:
                 i = int(w["window_idx"])
+                if not _layout_matches(w):
+                    stale.setdefault(i, []).append(nm)
+                    stale_tpl[i] = w          # 留作占位模板：键齐全
+                    continue
                 if i not in merged or w.get("has_convergence"):
                     merged[i] = dict(w, segment=nm)
                     provenance[i] = nm
+        # ⚠️ **证据全过期 ≠ 窗口不存在。** 直接把它从列表里剔掉，窗口就"消失"了，
+        # 决策会越过它去处理下游 —— 正是要防的那个失败模式（跳过前面的窗口）。
+        # 正确语义是「这个窗口目前**没有有效证据**」：留一条占位记录，
+        # `self_verdict=None` ⟹ 三态分类判 UNKNOWN ⟹ 动作是**产出证据**，
+        # 而且它仍然占着自己的位置，earliest 排序不会跳过它。
+        for i, segs in stale.items():
+            if i in merged:
+                continue
+            # 用被剔掉的那份当模板（键齐全），把**所有证据字段清空** ——
+            # 留结构、不留结论。
+            tpl = dict(stale_tpl.get(i) or {})
+            for k in list(tpl):
+                if k not in ("window_idx",):
+                    tpl[k] = None
+            tpl.update({
+                "window_idx": int(i),
+                "segment": None,
+                "has_convergence": False,
+                "has_warmup_failure": False,
+                "stale_layout_evidence_only": True,
+                "stale_segments": list(segs),
+            })
+            merged[i] = tpl
+            provenance[i] = "(证据已被布局变更作废)"
         windows = [merged[i] for i in sorted(merged)]
 
         expected = base_view.get("n_windows_expected")
@@ -3122,10 +3219,44 @@ exit_=(
         skipped = sorted({
             int(x) for _nm, v in views for x in (v.get("skipped_windows") or [])
         })
+        # [2026-09-12] 同一窗口**跨段**的主验收量轨迹。cap 分支早就写明
+        # 「块后立即用 N_eff/g 的边际增长判 —— 边际停滞/下降则停止同分布加帧」，
+        # 但判这件事需要的历史此前根本没进视图，于是规则一直是死的。
+        # ⚠️ **布局变更会作废这段历史。** 插 λ / 拆末窗之后，旧段描述的是**另一个
+        # 窗口几何**，它们的 min N_eff/g 不能再拿来判"加帧有没有用"。真机 15:59
+        # 实证：第一次插完还没产出任何新证据，判据读着旧轨迹又插了一次，
+        # 两次把末窗顶到 K=6 越界炸掉。
+        # 当前路径版本记录里的 `segments_before_change` 就是变更前已有的段。
+        _stale_segs = set()
+        try:
+            import lambda_path_versions as _lpv
+            _cur_rec = _lpv.load_current(self.path_checkpoint_dir) or {}
+            _ev = _cur_rec.get("event") or {}
+            if _ev.get("kind") in ("insert_lambda", "tail_repartition"):
+                _stale_segs = {
+                    str(x) for x in ((_ev.get("detail") or {}).get(
+                        "segments_before_change") or [])
+                }
+        except Exception:
+            _stale_segs = set()
+        support_history: Dict[int, List[Any]] = {}
+        for nm, vv in views:
+            if nm in _stale_segs:
+                continue          # 变更前的几何，不参与边际增长判定
+            for w in vv.get("windows") or []:
+                i = int(w["window_idx"])
+                if w.get("min_n_eff_over_g") is not None:
+                    support_history.setdefault(i, []).append(
+                        (nm, float(w["min_n_eff_over_g"]))
+                    )
         base_view.update({
             "stage_name": getattr(self, "_stage_base", self.stage_name),
             "aggregated_segments": names,
+            "min_n_eff_over_g_history": support_history,
+            "layout_change_invalidated_segments": sorted(_stale_segs),
             "window_provenance": provenance,
+            # 布局变更后作废的逐窗证据（λ 对不上当前布局）。
+            "stale_layout_evidence": {int(k): v for k, v in stale.items()},
             "windows": windows,
             "n_windows_found": len(windows),
             "missing_windows": missing,

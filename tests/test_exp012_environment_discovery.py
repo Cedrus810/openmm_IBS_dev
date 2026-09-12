@@ -13,27 +13,15 @@ import pytest
 from local_residual.environment import build_environment_manifest
 
 
-# Loaded by file path rather than ``from scripts.discover_exp012_environment_config
-# import ...``: ``scripts/`` has no ``__init__.py``, so it is a PEP 420 namespace
-# package, and depending on how a given pytest invocation builds sys.path for this
-# rootdir, ``import scripts`` can bind to an empty/wrong namespace portion instead of
-# this repository's ``scripts/`` directory.  Loading the module directly from its
-# absolute path sidesteps that resolution entirely.
-#
-# ``sys.modules`` is populated *before* ``exec_module`` (the documented pattern
-# for importing a source file directly) so that a function defined in this
-# module -- e.g. the ProcessPoolExecutor worker used for multi-frame discovery
-# -- can still be pickled by module+qualname and found by a child process.
-# Without this, num_workers > 1 raises ModuleNotFoundError when unpickled.
-_MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "discover_exp012_environment_config.py"
-_SPEC = importlib.util.spec_from_file_location("discover_exp012_environment_config", _MODULE_PATH)
-_discover_module = importlib.util.module_from_spec(_SPEC)
-sys.modules[_SPEC.name] = _discover_module
-_SPEC.loader.exec_module(_discover_module)
-
-Exp012EnvironmentDiscoveryError = _discover_module.Exp012EnvironmentDiscoveryError
-assemble_environment_config = _discover_module.assemble_environment_config
-discover_complete_residue_environment = _discover_module.discover_complete_residue_environment
+# 2026-09-12：`scripts/` 已改名 `abfe_scripts/` 并带 `__init__.py`（正规包）。
+# 原来这里按文件路径加载，是为了绕开 `scripts` 与 `mace_torch` 同名顶层包的冲突
+# ——正规包永远赢过 PEP 420 namespace 目录。改名后普通 import 即可，而且对下面
+# ProcessPoolExecutor 的 pickle 更稳：子进程能按 module+qualname 正常 import 回来。
+from abfe_scripts.discover_exp012_environment_config import (
+    Exp012EnvironmentDiscoveryError,
+    assemble_environment_config,
+    discover_complete_residue_environment,
+)
 
 
 pytestmark = pytest.mark.cpu_only

@@ -12,7 +12,7 @@ torch = pytest.importorskip("torch")
 from local_residual.softlift import build_softlift_model, primary_r1_config  # noqa: E402
 
 
-_SCRIPT = Path(__file__).resolve().parents[1] / "scripts/check_exp020_softlift_d2.py"
+_SCRIPT = Path(__file__).resolve().parents[1] / "abfe_scripts/check_exp020_softlift_d2.py"
 _SPEC = importlib.util.spec_from_file_location("exp020_softlift_d2", _SCRIPT)
 _MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MODULE)

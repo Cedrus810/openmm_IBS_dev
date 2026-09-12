@@ -5820,15 +5820,30 @@ class ABFEPipeline:
                 )
                 _lo = int(_stage_range_kwargs.get("min_states_per_window", 4))
                 _hi = int(_stage_range_kwargs.get("max_states_per_window", 6))
+                # 🔑 [2026-09-12] **末窗不套 `_hi`。**
+                # 末窗是**溢出槽**：model B 插 λ 时索引区间固定、多出来的态一律
+                # 落到它身上，所以它天然会比别的窗口大。既定口径是「末窗不加最大
+                # 设置 —— 太大了该加 λ 而不是拆开」。
+                # 这个报错自己的理由也只管**下界**（"内部只剩 K-2 个自由态，
+                # K<lo 压不平占据"），上界从来没有过论证。
+                # 先前一刀切套 `_hi`，于是合法的溢出布局（末窗 K=6）被拒，
+                # 而且拒在**执行时**、离写入点十万八千里 —— 真机就是这么把
+                # v3 写进版本链、然后每次启动都崩在同一个地方。
+                #
+                # 末窗真正的上界是「可拆上限」`2*_hi − 1`：超过它之后两个子窗
+                # 不可能都落在 [lo, hi]（p+q−1=K），溢出槽从此是死胡同。
+                _tail_cap = 2 * _hi - 1
+                _last = len(normalized_ranges) - 1
                 _bad = [
-                    (a, b) for a, b in normalized_ranges
-                    if not (_lo <= b - a <= _hi)
+                    (a, b) for i, (a, b) in enumerate(normalized_ranges)
+                    if not (_lo <= b - a <= (_tail_cap if i == _last else _hi))
                 ]
                 if _bad:
                     raise RuntimeError(
-                        f"权威 window_ranges 含越界窗口 {_bad}；每个 IBS 窗口的态数"
-                        f"必须落在 [{_lo}, {_hi}]（两端各有一个与邻窗共享的边界态，"
-                        f"内部只剩 K-2 个自由态，K<{_lo} 压不平占据）。"
+                        f"权威 window_ranges 含越界窗口 {_bad}；非末窗态数必须落在 "
+                        f"[{_lo}, {_hi}]，末窗（溢出槽）放宽到 [{_lo}, {_tail_cap}]"
+                        f"（两端各有一个与邻窗共享的边界态，内部只剩 K-2 个自由态，"
+                        f"K<{_lo} 压不平占据；末窗 K>{_tail_cap} 则永远拆不开）。"
                     )
                 window_ranges = normalized_ranges
             else:
@@ -6183,9 +6198,32 @@ class ABFEPipeline:
             ),
         )
         if stage_result.get("error"):
-            raise RuntimeError(
-                f"{stage_name} 阶段全局 TMBAR 失败: {stage_result['error']}"
-            )
+            # 🔑 [2026-09-12 真机] **窗口子集跑不产出 stage 级裁决。**
+            # 调用方显式只要了几个窗口（`only_window_indices`），剩下的全被
+            # `_excluded_for_analysis` 排除 —— 这种情况下"全局 TMBAR"本来就
+            # 不是一个完整路径的结论，它失败**不构成致命错误**。
+            #
+            # 真机链条：win4 被判 HARD_INSUFFICIENT ⟹ 求解器跳过它 ⟹ 这次 run
+            # 只跑了 win4 一个窗口 ⟹ 全局 TMBAR 一个可用窗口都没有 ⟹
+            # `no_local_tmbar_results` ⟹ RuntimeError 炸穿自治循环。
+            # 而那个 stage 结果**根本没人用**：自治循环的 stage 裁决来自 ANALYZE
+            # 的全路径合并求解，不来自补采这一次。
+            #
+            # 全窗口跑仍然照旧上抛 —— 那时候它是真的失败。
+            if only_window_indices is not None:
+                self._log(
+                    f"  [{stage_name}] 只跑了窗口 "
+                    f"{sorted(int(x) for x in only_window_indices)} ⟹ "
+                    f"stage 级求解不适用（{stage_result['error']}）。"
+                    "**不是致命错误**：窗口子集本来就给不出完整路径的裁决，"
+                    "完整裁决交全路径分析。"
+                )
+                stage_result["stage_scope"] = "window_subset_no_stage_verdict"
+                stage_result["stage_solve_error_not_fatal"] = stage_result.pop("error")
+            else:
+                raise RuntimeError(
+                    f"{stage_name} 阶段全局 TMBAR 失败: {stage_result['error']}"
+                )
         stage_result.setdefault("stage", stage_name)
         stage_result.setdefault("n_states", int(n_states))
         if _independent_endpoint_enabled:
@@ -10447,6 +10485,40 @@ class ABFEPipeline:
                 allow_untrusted_stage_results=bool(allow_untrusted_stage_results),
             )
             view = ctl.read()
+
+            # 🔑 **每轮先把布局弄合法，再决策。**
+            # 末窗豁免只活在 path-version 层；stage 的权威 window_ranges 校验对
+            # 所有窗口一律要求态数 ∈ [lo, hi]。上一跑要是崩在"插完还没拆"的中间
+            # 状态（真机 15:59：末窗被顶到 K=6，越界且落在死区），那个非法布局会
+            # 原样留在盘上 —— 而循环此前**启动时不校验布局**，于是谁先用权威
+            # ranges 跑谁崩，和上一次一模一样。合法时这里零成本。
+            _tk = ranges[-1][1] - ranges[-1][0]
+            if _tk > 2 * int(max_states_per_window) - 1:
+                # 插哪个窗口：**接着上次没做完的那次修复**。当前路径版本事件里
+                # 记着 `failed_global_state_range`，那就是上次插 λ 的目标窗口。
+                _ev = (_lpv.load_current(checkpoint_dir) or {}).get("event") or {}
+                _fr = (_ev.get("detail") or {}).get("failed_global_state_range")
+                self._log(
+                    f"  [自治] 启动布局校验：末窗 K={_tk} > "
+                    f"{max_states_per_window} ⟹ 先合法化再决策"
+                    f"（续上次针对窗口 {_fr} 的插 λ）。"
+                )
+                lam, ranges = self._legalize_tail_window(
+                    lam, ranges,
+                    failed_range=tuple(_fr) if _fr else None,
+                    pilot=self._load_pilot_for_path_evolution(
+                        os.path.join(checkpoint_dir, "preopt_dual_vanishing.json")),
+                    checkpoint_dir=checkpoint_dir,
+                    min_states_per_window=int(min_states_per_window),
+                    max_states_per_window=int(max_states_per_window),
+                    anchor_getter=lambda: ctl.tail_repartition_anchor(view),
+                    first_untrusted=ctl.first_untrusted_window(view),
+                )
+                # ⚠️ 合法化**改了布局**（拆末窗 ⟹ 窗口数都变了）。
+                # `view` 是改之前读的，拿它去 decide 等于按一个
+                # 已经不存在的布局路由。必须重读。
+                view = ctl.read()
+
             plan = ctl.decide(view)
             act = plan["action"]
             wins = [int(x) for x in (plan.get("windows") or [])]
@@ -10667,7 +10739,13 @@ class ABFEPipeline:
                             reason="autonomous_candidate_rejected_layout_action",
                             detail={"failed_global_state_range": list(_rng),
                                     "inserted_lambda_vdw": idiag["inserted_lambdas"],
-                                    "n_inserted": idiag["n_inserted"]},
+                                    "n_inserted": idiag["n_inserted"],
+                                    # 🔑 布局一变，旧段描述的是**另一个窗口几何**，
+                                    # 它们的 min N_eff/g 轨迹不能再拿来判"加帧有没有
+                                    # 用"。真机 15:59 就是这么连插两次的：第一次插完
+                                    # 还没产出任何新证据，判据读着旧轨迹又插一次。
+                                    "segments_before_change": self._existing_segment_names(
+                                        stage_dir)},
                         )
                         lam = [float(x) for x in new_l]
                         ranges = [tuple(int(i) for i in r) for r in new_r]
@@ -10675,6 +10753,20 @@ class ABFEPipeline:
                             f"  [自治] 插 λ：窗口 {_rng} 跨度 "
                             f"{idiag['failed_window_span_before']:.4f} → "
                             f"{idiag['failed_window_span_after']:.4f}；末窗吸收溢出。"
+                        )
+                        # 🔑 **末窗豁免只活在 path-version 层，执行层不认。**
+                        # 插 λ 允许末窗涨到「可拆上限」2*hi−1（它是溢出槽），
+                        # 但 stage 的权威 window_ranges 校验对**所有**窗口一律要求
+                        # 态数 ∈ [lo, hi]。所以超了就必须**先拆末窗再跑** ——
+                        # 真机 15:59 连插两次把末窗顶到 (17,23)=6 > 5，
+                        # 然后被下游验证器打死。
+                        lam, ranges = self._legalize_tail_window(
+                            lam, ranges, failed_range=_rng, pilot=_pilot,
+                            checkpoint_dir=checkpoint_dir,
+                            min_states_per_window=int(min_states_per_window),
+                            max_states_per_window=int(max_states_per_window),
+                            anchor_getter=lambda: ctl.tail_repartition_anchor(view),
+                            first_untrusted=ctl.first_untrusted_window(view),
                         )
                         result = run_once(
                             len(lam), list(lam), ranges,
@@ -11019,6 +11111,107 @@ class ABFEPipeline:
             f"{stage_dir.rstrip(os.sep)}_{n}",
             os.path.join(checkpoint_dir, f"segment_{n}"),
         )
+
+    def _legalize_tail_window(
+        self, lam, ranges, *, failed_range, pilot, checkpoint_dir,
+        min_states_per_window, max_states_per_window, anchor_getter,
+        first_untrusted,
+    ):
+        """把末窗弄回**执行层**合法（每个窗口态数 ∈ [lo, hi]）。返回 (lam, ranges)。
+
+        末窗豁免只活在 path-version 层：插 λ 允许它涨到「可拆上限」2*hi−1，因为它是
+        溢出槽。但 stage 的权威 window_ranges 校验对**所有**窗口一律要求 [lo, hi]，
+        所以跑之前必须合法化。
+
+        死区：K ∈ (hi, 2*lo−1) 既不能当单窗（超 hi）又拆不开（可拆区间
+        [2*lo−1, 2*hi−1]）。4/5 配置下死区只有 K=6 ⟹ 补 1 到 K=7 ⟹ 唯一拆法 4+4
+        （`[17,18,19,X] + [X,20,21,22]`，共享新插的 X）。
+        想要「俩 4」就只能补 1：补 2 到 K=8 只能拆 4+5 / 5+4，而「补 2 且俩 4」
+        意味着接缝上没有共享节点 —— 相邻 ensemble 没有公共态对齐自由能参考，
+        自由能链在那里断开。
+        """
+        from abfe_preoptimizer import (
+            insert_lambda_in_failed_ibs_window,
+            repartition_tail_from_anchor,
+            record_tail_repartition_version,
+        )
+
+        # 末窗的上界是**可拆上限** `2*hi−1`，不是 `hi` —— 它是溢出槽。
+        # 只有超过可拆上限才必须动手，否则原样放行（K=6 走到这里直接返回）。
+        lo, hi = int(min_states_per_window), int(max_states_per_window)
+        split_lo = 2 * lo - 1
+        tail_cap = 2 * hi - 1
+        ranges = [tuple(int(i) for i in r) for r in ranges]
+        tail_k = ranges[-1][1] - ranges[-1][0]
+        if tail_k <= tail_cap:
+            return [float(x) for x in lam], ranges
+
+        while hi < tail_k < split_lo:
+            if failed_range is None or pilot is None:
+                # ⚠️ **不能原样返回。** 那是个执行层非法的布局，下游权威校验必然
+                # 拒；带着它往下跑只会换个地方炸。
+                raise RuntimeError(
+                    f"末窗 K={tail_k} 落在死区（{hi} < K < {split_lo}），但取不到"
+                    "失败窗口区间或 pilot ⟹ 无法合法化。fail-closed。"
+                )
+            lam, ranges, _d = insert_lambda_in_failed_ibs_window(
+                list(lam), list(ranges), tuple(failed_range), pilot[0], pilot[1],
+                min_states_per_window=lo, max_states_per_window=hi, n_insert=1,
+            )
+            ranges = [tuple(int(i) for i in r) for r in ranges]
+            # 🔑 **每一次插点都要进版本链。** 先前这里只改内存不落盘：版本链上
+            # 只看得到后面那条 `tail_repartition`，λ 表却悄悄多了一个态；而且一旦
+            # 下面 anchor 取不到就原样返回，内存与盘上永久不一致。
+            import lambda_path_versions as _lpv_dz
+            _lpv_dz.append_version(
+                checkpoint_dir, [0.0] * len(lam), list(lam),
+                [list(r) for r in ranges],
+                kind="insert_lambda",
+                reason="tail_dead_zone_legalization",
+                detail={
+                    "failed_global_state_range": list(failed_range),
+                    "inserted_lambda_vdw": _d["inserted_lambdas"],
+                    "n_inserted": _d["n_inserted"],
+                    "tail_k_after": ranges[-1][1] - ranges[-1][0],
+                },
+            )
+            tail_k = ranges[-1][1] - ranges[-1][0]
+            self._log(
+                f"  [自治] 末窗落在死区（{hi} < K < {split_lo}）⟹ 补 1 个："
+                f"K={tail_k}，可拆区间 [{split_lo}, {2 * hi - 1}]。"
+            )
+
+        anchor = anchor_getter()
+        if anchor is None:
+            raise RuntimeError(
+                f"末窗 K={tail_k} 超执行层上限 {hi} 但取不到 tail anchor ⟹ "
+                "无法拆。fail-closed：不带着非法布局继续。"
+            )
+        new_ranges, tdiag = repartition_tail_from_anchor(
+            lam, ranges, anchor,
+            min_states_per_window=lo, max_states_per_window=hi,
+        )
+        record_tail_repartition_version(
+            checkpoint_dir, lam, new_ranges, tdiag,
+            first_untrusted_window=first_untrusted,
+        )
+        self._log(
+            f"  [自治] 末窗 K={tail_k} 超执行层上限 {hi} ⟹ 拆："
+            f"{tdiag['old_ranges']} → {tdiag['new_ranges']}。"
+        )
+        return ([float(x) for x in lam],
+                [tuple(int(i) for i in r) for r in new_ranges])
+
+    @staticmethod
+    def _existing_segment_names(stage_dir: str):
+        """盘上已有的采样段目录名（含基准段），按名字排序。"""
+        base = os.path.basename(os.path.normpath(stage_dir))
+        out = [base]
+        for d in sorted(glob.glob(stage_dir.rstrip(os.sep) + "_*")):
+            suf = os.path.basename(d).rsplit("_", 1)[-1]
+            if os.path.isdir(d) and suf.isdigit():
+                out.append(os.path.basename(d))
+        return out
 
     @staticmethod
     def _latest_segment_dirs(stage_dir: str, checkpoint_dir: str):

@@ -221,7 +221,7 @@ def test_cli_requires_explicit_paths_and_writes_requested_output(tmp_path):
     result = subprocess.run(
         [
             sys.executable,
-            str(ROOT / "scripts" / "build_exp012_environment_manifest.py"),
+            str(ROOT / "abfe_scripts" / "build_exp012_environment_manifest.py"),
             "--config",
             str(config_path),
             "--output",
@@ -237,7 +237,7 @@ def test_cli_requires_explicit_paths_and_writes_requested_output(tmp_path):
     assert result.stdout.strip() == load_environment_manifest(output)["canonical_sha256"]
 
     missing = subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "build_exp012_environment_manifest.py")],
+        [sys.executable, str(ROOT / "abfe_scripts" / "build_exp012_environment_manifest.py")],
         cwd=ROOT,
         text=True,
         capture_output=True,

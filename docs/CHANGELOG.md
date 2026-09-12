@@ -37,6 +37,9 @@
 | 09-12 | **文档补上「CUDA 插件必须自己编译」**：仓库不发任何 `.so`（`.gitignore` 排除 `plugins/*/build*`），而 loader 默认路径正是 `build/`，新 clone 一开开关就炸。写进 GETTING_STARTED《CUDA 插件》+ TROUBLESHOOTING。支持的 SM 范围由 mamba 环境的 `cuda-version=12.9` 决定（PTX sm_75~120），插件本身不锁 SM | — |
 | 09-12 | 诊断脚本里两个个人路径 argparse default 改 `required=True`，加 `tests/test_no_personal_paths_as_defaults.py` 全仓 AST 扫描防复发 | 否 |
 | 09-12 | **新增 clone 可导入门** `tests/test_fresh_clone_imports.py`：AST 扫全部已跟踪 `.py`，模块级 import 未跟踪模块 → 硬红（clone 当场 `ModuleNotFoundError`），惰性 import → 软门登记。**这道门就是发布清单本身。** 实测捞出 `step_guard.py` 未跟踪导致四个入口模块在 fake clone 里全死 | 否 |
+| 09-12 | **修好 `self-test` 唯一一条红**：`resume/cache invalidation system hash` 断的是「不同质量给出不同哈希」，但 `_system_xml_hash` 09-09 已退役恒返回 None ⟹ 它在比 `None != None`。改成断言**退役契约**（两个真 System 都必须是 None），比 `test_todo_verified_fixes.py` 的 `fn(None)` 更强，并在注释里写明「红了不要靠让哈希复活来弄绿」| 否 |
+| 09-12 | **顶层 `scripts/` 改名 `abfe_scripts/`（并加 `__init__.py` 变正规包）**：`mace_torch` 0.3.16 装了顶层正规包也叫 `scripts`，而本仓的只是 PEP 420 namespace 目录 ⟹ **正规包永远赢**，`runabfe.py` 闭式重训里 `from scripts.write_local_residual_resource_manifest import main` **在任何装了 MACE 的环境里必炸**（EXP-033 P1「真机没跑过」漏掉的那段）。同批全仓扫了顶层重名：24 个名字里只有 `scripts` 和 `tests` 撞车，都来自 mace_torch；`tests` 是潜伏的（没有任何 `from tests.` 用法，pytest 不走包名），未改 | 否 |
+| 09-12 | **预编译插件 `.so` 改为随仓库分发**（用户拍板）：对着 `openmm=8.5.2` 编的，而环境文件钉的就是这个版本 ⟹ 按 `environment.yml` 建环境**开箱可用，不用编**。只有不走环境文件用了别的 OpenMM 版本、或改了插件源码才需要重编 | — |
 | 09-11 | **Stage-2 分窗与多采样段重构**：一次会话查出并修掉八个真 bug（预热失败与生产质量门混淆、f_k 加帧前从不重标定、第二段采样被 bridge rescue 悄悄丢掉、分窗判据用等弧长而非 ∫g dλ 等）。全量 2083 passed | 否 |
 | 09-11 | **Stage-2 自治闭环接通**：`abfe_pipeline._run_stage2_autonomous()` 的 `decide → execute → reread`，默认开。剩余 4 件活见 [STAGE2_AUTONOMOUS_LOOP_STATUS](STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md) | 否 |
 | 09-11 | 三轴耦合（分窗口/分 λ/分采样量）现状快照 + 路径最小修补计划稿（**计划，未实现**） | — |

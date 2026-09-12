@@ -44,10 +44,18 @@
 > 只在用 `--outer-lambda-local-residual-ibs` 时才需要。**默认生产路径不加载插件**
 > （开关默认 `false`），不用这个功能可以整节跳过。
 
-`LocalManyBodyResidual` 是一个 OpenMM native plugin。**本仓库不分发任何 `.so`** ——
-`.gitignore` 排除了 `plugins/*/build` 和 `plugins/*/build_*`，所以新 clone 下来
-默认加载路径 `plugins/LocalManyBodyResidual/build/` **根本不存在**，
-开关一打开就会报 `缺少 LocalManyBodyResidual 插件库: …`。
+`LocalManyBodyResidual` 是一个 OpenMM native plugin。仓库里**带了一份预编译
+`.so`**，对着 **OpenMM 8.5.2** 编的 —— 而
+[`environment.yml`](../environment.yml) / [`environment-ci.yml`](../environment-ci.yml)
+钉的正是 `openmm=8.5.2`。**按环境文件建环境的话，直接能用，不用编。**
+
+要自己编的只有两种情况：
+
+1. 你没走环境文件，装的是**别的 OpenMM 版本**（`.so` 吃的是 OpenMM 私有平台头，
+   跨版本不保证可用）；
+2. 你改了插件源码。
+
+重编是秒级的，出现加载期符号错误时第一个动作也是它。
 
 ### 怎么编
 

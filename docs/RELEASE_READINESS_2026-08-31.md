@@ -6,6 +6,22 @@
 这是发布评估，不是五万多行代码的逐行正确性证明。评估期间核心文件仍有更新，
 文中行号用于定位检查时的实现；正式验收需要在冻结版本上重新执行。
 
+> ## 2026-09-12 更新：两条已按用户决定划掉，别再当缺口
+>
+> 下面 08-31 的原文不改（维护规则 3），但其中两条**不再是发布门**：
+>
+> 1. **不打包。** 原文列的「可安装的交付物」**不做**。发布定位是
+>    **clone-and-run**：`git clone` 之后直接 `python runabfe.py …`。
+>    `pyproject.toml` 只承担 linter 配置，不加 `[project]` / `[build-system]`，
+>    不加 `setup.py` / `MANIFEST.in`。别再把"装不了"当阻塞项提。
+> 2. **科学结论不是发布门。** 这是 **dev 通道**：发的是代码能不能跑，不宣称
+>    任何可引用的数值。独立重复、种子账本、GPU 复验属于在途工作，
+>    状态一律以 [STATUS.md](STATUS.md) 为准，不进发布阻塞清单。
+>
+> ⟹ 剩下的发布门只有**工程**那一类：clone 下来 import 得动、跑得动。
+> 判据就是 `pytest tests/test_fresh_clone_imports.py`，清单见
+> 《发布要带哪些文件》一节。
+
 ## 结论与建议发布范围
 
 核心工作流已经形成，不建议为了 release 继续增加新的势函数、采样算法或输入后端。
@@ -23,6 +39,43 @@
   科学结果达到生产资格合并成一个“成功”。
 
 即使缩小范围，以下安装、核心回归和复现契约也需要通过后才能称为可使用的预览版。
+
+## 发布要带哪些文件（2026-09-12 fake-clone 实测）
+
+用"只保留 git 跟踪路径 + 工作树内容"重建一份 clone 实测出来的，不是静态推断。
+**这份清单不要往别处抄**——真正的判据是 `pytest tests/test_fresh_clone_imports.py`，
+它绿了才说明 clone import 得动。
+
+### 核心流水线：只差三个顶层模块
+
+| 文件 | 为什么 |
+|---|---|
+| `step_guard.py` | **模块级** import，`ibs_engine.py:34` / `abfe_pipeline.py:124` / `abfe_preoptimizer.py:23`。缺了这一个，四个入口模块在 clone 里全部 `ModuleNotFoundError` |
+| `lambda_path_versions.py` | 惰性 import（`abfe_pipeline` 5 处 + `abfe_preoptimizer` 1 处）。import 过得去，跑到那一步才死 |
+| `multi_segment_analysis.py` | 惰性 import（`abfe_pipeline` 2 处 + `ibs_engine` 3 处）。同上 |
+
+三个都自包含。**它们跟着进，别人 clone 下来核心就能跑。**
+
+### outer-λ residual（可选功能）：还要再六个
+
+默认关（`outer_lambda_local_residual_ibs=false`），不用这个功能可以不带。要带的话：
+
+- `local_residual/{softlift,softlift_dataset,refit}.py` —— 目前该目录只跟踪 4/20；
+  运行时加载那条是自足的（`tests/test_import_time_side_effects.py` 守着），
+  但**闭式重训**要这三个；
+- `abfe_scripts/` —— 跟踪数 **0**。`runabfe.py:6313` 惰性
+  `from abfe_scripts.write_local_residual_resource_manifest import main`
+  会在 clone 里死，[RETRAIN_LOCAL_RESIDUAL.md](RETRAIN_LOCAL_RESIDUAL.md) 的
+  ①②③④ 四步链也整条不可用；
+- `resources/outer_lambda_local_residual/`（09-12 已定随首发）。
+
+`exp012_xed/` 是**二阶**依赖：没有任何已跟踪文件 import 它，只有
+`local_residual/{ledger_audit,metrics,mm_ledger,schema}.py` 用 `import *` 吃它，
+而那四个本身也未跟踪。闭式重训链不碰它。
+
+CUDA 插件不在这份清单里：`plugins/` 的 34 个源码文件已跟踪，`g0_build.sh` 也在，
+外加一份对着 `openmm=8.5.2`（环境文件钉的版本）编好的 `.so`。见
+[GETTING_STARTED.md](GETTING_STARTED.md)《CUDA 插件》。
 
 ## 已有基础：不要重复建设
 
@@ -156,8 +209,8 @@ ABFE_RANDOM_SEED 未设置时，main._repeat_seed = None
 > 1. CPU/CUDA 数值一致性与关闭时基线不变的随包测试证据；
 > 2. EXP-033 P2（这个闭式臂到底值不值得留）；
 > 3. ⚠️ **随发的文件还没配齐**——自动重训链踩在未跟踪的模块上：
->    `runabfe.py:6313` 惰性 `from scripts.write_local_residual_resource_manifest import main`，
->    而 `scripts/` 的 git 跟踪数是 **0**；`local_residual/` 只跟踪了 4/20，
+>    `runabfe.py:6313` 惰性 `from abfe_scripts.write_local_residual_resource_manifest import main`，
+>    而 `abfe_scripts/` 的 git 跟踪数是 **0**；`local_residual/` 只跟踪了 4/20，
 >    闭式重训还要 `softlift.py` / `softlift_dataset.py` / `refit.py`。
 >    以 `pytest tests/test_fresh_clone_imports.py` 的软门登记表为准。
 >
