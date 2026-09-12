@@ -31,6 +31,9 @@
 
 | 日期 | 变更 | 破缓存 |
 |---|---|---|
+| 09-12 | **预编译插件 `.so` 真的进仓库了**（09-12 早先只拍了板没执行）：`.gitignore` 加三条例外放行 `build` 符号链接 + `build_exp026_a2/*.so`，并单独排掉没有扩展名的 gtest 可执行文件（放开目录会把它们一起放进来）。`git add -An plugins/` 应当只有 4 条。GETTING_STARTED/TROUBLESHOOTING/docs/README 同步成「随仓库分发、按环境文件建环境不用编」 | 否 |
+| 09-12 | **发布文档改口径**：`RELEASE_READINESS` 不再当「首发规划」读——项目在**开发最末期**，剩下是收尾。原文按维护规则 3 不重写，加告示 + 逐条标掉已办/已划掉的（打包、R1/R2、资源随发、文档同步）；过期的 fake-clone 清单（「abfe_scripts 跟踪数 0 / local_residual 只跟踪 4/20」）改写成状态表 | — |
+| 09-12 | **文档整理统一**：`TODO.md` 改成唯一待办清单（六条已关闭缺陷整段进 `archive/`，不留 `[x]` 尸体），并把散在专题文档里的开放项收编成 `S2-` / `LR-` / `REL-` 四组编号；四份 README + `PROJECT_LAYOUT.md` 的仓库地图补全（漏了 RBFE 整条线和 9 个顶层模块），并翻掉两条与实际树相矛盾的旧维护规则（`exp0XX_*` 不进本仓、residual 不随首发）；`EXP-031_…_09-04` / `AUDIT_2026-09-09` / `STAGE2_WINDOW_AND_SEGMENT_REDESIGN` / `HANDOFF_LOCAL_RESIDUAL` 四份结案文档归档并带告示。`docs/` 内 228 条链接 0 坏链 | 否 |
 | 09-12 | **EXP-033 P1 闭式重训接入主线**：配体指纹对不上冻结 manifest 时不再 fail，改为预平衡跑完后自动闭式重训 `B_φ`，两条 vdW 腿共用这份权重（`local_residual/refit.py` + `runabfe.py`）。取代旧四步重训链的 ①②。**离线测试全绿，真机一次没跑过** —— [EXP-033_P1_LANDED_2026-09-12.md](EXP-033_P1_LANDED_2026-09-12.md) | 否 |
 | 09-12 | **EXP-033 P3（跨配体通用权重）划掉**（用户拍板）：P3 的前提是「逐配体重训很贵」，P1 把重训压成一次闭式求解后前提不成立。连带**不必改 CUDA kernel**（省掉 `KNOWN_PLUGIN_SOURCE_SHA256` 两处同步 + G0–G4 重验 + 成本门重跑）。EXP-033 只剩 P2 开着 | — |
 | 09-12 | **`resources/outer_lambda_local_residual/` 改为随首发**（用户拍板，翻转 08-31 的「residual sampling 不随首发」）：当时不发是因为「只能跑 Atenolol、永远没法换体系」，P1 闭式重训之后这条前提没了 | — |

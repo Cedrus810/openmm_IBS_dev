@@ -7756,7 +7756,21 @@ def main():
         # 自报 summary 交上去；缺哪一侧就记 not_evaluated，不会伪装成通过。
         complex_conformer_summary=complex_results.get("ligand_conformer_diagnostics"),
         solvent_conformer_summary=solv_results.get("ligand_conformer_diagnostics"),
+        strict_cross_leg_conformer=bool(
+            config.get("strict_cross_leg_conformer", False)
+        ),
     )
+    if cycle.get("cross_leg_conformer_gate") == "WARN":
+        log.warning(
+            "[跨腿构象门 WARN] 两条腿的配体构象系综不重叠：%s",
+            (cycle.get("cross_leg_conformer_report") or {}).get("reason", ""),
+        )
+        log.warning(
+            "[跨腿构象门 WARN] **不阻断汇总**（构象差在这类装置上是必然产物："
+            "溶剂腿里 vdW 一关配体就塌，复合物腿里主体腔卡住它）。"
+            "但这**不等于没事** —— 下面这个 ΔG_bind 里有一项构象自由能差没被计入，"
+            "结果中永久记为 cross_leg_conformer_gate=WARN。"
+        )
     delta_g_bind_uncorrected = cycle["delta_G_bind_uncorrected_kJ_mol"]
     delta_g_bind = cycle["delta_G_bind_kJ_mol"]
     total_err_bind = cycle["total_error_kJ_mol"]

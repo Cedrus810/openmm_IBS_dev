@@ -20,5 +20,18 @@ __pycache__/
 # 所以规则不能带尾斜杠（带斜杠只匹配目录）。
 plugins/*/build
 plugins/*/build_*
+
+# 例外：预编译的 LocalManyBodyResidual 插件**随仓库分发**（2026-09-12 拍板）。
+# 对着 openmm=8.5.2 编的，而 environment.yml 钉的就是这个版本 ⟹ 按环境文件建环境
+# 开箱可用，不用编。只有不走环境文件用了别的 OpenMM 版本、或改了插件源码才需要重编。
+#
+# ⚠️ 顺序有讲究：git 不会下降进被排除的**目录**，所以必须先把 `build_exp026_a2/`
+# 本身放回来，再放里面的 `*.so`。`build` 那条放的是**符号链接**（指向前者）。
+!plugins/LocalManyBodyResidual/build
+!plugins/LocalManyBodyResidual/build_exp026_a2/
+!plugins/LocalManyBodyResidual/build_exp026_a2/*.so
+# 但编译出来的 gtest 可执行文件没有扩展名，不被上面的 *.o/*.so/*.a 挡住，
+# 而放开目录就把它们一起放了进来 —— 单独排掉。
+plugins/LocalManyBodyResidual/build_exp026_a2/tests/
 .mypy_cache/
 .ruff_cache/

@@ -578,7 +578,23 @@ def load_ibs_window_outputs_from_dir(
         if u_kn.shape[0] != int(end) - int(start):
             raise ValueError(f"窗口 {local_idx} 状态数与 window_ranges 不符")
         lc, lv = list(lambdas_coul[start:end]), list(lambdas_vdw[start:end])
-        if convergence.get("lambdas_coul") != lc or convergence.get("lambdas_vdw") != lv:
+        # 🔑 [2026-09-12] **在量化栅格上比，不做浮点精确相等。**
+        # λ 路径落盘时被 `lambda_path_versions._q()` 量化到 LAMBDA_DECIMALS 位，
+        # 而窗口 convergence.json 记的是**实际采样用的**那个未量化值。两者因此
+        # 天然差半个栅格（真机实测 win4：路径 0.31005333 vs 采样 0.310053335，
+        # 差 5e-9），于是：
+        #   · 采样侧 resume 门用 np.allclose ⟹ 判"λ 匹配、跳过重采"
+        #   · 这里用精确相等        ⟹ 判"λ 不匹配"、抛 ValueError
+        # 同一个不变量两套严格度 ⟹ 那个窗口**永远采不了也永远读不了**，每次启动必崩。
+        #
+        # 这不是放宽判据：λ 既然量化到 8 位，任何**真实**的 λ 差异都 ≥ 1e-8，
+        # 而量化往返噪声 ≤ 5e-9。把两边都归一到栅格上再精确比较，既消掉噪声，
+        # 又保持对真实差异的 fail-closed。
+        def _grid(vals):
+            return [round(float(x), LAMBDA_GRID_DECIMALS) + 0.0 for x in (vals or [])]
+
+        if (_grid(convergence.get("lambdas_coul")) != _grid(lc)
+                or _grid(convergence.get("lambdas_vdw")) != _grid(lv)):
             raise ValueError(f"窗口 {local_idx} lambda 内容与当前路径不匹配")
         if stage_type == "vdw" and convergence.get("vdw_nonbonded_protocol_version") != VDW_NONBONDED_PROTOCOL_VERSION:
             raise ValueError(f"窗口 {local_idx} vdW 非键协议版本不匹配")
@@ -651,6 +667,14 @@ def load_ibs_window_outputs_from_dir(
             if field == "stage_protocol_key":
                 observed = _stage_window_sampling_identity(observed)
                 expected = _stage_window_sampling_identity(expected)
+            elif field in ("lambdas_coul", "lambdas_vdw"):
+                # 与上面同一条理由：λ 路径落盘时被量化到 LAMBDA_GRID_DECIMALS 位，
+                # manifest 记的是实际采样值，两者天然差半个栅格。归一到栅格上
+                # 再精确比较 —— 消掉量化噪声，保持对真实 λ 差异的 fail-closed。
+                observed = [round(float(x), LAMBDA_GRID_DECIMALS) + 0.0
+                            for x in (observed or [])]
+                expected = [round(float(x), LAMBDA_GRID_DECIMALS) + 0.0
+                            for x in (expected or [])]
             if observed != expected:
                 raise ValueError(f"窗口 {local_idx} production manifest {field} 不匹配")
         if production_manifest.get("frozen_f_k_sha256") != frozen_hash:
@@ -7644,6 +7668,13 @@ IBS_LOCAL_MBAR_GATE_MAX_BATCHES = 15
 # ⚠️ 与 `minimum_complete_validation_frames`（原始帧完整性要求，实测 200）是
 # **两个量**。混掉会把 gcrit 算小 20 倍 —— 实测后果：win4 只差 26% 帧数
 # （600 → 需要 773），却被判成"差 7.5 倍、预算内不可达"。
+# λ 比较栅格：与 `lambda_path_versions.LAMBDA_DECIMALS` 同源，**不另立一份**
+# （两份常量各自漂移正是这个 bug 的成因）。
+try:
+    from lambda_path_versions import LAMBDA_DECIMALS as LAMBDA_GRID_DECIMALS
+except Exception:  # pragma: no cover —— 极端情况下退回同一个字面量
+    LAMBDA_GRID_DECIMALS = 8
+
 IBS_LOCAL_MBAR_GATE_MIN_FRAMES = 10
 
 _LOCAL_MBAR_INSUFFICIENT_DATA_ERRORS = frozenset((

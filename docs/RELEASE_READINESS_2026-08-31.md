@@ -6,6 +6,19 @@
 这是发布评估，不是五万多行代码的逐行正确性证明。评估期间核心文件仍有更新，
 文中行号用于定位检查时的实现；正式验收需要在冻结版本上重新执行。
 
+> ## 2026-09-12 更新：这不再是「首发规划」，是**开发末期的收尾清单**
+>
+> 本文 2026-08-31 写成时的语境是「准备第一个研究预览版（`0.1.0a1`）」。
+> **那个语境已经过去了** —— 项目现在处于**开发最末期**：核心流水线、Stage-2
+> 自治控制器、闭式重训都已跑通，剩下的是收尾，不是从零规划一次首发。
+>
+> 所以读本文时：
+>
+> - 正文里的「预览版前」「首发支持范围」「建议版本号 `0.1.0a1`」都是**当时的措辞**，
+>   按维护规则 3 不原地重写；**当成"末期还欠什么"读**，别当成一次尚未开始的发布筹备。
+> - 还真正欠着的只有 [TODO.md](TODO.md) §3《发布工程门》那几条，其余要么已办、
+>   要么已被用户划掉。
+>
 > ## 2026-09-12 更新：两条已按用户决定划掉，别再当缺口
 >
 > 下面 08-31 的原文不改（维护规则 3），但其中两条**不再是发布门**：
@@ -28,6 +41,10 @@
 当前缺口主要是：**最新版本的运行时验证、可安装的交付物、可解释的结果资格、
 可复现的基准，以及长期任务的运行保护**。
 
+> ⚠️ **下面这段是 2026-08-31 的原文，措辞停在「准备一个预览版」。**
+> 现在的实际状态是开发末期收尾，支持范围本身没变、仍然有效，读的时候把
+> 「建议先准备」换成「当前声明的支持范围就是」。
+
 建议先准备范围明确的研究预览版（例如 `0.1.0a1`，仅为建议版本号）：
 
 - 首个支持目标限定为：经验证的中性配体、可溶体系、softcore、dual-lambda、
@@ -40,42 +57,27 @@
 
 即使缩小范围，以下安装、核心回归和复现契约也需要通过后才能称为可使用的预览版。
 
-## 发布要带哪些文件（2026-09-12 fake-clone 实测）
+## 发布要带哪些文件
 
-用"只保留 git 跟踪路径 + 工作树内容"重建一份 clone 实测出来的，不是静态推断。
+> **2026-09-12 复核：下面列过的全部已跟踪，只剩 `.so` 一项。**
+> 原来那份 fake-clone 实测清单（"只差三个顶层模块 / `abfe_scripts` 跟踪数 0 /
+> `local_residual` 只跟踪 4/20"）**已全部处置完毕**，留在这里只会误导，故改写。
+
 **这份清单不要往别处抄**——真正的判据是 `pytest tests/test_fresh_clone_imports.py`，
 它绿了才说明 clone import 得动。
 
-### 核心流水线：只差三个顶层模块
+| 组 | 内容 | 状态 |
+|---|---|---|
+| 核心流水线 | `step_guard.py`（**模块级** import ×3，缺了四个入口模块全部 `ModuleNotFoundError`）、`lambda_path_versions.py`、`multi_segment_analysis.py` | ✅ 已跟踪 |
+| outer-λ residual（可选，默认关） | `local_residual/`（20/20）、`abfe_scripts/`（8）、`resources/outer_lambda_local_residual/`（3） | ✅ 已跟踪 |
+| `exp012_xed/` | **二阶依赖**：没有任何已跟踪文件直接 import 它，只有 `local_residual/{ledger_audit,metrics,mm_ledger,schema}.py` 用 `import *` 吃它。闭式重训链不碰 | ✅ 已跟踪 |
+| CUDA 插件源码 | `plugins/` 的 34 个源码文件 + `g0_build.sh` | ✅ 已跟踪 |
+| **预编译 `.so`** | 对着 `openmm=8.5.2`（`environment.yml` 钉的版本）编好的三份，外加 `build -> build_exp026_a2` 那个符号链接 | ✅ 已跟踪（2026-09-12 执行；`.gitignore` 加了三条例外 + 排掉 gtest 可执行文件） |
 
-| 文件 | 为什么 |
-|---|---|
-| `step_guard.py` | **模块级** import，`ibs_engine.py:34` / `abfe_pipeline.py:124` / `abfe_preoptimizer.py:23`。缺了这一个，四个入口模块在 clone 里全部 `ModuleNotFoundError` |
-| `lambda_path_versions.py` | 惰性 import（`abfe_pipeline` 5 处 + `abfe_preoptimizer` 1 处）。import 过得去，跑到那一步才死 |
-| `multi_segment_analysis.py` | 惰性 import（`abfe_pipeline` 2 处 + `ibs_engine` 3 处）。同上 |
-
-三个都自包含。**它们跟着进，别人 clone 下来核心就能跑。**
-
-### outer-λ residual（可选功能）：还要再六个
-
-默认关（`outer_lambda_local_residual_ibs=false`），不用这个功能可以不带。要带的话：
-
-- `local_residual/{softlift,softlift_dataset,refit}.py` —— 目前该目录只跟踪 4/20；
-  运行时加载那条是自足的（`tests/test_import_time_side_effects.py` 守着），
-  但**闭式重训**要这三个；
-- `abfe_scripts/` —— 跟踪数 **0**。`runabfe.py:6313` 惰性
-  `from abfe_scripts.write_local_residual_resource_manifest import main`
-  会在 clone 里死，[RETRAIN_LOCAL_RESIDUAL.md](RETRAIN_LOCAL_RESIDUAL.md) 的
-  ①②③④ 四步链也整条不可用；
-- `resources/outer_lambda_local_residual/`（09-12 已定随首发）。
-
-`exp012_xed/` 是**二阶**依赖：没有任何已跟踪文件 import 它，只有
-`local_residual/{ledger_audit,metrics,mm_ledger,schema}.py` 用 `import *` 吃它，
-而那四个本身也未跟踪。闭式重训链不碰它。
-
-CUDA 插件不在这份清单里：`plugins/` 的 34 个源码文件已跟踪，`g0_build.sh` 也在，
-外加一份对着 `openmm=8.5.2`（环境文件钉的版本）编好的 `.so`。见
-[GETTING_STARTED.md](GETTING_STARTED.md)《CUDA 插件》。
+⚠️ `.gitignore` 里那组例外**顺序不能动**：git 不会下降进被排除的**目录**，
+所以必须先 `!…/build_exp026_a2/` 把目录本身放回来，再 `!…/*.so`；而编出来的
+gtest 可执行文件没有扩展名、不被 `*.o`/`*.so`/`*.a` 挡住，得单独排掉
+（`…/build_exp026_a2/tests/`）。改完用 `git add -An plugins/` 验一遍**只有 4 条**。
 
 ## 已有基础：不要重复建设
 
@@ -167,7 +169,7 @@ ABFE_RANDOM_SEED 未设置时，main._repeat_seed = None
 
 | 优先级 | 补什么 | 当前证据 | 可检查的完成标准 |
 |---|---|---|---|
-| 预览版前 | 可安装的 Python 包与命令 | `pyproject.toml` 只有工具设置，没有 `[build-system]`、`[project]`、依赖或 console script | 构建 wheel/sdist；在干净目录安装 wheel，离开源码目录仍能运行 help、诊断和示例；安装资源齐全 |
+| ~~预览版前~~ | ~~可安装的 Python 包与命令~~ | **2026-09-12 用户决定：不打包，已关闭。** 发布定位是 **clone-and-run**；`pyproject.toml` 只承担 linter 配置，不加 `[project]` / `[build-system]` / `setup.py` / `MANIFEST.in` | —（别再把「装不了」当阻塞项提；判据是 `pytest tests/test_fresh_clone_imports.py`） |
 | 预览版前 | 环境与支持矩阵 | `environment.yml` 含 `/home/canna/...` prefix 与 CUDA 12.9 开发工具链；文档写 Python 3.10+，CI 只测 3.12 | 基础环境与 GPU/ML 可选环境分离；声明已测版本组合；干净机器按文档安装成功；不依赖个人路径 |
 | 预览版前 | 最新核心回归证据 | 8 月 31 日交接记录明确只有静态通过；本轮也缺必需运行依赖 | 锁定待发布源码，在完整环境跑 CPU 全套，记录 passed/failed/skipped；必需功能不能因 importorskip 被跳过后算通过；GPU smoke 另跑 |
 | ~~预览版前~~ | ~~小型端到端 fixture~~ | **2026-09-02 用户决定：不作为本仓的缺口，已关闭。** 本仓是**工程区分支**（见 [PROJECT_LAYOUT.md](../PROJECT_LAYOUT.md)），端到端贯通的证据是**真实生产运行本身**——4W53 那次热力学循环闭合就是走真实 `runabfe.py` 入口跑完的，原始轨迹、checkpoint 与产物在 `Atenolol-rank11`，不在本仓 | —（不要再在 `tests/` 里加"走真实 CLI 的小体系 fixture"当验收项；要复核贯通性去看生产运行的原始产物） |
@@ -208,11 +210,10 @@ ABFE_RANDOM_SEED 未设置时，main._repeat_seed = None
 > **仍然欠着的**：
 > 1. CPU/CUDA 数值一致性与关闭时基线不变的随包测试证据；
 > 2. EXP-033 P2（这个闭式臂到底值不值得留）；
-> 3. ⚠️ **随发的文件还没配齐**——自动重训链踩在未跟踪的模块上：
->    `runabfe.py:6313` 惰性 `from abfe_scripts.write_local_residual_resource_manifest import main`，
->    而 `abfe_scripts/` 的 git 跟踪数是 **0**；`local_residual/` 只跟踪了 4/20，
->    闭式重训还要 `softlift.py` / `softlift_dataset.py` / `refit.py`。
->    以 `pytest tests/test_fresh_clone_imports.py` 的软门登记表为准。
+> 3. ~~随发的文件还没配齐~~ **2026-09-12 已办完**：`abfe_scripts/`（8）、
+>    `local_residual/`（20/20）、`resources/`（3）、预编译 `.so`（3）全部已跟踪，
+>    连 `build -> build_exp026_a2` 那个符号链接一起。判据仍是
+>    `pytest tests/test_fresh_clone_imports.py`。
 >
 > 下面是 08-31 的原文，不改。
 
@@ -483,11 +484,15 @@ software_version + protocol_versions + input_identity + actual_seed_ledger
 
 ## 建议执行顺序
 
-1. 确定首发支持范围，修 R1/R2；保持历史生产数据不变。
-2. 补 package/CLI/资源与可移植环境，在真实 checkout 中冻结待测版本。
-3. 跑完整 CPU 回归、安装测试与小体系真实入口测试，补作业中断/重复启动验证。
-4. 同步 README、支持矩阵、变更说明和结果状态规范，发布有明确限制的研究预览版。
-5. 独立完成 benchmark、统计口径与条件性科学验证，再决定稳定生产版的支持范围。
+> **2026-09-12：1、2、4 已办完或已被划掉。** 下面是原文，保留追溯用；
+> 当前真正还欠的按 [TODO.md](TODO.md) §3 走。
+
+1. ~~确定首发支持范围，修 R1/R2~~ **已办**（R1/R2 2026-09-01 修复；支持范围见上）；保持历史生产数据不变。
+2. ~~补 package/CLI/资源与可移植环境~~ **package 已划掉（不打包）**；CLI 诊断 09-02 落地；资源与预编译 `.so` 09-12 全部随仓库分发。
+3. 跑完整 CPU 回归、补作业中断/重复启动验证。（~~安装测试~~不打包故不适用；~~小体系真实入口 fixture~~ 09-02 用户已关闭）
+4. ~~同步 README、支持矩阵、变更说明和结果状态规范~~ **2026-09-12 文档整理已办**。
+5. 独立完成 benchmark、统计口径与条件性科学验证 —— **仍欠**，但按 09-12 的定位，
+   科学结论不是发布门（dev 通道），状态一律以 [STATUS.md](STATUS.md) 为准。
 
 不要求先做完所有实验路线、图形界面、容器、多平台和大规模架构重构。
 这些可以按用户需求后续扩展，不能替代上述验收证据。

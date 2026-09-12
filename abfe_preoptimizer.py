@@ -2696,6 +2696,19 @@ exit_=(
             w["window_idx"] for w in W
             if w.get("derailment_status") == "CONFIRMED_DERAILMENT"
         ]
+        # 🔑 [2026-09-12] **探针只探一次。**
+        # 它是**非变异**的，按定义不改盘 ⟹ "盘上状态没变"对它永远成立 ⟹
+        # 主循环的停滞保护必然把它判成"推不动"，连探三次后 NO_FEASIBLE_ACTION
+        # 退出（真机 16:46 就是这么把 win5 放弃的）。
+        # 它已经给出结论了（`stage2_fk_recalibration_probe.json`），
+        # 所以探过就得往下走，让后面的分支按那个结论选动作。
+        _probed = {
+            int(r.get("window", -1))
+            for r in ((view.get("fk_probe") or {}).get("windows") or [])
+            if r.get("window") is not None
+        }
+        if _suspected and all(int(i) in _probed for i in _suspected):
+            _suspected = []
         if _suspected and not _confirmed:
             return plan(
                 "PROBE_CANDIDATE_FK",
@@ -2923,7 +2936,11 @@ exit_=(
                "需要看 stage 结果里的生产质量门。" % (view["stage_converged"],)
                if view["has_stage_result"] else
                "，但 stage 分析还没跑（stage2_*.json 不存在）⟹ 先跑分析。"),
-            exit_=None if view["has_stage_result"] else None,
+            # 🔑 DONE **必须带出口**，否则 `terminal` 不成立、主循环不 break，
+            # 于是跑完了却掉进"没有执行器 ⟹ 退出循环交人工"的兜底分支
+            # （真机 17:22 实测：六窗全合格、ΔG 已算出，却报成交人工）。
+            # ANALYZE 仍然无出口 —— 它是路由，不是终态。
+            exit_="DONE" if view["has_stage_result"] else None,
             missing=[] if view["has_stage_result"] else ["stage2_*.json"],
         )
 
@@ -3170,7 +3187,16 @@ exit_=(
             want = _cur_lam[a:b]
             if len(want) != len(got):
                 return False
-            return all(abs(float(x) - float(y)) <= 1e-9 for x, y in zip(want, got))
+            # 🔑 **必须跟引擎用同一个栅格。** 先前这里写 `abs(x-y) <= 1e-9`，
+            # 而 `ibs_engine` 判 λ 身份是量化到 LAMBDA_GRID_DECIMALS 位后精确比较。
+            # 路径落盘量化 / 采样未量化之间天然差 5e-9 ⟹ 引擎说"λ 匹配"，
+            # 这里说"过期"。后果：win4 被塞进一条字段全空的占位记录，
+            # `production_steps=None` ⟹ 补采目标算成 0+250k 正好等于缓存 ⟹
+            # 每次都被 resume 门跳过、空转三次、再升级去开新段（真机 17:13）。
+            # **一个不变量只能有一份实现。**
+            from ibs_engine import LAMBDA_GRID_DECIMALS as _GD
+            _g = lambda vs: [round(float(x), _GD) + 0.0 for x in vs]
+            return _g(want) == _g(got)
 
         merged: Dict[int, Dict[str, Any]] = {}
         provenance: Dict[int, str] = {}

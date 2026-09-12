@@ -1,42 +1,242 @@
 # 当前行动清单
 
-> ## ⚠️ 时效警告（2026-08-31 发布整理核对）
->
-> **下面《当前决策》到《长期研究项》各节的主表停在 2026-08-06，已陈旧约 25 天，
-> 其中相当一部分条目很可能已经完成——但本仓库里没有能证明这一点的判据。**
->
-> 期间发生过：EXP-025~EXP-030、`BUGFIX_HANDOFF_2026-08-29` 的 41 项修复、
-> 2026-08-31 第九轮代码审查。这些的逐项记录都**不在本工程区分支**：
->
-> | 材料 | 位置 | 内容 |
-> |---|---|---|
-> | `BUGFIX_HANDOFF_2026-08-29_resolved_issues.md` | `Atenolol-rank11/archive/patches/` | 41 项已解决的逐条记录 |
-> | `0831issue.md` | `Atenolol-rank11/` | 第九轮审查新发现（2026-08-31，**尚未完成**，两个分片还在审查中） |
-> | `github issue.md` | `Atenolol-rank11/` | GitHub issue 状态 |
->
-> **不要按编号机械对账。** 两套文档的编号体系互相冲突且同名不同义——例如
-> `P1-19` 在 08-29 那份里是"v4 charging 接缝内静电失配"（已修），在本文件里是
-> "per-window σ 系统性低估 2–4 倍"（未完成）。照编号勾选会把未完成的物理问题
-> 错标成已修。本文件用的是更早的 `ATT-xx` / `MEM-xx` / `P0-9~13` 一套。
->
-> 下面那些 `- [ ]` **只表示"2026-08-06 当时未完成"**，不表示现在仍未完成。
-> 要更新状态，需要人对着上面三份材料逐条判定，本次发布整理没有代做这件事。
+[项目入口](../README.md) · [文档导航](README.md) · [当前科学状态](STATUS.md) · [变更记录](CHANGELOG.md)
 
-## 本文件的范围
+> **本文是本仓库唯一的待办清单**（2026-09-12 整理）。一条待办只在这里出现一次；
+> 专题文档负责讲"为什么"，本文只负责"还欠什么、欠在哪一行"。
+>
+> **项目处于开发最末期**，不是在筹备一次首发：核心流水线、Stage-2 自治控制器
+> （2026-09-12 17:22 首次独立跑完整条）、闭式重训都已跑通。剩下的是收尾 ——
+> 所以本文里没有"要建什么新能力"，只有"哪一处还没收干净"。
+> [RELEASE_READINESS](RELEASE_READINESS_2026-08-31.md) 里的「预览版前」「首发支持范围」
+> 是 08-31 的措辞，**按末期收尾读**，别当成一次尚未开始的发布筹备。
+>
+> **已关闭的条目不留在这里**，整段移进 `archive/`：
+>
+> | 归档 | 内容 |
+> |---|---|
+> | [archive/TODO_closed_2026-09-09.md](archive/TODO_closed_2026-09-09.md) | `MIGRATE-01` / `PBC-01` / `XFAIL-01` / `XFAIL-02` / `CACHE-01` / `CFG-01` 六条已关闭缺陷的完整记录 |
+> | [archive/TODO_2026-08-06_unreconciled.md](archive/TODO_2026-08-06_unreconciled.md) | 2026-08-06 的主表（1350 行，`ATT-xx`/`MEM-xx`/`P0-9~13` 编号）。**那里面的 `- [ ]` 只表示"当时未完成"**，要人逐条对账才能重新变成待办 |
+>
+> ⚠️ 不要按编号跨文档机械对账：`P1-19` 在 08-29 那份交接里是"v4 charging 接缝内静电失配"（已修），
+> 在 08-06 主表里是"per-window σ 系统性低估 2–4 倍"（未完成）。**同名不同义。**
 
-发布整理后，本文件只保留**有明确时间戳、且来源比 2026-08-06 更新**的两节：
+## 优先级
 
-- 《膜受体–配体路线》——更新于 2026-08-11（C4 已解锁、C5 未开始）；
-- 《未关闭的代码缺陷》——更新于 2026-08-29 / 08-31，其中 **PHY-03 是唯一
-  被明确记录为"仍挂起"的条目**。
-
-2026-08-06 那份主表（1350 行、`ATT-xx`/`MEM-xx`/`P0-9~13` 编号）已整段归档到
-[archive/TODO_2026-08-06_unreconciled.md](archive/TODO_2026-08-06_unreconciled.md)，
-一字未改。它需要人逐条对账后才能重新变成待办，本次发布整理没有代做。
+| | 在推 | 内容 |
+|---|---|---|
+| **1** | ✅ 验收已达成；`decide()` 重构中 | [Stage-2 自治闭环](#1-stage-2-自治闭环) —— 5 条缺口；另有 8 个测试因重构预期性红着，**别修** |
+| **2** | 排在后面 | [local-residual / EXP-033](#2-local-residual--exp-033) —— P2 是唯一还开着的，P1 真机没跑过 |
+| **3** | 收尾 | [发布工程门](#3-发布工程门) —— 判据是 clone 下来 import 得动、跑得动 |
+| **4** | 不修 | [已定位、判定不改](#4-已定位判定不改) —— `AUDIT-01`~`07`，理由别重新论证 |
+| **5** | 暂停 | [膜受体–配体路线](#5-膜受体配体路线暂停) —— 停在 C4，当前主线是可溶体系 |
+| **6** | 条件性阻塞 | [PHY-03](#6-phy-03带电路线的条件性阻塞) —— 带电配体路线 |
 
 ---
 
-## 膜受体–配体路线
+## 1. Stage-2 自治闭环
+
+> ### ✅ 验收口径已首次达成：2026-09-12 17:22
+>
+> 自治控制器独立走完整条 Stage-2（六窗全部 `ANALYSIS_ELIGIBLE` → `DONE`），
+> 体系 `cyclod_ligand2/rep1`（环糊精主客体，可溶），
+> ΔG_bind = **−3.48 ± 0.47 kcal/mol** vs 实验 −4.04，差 **1.19σ**。
+>
+> **设计、实证与十条陷阱全部在
+> [STAGE2_CONTROLLER_DESIGN_2026-09-12.md](STAGE2_CONTROLLER_DESIGN_2026-09-12.md)
+> —— 接手先读那份，别重推。** 本节只登记它 §7 列的缺口。
+>
+> ⚠️ 一次跑通 ≠ 通用。这是**单体系单 run**，没有独立重复。
+
+### 剩余缺口（源：控制器 design §7）
+
+- [ ] **S2-A 累计 f_k 残差门对多段窗口结构性不适用。**
+  多段窗口的帧采自两份不同偏置，`_load_ibs_window_outputs_merged` 因此显式
+  `base.pop("f_k")`。⟹ 循环每用换 Epoch 修好一个窗口，那个窗口就**永久失去**
+  这项证据（那一跑 win0–3 已全丢）。逐段残差不与合并后的 ΔF 直接望远镜相消，
+  **需要单独定口径**。
+- [ ] **S2-B 续验路径上验证要求随预算膨胀。**
+  `ibs_engine.py:15575` 续验时 `validation_attempt_budget_steps = full_bias_step_budget`，
+  于是 `minimum_complete_validation_frames = max(200, budget/stride)`：
+  **给的预算越多、要求的帧数越高**，可达性判据的第 2 档因此失效。
+  正解是把「完整性要求」与「去相关要求」解耦 —— 200 是统计目标，不该随预算浮动。
+- [ ] **S2-C 边际增长判据需要至少两段历史**，只有一段的窗口用不上。
+- [ ] **S2-D 代码仍散在三个文件** —— `abfe_preoptimizer`（`decide` / `read_aggregated`）、
+  `abfe_pipeline`（执行器 + 若干 helper）、`ibs_engine`（两个纯函数）。
+  设计要求是**包在一起**，尚未收拢。
+  🚧 **2026-09-12 维护者正在做这一条**（下面那 8 个红的测试就是它造成的）。
+> ### 🚧 `decide()` / join-λ 支撑判据**正在重构中** —— 下面这 8 个红的别去修
+>
+> 2026-09-12 18:20 实测 `./tests/run_offline_tests.sh` → **8 failed / 2206 passed / 3 skipped**：
+>
+> | 文件 | 个数 |
+> |---|---|
+> | `tests/test_stage2_repair_controller.py` | 6 |
+> | `tests/test_join_lambda_two_sided_support.py` | 2 |
+>
+> 样例：`test_short_production_runs_production` 断 `RUN_PRODUCTION`、实际得 `ANALYZE`。
+> **这是重构本身造成的**（维护者本人在改），断言会随新语义一起重写，
+> **不要当成回归去修、也不要为了让它绿而改回旧语义。**
+> 这轮重构就是 **`S2-D`**（把散在三个文件里的控制器收拢）。
+> 落地后这段整段删掉，届时以 `./tests/run_offline_tests.sh` 全绿为准。
+
+- [ ] **S2-E 旧修复机制是「关掉」不是「删掉」** —— path_evolution 修复分支 /
+  production rescue / rescue 后重标定。**等自治这条再跑通几次再删**，别现在删。
+
+### 不许回退的约定
+
+- **一个 stage 只许有一个控制器。** 不是风格偏好 —— 两套机制各判各的会直接打架。
+- **只有三个真终态**：`DONE` / `GLOBAL_BUDGET_EXHAUSTED` / `NO_FEASIBLE_ACTION`。
+  `LOCAL_VALIDATION_CAP` / `INSUFFICIENT_DATA` / `CUMULATIVE_FK_MISALIGNMENT` /
+  `SKIPPED_WINDOW` / `HALT_BUDGET` **全是路由信号**，不得炸出流水线。
+  异常同理：只有 `IBSFrozenCalibrationValidationError`（f_k 被**统计驳回**）是有功效的
+  否决，且它也只封存该候选、最多换一次 Epoch，仍不终止 Stage-2。
+- **四个量不许混用**：`n_decorr` 是求解器**资格**不是验收量；`N_eff,k / g_k` 是
+  **主验收量**（门 = 10）；`top1% weight` 是否决**警报**；occupancy / coverage ESS
+  **只诊断 f_k 训练**，永不决定 ΔG 是否有效。
+- **低支撑永远不是 `FAIL`**，是「尚不可测」（`INSUFFICIENT_DATA` / `HARD_INSUFFICIENT`），
+  动作是加预算。`FAIL` 是支撑够了却违反统计门，动作是换 Epoch。
+- **缺证据 ≠ 通过，但缺证据 ≠ 有问题** —— 它是 `UNKNOWN`，动作是去产出证据。
+- **累计 f_k 残差只能用 `sampling_states`** —— `energies` 多一个逐 λ 态常数（LRC），
+  其逐边差会伪造出「全负号单调」的形状（实测把某窗 span 抬高 2.2 倍）。
+  `N_eff/g` 则对它**不变**，两者不变性不同，别"统一"。
+- **不得为了得到期待的标签而换误差估计器**（estimator shopping）。新 Epoch 才是拿
+  独立证据的地方。
+- **`(K−1)×门槛` 不许写** —— 累计偏差门不随边数增长。
+- **控制器只读**；执行由独立的 execute 层落盘。
+
+### 设计依据（live，不是待办）
+
+- [STAGE2_CONTROLLER_DESIGN_2026-09-12.md](STAGE2_CONTROLLER_DESIGN_2026-09-12.md)
+  —— **权威**：设计 + 实证 + 十条真机咬过的陷阱。最贵的一条是
+  **「同一个不变量的 N 份实现」**（λ 身份有四份）。
+- [AUTONOMOUS_STAGE2_LOOP_SPEC_2026-09-11.md](AUTONOMOUS_STAGE2_LOOP_SPEC_2026-09-11.md)
+  —— 老板定的核心设计指标（唯一验收指标）。
+- [STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md](STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md)
+  —— 逐个 bug 的修复流水账（历史，不是待办）。
+- [PLAN_PATH_REPAIR_2026-09-11.md](PLAN_PATH_REPAIR_2026-09-11.md) —— 设计要求的来源，
+  分支编号（5a/5b/6）出自这里；代码里 10 余处引它作设计依据。
+- [STAGE2_THREE_AXES_COUPLING_2026-09-11.md](STAGE2_THREE_AXES_COUPLING_2026-09-11.md)
+  —— 分窗口/分 λ/分采样量三轴当前怎么耦合的。
+- [STAGE2_ROOT_CAUSE_2026-08-28.md](STAGE2_ROOT_CAUSE_2026-08-28.md) —— **所有收敛门
+  对单轨迹重加权这个失效模式是瞎的**：实测门全绿时 ΔG 错 42 kJ/mol。别拿质量门当验收。
+
+---
+
+## 2. local-residual / EXP-033
+
+背景：`B_φ` **不是配体的物理模型**，是提高 λ 态混合的**采样增强项**；按体系在线学的只有 `f_k`。
+方案见 [EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md](EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md)，
+P1 落地见 [EXP-033_P1_LANDED_2026-09-12.md](EXP-033_P1_LANDED_2026-09-12.md)。
+**P3（跨配体通用权重）已于 2026-09-12 由用户拍板划掉，前提没了，别重新提。**
+
+- [ ] **EXP-033-P1-GPU（先做这个）P1 闭式重训真机一次没跑过。**
+  `closed_form_refit()` 里 probe 那段要建 OpenMM Context，只过了静态校验。
+  最小验证：4W53 开 `--outer-lambda-local-residual-ibs`（配体指纹对不上冻结的 Atenolol
+  ⟹ 会走重训），跑到预平衡结束看它出不出 manifest。
+- [ ] **EXP-033-P2（EXP-033 唯一还开着的一条）** ridge 臂 vs 出厂非线性臂，**U3 口径上机**：
+  window-0 utility + ΔG 一致性，且**两臂各自独立标定并冻结自己的 `f_k`**。
+  U4 就是栽在候选臂复用 baseline 的 `f_k`，被封为 `INVALID_FOR_PROMOTION`。
+  ⚠️ 做 A/B **不要**走 P1 的自动重训（两臂各自重训 ⟹ `sampling_score_sha256` 变成
+  run-dependent，两臂不再共用同一把尺子）。要先离线冻一份两臂共用
+  （`tools/retrain_local_residual_offline.py`）。
+- [ ] **LR-01 `residual_sampling` 无条件进每个 stage 的指纹** ——
+  `abfe_pipeline.py:11008`，在 `if stage_name == "vanishing"` 分支**之前**。
+  ⟹ 打开开关会让预平衡 / attachment / decharging 的缓存**全部失配、整条链从头重算**，
+  而那几段的哈密顿量根本没被残差碰过。紧邻的 MEM-00h 注释写的正是相反的做法。
+  正解：挪进 vanishing 作用域（运行时判据是 `stage_name in {"vanishing","vanishing_rescue"}`，`:5489`）。
+- [ ] **LR-02 `skip_unsupported_frames` 该撤或反转** —— 支撑域外的帧正是"模型没覆盖这个
+  体系"的证据，跳过它等于把本该触发停止的信号变成拟合时看不见的样本。
+- [ ] **LR-03 `sample-hard-window-scratch` 在主线里是死的** ——
+  实现在发布清理时被移出的 `archive/` 里（`outer_lambda_neural_basis.py` 有 **13 处**
+  `from archive import`，全是空壳）。而且那份 legacy 实现读 `manifest["lambda_shield"]`，
+  WCA 壳退役后该字段是 `None` → `TypeError`。**要么补实现，要么把入口一起删掉。**
+- [ ] **LR-04 没有 solvent-only 入口** —— `--only-complex-charging` /
+  `--only-boresch-attachment` 与 residual 互斥。
+- [ ] **LR-05 重训用的 λ 表是默认值** `linspace(1.0, 0.5, 8)`
+  （可用 `outer_lambda_refit_lambda_max/_min/_n_states` 改）。因为重训发生在预优化算出
+  真实 stage-2 λ 路径**之前**。按 `B_φ` 的定位这不影响对错；要用真实窗口 λ 表得把重训
+  往后挪一个位置 —— 那要改的是**时序**，不是这个模块。
+
+> 🛑 **别在 run 内为了 A/B 重训**，三条理由：违反预注册；`sampling_score_sha256` 变成
+> run-dependent；**拿缺构型的帧拟合会把缺掉的态焊进模型**，然后 ESS / overlap /
+> split-half / 三方一致全都会更绿——它们只问"这批样本内部自洽吗"。
+> 完整的坑清单见 [archive/HANDOFF_LOCAL_RESIDUAL_2026-09-11.md](archive/HANDOFF_LOCAL_RESIDUAL_2026-09-11.md) §6。
+
+---
+
+## 3. 发布工程门
+
+发布定位是 **clone-and-run**（不打包、不发科学结论）。判据只有一条：
+`pytest tests/test_fresh_clone_imports.py` 绿。完整论证见
+[RELEASE_READINESS_2026-08-31.md](RELEASE_READINESS_2026-08-31.md)。
+
+> ✅ **`REL-01`（预编译 `.so` 随仓库分发）2026-09-12 已执行**，故不再列：
+> `.gitignore` 加了三条例外放行 `build` 符号链接 + `build_exp026_a2/*.so`，
+> 并单独排掉没有扩展名的 gtest 可执行文件。`git add -An plugins/` 应当**只有 4 条**。
+> 文档（[GETTING_STARTED.md](GETTING_STARTED.md)《CUDA 插件》/
+> [TROUBLESHOOTING.md](TROUBLESHOOTING.md)）已同步成"随仓库分发、按环境文件建环境不用编"。
+
+- [ ] **REL-02 `abfe_core.py` 分片没审完** —— 第九轮审查里它是唯一没有分片正文的
+  （5 条 P2 只有汇总行）。而《五个文件分别应补什么》恰恰把它的职责定为"集中最终结果资格
+  与协议登记"。补审属于预览版前的工作。
+- [ ] **REL-03 到目前为止全部是 CPU / 静态验证，零 GPU 复验。** 最需要真机的：
+  - residual 臂混合覆盖度门换口径后，EXP-030 candidate 臂的门读数（`ess_gate_mixture_gauge` 应为 `sampling_states`）；
+  - 三个 decharging builder 新增的 `frozen_ll_pairs` 断言（真实体系上触发 ⟹ P0-01 的前提本来就不成立，那是新发现不是回归）；
+  - 两条腿同进程时的 `pipeline.log` 分离（已用最小复现验证，未在真实两腿运行上确认）。
+- [ ] **REL-04 2026-09-09 全仓审计那 52 处改动无一上过 GPU。**
+  最需要复验的三处：偏置爬坡补 1.0 档、preopt 探针的 force group 重划、加密点的采样语义变更。
+  复跑命令见 [archive/AUDIT_2026-09-09_full_repo.md](archive/AUDIT_2026-09-09_full_repo.md) §4。
+
+---
+
+## 4. 已定位、判定不改
+
+> 完整记录见 [`archive/AUDIT_2026-09-09_full_repo.md`](archive/AUDIT_2026-09-09_full_repo.md)。
+> 那轮审计共 62 条候选，**52 条已修**（含 NaN 根因、stdout 消失、离线重算挂死、
+> 一批宿主内存放大、preopt 缓存两层拆分）。下面 7 条是**有意不修**的，
+> 登记在这里是因为它们确实"已定位、未修" —— 下一个人有权知道，
+> 也免得被当成新发现重查一遍。**理由都别重新论证。**
+
+- [ ] **AUDIT-01** `abfe_core.minimum_image_displacement_nm` —— 候选立方体随长宽比增长，
+  `radius > 64` 的 guard 在尝试 `N × 2.1e6 × 3 × 8` 字节之后才触发。
+  *不修*：真实触发需要极端长宽比 + 大批量输入；`docs/design` 的盒型识别提案覆盖这一片。
+- [ ] **AUDIT-02** `abfe_core` 膜 leaflet 的 wrapped/unwrapped 混用
+  （`_protein_leaflet_cross_sections_nm2`、`assign_lipid_leaflets`、
+  `verify_membrane_normal_axis`）。
+  *不修*：只影响膜路径，且 `membrane_observables_from_trajectory` 已按最大空隙弧修过一次；
+  当前生产是可溶体系，留给膜线单独一轮。
+- [ ] **AUDIT-03** `free_energy_engine.run_independent_windows` 保留全部帧
+  （73k × 1000 帧 × 8 态 ≈ 14 GB）。
+  *不修*：当前无生产调用者，是"接线即爆"而不是现在就爆。接线前必须先改。
+- [ ] **AUDIT-04** `apbs_correction._read_dx_values` —— 257³ 网格约 1 GB 峰值
+  （原文本 + 切片副本 + Python float list 三份）。
+  *不修*：APBS 修正当前不在主线路径上。改法是 `np.frombuffer`，可降到 ~136 MB。
+- [ ] **AUDIT-05** `abfe_core.OnlineConvergenceMonitor` 的 K==1 会抛、
+  `n_k_array` 与 `u_kn` 列数不一致。
+  *不修*：`abfe_core` 之外无调用者。
+- [ ] **AUDIT-06** `TraditionalABFEPipeline.pre_equilibration_identity_fingerprint`
+  引用 `self.pressure` / `self.barostat_protocol`，该类 `__init__` 从未赋值。
+  *不修*：全仓无活的调用点（runabfe 里那两个 baseline 都是 `ABFEPipeline` 实例）。
+- [ ] **AUDIT-07** `abfe_pipeline._rebalance_fingerprint` 没有 System 身份绑定
+  ⟹ System 变了而 Boresch 锚点没变时，`rebalance.chk` 会被复用。
+  *🛑 明确不修*：唯一修法是把自产产物的 sha256 放进缓存身份，而那是**用户否决过
+  4 次**的做法（`code_sha256` 2026-08-24、`system_xml_hash`+`positions_sha256`
+  2026-09-09、`preopt_cache_sha256` 2026-09-09）。这类 payload 本来就有显式协议
+  版本号承担"算法变了"的信号。**不要再提这个方案。**
+
+> ⚠️ 那 52 处**没有一处上过 GPU**。最需要真机复验的：偏置爬坡补 1.0 档、
+> preopt 探针的 force group 重划、加密点的采样语义变更。
+> 复跑命令见审计文档 §4。
+
+---
+
+## 5. 膜受体–配体路线（暂停）
+
+> **2026-09-12 状态：整条线暂停**，停在 C4。当前主线是**可溶体系 4W53**，
+> 膜线不阻塞任何在推的工作。本节内容的时间戳是 **2026-08-11**，之后没有人动过——
+> 重启这条线之前先对着源码核一遍，别直接照着勾。
+> 带电配体那一半另见本文 [PHY-03](#6-phy-03带电路线的条件性阻塞)。
 
 > 2026-08-31 发布整理并入，原文件 `docs/status/memtodolist.md`（在 `Atenolol-rank11`，**不在本仓**）。
 >
@@ -251,318 +451,9 @@ slab（无蛋白）不能代替这里的真实 receptor–ligand complex；C4 �
 
 ---
 
-## 未关闭的代码缺陷
+## 6. PHY-03（带电路线的条件性阻塞）
 
-> 2026-08-31 发布整理并入，原文件 `docs/status/BUGFIX_HANDOFF_2026-08-29.md`（在 `Atenolol-rank11`，**不在本仓**）。
-
-
-> 2026-08-31 状态：40 项已修复并已拆分为 GitHub issue；1 项科学验证（PHY-03）挂起。
-> 已解决条目的完整交接内容已归档到 `Atenolol-rank11/archive/patches/BUGFIX_HANDOFF_2026-08-29_resolved_issues.md`（在 `Atenolol-rank11`，**不在本仓**）。
-
-### 给接手人的提醒
-
-请先修复 P1，再处理 P2。不要通过降低 fail-closed 门槛、删除 provenance、
-忽略 checkpoint 不一致或复用旧结果来让流程跑通。
-
-涉及 Hamiltonian、采样协议、缓存含义或结果口径的修改，必须同步更新协议版本、
-缓存指纹和回归测试。
-
-### 当前未完成项
-
-#### AUDIT-2026-09-09：全仓审计的 7 条「判定不改」
-
-> 完整记录见 [`AUDIT_2026-09-09_full_repo.md`](AUDIT_2026-09-09_full_repo.md)。
-> 那轮审计共 62 条候选，**52 条已修**（含 NaN 根因、stdout 消失、离线重算挂死、
-> 一批宿主内存放大、preopt 缓存两层拆分）。下面 7 条是**有意不修**的，
-> 登记在这里是因为它们确实"已定位、未修" —— 下一个人有权知道，
-> 也免得被当成新发现重查一遍。**理由都别重新论证。**
-
-- [ ] **AUDIT-01** `abfe_core.minimum_image_displacement_nm` —— 候选立方体随长宽比增长，
-  `radius > 64` 的 guard 在尝试 `N × 2.1e6 × 3 × 8` 字节之后才触发。
-  *不修*：真实触发需要极端长宽比 + 大批量输入；`docs/design` 的盒型识别提案覆盖这一片。
-- [ ] **AUDIT-02** `abfe_core` 膜 leaflet 的 wrapped/unwrapped 混用
-  （`_protein_leaflet_cross_sections_nm2`、`assign_lipid_leaflets`、
-  `verify_membrane_normal_axis`）。
-  *不修*：只影响膜路径，且 `membrane_observables_from_trajectory` 已按最大空隙弧修过一次；
-  当前生产是可溶体系，留给膜线单独一轮。
-- [ ] **AUDIT-03** `free_energy_engine.run_independent_windows` 保留全部帧
-  （73k × 1000 帧 × 8 态 ≈ 14 GB）。
-  *不修*：当前无生产调用者，是"接线即爆"而不是现在就爆。接线前必须先改。
-- [ ] **AUDIT-04** `apbs_correction._read_dx_values` —— 257³ 网格约 1 GB 峰值
-  （原文本 + 切片副本 + Python float list 三份）。
-  *不修*：APBS 修正当前不在主线路径上。改法是 `np.frombuffer`，可降到 ~136 MB。
-- [ ] **AUDIT-05** `abfe_core.OnlineConvergenceMonitor` 的 K==1 会抛、
-  `n_k_array` 与 `u_kn` 列数不一致。
-  *不修*：`abfe_core` 之外无调用者。
-- [ ] **AUDIT-06** `TraditionalABFEPipeline.pre_equilibration_identity_fingerprint`
-  引用 `self.pressure` / `self.barostat_protocol`，该类 `__init__` 从未赋值。
-  *不修*：全仓无活的调用点（runabfe 里那两个 baseline 都是 `ABFEPipeline` 实例）。
-- [ ] **AUDIT-07** `abfe_pipeline._rebalance_fingerprint` 没有 System 身份绑定
-  ⟹ System 变了而 Boresch 锚点没变时，`rebalance.chk` 会被复用。
-  *🛑 明确不修*：唯一修法是把自产产物的 sha256 放进缓存身份，而那是**用户否决过
-  4 次**的做法（`code_sha256` 2026-08-24、`system_xml_hash`+`positions_sha256`
-  2026-09-09、`preopt_cache_sha256` 2026-09-09）。这类 payload 本来就有显式协议
-  版本号承担"算法变了"的信号。**不要再提这个方案。**
-
-> ⚠️ 那 52 处**没有一处上过 GPU**。最需要真机复验的：偏置爬坡补 1.0 档、
-> preopt 探针的 force group 重划、加密点的采样语义变更。
-> 复跑命令见审计文档 §4。
-
-
-#### [x] MIGRATE-01（已关闭 2026-09-09）EXP-031 接入主线时整份拷贝文件会抹掉 09-09 的 MEM-15 重构
-
-> 迁移已完成（详见下方原记录）。**本条剩下的价值是一条规矩、不是任务**：
-> 下次沙箱并线**别整份拷贝文件，逐 hunk 分拣**。
-
-
-> **已完成（2026-09-09）**：路线 A 与路线 B 都已接入主线，融合内核（S3）本轮不接。
-> 详见 `docs/EXP-031_GPU_OPTIMIZATION_2026-09-09.md` 两节顶部的落地记录。
-> `IBS_BIAS_PROTOCOL_VERSION` 已到 **33**，兼容集合收窄成 `frozenset((33,))`。
-> 回归 `pytest tests -m cpu_only` → 1079 passed。
-> ⚠️ `system_xml_sha256` 已变 ⟹ 既有 `dual_window_*` / `ibs_state_*` /
-> `convergence.json` 全部失配，**必须重跑**，不要试图复用。
-> 本条（MIGRATE-01）的价值转为**留给下一次沙箱并线**：别整份拷贝文件，
-> 逐 hunk 分拣。
-
-- **发现**：2026-09-09 逐文件对账沙箱 `ABFE_IBS_CUDA` 与主线时发现。
-- **事实**：三个文件里**只有 `ibs_engine.py` 是沙箱领先**；`abfe_core.py` 与
-  `abfe_pipeline.py` **主线在 2026-09-09 12:25 刚动过，比沙箱新**。
-
-  | 文件 | 主线 mtime | 沙箱 mtime | 谁领先 |
-  |---|---|---|---|
-  | `ibs_engine.py` | 09-03 20:48 | 09-08 16:22 | 沙箱 |
-  | `abfe_core.py` | **09-09 12:25** | 09-05 10:44 | **主线** |
-  | `abfe_pipeline.py` | **09-09 12:25** | 09-04 15:17 | **主线** |
-  | `runabfe.py` / `free_energy_engine.py` | — | — | 零差异 |
-
-- **危险动作**：主线领先的内容是 MEM-15 分子归组重构 —— 新增
-  `abfe_core.py:4645 system_molecule_grouping()` 与 `:4696 image_molecules_by_system()`
-  （按 **System** 的键+约束求连通分子，不信 topology 的键），并把 `abfe_pipeline.py`
-  里内联的「约束补成键」换成调这两个 helper。**这两个函数在沙箱里完全不存在**
-  （全仓 grep 零命中）。⟹ 整份拷贝沙箱那两个文件会抹掉 135 + 56 行。
-  而「把 EXP-031 合并到主线」最自然的执行方式恰好就是整份拷贝。
-- **为什么是 P0**：这是**静默数据丢失**，不报错。抹掉的 MEM-15 修复防的是刚性水
-  被逐原子回卷撕开 → 729 个 PME 排除对跨盒 → `Particle coordinate is NaN`（不到 1 ps）。
-  而该损坏对既有诊断是隐形的：键能、最大键长、最小化后 max|F| 全部正常，
-  只有查排除对距离才看得见。
-- **处置**：**逐条重放，不是合并。** `abfe_pipeline.py` 里没有任何 EXP-031 内容
-  （那条线从未改过它），它的 56 行差异 100% 属于主线，一行都不要往主线迁；
-  反过来沙箱应去拉主线那份。
-- **清单**：`ABFE_IBS_CUDA/experiments/EXP-031_ibs_bias_fusion/MIGRATION_CHECKLIST_2026-09-09.md`
-  （逐条动作、行号、代价栏、不迁清单）；主线侧摘要见
-  [EXP-031_GPU_OPTIMIZATION_2026-09-09.md](EXP-031_GPU_OPTIMIZATION_2026-09-09.md) §1。
-- **连带**：`docs/EXP-031_GPU_OPTIMIZATION_2026-09-04.md` 的两条结论已推翻、头条
-  `1.45×` 是水盒数（真体系 1.162×）。已在该文件顶部加取代提示，正文留档未改。
-
-#### [x] PBC-01（已关闭 2026-09-09）`topology.cif` 往返会凭空造出假键
-
-- **发现**：2026-09-09，brd4/ligand1 benchmark（`abfe-benchmark/openmm_IBS/runs/brd4_ligand1/rep1`）。
-  attachment 腿起点体检报「2 个 nonbonded_exceptions 对跨了周期镜像（最远 7.356 nm）」，
-  而输入 `.gro` 干净（六个 target 实测 0 个跨镜像水、最大分子内跨度 0.096–0.100 nm）。
-- **根因**：`app.PDBxFile` 写入端链 id 按 `chr(ord('A') + chainIndex % 26)` **循环**
-  （`pdbxfile.py:392/473`），读取端 `_struct_conn` 只按 `(seq_id, asym_id, atom_name)`
-  解析（`pdbxfile.py:218`），**不含链序号**。链数一超过 26 就有歧义。
-  brd4/ligand1 有 12549 条链（每个水一条），第一个残基 `ACE(A,1)` 的三条键被解析到
-  某个同样落在 `(A,1)` 的水上：
-
-  ```
-  (0, 39543) ACE1.CH3 — HOH12582.H1
-  (0, 39544) ACE1.CH3 — HOH12582.H2
-  (1, 39542) ACE1.C   — HOH12582.O
-  ```
-
-  `.top` 重建 27175 键，mmCIF 往返 27178 键，多的正好这 3 条；真键一条不缺
-  （读取端 `createStandardBonds()` 补齐了，所以 3 条是**净多出**）。
-  溶剂腿只有 3 条链，不触发。
-- **已修（2026-09-09，两步都做完了）**：
-
-  1. `repair_pbc_molecule_integrity` 的分子归组改成只信 System
-     （`abfe_core.image_molecules_by_system` / `system_molecule_grouping`），
-     回卷后逐对复查、fail closed。零指纹变动。
-  2. `_load_system_from_native_cache` 载入 mmCIF 拓扑后调
-     `abfe_core.prune_topology_bonds_unsupported_by_system()`，把 System
-     完全不认的键删掉（判据宽：`HarmonicBondForce` ∪ `CustomBondForce` ∪
-     `constraints`；漏删无害、误删致命）。同时两处裸 `traj.image_molecules()`
-     换成 `image_molecules_by_system()`。
-
-  原来记在这里的两个残留消费者，第 2 步一并解决了：
-
-  | 位置 | 影响 |
-  |---|---|
-  | `ibs_engine.py` `compute_u_kn` 里的 `traj.image_molecules(inplace=True)` | **载荷相关**：重算 u_kn 之前给轨迹回卷，用的是 topology 的键，而且**连约束都没补**（比修好前的生产路径还弱），外面还包着 `except → warning` 的 fail-open |
-  | `runabfe.py` 末帧 Boresch 诊断处的 `traj.image_molecules(inplace=True)` | 诊断用，末帧不重锚，影响面小 |
-
-  `runabfe.py` 构造 Boresch 锚点图时会把**非配体键原样拷贝**
-  （`for a, b in pipeline.topology.bonds()`），假边原本因此进了受体侧的锚点搜索图；
-  拓扑在载入时就删干净了，这里不用再改。
-- **本条最初写的方案（从 `.top` 重建拓扑）没有采用，理由记在这里，别再退回去**：
-  删假键比换拓扑源好三点 —— 不需要 `.top`（`--openmm-cache-only` 也能用）、
-  不引入任何新边（换成 System 的全图会多出 12478 条水的 H–H 边，
-  可能干扰按键距计数的逻辑，如 `LIGAND_INTERNAL_POLAR_MIN_BOND_SEPARATION`）、
-  且删完的键集与 `.top` **逐条相同**（实测 27178 → 27175 == `.top` 的 27175）。
-- **代价：比原估的小得多，且不需要协议版本号 bump。**
-  `abfe_pipeline._topology_hash()`（`abfe_pipeline.py:599`）把 bond 列表 +
-  chain.id + residue.index 一起哈希，出现在 6 处 `_protocol_fingerprint(...)`
-  （`abfe_pipeline.py:5710, 9363, 9564, 10224, 10554, 12421`）。但删键是**条件触发**的：
-  一条都不用删时原样返回**同一个 topology 对象** ⟹ mmCIF 干净的体系
-  （链数 ≤ 26，例如所有溶剂腿）`topology_sha256` 逐位不变、resume 全保住；
-  只有真的带假键的体系指纹才变，而它们的既有结果本来就不可信。
-  **不要再叠一个全局协议号 bump** —— 那会把没受影响的体系一起作废，
-  正是「同一件事两套机制」那个反复踩过的坑（见 `code_sha256` 那条教训）。
-- **物理量影响：无。** topology 不进哈密顿量，能量/力逐比特不变；唯一真实的坐标变化
-  就是把被撕开的分子拼回去（以及随之而来的 ~0.005 nm 整体质心平移）。
-  例外是 `compute_u_kn`：撕开的分子原本会给出跨盒 PME 排除对的错能量，
-  现在不会了 —— 只在原本就错的情形下变，且回卷失败从 fail-open 改成直接抛。
-- **验证**：从 `.top` + `.gro` 原始输入端到端复现整条机制（不依赖任何 run 产物），
-  往返后多出 3 条、删完与 `.top` 键集逐条相同、原子/残基/链/盒矢量全保持；
-  干净拓扑返回同一对象且哈希不变。回归 `pytest tests -m cpu_only`：1071 passed。
-  测试：`tests/test_membrane_barostat_protocol.py` 的
-  `test_image_molecules_ignores_phantom_topology_bonds` /
-  `test_prune_drops_only_bonds_the_system_does_not_back` /
-  `test_pbc_repair_groups_molecules_by_system_not_topology`。
-
-
-#### [x] XFAIL-01（已关闭 2026-09-09）P1-19 的 C_seam 已修好，xfail 标记已摘除
-
-- 位置：`tests/test_charge_transfer_real_endpoints.py:453` 的
-  `@pytest.mark.xfail(strict=False)`，挂在
-  `test_vanishing_lambda_one_seam_matches_charging_lambda_zero` 上。
-- reason 自述「实测 118.5 kJ/mol（中性 4 原子 fixture）…… **修复后此标记应转
-  XPASS 并摘除**」。它**现在正是 XPASS**，但 `strict=False` ⟹ 套件不会提醒任何人摘。
-- **实测（2026-09-02）**：`tools/diagnostics/probe_p119_charge_transfer_seam.py`
-
-  ```
-  abs_delta_e = 3.63206042e-04 kJ/mol      ← 不是 118.5，小 5.51 个数量级
-  rel_delta_e = 1.807e-06                  (门 1e-05)
-  max|ΔF|分量 = 2.526e-06 kJ/mol/nm        (门 1e-03)
-  ```
-
-- **剩下这 3.6e-4 不是 seam 残余**：同文件
-  `test_bake_handoff_seam_matches_for_charged_ligand_with_realistic_geometry`
-  上方的注释精确描述过它——紧凑几何（配体 4 原子挤在 <0.2 nm 内）自带一个
-  「与几何基本无关的 ~0.0005 kJ/mol 绝对残差」，数值性的，不是 Hamiltonian
-  构造错误。量级吻合。**没有这条排除性说明，下一个人会以为 3.6e-4 是 seam 残余。**
-- **已排掉「fixture 绕过失效路径」**（这是「真修好」与「绕过去了」的唯一分界）：
-  `LIGAND_CHARGES_NEUTRAL_E = (0.5, 0.3, -0.4, -0.4)` 逐原子非零，
-  `LIGAND_ORDINARY_PAIRS = {(0, 3)}` 是真正的 ordinary L-L 对（未定义任何
-  exception、走标准 combining rule，q_i·q_j = −0.2 e²）⟹ 内部库仑真实存在、
-  **机制被触发**，但常数不见了。
-- **谁修的、什么时候修的：未知。** 跨会话核对过时间线，只能**排除**：不是
-  2026-09-02 那两个会话中的任何一个，也不是 λ-WCA 壳退役、也不是力组切分收敛
-  （`IBS_E_BASE_FORCE_GROUPS`/`IBS_E_BIAS_FORCE_GROUPS`）的连带效果——那天第一次
-  全套跑之前 seam 就已经 XPASS。⚠️ **"未知"就是未知**，不要把它写成「大概是某次
-  改动的连带效果」——那种猜测会被后人当结论。
-- **已处置（2026-09-09）**：标记已摘除，原 reason 里的实测数据与「3.6e-4 是紧凑几何数值底噪、不是 seam 残余」这条排除性说明改写成函数上方的注释保留。
-  `pytest tests/test_charge_transfer_real_endpoints.py` → 39 passed。
-  ⚠️ 仍待人工确认：P1-19 在 issue 追踪里的状态该不该一起关（本仓没有 issue 追踪器，需要在上游做）。
-
-#### [x] XFAIL-02（已关闭 2026-09-09）两个 xfail 的 reason 是错的：它们红在 D，不在 C——根因已查明并修复
-
-- 位置：`tests/test_charge_transfer_real_endpoints.py:633` 与 `:822`
-  （`test_run_protocol_v2_matrix_cd_wiring_passes_on_charged_fixture`、
-  `test_run_protocol_v2_matrix_cd_normalizes_c2_style_switch_before_c_seam`）。
-- 两条的 reason 都写「同 …… 的 xfail 理由」，即都记在 P1-19 的 C_seam 失配上。
-  **这是错的。**
-- **实测（2026-09-02）**，复现方式
-  `python -m pytest tests/test_charge_transfer_real_endpoints.py --runxfail -q`，
-  两条的 `failed_frames` 完全一致：
-
-  ```
-  'failing': ['D:gate1_reference_identity,gate3_mixed_production_vs_reference']
-  ```
-
-  **前缀是 `D:`。整个输出里 `failing` 一次都没出现 `C:`** ⟹ C（seam）在这两条里
-  也是通过的，红的是 **D 端点**（全解耦：λ_coul≡0 且 λ_vdw=0）。
-- 讽刺的是 `:822` 那条测试名叫 `..._normalizes_c2_style_switch_before_c_seam`
-  ——它本身是为 C seam 写的，却卡在 D。
-- 为什么与 XFAIL-01 是**不同机制**：这两条的 fixture 是 `_case(1, n_dummies=1)`
-  （净电荷 +1 + reserved dummy），走完整 `run_protocol_v2_matrix_cd`，即
-  **co-alchemical charge-transfer** 路径（配体 +1 e → 0、co-ion 0 → +1 e、
-  flat-bottom 位置限制 k=100 kJ/mol/nm²）。失败的是 co-ion 在 λ=0 时的
-  reference identity 与 mixed(CPU)-vs-reference 一致性，跟「配体内部库仑常数」
-  没有关系。
-- ⚠️ **不是静默的生产 bug**：`charge_treatment=co_alchemical_charge_transfer`
-  本就 `production_qualified=False`，PHY-03（P1，见本节下方）仍挂着。属于
-  **已知未合格路径上的已知未合格行为**，只是被错标成了 P1-19。
-  **别当 P0 处理。**
-- **已处置（2026-09-09）：不是重写 reason，是直接修好了根因；两个标记已摘除。**
-
-  上面那段「跟 co-ion 有关」的推断**是错的，别再沿用**。逐 gate 打开 report 后
-  （`gate1`/`gate3` 都给出同一个数）：
-
-  ```
-  D  abs_delta_e = 22.057534 kJ/mol   rel = 5.108e-05 (门 1e-05)
-     max|ΔF| = 1143.130726 kJ/mol/nm  全部落在原子 0 的 x 分量
-     reference 侧该原子受力 = 恰好 0.0     production 侧 = -1143.13
-     strict_zero_reference / strict_zero_mixed 都 PASS ⟹ 配体–环境项确实是零
-     C 两个 gate 都 PASS，abs_delta_e = 5.2e-4（就是 XFAIL-01 那个紧凑几何底噪）
-  ```
-
-  手算 fixture 里唯一的 ordinary L–L 对 `(0,3)`（Lorentz-Berthelot，
-  r=0.265149 nm、σ=0.34 nm、ε=0.36 kJ/mol）：
-
-  ```
-  U_LJ(0,3) = 22.057512 kJ/mol      |F| = 1143.129513 kJ/mol/nm      方向 +x
-  ```
-
-  六位有效数字吻合 ⟹ **差值 100% 就是普通 L–L 对的内部 LJ**。
-
-- **根因**：`tools/validation/compare_charge_transfer_endpoints.py`
-  的 `reference_vanishing_zero_system` 把配体粒子 epsilon 一律置零，
-  连**普通（无 exception）L–L 对**的 LJ 一起杀掉了；生产侧 `U_common` 正确地
-  逐 λ_vdw 保留它。是 XFAIL-01（库仑版）的 **LJ 版本**，但错在**参照构造侧，
-  不在生产侧**。
-- **为什么会出现**：v3 [P0-01] 停掉了 `reference_charging_endpoint_system` 的
-  内部对补 exception——对**库仑**是正确的（普通 L–L 库仑必须随粒子电荷线性湮灭），
-  但普通对的 **LJ** 从此失去了庇护。该函数的 docstring 当时还写着
-  「配体内部 LJ 已经被冻结成显式 exception」，已经陈旧。
-- **已修**：置零之前先把普通 L–L 对冻结成显式 exception，搬进 combining-rule 的
-  σ/ε；chargeProd 取当前粒子电荷之积（λ=0 时为 0）⟹ 库仑逐比特不变，
-  PME 的 exception 倒扣项同样正比于 q_i·q_j ⟹ 也是 0。
-  只补普通对，raw 拓扑自带的 excluded/1-4 exception 一个不动 ⟹ 没有触碰 P0-01。
-- **影响面**：该常数逐 λ_vdw 不变 ⟹ **ΔG_vdw / ΔG_bind 不受影响**；且只改验证工具，
-  生产哈密顿量一行未动，协议版本号未动。
-- **定级结论：既不属于 PHY-03，也不是生产 bug**，是验证参照的构造缺陷。
-  PHY-03 仍然独立挂着，状态不变。
-- **回归**：新增 `test_reference_vanishing_zero_keeps_ordinary_intra_ligand_lj`
-  直接对着机制断言（普通对必须存在且 σ/ε 等于 combining rule，配体粒子 epsilon 仍须为 0）——
-  原来的 D 门失败信息只说 `D:gate1/gate3`，看不出是 LJ，正是这次查了半天的原因。
-- **为什么这条值得单列**：三条 xfail 共用一条错 reason，是**能自我掩盖的**——
-  谁照那两条的 reason 去修 C seam，会去修一个已经修好的东西；而真问题
-  （co-ion 在 D 端点）继续没人管；而且它不会在测试里报警，因为 XFAIL 也算"预期"。
-
-#### [x] CACHE-01（P2，纯噪音）`--openmm-cache-only` 下无条件调用 `find_gmx_include_dir`
-
-**已修（2026-09-02）。** `find_gmx_include_dir(config.gmx_path)` 挪进了非
-cache-only 的 `else` 分支，cache-only 路径 `include_dir` 留 `None`
-（`runabfe.py` 里搜 `[CACHE-01`）。cache-only 下不再打那条警告。
-
-- 原症状：带 `--openmm-cache-only` 跑时照样打「找不到 GROMACS 力场 include 目录」
-  警告，而这一路根本不需要 include 树。
-- 修改前已查清：审计通过的缓存上 `include_dir` **一次都不会被解引用**（三条使用
-  路径逐个核对过，见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md) 同名小节）。
-  ⟹ 只是噪音，不影响任何数值，挪动对 cache-only 路径行为中立。
-- 挪动后复核过的那一条：`system_cache_exists(...)` 仍然在 `or` 的右侧，
-  `openmm_cache_only=True` 时整个调用不执行（短路顺序未变）。
-- 来源：2026-09-02 运行期记录（原文已归档到
-  [archive/RUNTIME_ISSUES_2026-09-02.md](archive/RUNTIME_ISSUES_2026-09-02.md) BUG-1）。
-
-#### [x] CFG-01（P2，配置）`abfe_config.json` 的 `gmx_path` 指向不存在的路径
-
-- **2026-09-07 已修**：发布清理时清空为 `""`（机器本地键，见
-  `abfe_diagnostics._MACHINE_LOCAL_KEYS`），留空回退到 `GMXLIB`/`GMXDATA`/`PATH`
-  自动探测。下面是当时的记录。
-- 原值 `/home/ruigengji/gmx26.0C`，**本机不存在**。
-- 2026-09-01 那次实跑的 provenance 记的是
-  `/home/ruigengji/gmx26.3/share/gromacs/top`，与 config 里的值不同 ⟹ 配置里的
-  值从来没被那次运行用上（那次带了 `--openmm-cache-only`）。
-- 与 CACHE-01 **是两件事**：CACHE-01 是「不该问」，这条是「问了但答案是错的」。
-  非 cache-only 路径会真的用到它。
-- 修法：写 GROMACS 的**安装前缀**，不要写 `share/gromacs/top`
-  （解析逻辑见 `runabfe.py:557` `find_gmx_include_dir`，两种写法都能吃，但前缀是
-  2026-08-31 之后的约定）。**改配置会动 provenance，需用户确认取哪个版本的 GROMACS。**
-
-#### [ ] PHY-03（P1，实验路线）charge-transfer 的 tethered charge carrier 不能按当前论证严格跨腿抵消
+**P1，实验路线。**charge-transfer 的 tethered charge carrier 不能按当前论证严格跨腿抵消
 
 - 位置：`abfe_core.py` 的 co-ion restraint 说明与表达式（约 1088–1117 行）；
   `ibs_engine.py::_create_co_alchemical_ion_restraint`（约 807–848 行）；
@@ -587,6 +478,13 @@ cache-only 的 `else` 分支，cache-only 路径 `include_dir` 留 `None`
   ΔG 在统计误差内不变；complex/solvent reservoir 端点有独立 free-energy closure test。
   C4/C5 未通过前不得把数值提升为生产结果。
 
-### 验证边界
+---
 
-本轮五个核心文件已通过 py_compile/AST 检查；当前会话环境没有 OpenMM、pytest 或 ruff，因此未声称离线测试全绿。历史 openmm_dev 测试结果仅作为第五轮基线记录。
+## 往这里加条目的规则
+
+1. **一条待办只在本文出现一次。** 专题文档讲"为什么"，本文讲"还欠什么、欠在哪一行"。
+2. 关闭一条就**整段移进 `archive/`**，页首写清结论去了哪 —— 不要在本文留 `[x]` 尸体。
+3. 新条目必须带**位置**（`文件:行号` 或函数名）和**判据**（怎样算做完）。
+   写不出判据的不是待办，是想法，去 `design/`。
+4. 标"不修"的要写明理由，并注明**理由别重新论证** —— 否则下一个人会花一天重查一遍。
+5. 科学结论不进本文，进 [STATUS.md](STATUS.md)；协议/代码变更进 [CHANGELOG.md](CHANGELOG.md)。

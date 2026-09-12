@@ -18,12 +18,12 @@
 | 查某天改了什么、协议版本为什么跳、破不破缓存 | [CHANGELOG.md](CHANGELOG.md)（全程缩略时间线） |
 | 查某一步实现的是哪篇文献的方法、怎么引用 | [METHODS.md](METHODS.md) |
 | 安装依赖、准备输入、首次运行 | [GETTING_STARTED.md](GETTING_STARTED.md) |
-| **用 local-residual 开关前必须自己编译 CUDA 插件**（仓库不发 `.so`） | [GETTING_STARTED.md](GETTING_STARTED.md)《CUDA 插件》 |
+| CUDA 插件：**随仓库分发**，按 `environment.yml` 建环境开箱可用；只有换了 OpenMM 版本或改了插件源码才要重编（秒级） | [GETTING_STARTED.md](GETTING_STARTED.md)《CUDA 插件》 |
 | 理解输出、符号、缓存和续跑 | [OUTPUTS_AND_RESUME.md](OUTPUTS_AND_RESUME.md) |
 | 定位常见错误 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) |
 | 迁移到新蛋白–配体体系 | [MIGRATING_TO_A_NEW_SYSTEM.md](MIGRATING_TO_A_NEW_SYSTEM.md) |
 | 修改源码、运行最低验证 | [MAINTAINING.md](MAINTAINING.md) |
-| 查看未完成工作 | [TODO.md](TODO.md)（592 行；08-06 旧主表已归档） |
+| **查看未完成工作（唯一待办清单）** | [TODO.md](TODO.md) —— 已关闭条目整段进 `archive/`，本文不留 `[x]` 尸体 |
 | 判断能不能发布、还缺什么 | [RELEASE_READINESS_2026-08-31.md](RELEASE_READINESS_2026-08-31.md) |
 | 不确定度口径 | [PYMBAR_UNCERTAINTY_PROTOCOL.md](PYMBAR_UNCERTAINTY_PROTOCOL.md) |
 | 查某份历史材料写过什么 | [HISTORY_LOG.md](HISTORY_LOG.md) |
@@ -31,16 +31,18 @@
 | stage2 溶剂腿那 5.5σ 去哪了（**已关闭 2026-09-10**：参照臂的盒错了） | [STAGE2_SOLVENT_LEG_ERROR_BUDGET.md](STAGE2_SOLVENT_LEG_ERROR_BUDGET.md) |
 | 查 stage2 的失效机制（仍是活的参考） | [STAGE2_ROOT_CAUSE_2026-08-28.md](STAGE2_ROOT_CAUSE_2026-08-28.md) |
 | 重新设计 stage2 控制流前先读（分窗口/分 λ/分采样量 三轴当前怎么耦合的） | [STAGE2_THREE_AXES_COUPLING_2026-09-11.md](STAGE2_THREE_AXES_COUPLING_2026-09-11.md) |
-| 路径最小修补的计划（Type I/II/III + 修补顺序；计划稿，未实现） | [PLAN_PATH_REPAIR_2026-09-11.md](PLAN_PATH_REPAIR_2026-09-11.md) |
-| **stage2 自治循环：现状 + 剩余 4 件活**（接手先读这份） | [STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md](STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md) |
+| 路径最小修补：Type I/II/III + 修补顺序（**部分已实现**，代码里 10 余处引它作设计依据；缺口见 TODO §1） | [PLAN_PATH_REPAIR_2026-09-11.md](PLAN_PATH_REPAIR_2026-09-11.md) |
+| 🔑 **stage2 自治控制器：设计 + 实证 + 陷阱清单**（**接手先读这份**；含首次跑通的实证与 10 条真机咬过的坑） | [STAGE2_CONTROLLER_DESIGN_2026-09-12.md](STAGE2_CONTROLLER_DESIGN_2026-09-12.md) |
+| **stage2 自治控制器：设计 + 实证 + 十条真机陷阱**（碰 stage2 先读这份，**别重推**） | [STAGE2_CONTROLLER_DESIGN_2026-09-12.md](STAGE2_CONTROLLER_DESIGN_2026-09-12.md) |
+| stage2 自治循环逐个 bug 的修复流水账（历史，不是待办） | [STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md](STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md) |
 | stage2 自治闭环的**验收指标**（老板定案，唯一指标） | [AUTONOMOUS_STAGE2_LOOP_SPEC_2026-09-11.md](AUTONOMOUS_STAGE2_LOOP_SPEC_2026-09-11.md) |
-| stage2 分窗与多采样段：09-10/11 那八个 bug 改了什么 | [STAGE2_WINDOW_AND_SEGMENT_REDESIGN_2026-09-11.md](STAGE2_WINDOW_AND_SEGMENT_REDESIGN_2026-09-11.md) |
-| 2026-09-09 全仓审计原始记录（**不是待办**；7 条不修已进 TODO） | [AUDIT_2026-09-09_full_repo.md](AUDIT_2026-09-09_full_repo.md) |
+| stage2 分窗与多采样段：09-10/11 那八个 bug 改了什么（**已全部落地，09-12 归档**；仍是这几处当前行为的唯一出处） | [archive/STAGE2_WINDOW_AND_SEGMENT_REDESIGN_2026-09-11.md](archive/STAGE2_WINDOW_AND_SEGMENT_REDESIGN_2026-09-11.md) |
+| 2026-09-09 全仓审计原始记录（**不是待办**，09-12 归档；7 条不修已进 TODO §4，52 处待 GPU 复验进 TODO §3） | [archive/AUDIT_2026-09-09_full_repo.md](archive/AUDIT_2026-09-09_full_repo.md) |
 | 给新配体重训 local-residual R1 权重（操作手册） | [RETRAIN_LOCAL_RESIDUAL.md](RETRAIN_LOCAL_RESIDUAL.md) |
-| local-residual 换体系接线现状（**接线通了、模型没通**） | [HANDOFF_LOCAL_RESIDUAL_2026-09-11.md](HANDOFF_LOCAL_RESIDUAL_2026-09-11.md) |
+| local-residual 换体系**别再踩的坑**（接线部分已被 EXP-033 P1 取代，09-12 归档；§6 仍全部有效） | [archive/HANDOFF_LOCAL_RESIDUAL_2026-09-11.md](archive/HANDOFF_LOCAL_RESIDUAL_2026-09-11.md) |
 | 查 λ-WCA 壳为什么退役（已结案，历史） | [archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md](archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md) |
 | 拿独立参照真值对生产结果 | [reference_data/README.md](reference_data/README.md) |
-| 查 GPU 性能优化做过什么、结论是什么 | [EXP-031_GPU_OPTIMIZATION_2026-09-09.md](EXP-031_GPU_OPTIMIZATION_2026-09-09.md)（**取代 [09-04 那份](EXP-031_GPU_OPTIMIZATION_2026-09-04.md)，那份三条结论有两条已被推翻**；正文与脚本在沙箱 `ABFE_IBS_CUDA`） |
+| 查 GPU 性能优化做过什么、结论是什么 | [EXP-031_GPU_OPTIMIZATION_2026-09-09.md](EXP-031_GPU_OPTIMIZATION_2026-09-09.md)（**取代 [09-04 那份](archive/EXP-031_GPU_OPTIMIZATION_2026-09-04.md)，那份三条结论有两条已被推翻、09-12 归档**；正文与脚本在沙箱 `ABFE_IBS_CUDA`） |
 | 换配体要重训 local-residual 模型：方案与证据（**P1 闭式重训已接主线 09-12，真机未跑**） | [EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md](EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md) |
 | **闭式重训到底落成什么样**（代码已落地、离线全绿、真机一次没跑） | [EXP-033_P1_LANDED_2026-09-12.md](EXP-033_P1_LANDED_2026-09-12.md) |
 
@@ -74,6 +76,16 @@
   - `TECH_REPORT_0831issue_P2_2026-09-01.md` / `RUNTIME_ISSUES_2026-09-02.md`：
     2026-09-02 从已撤销的 `docs/status/` 移入。主题都已关闭、结论都已归位到正式文档，
     两份页首的告示写明「哪一节是别处没有的」。**都不是待办。**
+  - **2026-09-12 归档的五份**——主题都已结案，每份页首有归档告示写明「结论去了哪、
+    还剩什么已抄进 [TODO.md](TODO.md)」。**都不是待办：**
+
+    | 文件 | 为什么归档 | 仍然有效的部分 |
+    |---|---|---|
+    | `TODO_closed_2026-09-09.md` | `MIGRATE-01`/`PBC-01`/`XFAIL-01`/`XFAIL-02`/`CACHE-01`/`CFG-01` 六条已关闭 | 每条留下的那句规矩 |
+    | `AUDIT_2026-09-09_full_repo.md` | 62 条候选已收口（52 修 + 7 不修） | §4 的 GPU 复跑命令（→ TODO `REL-04`） |
+    | `STAGE2_WINDOW_AND_SEGMENT_REDESIGN_2026-09-11.md` | 八个 bug 全部落地 | 分窗判据用 `∫g dλ`、f_k 加帧前必须重标定的**唯一出处** |
+    | `HANDOFF_LOCAL_RESIDUAL_2026-09-11.md` | 接线部分被 EXP-033 P1 取代 | §6《别再踩的坑》全部有效；§4 的 3 条未修已进 TODO `LR-02`~`LR-04` |
+    | `EXP-031_GPU_OPTIMIZATION_2026-09-04.md` | 三条结论有两条被 09-09 那份推翻 | 仅追溯用 |
 
 ## 运行期发现往哪写
 
@@ -83,7 +95,7 @@
 | 发现的性质 | 写进哪 |
 |---|---|
 | 用户会遇到的症状 + 完整因果链 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) |
-| 已定位但没修的缺陷 | [TODO.md](TODO.md)《未关闭的代码缺陷》，带编号和位置 |
+| 已定位但没修的缺陷 | [TODO.md](TODO.md) —— 归到对应的编号段（`S2-` / `LR-` / `REL-` / `AUDIT-`），**必须带位置和判据** |
 | 发布阻塞判断 | [RELEASE_READINESS_2026-08-31.md](RELEASE_READINESS_2026-08-31.md) |
 | 一次性运行的原始记录（不分析） | 直接进 `archive/`，页首写清结论去了哪 |
 
