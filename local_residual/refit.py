@@ -710,7 +710,7 @@ def write_refit_payload(
 ) -> dict[str, Path]:
     """把闭式解写成 loader 能吃的 payload + weights。
 
-    产物与 `scripts/export_exp025_g1_reference_payload.py` 同一套 schema
+    产物与 `abfe_scripts/export_exp025_g1_reference_payload.py` 同一套 schema
     （`openmm_plugin.load_r1_payload` 逐字段读它），区别只在张量是解出来的、
     不是从 `.pt` 里搬的。`source_checkpoint.sha256` 记的是**拟合输入的身份**而不是
     某个 checkpoint —— 这条链上没有 checkpoint，写个假的更糟。

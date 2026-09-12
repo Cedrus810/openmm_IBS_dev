@@ -99,7 +99,7 @@ def test_lazy_imports_of_untracked_modules_are_reported():
     known_targets = {
         "lambda_path_versions.py",   # 主流水线会走到，发布必须带
         "multi_segment_analysis.py", # 同上
-        "scripts/",                  # 重训链 ①②③④ + 自动重训的 manifest 生成
+        "abfe_scripts/",                  # 重训链 ①②③④ + 自动重训的 manifest 生成
         "local_residual/",           # outer-λ 残差：只跟踪了 4/19
         "exp012_xed/",               # 仅 local_residual 的 ledger/metrics/mm_ledger/schema 需要
     }

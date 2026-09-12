@@ -264,9 +264,9 @@ RESOURCE_MISSING_HINT = (
     "见 docs/EXP-033_P1_LANDED_2026-09-12.md。看到这条说明 loader 被直接调用了，"
     "或者那条自动重训本身失败了。\n"
     "要手工冻一份（做 A/B 时两臂必须共用同一份）：按 docs/RETRAIN_LOCAL_RESIDUAL.md "
-    "重训，再用 scripts/write_local_residual_resource_manifest.py 生成 manifest。"
+    "重训，再用 abfe_scripts/write_local_residual_resource_manifest.py 生成 manifest。"
     "训练栈已在本仓（local_residual/softlift*、student、loss、environment、"
-    "mace_graph、atom_mapping + scripts/ 下的 exp019/exp020 入口）。\n"
+    "mace_graph、atom_mapping + abfe_scripts/ 下的 exp019/exp020 入口）。\n"
     "不需要该功能时保持该开关为 false 即可（默认值）。"
 )
 

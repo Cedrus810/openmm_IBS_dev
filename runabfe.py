@@ -3481,10 +3481,20 @@ def run_self_tests() -> int:
     sys_b.addParticle(13.0)
     meta_a = _pme_u_kn_meta_payload(2, [1.0, 0.0], [1.0, 1.0], 300.0, sys_a, None, [0], None)
     meta_b = _pme_u_kn_meta_payload(2, [1.0, 0.0], [1.0, 1.0], 300.0, sys_b, None, [0], None)
+    # [2026-09-09] `_system_xml_hash` 已退役、恒返回 None —— 它哈希的是**我们自己
+    # 生成的中间产物**而不是用户输入，每次进缓存身份都导致"改一行代码、或做一个按
+    # 设计改坐标的修复（PBC-01）⟹ 用户已烧掉的 GPU 时间全作废"（复发两次，理由写在
+    # abfe_pipeline._system_xml_hash 的函数体上方）。
+    # 所以这里断的是**退役契约**，不是"不同质量给出不同哈希"。
+    # ⚠️ 这条如果红了，说明有人把 sha256 加回了缓存身份 —— 先去读上面那段注释，
+    # 不要通过"让哈希重新生效"来把它弄绿。换了 HMR/质量这类真实差异，走的是 config
+    # 进 stage_protocol_key 那条路，与本字段无关。
+    # 这里用两个真 System（质量 12 vs 13，XML 确实不同）比 test_todo_verified_fixes.py
+    # 的 `fn(None)` 更强：它证明真实输入下也确实不产出哈希。
     check(
-        "resume/cache invalidation system hash",
-        meta_a["system_xml_sha256"] != meta_b["system_xml_sha256"],
-        "same cache signature for different particle masses",
+        "resume/cache invalidation system hash retired (always None)",
+        meta_a["system_xml_sha256"] is None and meta_b["system_xml_sha256"] is None,
+        f"system_xml_sha256 复活了: a={meta_a['system_xml_sha256']}, b={meta_b['system_xml_sha256']}",
     )
 
     try:
@@ -6310,7 +6320,11 @@ def _refit_outer_lambda_residual_for_this_ligand(
         log=lambda message: log.info("%s", message),
     )
     manifest_path = os.path.join(resources, "manifest.json")
-    from scripts.write_local_residual_resource_manifest import main as write_manifest
+    # 顶层名是 `abfe_scripts` 不是 `scripts`：`mace_torch` 装了个同名顶层正规包，
+    # 正规包永远赢过 PEP 420 namespace 目录 ⟹ 旧写法在任何装了 MACE 的环境里必然
+    # ModuleNotFoundError（2026-09-12 实测）。改名后这里就是一句普通 import，
+    # 也让 tests/test_fresh_clone_imports.py 的 AST 门重新看得见这个依赖。
+    from abfe_scripts.write_local_residual_resource_manifest import main as write_manifest
 
     write_manifest([
         "--payload", os.path.join(resources, "r1_model_payload_v1.json"),

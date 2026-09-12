@@ -107,7 +107,7 @@ struct LoadedPayload {
 };
 
 // Loads + fail-closed-verifies r1_model_payload_v1.json + r1_model_weights_f64.bin
-// (see scripts/export_exp025_g1_reference_payload.py). Every tensor's sha256
+// (see abfe_scripts/export_exp025_g1_reference_payload.py). Every tensor's sha256
 // is re-checked against the manifest while reading it back from the blob.
 inline LoadedPayload loadModelPayload(const std::string& payloadJsonPath, const std::string& weightsBinPath) {
     yyjson_doc* doc = yyjson_read_file(payloadJsonPath.c_str(), 0, nullptr, nullptr);
@@ -196,7 +196,7 @@ inline LoadedPayload loadModelPayload(const std::string& payloadJsonPath, const 
     return loaded;
 }
 
-// Loads canonical_fixture_v1.bin (see scripts/export_exp025_g1_canonical_fixture.py).
+// Loads canonical_fixture_v1.bin (see abfe_scripts/export_exp025_g1_canonical_fixture.py).
 inline AtomSystemView loadFixture(const std::string& path) {
     std::vector<unsigned char> data = readFile(path);
     if (data.size() < 24) throw MathError("fixture file too small");

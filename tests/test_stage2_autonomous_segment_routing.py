@@ -221,6 +221,33 @@ def test_probe_candidate_fk_is_non_mutating():
     assert "PROBE_CANDIDATE_FK" in body
 
 
+def test_marginal_gain_rule_stops_futile_frame_addition():
+    """min N_eff/g 不随采样上升 ⟹ 停止同分布加帧，改走布局动作。
+
+    cap 分支原文早就写了「边际停滞/下降则关闭 Epoch」，但判它需要的跨段历史
+    此前没进视图，规则一直是死的。真机 win4：3.44→2.29→2.01→1.62，
+    g 15.1→168.8，控制器却一直返回 RUN_PRODUCTION。
+    只落**无歧义的那一半**（没有上升），不自造"停滞"阈值。
+    """
+    import ast
+
+    src = pathlib.Path(__file__).resolve().parents[1].joinpath("abfe_preoptimizer.py")
+    tree = ast.parse(src.read_text())
+    # 视图必须带跨段历史
+    assert "min_n_eff_over_g_history" in src.read_text()
+    fn = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "decide"
+    )
+    dump = ast.dump(fn)
+    assert "_no_gain" in dump, "边际增长判据必须在 decide() 里"
+    # 必须**早于**所有加帧分支，否则永远轮不到它
+    body = src.read_text()
+    i_gain = body.index("_no_gain = []")
+    i_short = body.index("short_self = _pick(")
+    assert i_gain < i_short, "边际增长判据必须前置于自检补采分支"
+
+
 if __name__ == "__main__":
     import tempfile
     import pathlib

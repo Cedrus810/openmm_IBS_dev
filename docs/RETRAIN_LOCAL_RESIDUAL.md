@@ -23,7 +23,7 @@ float64（24 KB）。
 > `bidirectional_gap_variance_loss` 只吃 `adjacent_gap_reduced`（来自 MM ledger），
 > `local_residual/softlift_dataset.py:467-471` 只读 ledger 的
 > `adjacent_gap_reduced` / `log_importance_unnormalized` + 对应轨迹，
-> `scripts/run_exp019_softlift_d0.py` 的参数里没有任何 teacher/model 入口。
+> `abfe_scripts/run_exp019_softlift_d0.py` 的参数里没有任何 teacher/model 入口。
 > EXP-010 那套 `exp010-*` 教师子命令是**另一条谱系**，不在 R1 重训链上。
 
 > **P1 已落地（2026-09-12）：** 这条四步链的 ①② 现在有了自动替代 —— 开
@@ -37,11 +37,11 @@ float64（24 KB）。
 ## 链条
 
 ```
-① 数据集      scripts/run_exp019_softlift_d0.py            → softlift_dataset_v1.npz
+① 数据集      abfe_scripts/run_exp019_softlift_d0.py            → softlift_dataset_v1.npz
               输入：生产每窗口的 MM ledger + 对应轨迹（无 MACE、无 GPU 标注）
-② 训练        scripts/train_exp019_softlift_loro.py --rung R1 → *.pt
-③ 导出        scripts/export_exp025_g1_reference_payload.py  → payload.json + weights.bin
-④ 部署 manifest scripts/write_local_residual_resource_manifest.py → manifest.json
+② 训练        abfe_scripts/train_exp019_softlift_loro.py --rung R1 → *.pt
+③ 导出        abfe_scripts/export_exp025_g1_reference_payload.py  → payload.json + weights.bin
+④ 部署 manifest abfe_scripts/write_local_residual_resource_manifest.py → manifest.json
 ```
 
 代码位置：训练本体在 `local_residual/`（`softlift*`、`student`、`loss`、
@@ -53,8 +53,8 @@ Atenolol-rank11 搬入。**生产入口不会 import 到它们**——`local_res
 ## ①② 数据集与训练
 
 ```bash
-python scripts/run_exp019_softlift_d0.py       # → dataset/softlift_dataset_v1.npz
-python scripts/train_exp019_softlift_loro.py \
+python abfe_scripts/run_exp019_softlift_d0.py       # → dataset/softlift_dataset_v1.npz
+python abfe_scripts/train_exp019_softlift_loro.py \
     --dataset <上面那份 npz> --rung R1 --seeds 0 1 2 \
     --output-root output/<新体系>_softlift
 ```
@@ -68,7 +68,7 @@ python scripts/train_exp019_softlift_loro.py \
 没有事先约定 sha 的输入传 `none` 表示"只记录不比对"：
 
 ```bash
-python scripts/export_exp025_g1_reference_payload.py \
+python abfe_scripts/export_exp025_g1_reference_payload.py \
     --checkpoint <你的 .pt>            --checkpoint-sha256 none \
     --dataset    <你的 .npz>           --dataset-sha256 none \
     --ligand-indices <ligand_indices.json> --ligand-indices-sha256 none \
@@ -84,7 +84,7 @@ python scripts/export_exp025_g1_reference_payload.py \
 ## ④ 生成部署 manifest
 
 ```bash
-python scripts/write_local_residual_resource_manifest.py \
+python abfe_scripts/write_local_residual_resource_manifest.py \
     --payload  <输出目录>/r1_model_payload_v1.json \
     --weights  <输出目录>/r1_model_weights_f64.bin \
     --topology output/topology.cif \

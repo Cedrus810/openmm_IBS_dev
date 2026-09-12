@@ -3,9 +3,9 @@
 换配体时自动重训 R1 局部残差模型（原设计：在 Stage-2 vdW 采样之前跑完）。
 
 与 `docs/RETRAIN_LOCAL_RESIDUAL.md` 那条四步手工链共用同一批实现
-（`build_dataset_v1` → `scripts/train_exp019_softlift_loro.py` →
-`scripts/export_exp025_g1_reference_payload.py` →
-`scripts/write_local_residual_resource_manifest.py`）。只有两处不同：
+（`build_dataset_v1` → `abfe_scripts/train_exp019_softlift_loro.py` →
+`abfe_scripts/export_exp025_g1_reference_payload.py` →
+`abfe_scripts/write_local_residual_resource_manifest.py`）。只有两处不同：
 
 1. **训练帧来自本次 run 自己现采的探针轨迹**，而不是三条冻结的 EXP-012 run。
    探针就是 Stage-2 那套 dual-lambda 软核系统，沿 λ_vdw 梯子走一遍，每个 λ 采几帧。
@@ -920,7 +920,7 @@ def _check_reweighting_sanity(
 
 
 def _run_script(module_name: str, argv: list[str]) -> None:
-    """调 `scripts/` 下那三个已有生成器的 `main(argv)`，不 subprocess。
+    """调 `abfe_scripts/` 下那三个已有生成器的 `main(argv)`，不 subprocess。
 
     它们本来就是 argparse 入口，出厂那条手工链跑的也是同一批代码；这里只是把
     命令行换成参数列表，避免重写一份并行实现。
@@ -928,7 +928,7 @@ def _run_script(module_name: str, argv: list[str]) -> None:
 
     import importlib.util
 
-    path = _REPO_ROOT / "scripts" / f"{module_name}.py"
+    path = _REPO_ROOT / "abfe_scripts" / f"{module_name}.py"
     if not path.is_file():
         raise AutofitError(f"缺少重训链脚本: {path}")
     spec = importlib.util.spec_from_file_location(f"_autofit_{module_name}", path)

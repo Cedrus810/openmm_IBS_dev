@@ -6,7 +6,7 @@ from pathlib import Path
 
 np = pytest.importorskip("numpy")
 
-_SCRIPT = Path(__file__).resolve().parents[1] / "scripts/train_exp019_softlift_loro.py"
+_SCRIPT = Path(__file__).resolve().parents[1] / "abfe_scripts/train_exp019_softlift_loro.py"
 _SPEC = importlib.util.spec_from_file_location("exp020_softlift_loro", _SCRIPT)
 _MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MODULE)

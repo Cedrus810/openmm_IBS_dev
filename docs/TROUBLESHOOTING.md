@@ -75,16 +75,16 @@ GROMACS 安装前缀（前缀和 `share/gromacs/top` 两种写法都能吃，见
 
 ### `缺少 LocalManyBodyResidual 插件库: …/plugins/LocalManyBodyResidual/build/lib….so`
 
-**不是装坏了 —— 那个目录本来就该由你自己编出来。** 本仓库不分发任何编译产物
-（`.gitignore` 排除 `plugins/*/build` 和 `build_*`）。
+仓库带了一份预编译 `.so`，没拿到（或被 `.gitignore` 拦了）就自己编一份，秒级：
 
 ```bash
 conda activate <装有 OpenMM 的环境>
 bash plugins/LocalManyBodyResidual/g0_build.sh
 ```
 
-换过 OpenMM 版本或换了 conda 环境也会报这个（或者更隐蔽的加载期符号错误）——
-`.so` 链接到 `$CONDA_PREFIX/lib` 且吃了 OpenMM 的私有平台头，**必须重编**。
+带的那份 `.so` 是对 `openmm=8.5.2`（环境文件钉的版本）编的。
+**没走环境文件、装了别的 OpenMM 版本**时也重编一次 —— 插件吃的是 OpenMM
+私有平台头，跨版本不保证可用。
 完整说明见 [GETTING_STARTED.md](GETTING_STARTED.md)《CUDA 插件》一节。
 
 只在用 `--outer-lambda-local-residual-ibs` 时会撞上；默认生产路径不加载插件。

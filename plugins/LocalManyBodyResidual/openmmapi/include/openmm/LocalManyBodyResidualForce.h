@@ -21,7 +21,7 @@
  *
  * This Force holds the frozen EXP-020 R1 checkpoint's numeric content
  * (see local_residual/softlift.py R1Model and
- * scripts/export_exp025_g1_reference_payload.py) plus the physical constant
+ * abfe_scripts/export_exp025_g1_reference_payload.py) plus the physical constant
  * needed to turn the model's reduced output into an energy.
  *
  * ================= exactly-once kBT contract (frozen, not a G1 choice) =================

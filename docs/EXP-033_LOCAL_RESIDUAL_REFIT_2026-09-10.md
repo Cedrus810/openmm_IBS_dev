@@ -61,7 +61,7 @@ P1 的实现、门的定法与未验证项见
 `exp012_xed/mm_ledger.py:118` 就是 `np.diff(target_u, axis=1)`，`target_u` =
 β·(base + softcore + lrc)。`local_residual/softlift_dataset.py:467-471` 只读
 ledger 的 `adjacent_gap_reduced` / `log_importance_unnormalized` + 对应轨迹；
-`scripts/run_exp019_softlift_d0.py` 的参数里没有任何 teacher/model 入口。
+`abfe_scripts/run_exp019_softlift_d0.py` 的参数里没有任何 teacher/model 入口。
 `DiffLift.MD` §15 也明写 `direct_gap` 变体「完全不看 MACE teacher」。
 
 ⟹ 手册里「贵的不是训练，是教师标签」那句是错的，`docs/RETRAIN_LOCAL_RESIDUAL.md`
@@ -214,7 +214,7 @@ utility + ΔG 一致性。赢了就把「重训」永久变成流水线里一次
   P1 落地后由那一步取代。
 * **EXP-020 那份 canonical fixture 的轨迹已经被清**
   （`hard_window0_run1/scratch_sample/*.dcd`），`active_edges=1206`
-  （`scripts/export_exp025_g1_reference_payload.py:81`）复现不了。换同拓扑轨迹并传
+  （`abfe_scripts/export_exp025_g1_reference_payload.py:81`）复现不了。换同拓扑轨迹并传
   `--expected-active-edges none`，导出的权重仍逐字节等于出厂那份 `c4492f9d…`
   （abfe-ibs-66 于 2026-09-10 实测）。
 

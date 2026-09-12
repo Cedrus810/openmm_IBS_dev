@@ -199,7 +199,7 @@ def test_trainer_still_refuses_a_foreign_ligand_without_the_opt_in():
 
     import importlib.util
 
-    path = REPO_ROOT / "scripts" / "train_exp019_softlift_loro.py"
+    path = REPO_ROOT / "abfe_scripts" / "train_exp019_softlift_loro.py"
     spec = importlib.util.spec_from_file_location("_trainer_under_test", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -355,7 +355,7 @@ def test_run_script_registers_the_module_before_executing_it(tmp_path, monkeypat
 
     from local_residual import autofit
 
-    script = tmp_path / "scripts" / "fake_stage.py"
+    script = tmp_path / "abfe_scripts" / "fake_stage.py"
     script.parent.mkdir(parents=True)
     script.write_text(
         "\n".join(
@@ -419,7 +419,7 @@ def _load_exporter():
     import importlib.util
     import sys
 
-    path = REPO_ROOT / "scripts" / "export_exp025_g1_reference_payload.py"
+    path = REPO_ROOT / "abfe_scripts" / "export_exp025_g1_reference_payload.py"
     spec = importlib.util.spec_from_file_location("_exporter_under_test", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
