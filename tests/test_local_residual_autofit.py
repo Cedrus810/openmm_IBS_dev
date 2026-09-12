@@ -92,6 +92,7 @@ def test_derived_config_scales_capacity_and_b_max_for_a_bigger_ligand():
     "teacher,missing_z",
     [("mace-off24-medium", 11), ("ubio-molfm-omol25", 92)],
 )
+@pytest.mark.needs_gpu  # 需要从真实 MACE 模型文件读 z_table（GPU 节点才有）
 def test_element_coverage_fails_closed_per_teacher(teacher, missing_z):
     from local_residual.autofit import AutofitError, check_element_coverage
 
@@ -266,6 +267,7 @@ def test_atom_type_index_reports_every_missing_element_at_once():
     assert atom_type_index_for_topology([1, 6, 6], [1, 6, 7]) == [0, 1, 1]
 
 
+@pytest.mark.needs_gpu  # torch/mace（GPU 版构建）
 def test_mace_z_table_is_read_from_the_model_not_from_a_constant():
     """换模型 = 换路径。z-table 从 .model 里读，所以不会跟模型对不上。"""
 
@@ -382,6 +384,7 @@ def test_run_script_registers_the_module_before_executing_it(tmp_path, monkeypat
     assert "_autofit_fake_stage" not in sys.modules
 
 
+@pytest.mark.needs_gpu  # torch（GPU 版构建）
 def test_resume_refuses_a_dataset_built_with_different_parameters(tmp_path):
     """续跑只在协议身份一致时复用；参数变了就说清楚怎么清，不静默用旧数据。"""
 

@@ -2,6 +2,8 @@
 
 import pytest
 
+pytestmark = pytest.mark.needs_gpu  # torch 为 GPU 版构建，CPU 上无意义，归 GPU 节点套件
+
 torch = pytest.importorskip("torch")
 
 from local_residual.softlift import PackedSoftLiftBatch, SoftLiftConfig, build_softlift_model  # noqa: E402

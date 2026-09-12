@@ -26,6 +26,7 @@ def test_trailing_validation_split_never_randomizes_or_leaks_runs():
     assert set(validation).isdisjoint(set(test))
 
 
+@pytest.mark.needs_gpu  # torch（GPU 版构建）
 def test_seed_is_applied_before_model_construction():
     torch = pytest.importorskip("torch")
     from local_residual.softlift import primary_r1_config
