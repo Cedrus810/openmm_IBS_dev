@@ -1,6 +1,6 @@
 # EXP-031 IBS 偏置力 GPU 优化 —— 主线接入现状（2026-09-09）
 
-**取代 [EXP-031_GPU_OPTIMIZATION_2026-09-04.md](EXP-031_GPU_OPTIMIZATION_2026-09-04.md)。
+**取代 [EXP-031_GPU_OPTIMIZATION_2026-09-04.md](archive/EXP-031_GPU_OPTIMIZATION_2026-09-04.md)。
 那份的三条结论有两条已被推翻，头条数字也不能引用 —— 见 §4。**
 
 正文、脚本与全部证据仍在沙箱，不在主线：

@@ -10672,10 +10672,31 @@ class ABFEPipeline:
                         probe_only=_probe_only,
                     )
                     if _probe_only:
+                        # 🔑 **探针的结论必须落盘。** 非变异探针按定义不改盘，
+                        # 所以"盘上状态没变"对它永远成立 ⟹ 必然触发停滞保护 ⟹
+                        # 连探三次然后 NO_FEASIBLE_ACTION 退出（真机 16:46 就是
+                        # 这么把 win5 放弃的）。而它**已经给出结论了**
+                        # （"没有窗口超过相邻位移阈值 ⟹ f_k 不是瓶颈"），只是
+                        # `diag` 拿到就丢、下一轮 decide() 看不见。
+                        # 控制器读的就是这个文件（`fk_probe`），写进去它才能消费。
                         self._log(
                             f"  [自治] PROBE_CANDIDATE_FK{wins} 是**非变异**探针："
                             "只算候选并报告，不新开段、不切换 f_k、不改预算。"
                         )
+                        try:
+                            _atomic_write_json(
+                                os.path.join(
+                                    checkpoint_dir,
+                                    "stage2_fk_recalibration_probe.json"),
+                                json.loads(json.dumps(diag, default=str)),
+                            )
+                            self._log(
+                                "  [自治] 探针结论已落盘："
+                                f"{diag.get('verdict')}；建议重标定的窗口="
+                                f"{diag.get('recalibration_recommended_windows')}。"
+                            )
+                        except Exception as _pe:  # noqa: BLE001
+                            self._log(f"  [自治] 探针结论落盘失败：{_pe!r}")
                     if result is None:
                         # 没有窗口值得重标定 ⟹ 这条路推不动，让下一轮 decide 换动作。
                         self._log("  [自治] 重标定未产生新段（无窗口超阈值）。")
@@ -10732,7 +10753,7 @@ class ABFEPipeline:
                             n_insert=1,
                         )
                         import lambda_path_versions as _lpv_ins
-                        _lpv_ins.append_version(
+                        _ins_rec = _lpv_ins.append_version(
                             checkpoint_dir, [0.0] * len(new_l), new_l,
                             [list(r) for r in new_r],
                             kind="insert_lambda",
@@ -10747,7 +10768,8 @@ class ABFEPipeline:
                                     "segments_before_change": self._existing_segment_names(
                                         stage_dir)},
                         )
-                        lam = [float(x) for x in new_l]
+                        # 采样必须用**落盘后**的 λ（已量化），否则和路径版本错位 5e-9。
+                        lam = self._lambdas_from_version_record(_ins_rec, new_l)
                         ranges = [tuple(int(i) for i in r) for r in new_r]
                         self._log(
                             f"  [自治] 插 λ：窗口 {_rng} 跨度 "
@@ -11163,7 +11185,7 @@ class ABFEPipeline:
             # 只看得到后面那条 `tail_repartition`，λ 表却悄悄多了一个态；而且一旦
             # 下面 anchor 取不到就原样返回，内存与盘上永久不一致。
             import lambda_path_versions as _lpv_dz
-            _lpv_dz.append_version(
+            _dz_rec = _lpv_dz.append_version(
                 checkpoint_dir, [0.0] * len(lam), list(lam),
                 [list(r) for r in ranges],
                 kind="insert_lambda",
@@ -11175,6 +11197,7 @@ class ABFEPipeline:
                     "tail_k_after": ranges[-1][1] - ranges[-1][0],
                 },
             )
+            lam = self._lambdas_from_version_record(_dz_rec, lam)
             tail_k = ranges[-1][1] - ranges[-1][0]
             self._log(
                 f"  [自治] 末窗落在死区（{hi} < K < {split_lo}）⟹ 补 1 个："
@@ -11201,6 +11224,28 @@ class ABFEPipeline:
         )
         return ([float(x) for x in lam],
                 [tuple(int(i) for i in r) for r in new_ranges])
+
+
+    @staticmethod
+    def _lambdas_from_version_record(record, fallback):
+        """🔑 **落盘的路径版本是 λ 的唯一权威。**
+
+        `lambda_path_versions._q()` 写盘时把 λ 量化到 `LAMBDA_DECIMALS` 位；
+        如果继续拿内存里那份**未量化**的去采样，每插一个 λ 就永久制造一次错位。
+
+        真机（2026-09-12 17:05）实测 win4：
+            路径版本 0.31005333   vs   实际采样 0.310053335   差 5e-9
+        后果是死锁 —— 采样侧的 resume 门用 `np.allclose(atol=1e-9)`（含默认
+        rtol=1e-5 ⟹ 实际容差 ~3e-6）判"λ 匹配、跳过重采"，而分析侧
+        `load_ibs_window_outputs_from_dir` 用**精确相等**判"λ 不匹配"直接抛
+        ValueError。于是那个窗口**永远采不了也永远读不了**，每次启动必崩。
+        """
+        states = (record or {}).get("states") or []
+        out = [
+            float(st.get("lambda_vdw")) for st in states
+            if st.get("lambda_vdw") is not None
+        ]
+        return out if len(out) == len(fallback) else [float(x) for x in fallback]
 
     @staticmethod
     def _existing_segment_names(stage_dir: str):
@@ -14527,9 +14572,54 @@ class ABFEPipeline:
                         "allow_untrusted_stage_results", False
                     )
                 )
+                # 🔑🔑 [2026-09-12] **一个 stage 只许有一个控制器。**
+                #
+                # PLAN_PATH_REPAIR 里这些策略本来就是**同一个 `decide()` 的分支**：
+                #   · 分支 5a  = 重标定 f_k      （对应 stage2_recalibrate_f_k_on_rescue）
+                #   · 分支 5b/6 = 补采加帧        （对应 production coverage rescue）
+                #   · 布局动作 = 插 λ / 拆末窗    （对应 path_evolution 的修复分支）
+                # 所以把它们关掉**不丢任何能力**，只是不再让同一个决定被两套机制
+                # 各判一次。
+                #
+                # 真机代价（2026-09-12 16:46）：自治循环在 win5 上退出后，旧 rescue
+                # 立刻接管，拿**基准段**里旧 f_k 下的 win3（自治早已用段2 重标定解到
+                # 10.52）去"追加窗口 [3,4,5] 到 500k 步"。两套判据直接打架：
+                #   自治：加帧已被该窗口自己的数据证伪 ⟹ 插 λ 缩跨度
+                #   rescue：低于门 ⟹ 步数翻倍
+                # 而无意义的加帧会让 N_eff/g **越加越差**（同一个偏斜分布里 N 涨 g 也
+                # 涨，比值不动甚至倒退 —— win4 实测 500→1000 帧 g 从 15.1 到 49.2）。
+                _autonomous_on = bool(
+                    kwargs.get("stage2_autonomous_controller", True)
+                )
                 production_rescue_rounds = max(
                     0, int(kwargs.get("stage2_production_rescue_rounds", 2))
                 )
+                if _autonomous_on:
+                    _silenced = []
+                    if production_rescue_rounds:
+                        _silenced.append(
+                            f"生产 coverage rescue（{production_rescue_rounds} 轮）")
+                        production_rescue_rounds = 0
+                    if bool(kwargs.get("stage2_recalibrate_f_k_on_rescue", False)):
+                        _silenced.append("rescue 后 f_k 重标定")
+                        kwargs["stage2_recalibrate_f_k_on_rescue"] = False
+                    if _sampling_repair_policy == "path_evolution_v1":
+                        _silenced.append("path_evolution 的插 λ 修复分支")
+                    if _silenced:
+                        self._log(
+                            "  [控制器] 自治控制器已启用 ⟹ 关闭 "
+                            + "、".join(_silenced)
+                            + "。这些策略已经是 `decide()` 的分支（5a 重标定 / "
+                            "5b·6 补采 / 布局动作），不再让同一个决定被两套机制各判"
+                            "一次。"
+                        )
+                    # 硬断言：**不是靠我记得去 grep**。
+                    assert production_rescue_rounds == 0, (
+                        "自治控制器启用时不得并存 production rescue"
+                    )
+                    assert not kwargs.get("stage2_recalibrate_f_k_on_rescue"), (
+                        "自治控制器启用时不得并存 rescue 后 f_k 重标定"
+                    )
                 if _rescue_disabled_by_untrusted and production_rescue_rounds:
                     self._log(
                         "  [rescue] allow_untrusted_stage_results=True —— 跳过 "

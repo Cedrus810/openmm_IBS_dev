@@ -111,13 +111,25 @@ python runabfe.py --config abfe_config.json --ligand MOL --analyze-only
 ## 6. 仓库地图
 
 ```text
-runabfe.py                  主命令入口
-abfe_core.py                系统与底层物理组件
+runabfe.py                  ABFE 主命令入口（含 doctor / validate-config / config-template）
+runrbfe.py                  RBFE 命令入口（相对结合自由能，独立于 ABFE 主线）
+abfe_core.py                体系构建与底层物理组件
 abfe_pipeline.py            阶段编排、质量门、resume 和结果落盘
+abfe_preoptimizer.py        lambda 路径与窗口预优化；Stage-2 分窗与修补控制器
 ibs_engine.py               IBS、MBAR/TMBAR、Boresch、LRC 核心
-abfe_preoptimizer.py        lambda 路径和窗口预优化
-abfe_diagnostics.py         doctor / validate-config / config-template
-local_residual/             local-residual 路径势的生产子集
+free_energy_engine.py       ABFE / RBFE 共用的自由能采样引擎
+abfe_diagnostics.py         doctor / validate-config / config-template 的实现（只读）
+rbfe_core.py                RBFE 数据契约、输入验证、ΔΔG 汇总
+rbfe_pipeline.py            RBFE 编排层
+step_guard.py               OpenMM 步进的统一异常出口（模块级 import，缺了整条链起不来）
+lambda_path_versions.py     Stage-2 λ 路径的版本记录
+multi_segment_analysis.py   多采样段分析适配层（同窗口多段相加而非替换）
+apbs_correction.py          Rocklin 有限尺寸静电修正（膜路线用，当前不在主线）
+outer_lambda_neural_basis.py  外层 λ 神经基势（local_residual 加载器的依赖）
+local_residual/             local-residual 路径势
+resources/                  冻结的 R1 模型资源（2026-09-12 起随仓库分发）
+abfe_scripts/               离线脚本：local-residual 训练 / 导出 / manifest
+exp012_xed/                 EXP-012 独立研究代码（local_residual 的二阶依赖）
 tests/                      回归与协议测试
 tools/                      诊断、显式修复和绘图（非生产入口）
 plugins/                    原生 OpenMM 插件源码
@@ -137,14 +149,17 @@ docs/                       唯一文档集
 | 排障 | [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) |
 | 迁移到其他体系 | [MIGRATING_TO_A_NEW_SYSTEM.md](docs/MIGRATING_TO_A_NEW_SYSTEM.md) |
 | 改代码和验证 | [MAINTAINING.md](docs/MAINTAINING.md) |
-| 当前行动 | [docs/TODO.md](docs/TODO.md) |
+| 还欠什么活（唯一待办清单） | [docs/TODO.md](docs/TODO.md) |
 | 历史材料索引 | [docs/HISTORY_LOG.md](docs/HISTORY_LOG.md) |
 | 完整文档地图 | [docs/README.md](docs/README.md) |
 
 本仓库是 ABFE-IBS 的**工程区分支**：只有工作流源码、生产回归测试、诊断工具和使用
-文档。参考体系的 `output*` / 轨迹 / checkpoint、开发期实验脚本（`exp0XX_*`）、
-失败实验记录和逐条决策历史都在 `Atenolol-rank11` 工作区，本仓库只保留
-[历史材料索引](docs/HISTORY_LOG.md)。
+文档。参考体系的 `output*` / 轨迹 / checkpoint、失败实验记录和逐条决策历史都在
+`Atenolol-rank11` 工作区，本仓库只保留[历史材料索引](docs/HISTORY_LOG.md)。
+
+**发布定位是 clone-and-run**：`git clone` 之后直接 `python runabfe.py …`，不打包。
+`pyproject.toml` 只承担 linter 配置。判据是 `pytest tests/test_fresh_clone_imports.py`。
+冻结的 R1 资源与预编译插件 `.so` 都随仓库分发，clone 下来不用编、不用另取。
 
 ## 许可
 

@@ -20,8 +20,9 @@
 可选依赖：
 
 - CUDA 或 OpenCL，用于 GPU 运行。
-- **C++ 编译器 + CUDA toolkit**，仅在使用 `--outer-lambda-local-residual-ibs` 时需要 ——
-  那个开关依赖一个**必须自己编译**的 OpenMM native plugin，见下节。
+- **C++ 编译器 + CUDA toolkit**，**只在需要重编** `--outer-lambda-local-residual-ibs`
+  那个 OpenMM native plugin 时才用得上。仓库带了预编译 `.so`，按环境文件建环境
+  **不用编**，见下节。
 - GROMACS force-field include 目录，用于首次从 `.top` 构建系统。
 - OpenMM-ML、torch、MACE/ORB 相关依赖，仅在使用 `--boresch-source auto`、`orb_simple`、`orb_ml` 或相关 ML 功能时需要。
 
@@ -39,7 +40,7 @@
 实际跑的时候以运行产物 `<output>/run_provenance.json` 里记录的 `pymbar.__version__`
 为准 —— 那才是那次运行真正导入的版本。
 
-## CUDA 插件：**必须自己编译，仓库里不发编译产物**
+## CUDA 插件：**随仓库分发，按环境文件建环境不用编**
 
 > 只在用 `--outer-lambda-local-residual-ibs` 时才需要。**默认生产路径不加载插件**
 > （开关默认 `false`），不用这个功能可以整节跳过。

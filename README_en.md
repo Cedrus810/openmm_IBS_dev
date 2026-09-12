@@ -118,13 +118,25 @@ Passing tests establish **software contracts**; they do not automatically valida
 ## 6. Repository map
 
 ```text
-runabfe.py                  main CLI entry
+runabfe.py                  main ABFE CLI (also doctor / validate-config / config-template)
+runrbfe.py                  RBFE CLI (relative binding free energy; independent of the ABFE line)
 abfe_core.py                systems and low-level physical components
 abfe_pipeline.py            orchestration, quality gates, resume, result writing
+abfe_preoptimizer.py        lambda-path and window preoptimization; stage-2 repair controller
 ibs_engine.py               IBS, MBAR/TMBAR, Boresch, and LRC core
-abfe_preoptimizer.py        lambda-path and window preoptimization
-abfe_diagnostics.py         doctor / validate-config / config-template
-local_residual/             production subset of the local-residual path potential
+free_energy_engine.py       free-energy sampling engine shared by ABFE and RBFE
+abfe_diagnostics.py         doctor / validate-config / config-template (read-only)
+rbfe_core.py                RBFE data contracts, input validation, ddG summary
+rbfe_pipeline.py            RBFE orchestration
+step_guard.py               single exception exit for OpenMM stepping (module-level import)
+lambda_path_versions.py     version record for the stage-2 lambda path
+multi_segment_analysis.py   multi-segment adapter (segments of one window ADD, not replace)
+apbs_correction.py          Rocklin finite-size electrostatic correction (membrane route)
+outer_lambda_neural_basis.py  outer-lambda neural basis (dependency of the local_residual loader)
+local_residual/             local-residual path potential
+resources/                  frozen R1 model resources (shipped with the repo since 2026-09-12)
+abfe_scripts/               offline scripts: local-residual training / export / manifest
+exp012_xed/                 standalone EXP-012 research code (second-order dependency)
 tests/                      regression and protocol tests
 tools/                      diagnostics, explicit repairs, plotting (not production entries)
 plugins/                    native OpenMM plugin sources
@@ -144,16 +156,20 @@ Per-item notes: [PROJECT_LAYOUT.md](PROJECT_LAYOUT.md).
 | Troubleshooting | [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) |
 | Migration to another system | [MIGRATING_TO_A_NEW_SYSTEM.md](docs/MIGRATING_TO_A_NEW_SYSTEM.md) |
 | Code maintenance and tests | [MAINTAINING.md](docs/MAINTAINING.md) |
-| Current actions | [docs/TODO.md](docs/TODO.md) |
+| Open work (the single TODO list) | [docs/TODO.md](docs/TODO.md) |
 | Index of historical material | [docs/HISTORY_LOG.md](docs/HISTORY_LOG.md) |
 | Full documentation map | [docs/README.md](docs/README.md) |
 
 This repository is the **engineering branch** of ABFE-IBS: workflow source, production
 regression tests, diagnostic tooling, and user documentation only. Reference-system
-`output*` trees, trajectories and checkpoints, development-era experiment scripts
-(`exp0XX_*`), failed-experiment records, and the per-decision history live in the
-`Atenolol-rank11` workspace; this repository keeps only an
-[index of that material](docs/HISTORY_LOG.md).
+`output*` trees, trajectories and checkpoints, failed-experiment records, and the
+per-decision history live in the `Atenolol-rank11` workspace; this repository keeps only
+an [index of that material](docs/HISTORY_LOG.md).
+
+**The release model is clone-and-run**: `git clone`, then `python runabfe.py ...`. There is
+no packaging step; `pyproject.toml` only carries linter configuration. The criterion is
+`pytest tests/test_fresh_clone_imports.py`. The frozen R1 resources and the prebuilt plugin
+`.so` ship with the repository -- a clone needs no compilation step and no separate download.
 
 Most detailed tutorials are maintained in Chinese; their commands, paths, and status
 markers remain directly usable.

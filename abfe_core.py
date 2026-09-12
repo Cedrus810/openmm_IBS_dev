@@ -8485,6 +8485,7 @@ def combine_binding_free_energy(
     charge_transfer_reservoir_error_kJ_mol: float = 0.0,
     complex_conformer_summary: Optional[Dict[str, Any]] = None,
     solvent_conformer_summary: Optional[Dict[str, Any]] = None,
+    strict_cross_leg_conformer: bool = False,
 ) -> Dict[str, Any]:
     """🔑 [ATT-09] 热力学循环闭合的**唯一**实现。
 
@@ -8556,9 +8557,31 @@ def combine_binding_free_energy(
     conformer_report = evaluate_cross_leg_conformer_consistency(
         complex_conformer_summary, solvent_conformer_summary
     )
-    assert_cross_leg_conformer_consistency(conformer_report)
+    # 🔑 [2026-09-12 老板裁决] **这道门最多是 WARN 级，不阻断汇总。**
+    #
+    # 两条腿的配体构象差在这类装置上是**必然产物**而不是采样不足：溶剂腿里
+    # 配体没有任何东西撑着、vdW 一关就塌；复合物腿里主体腔把它卡住、塌不了。
+    # 拿它去硬拦 ΔG_bind 等于用一个装置固有的性质否决整条热力学循环。
+    #
+    # ⚠️ 但它**也不能反过来当作"完全跳出"的判据** —— 不是"警告了就等于没事"。
+    # 所以：判据一字不改、report 完整带出去、不重叠时 `cross_leg_conformer_gate`
+    # 永远写成 `WARN`，读数的人一眼看得见这条路径上有未计入的构象自由能差。
+    # 想要硬阻断的调用方显式传 `strict_cross_leg_conformer=True`。
+    # 口径跟 `assert_cross_leg_conformer_consistency` 一字不差：
+    # `evaluated=False`（判不了）不算不合格，只有"评估了且没过"才 WARN。
+    _r = conformer_report or {}
+    _conformer_ok = not (_r.get("evaluated") and not _r.get("passed"))
+    if strict_cross_leg_conformer:
+        assert_cross_leg_conformer_consistency(conformer_report)
 
     return {
+        # PASSED / WARN —— **永远**写，永远带着完整 report。
+        # WARN 不是"已处理"，是"这个 ΔG_bind 里有一项构象自由能差没被计入"。
+        "cross_leg_conformer_gate": (
+            "NOT_EVALUATED" if not _r.get("evaluated")
+            else ("PASSED" if _conformer_ok else "WARN")
+        ),
+        "cross_leg_conformer_report": conformer_report,
         "complex_delta_G_kJ_mol": dg_complex,
         "solvent_delta_G_kJ_mol": dg_solvent,
         "boresch_correction_kJ_mol": dg_boresch,
