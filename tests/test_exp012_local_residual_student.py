@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.needs_gpu  # torch 为 GPU 版构建，CPU 上无意义，归 GPU 节点套件
+
 torch = pytest.importorskip("torch")
 
 from local_residual.geometry import ligand_environment_cross_edges  # noqa: E402
@@ -25,7 +27,6 @@ from local_residual.student import (  # noqa: E402
     reindex_ligand_environment_edges,
 )
 
-pytestmark = pytest.mark.cpu_only
 
 DTYPE = torch.float64
 TYPE_VOCABULARY = (1, 6, 7, 8, 16)  # H, C, N, O, S -- matches the project's existing element set

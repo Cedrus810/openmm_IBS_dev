@@ -6,6 +6,8 @@ from dataclasses import replace
 
 import pytest
 
+pytestmark = pytest.mark.needs_gpu  # torch 为 GPU 版构建，CPU 上无意义，归 GPU 节点套件
+
 torch = pytest.importorskip("torch")
 
 from local_residual.softlift import (  # noqa: E402
@@ -15,7 +17,6 @@ from local_residual.softlift import (  # noqa: E402
     count_trainable_parameters,
 )
 
-pytestmark = pytest.mark.cpu_only
 
 
 def _config(rung: str, n_ligand: int = 2) -> SoftLiftConfig:
