@@ -242,16 +242,61 @@ def test_bake_preserves_full_nonbonded_force_configuration():
 # ---------------------------------------------------------------------------
 
 
-def test_bake_fails_closed_if_parameter_used_by_another_force():
+def test_bake_fails_closed_if_parameter_used_by_an_unbakeable_force():
+    """除 NonbondedForce / CustomBondForce 之外的力引用该参数 ⟹ 仍然 fail closed。
+
+    契约没变：本函数不能宣称「整个 System 已经不再有这个活参数」，除非它真的处理了
+    每一处引用。2026-09-14 只把 `CustomBondForce` 加进「处理得了」的那一类
+    （见下一条测试），其余照旧拒绝。
+    """
     system, nb = _simple_system()
     nb.addGlobalParameter("lam_test", 1.0)
-    other = openmm.CustomBondForce("lam_test*r")
+    other = openmm.CustomExternalForce("lam_test*x")
     other.addGlobalParameter("lam_test", 1.0)
-    other.addBond(0, 1, [])
+    other.addParticle(0, [])
     system.addForce(other)
 
-    with pytest.raises(RuntimeError, match="非 NonbondedForce"):
+    with pytest.raises(RuntimeError, match="还被以下 Force 引用"):
         core.bake_global_parameter_into_fixed_nonbonded_force(system, "lam_test", 0.0)
+
+
+@pytest.mark.parametrize("lam", [0.0, 1.0])
+def test_bake_substitutes_the_value_into_a_custom_bond_force(lam):
+    """CustomBondForce 里的该参数被**代进表达式**，参数从 System 上彻底消失。
+
+    这是 v5 配体内部库仑补偿项（`LigandInternalCoulomb`，前缀 `1 - lambda_coul^2`）
+    能过 stage-1→stage-2 烘焙交接的前提。判据是能量：烘焙后的力在数值上必须等于
+    「把 λ 设成该值的原力」，而不只是「参数不见了」。
+    """
+    system, nb = _simple_system()
+    nb.addGlobalParameter("lam_test", 1.0)
+    other = openmm.CustomBondForce("(1 - lam_test^2)*7.0*r")
+    other.setName("LigandInternalCoulomb")
+    other.addGlobalParameter("lam_test", 1.0)
+    other.addBond(0, 1, [])
+    other.setForceGroup(2)
+    system.addForce(other)
+
+    baked = core.bake_global_parameter_into_fixed_nonbonded_force(system, "lam_test", lam)
+
+    names = set()
+    custom = None
+    for f in baked.getForces():
+        if isinstance(f, openmm.CustomBondForce):
+            custom = f
+        for i in range(f.getNumGlobalParameters()) if hasattr(f, "getNumGlobalParameters") else []:
+            names.add(f.getGlobalParameterName(i))
+    assert "lam_test" not in names, f"烘焙后 System 上仍有活参数：{sorted(names)}"
+    assert custom is not None
+    assert custom.getName() == "LigandInternalCoulomb"
+    assert custom.getForceGroup() == 2
+    assert "lam_test" not in custom.getEnergyFunction()
+
+    # 数值判据（不只是"参数不见了"）：烘焙后的 System == 把 λ 显式设成该值的原 System。
+    want_e, want_f = _energy_and_forces(system, POSITIONS, {"lam_test": lam})
+    got_e, got_f = _energy_and_forces(baked, POSITIONS)  # 不传任何 global_parameters
+    assert got_e == pytest.approx(want_e, rel=1e-12), f"λ={lam}: {got_e} vs {want_e}"
+    assert np.allclose(got_f, want_f, atol=1e-9)
 
 
 def test_bake_fails_closed_if_parameter_not_found():

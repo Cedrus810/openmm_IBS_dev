@@ -254,6 +254,19 @@ def init_version(
     return _write_version(checkpoint_dir, record)
 
 
+# 2026-09-14 起从 `detail` 迁往 `note` 的**旁注**键：它们是自产产物（盘面扫描结果），
+# 进 `event_id` 会让同一次事件在重试时 id 漂移。比对幂等时两边都要剔掉它们，
+# 否则**已落盘的旧记录**（按含该键的旧形状算过 id）与新算的 id 永远配不上。
+_NOTE_MIGRATED_DETAIL_KEYS = ("segments_before_change",)
+
+
+def _semantic_event_id(kind: str, detail: Optional[Dict[str, Any]]) -> str:
+    """剔掉已迁往 `note` 的旁注键之后的 `event_id`，用于**跨新旧形状**比对幂等。"""
+    d = {k: v for k, v in (detail or {}).items()
+         if k not in _NOTE_MIGRATED_DETAIL_KEYS}
+    return event_id(kind, d)
+
+
 def append_version(
     checkpoint_dir: str,
     lambdas_coul: Sequence[float],
@@ -263,6 +276,7 @@ def append_version(
     kind: str,
     reason: str,
     detail: Optional[Dict[str, Any]] = None,
+    note: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """在当前版本之上追加一个新版本（按 event_id 幂等）。
 
@@ -274,18 +288,49 @@ def append_version(
         raise ValueError("没有当前路径版本，先调用 init_version()")
     parent = int(current["version"])
     detail = dict(detail or {})
+    # 🔑🔑 [审计 #5] **`note` 是旁注：进记录、不进 `event_id`。**
+    # `event_id` 哈希整个 `{kind, detail}`，而它是本函数**唯一**的幂等键。
+    # 所以放进 `detail` 的任何**自产产物**都会让重试时 eid 漂移 ——
+    # 真机形状：`abfe_pipeline` 把 `existing_segment_names(stage_dir)`（盘上段目录
+    # 扫描结果）塞进 detail，控制器每开一个新采样段就多一个目录 ⟹ 同一次插点的
+    # eid 变了 ⟹ 祖先链检查与孤儿检查双双 miss ⟹ **同一次插点被应用第二次**，
+    # 还白吃一次 `max_path_insertions` 预算。
+    # 这是本仓「只有用户输入才配做身份 / 自产产物进身份」这条老坑的第 5 次复发。
+    # ⚠️ 修法**不能**改成「event_id 只哈希白名单键」：那会让**现存全部**记录
+    # 重算的 eid 与盘上不等，已应用过的插点在下次 resume 时被整体重放一遍。
+    note = dict(note or {})
     eid = event_id(kind, detail)
+
+    # 🔑🔑 **幂等比对必须对「旁注键搬家」向后兼容。**
+    # 2026-09-14 把 `segments_before_change` 从 `detail` 挪到了 `note`（它是自产的
+    # 目录扫描结果，进 eid 会让重试时 eid 漂移）。但**已经落盘**的事件，它的
+    # `event.id` 是按**旧形状**（含该键）算出来的 ⟹ 直接拿新 eid 去比字面值必然
+    # 配不上：祖先链检查 miss、孤儿检查也 miss ⟹ **同一次插点被写第二遍**，
+    # 还多占一个 `max_path_insertions`。最具体的复现是「写完版本文件、还没推指针
+    # 就被杀」那条路径。
+    # 所以比对走 `_semantic_event_id()`：两边都把已迁往 note 的旁注键剔掉再算，
+    # 新旧记录因此落在同一个身份空间里。
+    # ⚠️ 这**不是**「event_id 只哈希白名单键」（那个方案已否决：它会让现存全部
+    # 记录重算值与盘上不等、已应用过的插点整体重放）。这里只对**明确迁走的那几个
+    # 键**做归一化，其余键一字不动。
+    def _same_event(rec) -> bool:
+        _ev = (rec or {}).get("event") or {}
+        if _ev.get("id") == eid:
+            return True                      # 新形状：字面值直接命中
+        if _ev.get("kind") != kind:
+            return False
+        return _semantic_event_id(_ev.get("kind"), _ev.get("detail")) == eid
 
     # 1) 这次插点已经在当前路径的**祖先链**里 → 路径里已经有它了，原样返回，不重插、
     #    也绝不把指针退回那个祖先。
-    if any(rec.get("event", {}).get("id") == eid for rec in history(checkpoint_dir)):
+    if any(_same_event(rec) for rec in history(checkpoint_dir)):
         return current
     # 2) 存在写完但没来得及推指针的**孤儿**版本 → 采纳它（只前进）。
     for version in existing_versions(checkpoint_dir):
         if version <= parent:
             continue
         candidate = load_version(checkpoint_dir, version)
-        if candidate is not None and candidate.get("event", {}).get("id") == eid:
+        if candidate is not None and _same_event(candidate):
             _publish(checkpoint_dir, version)
             return candidate
 
@@ -293,7 +338,10 @@ def append_version(
     record = _make_record(
         max(existing_versions(checkpoint_dir) or [parent]) + 1,
         parent, states, window_ranges,
-        {"id": eid, "kind": kind, "reason": reason, "detail": detail},
+        # `note` 为空时事件字典**逐字**与先前相同 ⟹ 其余调用点产出的记录
+        # 字节不变、旧版本链的 eid 完全匹配。
+        dict({"id": eid, "kind": kind, "reason": reason, "detail": detail},
+             **({"note": note} if note else {})),
     )
     return _write_version(checkpoint_dir, record)
 

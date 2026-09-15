@@ -181,10 +181,18 @@ K_tail = 7  可拆            K_tail = 10 ★ 永远拆不开 —— 死胡同
 | 字段 | 定义 | 出处 | 回答 |
 |---|---|---|---|
 | `fisher_metric_g` | `β²Var[∂U/∂λ]` | `abfe_preoptimizer.py:971` | **λ 间距**够不够 → Type I |
-| `tau_int` | 时间自相关 | `ibs_engine.py:19037-19044` | **采样时间**够不够 → Type II |
+| `statistical_inefficiency_g`（旧键 `tau_int`） | 统计低效率 `g = 1 + 2·τ_int` | `ibs_engine.join_lambda_two_sided_support` | **采样时间**够不够 → Type II |
 | `friction metric` *[待引入]* | 动力学代价 | Optimal Alchemistry | 区分"热力学距离长"与"动力学慢" |
 
 混用 = 用时间预算回答布点问题，会稳定选错类型。
+
+> ⚠️ **2026-09-14 更正：`g` 不等于 `tau_int`，`g = 1 + 2·τ_int`。**
+> 本文 09-11 原稿三处（本表、§3bis.1、§3bis.5 证据表）把两者当同一个量，是错的。
+> 起因是 `join_lambda_two_sided_support` 当时把统计低效率 `g` 直接落进了 `tau_int`
+> 这个键（审计 **#54**）。现已修：真正的 g 落新键 `statistical_inefficiency_g`，
+> `tau_int` 保留为别名但**值已改成真正的 `(g−1)/2`**。
+> 🔑 **这是「键名没变、值变了」的改动** —— 比改名危险得多：读点不跟着改就静默差
+> 约 2 倍，且不会抛任何异常。引用本文旧数字时先确认那份产物的落盘日期。
 
 ### `|ΔF|` 不能单独触发 Type I
 
@@ -203,7 +211,7 @@ MBAR 本来就处理多个采样分布 —— 所以"某个 λ 态到底有没�
 ### 3bis.1 实测：判据在窗口内问、答案在窗口外
 
 `cyclod_ligand2/rep1` vanishing，每个窗口对自己每个 λ 态的重加权支撑
-（rawESS / 帧数，`g` = `tau_int`）：
+（rawESS / 帧数；下表的 `g` 是**统计低效率** `g = 1 + 2·τ_int`，09-14 前它被落在 `tau_int` 键里，见上文更正框）：
 
 ```
 win0  λ=1.0000 ESS 436/500 g= 1.1     win1  λ=0.6079 ESS 332/500 g= 1.6
@@ -260,7 +268,7 @@ win2 算完      → 查 join λ=0.4847        ← 是 (win1,win2)，不是累�
 
 | 证据 | 用现有落盘数据算得出 | 回答 |
 |---|---|---|
-| **per-state support profile**：窗口内逐 λ 的 rawESS/`tau_int` 剖面 | ✅ | **单调衰减到远端** = 窗口太宽（II 缩窗）；**整体偏低** = 采样不够（II 延长）。比"整窗一个 g" 分得开得多 |
+| **per-state support profile**：窗口内逐 λ 的 rawESS/`statistical_inefficiency_g` 剖面（09-14 前该量落在 `tau_int` 键里，见上文更正框） | ✅ | **单调衰减到远端** = 窗口太宽（II 缩窗）；**整体偏低** = 采样不够（II 延长）。比"整窗一个 g" 分得开得多 |
 | **join 两侧支撑比** | ✅（仅 join λ） | 端点弱是不是真问题；上游窗口的 ΔF 端点值可否采信 |
 | 内部 λ 的跨窗支撑 | ❌ 需协议改动 | — |
 

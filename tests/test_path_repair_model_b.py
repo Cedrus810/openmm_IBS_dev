@@ -153,14 +153,18 @@ def test_feasible_split_needs_two_times_lo_minus_one():
         RANGES, 16, min_states_per_window=4, max_states_per_window=5
     )
     assert d["insert_lambda"] is None, "末窗豁免上限 ⟹ 插点总是可行"
-    assert d["split_tail_window"] is not None
-    assert "最小可拆 K = 7" in d["split_tail_window"]
+    # 🔑 [审计 #24，2026-09-14] 键从 `split_tail_window` 换成 `split_last_window_in_two`：
+    # 本测试问的是「**末窗**能不能一分为二」，而 `split_tail_window` 现在指的是
+    # 控制器那个**动作**的可行性，它的执行器做的是「从 anchor 起重分整个尾段」
+    # （`repartition_tail_from_anchor`）—— 两个不同的问题，先前共用一个键。
+    assert d["split_last_window_in_two"] is not None
+    assert "最小可拆 K = 7" in d["split_last_window_in_two"]
     # 末窗长到 7 态之后可拆（4+4）
     grown = RANGES[:-1] + [(11, 18)]
     d2 = pre.feasible_repair_actions(
         grown, 18, min_states_per_window=4, max_states_per_window=5
     )
-    assert d2["split_tail_window"] is None
+    assert d2["split_last_window_in_two"] is None
 
 
 def test_feasible_insert_blocked_once_overflow_slot_is_gone():
@@ -291,7 +295,11 @@ def test_tail_at_the_ceiling_can_still_be_split():
         ranges, 19, min_states_per_window=4, max_states_per_window=5, n_insert=1
     )
     assert d["insert_lambda"] is not None, "再插会越界"
-    assert d["split_tail_window"] is None, "但拆得开 —— 这才是该走的动作"
+    # 🔑 [审计 #24，2026-09-14] 键从 `split_tail_window` 换成 `split_last_window_in_two`：
+    # 本测试问的是「**末窗**能不能一分为二」，而 `split_tail_window` 现在指的是
+    # 控制器那个**动作**的可行性，它的执行器做的是「从 anchor 起重分整个尾段」
+    # （`repartition_tail_from_anchor`）—— 两个不同的问题，先前共用一个键。
+    assert d["split_last_window_in_two"] is None, "但拆得开 —— 这才是该走的动作"
 
 
 # ============================================================================

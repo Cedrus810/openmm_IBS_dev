@@ -245,7 +245,17 @@ def test_explicit_ranges_pin_the_layout_and_disable_insertion():
         abfe_pipeline.ABFEPipeline._run_stage2_with_path_evolution
     )
     body = src[src.index("if explicit_window_ranges_pinned:"):]
-    assert "return run_once(" in body[:1200], "钉住时必须直接跑一次并返回，不进插点循环"
+    # [2026-09-14] 判据从"字面出现 `return run_once(`"改成语义判据：
+    # 这条分支必须**直接返回一次普通运行**、不进插点循环。实际调用现在包了一层
+    # `_guarded_once()`（接住 LOCAL_VALIDATION_CAP 这个路由信号），原来的字面
+    # 匹配会把这层包装误判成"改坏了"。
+    _head = body[:1200]
+    assert "return _guarded_once(), current_l, current_r" in _head or (
+        "return run_once(" in _head
+    ), "钉住时必须直接跑一次并返回"
+    assert "insert_lambda_in_failed_ibs_window" not in _head, (
+        "钉住时不许进插点循环"
+    )
     assert "不做" in body[:1200] and "stage2_window_ranges" in body[:1200], (
         "必须打日志说明演化被关掉了"
     )

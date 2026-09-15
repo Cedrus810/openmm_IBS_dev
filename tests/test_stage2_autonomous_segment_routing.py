@@ -24,8 +24,8 @@ except ImportError:  # 没装 openmm 的机器上：直接从源码抽这几个�
         if isinstance(n, ast.ClassDef) and n.name == "ABFEPipeline"
     )
     _WANT = {
-        "_segment_dirs_for_evidence",
-        "_latest_segment_dirs",
+        # S2-D（2026-09-12）：`_segment_dirs_for_evidence` 已迁到
+        # `abfe_preoptimizer.segment_dirs_for_evidence`，见本文件 SEG 的取法。
         "_recalibrate_f_k_and_resample_segment",
     }
     _ns = {"os": os, "glob": __import__("glob"), "Optional": object, "List": list,
@@ -38,8 +38,11 @@ except ImportError:  # 没装 openmm 的机器上：直接从源码抽这几个�
             exec(compile(ast.fix_missing_locations(_mod), "<x>", "exec"), _ns)
             setattr(ABFEPipeline, _n.name, _ns[_n.name])
 
-SEG = ABFEPipeline._segment_dirs_for_evidence
-LATEST = ABFEPipeline._latest_segment_dirs
+# S2-D：段名解析是**决策同源**的纯函数，跟 insert_lambda / repartition 同住
+# `abfe_preoptimizer`；`abfe_preoptimizer` 不拖 openmm 顶层依赖，直接 import 即可。
+from abfe_preoptimizer import segment_dirs_for_evidence as SEG  # noqa: E402
+
+
 
 
 def test_evidence_in_base_segment_uses_default_dirs():
@@ -62,18 +65,6 @@ def test_evidence_spanning_segments_fails_closed():
     raise AssertionError("跨段补采应当 fail-closed")
 
 
-def test_latest_segment_picks_max_suffix(tmp_path):
-    stage = tmp_path / "vanishing"
-    for name in ("vanishing", "vanishing_2", "vanishing_5", "vanishing_x"):
-        (tmp_path / name).mkdir()
-    out, ckpt = LATEST(str(stage), str(tmp_path / "checkpoints"))
-    assert out.endswith("vanishing_5")
-    assert ckpt.endswith("segment_5")
-
-
-def test_latest_segment_is_none_when_only_base(tmp_path):
-    (tmp_path / "vanishing").mkdir()
-    assert LATEST(str(tmp_path / "vanishing"), str(tmp_path / "cp")) == (None, None)
 
 
 def test_recalibrate_reads_source_not_output_dir():
@@ -262,3 +253,32 @@ if __name__ == "__main__":
             fn()
         print("  ok", name)
     print("全过")
+
+
+def test_multi_window_topup_is_grouped_by_segment_not_handed_over_as_one_set():
+    """跨段的多窗补采必须**一段一次**。
+
+    控制器是允许发出跨段窗口集合的（分支 9c「端点 σ 没有逐窗归因 ⟹ 全窗各补
+    一块」就必然跨段），而 `segment_dirs_for_evidence` 对跨段集合 fail-closed。
+    先前执行器把整批丢进去 ⟹ ValueError 穿过 `except Exception` 被 re-raise，
+    整条流水线死在一个**本来可以正常执行**的动作上。
+    """
+    from abfe_preoptimizer import windows_by_segment
+
+    recs = [
+        {"window_idx": 0, "segment": "vanishing_2", "production_steps": 500_000},
+        {"window_idx": 1, "segment": "vanishing_2", "production_steps": 250_000},
+        {"window_idx": 4, "segment": "vanishing", "production_steps": 750_000},
+        {"window_idx": 5, "segment": None, "production_steps": 0},   # 段名缺失=基准段
+    ]
+    by_seg = windows_by_segment([0, 1, 4, 5], recs, 250_000)
+    assert by_seg == {
+        "vanishing_2": {0: 750_000, 1: 500_000},
+        "vanishing": {4: 1_000_000},
+        "": {5: 250_000},
+    }
+    # 每一组都能单独解析出目录（整批一起丢才会炸）。
+    assert SEG({"vanishing_2"}, "/r/vanishing", "/r/ck") == ("/r/vanishing_2",
+                                                            "/r/ck/segment_2")
+    for seg in ("vanishing", ""):
+        assert SEG({seg}, "/r/vanishing", "/r/ck") == (None, None)

@@ -32,8 +32,10 @@
 | 查 stage2 的失效机制（仍是活的参考） | [STAGE2_ROOT_CAUSE_2026-08-28.md](STAGE2_ROOT_CAUSE_2026-08-28.md) |
 | 重新设计 stage2 控制流前先读（分窗口/分 λ/分采样量 三轴当前怎么耦合的） | [STAGE2_THREE_AXES_COUPLING_2026-09-11.md](STAGE2_THREE_AXES_COUPLING_2026-09-11.md) |
 | 路径最小修补：Type I/II/III + 修补顺序（**部分已实现**，代码里 10 余处引它作设计依据；缺口见 TODO §1） | [PLAN_PATH_REPAIR_2026-09-11.md](PLAN_PATH_REPAIR_2026-09-11.md) |
+| 🔴 **stage2 控制器 + 预算：63+2 条缺陷的全面审计与修复状态**（**改控制器/预算前先读这份**；含三条贯穿性根因、逐条状态列、两条「别再犯」的规矩：#18「零调用点 ≠ 忘了接」、#65「改名/改值不通知消费者」） | [CONTROLLER_BUDGET_AUDIT_2026-09-14.md](CONTROLLER_BUDGET_AUDIT_2026-09-14.md) |
 | 🔑 **stage2 自治控制器：设计 + 实证 + 陷阱清单**（**接手先读这份**；含首次跑通的实证与 10 条真机咬过的坑） | [STAGE2_CONTROLLER_DESIGN_2026-09-12.md](STAGE2_CONTROLLER_DESIGN_2026-09-12.md) |
-| **stage2 自治控制器：设计 + 实证 + 十条真机陷阱**（碰 stage2 先读这份，**别重推**） | [STAGE2_CONTROLLER_DESIGN_2026-09-12.md](STAGE2_CONTROLLER_DESIGN_2026-09-12.md) |
+| **stage2 自治控制器：设计 + 实证 + 十条真机陷阱 + 交接**（碰 stage2 先读这份，**别重推**；含代码位置图、当前状态与复现、8 条别重新论证的事、给下一个人的规矩） | [STAGE2_CONTROLLER_DESIGN_2026-09-12.md](STAGE2_CONTROLLER_DESIGN_2026-09-12.md) |
+| **stage2 后分析：单跑演化报告 / 两跑 A/B 对比**（baseline vs outer-λ 增强采样，只读纯聚合，不重算自由能）<br>`python stage2_ab_report.py <run_dir>`｜`--ab <baseline> <cand>`｜`--json` | 脚本 [`stage2_ab_report.py`](../stage2_ab_report.py)；清单由 `abfe_preoptimizer.Stage2RepairController.comparison_manifest()` 生成，落在 `<run>/checkpoints/controller_comparison_manifest.json`（**2026-09-14 改名**，旧名 `stage2_comparison_manifest.json` 会被 `_read_stage_result()` 的兜底 glob `stage2_*.json` 吃掉；脚本两级回退兼容旧产物，见审计 **#65**） |
 | stage2 自治循环逐个 bug 的修复流水账（历史，不是待办） | [STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md](STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md) |
 | stage2 自治闭环的**验收指标**（老板定案，唯一指标） | [AUTONOMOUS_STAGE2_LOOP_SPEC_2026-09-11.md](AUTONOMOUS_STAGE2_LOOP_SPEC_2026-09-11.md) |
 | stage2 分窗与多采样段：09-10/11 那八个 bug 改了什么（**已全部落地，09-12 归档**；仍是这几处当前行为的唯一出处） | [archive/STAGE2_WINDOW_AND_SEGMENT_REDESIGN_2026-09-11.md](archive/STAGE2_WINDOW_AND_SEGMENT_REDESIGN_2026-09-11.md) |

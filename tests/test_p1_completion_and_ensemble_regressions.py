@@ -235,11 +235,18 @@ def test_analyze_only_applies_existing_conformer_gate(tmp_path, overlap):
         (directory / "final_results.json").write_text(json.dumps(result))
     args = SimpleNamespace(output=str(tmp_path), temperature=300., mode="ibs", decoupling="dual_lambda")
     args.get = lambda key, default=None: getattr(args, key, default)
+    # [2026-09-13] 不重叠**不再阻断后处理**（design §7.5 裁决：这道门最多 WARN）。
+    # 但 analyze-only 路径必须照样把门的读数落进产物 —— 否则"不阻断"就变成
+    # "看不见"。所以两个分支都要求产物存在，区别只在 gate 读数。
+    runabfe.run_post_analysis(args)
+    result = json.loads((tmp_path / "final_results_postprocess.json").read_text())
+    terms = result["thermodynamic_cycle_terms"]
+    assert terms["ligand_conformer_cross_leg"]["evaluated"]
     if overlap:
-        runabfe.run_post_analysis(args)
-        result = json.loads((tmp_path / "final_results_postprocess.json").read_text())
-        assert result["thermodynamic_cycle_terms"]["ligand_conformer_cross_leg"]["evaluated"]
+        assert terms["cross_leg_conformer_gate"] == "PASSED"
+        assert terms["ligand_conformer_cross_leg"]["passed"] is True
     else:
-        with pytest.raises(ValueError, match="构象"):
-            runabfe.run_post_analysis(args)
-        assert not (tmp_path / "final_results_postprocess.json").exists()
+        # WARN 不等于已处理：判据没放宽（passed 仍是 False），报告必须带着
+        assert terms["cross_leg_conformer_gate"] == "WARN"
+        assert terms["ligand_conformer_cross_leg"]["passed"] is False
+        assert terms["cross_leg_conformer_report"]["passed"] is False

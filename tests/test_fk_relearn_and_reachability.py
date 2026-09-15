@@ -170,7 +170,12 @@ def test_relearn_does_not_seed_old_f_k():
 
 
 def test_refuted_candidate_no_longer_kills_the_stage():
-    """统计驳回只终止这份候选 —— 那个 handler 里不得再有裸 raise。"""
+    """统计驳回只终止这份候选 —— 那个 handler 里不得有**任何** raise。
+
+    [2026-09-14] 原文写的是「裸 raise」，不准确：外层 `except Exception` 会接住
+    并重新抛出这个 handler 里的**任何**异常 ⟹ 不管抛的是什么、为了什么，结果都是
+    整个 run 死掉。所以判据就是「一个 raise 都不许有」，fail-closed 要停就走终态出口。
+    """
     fn = next(
         n for n in ast.walk(ast.parse((_SRC / "abfe_pipeline.py").read_text()))
         if isinstance(n, ast.FunctionDef) and n.name == "_run_stage2_autonomous"
@@ -179,6 +184,21 @@ def test_refuted_candidate_no_longer_kills_the_stage():
         names = {n.attr for n in ast.walk(h.type or ast.Pass())
                  if isinstance(n, ast.Attribute)}
         if "IBSFrozenCalibrationValidationError" in names:
+            # 🔑 [2026-09-14] **判据维持最严：这个 handler 里不得有任何 `raise`。**
+            #
+            # 我一度把它收窄成「只禁裸 raise / 重抛捕获变量 / 重抛同类型」，理由是
+            # 同一天 handler 里加了一道**针对另一件事**的 fail-closed（封存记录的
+            # 身份字段缺失时拒绝落一条注定匹配不上的空记录）。那个收窄是**错的**：
+            #   · 这个 handler 里**任何** raise 都会被外层 `except Exception` 接住
+            #     并重新抛出 ⟹ 不管抛的是什么、为了什么，结果都是整个 run 死掉。
+            #     所以「不得有任何 raise」不是过严，它就是这个 handler 的契约。
+            #   · 而那道 fail-closed 想表达的「台账写不成就别装作写成了」，用
+            #     **终态出口**（`_finish("TERMINAL", "HALT_FK_REFUTED", …)` + `break`）
+            #     一样能表达，而且更准确 —— 它本来就该停下并留诊断，不是抛异常。
+            #     执行器那边已经按这个改法落地，所以本断言一个字都不用放宽。
+            #
+            # 教训值得留在这里：「为了让改动通过而放宽测试」和「改动本身就不该触发
+            # 那条断言」是两件事。先确认是后者，再动测试。
             assert not any(isinstance(b, ast.Raise) for b in ast.walk(h)), \
                 "驳回应封存候选并路由到 RELEARN_FK_EPOCH，不再上抛终止整个 Stage-2"
             return
@@ -198,3 +218,65 @@ if __name__ == "__main__":
             fn()
         print("  ok", name)
     print("全过")
+
+
+# ── S2-B：完整性要求不许随预算浮动 ──────────────────────────────────────
+def _assignments_of(module: str, target: str):
+    """源码里对 `target` 的每一次赋值，返回右侧表达式里引用的名字集合。
+
+    按**源码 AST** 断言而不是跑一遍：这个量活在 `run_ibs_bias_warmup` 内部，
+    真要跑到它得起 OpenMM + 完整预热循环。同类源码断言的先例见
+    `docs/STAGE2_CONTROLLER_DESIGN_2026-09-12.md` §9.5。
+    """
+    out = []
+    for node in ast.walk(ast.parse((_SRC / module).read_text())):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == target for t in node.targets):
+            continue
+        out.append({n.id for n in ast.walk(node.value) if isinstance(n, ast.Name)})
+    return out
+
+
+def test_completeness_requirement_is_decoupled_from_budget():
+    """`minimum_complete_validation_frames` 是**统计目标**，不是预算的函数（S2-B）。
+
+    原式是 `max(统计目标, validation_attempt_budget_steps // check_chunk)`，而续验
+    路径上 `validation_attempt_budget_steps = full_bias_step_budget` ⟹ **给的预算
+    越多、要求的帧数越高**（实测 max(200, 515000//250) = 2061，是统计目标的 10 倍）。
+    那不是一个"要求"，那是把预算改名叫要求。
+
+    它只进报告、不当门，所以这条钉的不是判定，而是**这个数不许骗读它的人**：
+    可达性预检的 T 一度就被错取成它，把 gcrit 算小 20 倍（见上面 win4 那条）；
+    而且随预算浮动的数会让两次 run 的报告没法横向比。
+    """
+    rhs_names = _assignments_of("ibs_engine.py", "minimum_complete_validation_frames")
+    assert rhs_names, "找不到 minimum_complete_validation_frames 的赋值"
+    forbidden = {"validation_attempt_budget_steps", "full_bias_step_budget",
+                 "frozen_validation_reserved_steps", "budget_remaining_steps"}
+    for names in rhs_names:
+        leaked = names & forbidden
+        assert not leaked, (
+            f"完整性要求又跟预算耦合上了：右侧引用了 {sorted(leaked)}。"
+            "200 是统计目标，不该随预算浮动（S2-B）。"
+        )
+
+
+def test_reachability_T_is_the_decorrelated_floor_not_the_completeness_target():
+    """两个量不许合并：T 是**去相关**帧数下限，完整性目标是**原始**帧数。
+
+    混掉的实测后果就在本文件第一条测试里：gcrit 算小 20 倍。
+    """
+    src = (_SRC / "abfe_preoptimizer.py").read_text()
+    # 控制器取 T 的那一处必须读 decorrelated_frames_required，且回退到引擎常量
+    assert '"decorrelated_frames_required"' in src
+    assert "_ie_min_frames()" in src
+    # 完整性目标在控制器里只能是**报告字段**，名字自带 REPORT_ONLY 免得被误用
+    assert "validation_completeness_frames_REPORT_ONLY" in src
+    for node in ast.walk(ast.parse(src)):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_ie_reach"):
+            for kw in node.keywords:
+                if kw.arg == "required_decorrelated_frames":
+                    used = {n.id for n in ast.walk(kw.value) if isinstance(n, ast.Name)}
+                    assert "T" in used or used, "T 的来源读不出来"

@@ -485,7 +485,10 @@ def test_resume_rejects_each_gate_independently(overrides, failing_gate):
         ("lse_log_residual_tolerance", "lse_tolerance_match"),
         ("lj_tail_lrc_protocol_version", "lrc_version_match"),
         ("sampling_repair_policy", "repair_policy_match"),
-        ("n_steps_per_window_effective", "early_stop_ok"),
+        # [2026-09-14] 换字段不换证明：缺 n_steps_per_window_effective 仍然必须
+        # fail-closed（`usable is False` 那条断言没动）。只是拒绝它的门已经从
+        # 兼职的 early_stop_ok 拆成了名副其实的 step_budget_ok。
+        ("n_steps_per_window_effective", "step_budget_ok"),
     ],
 )
 def test_resume_fails_closed_on_missing_fields(missing_field, failing_gate):
@@ -531,8 +534,13 @@ def test_resume_rejects_cache_produced_under_lower_step_budget():
         target_steps=500_000,
     )
     assert status["usable"] is False
-    assert status["early_stop_ok"] is False
-    assert "目标步数" in status["early_stop_reject_reason"]
+    # [2026-09-14] 这条证明的仍然是「250k 时代跑满的缓存不得被当成满足 500k
+    # 目标」，只是改用正确的字段去证明：拒绝它的是纯进度判据 step_budget_ok，
+    # 与 early stop 无关（这份缓存 early_stop_triggered=False）。顺带钉住
+    # early_stop_ok **不再**被这种纯预算短缺拉下来。
+    assert status["step_budget_ok"] is False
+    assert "目标步数" in status["step_budget_reject_reason"]
+    assert status["early_stop_ok"] is True
 
 
 def test_resume_accepts_cache_produced_under_higher_step_budget():

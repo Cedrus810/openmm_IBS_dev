@@ -121,9 +121,13 @@ def test_tail_window_is_the_overflow_slot_and_grows_instead():
         abs(old_lam[20] - old_lam[16])
     )
     # 长到 7 态之后才可拆
+    # 🔑 [审计 #24，2026-09-14] 键从 `split_tail_window` 换成 `split_last_window_in_two`：
+    # 本测试问的是「**末窗**能不能一分为二」，而 `split_tail_window` 现在指的是
+    # 控制器那个**动作**的可行性，它的执行器做的是「从 anchor 起重分整个尾段」
+    # （`repartition_tail_from_anchor`）—— 两个不同的问题，先前共用一个键。
     assert feasible_repair_actions(
         new_ranges, len(new_lam), min_states_per_window=4, max_states_per_window=5
-    )["split_tail_window"] is None
+    )["split_last_window_in_two"] is None
 
 
 def test_it_never_splits_a_window():

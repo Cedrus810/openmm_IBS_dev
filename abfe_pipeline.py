@@ -41,6 +41,7 @@ from abfe_preoptimizer import (
     ABFEPreOptimizer,
     DualLambdaPreOptimizer,
     recompute_vanishing_path_from_cached_pilot,
+    segment_index_of_dir,
 )
 from abfe_preoptimizer import build_aces_probe_system, build_aces_probe_system_dual_lambda
 from abfe_preoptimizer import refine_stage_lambda_path_from_data
@@ -52,6 +53,7 @@ from abfe_preoptimizer import (
     canonicalize_window_ranges,
     split_window_from_ibs_lse_failure,
     feasible_repair_actions,
+    tail_overflow_exemption_active,
     Stage2RepairController,
     insert_thermodynamic_midpoint_from_ibs_lse_failure,
     redistribute_vanishing_lambda_subdomains,
@@ -138,6 +140,12 @@ from abfe_core import (
     validate_final_leg_result,
     validate_boresch_attachment_result,
     FinalResultValidationError,
+    # [2026-09-15] 精度只由**跨独立重复**的样本 SD 判定，唯一实现在 abfe_core。
+    # 单次 run 结构上只有一个重复 ⟹ 恒为 UNMEASURED（不是达标也不是不达标）。
+    cross_repeat_precision,
+    PRECISION_UNMEASURED,
+    PRECISION_MEETS,
+    MIN_INDEPENDENT_REPEATS,
     # 膜体系协议（memtodolist §3.1/§3.2，B1）。默认 soluble，行为与改动前一致。
     # 注意：这里的 soluble/membrane 是**环境类型**，与本文件里既有的
     # `system_type="complex"|"solvent"`（腿身份）是两个互不相干的轴。
@@ -202,7 +210,7 @@ import warnings
 # （annihilation 口径）。去电荷腿的逐腿 ΔG 数值会变（内部库仑湮灭项进腿），
 # 但 complex/solvent 两腿内部 Hamiltonian 相同、湮灭项在 ΔG_bind 中严格相消；
 # 协议身份必须换新，旧 Stage 1 artifact 不再与新结果混用。
-PME_DECHARGE_MODEL_VERSION = "pme_decharge_v4_ll_exception_frozen_normal_pairs_annihilated_seam_20260831"
+PME_DECHARGE_MODEL_VERSION = "pme_decharge_v5_ll_exception_frozen_intramolecular_coulomb_decoupled_20260914"
 
 # 膜体系预平衡的速度初始化种子。固定值使同一输入可复现；只影响膜路径
 # （可溶路径不初始化速度，以保持既有生产基线逐位一致）。
@@ -2467,13 +2475,44 @@ def _stage_analysis_protocol_versions(stage_name):
     return versions
 
 
-def _sampling_result_convergence_rejection_reason(result) -> Optional[str]:
-    """返回 None 表示通过；否则返回拒绝原因（P1-11）。
+# ---------------------------------------------------------------------------
+# [2026-09-15 用户拍板] stage 结果的 `converged` 键**已删除**，换成两个正交状态。
+#
+#   analysis_status  —— "求解器有没有在一条完整路径上解出有限的数"。
+#                       **只含硬不变量**：路径完整（无缺窗无跳窗）+ 数值有限 +
+#                       结构/身份自洽。**不含任何拟合阈值。**
+#   precision_status —— "这个数准不准"。只由 `abfe_core.cross_repeat_precision()`
+#                       跨**独立重复**的样本 SD 判定。单次 run 恒为 UNMEASURED。
+#
+# 故意删键而不是同名改义：同名改义是静默失效（别的文件照旧读到一个布尔），
+# 删掉之后 `result.get("converged")` 当场拿到 None，是 fail-loud。
+# **不要给 `converged` 做兼容别名。**
+#
+# `min_overlap` / `target_support_gate` / `min_decorrelated_samples` /
+# `max_endpoint_uncertainty_kJ_mol` 及各自阈值**原样留在结果里**，但只是报告：
+# 不进 `analysis_status`，也**不得**触发任何自动补帧 / rescue / top-up。
+# ---------------------------------------------------------------------------
+ANALYSIS_COMPLETE = "ANALYSIS_COMPLETE"
+ANALYSIS_INCOMPLETE = "ANALYSIS_INCOMPLETE"
 
-    判据：dict、total_delta_G/total_error 存在且为有限数值、误差非负、
-    converged 显式为 True。converged 缺席不算通过——本修复之后所有新写
-    的采样缓存都带该字段，旧缓存缺席即视为旧协议产物、拒绝复用。
-    """
+# 🔑🔑 [2026-09-15 用户拍板，第一位的要求] **假门驱动的补帧一律停用。**
+#
+# `min_overlap` / `target_support_gate` / `min_decorrelated_samples` /
+# `max_endpoint_uncertainty_kJ_mol` 没够到阈值，**不是**自动批 GPU 的理由：
+#   · 四个阈值全无标定（1.0 那个是抄自一个默认关闭的 early-stop 默认形参）；
+#   · 它们是逐段量，科学目标是两腿合成的 σ_bind；
+#   · MBAR 的 σ 是渐近估计，对「该采的构型一次都没采到」结构性失明
+#     （4W53 +32 kJ/mol、decharging −88 kJ/mol，两次 σ 都很小都没报警）；
+#   · 实测：同一个偏斜分布里加帧，N 涨 g 也涨，ESS **比值**不动甚至倒退。
+# 诊断照报、照落盘（`stage_quality_failures` / `window_overlap_diagnostics`），
+# 但**不得**据此触发 rescue / top-up / 重采样。
+# **不要**把这个常量翻成 True 来"恢复功能"—— 要补帧请走自治控制器的
+# `decide()`，它的理由是路径不完整，不是一个没标定过的阈值。
+AUTO_RESAMPLE_ON_FITTED_GATES = False
+
+
+def _finite_thermo_rejection_reason(result) -> Optional[str]:
+    """ΔG/σ 的硬不变量：dict、两个字段都在、都有限、σ 非负。返回 None 表示通过。"""
     if not isinstance(result, dict):
         return f"结果不是 dict 而是 {type(result).__name__}"
     for field in ("total_delta_G", "total_error"):
@@ -2487,6 +2526,97 @@ def _sampling_result_convergence_rejection_reason(result) -> Optional[str]:
             return f"{field} 非有限: {value!r}"
     if float(result["total_error"]) < 0.0:
         return f"total_error 为负: {float(result['total_error'])!r}"
+    return None
+
+
+def _stage_analysis_rejection_reason(result) -> Optional[str]:
+    """stage 结果的**硬不变量**门。返回 None = 结构上完整，可以进下一步 / 当缓存完成标记。
+
+    ⚠️ 这道门**不判精度**。"能不能作为已验收结果发布"另看 `precision_status`
+    （见 `_stage_precision_rejection_reason`）。
+
+    缺 `analysis_status` 键 ⟹ **fail-closed**：那是 2026-09-15 之前的老产物
+    （当时写的是已删除的 `converged`），它的硬不变量从来没有被这套口径判过。
+    """
+    reason = _finite_thermo_rejection_reason(result)
+    if reason is not None:
+        return reason
+    status = result.get("analysis_status")
+    if status is None:
+        return (
+            "缺少 analysis_status —— 这是 2026-09-15 `converged` 删除之前的老产物，"
+            "它的硬不变量（路径完整/数值有限/结构自洽）从未按当前口径判过。"
+            "fail-closed：不当成通过。请用当前代码重新求解该阶段"
+            "（能量矩阵已落盘时不需要重新采样）。"
+        )
+    if status != ANALYSIS_COMPLETE:
+        return (
+            f"analysis_status={status!r}（硬不变量未满足）："
+            f"{result.get('analysis_incomplete_reasons')}"
+        )
+    return None
+
+
+def _stage_precision_rejection_reason(result) -> Optional[str]:
+    """**发布**门：要作为已验收结果对外，跨重复精度必须实测达标。
+
+    单次 run 结构上只有一个重复 ⟹ `precision_status` 恒为 `UNMEASURED` ⟹
+    这道门恒拒。`UNMEASURED` **不是达标也不是不达标**，它是"没测"。
+    """
+    status = (result or {}).get("precision_status")
+    if status == PRECISION_MEETS:
+        return None
+    if status is None or status == PRECISION_UNMEASURED:
+        return (
+            f"precision_status={status!r} —— 跨重复精度**未测**（单次 run 只有一个"
+            f"重复，至少需要 {MIN_INDEPENDENT_REPEATS} 个独立重复）。"
+            "「未测」不是达标也不是不达标，**不得**当作已验收结果发布。"
+        )
+    return (
+        f"precision_status={status!r} —— 跨重复样本 SD 超过目标"
+        f"（{(result.get('precision_evidence') or {}).get('sample_stddev_kcal_per_mol')!r} > "
+        f"{(result.get('precision_evidence') or {}).get('threshold_kcal_per_mol')!r} kcal/mol）。"
+    )
+
+
+def _single_run_precision_payload() -> Dict[str, Any]:
+    """单次 run 的诚实精度证据：一个重复 ⟹ UNMEASURED。不发明任何新阈值。"""
+    return cross_repeat_precision([])
+
+
+def _pme_stage_status_fields(res: Dict[str, Any]) -> Dict[str, Any]:
+    """PME/REMD stage（`TraditionalMBARAnalyzer.solve`）结果的新契约状态字段。
+
+    这条路径的 λ 覆盖由 REMD 构造保证（每个 λ 一个 replica，全部求解），所以剩下
+    的硬不变量只有"数值有限"。求解器自己那个 `converged`（min_overlap 阈值合取）
+    **是拟合阈值** ⟹ 降级为报告，原样留在 `min_overlap`/`min_overlap_threshold`。
+    """
+    reason = _finite_thermo_rejection_reason({
+        "total_delta_G": res.get("delta_G"),
+        "total_error": res.get("error"),
+    })
+    return {
+        "analysis_status": ANALYSIS_COMPLETE if reason is None else ANALYSIS_INCOMPLETE,
+        "analysis_incomplete_reasons": [] if reason is None else [reason],
+        "precision_status": PRECISION_UNMEASURED,
+        "precision_evidence": _single_run_precision_payload(),
+    }
+
+
+def _sampling_result_convergence_rejection_reason(result) -> Optional[str]:
+    """**traditional 腿专用**（TraditionalMBARAnalyzer.solve 的结果）：返回 None 表示通过。
+
+    ⚠️ 这条路径的 `converged` **没有**被 2026-09-15 的删键波及 —— 删的是
+    `ibs_engine.solve_stage_integrated` 的返回契约。IBS/stage 结果请改用
+    `_stage_analysis_rejection_reason`，不要复用本函数。
+
+    判据：dict、total_delta_G/total_error 存在且为有限数值、误差非负、
+    converged 显式为 True。converged 缺席不算通过——本修复之后所有新写
+    的采样缓存都带该字段，旧缓存缺席即视为旧协议产物、拒绝复用。
+    """
+    reason = _finite_thermo_rejection_reason(result)
+    if reason is not None:
+        return reason
     if result.get("converged") is not True:
         return (
             f"converged={result.get('converged')!r}"
@@ -2539,7 +2669,12 @@ def _expected_remd_frame_count(n_steps: int, save_interval: int = 5000) -> int:
 
 def _all_remd_trajs_valid(stage_output_dir: str, stage_name: str, n_replicas: int, min_frames: int = 1) -> bool:
     traj_files = _expected_remd_traj_files(stage_output_dir, stage_name, n_replicas)
-    return all(_is_traj_valid(path, min_frames=min_frames) for path in traj_files)
+    # 🔑 `all([])` 是 True ⟹ `n_replicas == 0`（或期望文件列表为空）时会报
+    # 「REMD 轨迹全部完整」，`sampling_cache_ok` 因此成立、整段采样被跳过。
+    # 四个 resume 调用点都吃这个返回值。现实里 n_replicas=0 不可达，属潜伏项，
+    # 但「空集合上的全称命题为真」正是本仓反复栽的那类静默通过，封死成本一行。
+    return bool(traj_files) and all(
+        _is_traj_valid(path, min_frames=min_frames) for path in traj_files)
 
 
 def _remd_sampling_meta_path(stage_output_dir: str, stage_name: str) -> str:
@@ -2751,6 +2886,17 @@ class NumpyEncoder(json.JSONEncoder):
 # stage 缓存"那个 bug（decharging 整段约 28 分钟白重跑）。
 RESIDUAL_SAMPLING_STAGES = frozenset({"vanishing", "vanishing_rescue"})
 
+# 全局拼接失败里，**成因是「有窗口数据不够被跳过」**的那几个 reason。
+# 它们是路由信号（SKIPPED_WINDOW / INSUFFICIENT_DATA），不是终态：动作是补采，
+# 不是炸出流水线。字符串必须与 `ibs_engine` 里 `self._fallback("...")` 的字面量
+# 逐字一致（`no_local_tmbAR_results` 的大小写就是那么怪），
+# 由 tests/test_routing_signal_not_terminal.py 对着 ibs_engine 源码钉住。
+STAGE_SOLVE_ROUTING_ERRORS = frozenset({
+    "no_local_tmbAR_results",
+    "window_overlap_broken",
+    "window_overlap_broken_for_covariance_chain",
+})
+
 
 def _normalize_residual_sampling_runtime(
     enabled: bool,
@@ -2841,6 +2987,10 @@ _PREOPT_DERIVED_PATH_KEYS = (
     "stage2_refine_extra_points_per_segment",
     "stage2_window_min_states",
     "stage2_window_max_states",
+    # 🔑🔑 [2026-09-15] 见 `derived_path_params` 处的注释：这两个键同样决定布局。
+    "stage2_window_partition",
+    "stage2_first_window_max_states",
+    "stage2_n_windows",
     "stage2_free_energy_densify_points",
 )
 
@@ -5014,11 +5164,30 @@ class ABFEPipeline:
         """应用傅里叶级数格式的二面角修正"""
         from openmm import CustomTorsionForce
 
+        # 🔑🔑 [审计 B] **这是用户直接供数、直接改哈密顿量的入口 ⟹ 全程 fail-closed。**
+        # 先前整条路径是 fail-open：缺键静默取默认、畸形条目静默 `continue`
+        # 且不计数、偶数长度 params 静默丢掉最后一项，而日志照样打
+        # 「[OK] 已添加 N 个」—— 加错了的二面角不会有任何人知道。
         max_order = 0
-        for t in torsions:
-            params = t.get("parameters", [])
-            order = (len(params) - 1) // 2
-            max_order = max(max_order, order)
+        for i, t in enumerate(torsions):
+            if "parameters" not in t:
+                raise ValueError(
+                    f"二面角修正第 {i} 条缺少 `parameters`（傅里叶格式必需）。"
+                    "这是直接改哈密顿量的输入，不接受默认值。"
+                )
+            params = t["parameters"]
+            if len(params) < 1:
+                raise ValueError(f"二面角修正第 {i} 条的 `parameters` 为空。")
+            # 傅里叶展开是 offset + (c_n, s_n) 成对 ⟹ 长度必须是奇数。
+            # 先前 `order = (len(params) - 1) // 2` 对偶数长度**向下取整**，
+            # 例如 [offset, c1, s1, c2] 得 order=1，`c2` 被静默丢掉且照样计入 applied。
+            if len(params) % 2 != 1:
+                raise ValueError(
+                    f"二面角修正第 {i} 条的 `parameters` 长度为 {len(params)}（偶数）。"
+                    "傅里叶格式是 [offset, c1, s1, c2, s2, …]，长度必须是奇数；"
+                    "偶数长度会让最后一项被静默丢弃。"
+                )
+            max_order = max(max_order, (len(params) - 1) // 2)
 
         if max_order == 0:
             self._log("  [WARN] 无有效的傅里叶二面角参数")
@@ -5039,15 +5208,15 @@ class ABFEPipeline:
             force.addPerTorsionParameter(f"s{n}")
 
         applied = 0
-        for t in torsions:
+        for i, t in enumerate(torsions):
             indices = t.get("indices", [])
             if len(indices) != 4:
-                continue
-
-            params = t.get("parameters", [])
-            if len(params) < 1:
-                continue
-
+                raise ValueError(
+                    f"二面角修正第 {i} 条的 `indices` 是 {indices!r}，必须是 4 个原子下标。"
+                    "先前这里静默 `continue`：条目被丢弃、`applied` 不计数，"
+                    "而日志仍报「已添加 N 个」，N 比实际请求少且无人知道。"
+                )
+            params = t["parameters"]
             param_values = [params[0]]
             for n in range(1, max_order + 1):
                 c_idx = 2 * n - 1
@@ -5078,17 +5247,41 @@ class ABFEPipeline:
         force.addPerTorsionParameter("n")
         force.addPerTorsionParameter("phi0")
 
+        # 🔑🔑 [审计 B] 同上：fail-closed。先前 `t.get("k", 0.0)` 让**键名写错**
+        # 静默变成一条 k=0 的**零强度**二面角，`applied` 照样 +1、日志照样报
+        # 「[OK] 已添加 N 个」—— 用户以为加上了，实际什么都没加。
+        _REQUIRED = ("indices", "k", "n", "phi0", "phi0_in_degrees")
+        _ALLOWED = set(_REQUIRED)
         applied = 0
-        for t in torsions:
-            indices = t.get("indices", [])
+        for i, t in enumerate(torsions):
+            _missing = [key for key in _REQUIRED if key not in t]
+            if _missing:
+                raise ValueError(
+                    f"二面角修正第 {i} 条缺少必需键 {_missing}。"
+                    "这是直接改哈密顿量的输入，**不接受默认值** —— 键名写错时"
+                    "取默认会静默生成一条零强度二面角并照常计数。"
+                    + ("\n⚠️ `phi0_in_degrees` 必须显式给：它决定 `phi0` 的量纲，"
+                       "把弧度当成度会放大 57.3 倍，且完全静默。"
+                       if "phi0_in_degrees" in _missing else "")
+                )
+            _unknown = sorted(set(t) - _ALLOWED)
+            if _unknown:
+                raise ValueError(
+                    f"二面角修正第 {i} 条含未知键 {_unknown}（可用键：{sorted(_ALLOWED)}）。"
+                    "拒绝静默忽略：未知键最常见的成因就是把必需键拼错了。"
+                )
+            indices = t["indices"]
             if len(indices) != 4:
-                continue
-
-            k = t.get("k", 0.0)
-            n = t.get("n", 1)
-            phi0 = t.get("phi0", 0.0)
-            is_degrees = t.get("phi0_in_degrees", True)
+                raise ValueError(
+                    f"二面角修正第 {i} 条的 `indices` 是 {indices!r}，必须是 4 个原子下标。"
+                )
+            k, n, phi0 = t["k"], t["n"], t["phi0"]
+            is_degrees = bool(t["phi0_in_degrees"])
             phi0_rad = np.radians(phi0) if is_degrees else phi0
+            self._log(
+                f"    二面角 {i}: k={k} n={n} phi0={phi0}"
+                f"（{'度' if is_degrees else '弧度'}）⟹ phi0_rad={phi0_rad:.6f}"
+            )
 
             force.addTorsion(
                 indices[0], indices[1], indices[2], indices[3], [k, n, phi0_rad]
@@ -5639,7 +5832,13 @@ class ABFEPipeline:
                     "lambda_endpoint_diagnostics": _stage_lambda_endpoint_diagnostics(
                         stage_name, lambdas_coul, lambdas_vdw
                     ),
-                    "converged": res.get("converged"),
+                    # 🔑 [2026-09-15] 这是一个 **stage 结果**，要过
+                    # `_assert_stage_result_sane` ⟹ 必须说新契约。
+                    # REMD 按构造覆盖全部 λ 态，硬不变量只剩"数值有限"这一条，
+                    # 由下面 `_stage_analysis_status_from_finite` 判。
+                    # 求解器的 `converged`（min_overlap 阈值）降级为报告，
+                    # 原样留在 `min_overlap` / `min_overlap_threshold` 里。
+                    **_pme_stage_status_fields(res),
                     "min_overlap": res.get("min_overlap"),
                     "min_overlap_threshold": (
                         res.get("diagnostics", {}).get("min_overlap_threshold")
@@ -5772,7 +5971,8 @@ class ABFEPipeline:
                 "lambda_endpoint_diagnostics": _stage_lambda_endpoint_diagnostics(
                     stage_name, lambdas_coul, lambdas_vdw
                 ),
-                "converged": res.get("converged"),
+                # [2026-09-15] 同上：stage 结果说新契约，`converged` 降级为报告。
+                **_pme_stage_status_fields(res),
                 "min_overlap": res.get("min_overlap"),
                 "min_overlap_threshold": (
                     res.get("diagnostics", {}).get("min_overlap_threshold")
@@ -6209,8 +6409,32 @@ class ABFEPipeline:
             # 而那个 stage 结果**根本没人用**：自治循环的 stage 裁决来自 ANALYZE
             # 的全路径合并求解，不来自补采这一次。
             #
+            # 🔑🔑 [2026-09-14 真机] **窗口被跳过 ⟹ 拼不起来，是路由不是失败。**
+            #
+            # `window_overlap_broken` / `no_local_tmbAR_results` 的成因只有一个：
+            # 某些窗口的去相关帧数不够（"有效帧数 (9) < 10，跳过"）⟹ 拼接链上
+            # 缺了共享 λ 节点。按 docs/TODO.md「不许回退的约定」，
+            # `SKIPPED_WINDOW` / `INSUFFICIENT_DATA` **全是路由信号**，
+            # 「低支撑永远不是 FAIL，是『尚不可测』，动作是加预算」。
+            # 而这里原先无条件 RuntimeError ⟹ 在自治控制器（它有分支 6b：
+            # 缺窗口 → RUN_PRODUCTION 补采）接管之前就把整条管线打死。
+            #
+            # ⚠️ **不是把失败改成成功**：`converged` 仍然是 False、错误原样留在
+            # `stage_solve_error_not_fatal` 里，下游那道默认拒绝 converged=False
+            # 的门照旧拦。控制器反复补采也不会无限烧 —— 停滞保护三次之后
+            # NO_FEASIBLE_ACTION 退出，带完整诊断，比一条 traceback 强。
+            if str(stage_result["error"]) in STAGE_SOLVE_ROUTING_ERRORS:
+                self._log(
+                    f"  [{stage_name}] 全局拼接失败（{stage_result['error']}）——"
+                    "成因是有窗口因去相关帧数不足被跳过，拼接链缺共享 λ 节点。"
+                    "**这是路由信号不是终态**（SKIPPED_WINDOW / INSUFFICIENT_DATA）："
+                    "路径不完整 ⟹ 交自治控制器补采，`converged` 保持 False。"
+                )
+                stage_result["stage_scope"] = "path_incomplete_windows_skipped"
+                stage_result["routing_signal"] = "SKIPPED_WINDOW"
+                stage_result["stage_solve_error_not_fatal"] = stage_result.pop("error")
             # 全窗口跑仍然照旧上抛 —— 那时候它是真的失败。
-            if only_window_indices is not None:
+            elif only_window_indices is not None:
                 self._log(
                     f"  [{stage_name}] 只跑了窗口 "
                     f"{sorted(int(x) for x in only_window_indices)} ⟹ "
@@ -6224,6 +6448,41 @@ class ABFEPipeline:
                 raise RuntimeError(
                     f"{stage_name} 阶段全局 TMBAR 失败: {stage_result['error']}"
                 )
+        # 🔑🔑🔑 [2026-09-14 真机事故] **窗口子集跑的结果不是 stage 裁决 —— 成功也不是。**
+        #
+        # 09-12 那次只给"子集求解**失败**"开了 carve-out，子集求解**成功**时结果照样
+        # 一路流下去。真机 `cyclod_ligand2/rep1` 就这么出了事：
+        #     stage2_vanishing.json  ΔG=-49.04  converged=True
+        #     coverage_diagnostics: input/solved_window_indices = [5]
+        #                           covered_lambda_indices = [17,18,…,24]
+        # —— 那是**只解了末窗一个窗口**的部分和（只覆盖 λ 17 之后），却带着
+        # `converged=True` 写进了 stage 缓存完成标记、`final_results` 直接采信，
+        # 最终 ΔG 与同体系另一次跑差 **90 kJ/mol**（连符号都不同）。
+        # 同一个 run 里 21 态全路径的中间结果是 +43.00，与对照 run 的 +44.09 只差 1.1
+        # —— 所以那 90 不是重复间离散，是**部分和冒充了 ΔG**。
+        #
+        # 仓库铁律：**「缺窗口的和不是 ΔG，是另一个量，禁止当结果使用」**。
+        # 这里不再区分成功/失败：**只要是窗口子集跑，就一律标成"非裁决"并把
+        # `converged` 钉成 False** —— 它没有资格声称路径收敛。
+        if only_window_indices is not None:
+            stage_result["stage_scope"] = "window_subset_no_stage_verdict"
+            stage_result["window_subset_indices"] = sorted(
+                int(x) for x in only_window_indices)
+            if stage_result.get("analysis_status") == ANALYSIS_COMPLETE:
+                self._log(
+                    f"  [{stage_name}] ⚠️ 只跑了窗口 "
+                    f"{sorted(int(x) for x in only_window_indices)} 却报 "
+                    f"analysis_status={ANALYSIS_COMPLETE}"
+                    " ⟹ **那是部分和，不是路径裁决**。已钉成 "
+                    f"{ANALYSIS_INCOMPLETE}；完整裁决只能来自全路径求解。"
+                )
+            # 「只跑了窗口子集」是**硬不变量**（路径不完整），不是拟合阈值。
+            stage_result["analysis_status"] = ANALYSIS_INCOMPLETE
+            stage_result.setdefault("analysis_incomplete_reasons", []).append(
+                "window_subset_no_stage_verdict: 只求解了窗口子集 "
+                f"{sorted(int(x) for x in only_window_indices)}，路径不完整 ⟹ 部分和不是 ΔG"
+            )
+            stage_result["subset_partial_sum_not_delta_G"] = True
         stage_result.setdefault("stage", stage_name)
         stage_result.setdefault("n_states", int(n_states))
         if _independent_endpoint_enabled:
@@ -6308,7 +6567,11 @@ class ABFEPipeline:
             "uncertainty_note": stage_result.get("uncertainty_note"),
             # 🔑 [P1-15] 以下这些原本只存在于 solve_stage_integrated 的返回顶层，
             # 从不进 diagnostics、也就从不落盘。光看 total_delta_G 无法复核为何放行。
-            "converged": stage_result.get("converged"),
+            # [2026-09-15] `converged` 已删除，换成两个正交状态（都原样落盘）。
+            "analysis_status": stage_result.get("analysis_status"),
+            "analysis_incomplete_reasons": stage_result.get("analysis_incomplete_reasons"),
+            "precision_status": stage_result.get("precision_status"),
+            "precision_evidence": stage_result.get("precision_evidence"),
             "coverage_diagnostics": stage_result.get("coverage_diagnostics"),
             "covariance_chain_segments": stage_result.get("covariance_chain_segments"),
             "total_error_method": stage_result.get("total_error_method"),
@@ -6574,11 +6837,13 @@ class ABFEPipeline:
         # solve_stage_integrated），一个重叠不足但没有报错的 Shadow-IBS 腿会
         # 被当作成功结果直接并入 Stage1 总量。两条子腿必须都执行同等级的硬门，
         # 任一失败即整腿失败。
-        if shadow_ibs_result.get("converged") is not True:
+        # [2026-09-15] 这条子腿来自 `solve_stage_integrated` ⟹ 读新契约的硬不变量。
+        # min_overlap 等仍在结果里，但只是报告，不再参与这道门。
+        _shadow_reason = _stage_analysis_rejection_reason(shadow_ibs_result)
+        if _shadow_reason is not None:
             raise RuntimeError(
-                f"Shadow-IBS 去电荷子腿未收敛（converged="
-                f"{shadow_ibs_result.get('converged')!r}，min_overlap="
-                f"{shadow_ibs_result.get('min_overlap')}，阈值="
+                f"Shadow-IBS 去电荷子腿未通过硬不变量门：{_shadow_reason}"
+                f"（报告项 min_overlap={shadow_ibs_result.get('min_overlap')}，阈值="
                 f"{shadow_ibs_result.get('min_overlap_threshold')}）；拒绝把这条"
                 "子腿的结果并入 Stage1 去电荷总量。"
             )
@@ -6612,7 +6877,12 @@ class ABFEPipeline:
             "total_error": total_error,
             "method": "Shadow-Bridge+Shadow-IBS-TMBAR",
             "n_states": int(n_states),
-            "converged": True,
+            # [2026-09-15] 两条子腿都已各自过了硬不变量门（不满足的在上面已经 raise）。
+            # 精度是**跨重复**的事，单次 run 恒为 UNMEASURED（不是达标也不是不达标）。
+            "analysis_status": ANALYSIS_COMPLETE,
+            "analysis_incomplete_reasons": [],
+            "precision_status": PRECISION_UNMEASURED,
+            "precision_evidence": _single_run_precision_payload(),
             "min_overlap": float(min(both_min_overlaps)) if both_min_overlaps else None,
             "min_overlap_threshold": shadow_ibs_result.get("min_overlap_threshold"),
             "lambda_endpoint_diagnostics": _stage_lambda_endpoint_diagnostics(
@@ -7037,7 +7307,12 @@ class ABFEPipeline:
 
         try:
             from abfe_core import calc_boresch_from_last_frame
-            current_eq = calc_boresch_from_last_frame(self.positions, rec, lig)
+            # BOR-01：`self.positions` 会被 PBC 修复/居中/再平衡反复改写（:2986），
+            # 调用时刻没有成像保证，必须带 box 解缠。
+            current_eq = calc_boresch_from_last_frame(
+                self.positions, rec, lig,
+                box_vectors=getattr(self, "box_vectors", None),
+            )
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(
                 f"无法用当前坐标重算 Boresch 几何以校验已提交平衡值：{exc}。"
@@ -7114,6 +7389,7 @@ class ABFEPipeline:
                 self.positions,
                 boresch_params["receptor_indices"],
                 boresch_params["ligand_indices"],
+                box_vectors=getattr(self, "box_vectors", None),  # BOR-01
             )
             report = boresch_committed_deviation_sigma(
                 committed_eq,
@@ -7191,7 +7467,8 @@ class ABFEPipeline:
             new_eq = calc_boresch_from_last_frame(
                 self.positions,
                 boresch_params["receptor_indices"],
-                boresch_params["ligand_indices"]
+                boresch_params["ligand_indices"],
+                box_vectors=getattr(self, "box_vectors", None),  # BOR-01
             )
             new_r0 = float(new_eq.get("r0", orig_r0))
             new_thA = float(new_eq.get("thetaA0", 1.5708))
@@ -7441,12 +7718,42 @@ class ABFEPipeline:
             for _failure in _stage_result.get("stage_quality_failures") or []:
                 _quality_failures.append({"stage": _stage_key, **_json_safe(_failure)})
 
+        # 🔑🔑 [2026-09-15 用户拍板] **精度只由跨独立重复的样本 SD 判定。**
+        # 单次 run 结构上只有一个重复 ⟹ `UNMEASURED`。
+        # ⚠️ `UNMEASURED` **不是达标，也不是不达标** —— 它是"没测"。
+        # ⚠️ 这里**刻意不**把单次 MBAR 的 σ（`total_error` / 逐段 σ /
+        #    `max_endpoint_uncertainty_kJ_mol`）当成精度结论呈现：那是渐近估计，
+        #    在本仓 `N_eff/g` 常年个位数时系统性偏小，且对「该采的构型一次都没
+        #    采到」结构性失明（4W53 +32、decharging −88，两次 σ 都很小）。
+        #    σ 照旧原样落在 `total_error_kJ_mol` 等字段里，那是误差棒，不是验收结论。
+        _precision_evidence = _single_run_precision_payload()
+        _precision_status = _precision_evidence.get("status", PRECISION_UNMEASURED)
+        _publishable_reason = _stage_precision_rejection_reason({
+            "precision_status": _precision_status,
+            "precision_evidence": _precision_evidence,
+        })
+
         final = {
             "decoupling_scheme": decoupling_scheme,
-            # 顶层可发布性标记。True 表示至少有一个阶段的质量硬门失败、只是被
-            # `--allow-untrusted-stage-results` 放行了；这份结果不得当作可发布数值。
+            # 顶层可发布性标记。True 表示至少有一个阶段的质量诊断未达标；
+            # [2026-09-15] 这些诊断已降级为报告（不再 raise、不再触发补帧），
+            # 标记本身保留：它是"看过这些诊断的人应该知道"的那条信息。
             "results_untrusted": bool(_untrusted_stages),
             "results_untrusted_stages": _untrusted_stages,
+            # ---- 精度（唯一判据：跨独立重复的样本 SD，见 abfe_core.cross_repeat_precision）----
+            "precision_status": _precision_status,
+            "precision_evidence": _precision_evidence,
+            "precision_status_semantics": (
+                "UNMEASURED 不是达标也不是不达标 —— 它是「没测」。"
+                "达标(MEETS_CROSS_REPEAT_TARGET)只说明可重复，不构成真实误差 < 1 kcal/mol 的证明。"
+                "本文件里的 total_error_kJ_mol / 逐段 σ 是 MBAR 误差棒，**不是**精度结论。"
+            ),
+            # 能不能当**已验收**结果发布：必须同时满足
+            #   各 stage analysis_status == ANALYSIS_COMPLETE（硬不变量，上游已拦）
+            #   且 precision_status == MEETS_CROSS_REPEAT_TARGET
+            # 单次 run 恒不满足后者 ⟹ 恒为 False。
+            "publishable_as_accepted_result": _publishable_reason is None,
+            "publishable_rejection_reason": _publishable_reason,
             "stage_quality_failures": _quality_failures,
             # [P1-19] 供 UnitFormatter.format_results_human 选人类可读标题用，
             # 也供审计时确认这份 final_results.json 到底是哪条腿产出的。
@@ -7607,6 +7914,18 @@ class ABFEPipeline:
         cycle_path = os.path.join(self.output_dir, "thermodynamic_cycle.md")
         with open(cycle_path, "w", encoding="utf-8") as f:
             f.write(THERMODYNAMIC_CYCLE_DOC + "\n")
+        if _publishable_reason is not None:
+            self._log(
+                "\n  [报告] **这份结果不得作为已验收结果发布**："
+                f"{_publishable_reason}\n"
+                f"         precision_status={_precision_status}；"
+                f"precision_evidence={json.dumps(_precision_evidence, ensure_ascii=False)}\n"
+                "         「未测」≠「不达标」。要测出精度，需要至少 "
+                f"{MIN_INDEPENDENT_REPEATS} 个**独立重复**（不同 repeat_seed 的完整 run），"
+                "再由 abfe_core.cross_repeat_precision() 对它们的 ΔG_bind 求样本 SD。\n"
+                "         ⚠️ 本文件里的 total_error_kJ_mol 是单次 MBAR 的误差棒，"
+                "不是精度结论，不要拿它替代上面这条。"
+            )
         self._log(f"\n[OK] 最终结果已保存: {out_path}")
         self._log(f"  [OK] 热力学循环说明已保存: {cycle_path}")
         self._log(UnitFormatter.format_results_human(final))
@@ -7986,6 +8305,17 @@ class ABFEPipeline:
         total_delta_G=0.0、total_error=NaN 仍被当正常结果使用）。这里把"完全没有
         误差棒"或"自由能/误差不是有限数"当作阶段失败处理，拒绝继续，逼迫先解决
         采样/重叠/Boresch 一致性问题，而不是让一个已知不可信的数字悄悄流入生产结果。
+
+        🔑🔑 [2026-09-15] **这个函数只判硬不变量，不判精度。**
+        保留的：ΔG/σ 有限、FD-TI 一致性、自治循环终态、"子集不是 ΔG"、覆盖度、
+                身份/provenance 自洽 —— 全部**不依赖任何拟合阈值**。
+        降级为报告的：min_overlap / target_support_gate / min_absolute_ess /
+                min_decorrelated_samples / max_endpoint_uncertainty_kJ_mol。
+                它们照旧原样留在结果里、照旧落盘、照旧打印，但**不再 raise、
+                也不再驱动任何自动补帧**（补帧的理由必须是路径不完整，不是一个
+                没标定过的阈值没够到）。
+        "能不能作为**已验收**结果发布"另看 `precision_status`
+                （`_stage_precision_rejection_reason`），单次 run 恒为 UNMEASURED。
         """
         dg = result.get("total_delta_G")
         err = result.get("total_error")
@@ -7999,6 +8329,22 @@ class ABFEPipeline:
                 "求解在 default 和 robust 两种 solver protocol 下均失败）。这条腿的结果不可信，"
                 "拒绝标记为 completed 并写入最终 ΔG_bind；请检查窗口重叠率、采样长度，或该阶段"
                 "是否跨越了一次 --resume 重启导致 Boresch/restraint 基准不一致，再重新采样该阶段。"
+            )
+
+        # 🔑 [2026-09-15] 求解器自己报的硬不变量结论。缺键 ⟹ fail-closed（老产物）。
+        _analysis_status = result.get("analysis_status")
+        if _analysis_status is None:
+            raise RuntimeError(
+                f"{stage_label} 结果缺少 analysis_status —— 这是 2026-09-15 删除 "
+                "`converged` 之前的老产物，硬不变量（路径完整/数值有限/结构自洽）"
+                "从未按当前口径判过。fail-closed，拒绝标记为 completed。"
+                "请用当前代码重新求解该阶段（能量矩阵已落盘时不需要重新采样）。"
+            )
+        if _analysis_status != ANALYSIS_COMPLETE:
+            raise RuntimeError(
+                f"{stage_label} analysis_status={_analysis_status!r}（不是 "
+                f"{ANALYSIS_COMPLETE}）：{result.get('analysis_incomplete_reasons')}。"
+                "硬不变量未满足 ⟹ 这份结果不是一条完整路径上的 ΔG，拒绝标记为 completed。"
             )
 
         # charging 的 BAR 主值只有在 FD-TI 一致性门明确通过时才允许完成。
@@ -8058,17 +8404,85 @@ class ABFEPipeline:
         # （ΔG_LJ，见下）能判断这套修复对错的地方。门拦住的是一个本来就无法
         # 验证对错的数，代价却是永远拿不到能验证的那个。
         #
-        # 但这是**用户对某一次运行的决定**，不是代码该默认放松的东西：默认保持
-        # fail-closed（一整套测试专门钉住这一点）。要放行必须显式传
-        # `allow_untrusted_stage_results=True`，该决定会随 run_provenance 落盘。
-        _allow_untrusted = bool(
-            (getattr(self, "_last_run_config", {}) or {}).get(
-                "allow_untrusted_stage_results", False
+        # 🔑🔑 [2026-09-15 用户拍板] **上面这套"fail-closed vs 显式放行"已经作废。**
+        # 下面五道门（target_support_gate / min_overlap / min_absolute_ess /
+        # min_decorrelated_samples / max_endpoint_uncertainty_kJ_mol）用的全是
+        # **未经标定的拟合阈值**，不属于硬不变量 ⟹ 它们一律**只报告、不 raise、
+        # 也不触发任何自动补帧**。证据（数值 + 阈值 + 逐窗瓶颈）一条不少照旧写进
+        # `stage_quality_failures` 并落盘，`results_untrusted` 照旧打上。
+        # 「这份结果能不能发布」由 `precision_status` 回答，不由它们回答。
+        # ⚠️ 不要给它们设新阈值，也不要把任一条加回 `analysis_status` 的合取。
+
+        # 🔑🔑🔑 [2026-09-14 真机事故] **覆盖度是独立的一道硬门，先于一切判据。**
+        #
+        # 真机 `cyclod_ligand2/rep1`：一份只解了末窗（λ 17→24）的**部分和**
+        # 带着 `converged=True` 写进 stage 缓存、被 `final_results` 采信，
+        # 与同体系另一次跑差 90 kJ/mol、连符号都不同。
+        # 上游那道"子集不是裁决"的标记是**第一道**；这里是**第二道**，
+        # 它只看一件事：**这份结果覆盖了几个 λ 态**。两道互相独立 ——
+        # 上游漏标、或结果来自别的路径，这里照样拦得住。
+        # 子集结果之所以会走到 stage 裁决这一步，**永远**是因为自治循环先以非 DONE
+        # 终态退了（真机 cyclod_ligand1/rep2：NO_FEASIBLE_ACTION）。只报"这是子集"
+        # 等于报症状，所以把循环自己的结论接在拒绝理由后面。
+        _out = result.get("autonomous_outcome") or {}
+        _note = ("" if not _out else
+                 f"\n⟸ 上游：Stage-2 自治循环以 status={_out.get('status')} / "
+                 f"exit={_out.get('exit')}（由 {_out.get('exit_emitted_by')} 发出）退出，"
+                 f"用了 {_out.get('iterations_used')} 轮。理由：{_out.get('reason')}")
+        # 🔑🔑 [审计 #6] **自治循环没判 DONE ⟹ 这条腿按控制器自己的结论就是没跑完。**
+        # 先前这道拦截是**附带**实现的：循环把最后一次窗口子集跑交回来，撞下面
+        # 那条子集门。子集结果不再外传之后，那条附带保护随之消失 —— 必须把判据
+        # 显式写出来，否则一个停在 NO_FEASIBLE_ACTION / 转满迭代上限的 run
+        # 会**静静地把上游那份结果发布出去**。
+        # 只在 `autonomous_outcome` 存在时触发（该键只有 stage2 自治循环会写），
+        # 其余调用点行为逐字不变。
+        if _out and _out.get("exit") not in ("DONE", "DONE_UNTRUSTED"):
+            raise RuntimeError(
+                f"{stage_label} 的 Stage-2 自治循环没有以 DONE 退出，"
+                "这份结果不代表一条跑完的路径，拒绝标记为 completed。" + _note
             )
-        )
+        _scope = result.get("stage_scope")
+        if _scope == "window_subset_no_stage_verdict" or result.get(
+                "subset_partial_sum_not_delta_G"):
+            raise RuntimeError(
+                f"{stage_label} 的结果来自**窗口子集跑**"
+                f"（{result.get('window_subset_indices')}）⟹ 它是**部分和，不是 ΔG**，"
+                "没有资格作为 stage 裁决。完整裁决只能来自全路径求解。"
+                "拒绝标记为 completed。"
+                + _note
+            )
+        _cov = result.get("coverage_diagnostics") or {}
+        _covered = _cov.get("covered_lambda_indices")
+        _n = result.get("n_states")
+        if _covered is not None and _n:
+            _missing = sorted(set(range(int(_n))) - {int(x) for x in _covered})
+            if _missing:
+                raise RuntimeError(
+                    f"{stage_label} 的结果只覆盖了 {len(_covered)}/{int(_n)} 个 λ 态，"
+                    f"缺 {_missing[:12]}{' …' if len(_missing) > 12 else ''} ⟹ "
+                    "**缺窗口的和不是 ΔG，是另一个量**（仓库铁律）。"
+                    f"逐窗输入={_cov.get('input_window_indices')}、"
+                    f"解出={_cov.get('solved_window_indices')}。拒绝标记为 completed。"
+                )
 
         target_support_gate = result.get("target_support_gate")
         if result.get("stage") == "vanishing" and not isinstance(target_support_gate, dict):
+            # 🔑 [2026-09-14] **先分清「旧路径的结果」和「这个 stage 根本没解出来」。**
+            # 两者都缺 `target_support_gate`，但病因和处方完全相反：前者重解一次就有
+            # （能量矩阵已落盘、不用重采），后者重解一万次也不会有 —— 求解器压根
+            # 没走到判门那一步。照旧文案报会把人送去反复重解，真机就这么发生过
+            # （win0/win3 去相关后 7~9 帧 < 10 被跳过 ⟹ 拼接断链 ⟹ 求解器直接 fallback）。
+            # 两种情况都**照旧拒绝标记 completed**，只是说真话。
+            _solve_err = result.get("stage_solve_error_not_fatal")
+            if _solve_err or result.get("routing_signal"):
+                raise RuntimeError(
+                    f"{stage_label} **没有求解出结果**（{_solve_err or result.get('routing_signal')}）"
+                    "，因此没有 target_support_gate —— 求解器在判门之前就退出了。"
+                    "成因通常是有窗口去相关后帧数不足被跳过、拼接链缺共享 λ 节点。"
+                    "拒绝标记为 completed。**重新求解没有用**（帧还是那么多）："
+                    "正解是给那些窗口加采样预算（自治控制器的 RUN_PRODUCTION），"
+                    "或先处理相关时间过长的根因。"
+                )
             raise RuntimeError(
                 f"{stage_label} 结果缺少 target_support_gate（物理目标支撑度硬门，"
                 f"TARGET_SUPPORT_GATE_PROTOCOL_VERSION="
@@ -8100,9 +8514,8 @@ class ABFEPipeline:
                 f"(阈值 <= {target_support_gate.get('max_top1pct_raw_weight_threshold')})。"
                 f"逐窗口瓶颈：{self._format_stage_quality_failure_details(failure_details)}"
             )
-            if not _allow_untrusted:
-                raise RuntimeError(_msg)
-            self._log(f"  [ERR] [结果不可信] {_msg}")
+            # [2026-09-15] 拟合阈值 ⟹ 只报告，不 raise、不触发补帧。
+            self._log(f"  [报告] [质量诊断未达标] {_msg}")
             self._log(
                 "  [ERR] 已**不中止**流程继续推进（2026-09-01 决定：为了拿到溶剂腿——"
                 "唯一有独立参考真值的那条腿）。本阶段 ΔG 已标记 results_untrusted=True，"
@@ -8122,46 +8535,22 @@ class ABFEPipeline:
                 "per_window": failure_details,
                 "note": "门未通过但未中止；ΔG 不可发布。",
             })
-        # 🔑 修复（审查报告 #2）：此前 GlobalMBARAnalyzer/TraditionalMBARAnalyzer
-        # 返回的 converged/min_overlap 字段从未被这里检查过——即使它们现在已经是
-        # 真实的重叠/收敛诊断（见 ibs_engine.py 的 solve / solve_stage_integrated），
-        # 一个重叠度低到不可信的阶段仍然会被当作"合法完成"写进最终 ΔG_bind。这里
-        # 补上硬性检查：只在结果里带有这些诊断字段时才检查（兼容不提供这些字段的
-        # 旧路径），重叠度低于阶段自己报告的阈值就直接拒绝，而不是把一个已知不可靠
-        # 的数字悄悄传下去。
-        converged = result.get("converged")
+        # 🔑🔑 [2026-09-15] 原来这里读 `result["converged"]`。那个键已被删除
+        # （见文件顶部 `_stage_analysis_rejection_reason` 的说明），硬不变量已在
+        # 本函数开头由 `analysis_status` 判过。留在这里的 min_overlap 等只是报告。
         min_overlap = result.get("min_overlap")
         min_overlap_threshold = result.get("min_overlap_threshold")
-        if converged is False:
-            failure_details = self._stage_quality_failure_details(result)
-            _qmsg = (
-                f"{stage_label} 阶段报告 converged=False"
-                + (f"，min_overlap={min_overlap:.4g}（阈值 {min_overlap_threshold:.4g}）" if min_overlap is not None and min_overlap_threshold is not None else "")
-                + "。Reweighting-quality gate failed. Preserve data and run "
-                "rescue/coverage analysis; do not mutate the sampling grid in place. "
-                f"具体瓶颈：{self._format_stage_quality_failure_details(failure_details)}。"
-                "（完整诊断见 window_overlap_diagnostics / statistical_inefficiency；由 rescue/"
-                "coverage 审计决定是否需要新 ensemble，不在原地拆窗/插 λ/重校准 f_k。）"
-            )
-            # [2026-09-01] 质量门不再中止：标记不可信并继续（见 target_support_gate 处的说明）。
-            if not _allow_untrusted:
-                raise RuntimeError(_qmsg)
-            self._log(f"  [ERR] [结果不可信] {_qmsg}")
-            result["results_untrusted"] = True
-            result.setdefault("stage_quality_failures", []).append(
-                {"gate": "stage_quality", "message": str(_qmsg)})
         if min_overlap is not None and min_overlap_threshold is not None and min_overlap < min_overlap_threshold:
             _qmsg = (
                 f"{stage_label} 阶段单参考重要性 ESS 比值 min_overlap={min_overlap:.4g} 低于阈值 "
                 f"{min_overlap_threshold:.4g}（此处 min_overlap 是 compute_effective_sample_number "
-                "重要性 ESS 比值，非 fixed-H adjacent overlap），拒绝标记为 completed。"
+                "重要性 ESS 比值，非 fixed-H adjacent overlap）。**仅诊断**，不拒绝、不触发补帧。"
                 "Reweighting-quality gate failed. Preserve data and run rescue/coverage analysis; "
                 "do not mutate the sampling grid in place."
             )
             # [2026-09-01] 质量门不再中止：标记不可信并继续（见 target_support_gate 处的说明）。
-            if not _allow_untrusted:
-                raise RuntimeError(_qmsg)
-            self._log(f"  [ERR] [结果不可信] {_qmsg}")
+            # [2026-09-15] 拟合阈值 ⟹ 只报告，不 raise、不触发补帧。
+            self._log(f"  [报告] [质量诊断未达标] {_qmsg}")
             result["results_untrusted"] = True
             result.setdefault("stage_quality_failures", []).append(
                 {"gate": "stage_quality", "message": str(_qmsg)})
@@ -8180,13 +8569,12 @@ class ABFEPipeline:
         ):
             _qmsg = (
                 f"{stage_label} 阶段最小绝对有效样本数 min_absolute_ess="
-                f"{min_absolute_ess:.4g} 低于阈值 {min_absolute_ess_threshold:.4g}，拒绝标记为 "
-                "completed。ESS ratio 达标不代表绝对样本数足够，请延长重叠最差窗口的采样。"
+                f"{min_absolute_ess:.4g} 低于阈值 {min_absolute_ess_threshold:.4g}。**仅诊断**，"
+                "不拒绝、不触发补帧。ESS ratio 达标不代表绝对样本数足够。"
             )
             # [2026-09-01] 质量门不再中止：标记不可信并继续（见 target_support_gate 处的说明）。
-            if not _allow_untrusted:
-                raise RuntimeError(_qmsg)
-            self._log(f"  [ERR] [结果不可信] {_qmsg}")
+            # [2026-09-15] 拟合阈值 ⟹ 只报告，不 raise、不触发补帧。
+            self._log(f"  [报告] [质量诊断未达标] {_qmsg}")
             result["results_untrusted"] = True
             result.setdefault("stage_quality_failures", []).append(
                 {"gate": "stage_quality", "message": str(_qmsg)})
@@ -8199,13 +8587,12 @@ class ABFEPipeline:
         ):
             _qmsg = (
                 f"{stage_label} 阶段最少去相关样本数 min_decorrelated_samples="
-                f"{min_decorrelated_samples} 低于阈值 {min_decorrelated_samples_threshold}，"
-                "拒绝标记为 completed，请延长采样。"
+                f"{min_decorrelated_samples} 低于阈值 {min_decorrelated_samples_threshold}。"
+                "**仅诊断**，不拒绝、不触发补帧。"
             )
             # [2026-09-01] 质量门不再中止：标记不可信并继续（见 target_support_gate 处的说明）。
-            if not _allow_untrusted:
-                raise RuntimeError(_qmsg)
-            self._log(f"  [ERR] [结果不可信] {_qmsg}")
+            # [2026-09-15] 拟合阈值 ⟹ 只报告，不 raise、不触发补帧。
+            self._log(f"  [报告] [质量诊断未达标] {_qmsg}")
             result["results_untrusted"] = True
             result.setdefault("stage_quality_failures", []).append(
                 {"gate": "stage_quality", "message": str(_qmsg)})
@@ -8222,13 +8609,13 @@ class ABFEPipeline:
             _qmsg = (
                 f"{stage_label} 阶段最大端点自由能差不确定度 "
                 f"max_endpoint_uncertainty_kJ_mol={max_endpoint_uncertainty_kJ_mol:.4g} kJ/mol "
-                f"高于阈值 {max_endpoint_uncertainty_kJ_mol_threshold:.4g} kJ/mol，拒绝标记为 "
-                "completed，请延长采样或检查窗口重叠。"
+                f"高于阈值 {max_endpoint_uncertainty_kJ_mol_threshold:.4g} kJ/mol。**仅诊断**，"
+                "不拒绝、不触发补帧 —— 1.0 这个阈值抄自一个默认关闭的 early-stop 形参，"
+                "全仓无依据，且它是逐段量而科学目标是两腿合成的 σ_bind。"
             )
             # [2026-09-01] 质量门不再中止：标记不可信并继续（见 target_support_gate 处的说明）。
-            if not _allow_untrusted:
-                raise RuntimeError(_qmsg)
-            self._log(f"  [ERR] [结果不可信] {_qmsg}")
+            # [2026-09-15] 拟合阈值 ⟹ 只报告，不 raise、不触发补帧。
+            self._log(f"  [报告] [质量诊断未达标] {_qmsg}")
             result["results_untrusted"] = True
             result.setdefault("stage_quality_failures", []).append(
                 {"gate": "stage_quality", "message": str(_qmsg)})
@@ -8245,9 +8632,12 @@ class ABFEPipeline:
         at the top level because ``_assert_stage_result_sane`` is also used on
         fresh in-memory solver results and therefore reads the top-level form.
         """
-        if result.get("converged") is not True:
+        # [2026-09-15] 缓存能不能**复用**问的是"结构上完整不完整"，不是"准不准"
+        # ⟹ 读 analysis_status。缺键 = 老产物 ⟹ fail-closed。
+        _cache_reason = _stage_analysis_rejection_reason(result)
+        if _cache_reason is not None:
             raise RuntimeError(
-                f"{stage_label} 缓存缺少明确的 converged=True 证据，拒绝复用。"
+                f"{stage_label} 缓存未通过硬不变量门，拒绝复用：{_cache_reason}"
             )
         if result.get("stage") == "vanishing" and not isinstance(
             result.get("coverage_diagnostics"), dict
@@ -8259,6 +8649,12 @@ class ABFEPipeline:
         if not isinstance(diagnostics, dict):
             raise RuntimeError(f"{stage_label} 缓存 diagnostics 非法，拒绝复用。")
         for key in (
+            # [2026-09-15] 新契约的两个状态：`_populate_stage_diagnostics` 会把它们
+            # 写进 diagnostics，这里和其它证据一样拉回顶层供硬不变量门读。
+            "analysis_status",
+            "analysis_incomplete_reasons",
+            "precision_status",
+            "precision_evidence",
             "min_overlap",
             "min_overlap_threshold",
             "min_absolute_ess",
@@ -8296,7 +8692,13 @@ class ABFEPipeline:
             raise ValueError("阶段 checkpoint protocol_key 不匹配")
         if result.get("lambda_path_fingerprint") != self._lambda_path_fingerprint(lambdas_var, window_ranges):
             raise ValueError("阶段 checkpoint lambda_path_fingerprint 不匹配")
-        _assert_sampling_result_converged(result, context=stage_name)
+        # [2026-09-15] stage checkpoint 走 **stage** 硬不变量门
+        # （`converged` 已删除；traditional 腿的那个门在 `_assert_sampling_result_converged`）。
+        _ckpt_reason = _stage_analysis_rejection_reason(result)
+        if _ckpt_reason is not None:
+            raise RuntimeError(
+                f"[{stage_name}] 阶段 checkpoint 未通过硬不变量门：{_ckpt_reason}"
+            )
         checked = dict(result)
         self._assert_reusable_stage_cache_sane(stage_name, checked)
         return checked
@@ -8478,7 +8880,54 @@ class ABFEPipeline:
         new_lambdas: Optional[List[float]] = None,
         new_ranges: Optional[List[Tuple[int, int]]] = None,
     ) -> None:
-        """λ 路径/窗口边界被自动修复改变后，旧的每窗口产物（能量/偏置/基准能量、
+        """⚠️⚠️ **死代码：全仓零调用点。不要接上它，也不要因为「零调用」就删它。**
+
+        （2026-09-14 审计 #18 执行器半边，维护者已裁决 WONTFIX。别重新论证。）
+
+        它是 `non_mutating_v1` 删掉 overlap-autorepair 变异循环之后留下的孤儿
+        （老调用点见 `docs/archive/removed_overlap_autorepair_mutation_loop.md`），
+        **不是「忘了接」**。
+
+        **为什么不接**（审计原文建议「布局变更处应该真的调它」，那条是错的）：
+
+        1. 它的第二阶段是无条件 `os.remove` 已经烧过 GPU 的
+           `dual_window_*_{energies,bias,base}.npy` / `convergence.json` /
+           `ibs_state_*.json`，直接撞本仓明文规矩 —— 见
+           `_reconcile_rewindow_intents` 的 docstring：「**不删目录。** 本仓库规矩：
+           不原地删实验产物」。
+        2. 它**只认基准段目录**。自治循环的盘面是
+           `vanishing` + `vanishing_2…N` + `vanishing_rewindow_<identity>`；
+           在循环里调它只会削掉基准段，段目录与子系综原样留着 ⟹ 制造不对称盘面，
+           比不调更糟。
+        3. **不传 old/new 四个参数就是全清**（`reuse_map` 为空 ⟹ 第二阶段删光该
+           stage 的全部窗口产物）。这个默认行为对任何「顺手调一下」的调用点都是陷阱。
+        4. 它要防的失效模式**已经被三道语义身份门各自挡住了**，剩下的只是磁盘
+           占用、不是正确性：
+             · 控制器读证据 —— `read_aggregated._layout_matches` 按窗口
+               `convergence.json` 里的 `lambdas_vdw` 与当前布局在
+               `LAMBDA_GRID_DECIMALS` 栅格上逐项比，对不上就剔除、换成
+               `stale_layout_evidence_only=True` 的空壳占位；
+             · 采样侧 resume —— 缓存门校验 convergence 里的真实 λ，不匹配判无效
+               缓存并重采；
+             · 求解侧 —— `load_ibs_window_outputs_from_dir` 对
+               `_grid(lambdas_vdw) != _grid(lv)` 直接 `raise`，fail-closed，
+               旧 λ 的帧进不了 MBAR；窗口数变少时残留的高 idx 文件也进不了
+               （loader 只遍历 `range(len(ranges))`）。
+
+        **为什么也不删**：爆炸半径不抵收益 —— 本体 139 行、
+        `tests/test_resume_reuse_contracts.py` 里 7 个测试 + 专用
+        `_make_fake_pipeline` helper、`tests/test_non_mutating_policy.py` 的
+        mutator 名单一条、`lambda_path_versions.py` 与本文件各一处文档指路。
+        为清一个**不在任何执行路径上**的函数动这么多测试，风险大于收益。
+
+        🔑 **留给下一个人的规矩**：「某函数零调用点」≠「忘了接，接上就好」。
+        接之前先问两件事 —— 接上去会不会违反已经成文的规矩；它要防的失效模式
+        是不是已经被别的机制挡住了。这一条**两个方向都栽过**。
+
+        ---
+        以下是它原本的行为说明（保留备查，不代表它应该被调用）：
+
+        λ 路径/窗口边界被自动修复改变后，旧的每窗口产物（能量/偏置/基准能量、
         收敛诊断、IBS 断点状态）按新方案的窗口编号可能对不上号——window_idx 相同
         不代表覆盖同一段 λ，必须显式清掉，不能依赖隐式的形状校验（ibs_engine.py
         run_all_windows 的 resume 判断现在会额外校验 convergence.json 里记的真实
@@ -9971,6 +10420,7 @@ class ABFEPipeline:
         max_states_per_window: int = 5,
         explicit_window_ranges_pinned: bool = False,
         partition_criterion: str = "arclength",
+        route_to_controller: bool = False,
     ):
         """vanishing 的路径演化闭环：f_k 真的调不动时插一个 λ、登记新版本、重试。
 
@@ -9995,8 +10445,57 @@ class ABFEPipeline:
         current_l = [float(x) for x in lambdas_var]
         current_r = [tuple(int(i) for i in r) for r in window_ranges]
 
+        def _routing_marker(err):
+            """两个路由信号的统一交回值（见下面 except 的长注释）。"""
+            _sig = ("WARMUP_F_K_NOT_CONVERGED"
+                    if isinstance(err, _ie.IBSWarmupConvergenceError)
+                    else "LOCAL_VALIDATION_CAP")
+            self._log(
+                f"  [路径演化] 收到路由信号 {_sig} ⟹ "
+                f"**不是终态**，交顶层自治控制器重判：{str(err)[:200]}"
+            )
+            return {
+                # [2026-09-15] 路由信号 = 路径没跑完 = 硬不变量不满足。
+                "analysis_status": ANALYSIS_INCOMPLETE,
+                "analysis_incomplete_reasons": [f"routing_signal={_sig}: {str(err)[:200]}"],
+                "precision_status": PRECISION_UNMEASURED,
+                "error": ("warmup_f_k_not_converged"
+                          if _sig == "WARMUP_F_K_NOT_CONVERGED"
+                          else "validation_budget_indeterminate"),
+                "routing_signal": _sig,
+                "detail": str(err)[:600],
+                "total_delta_G": 0.0,
+                "total_error": 999.9,
+            }
+
+        def _guarded_once():
+            """不演化路径的那两条早退路径**也要**接住路由信号。
+
+            ⚠️ 这两条早退在 `return` 里，**不在**下面那个 try 的覆盖范围内。
+            自治控制器启用时策略已被降级成 `non_mutating_v1`（见 run_full_pipeline），
+            于是第一条早退**就是**实际走的那条 —— 不包住它等于路由修复整个失效。
+            """
+            try:
+                return run_once(len(current_l), current_l, current_r)
+            except (_ie.IBSValidationBudgetIndeterminateError,
+                    _ie.IBSWarmupConvergenceError) as _route_err:
+                # 🔑🔑 [2026-09-14 真机] **两个路由信号都要接，不只是 LOCAL_VALIDATION_CAP。**
+                #
+                # `IBSWarmupConvergenceError`（一个 bias 压不平这个跨度）在下面那个
+                # `while True` 里本来是被接住并演化路径的 —— 但自治控制器启用时
+                # `repair_policy` 已被降级成 `non_mutating_v1`（单控制器，布局动作归
+                # `decide()`），于是**早退这条路成了实际路径**，那个 handler 变得不可达，
+                # 异常直接炸穿 `run_full_pipeline`（真机 `cyclod_ligand2/rep2` win4）。
+                #
+                # 自治循环对这两个异常**都**有路由分支（`WARMUP_F_K_NOT_CONVERGED` /
+                # `LOCAL_VALIDATION_CAP`），所以这里同样是"交回上层重判"，
+                # 不是吞掉：`converged` 保持 False，路径一个字节不动。
+                if not route_to_controller:
+                    raise
+                return _routing_marker(_route_err)
+
         if not _ie.should_run_path_evolution(repair_policy):
-            return run_once(len(current_l), current_l, current_r), current_l, current_r
+            return _guarded_once(), current_l, current_r
 
         if explicit_window_ranges_pinned:
             # 🔑 `stage2_window_ranges` 是绝对节点下标，插一个 λ 之后态数就变了，
@@ -10008,7 +10507,7 @@ class ABFEPipeline:
                 "自动插 λ —— 显式布局是绝对节点下标，插点会让它不再描述这条路径。"
                 "要用自动插点请移除 stage2_window_ranges。"
             )
-            return run_once(len(current_l), current_l, current_r), current_l, current_r
+            return _guarded_once(), current_l, current_r
 
         # 当前有效路径优先于刚预优化出来的那份：已经插过点就不能被打回 v1。
         record, _lc, current_l, ranges = _lpv.resolve_path(
@@ -10063,6 +10562,23 @@ class ABFEPipeline:
                     max_states_per_window=int(max_states_per_window),
                 )
                 return result, current_l, current_r
+            except _ie.IBSValidationBudgetIndeterminateError as _cap_err:
+                # 🔑🔑 `LOCAL_VALIDATION_CAP` 是**路由信号，不是终态**
+                # （docs/TODO.md「不许回退的约定」）。「单周期预算内 Δf−ΔF 没求出来」
+                # 对这份 f_k **无结论** —— 既非收敛也非不收敛 ⟹ 不改 f_k、不插 λ、
+                # 不拆窗，冻结状态已落盘、resume 接着验。
+                #
+                # 这里先前一个 handler 都没有，于是它**直接炸穿 run_full_pipeline**：
+                # 这次调用只是「第一次执行」，顶层自治控制器就在它返回之后接管
+                # （`_run_stage2_autonomous` 对同一个异常有 `continue` 到重判的路由），
+                # 而信号在控制器拿到方向盘**之前**就把整条管线打死了。
+                #
+                # ⚠️ 只有**确实有控制器在下游**时才咽下去（`route_to_controller`）。
+                # 没有控制器就没人去延长那个窗口的验证预算，静默返回等于把一个
+                # 「没结论」伪装成一次执行完毕 —— 那时照旧抛。
+                if not route_to_controller:
+                    raise
+                return _routing_marker(_cap_err), current_l, current_r
             except _ie.IBSWarmupConvergenceError as err:
                 # 🔑 [2026-09-11] 拆窗的依据只有一个：**f_k 压不平**（这个窗口一个
                 # bias 扛不住这么大的自由能跨度）。
@@ -10110,13 +10626,36 @@ class ABFEPipeline:
                 # 这里的触发条件只有"末窗的 f_k 未收敛 + 拆得开"。
                 _failed_rng = tuple(int(x) for x in diagnostics["global_state_range"])
                 _is_tail = bool(current_r) and _failed_rng == tuple(current_r[-1])
+                # 🔑🔑 [审计 #29] **`tail_exempt_from_max` 先前是个死参数。**
+                # 它的语义是「末窗是 model B 的溢出槽，**在被拆过之前**豁免
+                # `max_states_per_window`；拆过之后两个孩子都受约束、溢出槽消失」。
+                # 而全仓没有任何调用方传过它 ⟹ 恒为默认 `True` ⟹「溢出槽已经用尽
+                # ⟹ 插点无处可去 ⟹ `HALT_LAMBDA_BUDGET_INSUFFICIENT`」那条分支
+                # **结构上不可达**，插 λ 在拆过末窗之后仍被判成可行。
+                # ⚠️ 两种拆窗事件都要数：路径演化分支写 `split_tail_window`，
+                # 自治分支写 `tail_repartition`（`record_tail_repartition_version`）
+                # —— 只数一种等于漏掉自治循环拆的每一次。判据本身在
+                # `tail_overflow_exemption_active` 里，这里不另写一遍。
+                _path_events = {
+                    _k: _lpv.count_events(checkpoint_dir, _k)
+                    for _k in ("split_tail_window", "tail_repartition")
+                }
                 _feas = feasible_repair_actions(
                     current_r, len(current_l),
                     min_states_per_window=int(min_states_per_window),
                     max_states_per_window=int(max_states_per_window),
+                    tail_exempt_from_max=tail_overflow_exemption_active(_path_events),
                     n_insert=1,
                 )
-                if _is_tail and _feas.get("split_tail_window") is None:
+                # 🔑🔑 [审计 #24 的连带] **这里问的是「末窗能不能一分为二」，
+                # 不是「从 anchor 起重分整个尾段」。** 本分支的执行器是
+                # `split_window_from_ibs_lse_failure`（末窗一分为二）；而 #24 把
+                # `feasible_repair_actions["split_tail_window"]` 的语义改成了控制器
+                # 那个动作真正做的事（`repartition_tail_from_anchor`），不给
+                # `tail_repartition_start_state` 就如实返回「判不了」。
+                # 若继续读那个键，这条分支会因为一个**与它无关**的问题判不了而
+                # 永远不触发 —— 静默掐死。对应的键是 `split_last_window_in_two`。
+                if _is_tail and _feas.get("split_last_window_in_two") is None:
                     _k_tail = _failed_rng[1] - _failed_rng[0]
                     try:
                         _new_r, _split_diag = split_window_from_ibs_lse_failure(
@@ -10348,7 +10887,15 @@ class ABFEPipeline:
                 if os.path.basename(base) == "checkpoints"
                 else getattr(self, "output_dir", base)
             )
-            ctl = Stage2RepairController(
+            # 🔑🔑 [审计 #26] **影子对账必须走 `for_physical_stage`，不能用普通构造。**
+            # 普通构造得到的是**单段**视图，而以下几项只在**合并视图**里产出：
+            #   · `min_n_eff_over_g_history` —— 边际增益判据（「加帧已被本窗口自己的
+            #     数据证伪」）唯一的输入，单段视图里恒为 None ⟹ 那条刹车在对账路径上
+            #     **结构性关闭**；
+            #   · `stale_layout_evidence` / `window_provenance` —— 过期证据保护同理。
+            # 而对账的**全部意义**就是「影子与生产在同一份盘面上给出同一个判断」；
+            # 两边视图口径不同，对出来的差异说明不了任何事。
+            ctl = Stage2RepairController.for_physical_stage(
                 run_dir, stage_name, stage_type,
                 min_states_per_window=min_states_per_window,
                 max_states_per_window=max_states_per_window,
@@ -10372,11 +10919,13 @@ class ABFEPipeline:
                    if plan.get("missing_evidence") else "")
                 + (f" | 结构动作可行={plan['feasible_structural_actions']}")
             )
-            if view.get("missing_windows") or view.get("skipped_windows"):
+            if (view.get("missing_windows") or view.get("skipped_windows")
+                    or view.get("skipped_sampling_units")):
                 self._log(
                     f"  [控制器·影子] ⚠️ 缺窗口={view.get('missing_windows')} "
-                    f"被踢出协方差链={view.get('skipped_windows')} —— "
-                    "缺窗口的总和不是完整 ΔG。"
+                    f"被踢出协方差链（物理窗口）={view.get('skipped_windows')} "
+                    f"（采样单元）={view.get('skipped_sampling_units')} —— "
+                    "缺窗口的总和不是完整 ΔG；子窗被跳同理，它那段 λ 没被覆盖。"
                 )
             return plan
         except Exception as _shadow_err:  # noqa: BLE001 —— 影子绝不阻断生产
@@ -10399,6 +10948,7 @@ class ABFEPipeline:
         max_states_per_window: int,
         max_iterations: int = 40,
         allow_untrusted_stage_results: bool = False,
+        f_k_reanchor_cadence_steps: int = 500_000,
     ):
         """**顶层自治循环**：读证据 → 决定动作 → 执行 → 重读，直到真终态。
 
@@ -10440,10 +10990,43 @@ class ABFEPipeline:
             else self.output_dir
         )
         base_unit = int(n_steps_per_window)
+        # 🔑🔑 [审计 #6，2026-09-14] **只有覆盖全路径的执行才配当 stage 结果。**
+        #
+        # 本函数的返回值被调用方按 `if _auto_result is not None: stage2 = _auto_result`
+        # 直接当成 Stage-2 的结果用。而循环里大多数动作跑的是**窗口子集**
+        # （补帧、续预热、换 Epoch、子窗续跑、全新 Epoch），它们的返回值是
+        # **子集的部分和，不是 ΔG**。先前这些全都写进同一个 `result`，于是：
+        #   · 多段补帧循环里 `result` 被每一段覆盖，只有最后一段活下来；
+        #   · 交出去之后还会**覆盖 `_run_stage2_with_path_evolution` 已经算好的
+        #     完整 stage2**；
+        #   · 下游 `_assert_stage_result_sane` fail-closed 抛 `subset_partial_sum_not_delta_G`。
+        #
+        # 现在：子集执行一律赋给 `_subset_only`（只用于判「这次有没有产出新段」
+        # 之类的局部逻辑），**永不外泄**；只有 `INSERT_LAMBDA` / `SPLIT_TAIL_WINDOW` /
+        # `ANALYZE`（含 merged 全路径求解）/ `IMMUTABLE_REWINDOW`（它内部做的是
+        # 合并求解）这几处全路径执行才写 `result`。
+        # ⟹ 一整跑只发过子集动作时 `result` 保持 None，调用方按 `is not None` 判，
+        #    自然保留它自己已经算好的那份完整结果 —— 这正是想要的行为。
         result = None
+        _subset_only = None   # 子集执行的返回值落这里，**不得**赋给 `result`
         history: List[Dict[str, Any]] = []
         seen: Dict[Tuple[str, Tuple[int, ...]], int] = {}
-        escalated: Dict[Tuple[str, Tuple[int, ...]], bool] = {}
+        # **不该被降级的动作**（审计 #17）。降级 = 把这个动作换成
+        # `PROBE_REANCHOR_EPOCH`，那是"新开采样段 + 新候选 f_k + 一个 +250k 块"的
+        # **变异**动作。
+        #   PROBE_REANCHOR_EPOCH —— 它就是降级目标，降级到自己是空操作。
+        #   ANALYZE —— 分支 6a 明写「绝不能因为"不知道"就去换 Epoch，那是在毫无
+        #     根据的窗口上烧 GPU」；UNKNOWN ≠ PROBLEM。
+        #   PROBE_CANDIDATE_FK —— 按定义**非变异**（只算候选并报告），所以盘面
+        #     必然不变、必然撞停滞门；把它升级成真开段，正是它自己那段注释拿
+        #     真机 win4「2 分钟造出 vanishing_3/_4、烧光 955k 预算」举证禁止的事。
+        #   NO_ACTION —— 控制器已经说了没有可行动作（现状都带终态 exit 会提前
+        #     break，列在这里是护栏）。
+        _NO_ESCALATION = frozenset({
+            "PROBE_REANCHOR_EPOCH", "ANALYZE", "PROBE_CANDIDATE_FK", "NO_ACTION",
+        })
+        # key = (action, windows, unit_id) + path_version —— 见 `esc_key` 处的注释。
+        escalated: Dict[Tuple[str, Tuple[int, ...], str, int], bool] = {}
         last_sig: Dict[Tuple[str, Tuple[int, ...]], Any] = {}
 
         def _disk_signature(v: Dict[str, Any]) -> Tuple:
@@ -10455,26 +11038,88 @@ class ABFEPipeline:
             # warmup 预算也算"盘动了"：撞验证批次上限那条路由不产出生产帧，
             # 但**确实在烧该窗口的预算**。不把它算进来，停滞保护会在预算还剩
             # 一半时就判"推不动"退出。
+            # 🔑🔑 [DECORR-01 / 2026-09-14] **求解器侧的证据也必须进签名。**
+            # 先前签名只有生产步数 / 自检结论 / 段 / 路径版本 —— 全是**自检侧和
+            # 执行侧**的量。于是"补了一块帧，求解器从跳窗变成不跳窗（或跳窗帧数
+            # 从 7 涨到 9）"这种**真实推进**在签名上看不见，会被算成"推不动"；
+            # 反过来，求解器跳窗数变了而自检没变时同样看不见。
+            # 求解器对"能否进入求解"有操作权威，它的读数就是进展的直接证据。
+            # 同理把 rescue/重窗的身份也钉进去：新建的子系综是**另一个**盘上状态。
             return (
                 int(v.get("path_version") or 0),
                 tuple(sorted(
                     (v.get("per_window_budget_remaining") or {}).items()
                 )),
+                # 🔑 未知 ≠ 0：`production_steps` 读不到时用哨兵 -1，别和"真的
+                # 跑了 0 步"同签名 —— 否则「从未知变成已知」这种真实推进看不见。
                 tuple(sorted(
-                    (int(w["window_idx"]), int(w.get("production_steps") or 0),
-                     str(w.get("self_verdict")), str(w.get("segment")))
+                    (int(w["window_idx"]),
+                     (-1 if w.get("production_steps") is None
+                      else int(w["production_steps"])),
+                     str(w.get("self_verdict")), str(w.get("segment")),
+                     # 求解器侧：跳没跳、跳的时候实际有几帧
+                     int(((w.get("solver_skip") or {}).get(
+                         "n_frames_after_decorrelation")) or -1))
                     for w in (v.get("windows") or [])
                 )),
+                # 求解器跳窗集合本身（合并视图是跨段并集，与逐窗那项互补）
+                tuple(sorted(int(x) for x in (v.get("skipped_windows") or []))),
+                # 🔑🔑 `skipped_windows` 拆键之后它**只剩物理窗口**；子窗被跳 /
+                # 不再被跳的变化不进签名，就会把真实推进记成 no-op，而 no-op 记账
+                # 又会反过来把那条唯一对症的路封掉。两个键都要进。
+                tuple(sorted(str(x) for x in (v.get("skipped_sampling_units") or []))),
+                # 重窗/rescue 身份：建了新的子系综 ⟹ 盘上状态确实变了
+                tuple(sorted(str(x) for x in (v.get("aggregated_segments") or []))),
+                str((v.get("immutable_rewindow") or {}).get("identity") or ""),
+                # 🔑 **子窗的进展也必须进签名。** 不含它，给子窗补的那一块帧在
+                # 签名上看不见 ⟹ 真实推进被记成 no-op，而 no-op 记账会反过来
+                # 把这条唯一对症的路也封掉。
+                tuple(sorted(
+                    (str(u.get("unit_id")), int(u.get("production_steps") or 0),
+                     int((u.get("solver_n_frames_decorrelated") or -1)),
+                     bool(u.get("complete")))
+                    for u in (v.get("sampling_units") or [])
+                )),
             )
+
+        # 🔑🔑 [2026-09-14] **循环为什么停，必须落盘。**
+        # 先前 history 只有 `{"iterations", "final_ranges"}`：撞迭代上限只剩一行日志，
+        # 三个真终态也只在 `history[-1]["exit"]` 里 —— 而停滞保护还会**改写**那个
+        # 字段，于是 `decide()` 给的出口和主循环给的出口混在同一个键上。
+        # 结果是事后没法回答"这一跑到底是收敛了、没预算了、还是转够 40 轮了"，
+        # 下游/下一个人只能去猜，或者让别的机制"代为补救"。
+        outcome: Dict[str, Any] = {
+            "status": "RUNNING",
+            "exit": None,
+            "exit_emitted_by": None,   # "controller" | "loop"
+            "reason": None,
+            "iterations_used": 0,
+            "max_iterations": int(max_iterations),
+        }
+
+        def _finish(status, exit_, by, reason, it=None):
+            outcome.update({
+                "status": status, "exit": exit_, "exit_emitted_by": by,
+                "reason": str(reason)[:400],
+            })
+            if it is not None:
+                outcome["iterations_used"] = int(it)
 
         def _write_history() -> None:
             try:
                 _atomic_write_json(
                     os.path.join(checkpoint_dir, "stage2_autonomous_history.json"),
-                    {"iterations": history, "final_ranges": [list(r) for r in ranges]},
+                    {"iterations": history, "final_ranges": [list(r) for r in ranges],
+                     "outcome": outcome},
                 )
             except Exception:
                 pass
+
+        # 🔑 [CTL-04] **先核销上一跑留下的未完成 rewindow 意图，再开始决策。**
+        # 进程在子系综采样里被打断时，台账里留的是 `SAMPLING_INTENT`；不核销的话
+        # 它既不能被求解采信（会被跳过），控制器也不知道那一份 GPU 到底烧出东西没有。
+        # 这一步零成本（只读盘上产物），但它决定了下一轮是"接着补帧"还是"重建一次"。
+        self._reconcile_rewindow_intents(checkpoint_dir)
 
         for it in range(1, int(max_iterations) + 1):
             # **按物理 stage 聚合**：段不是独立 stage（否则同一个 stage 出两个动作）。
@@ -10492,8 +11137,10 @@ class ABFEPipeline:
             # 状态（真机 15:59：末窗被顶到 K=6，越界且落在死区），那个非法布局会
             # 原样留在盘上 —— 而循环此前**启动时不校验布局**，于是谁先用权威
             # ranges 跑谁崩，和上一次一模一样。合法时这里零成本。
+            # 判据是**执行层上限** `hi`，不是可拆上限 `2hi−1`：后者是 path-version
+            # 层允许插 λ 溢出到的位置，不是"可以照跑的上限"（见 `_legalize_tail_window`）。
             _tk = ranges[-1][1] - ranges[-1][0]
-            if _tk > 2 * int(max_states_per_window) - 1:
+            if _tk > int(max_states_per_window):
                 # 插哪个窗口：**接着上次没做完的那次修复**。当前路径版本事件里
                 # 记着 `failed_global_state_range`，那就是上次插 λ 的目标窗口。
                 _ev = (_lpv.load_current(checkpoint_dir) or {}).get("event") or {}
@@ -10511,8 +11158,8 @@ class ABFEPipeline:
                     checkpoint_dir=checkpoint_dir,
                     min_states_per_window=int(min_states_per_window),
                     max_states_per_window=int(max_states_per_window),
-                    anchor_getter=lambda: ctl.tail_repartition_anchor(view),
                     first_untrusted=ctl.first_untrusted_window(view),
+                    partition_criterion=ctl.partition_criterion,
                 )
                 # ⚠️ 合法化**改了布局**（拆末窗 ⟹ 窗口数都变了）。
                 # `view` 是改之前读的，拿它去 decide 等于按一个
@@ -10522,12 +11169,24 @@ class ABFEPipeline:
             plan = ctl.decide(view)
             act = plan["action"]
             wins = [int(x) for x in (plan.get("windows") or [])]
-            key = (act, tuple(wins))
+            # 🔑 [2026-09-14] **key 必须含 `unit_id`。** 同一个父窗下的两个子窗
+            # 都报 `windows=[父窗]`，只有 `unit_id` 区分得开 —— 不含它，两个子窗
+            # 会共用一个停滞计数，补第二个子窗时被误判成"第 3 次、推不动"。
+            key = (act, tuple(wins), str(plan.get("unit_id") or ""))
+            # 🔑🔑 [审计 #10] **降级台账的失效条件是「布局换了」，不是「盘面变了」。**
+            # 先前 `escalated.pop(key)` 挂在「盘面变了」上 —— 而降级去跑的
+            # `PROBE_REANCHOR_EPOCH` **必然新建采样段并真采样** ⟹ 必然改签名
+            # ⟹ 每次都把"已经降过一次"这条记录抹掉 ⟹ 第 3/6/9… 轮各开一个新段，
+            # 注释声称修掉的「无限开新段、烧 GPU」被这个重置整个抵消。
+            # 用「盘面变了」当失效条件是自证循环：降级自己就是改盘面的那个动作。
+            # 窗口真被修好时不需要它失效 —— 修好了 `decide()` 就不再发同一个 key。
+            # 真正让旧记录失去意义的是**布局变了**（插 λ / 拆窗 ⟹ path_version
+            # 推进 ⟹ 这是另一个窗口几何），与 `stale_layout_evidence` 同一条规矩。
+            esc_key = key + (int(view.get("path_version") or 0),)
             sig = _disk_signature(view)
             if last_sig.get(key) != sig:
-                # 盘动了 ⟹ 这个动作还在起作用，计数清零重来。
+                # 盘动了 ⟹ 这个动作还在起作用，计数清零重来（`escalated` 不跟着清）。
                 seen[key] = 1
-                escalated.pop(key, None)
             else:
                 seen[key] = seen.get(key, 0) + 1
             last_sig[key] = sig
@@ -10537,7 +11196,67 @@ class ABFEPipeline:
                 "evidence_status": plan.get("evidence_status"),
                 "blocked_by_upstream": plan.get("blocked_by_upstream"),
                 "repeat_count": seen[key],
+                # 🔑 **每一轮各个参数长什么样** —— 只记终态的话，A/B 对比时
+                # 看不出差异是在哪一步产生的，也没法回答"这个动作到底把它
+                # 推动了多少"。这里是**决策那一刻**的盘面快照（只读已有字段，
+                # 不新算）。
+                "path_version": view.get("path_version"),
+                "window_ranges": [list(r) for r in ranges],
+                "snapshot": [
+                    {
+                        "window_idx": int(x["window_idx"]),
+                        "segment": x.get("segment"),
+                        "min_n_eff_over_g": x.get("min_n_eff_over_g"),
+                        "verdict": x.get("self_verdict"),
+                        "n_decorrelated": x.get("self_n_frames_decorrelated"),
+                        # 🔑 补帧准入看**求解器侧**的去相关帧数增长，不是自检那份
+                        # （两者实测差 2–8 倍），更不是"又跑了多少步"。
+                        "solver_n_decorrelated": x.get("solver_n_frames_decorrelated"),
+                        "production_steps": x.get("production_steps"),
+                        "warmup_steps_left": x.get("warmup_steps_left"),
+                        "lambda_span": x.get("lambda_span"),
+                        "derailment_status": x.get("derailment_status"),
+                    }
+                    for x in (view.get("windows") or [])
+                ],
+                # 🔑🔑 [契约 B / 审计 #8] **块账必须看得见子窗。**
+                # `snapshot` 只有物理窗口 ⟹ `_production_blocks_scan` 只遍历它，
+                # 子窗一条都不进账；而 `_frames_admission` 问的是**父窗**的账，
+                # 父窗被子系综取代之后 `production_steps` 冻结、去重后恒 1 行 ⟹
+                # 「每窗 4 块硬上限」和「上一块必须有增益」两道刹车在结构上
+                # 永远不会触发。这里只把 `view["sampling_units"]` 里**已有**的
+                # 字段平行落一份，不新算任何量。
+                # ⚠️ 键名全部实测核对过（本仓刚因「读一个没人写的键」连栽三次）：
+                #   · `sampling_units` 里**没有** `segment` —— 子系综的命名空间
+                #     等价物是 `identity`；
+                #   · 去相关帧数真名是 `solver_n_frames_decorrelated`，
+                #     **不是** `solver_n_decorrelated`（那是物理窗口 snapshot
+                #     这一侧改名后的输出键）。
+                # 对外输出的键名沿用块账消费侧现有的读法，省得再改一遍消费端。
+                "sampling_units_snapshot": [
+                    {
+                        "unit_id": str(u.get("unit_id")),
+                        "parent_window": u.get("parent_window"),
+                        "local_index": u.get("local_index"),
+                        # 段的等价物：同一条边际增益曲线只在同一个 identity 内成立
+                        "identity": u.get("identity"),
+                        "production_steps": u.get("production_steps"),
+                        "solver_n_decorrelated": u.get("solver_n_frames_decorrelated"),
+                        "min_n_eff_over_g": u.get("min_n_eff_over_g"),
+                        "complete": u.get("complete"),
+                    }
+                    for u in (view.get("sampling_units") or [])
+                ],
             })
+            # 🔑🔑 [审计 #19] **每一轮决策定下来就落盘，不等循环结束。**
+            # 补帧块账（`_production_blocks_ledger` / `_production_blocks_scan`）
+            # 就是从 `stage2_autonomous_history.json` 算出来的；先前只有三条异常
+            # 路径和函数收尾写盘 ⟹ 进程被 kill / 节点掉线 = 块数硬上限与边际增益
+            # 刹车一起清零，下一跑可以重新发满 4 块。而读不到历史时的兜底是
+            # 「第一块照常批」，失效方向正好是**放行**。
+            # 写在**执行之前**：这一块已经批出去了，崩在采样中途也必须算数。
+            outcome["iterations_used"] = int(it)
+            _write_history()
             self._log(
                 f"  [自治 {it}/{max_iterations}] 动作={act} 窗口={wins or '-'}"
                 + (f" 出口={plan['exit']}" if plan.get("exit") else "")
@@ -10549,6 +11268,8 @@ class ABFEPipeline:
             # ---- 真终态：只有这三类允许退出 ----
             if plan.get("terminal"):
                 self._log(f"  [自治] 终态 {plan.get('exit') or act}：{plan['reason'][:160]}")
+                _finish("TERMINAL", plan.get("exit") or act, "controller",
+                        plan["reason"], it)
                 break
 
             # ---- 停滞保护 ----
@@ -10559,15 +11280,22 @@ class ABFEPipeline:
                 )
                 # ⚠️ **降级只许一次**。先前每轮都重新降级一次，于是"推不动的动作"
                 # 每轮都触发一次换 Epoch —— 无限开新段、烧 GPU 且永不退出。
-                if escalated.get(key):
+                if escalated.get(esc_key):
+                    # 🔑 [裁决 2] **停滞保护不负责推断预算。**
+                    # "推不动"是执行事实，"预算耗尽"是账本结论 —— 两回事。
+                    # `GLOBAL_BUDGET_EXHAUSTED` 只由 `decide()` 在**生产预算已知且
+                    # 确实耗尽**时发出（见 `plan()` 里那道统一闸）。这里一律
+                    # `NO_FEASIBLE_ACTION`：动作推不动，与还有没有钱无关。
                     self._log(
                         "  [自治] 已经为它降级过一次、仍然推不动 ⟹ "
                         "NO_FEASIBLE_ACTION，退出。"
                     )
                     history[-1]["exit"] = "NO_FEASIBLE_ACTION"
+                    _finish("TERMINAL", "NO_FEASIBLE_ACTION", "loop",
+                            f"动作 {act}{wins} 降级后仍推不动（盘上状态未变）", it)
                     break
-                escalated[key] = True
-                if act != "PROBE_REANCHOR_EPOCH" and wins:
+                escalated[esc_key] = True
+                if act not in _NO_ESCALATION and wins:
                     # **有界探针**，不是全路径重来：只针对卡住的那个窗口、
                     # 只给一个 +250k 块。先前降级到 RECALIBRATE_FK ——
                     # 它无差别重标定全部窗口并整段重采，把已经
@@ -10576,48 +11304,102 @@ class ABFEPipeline:
                         f"  [自治] 降级到 PROBE_REANCHOR_EPOCH（只对窗口 {wins} "
                         "换 Epoch 拿独立证据，一个块）。"
                     )
+                    # 🔑 [审计 #62a] **这一行 history 是在降级之前 append 的。**
+                    # `action` 保持"控制器发的动作"不动 —— `_production_blocks_scan`
+                    # 的 `action != "RUN_PRODUCTION"` 过滤和 `comparison_manifest`
+                    # 的 actions 列表都按这个口径读，改写它会让一个**确实烧了一块
+                    # 帧**的探针迭代从块账里消失（= 拆刹车）。实际执行的动作另立
+                    # 一个键，别让"账上写 A、盘上跑 B"只活在日志里。
+                    history[-1]["action_executed"] = "PROBE_REANCHOR_EPOCH"
+                    history[-1]["degraded_from"] = history[-1].get("action")
                     act = "PROBE_REANCHOR_EPOCH"
                 else:
                     self._log("  [自治] 没有可降级的动作 ⟹ NO_FEASIBLE_ACTION，退出。")
                     history[-1]["exit"] = "NO_FEASIBLE_ACTION"
+                    _finish("TERMINAL", "NO_FEASIBLE_ACTION", "loop",
+                            f"动作 {act}{wins} 推不动且没有可降级的动作", it)
                     break
 
             # ---- 执行 ----
             try:
-                if act in ("RUN_PRODUCTION",):
+                if act in ("RUN_PRODUCTION",) and plan.get("unit_id"):
+                    # 🔑 [裁决 1] 带 `unit_id` ⟹ 目标是**子窗这个采样单元**，
+                    # 不是物理窗口。执行器续跑它自己的 checkpoint。
+                    _uid = str(plan["unit_id"])
+                    _unit = next(
+                        (u for u in (view.get("sampling_units") or [])
+                         if str(u.get("unit_id")) == _uid), None)
+                    if _unit is None:
+                        raise RuntimeError(
+                            f"控制器点名了采样单元 {_uid!r}，但视图里没有它 ⟹ "
+                            "台账与视图不一致。fail-closed。"
+                        )
+                    _subset_only = self._topup_rewindow_child(
+                        run_once, unit=_unit, view=view, lam=lam, ranges=ranges,
+                        stage_dir=stage_dir, checkpoint_dir=checkpoint_dir,
+                        base_unit=int(base_unit), kt=float(kt),
+                    )
+                elif act in ("RUN_PRODUCTION",):
                     # 补采口径按老板定的：**`+250k` 加法、每块复判**，不是 ×2 乘法
                     # （乘法会让检查间隔越来越粗，而信息率可能中途断崖）。
                     # ⚠️ 补采必须落在**证据所在的那个段**里。先前无条件写基准
                     # stage：既把 segment_N 的 cumulative 当成基准段的起点（跨
                     # 命名空间串号），又等于回头给旧 f_k 加帧 —— 两条都是错的。
-                    overrides = {}
-                    _segs = set()
-                    for w in wins:
-                        _rec = next(
-                            (x for x in view["windows"] if int(x["window_idx"]) == w),
-                            None,
+                    # ⚠️ **按段分组、一段一次。** `segment_dirs_for_evidence` 对
+                    # 跨段的窗口集合 fail-closed 抛错（回落基准段正是原来那个 bug），
+                    # 而多窗补采**天然会跨段** —— 真机 win0-3 在 `vanishing_2`、
+                    # win4 在基准段。先前直接把整批丢进去，一旦控制器发出跨段的
+                    # 窗口集合（分支 9c 的"端点 σ 没归因 ⟹ 全窗各补一块"就是），
+                    # ValueError 会穿过 `except Exception` 被 re-raise，整条流水线死。
+                    _by_seg = _pre.windows_by_segment(
+                        wins, view["windows"], base_unit)
+                    for _seg, overrides in sorted(_by_seg.items()):
+                        _out_override, _ckpt_override = _pre.segment_dirs_for_evidence(
+                            {_seg}, stage_dir, checkpoint_dir
                         )
-                        overrides[w] = int((_rec or {}).get("production_steps") or 0) + base_unit
-                        _segs.add(str((_rec or {}).get("segment") or ""))
-                    _out_override, _ckpt_override = self._segment_dirs_for_evidence(
-                        _segs, stage_dir, checkpoint_dir
-                    )
-                    if _out_override:
-                        self._log(f"  [自治] 补采落在段目录 {os.path.basename(_out_override)}。")
-                    result = run_once(
-                        len(lam), list(lam), ranges,
-                        _only_window_indices=sorted(wins) or None,
-                        _production_step_overrides=overrides or None,
-                        _output_dir_override=_out_override,
-                        _checkpoint_dir_override=_ckpt_override,
-                        _resume_override=True,
-                    )
+                        if _out_override:
+                            self._log(
+                                f"  [自治] 窗口 {sorted(overrides)} 的补采落在段目录 "
+                                f"{os.path.basename(_out_override)}。"
+                            )
+                        _subset_only = run_once(
+                            len(lam), list(lam), ranges,
+                            _only_window_indices=sorted(overrides) or None,
+                            _production_step_overrides=overrides or None,
+                            _output_dir_override=_out_override,
+                            _checkpoint_dir_override=_ckpt_override,
+                            _resume_override=True,
+                        )
                 elif act == "CONTINUE_WARMUP":
-                    result = run_once(
-                        len(lam), list(lam), ranges,
-                        _only_window_indices=sorted(wins) or None,
-                        _resume_override=True,
-                    )
+                    # ⚠️ [审计 #16] 预热同样必须落在**证据所在的那个段**。先前无条件
+                    # 写基准段：窗口的当前 Epoch 在 `vanishing_N` 时，预热预算烧在
+                    # 基准段的旧 f_k 上、目标段一步不动 —— 与 RUN_PRODUCTION 修过
+                    # 的是同一个错，这一处漏了。
+                    # ⚠️ **按段分组、一段一次**：`CONTINUE_WARMUP` 的窗口集合是
+                    # 列表（`with_budget` / `stuck` 都可能多窗），而
+                    # `segment_dirs_for_evidence` 对跨段集合 fail-closed 抛
+                    # ValueError，那个异常会穿过下面的 `except Exception` 被
+                    # re-raise，整条流水线死。
+                    # （`windows_by_segment` 第三个参数是"再补多少步"；预热不补生产
+                    #   步 ⟹ 传 0，这里只用它的分组。）
+                    for _seg, _ws in sorted(
+                        _pre.windows_by_segment(wins, view["windows"], 0).items()
+                    ):
+                        _out_override, _ckpt_override = _pre.segment_dirs_for_evidence(
+                            {_seg}, stage_dir, checkpoint_dir
+                        )
+                        if _out_override:
+                            self._log(
+                                f"  [自治] 窗口 {sorted(_ws)} 的预热落在段目录 "
+                                f"{os.path.basename(_out_override)}。"
+                            )
+                        _subset_only = run_once(
+                            len(lam), list(lam), ranges,
+                            _only_window_indices=sorted(_ws) or None,
+                            _output_dir_override=_out_override,
+                            _checkpoint_dir_override=_ckpt_override,
+                            _resume_override=True,
+                        )
                 elif act in ("RECALIBRATE_FK", "PROBE_CANDIDATE_FK"):
                     # ⚠️ [2026-09-12 真机修正] **这两个动作的落地不一样。**
                     # 控制器的 PROBE_CANDIDATE_FK 分支白纸黑字写着
@@ -10639,25 +11421,32 @@ class ABFEPipeline:
                     # 会跟已有段目录撞号（撞上就把别人的段覆盖掉）。
                     # 基准 stage 目录本身**隐含是段 1**（`_recalibrate_...` 的默认
                     # segment_index 就是 2），所以新段从 2 起，不是 1。
+                    # 🔑 [审计 #2] 判据必须是**完整后缀**纯数字。
+                    # `rsplit("_", 1)[-1]` 只看最后一段 ⟹ immutable rewindow 的
+                    # `<stage>_rewindow_<sha256[:12]>` 目录有 (10/16)**12 ≈ 0.34%
+                    # 的概率后缀全是数字，命中就会被当成采样段，`int()` 出来还是
+                    # 一个天文数字的段号。⚠️ 种子 `1` 不能去掉：它编码「基准目录
+                    # 隐含是段 1」这条约定，去掉的话盘上没有 `_N` 目录时新段会从
+                    # 2 变 1，直接跟基准段撞名。
                     _existing = [1]
                     for _d in glob.glob(stage_dir.rstrip(os.sep) + "_*"):
-                        _suf = os.path.basename(_d).rsplit("_", 1)[-1]
-                        if os.path.isdir(_d) and _suf.isdigit():
-                            _existing.append(int(_suf))
+                        _n = segment_index_of_dir(_d, stage_dir)
+                        if _n is not None and os.path.isdir(_d):
+                            _existing.append(int(_n))
                     seg_idx = max(_existing) + 1
                     # 🔑 源段 = **有这个窗口数据的最新段**，不是"全局最新段"。
                     # 真机 15:28:05 实证：全局最新段 vanishing_2 恰恰**没有 win4
                     # 的帧**（它是 win0-3 的部分段），拿它去重解 win4 的 f_k 既
                     # 炸 loader 又在逻辑上说不通。窗口的证据来自哪个段，
                     # 聚合视图里已经写着了。
-                    _src_dir, _src_ckpt = self._segment_dirs_for_evidence(
+                    _src_dir, _src_ckpt = _pre.segment_dirs_for_evidence(
                         {str((next((x for x in view["windows"]
                                     if int(x["window_idx"]) == w), {}) or {})
                               .get("segment") or "") for w in wins},
                         stage_dir, checkpoint_dir,
                     )
                     # ⚠️ `run_once` 是**位置参数**，不能用关键字传（会 TypeError）。
-                    result, diag = self._recalibrate_f_k_and_resample_segment(
+                    _subset_only, diag = self._recalibrate_f_k_and_resample_segment(
                         run_once,
                         segment_index=seg_idx,
                         stage_dir=stage_dir,
@@ -10670,6 +11459,16 @@ class ABFEPipeline:
                         # 只修 decide 指名的窗口，别把合格窗口拖进新段。
                         only_windows=sorted(wins) or None,
                         probe_only=_probe_only,
+                        # 🔑🔑 [2026-09-15] **不传这个 = 把固定节奏重锚整个关掉。**
+                        # `_cadence = int(reanchor_cadence_steps or 0)` ⟹ 不传就是 0
+                        # ⟹ `_by_cadence` 恒 False ⟹ 探针**永远**判 NO_REANCHOR_DUE
+                        # （日志特征："没有窗口到重锚节奏（**0 步**）"）。
+                        # 先前只有循环外的 rescue 路径传了它，而自治控制器一旦启用
+                        # 就把 rescue 关掉 ⟹ 设计里那条「1 ns 固定节奏重锚」在生产上
+                        # **一次都没生效过**。真机后果（4W53 vanishing）：win0 连吃
+                        # 4 块帧到 1.25M 步、min N_eff/g 纹丝不动（0.397→0.419），
+                        # 而自检每一轮都在明写"加帧治不了偏斜、对症动作是换 f_k"。
+                        reanchor_cadence_steps=int(f_k_reanchor_cadence_steps),
                     )
                     if _probe_only:
                         # 🔑 **探针的结论必须落盘。** 非变异探针按定义不改盘，
@@ -10697,26 +11496,39 @@ class ABFEPipeline:
                             )
                         except Exception as _pe:  # noqa: BLE001
                             self._log(f"  [自治] 探针结论落盘失败：{_pe!r}")
-                    if result is None:
+                    if _subset_only is None:
                         # 没有窗口值得重标定 ⟹ 这条路推不动，让下一轮 decide 换动作。
+                        # 🔑 **必须记账**：只打日志的话控制器看不见，会原样再发一次
+                        # （真机两次都是连发 4 次、盘面一字节未变）。
                         self._log("  [自治] 重标定未产生新段（无窗口超阈值）。")
+                        self._record_noop_action(
+                            checkpoint_dir, act, wins, view,
+                            reason="recalibration_produced_no_new_segment",
+                        )
                 elif act == "PROBE_REANCHOR_EPOCH":
                     # 有界探针：候选 f_k + 独立 burn-in + **一个** +250k 块。
                     # 落地仍走"新采样段"（它天然带独立 burn-in、旧段保留），
                     # 区别在于**只给一块**、且只针对 earliest 那一个窗口。
+                    # 🔑 [审计 #2] 判据必须是**完整后缀**纯数字。
+                    # `rsplit("_", 1)[-1]` 只看最后一段 ⟹ immutable rewindow 的
+                    # `<stage>_rewindow_<sha256[:12]>` 目录有 (10/16)**12 ≈ 0.34%
+                    # 的概率后缀全是数字，命中就会被当成采样段，`int()` 出来还是
+                    # 一个天文数字的段号。⚠️ 种子 `1` 不能去掉：它编码「基准目录
+                    # 隐含是段 1」这条约定，去掉的话盘上没有 `_N` 目录时新段会从
+                    # 2 变 1，直接跟基准段撞名。
                     _existing = [1]
                     for _d in glob.glob(stage_dir.rstrip(os.sep) + "_*"):
-                        _suf = os.path.basename(_d).rsplit("_", 1)[-1]
-                        if os.path.isdir(_d) and _suf.isdigit():
-                            _existing.append(int(_suf))
+                        _n = segment_index_of_dir(_d, stage_dir)
+                        if _n is not None and os.path.isdir(_d):
+                            _existing.append(int(_n))
                     # 源段 = **有这个窗口数据的最新段**（见 RECALIBRATE_FK 处注释）。
-                    _src_dir, _src_ckpt = self._segment_dirs_for_evidence(
+                    _src_dir, _src_ckpt = _pre.segment_dirs_for_evidence(
                         {str((next((x for x in view["windows"]
                                     if int(x["window_idx"]) == w), {}) or {})
                               .get("segment") or "") for w in wins},
                         stage_dir, checkpoint_dir,
                     )
-                    result, diag = self._recalibrate_f_k_and_resample_segment(
+                    _subset_only, diag = self._recalibrate_f_k_and_resample_segment(
                         run_once,
                         segment_index=max(_existing) + 1,
                         stage_dir=stage_dir,
@@ -10731,6 +11543,14 @@ class ABFEPipeline:
                         production_step_overrides={w: base_unit for w in wins},
                         only_windows=sorted(wins) or None,
                     )
+                    if _subset_only is None:
+                        # 探针也是"拿已有帧重解"那一族 —— 它同样会什么都不做。
+                        # 不记账的话控制器下一轮还会走回同一条路（真机实测）。
+                        self._log("  [自治] 有界探针未产生新段（无窗口超阈值）。")
+                        self._record_noop_action(
+                            checkpoint_dir, act, wins, view,
+                            reason="probe_reanchor_produced_no_new_segment",
+                        )
                 elif act == "INSERT_LAMBDA":
                     # 候选救不了、拆窗又不可行 ⟹ 插 λ 缩这个窗口的跨度（model B）。
                     from abfe_preoptimizer import insert_lambda_in_failed_ibs_window
@@ -10743,7 +11563,15 @@ class ABFEPipeline:
                         os.path.join(checkpoint_dir, "preopt_dual_vanishing.json")
                     )
                     if _rng is None or _pilot is None:
-                        self._log("  [自治] 插 λ 缺失败窗口区间或 pilot，跳过本动作。")
+                        # 与 SPLIT_TAIL_WINDOW 同一个坑：静默 skip ⟹ 盘面不变 ⟹
+                        # 控制器下一轮读到同样的状态、发同样的动作，只能靠通用停滞
+                        # 探测兜底。执行器做不了的事必须回到控制器的判断里。
+                        self._log(
+                            "  [自治] 插 λ 缺失败窗口区间或 pilot ⟹ 本动作在盘面上是 no-op，记账。")
+                        self._record_noop_action(
+                            checkpoint_dir, act, wins, view,
+                            reason="insert_lambda_without_range_or_pilot",
+                        )
                     else:
                         new_l, new_r, idiag = insert_lambda_in_failed_ibs_window(
                             list(lam), [tuple(r) for r in ranges], tuple(_rng),
@@ -10765,11 +11593,14 @@ class ABFEPipeline:
                                     # 它们的 min N_eff/g 轨迹不能再拿来判"加帧有没有
                                     # 用"。真机 15:59 就是这么连插两次的：第一次插完
                                     # 还没产出任何新证据，判据读着旧轨迹又插一次。
-                                    "segments_before_change": self._existing_segment_names(
-                                        stage_dir)},
+                                    },
+                            # 🔑 [审计 #5] 盘面扫描结果走 `note`，**不进 event_id** ——
+                            # 它是自产产物，进身份会让重试时同一次插点被插两次。
+                            note={"segments_before_change":
+                                  _pre.existing_segment_names(stage_dir)},
                         )
                         # 采样必须用**落盘后**的 λ（已量化），否则和路径版本错位 5e-9。
-                        lam = self._lambdas_from_version_record(_ins_rec, new_l)
+                        lam = _pre.lambdas_from_version_record(_ins_rec, new_l)
                         ranges = [tuple(int(i) for i in r) for r in new_r]
                         self._log(
                             f"  [自治] 插 λ：窗口 {_rng} 跨度 "
@@ -10787,7 +11618,6 @@ class ABFEPipeline:
                             checkpoint_dir=checkpoint_dir,
                             min_states_per_window=int(min_states_per_window),
                             max_states_per_window=int(max_states_per_window),
-                            anchor_getter=lambda: ctl.tail_repartition_anchor(view),
                             first_untrusted=ctl.first_untrusted_window(view),
                         )
                         result = run_once(
@@ -10797,13 +11627,43 @@ class ABFEPipeline:
                 elif act == "SPLIT_TAIL_WINDOW":
                     anchor_lam = ctl.tail_repartition_anchor(view)
                     if anchor_lam is None:
-                        self._log("  [自治] 取不到 tail anchor，跳过本动作。")
-                    else:
-                        new_ranges, tdiag = repartition_tail_from_anchor(
-                            lam, ranges, anchor_lam,
-                            min_states_per_window=int(min_states_per_window),
-                            max_states_per_window=int(max_states_per_window),
+                        # 🔑🔑 [2026-09-14 真机] **静默 skip 就是无限循环。**
+                        # 这条分支原来只打一行日志：不回路由信号、不记账本、不换
+                        # 动作 ⟹ 控制器下一轮读到同样的盘面、发同样的动作，只能靠
+                        # 通用停滞探测（连续 4 次盘面未变）兜底才停得下来。
+                        # 真机 cyclod_ligand1/rep2 连发 4 次 SPLIT_TAIL_WINDOW、
+                        # 版本链上一条 tail_repartition 都没有。
+                        # 根因（anchor 读了一个没人写的键）已在控制器侧修掉；
+                        # 这里仍然 fail-closed 记账，因为"执行器做不了"必须回到
+                        # 控制器的判断里，不能只留在日志里。
+                        self._log("  [自治] 取不到 tail anchor ⟹ 本动作在盘面上是 no-op，记账。")
+                        self._record_noop_action(
+                            checkpoint_dir, act, wins, view,
+                            reason="split_tail_window_without_anchor",
                         )
+                    else:
+                        # 🔑🔑 [2026-09-15] **与可行性判据共用同一次计算。**
+                        # 先前这里自己调 `repartition_tail_from_anchor` 且不传
+                        # `n_windows`/pilot ⟹ (a) 分窗器内部取**最少**窗口数，
+                        # 与可行性要求的"更细"方向相反（三个 5 态窗会被并成两个
+                        # 7 态窗）；(b) 生产按 ∫g 分窗、尾段却按等状态数切，
+                        # 同一条路径两套判据。`ctl._dry_run_tail_repartition`
+                        # 是可行性刚刚验过的**那一次**调用（纯函数、确定性），
+                        # 目标窗口数、pilot、判据都在它里面定死。
+                        new_ranges, tdiag = ctl._dry_run_tail_repartition(view)
+                        new_ranges = [tuple(int(i) for i in r) for r in new_ranges]
+                        # ⚠️ dry-run 用的是 `view["path"]` 里的 λ / 布局，而落版本链
+                        # 用的是循环里的局部 `lam` —— 两者必须是同一份，否则记下去的
+                        # 就是"用 A 的 λ 配 B 的 ranges"。本轮如果刚插过 λ 或合法化过
+                        # 末窗，`view` 是重读过的；对不上说明有人漏了那次重读。
+                        _view_lam = [float(x) for x in
+                                     ((view.get("path") or {}).get("lambdas_vdw") or [])]
+                        if [float(x) for x in lam] != _view_lam:
+                            raise RuntimeError(
+                                "SPLIT_TAIL_WINDOW：view 的 λ 表与循环局部 λ 不一致 "
+                                f"（{len(_view_lam)} vs {len(lam)} 个态）⟹ 拒绝把两份"
+                                "不同来源的 λ / ranges 配在一起落版本链。"
+                            )
                         record_tail_repartition_version(
                             checkpoint_dir, lam, new_ranges, tdiag,
                             first_untrusted_window=ctl.first_untrusted_window(view),
@@ -10832,27 +11692,58 @@ class ABFEPipeline:
                             "反复试到偶然通过）。"
                         )
                         history[-1]["exit"] = "NO_FEASIBLE_ACTION"
+                        # 🔑 [CTL-14] **终止必须同时写 `outcome`。** 只改
+                        # `history[-1]["exit"]` 的话，`outcome` 会停在
+                        # `status=RUNNING / exit=None`，事后分不清这一跑是收敛了、
+                        # 没预算了还是转够圈数了 —— 那正是 `outcome` 要解决的问题。
+                        _finish("TERMINAL", "NO_FEASIBLE_ACTION", "loop",
+                                f"窗口 {_wi} 的替代候选已用过一次（一个窗口只给一次）",
+                                it)
                         break
                     # **必须先预留完整的 LEARN + burn-in + 首档验证预算**才能启动。
                     # 预留量按这个窗口**自己**上一轮的实际消耗估（自校准，
                     # 不拍一个跨体系常量）。
                     _rec = next((x for x in view["windows"]
                                  if int(x["window_idx"]) == _wi), {}) or {}
-                    _need = _relearn_epoch_required_steps(_rec)
-                    _left = int(_rec.get("warmup_steps_left") or 0)
-                    if _left < _need:
+                    _need = _pre.relearn_epoch_required_steps(_rec)
+                    # 🔑🔑 [审计 #15] **未知不是零，两个方向都不是。**
+                    # `warmup_steps_left` 是三态的（引擎没给、且 cap/spent 任一不可
+                    # 得 ⟹ None）。`or 0` 把"账本读不到"压成"一步都不剩"，据此
+                    # break 整个循环，还在日志里打一个**编造出来的**读数。
+                    # 方向按 `_epoch_validation_unaffordable` 的既定裁决：**未知
+                    # ⟹ 不许开新 Epoch**（fail-closed）。危险的一侧是批准一个
+                    # 跑不完的 Epoch —— 把 LEARN+burn-in+首档验证的预算烧光再半路
+                    # 死掉；fail-closed 只是带着完整诊断停下。
+                    _left = _rec.get("warmup_steps_left")
+                    _left_txt = ("未知（账本读不到 warmup_steps_left）"
+                                 if _left is None else f"{int(_left)} 步")
+                    if _left is None or int(_left) < _need:
                         self._log(
-                            f"  [自治] 窗口 {_wi} 剩余 warmup 预算 {_left} 步 < "
-                            f"新 Epoch 所需 {_need} 步（LEARN+burn-in+首档验证）⟹ "
-                            "不启动半截 Epoch，NO_FEASIBLE_ACTION。"
+                            f"  [自治] 窗口 {_wi} 剩余 warmup 预算 {_left_txt}，"
+                            f"新 Epoch 需 {_need} 步（LEARN+burn-in+首档验证）⟹ "
+                            "不启动"
+                            + ("（预算未知，fail-closed：不知道有没有钱就不开"
+                               "新 Epoch）" if _left is None else "半截 Epoch")
+                            + "，NO_FEASIBLE_ACTION。"
                         )
                         history[-1]["exit"] = "NO_FEASIBLE_ACTION"
+                        # 🔑 [CTL-14] 同上：终止必须同时写 `outcome`。
+                        _finish("TERMINAL", "NO_FEASIBLE_ACTION", "loop",
+                                f"窗口 {_wi} 剩余 warmup 预算 {_left_txt} < "
+                                f"新 Epoch 所需 {_need}", it)
                         break
+                    # 🔑 [审计 #2] 判据必须是**完整后缀**纯数字。
+                    # `rsplit("_", 1)[-1]` 只看最后一段 ⟹ immutable rewindow 的
+                    # `<stage>_rewindow_<sha256[:12]>` 目录有 (10/16)**12 ≈ 0.34%
+                    # 的概率后缀全是数字，命中就会被当成采样段，`int()` 出来还是
+                    # 一个天文数字的段号。⚠️ 种子 `1` 不能去掉：它编码「基准目录
+                    # 隐含是段 1」这条约定，去掉的话盘上没有 `_N` 目录时新段会从
+                    # 2 变 1，直接跟基准段撞名。
                     _existing = [1]
                     for _d in glob.glob(stage_dir.rstrip(os.sep) + "_*"):
-                        _suf = os.path.basename(_d).rsplit("_", 1)[-1]
-                        if os.path.isdir(_d) and _suf.isdigit():
-                            _existing.append(int(_suf))
+                        _n = segment_index_of_dir(_d, stage_dir)
+                        if _n is not None and os.path.isdir(_d):
+                            _existing.append(int(_n))
                     _seg = max(_existing) + 1
                     _pre.mark_relearn_epoch_consumed(
                         checkpoint_dir, _pv, _wi,
@@ -10864,7 +11755,7 @@ class ABFEPipeline:
                         f"预留 {_need} 步。当前候选的**验证进度清零**，"
                         "但窗口终身 warmup 账本**不清零**。"
                     )
-                    result = run_once(
+                    _subset_only = run_once(
                         len(lam), list(lam), ranges,
                         _output_dir_override=(
                             f"{stage_dir.rstrip(os.sep)}_{_seg}"),
@@ -10874,6 +11765,17 @@ class ABFEPipeline:
                         # 等于把被驳回的那份 f_k 带进新 Epoch，独立性就没了。
                         _only_window_indices=[_wi],
                         _resume_override=True,
+                    )
+                elif act == "IMMUTABLE_REWINDOW":
+                    if not wins:
+                        raise RuntimeError(
+                            "IMMUTABLE_REWINDOW 必须点名一个窗口（控制器没给）"
+                        )
+                    result = self._immutable_rewindow_step(
+                        run_once, view=view, window_idx=int(wins[0]),
+                        lam=lam, ranges=ranges,
+                        stage_dir=stage_dir, checkpoint_dir=checkpoint_dir,
+                        base_unit=int(base_unit), kt=float(kt),
                     )
                 elif act == "ANALYZE":
                     # ⚠️ ANALYZE 的目的是**产出证据**（逐窗自检 / 累计 f_k 残差 /
@@ -10902,22 +11804,36 @@ class ABFEPipeline:
                     # **完成标记**，写了会让下次 resume 以为 stage 2 已经跑完。
                     # `.`(46) < `_`(95) ⟹ 真缓存一旦存在就排在前面、优先被采纳，
                     # 这份中间产物只在它不存在时兜底。
-                    if isinstance(result, dict):
-                        try:
-                            _atomic_write_json(
-                                os.path.join(
-                                    checkpoint_dir,
-                                    "stage2_vanishing_autonomous_inprogress.json"),
-                                json.loads(json.dumps(result, default=str)),
-                            )
-                        except Exception as _persist_err:  # noqa: BLE001
-                            self._log(
-                                f"  [自治] 中间 stage 结果落盘失败：{_persist_err!r}"
-                                "（不致命，但下一轮 decide() 会看不到新证据）。"
-                            )
+                    self._persist_inprogress_stage_result(checkpoint_dir, result)
                 else:
                     self._log(f"  [自治] 动作 {act} 没有执行器，退出循环交人工。")
+                    _finish("HALTED_NO_EXECUTOR", None, "loop",
+                            f"动作 {act} 没有执行器", it)
                     break
+                # 🔑🔑 [2026-09-14 真机] **通用 no-op 检测：动作跑完，盘面动了没有？**
+                #
+                # 今天三起事故同一个形状：控制器发一个动作、执行器什么也没做、
+                # 控制器无从得知于是原样再发。前两起靠逐动作打补丁（重标定 /
+                # 探针），第三起换成了 `CONTINUE_WARMUP`（窗口级 resume 缓存在
+                # 走到预热之前就跳过整个窗口）—— 逐个补必然漏下一个。
+                #
+                # 这里改成**通用判据**：执行前后各取一次盘面指纹，一样就记账。
+                # 指纹用的就是停滞保护那一份（生产步数 / 自检结论 / 段 / 路径版本 /
+                # 求解器跳窗 / rewindow 身份 / 预热余额）。
+                # ⚠️ 只记账、不改执行；换不换动作由 `decide()` 定。
+                try:
+                    if _disk_signature(ctl.read()) == sig:
+                        self._log(
+                            f"  [自治] 动作 {act}{wins} 执行完盘面**逐项未变** ⟹ "
+                            "记为当前盘面上的 no-op，下一轮换对症动作。"
+                        )
+                        self._record_noop_action(
+                            checkpoint_dir, act, wins, view,
+                            reason="action_changed_nothing_on_disk",
+                            unit_id=plan.get("unit_id"),
+                        )
+                except Exception as _noop_err:  # noqa: BLE001 —— 记账失败不阻断
+                    self._log(f"  [自治] no-op 检测失败：{_noop_err!r}（不致命）")
             except (
                 _ie_exc.IBSValidationBudgetIndeterminateError,
                 _ie_exc.IBSWarmupConvergenceError,
@@ -10941,6 +11857,23 @@ class ABFEPipeline:
                 )
                 history[-1]["routing_signal"] = _sig
                 history[-1]["detail"] = str(route_err)[:400]
+                # 🔑 [2026-09-14] **路由这条 `continue` 也要过 no-op 记账。**
+                # 先前它绕过了正常路径末尾那道检测，于是"这个动作被路由信号原样
+                # 弹回来、盘面一字节没变"这件事**连账都留不下** —— 真机 win0
+                # 就是这样连发 40 轮（预热预算耗尽 ⟹ 每次重新进入窗口都被弹回）。
+                try:
+                    if _disk_signature(ctl.read()) == sig:
+                        self._log(
+                            f"  [自治] 动作 {act}{wins} 被路由信号弹回且盘面未变 ⟹ "
+                            "记为当前盘面上的 no-op。"
+                        )
+                        self._record_noop_action(
+                            checkpoint_dir, act, wins, view,
+                            reason=f"routed_back_without_progress:{_sig}",
+                            unit_id=plan.get("unit_id"),
+                        )
+                except Exception:  # noqa: BLE001 —— 记账失败不阻断路由
+                    pass
                 _write_history()
                 continue
             except _ie_exc.IBSFrozenCalibrationValidationError as fk_err:
@@ -10955,20 +11888,72 @@ class ABFEPipeline:
                 # ⚠️ 统计驳回**不得**被解释成「λ 太稀」⟹ 不因此插 λ / 拆窗。
                 _fkd = getattr(fk_err, "diagnostics", None) or {}
                 _pv = int(((_lpv.load_current(checkpoint_dir) or {}).get("version")) or 0)
+                _uid_fk = str(plan.get("unit_id") or "") or None
                 _wi = int(wins[0]) if wins else -1
-                _pre.seal_refuted_candidate(
-                    checkpoint_dir,
-                    path_version=_pv, window_idx=_wi, lambdas_vdw=lam,
-                    fingerprint=_fkd.get("candidate_fingerprint"),
-                    f_k=_fkd.get("frozen_f_k_kJ_mol") or _fkd.get("f_k"),
-                    reason="statistically_rejected_by_frozen_validation",
-                )
-                self._log(
-                    f"  [自治] 窗口 {_wi} 的 f_k 候选被验证**统计驳回** ⟹ "
-                    "已封存、永不续验。"
-                )
+                # 🔑🔑 [审计 #61] **封存台账的身份只有 (path_version, window_idx)。**
+                # 带 `unit_id` 的动作里 `wins[0]` 是**父窗**，而被驳回的是 immutable
+                # rewindow 子系综**自己**冻结的那份 f_k。照父窗封存 = 把父窗那唯一
+                # 一次替代候选配额（`relearn_epoch_used` 就按 (path_version,
+                # window_idx) 匹配）记在一个根本没被驳回的系综头上，同时真正出问题
+                # 的子窗**一条记录都没有**。`wins` 为空时写 `window_idx=-1` 同样是
+                # 往台账里塞一个不存在的窗口。
+                # 台账加 unit 维度要动 `abfe_preoptimizer` 侧三个函数（跨文件，且
+                # `window_idx` 被 `int()` 强转 ⟹ 塞不进字符串身份）。在那之前
+                # **宁可不封存**：封错身份比不封存更坏；而不封存就必须停下来 ——
+                # 否则同一份被驳回的候选下一轮还会被原样发出来。
+                # 🔑 [审计 A] 身份字段缺失时同样**不落记录** —— 但走的是下面那条
+                # 终态出口，**不是 `raise`**：统计驳回按设计只终止这份候选、不得炸出
+                # 循环（`test_routing_exceptions_do_not_escape_the_loop` 钉的就是它）。
+                # fail-closed 的落点是「停下并留完整诊断」，不是「抛一个新异常」。
+                _fp = _fkd.get("candidate_fingerprint")
+                _fk_vec = _fkd.get("frozen_f_k_kJ_mol")
+                _id_ok = bool(_fk_vec) and _fp is not None
+                _sealed = _id_ok and not (_uid_fk or _wi < 0)
+                if _sealed:
+                    # 🔑🔑 [审计 A] **这两个键先前一个都不存在，封存记录恒为空身份。**
+                    # 两个 raise 点写的 diagnostics 里没有 `candidate_fingerprint`
+                    # 也没有 `frozen_f_k_kJ_mol`（写侧当时叫
+                    # `frozen_f_k_at_last_freeze`）⟹ 每条封存记录都是
+                    # `f_k_kJ_mol: []` + `fingerprint: None`，而
+                    # `sealed_candidate_matches` 第一行就是
+                    # `if not a or len(a) != len(b): return False`
+                    # ⟹ **空身份永远匹配不上任何新候选**，「候选被驳回后永不续验」
+                    # 这条在运行代码里等于不存在，且完全静默。
+                    # 键名已由集成方统一（两个 raise 点都写齐这三个）。
+                    # ⚠️ **不要**再加 `or _fkd.get("f_k")` 这类回退 —— 正是那种回退
+                    # 让「读不到」看起来像「有个空的」，把这个 bug 藏了这么久。
+                    _pre.seal_refuted_candidate(
+                        checkpoint_dir,
+                        path_version=_pv, window_idx=_wi, lambdas_vdw=lam,
+                        fingerprint=_fp,
+                        f_k=_fk_vec,
+                        reason="statistically_rejected_by_frozen_validation",
+                    )
+                    self._log(
+                        f"  [自治] 窗口 {_wi} 的 f_k 候选被验证**统计驳回** ⟹ "
+                        "已封存、永不续验。"
+                    )
+                elif not _id_ok:
+                    self._log(
+                        "  [自治] f_k 候选被验证**统计驳回**，但诊断里缺少封存身份"
+                        f"（candidate_fingerprint={_fp!r}、frozen_f_k_kJ_mol="
+                        f"{'缺失' if _fk_vec is None else '空'}）⟹ "
+                        "**拒绝落一条注定永远匹配不上的空身份记录**"
+                        "（`sealed_candidate_matches` 第一行就是 `if not a: return False`）。"
+                        "如实终止并留完整诊断。"
+                    )
+                else:
+                    self._log(
+                        "  [自治] f_k 候选被验证**统计驳回**，但它的身份是"
+                        + (f"采样单元 {_uid_fk}（父窗 {_wi}）"
+                           if _uid_fk else "未知窗口（动作没带窗口）")
+                        + "，而封存台账只认 (path_version, window) ⟹ "
+                        "**拒绝按父窗 / -1 封存**（那会误耗别人的替代候选配额）。"
+                        "如实终止，等台账支持 unit 维度后再自动续跑。"
+                    )
                 history[-1]["routing_signal"] = "FK_CANDIDATE_REFUTED"
                 history[-1]["detail"] = str(fk_err)[:400]
+                history[-1]["fk_candidate_sealed"] = bool(_sealed)
                 try:
                     _atomic_write_json(
                         os.path.join(checkpoint_dir, "stage2_fk_refuted.json"),
@@ -10978,12 +11963,32 @@ class ABFEPipeline:
                             "scope": "this_candidate_only_not_the_stage",
                             "path_version": _pv,
                             "window_idx": _wi,
+                            "unit_id": _uid_fk,
+                            "sealed": bool(_sealed),
+                            "not_sealed_reason": (
+                                None if _sealed else
+                                "refuted-candidate identity missing from diagnostics "
+                                "(candidate_fingerprint / frozen_f_k_kJ_mol); refusing "
+                                "to write an empty identity that can never match"
+                                if not _id_ok else
+                                "ledger identity is (path_version, window_idx) only; "
+                                "refuted f_k belongs to a sampling unit (or no window "
+                                "was named) — sealing it under the parent window would "
+                                "consume the parent's one-shot relearn quota"
+                            ),
                             "raised_by": "autonomous_loop",
                             "diagnostics": _fkd,
                         },
                     )
                 except Exception:
                     pass
+                if not _sealed:
+                    _finish("TERMINAL", "HALT_FK_REFUTED", "loop",
+                            f"f_k 候选被统计驳回但无法按身份封存"
+                            f"（unit_id={_uid_fk}, window={_wi}）⟹ fail-closed", it)
+                    history[-1]["exit"] = "HALT_FK_REFUTED"
+                    _write_history()
+                    break
                 _write_history()
                 continue
             except Exception as exec_err:  # noqa: BLE001
@@ -10992,29 +11997,572 @@ class ABFEPipeline:
                 # 时候丢掉（`raise` 会越过函数末尾那次写）。
                 self._log(f"  [自治] 执行 {act} 失败：{exec_err!r}")
                 history[-1]["execute_error"] = repr(exec_err)
+                _finish("FAILED", None, "loop", repr(exec_err), it)
                 _write_history()
                 raise
         else:
             self._log(
                 f"  [自治] 达到迭代上限 {max_iterations} 仍未收敛；保留全部进度后退出。"
             )
+            # **不是终态**：没收敛就是没收敛，别让下游把"转够圈数"读成"跑完了"。
+            _finish("ITERATION_CAP_NOT_CONVERGED", None, "loop",
+                    f"达到迭代上限 {max_iterations} 仍未收敛", int(max_iterations))
 
         _write_history()
+        # 🔑 [2026-09-14] **终态不是 DONE 时，交回去的往往是最后一次窗口子集跑。**
+        # 下游 `_assert_stage_result_sane` 会（正确地）拒绝把部分和当 ΔG，但那条
+        # 报错只说"这是子集"，说不出**控制器为什么停在这里** —— 真机看到的就是一条
+        # 与根因无关的 traceback。把控制器自己的结论盖上去，让那道门连同原因一起报。
+        # 🔑 [审计 #62b] 判据是 `exit`，**不是** `status`。`status` 只写
+        # TERMINAL/FAILED/HALTED_NO_EXECUTOR/ITERATION_CAP_NOT_CONVERGED/RUNNING，
+        # 从来不写 "DONE"（那是 `decide()` 的 `exit` 值）⟹ 原条件恒真，
+        # 连干净收敛的结果也被盖上"控制器非正常退出"的结论。
+        if isinstance(result, dict) and outcome.get("exit") not in (
+                "DONE", "DONE_UNTRUSTED"):
+            result["autonomous_outcome"] = dict(outcome)
+        # 🔑 [审计 #6] 循环自己的结论**不搭结果这趟车**：`result` 可能是 None
+        # （整跑只发过子集动作），那时下游仍然必须看得见"控制器停在哪、为什么"。
+        self._stage2_autonomous_outcome = dict(outcome)
+        # 双保险：万一将来有人给某个子集动作重新接上 `result`，这里兜住。
+        if isinstance(result, dict) and (
+                result.get("subset_partial_sum_not_delta_G")
+                or result.get("stage_scope") == "window_subset_no_stage_verdict"):
+            self._log(
+                f"  [自治] 最后一次执行是窗口子集跑"
+                f"（{result.get('window_subset_indices')}）⟹ 它是部分和、不是 ΔG，"
+                "不作为 stage 结果返回；保留上游的全路径结果。"
+            )
+            result = None
         return result, lam, ranges
 
-    @staticmethod
-    def _relearn_epoch_required_steps(window_record):
-        """开一个全新 f_k Epoch 至少要预留多少步：LEARN + burn-in + **首档**验证。
+    def _rewindow_ledger(self, checkpoint_dir):
+        """读 rewindow 台账（身份 → 条目）。读不到返回空 dict。"""
+        path = os.path.join(checkpoint_dir, "stage2_rewindow_ledger.json")
+        if not os.path.isfile(path):
+            return {}
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh) or {}
+        except Exception:  # noqa: BLE001
+            return {}
 
-        量从这个窗口**自己**上一轮的实际消耗估（自校准），估不到才退保守常量 ——
-        跨体系拍一个固定数字是引入未验证阈值。
+    @staticmethod
+    def _rewindow_entry_status(entry):
+        """台账条目的状态。**老台账没有这个字段 ⟹ 视为 `SAMPLED`。**
+
+        [CTL-04] `status` 是 2026-09-14 才加的。此前写下的条目全都是"采样已经
+        成功返回之后"才落的盘，语义上就是 SAMPLED；不给它们兜底会把所有既有 run
+        的子系综一次性判废（它们会被当成未核销的意图而跳过，父窗又被算成"没被
+        取代"⟹ 直接 fail-closed 抛错）。
         """
-        led = window_record.get("warmup_budget_ledger") or {}
-        learn = int(led.get("learning_steps") or 0) or 80000
-        burn = int(led.get("freeze_burn_in_steps") or 0) or 10000
-        # 首档验证预留：不是整份验证预算，只要够走完第一档。
-        first_rung = int(window_record.get("validation_attempt_budget_steps") or 0) or 50000
-        return int(learn + burn + first_rung)
+        return str((entry or {}).get("status") or "SAMPLED")
+
+    def _reconcile_rewindow_intents(self, checkpoint_dir):
+        """[CTL-04] 恢复时按**盘上产物**核销未完成的 `SAMPLING_INTENT` 条目。
+
+        采样是 rewindow 这条链上唯一烧 GPU 的一步。进程若死在采样中途（或采完、
+        还没来得及把状态推到 SAMPLED），台账里留下的就是一条 `SAMPLING_INTENT`。
+        光看台账分不出这两种情况，只有盘上产物能作证：
+
+          · 子窗目录里有 `dual_window_<local>_vdw_convergence.json`
+            ⟹ 这次意图其实**采出来了**，只是状态没写完 ⟹ 推进到 `SAMPLED`；
+          · 一个产物都没有 ⟹ 这次意图**没兑现** ⟹ `ABANDONED_NO_PRODUCT`，
+            求解不得采信它（否则父窗被当成"已被取代"而其实没有 ⟹ 截断的 ΔG）。
+
+        ⚠️ **不删目录。** 本仓库规矩：不原地删实验产物。半截产物留着人工看，
+        也留着下次同 identity 重建时被 `_resume_override=True` 接上。
+        """
+        path = os.path.join(checkpoint_dir, "stage2_rewindow_ledger.json")
+        ledger = self._rewindow_ledger(checkpoint_dir)
+        changed = []
+        for ident, entry in ledger.items():
+            if not isinstance(entry, dict):
+                continue
+            if self._rewindow_entry_status(entry) != "SAMPLING_INTENT":
+                continue
+            out_dir = entry.get("output_dir") or ""
+            n_children = len(entry.get("child_ranges") or [])
+            produced = [
+                li for li in range(n_children)
+                if os.path.isfile(os.path.join(
+                    out_dir, f"dual_window_{li}_vdw_convergence.json"))
+            ]
+            entry["status"] = "SAMPLED" if produced else "ABANDONED_NO_PRODUCT"
+            changed.append((ident, entry["status"], produced, n_children, out_dir))
+        for ident, st, produced, n_children, out_dir in changed:
+            if st == "SAMPLED":
+                self._log(
+                    f"  [自治] rewindow 意图核销：{ident} 盘上有 "
+                    f"{len(produced)}/{n_children} 个子窗产物 ⟹ 判为 SAMPLED"
+                    f"（上一跑采完了，只是没来得及改状态）。"
+                )
+            else:
+                self._log(
+                    f"  [自治] rewindow 意图核销：{ident} 盘上**零产物** ⟹ 判为 "
+                    f"ABANDONED_NO_PRODUCT，合并求解不采信它（父窗因此仍算未被"
+                    f"取代）。目录保留不删：{out_dir}"
+                )
+        if changed:
+            try:
+                _atomic_write_json(path, ledger)
+            except Exception as err:  # noqa: BLE001
+                self._log(f"  [自治] rewindow 意图核销落盘失败：{err!r}（不致命）")
+        return ledger
+
+    def _solve_with_rewindow_children(
+        self, *, stage_dir, checkpoint_dir, ranges, lam, kt,
+    ):
+        """**一次完整覆盖**的合并求解：所有采样段 + 所有有效 rewindow 子系综。
+
+        ⚠️ [2026-09-14] 先前这里只加载基准段 `vanishing` 和**当前这一组**子窗，
+        于是：
+          · 已有的数字段（`vanishing_2` …）整段丢掉；
+          · 给**第二个**父窗建 rewindow 时，**第一个**父窗的子窗也一起丢，
+            而被它取代的原始父窗反而重新进了结果 —— 而台账仍然声称那个父窗
+            "已被取代"。
+        正解是**从台账整体重建覆盖**，不是拿"当前父窗"增量拼。
+
+        求解器索引偏移取自台账里**建窗时就固定下来**的 `solver_index_base`
+        （不同 identity 不同基数），所以两组子窗不会串号；调度身份仍是 `unit_id`。
+        """
+        from ibs_engine import solve_stage_integrated as _solve
+
+        _ranges = [tuple(int(i) for i in r) for r in ranges]
+        ledger = self._rewindow_ledger(checkpoint_dir)
+        # 🔑🔑 [CTL-04 / 2026-09-14] **只有 `SAMPLED` 的条目才算数。**
+        # 台账里现在还会出现两种"不算数"的条目：还没核销的 `SAMPLING_INTENT`
+        # （上一跑死在采样里）和核销为空的 `ABANDONED_NO_PRODUCT`。
+        # 它们都**不能**进 `replaced`：`replaced` 的语义是"这个父窗已经被子系综
+        # 取代、不必再从采样段里找它"。把一个其实没采出来的条目算进 `replaced`，
+        # 下面那条覆盖完整性 fail-closed 就会被骗过去，直接产出**截断的 ΔG**
+        # （父窗既没被子窗覆盖、也被从采样段里排除掉了）。
+        entries = []
+        for _e in ledger.values():
+            if not isinstance(_e, dict):
+                continue
+            _st = self._rewindow_entry_status(_e)
+            if _st == "SAMPLED":
+                entries.append(_e)
+            else:
+                self._log(
+                    f"  [自治] rewindow 条目 {_e.get('identity')!r} 状态 {_st} "
+                    f"⟹ 不进合并求解，父窗 {_e.get('parent_window')} 仍按"
+                    f"「未被取代」处理（覆盖完整性照常 fail-closed）。"
+                )
+        replaced = sorted({int(e["parent_window"]) for e in entries
+                           if e.get("parent_window") is not None})
+
+        # ---- 所有采样段（含基准段），逐段显式声明缺哪些窗口 ----
+        dirs = [(stage_dir, checkpoint_dir)]
+        _segs = []
+        for d in glob.glob(stage_dir.rstrip(os.sep) + "_*"):
+            n = segment_index_of_dir(d, stage_dir)
+            # 空壳段（只有目录、没有任何 convergence 产物）不是采样段：
+            # 空转循环每轮建一个，真机留下过 39 个。
+            # 🔑 [审计 #2] 段号为 None ⟹ 根本不是采样段（例如 immutable rewindow
+            # 的 `<stage>_rewindow_<12hex>` 子系综目录）。先前按
+            # `rsplit("_", 1)[-1].isdigit()` 判，那个 12 位十六进制有 ≈0.34% 概率
+            # 全是数字 ⟹ 子系综目录被当采样段合并，**子窗的局部下标 0/1 被当成
+            # 物理窗口 0/1**，覆盖度检查照样通过 ⟹ 静默产出错误 ΔG。
+            if (n is not None and n > 1 and os.path.isdir(d)
+                    and glob.glob(os.path.join(d, "dual_window_*_vdw_convergence.json"))):
+                _segs.append((n, d))
+        # 🔑 [审计 #3] 按**段号数值**排序，不是字符串序 —— `sorted(glob(...))` 会
+        # 把 `vanishing_10` 排在 `vanishing_2` 前面（真机见过 39 个段目录）。
+        # ΔG 本身不会因此拼错（`solve_stage_integrated` 内部按 lambda_indices
+        # 重排），但元数据捐赠段（`base = dict(parts[0])`）会选错，且枚举下标
+        # `_segment_index` 写进 `sampling_source_id` ⟹ 归因表完全对不上号。
+        # 基准段是 dirs[0]，天然最前。
+        for n, d in sorted(_segs):
+            dirs.append((d, os.path.join(checkpoint_dir, f"segment_{n}")))
+        excl = {}
+        present = set()
+        for d, _ck in dirs:
+            have = {
+                i for i in range(len(_ranges))
+                if os.path.isfile(os.path.join(
+                    d, f"dual_window_{i}_vdw_convergence.json"))
+            }
+            present |= (have - set(replaced))
+            miss = sorted((set(range(len(_ranges))) - have) | set(replaced))
+            if miss:
+                excl[d] = miss
+        outputs = self._load_ibs_window_outputs_merged(
+            dirs, _ranges, [0.0] * len(lam), list(lam),
+            excluded_local_windows=excl or None,
+            window_label_prefix="original_window",
+        )
+
+        # ---- 所有**有效** rewindow 身份的子系综 ----
+        for e in sorted(entries, key=lambda x: int(x.get("solver_index_base") or 0)):
+            _od, _ck = e.get("output_dir"), e.get("checkpoint_dir")
+            _children = [list(c) for c in (e.get("child_ranges") or [])]
+            if not _od or not _ck or not _children:
+                raise RuntimeError(
+                    f"rewindow 台账条目 {e.get('identity')!r} 不完整 ⟹ "
+                    "无法重建完整覆盖。fail-closed。"
+                )
+            outputs += self._load_ibs_window_outputs_from_dir(
+                _od, _children, [0.0] * len(lam), list(lam),
+                checkpoint_dir=_ck,
+                window_index_offset=int(e["solver_index_base"]),
+                window_label_prefix=f"rewindow_{e.get('identity')}",
+                current_sampling_score_sha256=self.sampling_score_sha256,
+            )
+
+        # ---- 覆盖完整性：每个物理窗口要么在某个段里，要么被子系综取代 ----
+        _uncovered = sorted(set(range(len(_ranges))) - present - set(replaced))
+        if _uncovered:
+            raise RuntimeError(
+                f"窗口 {_uncovered} 既不在任何采样段里、也没有被 rewindow 取代 ⟹ "
+                "合并会产出截断的 ΔG。fail-closed。"
+            )
+        return _solve(
+            window_outputs=outputs, kt=float(kt), stage_name="vanishing",
+        )
+
+    def _topup_rewindow_child(
+        self, run_once, *, unit, view, lam, ranges,
+        stage_dir: str, checkpoint_dir: str, base_unit: int, kt: float,
+    ):
+        """给**一个**子窗续跑一个预算块，然后立刻重解并落盘。
+
+        [裁决 1] 执行器按 `unit_id` 续跑**该子窗自己的 checkpoint**。子窗的局部
+        下标 0/1 与父窗索引同名不同义，所以这里必须用单元自带的目录 + 局部下标，
+        绝不回落到基准 stage 目录。
+        """
+        children = [tuple(int(x) for x in c) for c in (unit.get("all_child_ranges") or [])]
+        li = int(unit["local_index"])
+        out_dir, ck_dir = unit.get("output_dir"), unit.get("checkpoint_dir")
+        if not children or not out_dir or not ck_dir:
+            raise RuntimeError(
+                f"采样单元 {unit.get('unit_id')!r} 的台账不完整"
+                f"（child_ranges/目录缺失）⟹ 无法续跑。fail-closed。"
+            )
+        # 🔑 **未知不是零。** 先前 `or 0` 把"读不到已采步数"当成 0，目标就成了
+        # 一个 base_unit —— 而这个子窗可能已经采了好几块，于是**少跑一整块**
+        # （resume 侧按"已有 N 步、续到 M 步"算，M 偏小就直接不跑）。
+        # 读不到就是账不完整，fail-closed：不猜一个目标出来。
+        _u_done = unit.get("production_steps")
+        if _u_done is None:
+            raise RuntimeError(
+                f"采样单元 {unit.get('unit_id')!r} 读不到已采生产步数 ⟹ "
+                "无法算出续跑目标（未知不是零，猜 0 会少跑一整块）。fail-closed。"
+            )
+        target = int(_u_done) + int(base_unit)
+        self._log(
+            f"  [自治] 续跑子窗 {unit['unit_id']}（局部下标 {li}，λ 区间 "
+            f"{unit.get('range')}）：生产步数 {unit.get('production_steps')} → {target}，"
+            f"落在 {os.path.basename(out_dir)}。"
+        )
+        run_once(
+            len(lam), list(lam), [list(c) for c in children],
+            _authoritative_window_ranges=True,
+            _only_window_indices=[li],
+            _production_step_overrides={li: target},
+            _output_dir_override=out_dir,
+            _checkpoint_dir_override=ck_dir,
+            _resume_override=True,
+            _stage_name="vanishing_rescue",
+            _allow_partial_rescue=True,
+        )
+        merged = self._solve_with_rewindow_children(
+            stage_dir=stage_dir, checkpoint_dir=checkpoint_dir,
+            ranges=ranges, lam=lam, kt=float(kt),
+        )
+        self._record_rewindow_block(
+            checkpoint_dir, str(unit.get("identity")), int(base_unit), merged)
+        self._persist_inprogress_stage_result(checkpoint_dir, merged)
+        return merged
+
+    def _record_noop_action(self, checkpoint_dir, action, windows, view, *, reason,
+                            unit_id=None):
+        """记下「这个动作在**当前盘面**对这些窗口什么也没做」。
+
+        执行器**知道**自己没做事（日志里明写"重标定未产生新段"），控制器却无从
+        得知 —— 真机两次都是同一个动作连发 4 次、盘面一字节没变，靠停滞保护退出，
+        而退出前**没有**去试那个真正对症的动作。这条账就是把那个信息交回去。
+
+        指纹由 `abfe_preoptimizer.action_noop_fingerprint()` 算（两侧同一份实现），
+        只取加帧/换段就会变的量 ⟹ 补过一块帧之后记录自动失效、动作重新可选。
+        """
+        import abfe_preoptimizer as _pre_noop
+
+        # 🔑 [审计 #62c] 没有记账对象就**不写盘**：原来空 `windows` + 无 `unit_id`
+        # 时空循环照样落盘，写出一份零新条目的文件（文件不存在时还凭空造个 `{}`），
+        # 而调用方只看得到"记账成功"。
+        if not windows and not unit_id:
+            self._log(
+                f"  [自治] 动作 {action} 的 no-op 记账没有对象"
+                f"（windows 与 unit_id 都为空，reason={reason}）⟹ 不记。"
+            )
+            return
+
+        path = os.path.join(checkpoint_dir, "stage2_noop_actions.json")
+        led = {}
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    led = json.load(fh) or {}
+            except Exception:  # noqa: BLE001
+                led = {}
+        by_idx = {int(w["window_idx"]): w for w in (view.get("windows") or [])}
+        if unit_id:
+            # 子窗的 no-op 只记在**它自己**头上：同父窗的另一个子窗照常可补。
+            led[f"{action}:unit:{unit_id}"] = {
+                "action": action, "unit_id": str(unit_id), "reason": reason,
+                "fingerprint": _pre_noop.action_noop_fingerprint(
+                    next((u for u in (view.get("sampling_units") or [])
+                          if str(u.get("unit_id")) == str(unit_id)), None),
+                    view.get("path_version")),
+            }
+            # 🔑🔑 [契约 A / 审计 #9] **不 return：父窗那条普通 key 也要写。**
+            # 先前这里提前 return ⟹ 带 `unit_id` 的那一轮**连普通 key 都不写**，
+            # 而控制器侧 `_is_noop` 只查 `f"{action}:{idx}"` ——
+            # 一侧写的 unit key 全仓无人读，另一侧读的普通 key 无人写，
+            # 子窗动作的 no-op 记账等于整条链断开。
+            # 带 `unit_id` 的动作 `windows` 就是 `[parent_window]`，所以下面那个
+            # 循环写的正是父窗那条。两条指纹各算各的，互不污染。
+        for w in (windows or []):
+            led[f"{action}:{int(w)}"] = {
+                "action": action,
+                "window_idx": int(w),
+                "reason": reason,
+                "fingerprint": _pre_noop.action_noop_fingerprint(
+                    by_idx.get(int(w)), view.get("path_version")),
+            }
+        try:
+            _atomic_write_json(path, led)
+        except Exception as err:  # noqa: BLE001
+            self._log(f"  [自治] no-op 记账落盘失败：{err!r}（不致命）")
+
+    def _record_rewindow_block(self, checkpoint_dir, identity, steps, merged):
+        """往 rewindow 台账里追加一个采样块的记账（**按身份分开记**）。"""
+        path = os.path.join(checkpoint_dir, "stage2_rewindow_ledger.json")
+        ledger = {}
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    ledger = json.load(fh) or {}
+            except Exception:  # noqa: BLE001
+                ledger = {}
+        entry = ledger.get(identity)
+        if not isinstance(entry, dict):
+            return
+        entry.setdefault("blocks", []).append({
+            "steps_per_child": int(steps),
+            "solver_error": (merged or {}).get("error"),
+            "analysis_status": (merged or {}).get("analysis_status"),
+            "skipped_windows": (merged or {}).get("skipped_windows"),
+        })
+        try:
+            _atomic_write_json(path, ledger)
+        except Exception as err:  # noqa: BLE001
+            self._log(f"  [自治] rewindow 台账落盘失败：{err!r}（不致命）")
+
+    def _persist_inprogress_stage_result(self, checkpoint_dir, result):
+        """把中间 stage 结果落盘，下一轮 `decide()` 才看得见新证据。
+
+        文件名刻意**不是** `stage2_vanishing.json`（那是 stage 缓存完成标记）。
+
+        🔑 [CTL-01] **必须盖上当前路径版本。** 控制器按 `path_version` 隔离
+        "另一条布局的结论"；不盖版本号它就只能放行，隔离形同虚设。
+        """
+        if not isinstance(result, dict):
+            return
+        try:
+            import lambda_path_versions as _lpv_pv
+            payload = json.loads(json.dumps(result, default=str))
+            _cur = _lpv_pv.load_current(checkpoint_dir) or {}
+            if _cur.get("version") is not None:
+                payload["path_version"] = int(_cur["version"])
+            _atomic_write_json(
+                os.path.join(
+                    checkpoint_dir, "stage2_vanishing_autonomous_inprogress.json"),
+                payload,
+            )
+        except Exception as err:  # noqa: BLE001
+            self._log(f"  [自治] 中间 stage 结果落盘失败：{err!r}")
+
+    def _immutable_rewindow_step(
+        self, run_once, *, view, window_idx: int, lam, ranges,
+        stage_dir: str, checkpoint_dir: str, base_unit: int, kt: float,
+    ):
+        """**有界的** immutable rewindow：一次只修一个窗口、只采一个预算块。
+
+        [2026-09-14 裁决] 9b 的插 λ / 拆末窗**不等同于** immutable rewindow ——
+        它们修不了固定 λ 表下的中间窗。这个动作在**不动 λ 表**的前提下，为被归因的
+        那一个窗口建立可完整覆盖其原区间的重叠子系综。
+
+        与已退役的 bridge rescue 的区别（**不许把它搬回来**）：
+          · bridge：一次性给**所有**失败窗口批量建系综 → 一次重解 → 直接撞门；
+          · 本动作：**一个**窗口、**一个**块，采完立刻
+            读盘 → 求解 → 读回求解器的帧数与跳窗 → 回到 `decide()`。
+            子窗若只有 11/20，下一轮可以给**同一个系综**补帧；支撑仍恶化，
+            再由 `decide()` 重新判跨度。
+
+        原生产数据一个字节不改：子系综写在独立的 `<stage>_rewindow_<identity>/`。
+        `identity` 锁住路径版本 + 父窗口 + 子区间，段名后缀不是纯数字 ⟹
+        控制器的段发现（`_segment_stage_names`，要求 `suf.isdigit()`）与
+        `_solve_merged_segments_if_any` 都不会把它误当成采样段。
+        """
+        import hashlib as _hl
+
+        parent = tuple(int(x) for x in ranges[int(window_idx)])
+        children = [
+            tuple(int(x) for x in r)
+            for r in self._build_vanishing_rescue_ranges([int(window_idx)], ranges)
+        ]
+
+        # ---- 覆盖完整性：fail-closed，绝不采一个覆盖不全的子系综 ----
+        if len(children) < 2:
+            raise RuntimeError(
+                f"窗口 {window_idx} 区间 {parent} 只有 {parent[1] - parent[0]} 个态，"
+                "拆不出两个各自 ≥2 态的重叠子系综 ⟹ rewindow 不适用。fail-closed。"
+            )
+        covered = set()
+        for a, b in children:
+            covered |= set(range(a, b))
+        if covered != set(range(parent[0], parent[1])):
+            raise RuntimeError(
+                f"子系综 {children} 没有完整覆盖父窗口 {parent}（覆盖 {sorted(covered)}）"
+                "⟹ 会产出截断的 ΔG。fail-closed。"
+            )
+        for (a1, b1), (a2, _b2) in zip(children, children[1:]):
+            if a2 >= b1:
+                raise RuntimeError(
+                    f"相邻子系综 {(a1, b1)} / {(a2, _b2)} 没有共享 λ 节点 ⟹ "
+                    "自由能链在接缝上断开。fail-closed。"
+                )
+
+        # ---- 身份锁定：路径版本 + 父窗口 + 子区间 + λ 表 ----
+        import lambda_path_versions as _lpv_id
+        _pv = int(((_lpv_id.load_current(checkpoint_dir) or {}).get("version")) or 0)
+        identity = _hl.sha256(json.dumps({
+            "path_version": _pv,
+            "parent_window": int(window_idx),
+            "parent_range": list(parent),
+            "child_ranges": [list(c) for c in children],
+            "lambdas_vdw": [round(float(x), 9) for x in lam],
+        }, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+
+        out_dir = f"{stage_dir.rstrip(os.sep)}_rewindow_{identity}"
+        ck_dir = os.path.join(checkpoint_dir, f"rewindow_{identity}")
+
+        # ⚠️ 独立端点段那条 fail-closed 必须保留：用完整 IBS 窗口集重解会把
+        # 「IBS 段 + 独立固定-λ 端点段」的结果静默替换成旧的纯 IBS 架构。
+        _prev = {}
+        for _f in sorted(glob.glob(os.path.join(checkpoint_dir, "stage2_*.json"))):
+            try:
+                with open(_f, encoding="utf-8") as _fh:
+                    _cand = json.load(_fh)
+                if isinstance(_cand, dict) and _cand.get("stage") == "vanishing":
+                    _prev = _cand
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+        if isinstance(_prev, dict) and _prev.get(
+                "independent_endpoint_diagnostics") is not None:
+            raise RuntimeError(
+                "本次 vanishing 使用了独立端点段，而 rewindow 的合并求解会用完整 "
+                "IBS 窗口集覆盖它 ⟹ 等于静默退回旧的纯 IBS 架构。拒绝继续。"
+            )
+
+        self._log(
+            f"  [自治] IMMUTABLE_REWINDOW：窗口 {window_idx} 区间 {parent} ⟹ "
+            f"重叠子系综 {children}（λ 表不变），身份 {identity}，"
+            f"本轮只采 {base_unit} 步/子系综，采完立刻重解并回到 decide()。"
+        )
+        # ---- 台账：不同 f_k 的采样段分开记账 ----
+        ledger_path = os.path.join(checkpoint_dir, "stage2_rewindow_ledger.json")  # noqa: E501
+        ledger = {}
+        if os.path.isfile(ledger_path):
+            try:
+                with open(ledger_path, encoding="utf-8") as fh:
+                    ledger = json.load(fh) or {}
+            except Exception:  # noqa: BLE001
+                ledger = {}
+        # 🔑 [2026-09-14] **求解器索引基数建窗时就钉死、写进台账。**
+        # 先前所有 identity 的子窗都复用 `10000/10001` ⟹ 两组子窗串号，
+        # solver 的跳窗记录会被误分配给另一组。基数按台账里已有条目数递增，
+        # 一旦写入就不再变（条目顺序变化也不影响）。
+        _base = 10_000 + 100 * len([v for v in ledger.values() if isinstance(v, dict)])
+        entry = ledger.setdefault(identity, {
+            "identity": identity,
+            "path_version": _pv,
+            "solver_index_base": int(_base),
+            "parent_window": int(window_idx),
+            "parent_range": list(parent),
+            "child_ranges": [list(c) for c in children],
+            "output_dir": out_dir,
+            "checkpoint_dir": ck_dir,
+            # 子系综各自预热、各自锁一份 f_k ⟹ 与基准段**不是同一份**，
+            # 残差/支撑度证据必须分开记，不能混进基准段的账。
+            "f_k_scope": "own_frozen_f_k_per_child_ensemble",
+            "blocks": [],
+        })
+        # 🔑🔑 [CTL-04 / 2026-09-14] **意图必须先于采样落盘。**
+        # 先前顺序是「采样 → 写台账 → 求解」。采样是这条链上**唯一**烧 GPU 的一步，
+        # 而它一旦被打断（崩溃 / 被 kill / 节点掉线），台账里连这个 identity 都不
+        # 存在 ⟹ 控制器只读台账，看不见盘上那个已经烧过 GPU 的子系综目录，
+        # 下一跑会用**同一个 identity** 重新建、重新采一遍，白烧一次。
+        # 现在先写 `SAMPLING_INTENT`：进程死在哪一步，盘上都留着"我打算采这个"的
+        # 凭据，恢复时由 `_reconcile_rewindow_intents()` 按**盘上产物**核销。
+        # ⚠️ 无条件覆盖 status（哪怕条目已存在）：这一次确实又要进采样，
+        # 中途死掉就该按这一次的产物重新核销，不能顶着上一次的 SAMPLED 过去。
+        # ⚠️ 台账也仍然**必须在求解之前**落盘：`_solve_with_rewindow_children`
+        # 从台账整体重建覆盖，写晚了这一次求解就看不到新子窗，而被取代的父窗
+        # 反而会混进结果。block 的记账在求解之后补。
+        entry["status"] = "SAMPLING_INTENT"
+        ledger[identity] = entry
+        try:
+            _atomic_write_json(ledger_path, ledger)
+        except Exception as err:  # noqa: BLE001
+            self._log(f"  [自治] rewindow 台账落盘失败：{err!r}（不致命）")
+
+        result = run_once(
+            len(lam), list(lam), [list(c) for c in children],
+            _authoritative_window_ranges=True,
+            _production_step_overrides={i: int(base_unit) for i in range(len(children))},
+            _output_dir_override=out_dir,
+            _checkpoint_dir_override=ck_dir,
+            _resume_override=True,
+            _stage_name="vanishing_rescue",     # 已有的"部分覆盖"采样标签
+            _allow_partial_rescue=True,
+        )
+
+        # 采样正常返回 ⟹ 意图兑现，推进到 SAMPLED。**只有 SAMPLED 的条目**才会被
+        # `_solve_with_rewindow_children` 采信（也才算"取代了父窗"），所以这一步
+        # 必须在合并求解之前完成，否则这次求解会把刚采的子窗漏掉、还把父窗当成
+        # 未取代 —— 那是另一种截断。
+        entry["status"] = "SAMPLED"
+        try:
+            _atomic_write_json(ledger_path, ledger)
+        except Exception as err:  # noqa: BLE001
+            self._log(f"  [自治] rewindow 台账落盘失败：{err!r}（不致命）")
+
+        merged = self._solve_with_rewindow_children(
+            stage_dir=stage_dir, checkpoint_dir=checkpoint_dir,
+            ranges=ranges, lam=lam, kt=float(kt),
+        )
+        entry["blocks"].append({
+            "steps_per_child": int(base_unit),
+            "solver_error": merged.get("error"),
+            "analysis_status": merged.get("analysis_status"),
+            "skipped_windows": merged.get("skipped_windows"),
+        })
+        try:
+            _atomic_write_json(ledger_path, ledger)
+        except Exception as err:  # noqa: BLE001
+            self._log(f"  [自治] rewindow 台账落盘失败：{err!r}（不致命）")
+
+        # 🔑🔑 [审计 #27] **走统一入口，别自己写。** 这里少盖一个 `path_version`，
+        # 控制器的 `stage_result_path_version_verified` 就恒为 False ⟹ 分支 0a 的
+        # `DONE` 与 `_evidence_status` 的 `CONVERGED` 结构上不可达 —— 而 rewindow
+        # 产出的 merged 恰恰是最可能够格判 DONE 的那一份。
+        # 对照组 `_topup_rewindow_child` 走的就是这个入口，只有这一处漏了。
+        self._persist_inprogress_stage_result(checkpoint_dir, merged)
+        return merged if isinstance(merged, dict) else result
 
     def _solve_merged_segments_if_any(
         self, stage_dir: str, checkpoint_dir: str, window_ranges, lambdas_vdw, kt: float
@@ -11030,10 +12578,27 @@ class ABFEPipeline:
         不在这里捕获，继续 fail-closed。
         """
         dirs = [(stage_dir, checkpoint_dir)]
-        for d in sorted(glob.glob(stage_dir.rstrip(os.sep) + "_*")):
-            suf = os.path.basename(d).rsplit("_", 1)[-1]
-            if os.path.isdir(d) and suf.isdigit():
-                dirs.append((d, os.path.join(checkpoint_dir, f"segment_{suf}")))
+        _segs = []
+        for d in glob.glob(stage_dir.rstrip(os.sep) + "_*"):
+            n = segment_index_of_dir(d, stage_dir)
+            # 空壳段（只有目录、没有任何 convergence 产物）不是采样段：
+            # 空转循环每轮建一个，真机留下过 39 个。
+            # 🔑 [审计 #2] 段号为 None ⟹ 根本不是采样段（例如 immutable rewindow
+            # 的 `<stage>_rewindow_<12hex>` 子系综目录）。先前按
+            # `rsplit("_", 1)[-1].isdigit()` 判，那个 12 位十六进制有 ≈0.34% 概率
+            # 全是数字 ⟹ 子系综目录被当采样段合并，**子窗的局部下标 0/1 被当成
+            # 物理窗口 0/1**，覆盖度检查照样通过 ⟹ 静默产出错误 ΔG。
+            if (n is not None and n > 1 and os.path.isdir(d)
+                    and glob.glob(os.path.join(d, "dual_window_*_vdw_convergence.json"))):
+                _segs.append((n, d))
+        # 🔑 [审计 #3] 按**段号数值**排序，不是字符串序 —— `sorted(glob(...))` 会
+        # 把 `vanishing_10` 排在 `vanishing_2` 前面（真机见过 39 个段目录）。
+        # ΔG 本身不会因此拼错（`solve_stage_integrated` 内部按 lambda_indices
+        # 重排），但元数据捐赠段（`base = dict(parts[0])`）会选错，且枚举下标
+        # `_segment_index` 写进 `sampling_source_id` ⟹ 归因表完全对不上号。
+        # 基准段是 dirs[0]，天然最前。
+        for n, d in sorted(_segs):
+            dirs.append((d, os.path.join(checkpoint_dir, f"segment_{n}")))
         if len(dirs) < 2:
             return None
 
@@ -11098,46 +12663,22 @@ class ABFEPipeline:
             f"  [自治] {len(dirs)} 段**合并**求解："
             f"ΔG={merged.get('total_delta_G', float('nan')):.4f} ± "
             f"{merged.get('total_error', float('nan')):.4f} kJ/mol，"
-            f"converged={merged.get('converged')}，"
+            f"analysis_status={merged.get('analysis_status')}，"
             f"完整路径={merged.get('path_is_complete')}。"
         )
         return merged
 
-    @staticmethod
-    def _segment_dirs_for_evidence(segments, stage_dir: str, checkpoint_dir: str):
-        """把证据来源的段名翻成 (输出目录, checkpoint 目录)；基准段返回 (None, None)。
-
-        `segments` 是窗口记录里的 `segment` 值（stage 目录名，如 `vanishing` /
-        `vanishing_3`）。多个窗口落在不同段时**fail-closed 抛错**，不静默回落到
-        基准段 —— 回落正是本来那个 bug。
-        """
-        base = os.path.basename(os.path.normpath(stage_dir))
-        names = {str(x) for x in segments if x}
-        suffixes = set()
-        for nm in names:
-            if nm == base:
-                suffixes.add(0)
-                continue
-            suf = nm[len(base):].lstrip("_") if nm.startswith(base) else ""
-            if not suf.isdigit():
-                raise ValueError(f"无法解析证据来源段名 {nm!r}（基准 {base!r}）")
-            suffixes.add(int(suf))
-        if len(suffixes) > 1:
-            raise ValueError(
-                f"补采的窗口跨越多个采样段 {sorted(suffixes)}，无法落在单一段里"
-            )
-        n = next(iter(suffixes)) if suffixes else 0
-        if n <= 1:
-            return None, None          # 基准段：走默认目录
-        return (
-            f"{stage_dir.rstrip(os.sep)}_{n}",
-            os.path.join(checkpoint_dir, f"segment_{n}"),
-        )
+    # ⚠️ [2026-09-12] `_latest_segment_dirs`（"源段 = 段号最大的段"）**已删除**。
+    # 不是"没人调所以清理掉"，是它被 `abfe_preoptimizer.segment_dirs_for_evidence`
+    # **取代**了：真机实证「段号最大的段」可能根本没有目标窗口的帧
+    # （`vanishing_2` 是 win0-3 的部分段，拿它去重解 win4 的 f_k 既炸 loader
+    # 又逻辑不通），正确语义是「**有这个窗口数据的**最新段」。
+    # 留着它等于把一个已修的崩溃摆在下一个人手边。要历史见 git HEAD~。
 
     def _legalize_tail_window(
         self, lam, ranges, *, failed_range, pilot, checkpoint_dir,
-        min_states_per_window, max_states_per_window, anchor_getter,
-        first_untrusted,
+        min_states_per_window, max_states_per_window,
+        first_untrusted, partition_criterion: str = "arclength",
     ):
         """把末窗弄回**执行层**合法（每个窗口态数 ∈ [lo, hi]）。返回 (lam, ranges)。
 
@@ -11152,20 +12693,42 @@ class ABFEPipeline:
         意味着接缝上没有共享节点 —— 相邻 ensemble 没有公共态对齐自由能参考，
         自由能链在那里断开。
         """
+        # ⚠️ S2-D 收拢时这行 import 被连同 `_lambdas_from_version_record` 等一起删掉，
+        # 但函数体里这三个名字**没有**跟着改成 `_pre.` —— 于是拆末窗那条路一走到就
+        # NameError（早退那条路不碰它们，所以离线测试全绿）。
+        # 由 tests/test_no_undefined_globals.py 的全仓 symtable 扫描钉住。
         from abfe_preoptimizer import (
             insert_lambda_in_failed_ibs_window,
             repartition_tail_from_anchor,
             record_tail_repartition_version,
         )
+        import abfe_preoptimizer as _pre
 
-        # 末窗的上界是**可拆上限** `2*hi−1`，不是 `hi` —— 它是溢出槽。
-        # 只有超过可拆上限才必须动手，否则原样放行（K=6 走到这里直接返回）。
+        # 🔑🔑 [2026-09-14 真机] **早退判据与本函数自己的 docstring 矛盾。**
+        #
+        # 上面写着「stage 的权威 window_ranges 校验对**所有**窗口一律要求 [lo, hi]，
+        # 所以跑之前必须合法化」，而代码却是 `if tail_k <= 2*hi-1: return` ——
+        # 于是 K=7/8/9 的末窗**原样放行**，带着一个超上限的窗口去跑。
+        # `2*hi−1` 是**可拆上限**（path-version 层允许插 λ 溢出到这里），
+        # **不是**"可以照跑的上限"。两个概念被写成了同一个数。
+        #
+        # 真机实测（2026-09-14）五个 run 的末窗与各自的配置：
+        #   brd4_ligand2/rep1    lo/hi=4/8  K=10   可拆区间 [7,15]
+        #   cyclod_ligand1/rep2  lo/hi=4/8  K=12   可拆区间 [7,15]
+        #   cyclod_ligand1/rep3  lo/hi=4/8  K=11   可拆区间 [7,15]
+        #   cyclod_ligand2/rep1  lo/hi=4/5  K=7    可拆区间 [7,9]
+        #   cyclod_ligand2/rep2  lo/hi=4/5  K=4    合法
+        # **每一个超标的末窗都还在自己配置的可拆区间内** —— 插点侧的溢出守卫
+        # （`insert_lambda_in_failed_ibs_window` 里 `> 2*hi−1` 那道 fail-closed）
+        # 从头到尾都守住了，没有一个 run 冲出过可拆上限。唯一放跑非法布局的
+        # 就是这道早退：K ∈ (hi, 2*hi−1] 被它原样放行，然后死在下游权威校验上。
+        # 实测 `repartition_tail_from_anchor` 对 K=7 和 K=12 都能拆成全部 ∈[lo,hi]
+        # （7 → 4+4，12 → 4+5+5），机器本来就够用，卡的只是这道门。
         lo, hi = int(min_states_per_window), int(max_states_per_window)
         split_lo = 2 * lo - 1
-        tail_cap = 2 * hi - 1
         ranges = [tuple(int(i) for i in r) for r in ranges]
         tail_k = ranges[-1][1] - ranges[-1][0]
-        if tail_k <= tail_cap:
+        if tail_k <= hi:
             return [float(x) for x in lam], ranges
 
         while hi < tail_k < split_lo:
@@ -11197,22 +12760,48 @@ class ABFEPipeline:
                     "tail_k_after": ranges[-1][1] - ranges[-1][0],
                 },
             )
-            lam = self._lambdas_from_version_record(_dz_rec, lam)
+            lam = _pre.lambdas_from_version_record(_dz_rec, lam)
             tail_k = ranges[-1][1] - ranges[-1][0]
             self._log(
                 f"  [自治] 末窗落在死区（{hi} < K < {split_lo}）⟹ 补 1 个："
                 f"K={tail_k}，可拆区间 [{split_lo}, {2 * hi - 1}]。"
             )
 
-        anchor = anchor_getter()
+        # 🔑🔑 [审计 #12] **anchor 必须用「插完之后」的布局现解，不能由调用方在插
+        # 之前捕获。** 两个调用点传的 `anchor_getter` 都是
+        # `lambda: ctl.tail_repartition_anchor(view)`，而那个 `view` 是插 λ **之前**
+        # 读的；`tail_repartition_anchor()` 返回的是 λ **数值**。model B 插点会把
+        # 插入下标之后每个 λ 的下标 +1 ⟹ 那个数值落到 `j+1`，那里不再是窗口起点
+        # ⟹ `repartition_tail_from_anchor` 抛
+        # `ValueError("anchor λ=… 不是现有共享态")`，穿过 `except Exception` 被
+        # re-raise、整跑炸穿。默认 4/5 配置 + `K_tail == 6`（死区循环自己先插了一个）
+        # 时可达；`first_untrusted > 失败窗口` 时必炸。
+        # 窗口**下标**在 model B 下不变（非末窗 ranges 逐字冻结，有后置断言），
+        # 所以这里按 `first_untrusted` 的**下标**、用**当前** lam/ranges 现解数值。
+        # 语义与 `Stage2RepairController.tail_repartition_anchor` 逐字相同
+        # （含 `idx <= 0` 时没有共享态可用 ⟹ None）。
+        # ⚠️ 原来的 `anchor_getter` 参数已于 2026-09-14 连同两个调用点一起摘除：
+        # 留一个「还在签名里但永远不被调用」的钩子，正是审计 #29 那条死参数的形状。
+        anchor = None
+        if first_untrusted is not None and 0 < int(first_untrusted) < len(ranges):
+            _a_idx = int(ranges[int(first_untrusted)][0])
+            if _a_idx < len(lam):
+                anchor = float(lam[_a_idx])
         if anchor is None:
             raise RuntimeError(
                 f"末窗 K={tail_k} 超执行层上限 {hi} 但取不到 tail anchor ⟹ "
                 "无法拆。fail-closed：不带着非法布局继续。"
             )
+        # 🔑 [2026-09-15] 分窗判据必须与生产一致（D）。这里**不传 `n_windows`**：
+        # 合法化的目标是「每个窗口回到 [lo,hi]」，不是「更细」—— 传了就会把
+        # `repartition_tail_from_anchor` 里那两条"必须更细"的硬断言也套上来，
+        # 而 [9,4] → [7,6] 这种窗口数不变的合法化是完全正确的。
         new_ranges, tdiag = repartition_tail_from_anchor(
             lam, ranges, anchor,
             min_states_per_window=lo, max_states_per_window=hi,
+            pilot_lambdas=(pilot[0] if pilot else None),
+            metric_g=(pilot[2] if pilot else None),
+            partition_criterion=str(partition_criterion).lower(),
         )
         record_tail_repartition_version(
             checkpoint_dir, lam, new_ranges, tdiag,
@@ -11225,52 +12814,66 @@ class ABFEPipeline:
         return ([float(x) for x in lam],
                 [tuple(int(i) for i in r) for r in new_ranges])
 
-
     @staticmethod
-    def _lambdas_from_version_record(record, fallback):
-        """🔑 **落盘的路径版本是 λ 的唯一权威。**
+    def _window_ranges_for_lambdas(
+        lambdas, kwargs, path_diagnostics, vanishing_range_kwargs,
+    ):
+        """这条 λ 表在**当前配置**下的权威分窗。
 
-        `lambda_path_versions._q()` 写盘时把 λ 量化到 `LAMBDA_DECIMALS` 位；
-        如果继续拿内存里那份**未量化**的去采样，每插一个 λ 就永久制造一次错位。
+        🔑🔑 [2026-09-15] **λ 布点与分窗是两个阶段，分窗只许有一个入口。**
+        先前算 ranges 的地方有三处、判据各不相同：
+          · fresh preopt 缓存写入 —— 等边数贪心
+          · resume 时的缓存校验 —— 等边数贪心（对不上就**整份拒掉并重跑 pilot**，
+            不是只打个 WARN）
+          · 派生层离线重算 —— 等边数贪心（`redistribute_vanishing_lambda_subdomains`
+            把布点与分窗耦在一个返回值里，顺手带回旧判据的 ranges）
+        而生产实际用的是 `stage2_window_partition=metric_integral`。三处都不是它。
+        只要有一处改成 metric 而别处没改，缓存校验立刻失配 ⟹ 每次 resume 重跑 pilot。
 
-        真机（2026-09-12 17:05）实测 win4：
-            路径版本 0.31005333   vs   实际采样 0.310053335   差 5e-9
-        后果是死锁 —— 采样侧的 resume 门用 `np.allclose(atol=1e-9)`（含默认
-        rtol=1e-5 ⟹ 实际容差 ~3e-6）判"λ 匹配、跳过重采"，而分析侧
-        `load_ibs_window_outputs_from_dir` 用**精确相等**判"λ 不匹配"直接抛
-        ValueError。于是那个窗口**永远采不了也永远读不了**，每次启动必崩。
+        所以这三处现在共用本函数。它**不做**显式分窗那套越界校验与日志 —— 那些留在
+        生产分支里（`_run_dual_lambda_stage` 之前那段），本函数只回答"ranges 是什么"。
         """
-        states = (record or {}).get("states") or []
-        out = [
-            float(st.get("lambda_vdw")) for st in states
-            if st.get("lambda_vdw") is not None
-        ]
-        return out if len(out) == len(fallback) else [float(x) for x in fallback]
-
-    @staticmethod
-    def _existing_segment_names(stage_dir: str):
-        """盘上已有的采样段目录名（含基准段），按名字排序。"""
-        base = os.path.basename(os.path.normpath(stage_dir))
-        out = [base]
-        for d in sorted(glob.glob(stage_dir.rstrip(os.sep) + "_*")):
-            suf = os.path.basename(d).rsplit("_", 1)[-1]
-            if os.path.isdir(d) and suf.isdigit():
-                out.append(os.path.basename(d))
-        return out
-
-    @staticmethod
-    def _latest_segment_dirs(stage_dir: str, checkpoint_dir: str):
-        """盘上**段号最大**的那个段目录；只有基准段时返回 (None, None)。"""
-        best = 1
-        for d in glob.glob(stage_dir.rstrip(os.sep) + "_*"):
-            suf = os.path.basename(d).rsplit("_", 1)[-1]
-            if os.path.isdir(d) and suf.isdigit():
-                best = max(best, int(suf))
-        if best <= 1:
-            return None, None
-        return (
-            f"{stage_dir.rstrip(os.sep)}_{best}",
-            os.path.join(checkpoint_dir, f"segment_{best}"),
+        explicit = kwargs.get("stage2_window_ranges")
+        if explicit:
+            return [(int(a), int(b)) for a, b in explicit]
+        criterion = str(
+            kwargs.get("stage2_window_partition", "arclength")
+        ).lower()
+        if criterion == "metric_integral":
+            diag = path_diagnostics or {}
+            if not diag.get("pilot_lambdas") or not diag.get("metric_g"):
+                raise RuntimeError(
+                    "stage2_window_partition=metric_integral 需要 pilot_lambdas/"
+                    "metric_g，但传进来的 path_diagnostics 里读不到。"
+                    "拒绝退回等弧长分窗——那会静默改变布局。"
+                )
+            from abfe_preoptimizer import (
+                partition_windows_by_metric_integral,
+                _pilot_mean_gradients_or_none,
+            )
+            ranges, _ = partition_windows_by_metric_integral(
+                [float(x) for x in lambdas],
+                diag["pilot_lambdas"],
+                diag["metric_g"],
+                min_states_per_window=int(
+                    vanishing_range_kwargs.get("min_states_per_window", 4)
+                ),
+                max_states_per_window=int(
+                    vanishing_range_kwargs.get("max_states_per_window", 8)
+                ),
+                n_windows=kwargs.get("stage2_n_windows"),
+                first_window_max_states=kwargs.get(
+                    "stage2_first_window_max_states"
+                ),
+                pilot_mean_dU_dlambda=_pilot_mean_gradients_or_none(
+                    diag.get("pilot_points") or []
+                ),
+            )
+            return [(int(a), int(b)) for a, b in ranges]
+        return vanishing_subdomain_ranges_from_lambdas(
+            lambdas,
+            first_ensemble_target_intervals=VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS,
+            **vanishing_range_kwargs,
         )
 
     @staticmethod
@@ -11605,6 +13208,24 @@ class ABFEPipeline:
                     f"位移超阈值的窗口（仅报告，非判据）：{sorted(seeds)}。只报告。"
                 )
             return None, diagnostics
+
+        # 🔑🔑 [2026-09-15] **调用方点名了窗口时，位移不再当第二道放行闸。**
+        # 探针按**固定节奏/脱轨**推荐重锚，执行器却按**相邻位移 0.5 kJ/mol** 放行
+        # —— 同一个决定两套判据，而且两者读的还不是同一份数据（执行器从"有这个
+        # 窗口数据的最新段"重解，探针读全量）⟹ 控制器发 RECALIBRATE_FK、执行器
+        # 静默不做事、记 no-op、控制器再也不发（`_is_noop`），这条修复路径就此消失。
+        # 位移那条早已被降级为**仅报告**（0.5 对 50~80 kJ/mol 的量程等于谁都超，
+        # win1/win2 两个实测反例见上面探针分支的注释），留着当放行闸等于让一条
+        # 已作废的判据否决控制器的决定。设计文档 §1：**唯一决策点是 `decide()`**。
+        # ⚠️ `seeds` 上面那层保持"位移超阈值"的原义不动 —— 探针分支的
+        # `displacement_over_threshold_windows_REPORT_ONLY` 依赖它，改了那个字段就说谎了。
+        # `only_windows is None` 的旧调用方逐字保持原行为。
+        if only_windows is not None:
+            seeds = {
+                int(r["window"]): [float(x) for x in r["f_k_after"]]
+                for r in records if r.get("f_k_after")
+            }
+            diagnostics["release_criterion"] = "caller_named_windows"
 
         if not seeds:
             self._log(
@@ -12031,6 +13652,11 @@ class ABFEPipeline:
             # 处理，λ=1 物理端点因此被改写（tests/test_pme_decharge_endpoint_
             # equivalence.py 实测复现）；v4 撤销补对、普通对内部库仑随 λ 湮灭，
             # 并将同一端点口径传递到 Stage 2 Group 2 以闭合 seam。
+            # [v5，2026-09-14] 湮灭那一半是缺陷（两腿 ⟨U_intra⟩ 差 −88.7 kJ/mol
+            # = 某体系 ΔG_bind 的全部误差），改为 couple-intramol=no：(1-λ²) 的
+            # CustomBondForce 把普通 ≥1-5 L–L 库仑补回全强度，Stage 2 用同一份
+            # 对表、前缀取 1。**stage1 与 stage2 的哈密顿量都变了**，所以本键
+            # 无条件进指纹这件事在 v5 下同样是必需的。
             # 这改变 decharging 腿的逐腿 ΔG（以及 charge-transfer handoff 下
             # vanishing 的烘焙端点），所以无条件进指纹，让旧 stage 缓存整体失效。
             "pme_decharge_model_version": PME_DECHARGE_MODEL_VERSION,
@@ -12405,7 +14031,14 @@ class ABFEPipeline:
             ),
             # 顶层收敛与覆盖证据：resume 命中时 _assert_stage_result_sane 需要它们，
             # 事后审计也需要。
-            "converged": _json_safe(result.get("converged")),
+            # [2026-09-15] `converged` 已删除，落盘两个正交状态（缺席 ⟹ resume 时
+            # 由 `_stage_analysis_rejection_reason` fail-closed 拒绝复用）。
+            "analysis_status": _json_safe(result.get("analysis_status")),
+            "analysis_incomplete_reasons": _json_safe(
+                result.get("analysis_incomplete_reasons")
+            ),
+            "precision_status": _json_safe(result.get("precision_status")),
+            "precision_evidence": _json_safe(result.get("precision_evidence")),
             "coverage_diagnostics": _json_safe(result.get("coverage_diagnostics")),
         }
         # 估计量 provenance/一致性证据必须随 stage checkpoint 往返；否则首次运行
@@ -12620,6 +14253,24 @@ class ABFEPipeline:
         )
         import ibs_engine as _ie_policy_check
         _ie_policy_check.repair_policy_cache_class(_sampling_repair_policy)  # fail-closed 校验
+
+        # 🔑🔑 [2026-09-14] **单控制器：path_evolution 必须在这里就被真的关掉。**
+        #
+        # 先前下面那段 `_autonomous_on` 的"静音"日志里写着「已关闭 path_evolution 的
+        # 插 λ 修复分支」，但那句是**假的**：`_sampling_repair_policy` 在那里只被读来
+        # 拼字符串、从没被赋值；而且那段代码跑在 `_run_stage2_with_path_evolution`
+        # **之后** 150 行 —— 路径早就被改过了。另外两样（production rescue /
+        # rescue 后重标定）都有真赋值 + 硬断言，只有这一样两者都没有。
+        #
+        # 降级到 `non_mutating_v1` 是**指纹中性**的：两者同属
+        # `_NON_MUTATING_POLICY_CLASS`（`repair_policy_cache_class` 判的就是它），
+        # 所以既有窗口缓存不失配。行为上 `_run_stage2_with_path_evolution` 退化成
+        # 一次普通的 `run_once`，布局动作全部交给 `decide()` 的 9b / INSERT_LAMBDA。
+        _path_evolution_silenced_for_autonomous = False
+        if (bool(kwargs.get("stage2_autonomous_controller", True))
+                and _sampling_repair_policy == "path_evolution_v1"):
+            _sampling_repair_policy = "non_mutating_v1"
+            _path_evolution_silenced_for_autonomous = True
 
         _vanishing_range_kwargs = {}
         if kwargs.get("stage2_window_min_states") is not None:
@@ -13401,6 +15052,16 @@ class ABFEPipeline:
                     ),
                     "stage2_window_min_states": kwargs.get("stage2_window_min_states"),
                     "stage2_window_max_states": kwargs.get("stage2_window_max_states"),
+                    # 🔑🔑 [2026-09-15] 这两个键**决定布局**，必须进第 2 层派生路径指纹。
+                    # `stage2_first_window_max_states` 是新加的（耦合端态数上限）。
+                    # `stage2_window_partition` 是**一直漏着的**：arclength↔metric_integral
+                    # 换的是分窗判据本身，布局必然不同，而 preopt 这一层先前会报"匹配"
+                    # —— 只靠下游"每个窗口自己的 λ 集合"复用键兜底才没出事。
+                    "stage2_window_partition": kwargs.get("stage2_window_partition"),
+                    "stage2_first_window_max_states": kwargs.get(
+                        "stage2_first_window_max_states"
+                    ),
+                    "stage2_n_windows": kwargs.get("stage2_n_windows"),
                     "stage2_free_energy_densify_points": kwargs.get(
                         "stage2_free_energy_densify_points"
                     ),
@@ -13787,6 +15448,20 @@ class ABFEPipeline:
                                     "stage2_free_energy_densify_points",
                                     "free_energy_densify_points",
                                 ),
+                                # 🔑🔑 [2026-09-15] **分窗判据必须透传。**
+                                # 不传 ⟹ 离线重算退回等边数贪心的 ranges，而生产是
+                                # metric_integral ⟹ 重算出来的布局与 fresh preopt 不一致，
+                                # 写回缓存的 `window_ranges`/`subdomain_*` 描述的是另一套布局。
+                                # ⚠️ 这三个键都在 `_PREOPT_DERIVED_PATH_KEYS` 里 ——
+                                # 它们是**触发**这条离线重算分支的东西，不透传等于
+                                # 「因为它变了才重算，重算时却不用它」。
+                                partition_criterion=str(
+                                    kwargs.get("stage2_window_partition", "arclength")
+                                ).lower(),
+                                n_windows=kwargs.get("stage2_n_windows"),
+                                first_window_max_states=kwargs.get(
+                                    "stage2_first_window_max_states"
+                                ),
                             )
                         except Exception as _recompute_exc:  # noqa: BLE001
                             self._log(
@@ -13821,6 +15496,15 @@ class ABFEPipeline:
                                 "subdomain_allocation"
                             ]
                             _diag["actual_state_count"] = len(_new_lambdas)
+                            # "这份 ranges 是按什么判据切的"必须留痕 —— 缺了它，
+                            # 离线重算带回旧判据布局这件事事后无从对账。
+                            _diag["window_partition_criterion"] = _recomputed.get(
+                                "partition_criterion"
+                            )
+                            if _recomputed.get("partition_diagnostics") is not None:
+                                _diag["window_partition_diagnostics"] = _recomputed[
+                                    "partition_diagnostics"
+                                ]
                             cached["protocol_key"] = _stage2_preopt_key
                             with open(preopt2_file, "w", encoding="utf-8") as f:
                                 json.dump(_json_safe(cached), f, indent=2)
@@ -13849,12 +15533,14 @@ class ABFEPipeline:
                         # 见 tests/test_stage2_states_not_contaminated_by_rejected_cache.py
                         _cached_state_count = len(cached_lambdas)
                         cached_ranges = cached.get("window_ranges")
-                        expected_subdomain_ranges = (
-                            vanishing_subdomain_ranges_from_lambdas(
-                                cached_lambdas,
-                                first_ensemble_target_intervals=VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS,
-                                **_vanishing_range_kwargs,
-                            )
+                        # 🔑🔑 [2026-09-15] **校验必须用生产的分窗判据。**
+                        # 这里先前写死等边数贪心：metric_integral 下缓存里的 ranges
+                        # 与它必然不等 ⟹ 走下面那条「拒绝整份缓存」的分支 ⟹
+                        # **每次 resume 重跑一整轮 pilot**。不是打个 WARN 而已。
+                        expected_subdomain_ranges = self._window_ranges_for_lambdas(
+                            cached_lambdas, kwargs,
+                            cached.get("path_diagnostics") or {},
+                            _vanishing_range_kwargs,
                         )
                         normalized_cached_ranges = (
                             [tuple(int(x) for x in r) for r in cached_ranges]
@@ -13986,12 +15672,19 @@ class ABFEPipeline:
                     # Lambda density is set by measured thermodynamic length;
                     # consecutive thermodynamic intervals are then grouped into
                     # few-state ensembles.  No fixed 0.5 or overlap=2 cut.
-                    window_ranges_2 = vanishing_subdomain_ranges_from_lambdas(
-                        optimized_lambdas_2,
-                        first_ensemble_target_intervals=VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS,
-                        **_vanishing_range_kwargs,
+                    # 🔑🔑 [2026-09-15] 与 resume 校验、派生层离线重算**共用同一入口**。
+                    # 先前这里写死等边数贪心，于是缓存里存的永远是旧判据的 ranges；
+                    # 三处只要有一处改判据，缓存校验立刻失配 ⟹ 重跑 pilot。
+                    window_ranges_2 = self._window_ranges_for_lambdas(
+                        optimized_lambdas_2, kwargs, _fresh_diag,
+                        _vanishing_range_kwargs,
                     )
                     opt_res["window_ranges"] = window_ranges_2
+                    opt_res.setdefault("path_diagnostics", {})[
+                        "window_partition_criterion"
+                    ] = str(
+                        kwargs.get("stage2_window_partition", "arclength")
+                    ).lower()
                     opt_res.setdefault("path_diagnostics", {})[
                         "ibs_ensemble_layout"
                     ] = "few_state_thermodynamic_subdomains"
@@ -14094,6 +15787,7 @@ class ABFEPipeline:
                 # 一个态都不用多采。贪心等弧长分窗给不出这种形状。
                 from abfe_preoptimizer import (
                     partition_windows_by_metric_integral,
+                    _pilot_mean_gradients_or_none,
                 )
                 _pd = {}
                 try:
@@ -14119,13 +15813,34 @@ class ABFEPipeline:
                             _vanishing_range_kwargs.get("max_states_per_window", 8)
                         ),
                         n_windows=kwargs.get("stage2_n_windows"),
+                        # 🔑 [2026-09-15] 耦合端专用上限，见该参数的注释：
+                        # ∫g 均衡没有 K 这一维，而 win0 事后没有任何修复路径。
+                        first_window_max_states=kwargs.get(
+                            "stage2_first_window_max_states"
+                        ),
+                        # 仅报告：每窗预测 |ΔF| 跨度（f_k 跨度的保守代理）。
+                        # ⚠️ `path_diagnostics` **没有** `pilot_mean_dU_dlambda`
+                        # 这个键 —— 梯度在 `pilot_points[i]["mean_dU_dlambda_kJ_mol"]`
+                        # 里。用既有的收集器：任一 pilot 点缺这个键就返回 None
+                        # （而不是找个替代值），跨度就如实不报。
+                        pilot_mean_dU_dlambda=_pilot_mean_gradients_or_none(
+                            _pd.get("pilot_points") or []
+                        ),
                     )
                 )
                 self._log(
                     f"  [∫g 均衡分窗] {_mi_diag['n_windows']} 个窗口，"
                     f"尺寸={_mi_diag['sizes']}，峰值 ∫g dλ="
                     f"{_mi_diag['peak_metric_integral']:.1f}，不均衡度="
-                    f"{_mi_diag['imbalance_max_over_min']:.2f}。"
+                    f"{_mi_diag['imbalance_max_over_min']:.2f}，"
+                    f"首窗上限={_mi_diag['first_window_max_states']}"
+                    + (f"，预测 ΔF 跨度(仅报告)="
+                       + "/".join(
+                           f"{x:.0f}" for x in
+                           _mi_diag["predicted_delta_f_span_kJ_mol_REPORT_ONLY"])
+                       if _mi_diag.get("predicted_delta_f_span_kJ_mol_REPORT_ONLY")
+                       else "")
+                    + "。"
                     "（峰值有地板：等于尖峰处一个最小窗的 ∫g；再低只能在尖峰段加 λ 态。）"
                 )
             else:
@@ -14347,13 +16062,19 @@ class ABFEPipeline:
                                       _checkpoint_dir_override=None,
                                       _initial_f_k_by_window=None,
                                       _only_window_indices=None,
-                                      _authoritative_window_ranges=None):
+                                      _authoritative_window_ranges=None,
+                                      _stage_name=None,
+                                      _allow_partial_rescue=False):
                     if _authoritative_window_ranges is None:
                         # 未显式指定时跟随"路径是否已演化"，免得每个调用点
                         # 都要记得传（rescue 那处漏传就再次被门拒绝）。
                         _authoritative_window_ranges = _stage2_path_evolved
                     return self._run_dual_lambda_stage(
-                        "vanishing",
+                        # 默认仍是 "vanishing"；只有 IMMUTABLE_REWINDOW 这类
+                        # **部分覆盖**的子系综采样才传 "vanishing_rescue"
+                        # （那是已有的内部采样标签，映射回同一个物理 stage）。
+                        _stage_name or "vanishing",
+                        allow_partial_vanishing_rescue=bool(_allow_partial_rescue),
                         stage_output_dir_override=_output_dir_override,
                         checkpoint_dir_override=_checkpoint_dir_override,
                         initial_f_k_by_window=_initial_f_k_by_window,
@@ -14471,6 +16192,10 @@ class ABFEPipeline:
                         kwargs.get("stage2_window_max_states", 5)
                     ),
                     partition_criterion=_partition_criterion,
+                    # 路由信号只有在下游真有控制器接管时才允许被咽下去。
+                    route_to_controller=bool(
+                        kwargs.get("stage2_autonomous_controller", True)
+                    ),
                 )
                 stage2_states = len(optimized_lambdas_2)
 
@@ -14528,9 +16253,20 @@ class ABFEPipeline:
                             allow_untrusted_stage_results=bool(
                                 kwargs.get("allow_untrusted_stage_results", False)
                             ),
+                            f_k_reanchor_cadence_steps=int(
+                                kwargs.get("stage2_f_k_reanchor_cadence_steps",
+                                           500_000)
+                            ),
                         )
                         if _auto_result is not None:
                             stage2 = _auto_result
+                        # 🔑 [审计 #6] 循环的结论必须跟着结果走：`result` 为 None
+                        # 时（整跑只发过子集动作）"控制器停在 NO_FEASIBLE_ACTION"
+                        # 这件事在下游质量门那里就完全看不见了。
+                        _auto_outcome = getattr(
+                            self, "_stage2_autonomous_outcome", None)
+                        if isinstance(stage2, dict) and _auto_outcome:
+                            stage2["autonomous_outcome"] = dict(_auto_outcome)
                         stage2_states = len(optimized_lambdas_2)
                     except Exception as _auto_err:  # noqa: BLE001
                         # 自治循环炸了**不能吞**：它现在是主驱动，静默降级到旧流程
@@ -14594,6 +16330,15 @@ class ABFEPipeline:
                 production_rescue_rounds = max(
                     0, int(kwargs.get("stage2_production_rescue_rounds", 2))
                 )
+                # [2026-09-15] 假门驱动的补帧已停用（见 AUTO_RESAMPLE_ON_FITTED_GATES）。
+                if production_rescue_rounds and not AUTO_RESAMPLE_ON_FITTED_GATES:
+                    self._log(
+                        f"  [rescue] 生产 coverage rescue（{production_rescue_rounds} 轮）"
+                        "**已停用**：它的触发条件是 min_overlap / 绝对 ESS / 去相关样本数 / "
+                        "端点 σ 这四个**未标定的拟合阈值**，不构成自动批 GPU 的理由。"
+                        "诊断照报照落盘，不再自动补帧。"
+                    )
+                    production_rescue_rounds = 0
                 if _autonomous_on:
                     _silenced = []
                     if production_rescue_rounds:
@@ -14603,8 +16348,12 @@ class ABFEPipeline:
                     if bool(kwargs.get("stage2_recalibrate_f_k_on_rescue", False)):
                         _silenced.append("rescue 后 f_k 重标定")
                         kwargs["stage2_recalibrate_f_k_on_rescue"] = False
-                    if _sampling_repair_policy == "path_evolution_v1":
-                        _silenced.append("path_evolution 的插 λ 修复分支")
+                    if _path_evolution_silenced_for_autonomous:
+                        _silenced.append(
+                            "path_evolution 的插 λ 修复分支（已在调用前降级为 "
+                            "non_mutating_v1，指纹中性）")
+                    if bool(kwargs.get("stage2_enable_bridge_rescue", True)):
+                        _silenced.append("bridge rescue (open-loop ensembles)")
                     if _silenced:
                         self._log(
                             "  [控制器] 自治控制器已启用 ⟹ 关闭 "
@@ -14620,6 +16369,14 @@ class ABFEPipeline:
                     assert not kwargs.get("stage2_recalibrate_f_k_on_rescue"), (
                         "自治控制器启用时不得并存 rescue 后 f_k 重标定"
                     )
+                    # 这一条先前只有日志、没有赋值也没有断言 —— 于是"已关闭"是假的。
+                    assert _sampling_repair_policy != "path_evolution_v1", (
+                        "自治控制器启用时不得并存 path_evolution 的插 λ 修复分支"
+                    )
+                _bridge_rescue_enabled = (
+                    bool(kwargs.get("stage2_enable_bridge_rescue", True))
+                    and not _autonomous_on
+                )
                 if _rescue_disabled_by_untrusted and production_rescue_rounds:
                     self._log(
                         "  [rescue] allow_untrusted_stage_results=True —— 跳过 "
@@ -14674,8 +16431,9 @@ class ABFEPipeline:
                         f"  [f_k 探针] 计算失败（不影响本轮 rescue）：{_probe_err!r}"
                     )
 
+                # production_rescue_rounds 现在恒为 0（见上），本循环不会执行。
                 for rescue_round in range(1, production_rescue_rounds + 1):
-                    if stage2.get("converged") is True:
+                    if _stage_analysis_rejection_reason(stage2) is None:
                         break
                     failure_details = self._stage_quality_failure_details(stage2)
                     failing_windows = sorted({
@@ -14739,8 +16497,10 @@ class ABFEPipeline:
                 # RMSE 0.060 vs 沿用旧 f_k 0.114。
                 #
                 # 默认关闭：不设这个开关时上面几行之后逐字维持原行为。
+                # [2026-09-15] 触发条件原为 `converged is not True`（= 四个拟合阈值的
+                # 合取没过）⟹ 假门驱动的重采样，已停用。
                 if (
-                    stage2.get("converged") is not True
+                    AUTO_RESAMPLE_ON_FITTED_GATES
                     and not _rescue_disabled_by_untrusted
                     and bool(kwargs.get("stage2_recalibrate_f_k_on_rescue", False))
                 ):
@@ -14809,7 +16569,7 @@ class ABFEPipeline:
                                 "  [f_k 重标定] 两段**合并**求解："
                                 f"ΔG={stage2.get('total_delta_G', float('nan')):.4f} ± "
                                 f"{stage2.get('total_error', float('nan')):.4f} kJ/mol，"
-                                f"converged={stage2.get('converged')}，"
+                                f"analysis_status={stage2.get('analysis_status')}，"
                                 f"完整路径={stage2.get('path_is_complete')}；"
                                 f"段 1 单独 ΔG={_seg_diag['previous_segment_delta_G']}。"
                             )
@@ -14840,10 +16600,11 @@ class ABFEPipeline:
                 # directory.  Original production files remain untouched;
                 # the failed ensemble is replaced only in the combined
                 # analysis cover.
+                # [2026-09-15] 同上：原触发条件是四个拟合阈值的合取没过 ⟹ 已停用。
                 if (
-                    stage2.get("converged") is not True
+                    AUTO_RESAMPLE_ON_FITTED_GATES
                     and not _rescue_disabled_by_untrusted
-                    and bool(kwargs.get("stage2_enable_bridge_rescue", True))
+                    and _bridge_rescue_enabled
                 ):
                     # ------------------------------------------------------
                     # 🔑 [P0，2026-08-30 / 判据前移 2026-08-31] rescue 会用**完整
@@ -15071,7 +16832,7 @@ class ABFEPipeline:
                             "  Stage 2 rescue 合并求解完成："
                             f"ΔG={stage2.get('total_delta_G', float('nan')):.4f} ± "
                             f"{stage2.get('total_error', float('nan')):.4f} kJ/mol，"
-                            f"converged={stage2.get('converged')}；"
+                            f"analysis_status={stage2.get('analysis_status')}；"
                             f"被 rescue 取代的原始窗口={failing_windows}，"
                             f"rescue ranges={rescue_ranges}；"
                             f"min_overlap={stage2.get('min_overlap')}，"
@@ -15099,6 +16860,22 @@ class ABFEPipeline:
                     charge_transfer_handoff_active=self._charge_transfer_vanishing_handoff_active(),
                 )
                 os.makedirs(self.checkpoint_dir, exist_ok=True)
+                # 🔑🔑 [2026-09-14] **stage 缓存也必须盖当前 λ 路径版本号。**
+                # 先前只有 `_persist_inprogress_stage_result` 写的中间产物盖版本，
+                # 这份**完成标记**不盖。而控制器的 `_read_stage_result()` 对
+                # "不带 path_version 的老产物"是"无法判定版本 ⟹ 放行"。于是：
+                #   布局 v1 收敛 → 写下这份 converged=True → 后来 resume 插了 λ 变 v2
+                #   → 中间产物因版本不符被跳过 → **这份老缓存被放行**
+                #   → 控制器据此判 DONE，端出一个描述**另一条布局**的 ΔG。
+                # 盖上之后，隔离在两类产物上口径一致；旧 run 没有这个字段 ⟹
+                # 控制器侧 `stage_result_path_version_verified` 为 False ⟹ 保守不据此终止。
+                try:
+                    import lambda_path_versions as _lpv_cache
+                    _cur_pv = (_lpv_cache.load_current(self.checkpoint_dir) or {}).get("version")
+                    if _cur_pv is not None:
+                        stage2_save["path_version"] = int(_cur_pv)
+                except Exception as _pv_err:  # noqa: BLE001 —— 盖不上就保持未核实（保守）
+                    self._log(f"  [Stage 2] 缓存盖路径版本号失败：{_pv_err!r}（按未核实处理）")
                 with open(stage2_file, "w", encoding="utf-8") as f:
                     json.dump(stage2_save, f, indent=2)
                 self._update_stage_status(

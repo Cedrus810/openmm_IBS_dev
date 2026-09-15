@@ -25,7 +25,7 @@ fail-closed quality gates.
 
 ## 1. Environment
 
-Core dependencies: Python 3.10+, OpenMM, NumPy, SciPy, MDTraj, PyMBAR. Production GPU
+Core dependencies: **Python 3.12**, OpenMM, NumPy, SciPy, MDTraj, PyMBAR. Production GPU
 runs additionally require a matching CUDA or OpenCL stack. The supplied `environment.yml`
 carries machine- and CUDA-specific choices and **must be reviewed before use on another
 host**.
@@ -171,8 +171,11 @@ no packaging step; `pyproject.toml` only carries linter configuration. The crite
 `pytest tests/test_fresh_clone_imports.py`. The frozen R1 resources and the prebuilt plugin
 `.so` ship with the repository -- a clone needs no compilation step and no separate download.
 
-Most detailed tutorials are maintained in Chinese; their commands, paths, and status
-markers remain directly usable.
+**Chinese is this project's primary documentation language** -- a deliberate choice for
+development speed, not an oversight. The detailed tutorials under `docs/` are written in
+Chinese and are the authoritative version; their commands, paths, and status markers are
+directly usable as-is. This English README covers the full workflow, but it is not kept
+at word-for-word parity with the Chinese one.
 
 ## License
 

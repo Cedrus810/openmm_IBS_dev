@@ -125,18 +125,45 @@ def test_gate_is_wired_into_the_single_cycle_closure_and_nowhere_else():
     )
 
 
-def test_combine_refuses_to_report_delta_g_bind_when_ensembles_disagree():
+def test_combine_warns_but_does_not_block_when_ensembles_disagree():
+    """[2026-09-12 裁决 / 2026-09-13 改写断言] 这道门**最多 WARN，不阻断汇总**。
+
+    旧断言要 `pytest.raises(ValueError)`。裁决理由（design §7.5）：两条腿的配体
+    构象差在这类装置上是**必然产物**而不是采样不足 —— 溶剂腿里配体没有任何东西
+    撑着、vdW 一关就塌；复合物腿里主体腔把它卡住、塌不了。拿装置固有的性质去硬拦
+    ΔG_bind 等于否决整条热力学循环。
+
+    ⚠️ **但 WARN 不等于"已处理"**，所以这里连带钉住三件事，少一件这道门就退化成
+    "警告了就等于没事"：
+      1. `cross_leg_conformer_gate` **永远**写（`PASSED`/`WARN`/`NOT_EVALUATED`）；
+      2. WARN 时**完整 report 必须带出来**，事后可审计；
+      3. 判据**一字未改** —— `passed is False`，改的只是"炸不炸"。
+    想硬阻断的调用方显式传 `strict_cross_leg_conformer=True`（下面一并钉住）。
+    """
     kwargs = dict(
         dg_complex_kJ_mol=175.57,
         dg_solvent_kJ_mol=272.93,
         err_complex_kJ_mol=1.50,
         err_solvent_kJ_mol=1.46,
     )
+    disagree = dict(
+        complex_conformer_summary=_summary("membrane_complex"),
+        solvent_conformer_summary=_summary("membrane_solvent"),
+    )
+    warned = core.combine_binding_free_energy(**disagree, **kwargs)
+    # 不阻断：ΔG_bind 照常算出来
+    assert warned["delta_G_bind_kJ_mol"] == pytest.approx(272.93 - 175.57)
+    # 但必须一眼看得见这条路径上有未计入的构象自由能差
+    assert warned["cross_leg_conformer_gate"] == "WARN"
+    # 判据本身没被放宽 —— 只是不炸了
+    assert warned["ligand_conformer_cross_leg"]["evaluated"] is True
+    assert warned["ligand_conformer_cross_leg"]["passed"] is False
+    # WARN 必须带完整 report，否则"警告"就是不可审计的
+    assert warned["cross_leg_conformer_report"] == warned["ligand_conformer_cross_leg"]
+    # 想硬阻断的调用方仍然拿得到硬阻断
     with pytest.raises(ValueError, match="构象跨腿一致性门未通过"):
         core.combine_binding_free_energy(
-            complex_conformer_summary=_summary("membrane_complex"),
-            solvent_conformer_summary=_summary("membrane_solvent"),
-            **kwargs,
+            **disagree, strict_cross_leg_conformer=True, **kwargs
         )
     # 重叠时正常汇总，且报告被带进结果（事后可审计）。
     payload = core.combine_binding_free_energy(

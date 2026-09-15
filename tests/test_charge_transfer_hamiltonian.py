@@ -250,12 +250,33 @@ def _reference_system_at_lambda(lam: float, *, coion_index: int = DUMMY_INDEX):
         coion_index, (1.0 - float(lam)) * unit.elementary_charge, sigma, epsilon
     )
 
-    # [P0-01, 2026-08-30] 参照体系**不再**给 L-L 对补 exception：OpenMM 的
+    # [P0-01, 2026-08-30] 参照体系**不**给 L-L 对补 exception：OpenMM 的
     # exception 不走普通非键的 cutoff/PME 处理，补对会改写 λ=1 物理端点
     # （见 tests/test_pme_decharge_endpoint_equivalence.py 的复现与定级）。
-    # v3 口径：普通 L-L 库仑随粒子电荷一起线性湮灭；拓扑里已有的 exception
-    # 冻结。这个 fixture 的 3 原子配体拓扑本身没有 exception，参照就是
-    # "只缩放粒子电荷"。
+    #
+    # [v5，2026-09-14] 口径从 annihilation 改成 couple-intramol=no：普通 L–L 库仑
+    # 不再随 λ² 湮灭，而是由一个 (1-λ²) 的补偿项补回全强度。参照侧在这里**独立**
+    # 把它写出来（这个 fixture 的 3 原子配体拓扑本身没有 exception，所以全部
+    # C(3,2)=3 对都是普通对），不调用被测实现的 builder。
+    lig = sorted(int(i) for i in LIGAND_INDICES)
+    comp = openmm.CustomBondForce("c*chargeProd/r")
+    comp.addPerBondParameter("chargeProd")
+    comp.addGlobalParameter("c", 138.935456 * (1.0 - float(lam) ** 2))
+    excepted = {
+        (min(int(nb.getExceptionParameters(e)[0]), int(nb.getExceptionParameters(e)[1])),
+         max(int(nb.getExceptionParameters(e)[0]), int(nb.getExceptionParameters(e)[1])))
+        for e in range(nb.getNumExceptions())
+    }
+    for a in range(len(lig)):
+        for b in range(a + 1, len(lig)):
+            i, j = lig[a], lig[b]
+            if (min(i, j), max(i, j)) in excepted:
+                continue
+            qi = params[i][0].value_in_unit(unit.elementary_charge)
+            qj = params[j][0].value_in_unit(unit.elementary_charge)
+            comp.addBond(i, j, [qi * qj])
+    if comp.getNumBonds():
+        system.addForce(comp)
     return system, positions
 
 

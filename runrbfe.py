@@ -170,8 +170,39 @@ def load_edge_spec(path: str) -> rc.EdgeSpec:
 
 
 def load_leg_result(path: str, expected_phase: str) -> rc.LegResult:
+    """从 JSON 加载一条腿的结果。**字段缺失／未知一律 fail-closed**，与
+    `load_edge_spec` 同一条规矩。
+
+    原来这里每个字段都带默认值，两条最危险的：
+      * `phase` 默认取 `expected_phase`——没写 phase 的文件永远"就是"调用方
+        要的那条腿，solvent 的结果被当 complex 读进来不会有任何抱怨；
+      * `energy_unit` 默认 kJ/mol——一份 kcal/mol 的结果漏写这个键就被当成
+        kJ/mol，而 `combine_rbfe` 只比较两腿是否**彼此**一致（两边都默认成
+        kJ/mol 就一致），于是 ΔΔG 静默差 4.184 倍。
+    单位和相是身份，不是"最好有"；缺了就是读不出来，不是可以猜。
+    """
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    phase = payload.get("phase", expected_phase)
+    if not isinstance(payload, dict):
+        raise rc.RBFEValidationError(f"{path} 顶层必须是对象，收到 {type(payload).__name__}")
+    # 未知字段一律拒绝：`n_effective_sample` 写漏一个 s，原来会静默记 0。
+    _reject_unknown(
+        payload,
+        {
+            "phase",
+            "edge_id",
+            "ligand_A",
+            "ligand_B",
+            "delta_g_A_to_B",
+            "stderr",
+            "energy_unit",
+            "uncertainty_method",
+            "n_effective_samples",
+            "quality_gate_passed",
+            "artifacts_fingerprint",
+        },
+        path,
+    )
+    phase = _require(payload, "phase", path)
     if phase != expected_phase:
         raise rc.RBFEValidationError(
             f"{path} 的 phase 是 {phase!r}，但这里需要 {expected_phase!r}"
@@ -183,11 +214,12 @@ def load_leg_result(path: str, expected_phase: str) -> rc.LegResult:
         ligand_b_name=_require(payload, "ligand_B", path),
         delta_g=float(_require(payload, "delta_g_A_to_B", path)),
         stderr=float(_require(payload, "stderr", path)),
-        energy_unit=payload.get("energy_unit", rc.KJ_PER_MOL),
-        uncertainty_method=payload.get("uncertainty_method", "unspecified"),
-        n_effective_samples=int(payload.get("n_effective_samples", 0)),
-        quality_gate_passed=bool(payload.get("quality_gate_passed", False)),
-        artifacts_fingerprint=payload.get("artifacts_fingerprint", ""),
+        energy_unit=_require(payload, "energy_unit", path),
+        uncertainty_method=_require(payload, "uncertainty_method", path),
+        # 未测到的 N_eff 不能当成 0 也不能当成满帧数——直接要求写出来。
+        n_effective_samples=int(_require(payload, "n_effective_samples", path)),
+        quality_gate_passed=bool(_require(payload, "quality_gate_passed", path)),
+        artifacts_fingerprint=_require(payload, "artifacts_fingerprint", path),
     )
 
 

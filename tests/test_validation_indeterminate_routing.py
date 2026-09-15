@@ -83,8 +83,29 @@ def test_splitting_is_driven_by_fk_only_never_by_insufficient_ess():
         for h in n.handlers if h.type is not None
     }
     assert "_ie.IBSWarmupConvergenceError" in str(caught), caught
-    # "没测出来"永远不许驱动布局动作
-    assert not any("Indeterminate" in c for c in caught), caught
+
+    # ——「没测出来」永远不许驱动布局动作 ——
+    # ⚠️ [2026-09-14] 判据从"不许有 handler"收紧成"handler 里不许做布局动作"。
+    # 原判据把两件事绑死了：它拦住的是**拆窗/插点**，但顺带也禁止了「接住它、
+    # 交给上层控制器」。而 `LOCAL_VALIDATION_CAP` 按约定是**路由信号**，一个
+    # handler 都不许有的结果是它直接炸穿 run_full_pipeline（真机 2026-09-14，
+    # 窗口 4），在自治控制器接管之前就把管线打死。
+    _layout = (
+        "insert_lambda_in_failed_ibs_window", "split_window_from_ibs_lse_failure",
+        "repartition_tail_from_anchor", "append_version", "record_",
+    )
+    for n in ast.walk(fn):
+        if not isinstance(n, ast.Try):
+            continue
+        for h in n.handlers:
+            if h.type is None or "Indeterminate" not in ast.unparse(h.type):
+                continue
+            hb = ast.unparse(h.body)
+            bad = [k for k in _layout if k in hb]
+            assert not bad, f"『没测出来』的 handler 里不许有布局动作: {bad}"
+            assert "return" in hb or "raise" in hb, (
+                "它只许原样交回上层（或原样上抛），不许自己发明补救"
+            )
     # 两种 reason 在版本链里必须分得清
     assert "ibs_warmup_f_k_not_converged" in src
     body = ast.unparse(fn)
@@ -129,10 +150,20 @@ def test_insertion_does_not_split_and_only_the_tail_grows():
     # 不拆窗：窗口数不变，只有末窗长大
     assert [b - a for a, b in new_r] == [8, 6, 4, 7]
     assert [tuple(r) for r in new_r[:-1]] == ranges[:-1]
-    # 现在（且只有现在）才可拆
-    assert feasible_repair_actions(
+    # 现在（且只有现在）末窗才**一分为二**得开：K=7 落进 [2·4−1, 2·8−1]。
+    # 🔑 [审计 #24，2026-09-14] 键从 `split_tail_window` 换成
+    # `split_last_window_in_two`：**测试的意图没变，变的是哪个键回答这个问题。**
+    # `split_tail_window` 现在指的是控制器那个**动作**的可行性，而那个动作的执行器
+    # 做的是「从 anchor 起重分整个尾段」（`repartition_tail_from_anchor`），
+    # 不是「末窗一分为二」—— 两个不同的问题，先前共用一个键。
+    # 本测试问的是后者（插 λ 让末窗长到可拆），所以读 `split_last_window_in_two`。
+    _feas = feasible_repair_actions(
         new_r, len(new_l), min_states_per_window=4, max_states_per_window=8
-    )["split_tail_window"] is None
+    )
+    assert _feas["split_last_window_in_two"] is None
+    # 而「从 anchor 起重分尾段」在没给起点时必须如实说「判不了」，
+    # **不得**拿上面那条冒充 —— 两个键必须是两个独立的答案。
+    assert isinstance(_feas["split_tail_window"], str)
 
 
 def test_indeterminate_state_is_persisted_and_restored():

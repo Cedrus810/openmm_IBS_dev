@@ -327,6 +327,9 @@ PRESET_CONFIGS = {
         "steps_per_update": 500,
         "stage1_n_states": 12,
         "stage2_n_states": 17,
+        # 见 production 预设里这两个键的说明（审计 #31）。
+        "stage2_production_budget_steps": None,
+        "stage2_max_production_blocks_per_window": 4,
     },
     "production": {
         "n_steps_per_window": 250000,
@@ -359,12 +362,25 @@ PRESET_CONFIGS = {
         # 重新定 N，不要沿用这个数。
         "stage1_n_states": 8,
         "stage2_n_states": 17,
+        # 🔑 [2026-09-14 审计 #31] Stage-2 控制器的三道预算闸，此前**全仓只有读侧**
+        # （`Stage2RepairController.__init__` 从 run_provenance.json 的 config 里读），
+        # 配置/预设/CLI 全都没有 ⟹ provenance 里永远没有这几个键 ⟹ 生产预算闸
+        # `cap_known=False` 从未生效过。默认值严格等于今天的硬编码兜底，行为不变：
+        #   · stage2_production_budget_steps = None —— 上限**未知**，不是 0。
+        #     控制器写死「未知时不拦」，所以 null 就是今天的行为；**不要**随手拍一个
+        #     具体数字，那等于给所有现存 run 引入一个没人验证过的终止条件。
+        #   · stage2_max_production_blocks_per_window = 4 —— 同 preoptimizer 兜底。
+        "stage2_production_budget_steps": None,
+        "stage2_max_production_blocks_per_window": 4,
     },
     "high_accuracy": {
         "n_steps_per_window": 500000,
         "steps_per_update": 500,
         "stage1_n_states": 24,
         "stage2_n_states": 17,
+        # 见 production 预设里这两个键的说明（审计 #31）。
+        "stage2_production_budget_steps": None,
+        "stage2_max_production_blocks_per_window": 4,
     },
 }
 
@@ -2836,6 +2852,14 @@ class RunConfig:
             preset["stage2_free_energy_densify_points"] = (
                 args.stage2_free_energy_densify_points
             )
+        if _flag_present("--stage2-production-budget-steps"):
+            preset["stage2_production_budget_steps"] = args.stage2_production_budget_steps
+        if _flag_present("--stage2-max-production-blocks-per-window"):
+            preset["stage2_max_production_blocks_per_window"] = (
+                args.stage2_max_production_blocks_per_window
+            )
+        if _flag_present("--max-path-insertions"):
+            preset["max_path_insertions"] = args.max_path_insertions
         if _flag_present("--temperature"):
             preset["temperature"] = args.temperature
         if _flag_present("--solvent-ionic-strength-molar"):
@@ -3796,7 +3820,14 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
     try:
         last_frame_pos = traj.xyz[-1] * unit.nanometer
         new_eq = calc_boresch_from_last_frame(
-            last_frame_pos, boresch["receptor_indices"], boresch["ligand_indices"]
+            last_frame_pos, boresch["receptor_indices"], boresch["ligand_indices"],
+            # BOR-01：这里上面刚 image + center 过，解缠应当是逐位恒等；
+            # 带上 box 是为了"不依赖调用点的口头保证"。
+            box_vectors=(
+                traj.unitcell_vectors[-1]
+                if getattr(traj, "unitcell_vectors", None) is not None
+                else None
+            ),
         )
         if source in ("simple", "fluctuation"):
             log.info(
@@ -4097,6 +4128,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage2-refine-extra-points", type=int, default=None, help="去VDW阶段 Fisher 探针在陡峭段自动加密时每段插入的额外探针点数；默认 4")
     parser.add_argument("--stage2-window-min-states", type=int, default=None, help="去VDW阶段每个窗口最少多少态（仅在 --stage2-final-n-states 设成非 23 时生效）；默认 4")
     parser.add_argument("--stage2-window-max-states", type=int, default=None, help="去VDW阶段每个窗口最多多少态（仅在 --stage2-final-n-states 设成非 23 时生效）；默认 6")
+    parser.add_argument("--stage2-production-budget-steps", type=int, default=None,
+                        help="[审计 #31] Stage-2 生产步数总上限（整个 stage 的 GPU 预算）。不传 = 保持配置/预设值；默认 null = **上限未知**，控制器不拦（未知 ≠ 0）。给它一个具体数字等于打开一个此前从未生效过的终止条件，请只在明知要限额时设。")
+    parser.add_argument("--stage2-max-production-blocks-per-window", type=int, default=None,
+                        help="[审计 #31] 每个采样单元（子窗/物理窗）最多补几块生产帧，`_frames_admission()` 的块数硬上限；默认 4，与 abfe_preoptimizer 的兜底一致。")
+    parser.add_argument("--max-path-insertions", type=int, default=None,
+                        help="[审计 #31] λ 插点的**终身**预算（跨 resume 从版本链数出，不是每次调用重置）；默认 3，与 abfe_preoptimizer / abfe_pipeline 的兜底一致。")
     parser.add_argument("--stage2-free-energy-densify-points", type=int, default=None, help="[路径协议 v22] 去VDW阶段自由能定向加密点数 k：基础布点用 (最终态数-k) 态，再按 pilot 实测 <dU/dλ> 在 |ΔF| 最大的边上贪心插 k 个点。**总态数不变，采样成本不变**，只是把节点从平坦中段挪到自由能陡峭段（通常是 λ≈1）。默认 0 = 关闭，布点与 v21 逐字节相同。4W53 实测：16 态下 14+2 使最大边 ΔF 从 13.6 降到 7.7 kJ/mol，δ_max 0.94→1.08")
     parser.add_argument("--temperature", type=float, default=300.0)
     parser.add_argument(
@@ -6225,6 +6262,16 @@ def _path_evolution_kwargs(config) -> dict:
     n_windows = config.get("stage2_n_windows")
     if n_windows is not None:
         out["stage2_n_windows"] = int(n_windows)
+    # 🔑 [2026-09-15] 耦合端（win0）专用的态数上限。理由与代价见 abfe_config.json
+    # 里同名键的 `_comment`；它进 `_PREOPT_DERIVED_PATH_KEYS`，改动作废全部窗口缓存。
+    first_cap = config.get("stage2_first_window_max_states")
+    if first_cap is not None:
+        out["stage2_first_window_max_states"] = int(first_cap)
+    # 🔑 [2026-09-15] 固定节奏重锚 f_k 的节奏（步）。缺省 500k = 1 ns @2fs。
+    # **不进指纹**（它只改控制器什么时候重锚，不改布局/协议）。
+    cadence = config.get("stage2_f_k_reanchor_cadence_steps")
+    if cadence is not None:
+        out["stage2_f_k_reanchor_cadence_steps"] = int(cadence)
     return out
 
 

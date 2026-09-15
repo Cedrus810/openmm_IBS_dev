@@ -170,12 +170,12 @@ ABFE_RANDOM_SEED 未设置时，main._repeat_seed = None
 | 优先级 | 补什么 | 当前证据 | 可检查的完成标准 |
 |---|---|---|---|
 | ~~预览版前~~ | ~~可安装的 Python 包与命令~~ | **2026-09-12 用户决定：不打包，已关闭。** 发布定位是 **clone-and-run**；`pyproject.toml` 只承担 linter 配置，不加 `[project]` / `[build-system]` / `setup.py` / `MANIFEST.in` | —（别再把「装不了」当阻塞项提；判据是 `pytest tests/test_fresh_clone_imports.py`） |
-| 预览版前 | 环境与支持矩阵 | `environment.yml` 含 `/home/canna/...` prefix 与 CUDA 12.9 开发工具链；文档写 Python 3.10+，CI 只测 3.12 | 基础环境与 GPU/ML 可选环境分离；声明已测版本组合；干净机器按文档安装成功；不依赖个人路径 |
+| 预览版前 | 环境与支持矩阵 | ~~文档写 Python 3.10+、CI 只测 3.12~~ **2026-09-12 已统一成 3.12**（`3.10+` 是搬集群之前的遗留，迁移后环境文件/CI/`pyproject.toml` 全是 3.12）。仍欠：CUDA 12.9 开发工具链、GPU/ML 可选环境未分离 ⟹ **2026-09-13 已登记为 [TODO.md](TODO.md) 的 `REL-08`**，以那边为准。（`/home/canna/...` prefix 那半条**已过期**：2026-09-13 实测 `environment.yml` 全文 grep 不到 `/home/`，个人路径早已清掉。） | 基础环境与 GPU/ML 可选环境分离；声明已测版本组合；干净机器按文档安装成功；不依赖个人路径 |
 | 预览版前 | 最新核心回归证据 | 8 月 31 日交接记录明确只有静态通过；本轮也缺必需运行依赖 | 锁定待发布源码，在完整环境跑 CPU 全套，记录 passed/failed/skipped；必需功能不能因 importorskip 被跳过后算通过；GPU smoke 另跑 |
 | ~~预览版前~~ | ~~小型端到端 fixture~~ | **2026-09-02 用户决定：不作为本仓的缺口，已关闭。** 本仓是**工程区分支**（见 [PROJECT_LAYOUT.md](../PROJECT_LAYOUT.md)），端到端贯通的证据是**真实生产运行本身**——4W53 那次热力学循环闭合就是走真实 `runabfe.py` 入口跑完的，原始轨迹、checkpoint 与产物在 `Atenolol-rank11`，不在本仓 | —（不要再在 `tests/` 里加"走真实 CLI 的小体系 fixture"当验收项；要复核贯通性去看生产运行的原始产物） |
 | 预览版前 | 用户可读的配置与运行诊断 | **2026-09-02 完成**：`doctor` / `validate-config` / `config-template` 三个只读命令已落地（`abfe_diagnostics.py`），覆盖依赖版本·平台·GPU·磁盘·GROMACS、配置未知键·取值·路径·参数来源，以及带说明和默认值的配置模板；均不启动 MD。`--help` 从 4.3 s 降到 ~2.2 s（torch/pymbar 改惰性 import）。**`dry-run` 按 2026-09-02 用户决定不做**——它要预测的东西里，静态部分（有哪些键、默认值、输出位置）由 `config-template` + `validate-config` 覆盖，而 Stage 2 的实际窗口划分是运行期 Fisher 探针的结果，任何"预演"都只能是猜 | `config-template` 生成的模板必须零错误通过 `validate-config`（已由 `test_template_round_trips_through_validate_config` 钉住） |
-| 预览版前 | 输出目录与长任务保护 | 有 checkpoint 和短时 pipeline state lock；未见覆盖整个作业生命周期的输出目录独占锁、SIGTERM 处理或磁盘预检 | 重复启动同一输出目录被明确拒绝；调度器中断后可从一致边界续跑；磁盘不足失败可解释；测试多文件写入中断 |
-| 预览版前 | 版本、发布清单与维护材料 | 当前 `.git` 不是有效 checkout；无项目级 LICENSE/CITATION；尚无软件版本及发布构建流水线 | 在真实上游 checkout 冻结版本；确定代码和数据授权；加入变更说明、引用信息、支持范围；构建产物不混入原始轨迹、旧副本和开发缓存 |
+| 预览版前 | 输出目录与长任务保护 | 有 checkpoint 和短时 pipeline state lock；未见覆盖整个作业生命周期的输出目录独占锁、SIGTERM 处理或磁盘预检 ⟹ **2026-09-13 已登记为 [TODO.md](TODO.md) 的 `REL-09`**，以那边为准 | 重复启动同一输出目录被明确拒绝；调度器中断后可从一致边界续跑；磁盘不足失败可解释；测试多文件写入中断 |
+| 预览版前 | 版本、发布清单与维护材料 | ~~无项目级 LICENSE~~ **已有**（MIT + NOTICE，2026-09-04）；~~CITATION~~ **2026-09-12 有意押后**：还在 dev，方法本身没做完，现在写引用信息就是承诺一个还不存在的东西。`.git` 已是有效 checkout。仍欠：软件版本号与变更说明 ⟹ **2026-09-13 已登记为 [TODO.md](TODO.md) 的 `REL-10`**，以那边为准 | 冻结版本；加入变更说明与支持范围；构建产物不混入原始轨迹、旧副本和开发缓存。**CITATION 等方法定稿再写，别当缺口反复提** |
 | 稳定生产版前 | 跨体系 benchmark 与误差验收 | TODO 中仍有基准与统计口径课题；历史最终文件名不代表结果合格 | 对声明支持的范围提供公开输入、冻结配置、独立 seed、环境、原始分析证据和复现脚本；记录不确定度方法与失败项；在运行前固定验收标准 |
 
 配置兼容特别说明：`runabfe.py:2360` 已记录未知键硬拒绝曾因影响 resume 被撤回。
