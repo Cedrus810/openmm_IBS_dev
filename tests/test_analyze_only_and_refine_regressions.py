@@ -210,7 +210,12 @@ def test_fallback_branch_checks_expected_window_count_and_uses_shared_helper():
     shared = inspect.getsource(ibs_engine.load_ibs_window_outputs_from_dir)
     assert "_assert_expected_windows_all_loaded(" in shared
     assert "_load_validated_window_data_triplet(" in shared
-    assert "production_entry_f_k" in shared
+    # [2026-09-14] 生产入口标记的解析搬进了 `_resolve_analysis_f_k()`（分析要用的
+    # 是**生成这批帧的那份 f_k**，不是状态文件里活的那份；两个字段语义不同）。
+    # 判据跟着搬，仍然钉住"这条路径确实读了生产入口标记"。
+    assert "_resolve_analysis_f_k(" in shared
+    assert "production_entry_f_k" in inspect.getsource(
+        ibs_engine._resolve_analysis_f_k)
 
 
 # ---------------------------------------------------------------------------

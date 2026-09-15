@@ -10,7 +10,7 @@
 
 建议使用 conda/mamba 环境。核心依赖包括：
 
-- Python 3.10+
+- **Python 3.12**（环境文件、CI 与 `pyproject.toml` 的 `target-version` 都是它）
 - OpenMM
 - NumPy
 - SciPy
@@ -216,6 +216,9 @@ python runabfe.py \
 
   "pilot_finite_difference_delta": 0.01,
 
+  "stage2_production_budget_steps": null,
+  "stage2_max_production_blocks_per_window": 4,
+
   "enable_lambda_refine": false,
 
   "resume": false,
@@ -224,6 +227,20 @@ python runabfe.py \
 ```
 
 注意：仓库里的 `gmx_path` 是机器相关路径，换机器运行前必须检查。当前配置刻意保留 `enable_lambda_refine=false`，以免覆盖已有的 Stage 2 尾部局部修复；不要在不了解 `abfe_config.json` 中 `_comment_lambda_refine` 背景的情况下直接打开。
+
+### Stage-2 控制器的三道预算闸（2026-09-14 补齐）
+
+`abfe_preoptimizer.Stage2RepairController` 从 `run_provenance.json` 的 `config` 里读这三个键。
+在 2026-09-14 之前它们**只有读侧**（配置文件、preset 默认值、CLI 三处都没有），于是 provenance
+里永远不会出现，生产预算闸 `cap_known=False`、**从未生效过**。现在前两个键在三处都补齐，
+默认值等于原来的硬编码兜底，行为逐位不变；第三个 `max_path_insertions` **刻意只补 CLI**，
+不给配置文件默认值也不给 preset 默认值 —— 理由见表格里那一行。
+
+| 键 | 默认值 | CLI flag | 含义 |
+|---|---|---|---|
+| `stage2_production_budget_steps` | **`null`** | `--stage2-production-budget-steps` | Stage-2 生产步数总上限。**`null` = 上限未知，不是 0** —— 控制器写死「未知不是零，未知时不拦」，所以 `null` 就是今天的行为。⚠️ 给它拍一个具体数字等于给所有现存 run 引入一个此前从未生效过的终止条件（`plan()` 里的统一闸会把花 GPU 的动作改写成 `NO_ACTION` + `GLOBAL_BUDGET_EXHAUSTED`），只在明知要限额时才设。 |
+| `stage2_max_production_blocks_per_window` | `4` | `--stage2-max-production-blocks-per-window` | `_frames_admission()` 的块数硬上限：每个采样单元（子窗 / 物理窗）最多补几块生产帧。缺省绝不能是无限 —— 那正是 09-14 修掉的「一路 25→150 万步」行为。 |
+| `max_path_insertions` | `3`（读侧兜底，**不写进配置/preset**） | `--max-path-insertions` | λ 插点的**终身**预算，跨 resume 从版本链数出（不是每次调用归零）。⚠️⚠️ 与上面两个不同：它会经 `runabfe._path_evolution_kwargs` 进 **stage 协议指纹**，而那个函数只在该键被**显式配置**时才发出它。所以给它任何默认值（配置文件或 preset）都会让先前没配过这个键的 run 其 Stage 1/2 **结果**缓存全部失配重跑（Stage 1 实测 ~28 分钟/指纹）。要调它只用 CLI —— 那条路径只在你真的传了它时才改指纹。窗口轨迹缓存任何情况下都不受影响（该键在 `ibs_engine._stage_window_sampling_identity` 里被显式摘掉）。 |
 
 ## 命令入口
 

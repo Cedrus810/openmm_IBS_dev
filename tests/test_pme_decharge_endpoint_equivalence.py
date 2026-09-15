@@ -167,6 +167,28 @@ def _build_reference_system(
     return system, positions_nm * unit.nanometer
 
 
+def _add_reference_intramolecular_coulomb(system, lam: float) -> int:
+    """参考侧：把 ≥1-5 普通 L–L 库仑按 (1-λ²) 补回全强度（v5 口径）。
+
+    对表由本 fixture 自己的拓扑约定枚举（`sep >= 4` 即普通非键），**不**复用被测
+    实现的排除表收集器 —— 参考实现必须独立，否则就是自己跟自己对账。
+    """
+    lig_q = np.asarray(_LIGAND_Q_E, dtype=float)
+    force = openmm.CustomBondForce("c*chargeProd/r")
+    force.addPerBondParameter("chargeProd")
+    force.addGlobalParameter("c", 138.935456 * (1.0 - float(lam) ** 2))
+    n = 0
+    for i in range(_N_LIG):
+        for j in range(i + 1, _N_LIG):
+            if j - i < 4:
+                continue
+            force.addBond(i, j, [float(lig_q[i] * lig_q[j])])
+            n += 1
+    assert n == _n_normal_ll_pairs(system), "参考侧对表与 fixture 的普通 L–L 对数不符"
+    system.addForce(force)
+    return n
+
+
 def _n_normal_ll_pairs(system: openmm.System, n_lig: int = _N_LIG) -> int:
     """普通非键（无 exception 覆盖）的 L–L 对数 —— 这些正是被转成 exception 的对。"""
     nb = next(f for f in system.getForces() if isinstance(f, NonbondedForce))
@@ -248,12 +270,22 @@ def test_configuration_must_not_add_or_remove_exceptions():
 
 @pytest.mark.parametrize("lam", [0.0, 0.25, 0.5, 0.75, 1.0])
 def test_every_lambda_matches_direct_charge_scaling_reference(lam):
-    """配置后 System(λ) ≡ 粒子电荷直接乘 λ 的参考 System，对所有 λ 成立。
+    """配置后 System(λ) ≡ 独立参考 System，对所有 λ 成立。
 
-    这同时钉住 λ=0 与中间态的 ligand-internal 口径：普通 L–L 库仑随 λ 线性
-    湮灭、既有 exception 冻结 —— 正是参考实现所做的事。
+    这同时钉住 λ=0 与中间态的 ligand-internal 口径。
+
+    ⚠️ **2026-09-14（PME_DECHARGE_MODEL_VERSION v4 → v5）参考实现改了**：
+    v4 的参考是「粒子电荷直接乘 λ」，即普通 L–L 库仑随 λ² 一起湮灭。那个口径本身
+    是缺陷（见 `tests/test_intramolecular_coulomb_is_lambda_independent.py`：湮灭项
+    的两腿之差 −88.7 kJ/mol 恰好是某体系 ΔG_bind 的全部误差）。v5 的参考因此是
+    「粒子电荷乘 λ **加上** 把 ≥1-5 普通 L–L 库仑按 (1-λ²) 补回全强度」。
+
+    参考侧的补偿项在本文件里**独立构造**（对表直接由本 fixture 自己的拓扑约定
+    `sep >= 4` 枚举，不调用 `abfe_core.create_ligand_internal_coulomb_force`），
+    所以它仍然是独立参考，不是拿被测实现自己对自己。
     """
     ref_sys, positions = _build_reference_system(ligand_charge_scale=lam)
+    _add_reference_intramolecular_coulomb(ref_sys, lam)
     e_ref, f_ref = _energy_and_forces(ref_sys, positions)
 
     cfg_sys, positions2 = _build_reference_system()

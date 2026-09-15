@@ -51,7 +51,9 @@ import free_energy_engine as fee
 import rbfe_core as rc
 
 #: 编排层协议版本。改变运行目录布局、身份指纹构成或重复聚合口径都必须 +1。
-RBFE_PIPELINE_PROTOCOL_VERSION = 1
+#: v2（2026-09-14）：`leg_identity` 移出 `n_steps_per_state`（目标步数是执行参数
+#: 不是身份，见该函数 docstring）。
+RBFE_PIPELINE_PROTOCOL_VERSION = 2
 
 #: 运行目录里的固定文件名（计划 §7）。
 MANIFEST_NAME = "edge_manifest.json"
@@ -136,18 +138,24 @@ def leg_identity(
     backend: Optional[fee.BackendResolution] = None,
     **kwargs: Any,
 ) -> dict:
-    """一条腿的采样身份 = 边身份 + 相 + 采样预算 + 实际后端。
+    """一条腿的采样身份 = 边身份 + 相 + 随机源 + 实际后端。
 
     后端进**腿**的身份而不是边的身份：换后端会让已采的样本不可续接（计划 §4.3
     「禁止跨后端直接加载动态 checkpoint 或向旧后端的未完成 DCD 追加帧」），
     但不该让映射和建系那一步作废。
+
+    🔑 **`n_steps_per_state` 故意不在这里**：它是目标步数，是执行参数不是身份。
+    同一个 seed、同一张 λ 表、同一个后端下，跑 1M 步的轨迹就是跑 500k 步那条的
+    延长——把预算写进 resume 身份，等于"想多跑一点"必须把已经烧掉的 GPU 全部
+    作废重来。ABFE 那边为这条规矩付过账（`max_bias_warmup_steps` 进
+    `stage_protocol_key` 导致全部窗口缓存作废）。跑了多少步属于产物的记账，
+    由 `StepPlan` / 落盘的 `n_steps` 负责，不属于"这两份样本能不能混"。
     """
     if phase not in rc.RBFE_PHASES:
         raise ValueError(f"phase 必须是 {rc.RBFE_PHASES} 之一：{phase!r}")
     payload = {
         "edge": edge_identity(spec, **kwargs),
         "phase": phase,
-        "n_steps_per_state": int(spec.protocol.n_steps_per_state),
         "seed": int(spec.protocol.seed),
     }
     if backend is not None:
@@ -271,8 +279,11 @@ def assert_reusable(
         )
 
     new = edge_identity(spec, **identity_kwargs)
+    # 用 new.get() 而不是 new[k]：k 来自两边键名的并集，旧 manifest 里有而当前
+    # 身份里没有的键（改过身份构成时必然出现）会让 new[k] 抛 KeyError，
+    # 调用方只 catch RBFEResumeError，于是"拒绝复用"变成未捕获异常炸穿。
     diffs = [
-        f"{k}: 已有={old.get(k)!r} 现在={new[k]!r}"
+        f"{k}: 已有={old.get(k)!r} 现在={new.get(k)!r}"
         for k in sorted(set(old) | set(new))
         if old.get(k) != new.get(k)
     ]
@@ -527,7 +538,15 @@ class NetworkReport:
     energy_unit: str
 
     @property
-    def all_cycles_close(self) -> bool:
+    def all_cycles_close(self) -> Optional[bool]:
+        """所有环都闭合吗？**没有环时返回 None，不是 True。**
+
+        `all([])` 是 True：一张树状/星状的边网络（小规模 RBFE 最常见的形状）
+        一个环都没有，闭合检查一次都没做过，却会报"全部闭合"。
+        那是"没得查"，不是"查过了都过"。
+        """
+        if not self.cycles:
+            return None
         return all(c.passes() for c in self.cycles)
 
     def to_dict(self) -> dict:
@@ -551,6 +570,30 @@ class NetworkReport:
                 "「所有边共享同一个系统性偏差」完全不敏感（计划 §7）。"
             ),
         }
+
+
+def _index_edges(edges: Sequence[NetworkEdge]) -> tuple:
+    """把边表索引成 (directed, adjacency)，并在这里**一次性**执行"同一对配体
+    只能有一条边"这条规则。
+
+    原来这条规则只写在 `analyze_network` 里，`absolute_from_anchor` 自己又写了
+    一遍索引循环、却不查重：同一对配体给两条边时它静默留下最后一条，A→B 与
+    B→A 同时存在时走哪条取决于 BFS 的遍历顺序 —— 同一份输入两个函数一个拒绝
+    一个照算。一条不变量只许有一份实现。
+    """
+    directed: dict = {}
+    adjacency: dict = {}
+    for e in edges:
+        key = (e.ligand_a, e.ligand_b)
+        if key in directed or (e.ligand_b, e.ligand_a) in directed:
+            raise RBFEPipelineError(
+                f"重复边 {e.ligand_a}→{e.ligand_b}（同一对配体只应有一条边；"
+                "要合并多次测量请先聚合成一条）"
+            )
+        directed[key] = e
+        adjacency.setdefault(e.ligand_a, set()).add(e.ligand_b)
+        adjacency.setdefault(e.ligand_b, set()).add(e.ligand_a)
+    return directed, adjacency
 
 
 def _connected_components(nodes: set, adjacency: dict) -> list:
@@ -593,20 +636,8 @@ def analyze_network(
         raise RBFEPipelineError(f"网络里混了多种单位：{sorted(units)}")
     unit = units.pop()
 
-    nodes: set = set()
-    adjacency: dict = {}
-    directed: dict = {}
-    for e in edges:
-        nodes.update((e.ligand_a, e.ligand_b))
-        adjacency.setdefault(e.ligand_a, set()).add(e.ligand_b)
-        adjacency.setdefault(e.ligand_b, set()).add(e.ligand_a)
-        key = (e.ligand_a, e.ligand_b)
-        if key in directed or (e.ligand_b, e.ligand_a) in directed:
-            raise RBFEPipelineError(
-                f"重复边 {e.ligand_a}→{e.ligand_b}（同一对配体只应有一条边；"
-                "要合并多次测量请先聚合成一条）"
-            )
-        directed[key] = e
+    directed, adjacency = _index_edges(edges)
+    nodes: set = set(adjacency)
 
     components = _connected_components(nodes, adjacency)
 
@@ -708,17 +739,15 @@ def absolute_from_anchor(
     if len(units) != 1:
         raise RBFEPipelineError(f"锚点与网络单位不一致：{sorted(units)}")
 
-    directed: dict = {}
-    adjacency: dict = {}
-    for e in edges:
-        directed[(e.ligand_a, e.ligand_b)] = e
-        adjacency.setdefault(e.ligand_a, set()).add(e.ligand_b)
-        adjacency.setdefault(e.ligand_b, set()).add(e.ligand_a)
+    # 与 analyze_network 共用同一份索引与查重规则（见 _index_edges）。
+    directed, adjacency = _index_edges(edges)
 
     if anchor.ligand not in adjacency:
         raise RBFEPipelineError(f"锚点配体 {anchor.ligand!r} 不在网络里")
 
-    # 广度优先：跳数最少的路径 = 累加误差最小的路径
+    # 广度优先：取**跳数最少**的路径。注意这不等于误差最小的路径——一条 stderr
+    # 很大的直连边会赢过两条很精确的边。跳数少通常误差也小，但那是经验不是定理；
+    # `hops_from_anchor` 如实报出来，让读的人能自己判断。
     absolute = {
         anchor.ligand: {
             "delta_g_bind": float(anchor.delta_g_bind),

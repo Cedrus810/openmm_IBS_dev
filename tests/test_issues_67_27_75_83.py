@@ -356,7 +356,9 @@ def test_extending_budget_keeps_physical_continuation_but_not_completed_reuse(tm
         conv, GOOD_SHAPE, LC_WIN, LV_WIN, REPAIR_POLICY, LSE_TOL, False,
         EARLY_STOP_CONFIG, TARGET_STEPS*2, current_stage_protocol_key=new_key)
     assert status["stage_protocol_match"] is True
-    assert status["early_stop_ok"] is False
+    # [2026-09-14] 同一条证明（"跑短了的缓存不算已完成"），换成正确的字段：
+    # 挡住它的是纯进度判据 step_budget_ok，不是 early-stop 身份。
+    assert status["step_budget_ok"] is False
     assert status["usable"] is False  # A short run is not already complete.
     manifest = ie._build_production_window_checkpoint_manifest("coul", 0, 3, "same-window-system", LC_WIN, LV_WIN, None, None, [0.]*3, 300., "Reference")
     manifest["stage_protocol_key"] = old_key

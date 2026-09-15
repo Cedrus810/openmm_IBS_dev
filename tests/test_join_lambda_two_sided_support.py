@@ -88,7 +88,37 @@ def test_both_gauges_give_the_same_answer(tmp_path):
     assert a["gauge"] == "sampling_states" and b["gauge"] == "energies"
     for side in ("upstream", "downstream"):
         assert a[side]["raw_ess"] == pytest.approx(b[side]["raw_ess"], rel=1e-9)
-        assert a[side]["tau_int"] == pytest.approx(b[side]["tau_int"], rel=1e-9)
+        assert a[side]["statistical_inefficiency_g"] == pytest.approx(
+            b[side]["statistical_inefficiency_g"], rel=1e-9
+        )
+        # [2026-09-14] 这个量是**统计低效率 g**，09-14 之前被错落成 `tau_int`。
+        # 新产物**只写** `statistical_inefficiency_g`、不再写 `tau_int` —— 保留一个
+        # "名字不变、值变成真 τ" 的别名会让漏改的读点静默差一倍。漏改的读点现在
+        # 在新产物上拿到 None（看得见）。下面两条钉的就是这个最终决定：
+        #   · 新键必须在，且 **g >= 1**（`g = 1 + 2τ_int ≥ 1` 是恒真的；真出现
+        #     g < 1 只能是这个键里被塞了 τ，当场红）；
+        #   · `tau_int` 这个名字不得出现在新产物里。
+        # 「万一 `tau_int` 回来了必须装真 τ」那条由
+        # tests/test_audit_2026_09_14_controller_budget.py 钉着，不在这里重复一份。
+        for side_dict in (a[side], b[side]):
+            assert side_dict["statistical_inefficiency_g"] >= 1.0, side_dict
+        assert "tau_int" not in a[side] and "tau_int" not in b[side]
+
+
+def test_the_recommended_read_pattern_gets_g_from_both_old_and_new_products():
+    """[2026-09-14] 读点的正确写法，钉在这里当契约。
+
+    历史产物的 `tau_int` 键装的**一直是 g**（名字错、值对），新产物只写
+    `statistical_inefficiency_g`。所以读点写成带回退的形式时，新旧产物拿到的
+    **都是 g**，语义一致；而漏改的读点在新产物上拿到 `None`（显式缺失、看得见），
+    不是一个悄悄减半的数 —— 这正是不保留"同名改值"别名的理由。
+    """
+    def read(d):
+        return d.get("statistical_inefficiency_g", d.get("tau_int"))
+
+    assert read({"statistical_inefficiency_g": 6.85}) == 6.85   # 新产物
+    assert read({"tau_int": 6.85}) == 6.85                      # 旧产物：值就是 g
+    assert read({}) is None                                     # 漏改 ⟹ 看得见
 
 
 def test_transposition_of_the_two_arrays_is_opposite(tmp_path):
@@ -150,8 +180,12 @@ def test_controller_reads_the_join_artifacts(tmp_path):
     (run / "vanishing" / "dual_join_0_1_vdw_support.json").write_text(json.dumps({
         "protocol_version": 1, "gauge": "sampling_states", "join_lambda_vdw": 0.5407,
         "upstream_window": 0, "downstream_window": 1,
-        "upstream": {"raw_ess": 13.21, "tau_int": 6.85, "top1pct_weight": 0.545},
-        "downstream": {"raw_ess": 240.56, "tau_int": 4.12, "top1pct_weight": 0.033},
+        # [2026-09-14] 这两个实测值一直是**统计低效率 g**（当年被错落成
+        # `tau_int`，名字错、值对）。按真实语义改名，新键不再带 `tau_int`。
+        "upstream": {"raw_ess": 13.21, "statistical_inefficiency_g": 6.85,
+                     "top1pct_weight": 0.545},
+        "downstream": {"raw_ess": 240.56, "statistical_inefficiency_g": 4.12,
+                       "top1pct_weight": 0.033},
         "downstream_over_upstream_raw_ess": 18.21,
         "asymmetry_direction": "downstream_better",
     }))
@@ -200,7 +234,12 @@ def test_self_support_is_sufficient_for_a_healthy_window(tmp_path):
     # `sufficient` 现在的含义是 ANALYSIS_ELIGIBLE（可以进入分析），不是"通过验收"
     assert r["sufficient"] is True
     assert r["verdict"] == "ANALYSIS_ELIGIBLE"
-    assert r["frames_short_by"] == 0
+    # [2026-09-13] **健康窗口的 `frames_short_by` 是 `None`，不是 0。**
+    # 它是**去相关帧数**的缺口，只在去相关这一关真的没过时才有意义
+    # （`ibs_engine.py`：`max(0, floor - n_dec) if n_dec < floor else None`）。
+    # 旧断言要 0，那正是被删掉的语义：真机据此印出过「还差 0 帧」这种自相矛盾的话。
+    # 现在 None 的含义是「帧数这一关不是问题」，让调用方能把"缺帧"和"缺有效样本"分开。
+    assert r["frames_short_by"] is None
     assert r["remedy"] is None
     assert len(r["statistical_inefficiency_per_lambda"]) == 4, "逐态 g 剖面要给全"
 
@@ -404,7 +443,18 @@ def test_controller_puts_recalibration_before_adding_frames(tmp_path):
                         "cumulative_production_steps": 250000,
                         "n_steps_per_window_effective": 250000,
                         "production_segments": [{}],
-                        "window_data": {"n_frames": 500}}))
+                        "window_data": {"n_frames": 500},
+                        # 🔑 [2026-09-13] **预算台账必须造。** 缺了它
+                        # `warmup_steps_left is None` ⟹ 预算可行性判
+                        # `budget_unknown_fail_closed`，而那道门排在**所有**动作选择
+                        # 之前（design §决策顺序），于是本测试想钉的 f_k 探针分支
+                        # 一步都走不到，动作被兜成 RUN_PRODUCTION。
+                        # fail-closed 本身是对的（不知道付不付得起验证就别开新
+                        # Epoch），所以修 fixture、不是修那道门。
+                        "bias_warmup": {"warmup_budget_ledger": {
+                            "learning_steps": 50000,
+                            "cumulative_cap_steps": 555000,
+                        }, "bias_update_count": 12}}))
         (ck / f"ibs_state_vdw_window_{i}.json").write_text(json.dumps(
             {"bias_status": "converged", "f_k_evidence_status": "verified",
              "frozen_validation_cumulative_steps": 0, "lambdas_vdw": lam}))

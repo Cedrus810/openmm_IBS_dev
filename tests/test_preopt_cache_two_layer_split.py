@@ -274,6 +274,14 @@ def _production_shaped(**overrides):
         "stage2_free_energy_densify_points": 2,
         "stage2_window_min_states": 4,
         "stage2_window_max_states": 5,
+        # 🔑 [2026-09-15] 这两个键同期进了 `_PREOPT_DERIVED_PATH_KEYS`：
+        # `stage2_window_partition`（一直漏着的）与 `stage2_first_window_max_states`
+        # （新加的耦合端上限）。本夹具自称"production shaped"，就得跟着长。
+        # 下面 `all(value is not None)` 那条断言的牙就在这里 —— 它刚刚正确地
+        # 咬到了"加了派生键却没更新夹具"。
+        "stage2_window_partition": "metric_integral",
+        "stage2_first_window_max_states": 4,
+        "stage2_n_windows": 6,
         "stage2_refine_extra_points_per_segment": 4,
     }
     payload.update(overrides)

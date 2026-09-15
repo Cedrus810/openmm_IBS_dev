@@ -1577,10 +1577,16 @@ class AtomMapping:
         换了映射 ⇒ 哈希变 ⇒ 旧产物不可复用（计划 §7 的硬要求）。
         故意**不含** `atom_identity_*`：那是给人看的审计信息，改个原子名不该
         让已经跑完的采样作废。
+
+        同理故意**不含** `method`：它是"走了哪条代码路径"的标签，不是身份。
+        `..._mcs_unavailable_conservative`（这台机器没装 rdkit）与
+        `..._mcs_disabled_conservative`（用户给了 --no-mcs）会给出**逐位相同**的
+        core/a_only/b_only，却曾经算出两个不同的指纹 ⟹ 换台机器重跑就被
+        `assert_reusable` 判成"换了映射"、整条边的 GPU 采样作废。
+        映射的内容已经完整地在下面的 payload 里了，method 一个 bit 都没加。
         """
         payload = {
             "v": int(self.protocol_version),
-            "method": self.method,
             "core": [[int(a), int(b)] for a, b in self.core_pairs],
             "a_only": [int(i) for i in self.a_only],
             "b_only": [int(i) for i in self.b_only],
@@ -1796,6 +1802,21 @@ def validate_mapping(
 
     index_a = {graph_a.local_index(i): i for i in graph_a.indices}
     index_b = {graph_b.local_index(i): i for i in graph_b.indices}
+
+    # 🔑 下面两条判据（元素改变、环断裂）都靠 index_a/index_b 把分子内索引翻回
+    # 图里的原子。原来对翻不出来的 core pair 直接 `continue`——映射与图对不上时，
+    # 这两条"首版明令拒绝"的判据就被静默跳过、报告照样 PASS。
+    # 先在这里 fail-closed 一次，两个循环的 `continue` 就再也不会真的发生。
+    orphan = [
+        (int(a), int(b))
+        for a, b in mapping.core_pairs
+        if a not in index_a or b not in index_b
+    ]
+    if orphan:
+        report.errors.append(
+            f"core_pairs 里有 {len(orphan)} 对索引在所给的图里不存在（例如 {orphan[:4]}）"
+            "——这份映射不是从这两个图算出来的，元素改变与环断裂判据无法执行"
+        )
 
     # 化学一致性：元素必须相同（计划 §2 的"映射元素改变"）
     element_changes = []
@@ -3271,9 +3292,26 @@ def verify_hybrid_forces_finite_difference(
 
     rng = np.random.default_rng(seed)
     n_particles = positions.shape[0]
-    picks = [
+    n_samples = int(n_samples)
+
+    # 🔑 抽样必须**结构上**覆盖炼金区，不能靠运气。原来是在全体粒子上均匀抽：
+    # 真实溶剂化体系里炼金原子只有几十个、总粒子七万个，12 个点抽中一个的概率
+    # ≈1%——而本函数 docstring 声称测的正是那几个手写的 softcore 分母。
+    # 小体系的单元测试（fixture 几乎全是炼金原子）永远看不出这一点。
+    # 现在前一半的点在 dummy 与 core 之间交替抽（两类手写力各自覆盖），
+    # 后一半仍抽全体（环境侧的 native 力也要测）。
+    dummies = sorted(set(bundle.layout.a_only) | set(bundle.layout.b_only))
+    core = sorted(set(bundle.layout.core))
+    alchemical = sorted(set(bundle.layout.alchemical))
+    n_alch = min(n_samples // 2, len(alchemical))
+    picks = []
+    for i in range(n_alch):
+        pool = dummies if (dummies and (i % 2 == 0 or not core)) else core
+        pool = pool or alchemical
+        picks.append((int(pool[int(rng.integers(0, len(pool)))]), int(rng.integers(0, 3))))
+    picks += [
         (int(rng.integers(0, n_particles)), int(rng.integers(0, 3)))
-        for _ in range(int(n_samples))
+        for _ in range(n_samples - n_alch)
     ]
 
     rows = []
@@ -3312,6 +3350,8 @@ def verify_hybrid_forces_finite_difference(
         "lambda_values": parameters,
         "delta_nm": float(delta_nm),
         "n_samples": len(rows),
+        #: 其中有多少个点落在炼金区（core/dummy）——"测了多少"要能被读出来。
+        "n_alchemical_samples": int(n_alch),
         "worst_relative_deviation": float(worst),
         "samples": rows,
         "passed": all(row["passed"] for row in rows),
@@ -3577,11 +3617,16 @@ def analyze_leg(
     delta_g = convert_energy(delta_g_kj, KJ_PER_MOL, energy_unit)
     stderr = convert_energy(stderr_kj, KJ_PER_MOL, energy_unit)
 
+    # MBAR 的 ESS 算不出来时（`compute_effective_sample_number()` 抛错），原来
+    # 退回**原始帧数** `n_frames`——把"没测到"报成最乐观的那个数，任何下游
+    # "N_eff 够不够"的门都会被这个假数字放行。未知只能往保守方向记，并把
+    # 原因写进 diagnostics，不许伪装成一次测量。
     effective = solved.get("diagnostics", {}).get("effective_sample_number")
-    if isinstance(effective, (list, tuple)) and effective:
+    n_effective_measured = isinstance(effective, (list, tuple)) and bool(effective)
+    if n_effective_measured:
         n_effective = int(min(float(v) for v in effective))
     else:
-        n_effective = int(solved.get("n_frames", matrix["n_samples"]))
+        n_effective = 0
 
     fingerprint_payload = {
         "hybrid_fingerprint": matrix["hybrid_fingerprint"],
@@ -3616,6 +3661,8 @@ def analyze_leg(
     diagnostics = {
         "u_kn_shape": list(matrix["u_kn"].shape),
         "n_k": matrix["n_k"].tolist(),
+        #: False 时上面的 n_effective_samples=0 是"没测到"，不是"一个有效样本都没有"。
+        "n_effective_samples_measured": bool(n_effective_measured),
         "includes_pV": matrix["includes_pV"],
         "min_overlap": solved.get("min_overlap"),
         "converged": solved.get("converged"),

@@ -22,7 +22,7 @@ LJ 长程修正、缓存、续跑和 fail-closed 质量门。
 
 ## 1. 环境
 
-核心依赖：Python 3.10+、OpenMM、NumPy、SciPy、MDTraj、PyMBAR。GPU 生产运行还需要
+核心依赖：**Python 3.12**、OpenMM、NumPy、SciPy、MDTraj、PyMBAR。GPU 生产运行还需要
 匹配的 CUDA 或 OpenCL。仓库提供 `environment.yml`，但其中包含 CUDA 版本和原机器的
 环境选择，**安装到其他主机前必须审阅**。
 

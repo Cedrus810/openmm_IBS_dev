@@ -1598,6 +1598,69 @@ def minimum_image_displacement_nm(displacement, box_vectors) -> np.ndarray:
             )
 
 
+def box_vectors_to_nm_array(box_vectors) -> Optional[np.ndarray]:
+    """把 OpenMM Quantity / list-of-Vec3 / 裸数组的周期盒归一成 (3,3) nm 数组。
+
+    唯一实现放在这里（`ibs_engine._box_vectors_to_nm_array` 是它的别名），因为
+    `unwrap_boresch_anchors_nm` 与 co-ion 的几何判据在本层就要用。
+    盒信息缺失或形状不对返回 `None`，由调用方决定是 fail-closed 还是跳过。
+    """
+    if box_vectors is None:
+        return None
+    if hasattr(box_vectors, "value_in_unit"):
+        return np.asarray(box_vectors.value_in_unit(unit.nanometer), dtype=np.float64)
+    if isinstance(box_vectors, np.ndarray):
+        return box_vectors.astype(np.float64, copy=False)
+    if isinstance(box_vectors, (list, tuple)):
+        if len(box_vectors) != 3:
+            return None
+        first = box_vectors[0]
+        if hasattr(first, "x"):
+            return np.asarray([[v.x, v.y, v.z] for v in box_vectors], dtype=np.float64)
+        return np.asarray(box_vectors, dtype=np.float64)
+    return None
+
+
+def unwrap_boresch_anchors_nm(rec_coords, lig_coords, box_vectors) -> np.ndarray:
+    """把 6 个 Boresch 锚点解缠到同一个周期像，返回 (6,3) 的 [H0,H1,H2,L0,L1,L2]。
+
+    **BOR-01**：这是本仓库 Boresch 六锚点解缠的唯一实现。原先只有校验那份
+    （`ibs_engine._check_boresch_geometry_safe`）解缠，而真正把 r0/θ/φ 写进限制势的
+    `calc_boresch_from_last_frame` 用的是裸 `norm(a-b)`。锚点对一旦跨周期边界，
+    提交的 r0 就静默差一个盒矢量（~4–5 nm），校验函数因为自己解了缠**反而看不出分歧**。
+    跟"同一个不变量的 N 份实现"是同一个形状（λ 身份那次是四份）。
+
+    解缠链与校验那份一致：H0→H1→H2 与 H0→L0→L1→L2（逐跳，不是全部对 H0）。
+
+    平移量取**整数格矢**（`raw - ((raw-ref) - minimum_image(raw-ref))`）而不是
+    `ref + minimum_image(raw-ref)`：没跨边界时格矢恰为 0.0，返回坐标与输入**逐位相同**，
+    既有 Boresch 平衡值不会被一次浮点重排整体作废。
+
+    `box_vectors` 为 `None`（或无法解析成 (3,3)）时原样返回 —— 等于调用方声明
+    这组坐标已经连续（例如 `runabfe` 里刚跑过 `image_molecules_by_system`）。
+    """
+    anchors = np.asarray(
+        [np.asarray(p, dtype=np.float64) for p in (*rec_coords, *lig_coords)],
+        dtype=np.float64,
+    )
+    if anchors.shape != (6, 3):
+        raise ValueError(f"Boresch 锚点解缠需要 3+3 个点，实得 {anchors.shape}")
+    box = box_vectors_to_nm_array(box_vectors)
+    if box is None:
+        return anchors
+
+    def _to(ref, raw):
+        delta = raw - ref
+        return raw - (delta - minimum_image_displacement_nm(delta, box))
+
+    H0 = anchors[0]
+    H1 = _to(H0, anchors[1])
+    H2 = _to(H1, anchors[2])
+    L0 = _to(H0, anchors[3])
+    L1 = _to(L0, anchors[4])
+    L2 = _to(L1, anchors[5])
+    return np.asarray([H0, H1, H2, L0, L1, L2], dtype=np.float64)
+
 def co_alchemical_ion_anchor_atom_index(
     *,
     system: Any,
@@ -2575,6 +2638,89 @@ BENCHMARK_MAX_MAE_KCAL_PER_MOL = 1.5
 BENCHMARK_MAX_ABS_OUTLIER_KCAL_PER_MOL = 3.0
 # §3.0 空腔填充迟滞：正反向 / 双起点 stage 2 的 ΔF 差 ≤ 2σ。
 STAGE2_HYSTERESIS_MAX_SIGMA = 2.0
+
+# 精度状态词汇表。**三个值，不是布尔** —— 「没测」与「测了不达标」必须分得开。
+PRECISION_UNMEASURED = "UNMEASURED"
+PRECISION_MEETS = "MEETS_CROSS_REPEAT_TARGET"
+PRECISION_EXCEEDS = "EXCEEDS_CROSS_REPEAT_TARGET"
+
+
+def cross_repeat_precision(
+    repeat_delta_g_kcal_per_mol,
+    *,
+    min_repeats: int = MIN_INDEPENDENT_REPEATS,
+    max_stddev_kcal_per_mol: float = CROSS_REPEAT_MAX_STDDEV_KCAL_PER_MOL,
+) -> Dict[str, Any]:
+    """跨**独立重复**的样本标准差 vs 1 kcal/mol。数据不够就诚实返回 `UNMEASURED`。
+
+    🔑🔑 [2026-09-15 用户拍板] **这是目前唯一不依赖 MBAR 渐近性的统计精度判据，
+    而它此前只是两个声明在 `acceptance_thresholds_payload()` 里的常量 —— 全仓没有
+    任何代码计算它。** 与此同时，一个**不可信**的量（MBAR 的
+    `max_endpoint_uncertainty_kJ_mol ≤ 1.0`）在卡 `converged` 并驱动自动补帧。
+
+    为什么 MBAR 的 σ 不能当精度门：
+      · 它是**渐近**估计，前提是「去相关后样本近独立」。本仓实测 `N_eff/g` 常年
+        个位数、`g` 能从 15 涨到 168 —— 前提不成立时它系统性**偏小**。
+      · 它对「**该采的构型一次都没采到**」结构性失明。本仓两次大错都是这个形状：
+        4W53 stage2 偏 **+32 kJ/mol**（单轨迹重加权抓不到空腔重组熵项）、
+        decharging 偏 **−88 kJ/mol**（两腿分子内库仑）。两次 σ 都很小、都没报警。
+
+    ⚠️⚠️ **本判据测的是「重复性」，不是「真实误差」。**
+    三个重复可以共享**同一个系统偏差**（同一份力场、同一个建系脚本、同一条 λ 路径、
+    同一个估计器）—— 它们会一致地错，而 s 很小。所以：
+      · 达标（`MEETS_*`）**只说明可重复**，**不构成**「真实误差 < 1 kcal/mol」的证明；
+      · 不达标（`EXCEEDS_*`）是**确定**的坏消息（连自己都重复不出来）。
+    真实误差还需要独立手段：已知答案体系的基准、循环闭合、系统误差审查。
+
+    ⚠️ **比的是样本标准差 s（ddof=1），不是标准误 s/√n。**
+    用 s/√n 会把「重复之间离散得厉害」除以 √n 粉饰成「均值很准」—— 那是对
+    *均值*的不确定度，不是我们要问的*离散度*。n=3 时两者差 1.73 倍。
+
+    返回 dict（永远带 `status`，永远不抛）：
+        status / n_repeats / sample_stddev_kcal_per_mol / threshold_kcal_per_mol
+        / mean_kcal_per_mol / values_kcal_per_mol / unmeasured_reason
+        / measures_repeatability_not_true_error
+    """
+    out: Dict[str, Any] = {
+        "status": PRECISION_UNMEASURED,
+        "n_repeats": 0,
+        "min_independent_repeats": int(min_repeats),
+        "sample_stddev_kcal_per_mol": None,
+        "threshold_kcal_per_mol": float(max_stddev_kcal_per_mol),
+        "mean_kcal_per_mol": None,
+        "values_kcal_per_mol": [],
+        "unmeasured_reason": None,
+        "stddev_convention": "sample_stddev_ddof_1_NOT_standard_error",
+        "measures_repeatability_not_true_error": (
+            "跨重复 SD 只测重复性。三个重复可能共享同一个系统偏差（力场/建系/λ 路径/"
+            "估计器都一样），一致地错而 s 很小。达标不构成真实误差 < 1 kcal/mol 的证明。"
+        ),
+    }
+    vals = []
+    for x in (repeat_delta_g_kcal_per_mol or []):
+        try:
+            v = float(x)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(v):
+            vals.append(v)
+    out["values_kcal_per_mol"] = vals
+    out["n_repeats"] = len(vals)
+    if len(vals) < int(min_repeats):
+        out["unmeasured_reason"] = (
+            f"只有 {len(vals)} 个有限的独立重复，少于 {int(min_repeats)} 个 ⟹ "
+            "跨重复离散度**没有测**。这不是「达标」也不是「不达标」。"
+        )
+        return out
+    s = float(np.std(np.asarray(vals, dtype=float), ddof=1))
+    out["sample_stddev_kcal_per_mol"] = s
+    out["mean_kcal_per_mol"] = float(np.mean(vals))
+    if not np.isfinite(s):
+        out["unmeasured_reason"] = "样本标准差不是有限数"
+        return out
+    out["status"] = (PRECISION_MEETS if s <= float(max_stddev_kcal_per_mol)
+                     else PRECISION_EXCEEDS)
+    return out
 
 
 def acceptance_thresholds_payload() -> Dict[str, Any]:
@@ -8423,9 +8569,48 @@ def validate_final_leg_result(
     for stage_name in ("stage_decharging", "stage_vanishing"):
         if stage_name in payload:
             stage = payload[stage_name]
-            if not isinstance(stage, dict) or stage.get("converged") is not True:
+            # 🔑🔑 [2026-09-15 用户拍板] **stage 的 `converged` 已被删除。**
+            # 它把「算出了数」误报成「精度已验收」：那个合取里四项全是未经标定的
+            # 拟合阈值，其中 `max_endpoint_uncertainty ≤ 1.0` 抄自一个默认关闭的
+            # early-stop 启发式、全仓无依据，而且是**逐段**量、目标却是两腿合成的
+            # σ_bind。改成两个正交状态后，这道门只管**结构**那一半：
+            #   · `analysis_status` —— 只含不依赖拟合阈值的硬不变量（路径完整、
+            #     数值有限、结构自洽）。这里 fail-closed。
+            #   · `precision_status` —— 跨重复离散度，单次 run 结构上恒为
+            #     `UNMEASURED`。**它不在这里判**：本函数是「这份结果能不能被消费/
+            #     复用」的 schema 门，而「能不能作为**已验收**结果发布」是发布路径
+            #     的事。在这里要求精度达标会让流水线连产出都做不到。
+            if not isinstance(stage, dict):
                 raise FinalResultValidationError(
-                    f"[{context}] ({source}) {stage_name} 缺少 converged=true；拒绝消费"
+                    f"[{context}] ({source}) {stage_name} 不是 dict；拒绝消费"
+                )
+            # ⚠️ **按生产者分流，不要按键名一刀切。** 这个位置上会出现两种 stage：
+            #   · IBS / dual-lambda 腿 ⟹ `solve_stage_integrated`，它带
+            #     `covariance_chain_segments`，且已改用 `analysis_status`；
+            #   · traditional 腿 ⟹ `run_leg`，**另一个生产者**，它的 `converged`
+            #     没有被删、语义也不同（不是那四项阈值的合取）。
+            # 一刀切要求 `analysis_status` 会把 traditional 腿整条打死。
+            _is_ibs_producer = ("analysis_status" in stage
+                                or "covariance_chain_segments" in stage)
+            if _is_ibs_producer:
+                _st = stage.get("analysis_status")
+                if _st != "ANALYSIS_COMPLETE":
+                    _why = stage.get("analysis_incomplete_reasons")
+                    raise FinalResultValidationError(
+                        f"[{context}] ({source}) {stage_name} 的 analysis_status="
+                        f"{_st!r}（需要 'ANALYSIS_COMPLETE'）；拒绝消费。"
+                        + (f" 缺什么：{_why}" if _why else
+                           " 带 covariance_chain_segments 却没有 analysis_status ⟹ "
+                           "删除 `converged` 之前的老产物，fail-closed：老产物的 "
+                           "`converged=true` **不等于**结构完整，它还混着四项未标定"
+                           "的阈值（min_overlap / target_support / "
+                           "min_decorrelated_samples / max_endpoint_uncertainty≤1.0），"
+                           "不得据此放行。")
+                    )
+            elif stage.get("converged") is not True:
+                raise FinalResultValidationError(
+                    f"[{context}] ({source}) {stage_name}（traditional 生产者）"
+                    f"缺少 converged=true；拒绝消费"
                 )
     attachment = payload.get("boresch_attachment_result")
     if attachment is not None:
@@ -10700,8 +10885,14 @@ def constraint_identity_fingerprint(system, ligand_indices) -> Dict[str, Any]:
 # 修复 6: Boresch 平衡值从预平衡最后一帧直接计算
 #=============================================================================
 # 完整替换 abfe_core.py 中的 calc_boresch_from_last_frame 函数
-def calc_boresch_from_last_frame(positions, rec_idx, lig_idx):
-    """✅ 修复 2.3：兼容 Quantity 包裹、Numpy 数组、OpenMM Vec3 列表"""
+def calc_boresch_from_last_frame(positions, rec_idx, lig_idx, box_vectors=None):
+    """✅ 修复 2.3：兼容 Quantity 包裹、Numpy 数组、OpenMM Vec3 列表
+
+    **BOR-01**：传 `box_vectors` 则六个锚点先走 `unwrap_boresch_anchors_nm` 解缠，
+    与校验那份（`ibs_engine._check_boresch_geometry_safe`）共用同一份解缠实现。
+    不传等于调用方声明这组坐标已经连续（`runabfe` 里刚 image 过的轨迹就是这种）；
+    生产调用点都传。没跨边界时解缠是**逐位恒等**，不会作废既有平衡值。
+    """
     # 1. 尝试剥离单位
     if hasattr(positions, "value_in_unit"):
         pos = np.asarray(positions.value_in_unit(unit.nanometer), dtype=np.float64)
@@ -10735,10 +10926,11 @@ def calc_boresch_from_last_frame(positions, rec_idx, lig_idx):
     l_coords = pos[lig_idx]
     if not np.all(np.isfinite(r_coords)) or not np.all(np.isfinite(l_coords)):
         raise ValueError("Boresch 锚点坐标包含 NaN/Inf，拒绝更新平衡几何")
-    L0, L1, L2 = l_coords
 
     # 受体锚点顺序必须在估算阶段确定后保持锁定，绝不能按瞬时几何动态重排。
-    H0, H1, H2 = r_coords
+    H0, H1, H2, L0, L1, L2 = unwrap_boresch_anchors_nm(
+        r_coords, l_coords, box_vectors
+    )
 
     def dist(a, b): return np.linalg.norm(a - b)
     def angle(a, b, c):
@@ -11847,6 +12039,55 @@ def _scan_forces_referencing_global_parameter(
     return hits
 
 
+def _bake_global_parameter_into_custom_bond_force(
+    force: "openmm.CustomBondForce",
+    parameter_name: str,
+    lambda_value: float,
+) -> "openmm.CustomBondForce":
+    """把 `parameter_name` 的取值代进 CustomBondForce 的能量表达式，并重建一个
+    不再声明该 GlobalParameter 的力（OpenMM 没有 removeGlobalParameter）。
+
+    只做**整词**替换，替换后再断言表达式里确实不含该标识符 —— 宁可报错也不留一个
+    看起来烘焙过、实际还带着活参数的力。
+    """
+    import re
+
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", str(parameter_name)):
+        raise ValueError(
+            f"{parameter_name!r} 不是合法标识符，拒绝在能量表达式里做整词替换。"
+        )
+    expr = force.getEnergyFunction()
+    pattern = re.compile(rf"\b{re.escape(str(parameter_name))}\b")
+    if not pattern.search(expr):
+        raise RuntimeError(
+            f"{parameter_name!r} 被登记为该 CustomBondForce 的 GlobalParameter，"
+            f"但没出现在能量表达式里：{expr!r}。语义不明，拒绝烘焙。"
+        )
+    baked_expr = pattern.sub(f"({float(lambda_value):.17g})", expr)
+    if pattern.search(baked_expr):
+        raise RuntimeError(f"整词替换后表达式仍含 {parameter_name!r}：{baked_expr!r}")
+
+    new_force = openmm.CustomBondForce(baked_expr)
+    new_force.setName(force.getName())
+    new_force.setForceGroup(force.getForceGroup())
+    new_force.setUsesPeriodicBoundaryConditions(
+        force.usesPeriodicBoundaryConditions()
+    )
+    for i in range(force.getNumPerBondParameters()):
+        new_force.addPerBondParameter(force.getPerBondParameterName(i))
+    for i in range(force.getNumGlobalParameters()):
+        name = force.getGlobalParameterName(i)
+        if str(name) == str(parameter_name):
+            continue
+        new_force.addGlobalParameter(name, force.getGlobalParameterDefaultValue(i))
+    for i in range(force.getNumBonds()):
+        p1, p2, params = force.getBondParameters(i)
+        new_force.addBond(int(p1), int(p2), params)
+    if new_force.getNumBonds() != force.getNumBonds():
+        raise RuntimeError("烘焙 CustomBondForce 时键数对不上")
+    return new_force
+
+
 def bake_global_parameter_into_fixed_nonbonded_force(
     system: openmm.System,
     parameter_name: str,
@@ -11916,14 +12157,31 @@ def bake_global_parameter_into_fixed_nonbonded_force(
             f"{parameter_name!r} 出现在 {len(nb_hits)} 个 NonbondedForce 上——"
             "当前实现只支持单个 NonbondedForce，多个的语义未定义，拒绝继续。"
         )
-    if other_hits:
-        other_types = [type(f).__name__ for _idx, f in other_hits]
+    unbakeable = [
+        (idx, f) for idx, f in other_hits if not isinstance(f, openmm.CustomBondForce)
+    ]
+    if unbakeable:
+        other_types = [type(f).__name__ for _idx, f in unbakeable]
         raise RuntimeError(
-            f"{parameter_name!r} 还被以下非 NonbondedForce 引用：{other_types}——"
-            "本函数只烘焙 NonbondedForce 的 offset，其它 Force 里这个参数不会被"
-            "处理。不能假装整个 System 已经不再有这个活参数；请先确认这些 Force "
-            "是否也需要烘焙（当前未实现），或者改用别的参数名把它们隔离开。"
+            f"{parameter_name!r} 还被以下 Force 引用：{other_types}——"
+            "本函数只烘焙 NonbondedForce 的 offset 与 CustomBondForce 的表达式，"
+            "其它 Force 里这个参数不会被处理。不能假装整个 System 已经不再有这个活"
+            "参数；请先确认这些 Force 是否也需要烘焙（当前未实现），或者改用别的"
+            "参数名把它们隔离开。"
         )
+    # CustomBondForce（当前只有配体内部库仑补偿项 `LigandInternalCoulomb` 走这里）：
+    # 参数只出现在能量表达式里，没有 per-bond offset，所以把数值代进表达式、重建
+    # 一个不再声明该 GlobalParameter 的力即可 —— 与 NonbondedForce 那侧同样满足
+    # 「参数从 System 上彻底消失」这条契约（忘了设 λ 这条路径在结构上不存在）。
+    # ⚠️ 必须**先建后删**：`system.getForce(i)` 返回的是 System 持有的引用，
+    # `removeForce(i)` 会把它析构掉，之后再读那个 Python 句柄拿到的是垃圾内存
+    # （实测能量表达式变成乱码字节）。本仓库栽过同类 SWIG 所有权的坑不止一次。
+    for idx, force in sorted(other_hits, key=lambda t: -t[0]):
+        baked = _bake_global_parameter_into_custom_bond_force(
+            force, parameter_name, lambda_value
+        )
+        system.removeForce(idx)
+        system.addForce(baked)
 
     nb_index, nb = nb_hits[0]
     num_particles = nb.getNumParticles()
@@ -12057,51 +12315,28 @@ def bake_global_parameter_into_fixed_nonbonded_force(
     return system
 
 
-def create_ligand_internal_force(
+# 1/(4πε₀)，kJ·nm/(mol·e²)。OpenMM 的 `unit` 包不暴露 ε₀，所以只能写成字面量；
+# 本文件里凡是配体内部非键表达式都引这一个名字，不再各写一遍字面量。
+# ⚠️ 本仓库其它地方还有同值的副本（`ibs_engine._SHADOW_ONE_4PI_EPS0`）与一个**精度
+# 不同**的副本（`apbs_correction.COULOMB_FACTOR_KJ_NM_PER_MOL_E2 = 138.93545585`）。
+# 那是存量，不在本次改动范围内；**不要再新增第 N 份**。
+ONE_4PI_EPS0_KJ_NM_PER_MOL_E2 = 138.935456
+
+
+def collect_ligand_internal_exclusions(
     nb_force: openmm.NonbondedForce,
-    perturbed_indices: List[int],
-    particle_params,
+    perturbed_indices,
     reference_exclusions=None,
-    num_particles: int = None,
-    system: openmm.System = None
+    system: openmm.System = None,
 ):
+    """收集配体内部 1-2/1-3/1-4 排除对（键 / 角 / 刚性约束 / NB exception / 参考表）。
+
+    `create_ligand_internal_force`（Group 2 的 CustomNonbondedForce）与
+    `create_ligand_internal_coulomb_force`（去电荷腿的 λ 补偿项）**必须**用同一份
+    排除表：两边一旦不一致，Stage-1/Stage-2 接缝上配体内部对就会漏算或重复算，
+    而且是个静默的自由能偏差。所以这里只留一份实现。
     """
-    构建配体-配体内部非键力 (Standard LJ + Coulomb) 和 1-4 恢复力。
-    注意：此函数不分配 ForceGroup，调用者需自行设置并添加至 System。
-    """
-    if num_particles is None:
-        num_particles = nb_force.getNumParticles()
-    perturbed_set = set(perturbed_indices)
-
-    expr = "4*sqrt(epsilon1*epsilon2)*((sigma12/r)^12 - (sigma12/r)^6) + 138.935456*q1*q2/r; sigma12 = 0.5*(sigma1+sigma2)"
-    ll_force = openmm.CustomNonbondedForce(expr)
-    ll_force.addPerParticleParameter('q')
-    ll_force.addPerParticleParameter('sigma')
-    ll_force.addPerParticleParameter('epsilon')
-
-    for i in range(num_particles):
-        if particle_params and i < len(particle_params):
-            q, sig, eps = particle_params[i]
-        else:
-            q, sig, eps = nb_force.getParticleParameters(i)
-        ll_force.addParticle([
-            q.value_in_unit(unit.elementary_charge),
-            sig.value_in_unit(unit.nanometer),
-            eps.value_in_unit(unit.kilojoule_per_mole)
-        ])
-
-    ll_force.addInteractionGroup(perturbed_set, perturbed_set)
-    ll_force.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
-    # [MEM-00h，2026-08-06] 统一到基础力场的 1.0 nm、无 switching——理由见
-    # BEUTLER_SOFTCORE_CUTOFF_NM 定义处；这个力此前用的是跟 softcore CV 一样的
-    # 1.2nm+switch，跟基础 NonbondedForce 的 1.0nm 不一致，是同一个 MEM-00h
-    # 存量问题的一部分。
-    ll_force.setCutoffDistance(BEUTLER_SOFTCORE_CUTOFF_NM * unit.nanometer)
-    ll_force.setUseLongRangeCorrection(False)
-
-    # ========================================================================
-    # 🔑 生产级排除对收集：全覆盖 1-2/1-3/1-4 (修复漏扫约束与异常表的致命缺陷)
-    # ========================================================================
+    perturbed_set = set(int(i) for i in perturbed_indices)
     exclusion_pairs = set()
 
     if system is not None:
@@ -12145,6 +12380,59 @@ def create_ligand_internal_force(
             if p1 in perturbed_set and p2 in perturbed_set:
                 exclusion_pairs.add((min(p1, p2), max(p1, p2)))
 
+    return exclusion_pairs
+
+
+def create_ligand_internal_force(
+    nb_force: openmm.NonbondedForce,
+    perturbed_indices: List[int],
+    particle_params,
+    reference_exclusions=None,
+    num_particles: int = None,
+    system: openmm.System = None
+):
+    """
+    构建配体-配体内部非键力 (Standard LJ + Coulomb) 和 1-4 恢复力。
+    注意：此函数不分配 ForceGroup，调用者需自行设置并添加至 System。
+    """
+    if num_particles is None:
+        num_particles = nb_force.getNumParticles()
+    perturbed_set = set(perturbed_indices)
+
+    expr = (
+        "4*sqrt(epsilon1*epsilon2)*((sigma12/r)^12 - (sigma12/r)^6) + "
+        f"{ONE_4PI_EPS0_KJ_NM_PER_MOL_E2}*q1*q2/r; sigma12 = 0.5*(sigma1+sigma2)"
+    )
+    ll_force = openmm.CustomNonbondedForce(expr)
+    ll_force.addPerParticleParameter('q')
+    ll_force.addPerParticleParameter('sigma')
+    ll_force.addPerParticleParameter('epsilon')
+
+    for i in range(num_particles):
+        if particle_params and i < len(particle_params):
+            q, sig, eps = particle_params[i]
+        else:
+            q, sig, eps = nb_force.getParticleParameters(i)
+        ll_force.addParticle([
+            q.value_in_unit(unit.elementary_charge),
+            sig.value_in_unit(unit.nanometer),
+            eps.value_in_unit(unit.kilojoule_per_mole)
+        ])
+
+    ll_force.addInteractionGroup(perturbed_set, perturbed_set)
+    ll_force.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
+    # [MEM-00h，2026-08-06] 统一到基础力场的 1.0 nm、无 switching——理由见
+    # BEUTLER_SOFTCORE_CUTOFF_NM 定义处；这个力此前用的是跟 softcore CV 一样的
+    # 1.2nm+switch，跟基础 NonbondedForce 的 1.0nm 不一致，是同一个 MEM-00h
+    # 存量问题的一部分。
+    ll_force.setCutoffDistance(BEUTLER_SOFTCORE_CUTOFF_NM * unit.nanometer)
+    ll_force.setUseLongRangeCorrection(False)
+
+    # 排除表由 `collect_ligand_internal_exclusions` 单点收集（1-2/1-3/1-4）。
+    exclusion_pairs = collect_ligand_internal_exclusions(
+        nb_force, perturbed_set, reference_exclusions, system
+    )
+
     # === 6. 执行排除添加 (严格去重) ===
     for p1, p2 in exclusion_pairs:
         ll_force.addExclusion(p1, p2)
@@ -12167,7 +12455,10 @@ def create_ligand_internal_force(
                 exceptions_14.append((p1, p2, chargeProd, sigma, epsilon))
 
     if exceptions_14:
-        expr_14 = "4*epsilon*((sigma/r)^12 - (sigma/r)^6) + 138.935456*chargeProd/r"
+        expr_14 = (
+            "4*epsilon*((sigma/r)^12 - (sigma/r)^6) + "
+            f"{ONE_4PI_EPS0_KJ_NM_PER_MOL_E2}*chargeProd/r"
+        )
         ll_14_force = openmm.CustomBondForce(expr_14)
         ll_14_force.addPerBondParameter('chargeProd')
         ll_14_force.addPerBondParameter('sigma')
@@ -12182,6 +12473,119 @@ def create_ligand_internal_force(
     ll_force.setUseSwitchingFunction(False)
     ll_force.setSwitchingDistance(BEUTLER_SOFTCORE_CUTOFF_NM * unit.nanometer)
     return ll_force, ll_14_force
+
+
+LIGAND_INTERNAL_COULOMB_FORCE_NAME = "LigandInternalCoulomb"
+
+
+def create_ligand_internal_coulomb_force(
+    nb_force: openmm.NonbondedForce,
+    perturbed_indices,
+    ligand_charges_e,
+    system: openmm.System = None,
+    reference_exclusions=None,
+    scale_expr: str = "1",
+    global_parameters=None,
+):
+    """配体内部 ≥1-5 普通对的库仑项，显式逐对、**无截断**。返回 CustomBondForce 或 None。
+
+    **为什么必须是一个独立的力**：`NonbondedForce` 里一个粒子只有一份电荷。一旦让
+    它随 λ 缩放，配体–环境对按 λ 走、配体–配体对就必然按 λ² 走 —— 没有任何写法能
+    在同一个力里把两者分开。所以「配体内部库仑保持 λ 无关」只能靠一个附加项。
+    这不是风格选择。
+
+    **两个 stage 用同一份对表**（`collect_ligand_internal_exclusions` 的补集），
+    Stage-1/Stage-2 接缝因此按构造恒等：
+
+      * 去电荷腿：``scale_expr=f"(1 - {lambda_name}^2)"``。主 NB 力给出
+        λ²·U_intra，本力补上 (1-λ²)·U_intra，合计恒为 U_intra。λ=1 时本力**恒等
+        于 0**，物理端点逐位等于原 System —— 正是 P0-01 要保护的不变量。
+      * vanishing 腿：``scale_expr="1"``。配体已整体从主 NB 力剥离，本力就是全部。
+
+    **为什么是 CustomBondForce 而不是 CustomNonbondedForce**：后者必须带 cutoff，
+    而 Group 2 用的是 1.0 nm（`BEUTLER_SOFTCORE_CUTOFF_NM`）。跨度超过 1 nm 的配体
+    会被截掉最长的内部对（实测某体系最大内部距离 1.46 nm），而去电荷腿那侧的
+    PME 是不截断的 —— 两边口径就不一致了。逐对展开既无截断、两个 stage 又逐位一致。
+
+    **为什么是 CustomBondForce 而不是 CustomNonbondedForce**：后者必须带 cutoff，
+    而 Group 2 用的是 1.0 nm（`BEUTLER_SOFTCORE_CUTOFF_NM`）。跨度超过 1 nm 的配体
+    会被截掉最长的内部对（实测某体系最大内部距离 1.46 nm），而去电荷腿那侧的
+    PME 是不截断的 —— 两边口径就不一致了。逐对展开既无截断、两个 stage 又逐位一致。
+
+    ⚠️ **刻意不启用 PBC（不走最小镜像）**，与 `NonbondedForce` 的 exception 同口径。
+
+    这条来回改过一次，把理由记死免得再来：**OpenMM 的 `NonbondedForce` exception
+    本身就不做最小镜像**，它假定成键原子总在同一个周期像里。这不是断言，是可运行的
+    判据，见 `tests/test_intramolecular_coulomb_is_lambda_independent.py::
+    test_nonbonded_exceptions_ignore_minimum_image`（那里现场建体系、现场算，
+    不抄任何数字）。
+
+    所以配体内部这一段的**唯一正确前提是"坐标到达时分子是完整的"**（靠平移补全，
+    见 PBC-01）。在这个前提下最小镜像与直接距离逐位相同，加 PBC 不解决任何问题；
+    而在前提被破坏时，加 PBC 只会让分子内的两半口径不一致（本项"对"、1-2/1-3/1-4
+    仍然错），整体照样是错的 —— 等于把上游的坐标问题掩盖成一个更难查的形态。
+    额外的坏处：最小镜像在配体跨度 > L/2 时会静默返回错误的距离。
+
+    真正的保证在上游：分子完整性。不要在这里加 PBC。
+
+    Args:
+        ligand_charges_e: {粒子索引: 电荷(e)}，必须是**原始**电荷，不是被清零/
+            缩放之后的。
+        global_parameters: `scale_expr` 里用到的 global parameter，形如
+            ``[(name, default)]``。OpenMM 要求**每个 Force 各自注册**它用到的
+            global parameter（`NonbondedForce` 上注册过不算数），漏了会在建
+            Context 时抛 "Unknown variable"。所以这里收成 builder 的入参，而不是
+            留给调用方 —— 「注册是 caller 的活」这个形状在本仓库已经出过静默算错的事故。
+    """
+    perturbed = sorted(set(int(i) for i in perturbed_indices))
+    perturbed_set = set(perturbed)
+    charges = {int(k): float(v) for k, v in dict(ligand_charges_e).items()}
+    missing = perturbed_set - set(charges)
+    if missing:
+        raise ValueError(
+            f"create_ligand_internal_coulomb_force 缺少 {len(missing)} 个配体原子的原始电荷："
+            f"{sorted(missing)[:8]}… 逐对展开不允许缺项（缺一对就是静默少算一段内部库仑）。"
+        )
+
+    excluded = collect_ligand_internal_exclusions(
+        nb_force, perturbed_set, reference_exclusions, system
+    )
+
+    force = openmm.CustomBondForce(
+        f"({scale_expr})*{ONE_4PI_EPS0_KJ_NM_PER_MOL_E2}*chargeProd/r"
+    )
+    # 名字是身份：`build_ibs_dual_system` 拿到的 vanishing 模板可能已经带着一份
+    # （charge-transfer 的烘焙交接会把它带过 stage 边界），靠名字显式去重，
+    # 不靠"烘焙后配体电荷为 0、所以新建的那份自然是空"这种隐式巧合。
+    force.setName(LIGAND_INTERNAL_COULOMB_FORCE_NAME)
+    force.addPerBondParameter("chargeProd")
+    for name, default in (global_parameters or []):
+        force.addGlobalParameter(str(name), float(default))
+    n_pairs = 0
+    for a in range(len(perturbed)):
+        for b in range(a + 1, len(perturbed)):
+            p1, p2 = perturbed[a], perturbed[b]
+            if (min(p1, p2), max(p1, p2)) in excluded:
+                continue
+            n_pairs += 1
+            qq = charges[p1] * charges[p2]
+            if qq == 0.0:
+                continue
+            force.addBond(p1, p2, [qq])
+
+    n_total = len(perturbed) * (len(perturbed) - 1) // 2
+    n_excluded_internal = sum(
+        1 for (p1, p2) in excluded if p1 in perturbed_set and p2 in perturbed_set
+    )
+    if n_pairs + n_excluded_internal != n_total:
+        raise RuntimeError(
+            f"配体内部对账不平：普通对 {n_pairs} + 排除对 {n_excluded_internal} "
+            f"≠ 全部对 {n_total}。排除表与逐对枚举用的不是同一个口径。"
+        )
+    if force.getNumBonds() == 0:
+        return None
+    return force
+
 
 # ============================================================================
 # 8. 纯轨迹几何波动 Boresch 估算器 (基于化学连通性 + 方差最小化)

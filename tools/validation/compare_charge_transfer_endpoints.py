@@ -421,12 +421,41 @@ def reference_charging_endpoint_system(
 
     # 配体内部对的 λ 口径 [P0-01, 2026-08-30 → v3]：生产侧不再把普通 L–L 对
     # 补成 exception（那会改写真实 PME 的 λ=1 端点，见
-    # tests/test_pme_decharge_endpoint_equivalence.py 的复现）。v3 协议是
-    # "既有 exception 冻结 + 普通对随粒子电荷线性湮灭"，独立参照必须镜像：
-    # 这里**只保留 raw 拓扑自带的 exception**，不做任何补对。普通 L–L 库仑
-    # 在两个端点之间的差异完全由粒子电荷（λ·q_i）承载。
+    # tests/test_pme_decharge_endpoint_equivalence.py 的复现）。
     # v2 的补对行为保留在 `_freeze_ligand_internal_pairs`（已停用，仅供审计
     # 对照复现 v2 偏差），任何生产/参照路径都不得调用。
+    #
+    # [v5，2026-09-14] 口径从 annihilation 改成 couple-intramol=no。v3/v4 是
+    # "既有 exception 冻结 + 普通对随粒子电荷线性湮灭"；**湮灭那一半是缺陷**
+    # （两腿的 ⟨U_intra⟩ 之差 −88.7 kJ/mol 恰好是某体系 ΔG_bind 的全部误差，
+    # 见 tests/test_intramolecular_coulomb_is_lambda_independent.py）。生产侧现在
+    # 用一个 (1-λ²) 的 CustomBondForce 把普通 ≥1-5 L–L 库仑补回全强度，独立参照
+    # 必须镜像：λ=0 时把它按**物理电荷**全额加回来（λ=1 时补偿项本就为 0，
+    # 参照就是物理体系本身，不需要动）。
+    #
+    # 这里仍然**不补 exception**（P0-01 的约束没被触碰）：加的是一个独立的
+    # CustomBondForce，对表由 raw 拓扑自带的 exception 取补集，在本文件里独立枚举，
+    # 不调用 `abfe_core.create_ligand_internal_coulomb_force`。
+    if lam == 0.0:
+        excepted_ll = set()
+        for exc_idx in range(nb.getNumExceptions()):
+            p1, p2, _cp, _s, _e = nb.getExceptionParameters(exc_idx)
+            p1, p2 = int(p1), int(p2)
+            if p1 in set(ligand_set) and p2 in set(ligand_set):
+                excepted_ll.add((min(p1, p2), max(p1, p2)))
+        intra = openmm.CustomBondForce("138.935456*chargeProd/r")
+        intra.addPerBondParameter("chargeProd")
+        for a in range(len(ligand_set)):
+            for b in range(a + 1, len(ligand_set)):
+                i, j = ligand_set[a], ligand_set[b]
+                if (min(i, j), max(i, j)) in excepted_ll:
+                    continue
+                qq = physical_ligand_params[i][0] * physical_ligand_params[j][0]
+                if qq == 0.0:
+                    continue
+                intra.addBond(i, j, [qq])
+        if intra.getNumBonds():
+            system.addForce(intra)
 
     return system
 
