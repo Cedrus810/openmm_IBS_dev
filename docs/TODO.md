@@ -33,8 +33,8 @@
 
 | | 在推 | 内容 |
 |---|---|---|
-| **1** | 🔴 **代码侧没有收口** | [Stage-2 自治闭环](#1-stage-2-自治闭环) —— `S2-A`~`S2-F`、`CTL-01`~`CTL-10` 已关闭，但 2026-09-14 第三轮复核又开出 `BUD-01`~`07`（**预算系统整条没接上**：生产 cap 从不存在、补帧块账恒空、单窗实测烧到 1.5M 步）与 `CTL-11`~`15`（converged 了也判不出 `DONE`、no-op 台账只有 3/12 个动作会读）。6 个 benchmark run 用**当前代码**重放 `decide()`：**只有 1 个给出 `DONE`**。另剩 `S2-E`、`AUDIT-S2-01`~`03`。**2026-09-14 另有六路并行全面审计（63+2 条），见 [CONTROLLER_BUDGET_AUDIT_2026-09-14.md](CONTROLLER_BUDGET_AUDIT_2026-09-14.md)** —— 下面 `BUD-*` / `CTL-*` 已被它覆盖的逐条标在各条目下，**原条目一律不删**。⚠️ 上一条「2383 passed」是离线测试，**它对上面这些一条都没覆盖到** |
-| **2** | 排在后面 | [local-residual / EXP-033](#2-local-residual--exp-033) —— P2 是唯一还开着的，P1 真机没跑过 |
+| **1** | 🔴 **代码侧没有收口** | [Stage-2 自治闭环](#1-stage-2-自治闭环) —— `S2-A`~`S2-F`、`CTL-01`~`CTL-10` 已关闭，但 2026-09-14 第三轮复核又开出 `BUD-01`~`07`（**预算系统整条没接上**：生产 cap 从不存在、补帧块账恒空、单窗实测烧到 1.5M 步）与 `CTL-11`~`15`（converged 了也判不出 `DONE`、no-op 台账只有 3/12 个动作会读）。6 个 benchmark run 用**当前代码**重放 `decide()`：**只有 1 个给出 `DONE`**。另剩 `S2-E`、`AUDIT-S2-01`~`03`、`IDENT-01`（顶层 vs stage 指纹口径，**待拍板**）、`BM-04`（**window 0 卡住时缩跨度在构造上不可行**，2026-09-16 benchmark 28 个报错 run 里 5 个死在这里，**待拍板**）。**2026-09-14 另有六路并行全面审计（63+2 条），见 [CONTROLLER_BUDGET_AUDIT_2026-09-14.md](CONTROLLER_BUDGET_AUDIT_2026-09-14.md)** —— 下面 `BUD-*` / `CTL-*` 已被它覆盖的逐条标在各条目下，**原条目一律不删**。⚠️ 上一条「2383 passed」是离线测试，**它对上面这些一条都没覆盖到** |
+| **2** | 排在后面 | [local-residual / EXP-033](#2-local-residual--exp-033) —— `LR-06`（插件 `0.1 Å` 下限在软核窗口打死整条 run，2026-09-16 真机定位）是**红的**；另有 `EXP-033-P2`、`LR-02`~`05`，P1 真机没跑过 |
 | **3** | 收尾 | [发布工程门](#3-发布工程门) —— 判据是 clone 下来 import 得动、跑得动 |
 | **4** | 不修 | [已定位、判定不改](#4-已定位判定不改) —— `AUDIT-01`~`07`，理由别重新论证。**故意不用 checkbox**，它们不会被打勾 |
 | **5** | 暂停 | [膜受体–配体路线](#5-膜受体配体路线暂停) —— 停在 C4，当前主线是可溶体系。**这一节占全文 62 个框（约 2/3），是暂停中的将来工作，不计入当前工作量** —— 数框之前先看这一行 |
@@ -391,6 +391,206 @@
 >   所以 cyclod_ligand1/rep2 里一个 `HARD_INSUFFICIENT`（自检 0.386）的窗口拿到的是
 >   `RECALIBRATE_FK` 而不是缩跨度 —— 是不是 bug 需要判据侧确认。
 
+### 🟠 2026-09-15 预算接线收口后留下的一条待拍板（`IDENT-01`）
+
+> 当天修完三处「配置在中间层丢失 / 停止决定在收尾层被绕过」（CLI 两条腿都没传生产预算；
+> `read_aggregated()` 造子控制器时丢 `effective_config`，于是合并视图的 cap/块大小又退默认；
+> 退出前的全路径 `ANALYZE` 会在缺产物时重新采样，绕过刚做出的停止决定）。
+> 接预算时顺带加了 `abfe_pipeline._strip_non_identity_kwargs()` ——
+> **两个预算键今天不在任何指纹里，剔除它们对既有缓存逐位 no-op**，这是它能无痛落地的前提。
+> 下面这条不同：它要动一个**今天确实在指纹里**的键，所以没自行处理。
+
+- [ ] **IDENT-01 `allow_untrusted_stage_results` 在顶层 `final_results` 指纹里，stage 指纹里已剔除。**
+  位置：`abfe_pipeline.py::ABFEPipeline._stage_protocol_key`（已 `run_config.pop(...)`，
+  顶层与 `kwargs` 两处都剔）vs `_build_top_level_protocol_key` 里的
+  `config = dict(self._last_run_config)`（只 pop 了 `resume` / `run_equilibration`）。
+  **两边口径不一致是事实，但哪边对没定。** 两个方向都有像样的理由，别只看一边就改：
+  - **该剔**：与 stage 指纹同一条论证 —— 它只决定「质量门没过时是中止还是标记
+    `results_untrusted` 继续」，不改 Hamiltonian、不改任何被算出来的数，
+    同一份轨迹在开关两种取值下 ΔG 逐位相同。
+  - **不该剔**：顶层指纹代表的是**整个 run 的身份**，而这个开关确实改变了
+    `final_results.json` 这件产物（带不带 `results_untrusted` 标记）。
+    这正是 `LR-01` 关闭时留下的规矩：**顶层 run 指纹与 stage 指纹口径不同，
+    顶层无条件进是对的，不要跟着 stage 那侧"统一"**
+    （见 [archive/TODO_closed_2026-09-13.md](archive/TODO_closed_2026-09-13.md)）。
+  ⚠️ **代价是单向的**：这个键今天**在**顶层指纹里且恒有值（`bool`），
+  摘掉它会改变 payload ⟹ **现存 run 的 final-result 缓存全部失配**。
+  所以「顺手统一一下」不是零成本动作。
+  ⚠️ **需要维护者拍板**，代理不要自行改。
+  判据（若判「该剔」）：`tests/test_untrusted_switch_is_not_identity.py` 里的
+  `test_flag_is_scrubbed_from_stage_protocol_key_both_levels` 扩到顶层指纹，
+  且**同一个 PR 里写清现存 run 的 final-result 缓存会作废**。
+  判据（若判「不该剔」）：在 `_build_top_level_protocol_key` 就地写一行注释说明
+  「顶层无条件进是刻意的，别跟着 `_stage_protocol_key` 统一」，并在本条下归档 ——
+  否则下一轮复核还会把它当成"漏网的一处"重新开一遍。
+
+### 🔴 2026-09-16 benchmark 28 个报错 run 的分类（`BM-01` ~ `BM-05`）
+
+> **来源**：13 个体系 × 3 rep 的 benchmark 跑完后，28 个 run 带错误退出。
+> 逐个查了 `pipeline.log` / `launch.log` / `checkpoints/path_versions/` / 落盘产物。
+> 归属结论：
+>
+> | 类别 | run 数 | 归属 |
+> |---|---|---|
+> | 布局变更后发出构造上不可能成功的动作（崩溃） | 7 | **本仓库 bug** → `BM-01`/`02`/`03`，已修 |
+> | 末窗被插成拆不开的非法布局（崩溃 + 非法布局落盘） | 2 | **本仓库 bug** → `BM-03` 已修表层；死局本身 → `BM-04` **待拍板** |
+> | `LOCAL_VALIDATION_CAP` 撞单周期上限 | 3 | 2 个是 window-0 死局 → `BM-04`；`jnk1_ligand1/rep3` 修完后能继续（见下方重放表） |
+> | 插件 `0.1 Å` 几何下限误报 | 3 | **本仓库 bug** → 已由 [`LR-06`](#2-local-residual--exp-033) 立项，别在本节重复 |
+> | 带电配体复合物腿缺 reserved co-ion | 3 | **本仓库缺功能，2026-09-16 已修**（`runabfe.py` 派生 `.gro`/`.top`，`[molecules]` 末尾追加；`tests/test_complex_leg_reserved_coion_2026_09_16.py` **17 passed**，含 thrombin_ligand1 端到端）。**重跑即可。** |
+> | 求解器缺窗（去相关后帧数不足） | 4 | **不是 bug** —— 真采样不足，见本节末「`BM-A` 不是 bug」 |
+> | 其它单发（3 条旧 run + 1 条已修） | 6 | **不是 bug / 已修**，见本节末 |
+>
+> ⚠️ **第一轮我有四处归因是错的，写在这里免得下一个人重走：**
+> 1. ~~C 类是 09-15 换分窗协议作废了 09-11 的旧产物~~ —— **证伪**：
+>    `brd4_ligand1/rep1` 五个窗口产物全是 09-16 02:31–02:51 的新文件、形状
+>    `(7,6,4,4,4)` 与当前布局逐字一致。真因是**本次运行内自己插的 λ**。
+> 2. ~~`g=75.4` 却报 `106/1000` 是记账自相矛盾~~ —— **不是**。多段路径返回
+>    `concatenate(indices)`（各段去相关数**求和**）配 `g_values[worst]`（各段 g 的
+>    **最大值**），自洽。见 `ibs_engine.py:21473`。
+> 3. ~~500 帧卡在判据线上、过不过基本抛硬币~~ —— **过强**。772 个实测样本：
+>    去相关帧数中位数 47，低于门槛 10 的只占 6.5%。不是系统性的。
+> 4. ~~`LOCAL_VALIDATION_CAP` 炸到 `_assert_stage_result_sane` 是契约越界~~ ——
+>    **不是**。自治循环确实把它当路由信号处理过（重判、重试、`NO_FEASIBLE_ACTION`
+>    退出），顶层拒绝一条不完整路径是设计。**这条别再"修"。**
+
+> **`BM-01`~`03`、`BM-05` 于 2026-09-16 一并修完。** 回归差分（HEAD 不能当基线 ——
+> 工作区本来就带着别的会话的未提交改动，所以是**在当前工作区上只回退本次改动**
+> 跑同一套 `-m cpu_only`）：
+>
+> | | failed | passed |
+> |---|---|---|
+> | 回退本次改动 | 74 | 2322 |
+> | 带本次改动 | 74 | 2330 |
+>
+> 失败集合逐条一致（那 74 条是存量，见 `benchmark vdw 漂移` 那组），多出的 8 个
+> pass 正好是新增的 `tests/test_layout_change_does_not_crash_the_loop_2026_09_16.py`。
+>
+> ### 修完之后这些 run 走得到哪（2026-09-16，当前代码只读重放 `decide()`）
+>
+> | run | `decide()` | 说明 |
+> |---|---|---|
+> | brd4_ligand1/rep1 | `PROBE_CANDIDATE_FK[3]` | 不再崩，可重跑 |
+> | jnk1_ligand1/rep2 | `RUN_PRODUCTION[4]` | 可重跑 |
+> | jnk1_ligand2/rep1 | `RUN_PRODUCTION[3]` | 可重跑 |
+> | jnk1_ligand2/rep2 | `PROBE_CANDIDATE_FK[2]` | 可重跑 |
+> | jnk1_ligand2/rep3 | `RUN_PRODUCTION[4]` | 可重跑 |
+> | cyclod_ligand3/rep2 | `PROBE_CANDIDATE_FK[0]` | 可重跑 |
+> | p38_ligand1/rep3 | `PROBE_CANDIDATE_FK[1]` | 可重跑 |
+> | jnk1_ligand1/rep3 | `RECALIBRATE_FK[4]` | 可重跑（**原以为是 window-0 死局，重放证伪**） |
+> | p38_ligand1/rep2 | `RUN_PRODUCTION[5]` | 可重跑（win5 g=100.1，要加采样才有用） |
+> | cyclod_ligand3/rep1,rep3 | ⚠️ `RUN_PRODUCTION[0]` 是**假象** | 启动布局校验先抛 `RuntimeError` ⟹ **起不来**，见 `DATA-02` |
+> | cmet_ligand1/rep1 | `NO_FEASIBLE_ACTION[0]` | `BM-04`（window 0 + 末窗已顶满 K=8） |
+> | p38_ligand2/rep1 | `NO_FEASIBLE_ACTION[4]` | warmup 预算耗尽 + `BM-04` |
+> | cmet_ligand1/rep2 | `NO_FEASIBLE_ACTION[0]` | λ 总数不够，见 `DATA-03` |
+> | cmet_ligand2/rep1 | `NO_FEASIBLE_ACTION[4]` | λ 总数不够，见 `DATA-03` |
+> | p38_ligand2/rep3 | `NO_FEASIBLE_ACTION[2]` | λ 总数不够，见 `DATA-03` |
+>
+> ⚠️ **「不再崩」不等于「能跑完」** —— 上表只说 `decide()` 现在给得出可执行动作，
+> 没有任何一个 run 真机验证过。
+
+> **留下一条规矩**：`INSERT_LAMBDA` 明写「本动作不采样，受影响窗口的重采由下一轮
+> 逐块发 `RUN_PRODUCTION`」，所以**从插 λ 到下游重采完成之间，下游产物描述的是
+> 上一套布局 —— 这是设计内的合法中间态，不是要消灭的状态**。凡是消费窗口产物的
+> 代码都必须能在这个中间态下工作；`ibs_engine` loader 的 fail-closed 是对的，
+> 错的永远是"在这个中间态里去载它不需要的窗口"。
+
+- [x] ~~**BM-01 局部动作的执行器去载全路径。**~~ **2026-09-16 已修。**
+  位置：`abfe_pipeline.py:13360`（`_recalibrate_f_k_and_resample_segment`）。
+  `only_windows` 的过滤原来在 loader **之后**的循环里，而 loader 对每个载入的窗口
+  做 fail-closed 布局校验 ⟹ 一个只针对窗口 3 的动作崩在窗口 4 上：
+  `动作=PROBE_CANDIDATE_FK 窗口=[3]` → `ValueError('窗口 4 状态数与 window_ranges 不符')`。
+  真机 7 个 run 同签名（brd4_ligand1/rep1、jnk1_ligand1/rep2、jnk1_ligand2/rep1-3、
+  cyclod_ligand3/rep2、p38_ligand1/rep3）。改成在**载入时**把 `only_windows` 之外的
+  窗口一并排除；`records` 内容与语义逐字不变（重锚节奏逻辑读它）。
+  判据：`test_layout_change_does_not_crash_the_loop_2026_09_16.py::test_recalibrate_only_loads_the_windows_it_acts_on`
+  （`only_windows=[1]` ⟹ 排除集合 `{0,2,3}`）+ `…::test_no_only_windows_still_loads_the_whole_path`。
+
+- [x] ~~**BM-02 停滞保护的降级绕过 `decide()` 的全部可行性守卫。**~~ **2026-09-16 已修。**
+  位置：`abfe_pipeline.py:11465`（`_run_stage2_autonomous` 的停滞保护）。
+  它直接改写 `act = "PROBE_REANCHOR_EPOCH"`，而 `decide()` 里的 1d-0（布局过期）、
+  1e（预热进不去）、`TERMINAL` 分流全在上游，一条也没走。真机 jnk1_ligand2/rep1：
+  `RUN_PRODUCTION[3]` 被 `LOCAL_VALIDATION_CAP` 连弹 3 次 ⟹ 降级成
+  `PROBE_REANCHOR_EPOCH[3]` ⟹ win3 的帧正是插 λ 之后的过期布局 ⟹ 炸穿主循环。
+  已加闸：目标窗口在过期集合里 ⟹ 不降级，如实 `NO_FEASIBLE_ACTION`，
+  并记 `history[-1]["escalation_blocked_by"]`。
+  ⚠️ 顺带把「产物是不是过期布局的」收成**一份实现**
+  `Stage2RepairController.stale_layout_windows()`（`abfe_preoptimizer.py:6158`），
+  `decide()` 的 1d-0 改成调它 —— 这个判据有两个消费者，而 `ibs_engine` loader 对
+  同一件事是 fail-closed 抛 `ValueError`，两边一分岔就是崩溃。
+  判据：`…::test_the_escalation_gate_actually_sits_before_the_downgrade`（AST 检查闸的
+  位置在降级赋值之前，沿用本仓对这个大循环的既有测法）+ `…::test_stale_layout_windows_is_one_implementation`。
+
+- [x] ~~**BM-03 插 λ 能造出拆不开的末窗，且非法布局在 fail-closed 之前已落盘。**~~
+  **2026-09-16 已修（表层；死局本身见 `BM-04`）。**
+  真机 `cyclod_ligand3/rep1` 的 `path_versions` 末窗 K：v1=6 → v2=7 → v3=8 → **v4=9**，
+  而 `stage2_window_max_states=8`。`append_version` 在 anchor 检查**之前**
+  （`abfe_pipeline.py` 插 λ 分支 vs `_legalize_tail_window`），所以 v4 那个非法布局
+  **已经写进版本链** —— 后果不是"这一轮崩掉"，是 resume 读到它照样合法化不了，
+  这一跑再也走不出来。
+  两道都加了，缺一不可：
+  · 可行性侧 `abfe_preoptimizer.py:4179`（`feasible()`）——
+    插完末窗越过 `hi` 且取不到 tail anchor ⟹ `insert_lambda` 判不可行（回答"该不该发"）；
+  · 执行器侧 `abfe_pipeline.py:11802` —— 可落性在 `append_version` **之前**判（回答"发了能不能落"）。
+  ⚠️ 闸只在 `末窗K+n_insert > hi` **且** 无 anchor 时触发：cyclod_ligand3/rep1 的
+  前两次插点（6→7、7→8）照样放行，挡住的正是把布局搞成非法的第三次。
+  判据：`…::test_insert_is_infeasible_when_it_would_strand_the_tail` +
+  `…::test_insert_stays_feasible_when_the_tail_has_room`（后者钉的是**不许误伤**）。
+  ⚠️ 顺带记一条口径：末窗吸收溢出自己的 fail-closed 门槛是 `K > 2·hi−1`（=15），
+  而合法化门槛是 `K > hi`（=8）—— **8..15 是一段"吸收得进、拆不出来"的死区**，
+  `BM-03` 只是不让人再走进去，死区是 `BM-04` 的事。
+
+- [ ] **🟠 BM-04 卡住的窗口是 window 0 时，「缩跨度」这一族动作在构造上全部不可行。** **需要维护者拍板，代理不要自行改。**
+  位置：`abfe_preoptimizer.py::Stage2RepairController.tail_repartition_anchor`
+  —— `if idx is None or idx <= 0: return None`。
+  链条：拆末窗要 tail anchor → anchor 取自 `first_untrusted_window` 的**首态**
+  → window 0 不可信时 `idx == 0` ⟹ anchor 恒 None ⟹ **拆窗永远不可行**
+  ⟹ 只剩插 λ ⟹ 插到末窗满（K=hi）就没动作了 ⟹ `NO_FEASIBLE_ACTION`。
+  `idx <= 0` 本身不是笔误：docstring 写明 anchor 的语义是「冻结 anchor 之前的窗口」，
+  而 window 0 之前没有窗口可冻结。**所以这是设计边界，不是接线错误。**
+  真机命中：`cyclod_ligand3/rep1,rep3`（崩）+ `cmet_ligand1/rep1`、`jnk1_ligand1/rep3`、
+  `p38_ligand2/rep1`（插 λ 预算先用完所以没崩，终态理由逐字是
+  「拆窗：取不到 tail anchor（没有 window_idx > 0 的不可信窗口）」+「插 λ 预算已用尽」）。
+  ⚠️ `BM-01`~`03` **不会**让这些 run 跑完 —— 它们只把"崩溃 / 留下非法布局"换成
+  "如实停下并说清原因"。**别把 `BM-04` 当成已经解决了。**
+  三条出路，代价差很远，**没有默认答案**：
+  1. 允许 anchor = window 0 的首态，即**整条路径重分窗** —— 语义上是"全部作废重采"，
+     GPU 代价最大；但 window 0 恰恰是最常卡住的窗口（它是耦合端）；
+  2. 加大 `stage2_final_n_states` 给末窗留余量 —— 只把死区推后，不消除；
+  3. 接受现状，window 0 卡住就人工介入 —— 现在至少会明确说"卡在 window 0 且拆不开"。
+  判据：拍板后在本条下写明选了哪条 + 理由，并归档；若选 1，需要一个
+  "window 0 不可信 + 末窗顶满"的盘面能走到实际重分窗且不作废已合格窗口的测试。
+
+- [x] ~~**BM-05 两处会把排查引向错误对象的记账 bug。**~~ **2026-09-16 已修。**
+  ① `ibs_engine.py:22526`（`solve_stage_integrated`）：`w_idx` 是
+  `enumerate(valid_windows)` 的**列表位置**，而 `valid_windows` 只含被载入的窗口。
+  部分段分析（`[部分窗口段] 本段只采了窗口 [3]`）里它是 0，于是 12 条
+  `窗口 {w_idx}` 的日志把物理 win3 报成"窗口 0" —— 真机 brd4_ligand1/rep1 就是这么
+  把排查引到错误窗口上的（第一轮归因错 4 条里有 1 条源于此）。结构化字段一直是对的
+  （都走 `source_window_idx`）。修法是**在源头改名**：列表位置叫 `_list_pos`，
+  `w_idx` 从此就是物理窗口号 —— 一次改对 12 条消息，而不是逐条改 f-string。
+  ② `abfe_preoptimizer.py:2706`（`Stage2RepairController.__init__`）：`_explicit` 早就
+  滤了 `None`，`_disk`（`run_provenance.json` 的 config，是 argparse 完整命名空间落盘的）
+  **没滤**。实测 13 个 run 的 provenance 每份都带 17~18 个 `None` 键。今天不炸只是因为
+  那几个键恰好没走 `int()`；09-15 `cyclod_ligand1/rep1` 的
+  `TypeError: int() argument … not 'NoneType'` 就是同一个形状。
+  **「未知」只有一种表达：缺键。**
+  判据：`…::test_null_in_run_provenance_is_treated_as_absent`。
+
+> **`BM-A` 这些不是 bug，别再查**（理由别重新论证）：
+> · **求解器缺窗 4 个**（`p38_ligand1/rep2` 物理 win5 去相关后 5 帧 **g=100.1**；
+>   `cmet_ligand2/rep1` 跳 [3,4]，win3 g=82.6；`p38_ligand2/rep3` 跳 [4] g=60.0；
+>   `cmet_ligand1/rep2` 跳 [0] g=75.4）—— **真采样不足**，门抓对了。要治就是加采样
+>   或缩窗跨度，不是改门。
+> · `cmet_ligand1/rep3` attachment 腿前后半程 5.1638→4.4046、漂移 −0.7592 > 容差 0.5373
+>   —— 真·系综未收敛。
+> · `cmet_ligand2/rep3`（09-09 旧 run）50/50 次权重更新才判不收敛，预算给足了。
+> · `cyclod_ligand2/rep1_evidence`（09-11 旧 run）已被 `rep1_evidence_run2` 取代，过期。
+> · `cyclod_ligand2/rep1_evidence_run2`（09-11 旧 run）"累计已耗 555000 / 上限 555000、
+>   本次可用 0 步" → 0 次更新 → 报"未收敛" → `IBSWarmupConvergenceError`。
+>   **当时是真 bug（预算耗尽被写成 f_k 错了），现已修**：当前代码走
+>   `IBSValidationBudgetIndeterminateError` + `last_failure_reason="halt_budget_no_steps_available"`
+>   （`ibs_engine.py` 约 18253–18277）。旧 run 的这条不用再追。
+
 ### 📌 与代码无关的数据状态问题（不是 bug，但会挡住 run）
 
 - [x] ~~**DATA-01 `cyclod_ligand2/rep3` win4 的 production manifest 与 f_k 全都对不上。**~~
@@ -409,6 +609,33 @@
   `_resolve_analysis_f_k` 修复。
   ~~**待定**：这个窗口是重采、还是把那份 stale checkpoint 作废，需要维护者拍板。~~
   → 维护者选了**清空重跑**。
+
+- [ ] **🟠 DATA-02 `cyclod_ligand3/rep1` 与 `rep3` 的非法布局已经落盘，这两个 run 起不来。** **需要维护者拍板。**
+  实测（2026-09-16，当前代码只读）：两者 `checkpoints/path_versions/v4.json` 的
+  `window_ranges` 是 `K=[8, 6, 4, 9]`，末窗 9 > `stage2_window_max_states=8`；
+  `first_untrusted_window=0` ⟹ `tail_repartition_anchor=None`。
+  于是主循环的**启动布局校验**（`abfe_pipeline.py:11306`）看到 `_tk=9 > hi` 就去调
+  `_legalize_tail_window`，那里 anchor 取不到 ⟹ `RuntimeError` ⟹ **`decide()` 一次都轮不到**。
+  （只读重放 `decide()` 会给 `RUN_PRODUCTION[0]`，那是**假象** —— `decide()` 不做这道校验。）
+  ⚠️ `BM-03` 只阻止**再造出**这种布局，**不会**清理已经写进版本链的。这是数据状态问题，
+  和 `DATA-01` 同一类，代码侧修不掉。
+  两个选项：① 把版本链回退到 `v3`（末窗 K=8，合法）—— 但三次插点都打在 window 0，
+  win0 的产物在每一版都是过期的，回退后仍要重采 win0 及下游；
+  ② 清空这两个 run 的 stage-2 产物重跑（`DATA-01` 当时维护者选的就是这条）。
+  判据：拍板后在本条写明选了哪条，并确认该 run 能走过启动布局校验进入 `decide()`。
+
+- [ ] **🟠 DATA-03 三个 run 的 λ 总数不够，控制器自己判成「输入问题」。** **需要维护者拍板。**
+  `cmet_ligand1/rep2`、`cmet_ligand2/rep1`、`p38_ligand2/rep3` 当前 `decide()` 给
+  `NO_ACTION` + `NO_FEASIBLE_ACTION`，理由逐字是：
+  「插 λ 的跨 resume 累计预算已用尽（`max_path_insertions=3`，版本链上已插 3 次）⟹
+  继续插就是无限循环。**λ 总数不够是输入问题，应判 `HALT_LAMBDA_BUDGET_INSUFFICIENT`
+  由人工改输入**」。这是**设计内的正确退出**，不是 bug —— 但它就停在这里，
+  除非有人改输入。
+  当前 benchmark config：`stage2_final_n_states=21`、`max_path_insertions=3`
+  （`abfe-benchmark/openmm_IBS/configs/*.json`）。
+  ⚠️ 改 config 会动 `stage_protocol_key` ⟹ **作废现有窗口缓存**
+  （见 `incident_config_change_invalidated_all_window_caches`）。改之前先把 GPU 代价摆出来。
+  判据：拍板后写明改成多少、以及这几个 run 是重跑还是放弃。
 
 - [ ] **S2-E 旧修复机制是「关掉」不是「删掉」** —— path_evolution 修复分支 /
   production rescue / rescue 后重标定。**等自治这条再跑通几次再删**，别现在删。
@@ -472,6 +699,115 @@ P1 落地见 [EXP-033_P1_LANDED_2026-09-12.md](EXP-033_P1_LANDED_2026-09-12.md)�
   ⚠️ 做 A/B **不要**走 P1 的自动重训（两臂各自重训 ⟹ `sampling_score_sha256` 变成
   run-dependent，两臂不再共用同一把尺子）。要先离线冻一份两臂共用
   （`tools/retrain_local_residual_offline.py`）。
+- [ ] **🔴 LR-06 预热鬼影期 × 插件 0.1 Å 硬门 ⟹ outer 臂在窗口 0 必死（2026-09-16 真机定位，已定修法 = 方案 A）**
+
+  **症状**：`cyclod_ligand1_outer` 三个 rep 全部死在 stage-2 窗口 0：
+  `LocalManyBodyResidualForce (CUDA) fail-closed in K1/K6a (computeQ) (code 2):
+  pair distance below 0.1 Angstrom`。步长 2 fs→0.02 fs 无效。本节点复现 3/3。
+
+  ### 根因
+
+  `bias_scale` 乘在 **Group-1 整个表达式外面**（`ibs_engine.py` 的
+  `f"{prefix}_bias_scale * ({_state_expr(0)} - kt*(...))"`），而 `_state_expr(0)` 里就是
+  `cv_0_int + cv_0_rest` —— **配体↔环境的软核相互作用**。所以 `bias_scale = 0` 不是
+  "关掉偏置"，是**把配体关成完全的鬼影**：水分子直接穿过配体，`r → 0` 是**必然**。
+  三处会进入这个状态（后两处是有意的设计）：
+
+  | 位置 | 何时 |
+  |---|---|
+  | `local_residual/em_no_residual.py` post-EM | **已修，见下面 ①** |
+  | `ibs_engine.py` 时间步长爬坡 | 全程 `bias_scale=0`（注释：避免 dt 与未校准偏置两个不稳定源混在一起） |
+  | `ibs_engine.py` 偏置爬坡 | 0 → 0.2 → … → 1.0 |
+
+  而 `CustomCVForce` 会求值它的**每一个** CV（与系数是否为 0 无关），于是插件照样在
+  鬼影几何上跑 K1/K6a，撞硬门。
+
+  ### 为什么不能靠"别在鬼影期求值残差"来绕
+
+  一天之内已经找到**三个**求值点，每堵一个就冒出下一个：
+
+  1. 积分器（`setIntegrationForceGroups` 可排除）
+  2. 不带 `groups` 的 `getState`（`step_guard.finite_state_check` 每 500 步一次）
+  3. **`ibs_engine.py:16033 → 8924` 的 `getCollectiveVariableValues()`** —— 既不走积分
+     力组、也不走 `getState`，直接求值全部 CV。**真机就死在这里。**
+
+  鬼影期**照样在产生** <0.1 Å 的构型，排除力组只是让积分器不碰它，构型本身还在往
+  重叠里漂。⟹ 逐个堵求值点是打地鼠；两次真机跑谁过谁不过是**随机**的（速度种子不同）。
+
+  ### 已落地（独立成立，与下面的选择无关）
+
+  - **① `local_residual/em_no_residual.py` post-EM 只清 `_s_residual`，不再连
+    `_bias_scale` 一起清。** 原来两个一起清，而恢复要等到热化之后 ⟹ 那 10000 步热化
+    跑的是鬼影配体。这与 `ibs_engine` 自己的注释直接冲突（它在 EM 前**只**关
+    `s_residual`，明写「不像 bias_scale=0 那样连 baseline 也在正常使用的物理
+    softcore-state 混合力一起关掉」）。副作用也修掉了：**A/B 两臂不再是一个热化真配体、
+    一个热化鬼影**。实测：热化从「3/3 必崩在第 2500 步」变成**稳定通过**。
+
+  ⚠️ **临时脚手架，A 落地后删掉**：`em_no_residual.install()` 里另外两个 `Context` 级
+  补丁（`setParameter` 同步积分力组、`getState` 按积分力组取 State）。它们把失败点从
+  热化推到了 dt 爬坡之后，但**不是修复**（见上面第 3 个求值点）。主线
+  `ibs_engine.py` / `step_guard.py` 目前**零改动**。
+
+  ### 选定修法：**A —— 插件侧夹取**（不是 B）
+
+  把 4 处 `rAngstrom < EXP025_MIN_DISTANCE_ANGSTROM` 的「报错 + `continue`」改成**夹取**：
+  能量用 `r_eff = max(r, r_floor)`（下限内是平台、C0 连续、**这条边照样计入**），
+  力在下限内取 0（`invRM = 1/r` 那条发散项因此根本不需要求值）。
+  位置：`plugins/LocalManyBodyResidual/platforms/cuda/src/CudaLocalManyBodyResidualKernels.cpp`
+  的 304 / 447（K1 computeQ / force-scatter）与 766 / 832（K6a 同上）。
+  ⚠️ 别改成单纯 `continue`：那会在下限处制造能量跳变、给出冲量。
+
+  **为什么 A 而不是 B**（B = 把 `em_no_residual` 的孪生 System 从"只保护 EM"扩到整个预热期）：
+  A **消除失效模式**，B 只是**安排它不被观察到** —— B 的不变量「残差力永远不被喂到鬼影
+  几何上」靠控制流维持，而今天已经漏了三次，以后加一个探针就再漏一次。另外 A 不碰
+  `run_all_windows` 那 700 行（Context 迁移要搬位置/速度/盒子/全局参数/sampler 的
+  context 引用/checkpoint，漏一项是静默错），且对**所有**体系生效。
+
+  **`r_floor` 取训练支撑域下界、跟着模型走**（写进 payload/manifest，重训时从训练帧实测），
+  不沿用 0.1 Å —— 那个数的来历只是防 `1/r` 发散。本次训练帧（`pre_equilibration.dcd`
+  200 帧，λ=1，**按每帧自己的盒子**算）配体↔环境最小距离：水氢 **1.517 Å** / 带 LJ
+  **1.524 Å**，中位都在 1.8 Å；而崩点 0.093 Å **比支撑域近 16 倍**，那一段 typed MLP
+  在响应区外、输出与梯度都不受训练约束。⚠️ 水**在**模型环境里（type vocabulary 含
+  Z=1/Z=8），所以只能夹取、**不能把水氢剔出环境**。
+
+  ### 前提已验证（2026-09-16，本机）
+
+  | 检查 | 结果 |
+  |---|---|
+  | nvcc | `/opt/cuda/bin/nvcc` 12.9 ✓ |
+  | 构建脚本 | `plugins/LocalManyBodyResidual/g0_build.sh`（手写 g++，非 CMake），只要 `CONDA_PREFIX` 指向 openmm_dev ✓ |
+  | 上次构建 | `build_exp026_a2/` 2026-09-10 建于本机，`.o` 还在 ✓ |
+  | **CUDA 内核是运行时编译** | 内核源码在 `kDeviceSource` / `kDeviceSourceCSR` 两个 `R"CUDA(...)"` 字符串里，由 OpenMM `createModule` 运行时编译 ⟹ **改内核只需重编宿主 .so，不走 nvcc 路径** ✓ |
+
+  ### 执行顺序与代价
+
+  1. 改 4 处 → 2. `g0_build.sh` 重编 → 3. G0–G3（`exp028_run_regression_suite.sh`）
+  → 4. 同步 `local_residual/openmm_plugin.py` 的 `KNOWN_PLUGIN_SOURCE_SHA256`
+  **和** `resources/outer_lambda_local_residual/manifest.json` 的 `plugin.source_sha256`
+  （run 内重训产出的 manifest 会自动带新值）→ 5. 删掉上面那两个临时 `Context` 补丁
+  → 6. `cyclod_ligand1_outer` 真机复跑 → 7. 换一个疏水口袋体系（jnk1 / p38 / brd4）再跑一遍。
+
+  ⚠️ `B_φ` 在 `r < r_floor` 处的定义变了 ⟹ `sampling_score_sha256` 变 ⟹ 与**已冻结**的
+  旧分数不再可比。对 ΔG 正确性无影响（它是偏置，MBAR 对任意冻结偏置无偏），但做 A/B 时
+  两臂必须都用新插件。
+  ⚠️ 错误码 `EXP025_DEVICE_ERROR_MIN_DISTANCE = 2` **保留**（`exp026_control_plane_layout.h`
+  有 `static_assert` 钉 ABI），只改触发策略。
+
+  ### 已排除，别重查
+
+  - 不是体系爆炸 —— 失败时逐力组全正常（g0 max|F|=4818、g2=677 kJ/mol/nm），坐标全有限，
+    配体内部最近对 0.97 Å（正常 C–H）；
+  - **不是合并主线改坏的** —— 插件源码与 EXP-030 实跑那份（`Atenolol-rank11/plugins/…`，
+    sha `10afff53…`）`diff` **只差 17 行 MIT 许可证头**；`em_no_residual.py` 两份也都清
+    `_bias_scale`；
+  - 不是残差力在推 —— 失败坐标上把那个水 H 从 0.12 Å 扫到 4 Å，残差力恒 ~1e-5 kJ/mol/nm
+    （本次是闭式重训出的空模型，`relative_improvement=9.2e-07`）；
+  - 不是"软核允许重叠所以必然触雷" —— `power_lj=[2,2]`、`alpha_lj=0.5`，窗口 0 最深
+    λ_vdw=0.5933 时带 LJ 的对势垒 ~26 kT、λ=0.7054 时 ~118 kT，热涨落进不去。**能进去的
+    只有鬼影期。**
+  - `candidates=0` 是**死字段** —— `EXP026_STATUS_CANDIDATES` 只被 `exp026ResetSupportStatus`
+    置 0、全仓没有任何地方写过。要么补写入，要么从错误信息里删掉。
+
 - [ ] **LR-02 `skip_unsupported_frames` 该撤或反转** —— 支撑域外的帧正是"模型没覆盖这个
   体系"的证据，跳过它等于把本该触发停止的信号变成拟合时看不见的样本。
 - [ ] **LR-03 `sample-hard-window-scratch` 在主线里是死的** ——

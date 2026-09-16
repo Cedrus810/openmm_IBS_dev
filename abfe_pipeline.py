@@ -2798,6 +2798,51 @@ def _split_platform_spec(platform_name: str) -> Tuple[str, Optional[str]]:
     return base, device
 
 
+def _resolve_nvcc() -> Optional[str]:
+    """找 `nvcc` 的**绝对路径**。🔑🔑 **不能只问 PATH。**
+
+    真机（计算节点，2026-09-15）：`nvcc` 只存在于 mamba env 里，而作业的启动方式
+    是**用绝对路径调 env 的 python**：
+
+        /…/miniforge3/envs/openmm_dev/bin/python  /…/runabfe.py …
+
+    那样启动**不会**把 env 的 `bin/` 放进 PATH ⟹ `shutil.which("nvcc")` 返回
+    None ⟹ 不设 `CudaCompiler` ⟹ OpenMM 退回 NVRTC ⟹ 那段生成源码编译失败
+    ⟹ 被 `_create_context_with_local_cpu_fallback` 静默接住、**整个阶段跑 CPU**
+    （实测 pilot 87.6 s/λ）。同一份 `launch.log` 里 vanishing pilot 连起三次，
+    前两次（从激活过 env 的 shell 起）`CudaCompiler: 'nvcc'` 跑 CUDA，第三次没有
+    ⟹ `default_program(325)` 编译错误 ⟹ CPU。差别只在 PATH，不在代码、不在体系。
+
+    所以查找顺序按"**可靠性**"排，PATH 排在后面：
+      1. `OPENMM_CUDA_COMPILER` —— 使用者显式指定，最高优先级；
+      2. **运行中解释器的同级目录**（`sys.executable` 的 bin/）—— conda/mamba env
+         里 nvcc 与 python 是邻居，这条与"有没有 activate"完全无关，正是上面
+         那个失败形状的对症解；
+      3. `CONDA_PREFIX/bin`；
+      4. PATH（原来唯一的那条，留作兜底）；
+      5. `CUDA_HOME` / `CUDA_PATH` 的 `bin/`。
+
+    找不到返回 None —— 调用方负责**明说**，不要静默。
+    """
+    import sys as _sys
+
+    explicit = os.environ.get("OPENMM_CUDA_COMPILER")
+    if explicit and os.path.isfile(explicit) and os.access(explicit, os.X_OK):
+        return explicit
+    cands = [
+        os.path.join(os.path.dirname(os.path.abspath(_sys.executable)), "nvcc"),
+    ]
+    if os.environ.get("CONDA_PREFIX"):
+        cands.append(os.path.join(os.environ["CONDA_PREFIX"], "bin", "nvcc"))
+    for var in ("CUDA_HOME", "CUDA_PATH"):
+        if os.environ.get(var):
+            cands.append(os.path.join(os.environ[var], "bin", "nvcc"))
+    for c in cands:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return shutil.which("nvcc")
+
+
 def _build_platform_props(platform_name: str) -> Tuple[str, Dict[str, str]]:
     base, device = _split_platform_spec(platform_name)
     upper = base.upper()
@@ -2816,8 +2861,14 @@ def _build_platform_props(platform_name: str) -> Tuple[str, Dict[str, str]]:
         props["Precision"] = "mixed"
         if device is not None:
             props["DeviceIndex"] = device
-        if shutil.which("nvcc"):
-            props["CudaCompiler"] = "nvcc"
+        # 🔑 [2026-09-15] 原来是 `shutil.which("nvcc")` —— 只问 PATH。
+        # 绝对路径调 env 的 python 时 env 的 bin 不在 PATH ⟹ 找不到 ⟹ 退 NVRTC
+        # ⟹ 编译失败 ⟹ 静默跑 CPU。见 `_resolve_nvcc` 的 docstring（真机实证）。
+        # 这里写**绝对路径**而不是 "nvcc"：OpenMM 接受全路径，而且这样它不依赖
+        # 子进程的 PATH（`CudaCompiler` 最终是被 system() 调起来的）。
+        _nvcc = _resolve_nvcc()
+        if _nvcc:
+            props["CudaCompiler"] = _nvcc
     elif upper == "OPENCL":
         props["Precision"] = "mixed"
         if device is not None:
@@ -2850,9 +2901,40 @@ def _create_context_with_local_cpu_fallback(
     except Exception as exc:
         if requested_base.upper() == "CPU":
             raise
+        # 🔑🔑 [2026-09-15 真机] **编译错误和"卡忙/显存不够"不是一类失败。**
+        #
+        # 原来一个 `except Exception` 全接住、一律回退 CPU。但：
+        #   · 资源类（设备被占 / OOM / 卡不在）—— 换台机、等一会儿就好，回退合理；
+        #   · **编译错误** —— 确定性的。回退只是把一个每次都会复现的 bug 变成一次
+        #     **静默的百倍减速**：真机 vanishing pilot 掉到 CPU 后 87.6 s/λ，
+        #     20 个 λ 点光 pilot 就半小时，生产阶段更不用说，而且跑完还得重来。
+        #
+        # ⚠️ 顺带一个更要紧的事实：**OpenMM 的 `CudaCompiler` 默认值是空串，
+        # 也就是默认走 NVRTC**，nvcc 是可选旧路。先前 `shutil.which("nvcc")` 能不能
+        # 命中纯看启动 shell 的 PATH —— 命中了就绕开 NVRTC，没命中就撞上这个编译
+        # 错误。所以「以前一直好好的」是**碰巧**，不是代码正确。
+        # 真正的 bug 在生成的 kernel 源码里（`0 }`：一个裸常数后面直接跟 `}`，
+        # 缺分号）。要定位它必须拿到那段源码 —— 所以这里把完整编译错误原样抛出，
+        # 而不是吞掉换 CPU。
+        _msg = str(exc)
+        _is_compile = ("Error compiling program" in _msg
+                       or "error: expected" in _msg
+                       or "nvrtc" in _msg.lower())
+        if _is_compile:
+            raise RuntimeError(
+                f"平台 {platform_name!r} 的 kernel **编译失败**（不是资源问题）："
+                f"{_msg}\n"
+                "这类失败是确定性的：回退 CPU 只会把它变成一次静默的百倍减速"
+                "（真机实测 pilot 87.6 s/λ），跑完还得重来，所以这里不回退。\n"
+                "处置（三选一）：\n"
+                "  · 指定 nvcc 绕开 NVRTC：export OPENMM_CUDA_COMPILER=<nvcc 绝对路径>\n"
+                "    （conda/mamba 环境里它就在解释器隔壁；本代码也会自动去那儿找）\n"
+                "  · 真要用 CPU 就显式传 --platform CPU，让它成为一个决定而不是意外\n"
+                "  · 把上面那段编译错误连同 kernel 源码留档 —— 那才是根因所在"
+            ) from exc
         log(
-            f"  [WARN] 平台 {platform_name!r} 的 Context 初始化失败: {exc}，"
-            "本阶段局部回退到 CPU"
+            f"  [WARN] 平台 {platform_name!r} 的 Context 初始化失败（判为**资源类**，"
+            f"非编译错误）: {exc}，本阶段局部回退到 CPU"
         )
         integrator = integrator_factory()
         platform = openmm.Platform.getPlatformByName("CPU")
@@ -2885,6 +2967,29 @@ class NumpyEncoder(json.JSONEncoder):
 # 身份必须读同一个集合：这两处一旦漂开，就是"开开关会作废压根没被残差碰过的
 # stage 缓存"那个 bug（decharging 整段约 28 分钟白重跑）。
 RESIDUAL_SAMPLING_STAGES = frozenset({"vanishing", "vanishing_rescue"})
+
+# 🔑 [2026-09-15] Stage-2 控制器的**执行策略**键：它们决定控制器什么时候停手，
+# 不改 Hamiltonian、不改任何被算出来的数（同一份轨迹在任意取值下 ΔG 逐位相同），
+# 所以和 `resume` / `allow_untrusted_stage_results` 一样必须被排除在缓存身份之外。
+# 不排除的后果是已经踩过的那条：`_last_run_config["kwargs"]` 逐字段进指纹，
+# 新加一个 kwargs 键就让全部 stage 缓存失配（Stage 1 约 28 分钟 + 6 个 vanishing
+# 窗口全部重采样）—— 于是"把预算接上去"和"不重跑 GPU"变成二选一。
+# ⚠️ 这两个键**今天的指纹里本来就没有**（上游从没传过），所以剔除它们对既有
+# 缓存是逐位 no-op；这是它能无痛落地的前提，别往这个集合里塞已经在传的键。
+_NON_IDENTITY_KWARGS = (
+    "stage2_production_budget_steps",
+    "stage2_max_production_blocks_per_window",
+)
+
+
+def _strip_non_identity_kwargs(run_config: Dict) -> Dict:
+    """把执行策略键从 run_config["kwargs"] 里摘掉（不改入参）。"""
+    kw = run_config.get("kwargs")
+    if isinstance(kw, dict) and any(k in kw for k in _NON_IDENTITY_KWARGS):
+        kw = {k: v for k, v in kw.items() if k not in _NON_IDENTITY_KWARGS}
+        run_config = dict(run_config)
+        run_config["kwargs"] = kw
+    return run_config
 
 # 全局拼接失败里，**成因是「有窗口数据不够被跳过」**的那几个 reason。
 # 它们是路由信号（SKIPPED_WINDOW / INSUFFICIENT_DATA），不是终态：动作是补采，
@@ -5610,6 +5715,7 @@ class ABFEPipeline:
         production_step_overrides: Optional[Dict[int, int]] = None,
         frozen_validation_step_overrides: Optional[Dict[int, int]] = None,
         frozen_validation_is_final_rung: Optional[Dict[int, bool]] = None,
+        provisional_production_windows: Optional[List[int]] = None,
         pilot_lambdas: Optional[List[float]] = None,
         pilot_mean_dU_dlambda: Optional[List[float]] = None,
         pilot_std_dU_dlambda: Optional[List[float]] = None,
@@ -5672,6 +5778,9 @@ class ABFEPipeline:
             完的差值（ibs_engine.py 内部按 frozen_validation_cumulative_steps
             记账，不会把这个字段当成"这次要新跑多少步"）。
 
+        provisional_production_windows: 透传给 run_all_windows —— 被显式授权在
+            冻结验证撞批次上限（无结论）时进**一块**临时生产的窗口。详见
+            `ibs_engine.run_all_windows` 的同名形参说明。
         frozen_validation_is_final_rung: 可选的 {window_idx: 这次是否已经是
             冻结验证阶梯的最后一档} 表，透传给 ibs_engine.py::run_all_windows。
             标记为 True 后如果仍未通过独立验证，该窗口会被直接判定为终态失败
@@ -6220,6 +6329,7 @@ class ABFEPipeline:
             production_step_overrides=production_step_overrides,
             frozen_validation_step_overrides=frozen_validation_step_overrides,
             frozen_validation_is_final_rung=frozen_validation_is_final_rung,
+            provisional_production_windows=provisional_production_windows,
             initial_f_k_by_window=initial_f_k_by_window,
             # 🔑 [2026-09-11 实验开关，默认 False] 见 ibs_engine 里的参数注释。
             accept_recalibrated_f_k_without_gate=bool(
@@ -8347,6 +8457,22 @@ class ABFEPipeline:
                 "硬不变量未满足 ⟹ 这份结果不是一条完整路径上的 ΔG，拒绝标记为 completed。"
             )
 
+        # 🔑 [2026-09-15] **临时生产窗口必须在最终结果上说出来，不只在日志里。**
+        # 这条路径完整、数值有限（上面的硬不变量已经判过），所以**不拦**；
+        # 但它含至少一个 f_k 从未通过冻结验证的窗口 ⟹ 绝不是可信 PASS。
+        # 老产物没有这个键 ⟹ 空列表 ⟹ 不打印，行为逐字不变。
+        _prov_wins = result.get("provisional_production_windows") or []
+        if _prov_wins:
+            self._log(
+                f"  [WARN][临时生产] {stage_label} 的窗口 {list(_prov_wins)} 是用"
+                "**从未通过冻结验证**的冻结 f_k 采的（Δf−ΔF 在单周期批次上限内"
+                "从未被求出 ⟹ 对那份 f_k 无结论，既非通过也非被驳回）。"
+                "这些帧本身是合法的 MBAR 数据（单一固定采样分布），路径也完整，"
+                "但这份 ΔG **不是可信 PASS** —— 它的放行依据只有生产后的 "
+                "min N_eff/g 支撑门与最终 MBAR，没有生产前的 f_k 预筛。"
+                "逐窗证据见各窗口的 `*_warmup_failure.json`（刻意保留未删）。"
+            )
+
         # charging 的 BAR 主值只有在 FD-TI 一致性门明确通过时才允许完成。
         # `passed=None` 表示 TI 缺失/异常或容差没声明，不是“软警告”。
         if result.get("primary_estimator") == "adjacent_bar":
@@ -8436,10 +8562,34 @@ class ABFEPipeline:
         # 会**静静地把上游那份结果发布出去**。
         # 只在 `autonomous_outcome` 存在时触发（该键只有 stage2 自治循环会写），
         # 其余调用点行为逐字不变。
+        # 🔑🔑 [2026-09-15 用户拍板] **这道门原来是总闸，而单次计算在构造上过不去。**
+        #
+        # `DONE` 的充要条件是 `precision_status == MEETS_CROSS_REPEAT_TARGET`，
+        # 而那是**跨 ≥3 个独立重复**的样本标准差（`abfe_core.cross_repeat_precision`
+        # 数据不足时诚实返回 `UNMEASURED`）。单次计算永远只有 1 个重复 ⟹ 出口恒为
+        # `ANALYSIS_COMPLETE_PRECISION_UNMEASURED` ⟹ 恒不在 `(DONE, DONE_UNTRUSTED)`
+        # 里 ⟹ **抛**。实测：六个窗全 `min N_eff/g=50`、`ANALYSIS_COMPLETE`、
+        # 无缺窗无跳窗的完美盘面，照样 `过 8461: False`，`--allow-untrusted-
+        # stage-results` 也救不了（它降级的是另外 6 条质量门）。
+        #
+        # ⟹ 把跨重复的量当单次计算的放行条件，是拿一个它产不出来的东西拦它。
+        # 判据换成**这一跑自己能回答的那个问题**：这条路径完整吗。
+        #   · `ANALYSIS_COMPLETE` ⟹ 放行。精度是另一个维度，由 `precision_status`
+        #     如实携带（单次 = `UNMEASURED`），谁要发布谁自己看，不在这里拦。
+        #   · 否则仍然抛 —— 那**不是阈值问题**：缺窗的和是另一个量，不是 ΔG。
+        #     上面 `analysis_status != ANALYSIS_COMPLETE` 那道已经拦过了。
+        #
+        # ⚠️ 逐窗 `min N_eff/g`、σ、overlap 一条都没少算、没少落盘（性能分析要用），
+        # 只是不再**拦**。
         if _out and _out.get("exit") not in ("DONE", "DONE_UNTRUSTED"):
-            raise RuntimeError(
-                f"{stage_label} 的 Stage-2 自治循环没有以 DONE 退出，"
-                "这份结果不代表一条跑完的路径，拒绝标记为 completed。" + _note
+            self._log(
+                f"  [{stage_label}] Stage-2 自治循环以 exit={_out.get('exit')!r} 退出"
+                f"（用了 {_out.get('iterations_used')} 轮），**不是 DONE**。"
+                "硬不变量（路径完整/数值有限/结构自洽）已在上面单独判过并通过 ⟹ "
+                "放行。精度维度由 `precision_status` 如实携带："
+                f"{result.get('precision_status')!r} —— 单次计算测不出跨重复离散度，"
+                "这份 ΔG **不得作为已验收结果发布**。"
+                + _note
             )
         _scope = result.get("stage_scope")
         if _scope == "window_subset_no_stage_verdict" or result.get(
@@ -10949,6 +11099,7 @@ class ABFEPipeline:
         max_iterations: int = 40,
         allow_untrusted_stage_results: bool = False,
         f_k_reanchor_cadence_steps: int = 500_000,
+        effective_config: Optional[Dict[str, Any]] = None,
     ):
         """**顶层自治循环**：读证据 → 决定动作 → 执行 → 重读，直到真终态。
 
@@ -11121,14 +11272,26 @@ class ABFEPipeline:
         # 这一步零成本（只读盘上产物），但它决定了下一轮是"接着补帧"还是"重建一次"。
         self._reconcile_rewindow_intents(checkpoint_dir)
 
-        for it in range(1, int(max_iterations) + 1):
-            # **按物理 stage 聚合**：段不是独立 stage（否则同一个 stage 出两个动作）。
-            ctl = Stage2RepairController.for_physical_stage(
+        def _make_ctl():
+            """**按物理 stage 聚合**：段不是独立 stage（否则同一个 stage 出两个动作）。
+
+            一个闭包而不是两处字面量：循环里和退出前的收尾各要造一次，
+            两处参数一旦漂开就是"决策看的是一套配置、收尾看的是另一套"。
+            """
+            return Stage2RepairController.for_physical_stage(
                 run_dir, "vanishing", "vdw",
                 min_states_per_window=int(min_states_per_window),
                 max_states_per_window=int(max_states_per_window),
                 allow_untrusted_stage_results=bool(allow_untrusted_stage_results),
+                # 🔑 [2026-09-15 审计 #1] **显式喂配置，别让控制器去 run_dir 底下
+                # 碰运气。** 溶剂腿的 run_dir 是 `output_dir/solvent_leg`，那里
+                # 没有 `run_provenance.json` ⟹ 分窗判据/预算/上限全退默认值，
+                # 与复合物腿不是同一套。传 None 时行为逐字不变（仍读 provenance）。
+                effective_config=effective_config,
             )
+
+        for it in range(1, int(max_iterations) + 1):
+            ctl = _make_ctl()
             view = ctl.read()
 
             # 🔑 **每轮先把布局弄合法，再决策。**
@@ -11195,6 +11358,10 @@ class ABFEPipeline:
                 "windows": wins, "terminal": plan.get("terminal"),
                 "evidence_status": plan.get("evidence_status"),
                 "blocked_by_upstream": plan.get("blocked_by_upstream"),
+                # [2026-09-16] 本轮被退役出路由顺序的窗口（对它们已无可行动作）。
+                # 必须留痕：否则事后只看到"动作跳到了下游窗口"，看不出上游是被
+                # 判定修不动了还是被漏掉了 —— 那正是这次要修的那种看不见。
+                "retired_windows": plan.get("retired_windows"),
                 "repeat_count": seen[key],
                 # 🔑 **每一轮各个参数长什么样** —— 只记终态的话，A/B 对比时
                 # 看不出差异是在哪一步产生的，也没法回答"这个动作到底把它
@@ -11295,6 +11462,38 @@ class ABFEPipeline:
                             f"动作 {act}{wins} 降级后仍推不动（盘上状态未变）", it)
                     break
                 escalated[esc_key] = True
+                # 🔑🔑 [2026-09-16 真机] **降级必须过可行性闸，它绕开了 `decide()`。**
+                #
+                # 下面这段直接改写 `act`，`decide()` 里的每一道可行性守卫
+                # （1d-0 布局过期 / 1e 预热进不去 / TERMINAL …）都在它上游，
+                # 一条也没走。真机 jnk1_ligand2/rep1：`RUN_PRODUCTION[3]` 被
+                # `LOCAL_VALIDATION_CAP` 连弹 3 次 ⟹ 停滞保护降级成
+                # `PROBE_REANCHOR_EPOCH[3]` ⟹ 而 win3 的产物正是插 λ 之后的过期
+                # 布局，重解必然维度不符 ⟹ `ValueError` 炸穿主循环。
+                #
+                # 「布局过期的窗口只能重采」是 1d-0 已经定下的口径；而我们**正是
+                # 因为重采推不动**才走到这里，所以对这种窗口根本没有可降级的动作。
+                # 如实发 NO_FEASIBLE_ACTION，别拿一个构造上不可能成功的动作充数。
+                _stale_for_escalation = sorted(
+                    _pre.Stage2RepairController.stale_layout_windows(view)
+                    & {int(x) for x in (wins or [])}
+                )
+                if _stale_for_escalation:
+                    self._log(
+                        f"  [自治] 窗口 {_stale_for_escalation} 的产物描述的是**另一套 "
+                        "λ 布局**（插 λ / 拆窗之后旧帧的态数或 λ 内容与当前 "
+                        "`window_ranges` 不符）⟹ 任何拿已有帧重解的降级动作在构造上"
+                        "都会维度不符（真机实测直接 ValueError 炸出流水线）。"
+                        "唯一能推动它的是按新布局重采，而重采刚刚被判定推不动 ⟹ "
+                        "NO_FEASIBLE_ACTION，退出。"
+                    )
+                    history[-1]["exit"] = "NO_FEASIBLE_ACTION"
+                    history[-1]["escalation_blocked_by"] = "stale_layout_evidence"
+                    _finish("TERMINAL", "NO_FEASIBLE_ACTION", "loop",
+                            f"动作 {act}{wins} 推不动，而窗口 "
+                            f"{_stale_for_escalation} 的证据被布局变更作废 ⟹ "
+                            "重解类降级动作在构造上不可能成功", it)
+                    break
                 if act not in _NO_ESCALATION and wins:
                     # **有界探针**，不是全路径重来：只针对卡住的那个窗口、
                     # 只给一个 +250k 块。先前降级到 RECALIBRATE_FK ——
@@ -11362,10 +11561,48 @@ class ABFEPipeline:
                                 f"  [自治] 窗口 {sorted(overrides)} 的补采落在段目录 "
                                 f"{os.path.basename(_out_override)}。"
                             )
+                        # `overrides` 的值可能是 None（那个窗口盘上烧了多少步
+                        # 读不到 ⟹ 不给目标、按原目标跑）。窗口本身仍要跑 ——
+                        # 见 `windows_by_segment` 里那段「不给目标≠不给窗口」。
+                        _targets = {k: v for k, v in overrides.items()
+                                    if v is not None}
                         _subset_only = run_once(
                             len(lam), list(lam), ranges,
                             _only_window_indices=sorted(overrides) or None,
-                            _production_step_overrides=overrides or None,
+                            _production_step_overrides=_targets or None,
+                            _output_dir_override=_out_override,
+                            _checkpoint_dir_override=_ckpt_override,
+                            _resume_override=True,
+                        )
+                elif act == "PROVISIONAL_PRODUCTION":
+                    # 🔑🔑 [2026-09-15] 冻结验证撞 15 批上限、Δf−ΔF 从未被求出
+                    # （无结论、**未被驳回**）⟹ 显式授权引擎用这份未验证的冻结
+                    # f_k 采**一块**诊断生产，而不是再抛一次路由信号。
+                    # ⚠️ 授权必须**显式逐窗**传下去：引擎默认仍然 fail-closed
+                    # 抛 `IBSValidationBudgetIndeterminateError`。
+                    # ⚠️ 块大小 = 该窗口已有步数 + 一个 `base_unit`；读不到已有
+                    # 步数（这类窗口从未生产过，正是常态）就**不给目标**，按
+                    # 配置的 `n_steps_per_window` 跑 —— 见 `windows_by_segment`。
+                    # **别因为"差一点到 10"就在这里改成两块**（4818 那段明令）。
+                    for _seg, overrides in sorted(_pre.windows_by_segment(
+                        wins, view["windows"], base_unit).items()
+                    ):
+                        _out_override, _ckpt_override = _pre.segment_dirs_for_evidence(
+                            {_seg}, stage_dir, checkpoint_dir
+                        )
+                        _targets = {k: v for k, v in overrides.items()
+                                    if v is not None}
+                        self._log(
+                            f"  [自治] 窗口 {sorted(overrides)} 进**临时生产**"
+                            f"（段目录 {os.path.basename(_out_override) if _out_override else '基准段'}）"
+                            "：f_k 未经验证，**不是可信 PASS**，"
+                            "采用与否交生产后的 min N_eff/g 支撑门与最终 MBAR。"
+                        )
+                        _subset_only = run_once(
+                            len(lam), list(lam), ranges,
+                            _only_window_indices=sorted(overrides) or None,
+                            _production_step_overrides=_targets or None,
+                            _provisional_production_windows=sorted(overrides),
                             _output_dir_override=_out_override,
                             _checkpoint_dir_override=_ckpt_override,
                             _resume_override=True,
@@ -11562,15 +11799,48 @@ class ABFEPipeline:
                     _pilot = self._load_pilot_for_path_evolution(
                         os.path.join(checkpoint_dir, "preopt_dual_vanishing.json")
                     )
-                    if _rng is None or _pilot is None:
+                    # 🔑🔑 [2026-09-16 真机] **先验能不能合法化，再落盘。**
+                    #
+                    # 下面那条 `append_version` 一落，新布局就是盘上的权威；而紧接着
+                    # 的 `_legalize_tail_window` 在「末窗 K > hi 且取不到 tail anchor」
+                    # 时 fail-closed 抛 RuntimeError。顺序反了的后果不是「这一轮崩掉」，
+                    # 是**非法布局被永久留在版本链上** —— 真机 cyclod_ligand3/rep1 的
+                    # v4 末窗 K=9 > hi=8 就躺在盘上，resume 读到它照样合法化不了，
+                    # 这一跑再也走不出来。
+                    #
+                    # 末窗吸收溢出的规则是「插几个就涨几个」（见
+                    # `insert_lambda_in_failed_ibs_window` 里 `_tail_k_after` 的算法），
+                    # 这里 `n_insert=1` 是下面写死的常数 ⟹ 涨 1。放在插点**之前**算，
+                    # 是为了不必为了判可行性先把布局造出来。
+                    # 可行性判据（`Stage2RepairController._feasibility`）现在也挡这一条；
+                    # 两道都要留：判据回答"该不该发"，这里回答"发了能不能落"。
+                    _tail_k_after_insert = (
+                        int(ranges[-1][1]) - int(ranges[-1][0]) + 1 if ranges else 0
+                    )
+                    _tail_would_strand = (
+                        _tail_k_after_insert > int(max_states_per_window)
+                        and ctl.tail_repartition_anchor(view) is None
+                    )
+                    if _rng is None or _pilot is None or _tail_would_strand:
                         # 与 SPLIT_TAIL_WINDOW 同一个坑：静默 skip ⟹ 盘面不变 ⟹
                         # 控制器下一轮读到同样的状态、发同样的动作，只能靠通用停滞
                         # 探测兜底。执行器做不了的事必须回到控制器的判断里。
-                        self._log(
-                            "  [自治] 插 λ 缺失败窗口区间或 pilot ⟹ 本动作在盘面上是 no-op，记账。")
+                        if _tail_would_strand:
+                            self._log(
+                                f"  [自治] 插 λ **不提交**：插完末窗 K={_tail_k_after_insert}"
+                                f" > 执行层上限 {int(max_states_per_window)}，而合法化只能"
+                                "靠拆末窗、拆末窗又取不到 tail anchor（没有 window_idx > 0 "
+                                "的不可信窗口）⟹ 落盘就是一个拆不开的非法布局。"
+                                "记账，**不改版本链**。"
+                            )
+                            _noop_reason = "insert_lambda_would_strand_tail_window"
+                        else:
+                            self._log(
+                                "  [自治] 插 λ 缺失败窗口区间或 pilot ⟹ 本动作在盘面上是 no-op，记账。")
+                            _noop_reason = "insert_lambda_without_range_or_pilot"
                         self._record_noop_action(
                             checkpoint_dir, act, wins, view,
-                            reason="insert_lambda_without_range_or_pilot",
+                            reason=_noop_reason,
                         )
                     else:
                         new_l, new_r, idiag = insert_lambda_in_failed_ibs_window(
@@ -11580,6 +11850,8 @@ class ABFEPipeline:
                             max_states_per_window=int(max_states_per_window),
                             n_insert=1,
                         )
+                        # ⚠️ 末窗溢出的可落性已在插点**之前**判过（见上面
+                        # `_tail_would_strand`）—— 走到这里表示新布局一定合法化得了。
                         import lambda_path_versions as _lpv_ins
                         _ins_rec = _lpv_ins.append_version(
                             checkpoint_dir, [0.0] * len(new_l), new_l,
@@ -11620,9 +11892,32 @@ class ABFEPipeline:
                             max_states_per_window=int(max_states_per_window),
                             first_untrusted=ctl.first_untrusted_window(view),
                         )
-                        result = run_once(
-                            len(lam), list(lam), ranges,
-                            _authoritative_window_ranges=True, _resume_override=True,
+                        # 🔑🔑 [2026-09-15 审计 #3] **这里原来直接 `run_once(...)`
+                        # 全路径重采，而 `plan()` 刚刚把这个动作判为"零生产成本"。**
+                        #
+                        # `plan()` 的 `_PRODUCTION_CHARGED` 白纸黑字把
+                        # `INSERT_LAMBDA` / `SPLIT_TAIL_WINDOW` 排除在生产预算准入
+                        # 之外，理由写的是「布局动作本身不直接花采样预算（它们引发的
+                        # 重采由下一轮的 `RUN_PRODUCTION` 计费）」。但执行器改完布局
+                        # 立刻 `run_once(...)`、**不带 `_only_window_indices`** ⟹
+                        # 所有缓存失效/缺失的窗口当场全部重采。于是：
+                        #   · 决策层说零成本、执行层直接烧一整段 GPU，预算超支要等
+                        #     下一轮读盘才发现；
+                        #   · 「每个动作之后重新判断」的调度边界被撑成一次整段采样。
+                        #
+                        # 修法取 `plan()` 已经声明的那一条（不是新设计，是让执行器
+                        # 兑现契约）：**布局动作只提交新布局，不采样。**
+                        # 下一轮 `decide()` 看到新布局 + 被作废的窗口，逐窗发
+                        # `RUN_PRODUCTION`，每块都过生产准入。
+                        #
+                        # 循环不会因此停住：路径版本已经推进（`append_version` 落盘），
+                        # 而 `_disk_signature` 把 `path_version` 算在内 ⟹ 盘面确实变了，
+                        # 不会被记成 no-op。`result` 保持 None 也是**已支持**的状态
+                        # （见本函数开头「一整跑只发过子集动作时 result 保持 None」）。
+                        self._log(
+                            "  [自治] 插 λ 已提交新布局（路径版本已推进）；"
+                            "**本动作不采样** —— 受影响窗口的重采由下一轮逐块发 "
+                            "`RUN_PRODUCTION`，每块都过生产预算准入。"
                         )
                 elif act == "SPLIT_TAIL_WINDOW":
                     anchor_lam = ctl.tail_repartition_anchor(view)
@@ -11674,10 +11969,12 @@ class ABFEPipeline:
                             f"（冻结前缀 {tdiag['frozen_prefix_windows']}，"
                             f"作废 {tdiag['invalidated_old_windows']}）"
                         )
-                        result = run_once(
-                            len(lam), list(lam), ranges,
-                            _authoritative_window_ranges=True,
-                            _resume_override=True,
+                        # 审计 #3，与 `INSERT_LAMBDA` 同一条：布局动作只提交布局。
+                        # 理由见那里的长注释（决策层判零成本、执行层却整段重采）。
+                        self._log(
+                            "  [自治] 尾段重分已提交新布局（路径版本已推进）；"
+                            "**本动作不采样** —— 受影响窗口的重采由下一轮逐块发 "
+                            "`RUN_PRODUCTION`，每块都过生产预算准入。"
                         )
                 elif act == "RELEARN_FK_EPOCH":
                     # **与 RECALIBRATE_FK 不是一回事**：那个拿旧生产帧重解 f_k
@@ -12017,6 +12314,80 @@ class ABFEPipeline:
         # TERMINAL/FAILED/HALTED_NO_EXECUTOR/ITERATION_CAP_NOT_CONVERGED/RUNNING，
         # 从来不写 "DONE"（那是 `decide()` 的 `exit` 值）⟹ 原条件恒真，
         # 连干净收敛的结果也被盖上"控制器非正常退出"的结论。
+        # 🔑🔑 [2026-09-15 用户拍板：**诊断照算照落盘，但不许拦**] 退出前**必跑一次
+        # 全路径 ANALYZE**，不管是以什么终态退出的。
+        #
+        # 两个理由，都不是"为了好看"：
+        #   ① **循环依赖。** 补帧准入的判据量是 `solver_n_frames_decorrelated`，
+        #      它只存在于 stage 求解结果的 `window_overlap_diagnostics` 里；而
+        #      `ANALYZE` 只在所有窗口都解决之后才会被选中。窗口解决不了 ⟹ 没有
+        #      ANALYZE ⟹ 没有 stage 结果 ⟹ 判据量恒 `None` ⟹
+        #      `marginal_gain_stalled([None,...])` 返回 `NOT_ENOUGH_POINTS` ⟹
+        #      边际刹车**从来没判过一次**，只剩硬计数 4 块。
+        #      真机三个 run 同一个死法，那行 `逐块判据量=[(…, None) ×4]` 就是它。
+        #   ② **性能分析要用。** 逐窗 N_eff/g / 逐段 σ / overlap 全在这份结果里；
+        #      停在 NO_FEASIBLE_ACTION 就一份都拿不到，等于把整跑的 GPU 白烧。
+        #
+        # ⚠️ 这**不放宽任何判据**：ANALYZE 是只读求解，产出的 `analysis_status`
+        # 由求解器自己判（缺窗照样 `ANALYSIS_INCOMPLETE`，部分和照样被钉死）。
+        # 它只保证"证据被算出来并落了盘"，不保证证据合格。
+        # 🔑🔑 [2026-09-15] **但 ANALYZE 只有在"不会采样"时才准跑。**
+        # `run_once` 是全窗口 `run_all_windows`，`_resume_override=True` 只是
+        # "有合法缓存就复用" —— 缓存**不存在**（窗口从没采过）或**对不上当前布局**
+        # 时，它会老老实实去采样，每窗一整个 `n_steps_per_window`。
+        # 那正是控制器刚刚决定不要做的事：GLOBAL_BUDGET_EXHAUSTED / INVALID_INPUT /
+        # 补帧次数耗尽这三个终态下，收尾会绕过那个停止决定重新烧 GPU，而且不复查
+        # 任何一道预算闸（这条路径上根本没有闸）。
+        # 判据用控制器自己的视图，不另立一套：
+        #   · `missing_windows`  —— 布局里有、所有段都没有产物 ⟹ 必然采样；
+        #   · `stale_layout_evidence` —— 有产物但 λ 对不上当前布局 ⟹ 必然重采。
+        # 两者都空 ⟹ 每个窗口都有当前布局下的产物，这次调用是**纯重解**，
+        # 也正是它想要的那份诊断。不空就不跑，并把原因说出来（静默跳过等于
+        # 又制造一个"判据量恒 None"的哑坑）。
+        if outcome.get("exit") not in ("DONE", "DONE_UNTRUSTED"):
+            try:
+                _fresh = _make_ctl().read()
+            except Exception as _rd_err:  # noqa: BLE001 —— 读不到就别赌
+                _fresh, _blockers = None, [f"read_failed:{_rd_err!r}"]
+            else:
+                _blockers = (
+                    [f"missing_window_{int(i)}"
+                     for i in (_fresh.get("missing_windows") or [])]
+                    + [f"stale_layout_window_{int(i)}"
+                       for i in (_fresh.get("stale_layout_evidence") or {})]
+                )
+        else:
+            _blockers = []
+        if outcome.get("exit") not in ("DONE", "DONE_UNTRUSTED") and _blockers:
+            self._log(
+                "  [自治] 退出前的全路径 ANALYZE **跳过**：这些窗口在当前布局下没有"
+                f"可复用的产物 {_blockers} ⟹ 跑它就是重新采样，而控制器刚刚以 "
+                f"{outcome.get('exit')} 决定停手。诊断缺失是预期结果，不是失败。"
+            )
+            outcome["final_analyze_skipped"] = _blockers
+            _write_history()   # 上一次写盘在这个决定之前，不补写就看不见它
+        elif outcome.get("exit") not in ("DONE", "DONE_UNTRUSTED"):
+            try:
+                self._log(
+                    "  [自治] 退出前跑一次**全路径 ANALYZE**：把逐窗支撑/σ/overlap "
+                    "算出来落盘（补帧准入的判据量只在这份结果里；不跑它，"
+                    "边际刹车永远拿不到数据，性能分析也无从做起）。"
+                )
+                _final = run_once(
+                    len(lam), list(lam), ranges,
+                    _only_window_indices=None, _resume_override=True,
+                )
+                _merged = self._solve_merged_segments_if_any(
+                    stage_dir, checkpoint_dir, ranges, lam, float(kt)
+                )
+                if _merged is not None:
+                    _final = _merged
+                if isinstance(_final, dict):
+                    self._persist_inprogress_stage_result(checkpoint_dir, _final)
+                    result = _final
+            except Exception as _fin_err:  # noqa: BLE001 —— 收尾求解失败不改终态
+                self._log(f"  [自治] 退出前 ANALYZE 失败：{_fin_err!r}（不改终态）")
+
         if isinstance(result, dict) and outcome.get("exit") not in (
                 "DONE", "DONE_UNTRUSTED"):
             result["autonomous_outcome"] = dict(outcome)
@@ -12309,13 +12680,15 @@ class ABFEPipeline:
         by_idx = {int(w["window_idx"]): w for w in (view.get("windows") or [])}
         if unit_id:
             # 子窗的 no-op 只记在**它自己**头上：同父窗的另一个子窗照常可补。
-            led[f"{action}:unit:{unit_id}"] = {
-                "action": action, "unit_id": str(unit_id), "reason": reason,
-                "fingerprint": _pre_noop.action_noop_fingerprint(
-                    next((u for u in (view.get("sampling_units") or [])
-                          if str(u.get("unit_id")) == str(unit_id)), None),
-                    view.get("path_version")),
-            }
+            _fp_unit = _pre_noop.action_noop_fingerprint(
+                next((u for u in (view.get("sampling_units") or [])
+                      if str(u.get("unit_id")) == str(unit_id)), None),
+                view.get("path_version"))
+            if _fp_unit is not None:      # None = 没有可比身份，不落账（同下）
+                led[f"{action}:unit:{unit_id}"] = {
+                    "action": action, "unit_id": str(unit_id), "reason": reason,
+                    "fingerprint": _fp_unit,
+                }
             # 🔑🔑 [契约 A / 审计 #9] **不 return：父窗那条普通 key 也要写。**
             # 先前这里提前 return ⟹ 带 `unit_id` 的那一轮**连普通 key 都不写**，
             # 而控制器侧 `_is_noop` 只查 `f"{action}:{idx}"` ——
@@ -12324,12 +12697,23 @@ class ABFEPipeline:
             # 带 `unit_id` 的动作 `windows` 就是 `[parent_window]`，所以下面那个
             # 循环写的正是父窗那条。两条指纹各算各的，互不污染。
         for w in (windows or []):
+            # 🔑 [2026-09-15] 指纹为 None = 这个盘面没有可比身份（生产步数读不到）
+            # ⟹ **不落账**。落了也永远失效不了（`?` == `?`），等于给这个窗口
+            # 判了无期 —— 真机 win4 就是被一条这样的记录锁死的。
+            _fp = _pre_noop.action_noop_fingerprint(
+                by_idx.get(int(w)), view.get("path_version"))
+            if _fp is None:
+                self._log(
+                    f"  [自治] 动作 {action}[{int(w)}] 的盘面没有可比身份"
+                    "（生产步数读不到）⟹ **不记** no-op："
+                    "这样的记录无法失效，会把该窗口永久钉死。"
+                )
+                continue
             led[f"{action}:{int(w)}"] = {
                 "action": action,
                 "window_idx": int(w),
                 "reason": reason,
-                "fingerprint": _pre_noop.action_noop_fingerprint(
-                    by_idx.get(int(w)), view.get("path_version")),
+                "fingerprint": _fp,
             }
         try:
             _atomic_write_json(path, led)
@@ -12972,23 +13356,51 @@ class ABFEPipeline:
                 f"  [f_k 重标定] 源段 {os.path.basename(src_dir)} 缺窗口 "
                 f"{_src_missing}（部分段，已显式声明）；只用它有的窗口重解。"
             )
+        restrict = None if only_windows is None else {int(x) for x in only_windows}
+        # 🔑🔑 [2026-09-16 真机] **不载的窗口就别载 —— 局部动作不许吃全路径。**
+        #
+        # 下面那个循环本来就把 `only_windows` 之外的窗口原样 skip 掉，但它是在
+        # **载完之后**才 skip 的，而 loader 对每个载入的窗口都做 fail-closed 的
+        # 布局校验（态数 / λ 内容必须与当前 `ranges` 逐字相符）。于是一个只针对
+        # 窗口 3 的动作会崩在窗口 4 上：
+        #     [自治 5/40] 动作=PROBE_CANDIDATE_FK 窗口=[3]
+        #     [自治] 执行 PROBE_CANDIDATE_FK 失败：ValueError('窗口 4 状态数与 window_ranges 不符')
+        # 真机 7 个 run 同一签名（brd4_ligand1/rep1、jnk1_ligand1/rep2、
+        # jnk1_ligand2/rep1-3、cyclod_ligand3/rep2、p38_ligand1/rep3）。
+        #
+        # 那些下游窗口过期是**设计内的合法中间态**：`INSERT_LAMBDA` 明写"本动作
+        # 不采样，受影响窗口的重采由下一轮逐块发 RUN_PRODUCTION"，所以从插 λ 到
+        # 下游重采完成之间，下游产物必然描述的是上一套布局。loader 的 fail-closed
+        # 是对的（全路径求解绝不许吃错布局的帧），错的是**局部动作去载全路径**。
+        #
+        # ⚠️ `records` 的内容与语义保持逐字不变（被探针的重锚节奏逻辑消费），
+        # 只是改成在载入前生成 —— 那几条记录本来也只有 `window`/`skipped` 两个键，
+        # 后面的节奏逻辑是按窗口号**从盘上**读 convergence/self_support，不依赖
+        # 这个窗口有没有被 loader 载进来。顺序无人消费（`_due` 恒 `sorted()`）。
+        _load_excluded = set(_src_missing)
+        records = []
+        if restrict is not None:
+            for _i in range(len(ranges)):
+                if _i in restrict or _i in _load_excluded:
+                    continue
+                _load_excluded.add(_i)
+                records.append({"window": _i, "skipped": "not_in_only_windows"})
         previous = self._load_ibs_window_outputs_from_dir(
             src_dir, ranges, full_lambdas_coul, list(lambdas_var),
             checkpoint_dir=src_ckpt,
-            excluded_local_windows=_src_missing or None,
+            excluded_local_windows=sorted(_load_excluded) or None,
             window_label_prefix=f"{os.path.basename(src_dir)}_window",
             current_sampling_score_sha256=self.sampling_score_sha256,
         )
 
         seeds: Dict[int, Any] = {}
-        records = []
-        restrict = None if only_windows is None else {int(x) for x in only_windows}
         for local_idx, entry in enumerate(previous):
             w_idx = int(entry.get("window_index", local_idx))
             if restrict is not None and w_idx not in restrict:
                 # 🔑 **换 Epoch 是局部修复，不是全路径重来。** 已经
                 # ANALYSIS_ELIGIBLE 的窗口不该被拖进新段：既白烧 GPU，又因为
                 # 段聚合取「段号最大的那份」而让新的短证据顶掉旧的合格证据。
+                # （正常路径下 loader 已经排除掉它们了，这里是兜底。）
                 records.append({"window": w_idx, "skipped": "not_in_only_windows"})
                 continue
             f_current = entry.get("f_k")
@@ -13545,6 +13957,7 @@ class ABFEPipeline:
             _rc_kwargs = dict(_rc_kwargs)
             _rc_kwargs.pop("allow_untrusted_stage_results", None)
             run_config["kwargs"] = _rc_kwargs
+        run_config = _strip_non_identity_kwargs(run_config)
         payload = {
             "kind": "dual_lambda_stage",
             "stage_name": stage_name,
@@ -14567,6 +14980,7 @@ class ABFEPipeline:
             config = dict(self._last_run_config)
             config.pop("resume", None)
             config.pop("run_equilibration", None)
+            config = _strip_non_identity_kwargs(config)
             payload = {
                 "kind": "abfe_final_result",
                 "pme_decharge_model_version": PME_DECHARGE_MODEL_VERSION,
@@ -15961,7 +16375,8 @@ class ABFEPipeline:
 
                 def _run_stage1_once(_n_states, _lambdas, _ranges, _production_step_overrides=None,
                                       _frozen_validation_step_overrides=None,
-                                      _frozen_validation_is_final_rung=None):
+                                      _frozen_validation_is_final_rung=None,
+                                      _provisional_production_windows=None):
                     # decharging has no probe_window_overlap_fn / sampling-repair /
                     # IBS-bias-calibration branch, so _production_step_overrides and
                     # _frozen_validation_step_overrides/_frozen_validation_is_final_rung
@@ -16057,6 +16472,7 @@ class ABFEPipeline:
                 def _run_stage2_once(_n_states, _lambdas, _ranges, _production_step_overrides=None,
                                       _frozen_validation_step_overrides=None,
                                       _frozen_validation_is_final_rung=None,
+                                      _provisional_production_windows=None,
                                       _resume_override=None,
                                       _output_dir_override=None,
                                       _checkpoint_dir_override=None,
@@ -16120,6 +16536,7 @@ class ABFEPipeline:
                         production_step_overrides=_production_step_overrides,
                         frozen_validation_step_overrides=_frozen_validation_step_overrides,
                         frozen_validation_is_final_rung=_frozen_validation_is_final_rung,
+                        provisional_production_windows=_provisional_production_windows,
                         pilot_lambdas=stage2_pilot_lambdas,
                         pilot_mean_dU_dlambda=stage2_pilot_mean_dU_dlambda,
                         pilot_std_dU_dlambda=stage2_pilot_std_dU_dlambda,
@@ -16238,9 +16655,50 @@ class ABFEPipeline:
                             kt=(
                                 unit.MOLAR_GAS_CONSTANT_R * self.temperature
                             ).value_in_unit(unit.kilojoule_per_mole),
-                            n_steps_per_window=int(
-                                kwargs.get("n_steps_per_window", 250_000)
-                            ),
+                            # 🔑🔑 [2026-09-15 审计 #2] **正式形参不在 `kwargs` 里。**
+                            # `run_full_pipeline` 的签名里 `n_steps_per_window` 是
+                            # 正式形参（默认 50000），Python 绑定时就把它取走了 ⟹
+                            # `kwargs.get("n_steps_per_window", 250_000)` **恒取默认值
+                            # 250000**，config 填什么都一样。实测：config 50000/250000/
+                            # 500000 三档，自治循环收到的都是 250000。
+                            # 后果是准入与执行不同口径：控制器按 provenance 里的真实
+                            # 步数准入一个动作，执行器却按 250000 的 `base_unit` 补采
+                            # —— 配 50000 时会超采 5 倍，配 500000 时会按 500k 拒掉一个
+                            # 实际只跑 250k 的动作。首轮采样用的是真参数，所以这个偏差
+                            # 只出现在自治补采上，更难看出来。
+                            n_steps_per_window=int(n_steps_per_window),
+                            # 审计 #1：控制器消费的**全部** 7 个配置键，从这一处
+                            # 解析好的有效值组装，而不是让它去 run_dir 下找文件。
+                            # 键名与 `Stage2RepairController.__init__` 读的完全一致；
+                            # 少一个就是那个键悄悄退回默认值。
+                            # 🔑🔑 **值为 None 的键必须整个不放进来。**
+                            # 读侧一律是 `_cfg.get(key, <默认>)`，而
+                            # `{"k": None}.get("k", 4)` 返回的是 **None 不是 4**
+                            # （键存在，默认值用不上）⟹ `int(None)` 当场炸。
+                            # 真机就是这么崩的：`stage2_max_production_blocks_per_window`
+                            # 没配 ⟹ 显式传了个 None ⟹ 控制器一构造就 TypeError，
+                            # 而这条路每一轮都要走，等于整个自治循环进不去。
+                            # 「未知」的正确表达是**这个键不出现**，让读侧的默认值生效
+                            # —— 不是塞一个 None 进去。（`stage2_production_budget_steps`
+                            # 的 None 语义是"上限未知、不拦"，同样靠缺键表达。）
+                            effective_config={
+                                k: v for k, v in {
+                                    "n_steps_per_window": int(n_steps_per_window),
+                                    "stage2_window_min_states": kwargs.get(
+                                        "stage2_window_min_states"),
+                                    "stage2_window_max_states": kwargs.get(
+                                        "stage2_window_max_states"),
+                                    "stage2_window_partition": kwargs.get(
+                                        "stage2_window_partition"),
+                                    "max_path_insertions": kwargs.get(
+                                        "max_path_insertions"),
+                                    "stage2_production_budget_steps": kwargs.get(
+                                        "stage2_production_budget_steps"),
+                                    "stage2_max_production_blocks_per_window":
+                                        kwargs.get(
+                                            "stage2_max_production_blocks_per_window"),
+                                }.items() if v is not None
+                            },
                             min_states_per_window=int(
                                 kwargs.get("stage2_window_min_states", 4)
                             ),

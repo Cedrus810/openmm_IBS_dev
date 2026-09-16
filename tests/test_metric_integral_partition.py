@@ -292,3 +292,68 @@ def test_path_evolution_never_clears_the_config_based_authority():
         assert "_stage2_path_evolved" in rendered, (
             f"后续赋值必须保留原值（或上去），不能覆盖：{rendered}"
         )
+
+
+def test_max_window_states_is_the_third_dp_objective():
+    """🔑 [2026-09-15] 峰值 ∫g 判据在构造上**看不见 K**。
+
+    真机 cyclod_ligand1（21 态、真实 pilot）：`[8,6,4,6]` 与 `[7,7,4,6]`
+    峰值 ∫g **都是 85.5**、窗口数**都是 4**，先前 DP 只按平方和打平局
+    （20252.7 < 20770.1）⟹ 交付 8 态首窗，预测 ΔF 跨度 74 kJ/mol，
+    而 win0 事后没有任何布局修复路径。
+
+    现在排序是 峰值 → 窗数 → maxK → 平方和：同样的峰值与窗数下取更小的 maxK。
+    """
+    import json
+    import numpy as np
+
+    from abfe_preoptimizer import (
+        metric_integral_cumulative,
+        partition_windows_by_metric_integral as part,
+    )
+
+    # 合成一条"耦合端便宜、中段陡"的度规：不依赖任何 run 目录。
+    pilot = list(np.linspace(0.0, 1.0, 41))
+    g = [1.0 + 40.0 * np.exp(-((x - 0.72) ** 2) / (2 * 0.05 ** 2)) for x in pilot]
+    lam = list(np.linspace(1.0, 0.0, 21))
+
+    ranges, diag = part(lam, pilot_lambdas=pilot, metric_g=g,
+                        min_states_per_window=4, max_states_per_window=8)
+    sizes = diag["sizes"]
+    assert diag["max_window_states"] == max(sizes), diag
+    peak = diag["peak_metric_integral"]
+
+    # 关键性质：在**同样的窗口数**下，不存在峰值同样是 peak 而 maxK 更小的布局。
+    gc = metric_integral_cumulative(np.asarray(lam, float), pilot, g)
+    cost = lambda a, b: abs(float(gc[b - 1] - gc[a]))
+    import itertools
+    n, w = len(lam), len(ranges)
+
+    def layouts(start, k):
+        if k == 1:
+            if n - start >= 4 and n - start <= 8:
+                yield [(start, n)]
+            return
+        for size in range(4, 9):
+            j = start + size - 1
+            if j >= n:
+                break
+            for rest in layouts(j, k - 1):
+                yield [(start, j + 1)] + rest
+
+    better = [L for L in layouts(0, w)
+              if max(cost(a, b) for a, b in L) <= peak * (1 + 1e-9)
+              and max(b - a for a, b in L) < diag["max_window_states"]]
+    assert not better, f"存在同峰值同窗数但 maxK 更小的布局，DP 没取到：{better[:2]}"
+
+
+def test_window_count_still_outranks_max_window_states():
+    """窗数排在 maxK **之前** —— 否则分窗器会用 GPU 去买 K。"""
+    import inspect
+
+    from abfe_preoptimizer import partition_windows_by_metric_integral as part
+
+    src = inspect.getsource(part)
+    assert "candidates.append((got[0], w, got[1], got[2], got[3]))" in src
+    # 排序键顺序：peak(got[0]) → w → maxK(got[1]) → ssq(got[2])
+    assert "peak, w_used, max_k, ssq, ranges = min(candidates)" in src

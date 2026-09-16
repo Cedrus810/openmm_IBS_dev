@@ -52,6 +52,7 @@ def test_marginal_gain_only_looks_at_the_current_segment(tmp_path):
     """旧段点数再多，也不许拿它的趋势裁决当前段（换段 = 换 f_k）。"""
     w = dict(FULL)
     w[0] = {"K": 4, "self_verdict": "INSUFFICIENT_DATA", "prod": 500000,
+        "self_verdict_source": "solver_eligibility",  # [2026-09-15] 本用例测的是预算/计费，低比值只是拿到 RUN_PRODUCTION 的载体；`min_n_eff_over_g` 现在归**偏斜**（加帧治不了）⟹ 显式声明成缺帧，语义不变
             "min_n_eff_over_g": 3.8}
     run = _mkrun(tmp_path, windows=w, ranges=R4, n_states=13)
     # 逐轮快照：**旧段** `vanishing_9` 有 3 个点（下降趋势），
@@ -109,6 +110,7 @@ def test_a_sampling_action_is_still_charged(tmp_path):
            "stage2_production_budget_steps": 1_100_000}
     w = {i: {"K": 4, "prod": 250000} for i in range(4)}
     w[0] = {"K": 4, "prod": 250000, "self_verdict": "INSUFFICIENT_DATA",
+        "self_verdict_source": "solver_eligibility",  # [2026-09-15] 本用例测的是预算/计费，低比值只是拿到 RUN_PRODUCTION 的载体；`min_n_eff_over_g` 现在归**偏斜**（加帧治不了）⟹ 显式声明成缺帧，语义不变
             "min_n_eff_over_g": 3.1}
     run = _mkrun(tmp_path, windows=w, ranges=R4, n_states=13, config=cfg)
     plan = Stage2RepairController(run, "vanishing").decide()

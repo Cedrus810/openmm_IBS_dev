@@ -743,6 +743,11 @@ def load_ibs_window_outputs_from_dir(
         segments = _validate_production_segments(convergence.get("production_segments"), n_frames)
         outputs.append({
             "production_segments": segments,
+            # 🔑 [2026-09-15] 这个窗口的帧是不是在一份**从未通过冻结验证**的 f_k
+            # 下采的。必须跟着窗口一路传到 stage result —— 「这份 ΔG 里含临时生产
+            # 窗口」这件事只活在日志里等于没有。老产物缺键 ⟹ False。
+            "provisional_production": bool(
+                convergence.get("provisional_production", False)),
             "window_index": int(window_index_offset + local_idx),
             "window_label": f"{window_label_prefix}_{local_idx}",
             "window_range": [int(start), int(end)],
@@ -10497,6 +10502,20 @@ class IBSSampler:
                 self.bias_status = "calibrated_validation_failed"
                 self.frozen_f_k_pending = None
                 self.frozen_validation_cumulative_steps = 0
+            elif cached_status == "provisional_production":
+                # 🔑 [2026-09-15] 临时生产：这份 f_k 的冻结验证撞了 15 批上限、
+                # Δf−ΔF **从未被求出**（无结论，既非通过也非被驳回），调用方
+                # 显式授权用它跑**一块**诊断生产。该窗口已经有生产产物，
+                # 恢复时既不重新 learning、也不重新验证（那会把已经花掉的
+                # Epoch 再烧一遍），但**绝不**升级成 verified。
+                # `frozen_f_k_pending` 必须是 None：否则 run_all_windows 那道
+                # non_mutating_v1 的 ExistingEnsembleRequiresRescueAudit 会把
+                # 它当成旧变异路径的产物拒掉。
+                self.bias_status = "provisional_production"
+                self.frozen_f_k_pending = None
+                self.frozen_validation_cumulative_steps = int(
+                    state.get("frozen_validation_cumulative_steps", 0)
+                )
             elif cached_status == "failed":
                 # [Candidate-first, Validate-or-Learn v1] 新协议下的终态失败
                 # 值——必须原样保留，不能落进下面的 else 分支被静默改写成
@@ -14888,6 +14907,7 @@ class IBSWindowManagerDualLambda:
         mbar_calibration_reserved_steps: int = 50000,
         frozen_validation_step_overrides: Optional[Dict[int, int]] = None,
         frozen_validation_is_final_rung: Optional[Dict[int, bool]] = None,
+        provisional_production_windows: Optional[Sequence[int]] = None,
         production_step_overrides: Optional[Dict[int, int]] = None,
         enable_early_stop: bool = False,
         early_stop_min_steps: int = 100000,
@@ -14979,6 +14999,23 @@ class IBSWindowManagerDualLambda:
             - 关键阶段调用 diagnose_force_breakdown (非侵入式力分解)
             - 若检测到 NaN 或力爆炸，立即抛出异常并终止
 
+        provisional_production_windows: 可选的窗口下标集合。**调用方显式授权**：
+            这些窗口的冻结验证若撞到 IBS_LOCAL_MBAR_GATE_MAX_BATCHES 批上限、
+            Δf−ΔF 从未被求出（`validation_budget_exhausted_indeterminate`，
+            对这份 f_k **无结论**、既非通过也非被驳回），就用这份冻结 f_k 进
+            **一块**诊断生产，而不是抛 IBSValidationBudgetIndeterminateError。
+            ⚠️ 这**不是**把门放宽：
+              · `f_k_evidence_status` 保持 `indeterminate`，**绝不**升级成
+                `verified`；`bias_status` 写 `provisional_production`，与
+                `converged` 在词汇上分开，下游不会把它读成可信 PASS；
+              · `*_warmup_failure.json` 作为证据**保留**（收敛路径会删掉它）；
+              · 真正的验收仍然是生产后的 min N_eff/g 支撑门 + 最终 MBAR +
+                `_assert_stage_result_sane` —— 被放宽的只是**生产前**那道
+                f_k 预筛，而且是一次性的、记录在案的。
+            为什么需要它：15 批是**工程预算**，撞上限只说明"这一轮没测出来"。
+            在没有这条路径时，这样的窗口既进不了生产（引擎抛路由信号）、
+            又拿不到新证据（补帧动作在构造上推不动它），整条流水线只能停在
+            NO_FEASIBLE_ACTION —— 真机 cyclod_ligand2/rep2 win4 就是这样卡死的。
         frozen_validation_is_final_rung: 可选的 {window_idx: 这次是否已经是调用方
             冻结验证阶梯的最后一档} 表。只在 calibration_pending 场景下参与判断：
             若 True 且这次仍未通过独立验证，直接判定为终态失败
@@ -15126,8 +15163,24 @@ class IBSWindowManagerDualLambda:
                         cached_policy_early = cached_conv.get(
                             "sampling_repair_policy"
                         )
+                        # 🔑🔑 [2026-09-15 真机 cyclod_ligand1/rep1] **「没有这个键」
+                        # 不是「另一套策略的数据」。**
+                        #
+                        # `ExistingEnsembleRequiresRescueAudit` 的语义是「盘上躺着
+                        # **旧变异策略**采的 ensemble，不许就地覆盖，留给审计」。
+                        # 而键**整个缺失**只说明这份 convergence.json 不是一次完整的
+                        # 窗口收尾写出来的：
+                        #   · 生产中途的周期快照（见 `_periodic_conv`：文件不存在时
+                        #     从 `{}` 起写，只有 8 个键、一个身份键都没有）——真机就是
+                        #     作业被杀在 win0 生产 200k/250k 步，重启即崩，且**永远**
+                        #     进不去这个窗口；
+                        #   · 或者没有这个字段的老格式产物。
+                        # 两者都该走「无效缓存 ⟹ 重采」那条路（跟其余 9 门一样打 WARN），
+                        # 不该把整条流水线打死。
+                        # ⚠️ 键**存在但不同**仍然一律 fail-closed —— 那才是真的旧策略数据。
                         if (
                             not legacy_repair
+                            and cached_policy_early is not None
                             and cached_policy_early != repair_policy
                         ):
                             raise ExistingEnsembleRequiresRescueAudit(
@@ -15257,7 +15310,14 @@ class IBSWindowManagerDualLambda:
                             # 就地重采覆盖它——那会毁掉 rescue 审计所需的原始 ensemble。
                             # 保留原文件，抛 ExistingEnsembleRequiresRescueAudit，交审计
                             # 判定是否可救 / 是否需重跑（可强制写入新 ensemble-ID 目录）。
-                            if not legacy_repair:
+                            # 🔑🔑 [2026-09-15] 与上面那道早门同一条修正：**键缺失 ≠
+                            # 旧策略数据**。缺失只说明这份记录不完整（生产中途的周期
+                            # 快照 / 老格式），走"无效缓存 ⟹ 重采"，不走 rescue audit。
+                            # 这两处是同一判据的两份实现，改一处必须改另一处。
+                            if (
+                                not legacy_repair
+                                and cached_conv.get("sampling_repair_policy") is not None
+                            ):
                                 raise ExistingEnsembleRequiresRescueAudit(
                                     f"窗口 {window_idx}: 磁盘能量缓存的 sampling_repair_policy="
                                     f"{cached_conv.get('sampling_repair_policy')!r}（当前 {repair_policy!r}）——"
@@ -16526,6 +16586,13 @@ class IBSWindowManagerDualLambda:
             last_local_mbar_gate = None
             # 非 None 表示本窗口以"验证预算耗尽、无法判定"退出（见下方分级求解）。
             validation_indeterminate_diag = None
+            # [2026-09-15] 调用方是否授权这个窗口在撞批次上限时进**临时生产**
+            # （见 `provisional_production_windows` 的形参说明）。
+            provisional_authorized = int(window_idx) in {
+                int(x) for x in (provisional_production_windows or ())
+            }
+            # 本窗口这次**实际**是以临时生产进的生产（授权 + 真的撞了上限）。
+            provisional_production = False
             if resumed_frozen_f_k is not None:
                 # 🔑 [MAIN_WINDOW_CHECKPOINT_PROTOCOL_VERSION] 从主窗口 checkpoint
                 # 续算时不需要 freeze_burn_in：checkpoint 保存的那一刻本身就已经
@@ -17234,6 +17301,29 @@ class IBSWindowManagerDualLambda:
                             "不退回 SGD、不插 λ；冻结状态与数据保留，交上层决定是否"
                             "延长预算。"
                         )
+                        # 🔑🔑 [2026-09-15] **调用方授权过 ⟹ 走临时生产，不抛路由信号。**
+                        # 「没测出来」不是「不合格」：这份 f_k 没有任何反面证据。
+                        # 在没有这条路径时，这样的窗口进不了生产（引擎抛
+                        # IBSValidationBudgetIndeterminateError）、又拿不到新证据
+                        # （补帧动作在构造上推不动它）⟹ 整条流水线停在
+                        # NO_FEASIBLE_ACTION（真机 cyclod_ligand2/rep2 win4）。
+                        # ⚠️ 这里只改**走向**，一个判据都没放宽：
+                        #   · `validation_indeterminate_diag` 照样留着当证据；
+                        #   · `f_k_evidence_status` 在下面保持 indeterminate；
+                        #   · 真正的验收仍是生产后的支撑门 + 最终 MBAR。
+                        # ⚠️ 块大小由调用方的 `production_step_overrides` 决定
+                        #    （策略是**一块** +250k），引擎不在这里发明预算。
+                        if provisional_authorized:
+                            provisional_production = True
+                            bias_converged = True
+                            last_failure_reason = None
+                            print(
+                                f"    [临时生产] 窗口 {window_idx} 已被调用方显式授权："
+                                "用这份**未经验证**的冻结 f_k 进一块诊断生产。"
+                                "**这不是可信 PASS** —— f_k 证据保持 `indeterminate`，"
+                                "warmup_failure.json 作为证据保留，"
+                                "能否采用交生产后的 min N_eff/g 支撑门与最终 MBAR 裁决。"
+                            )
                         break
                     validation_solve_at_batches = min(
                         IBS_LOCAL_MBAR_GATE_MAX_BATCHES,
@@ -18070,8 +18160,20 @@ class IBSWindowManagerDualLambda:
                         "batches）；真正的自由能/ESS/overlap/误差交生产后 MBAR）"
                     )
                 sampler.bias_converged = True
-                sampler.bias_status = "converged"
-                sampler.f_k_evidence_status = F_K_EVIDENCE_VERIFIED
+                # 🔑🔑 [2026-09-15] **临时生产与收敛在词汇上必须分开。**
+                # 走到这里的临时生产窗口，它的 Δf−ΔF **从未被求出** —— 把它写成
+                # `converged` / `verified` 等于凭空发明一份不存在的证据，而下游
+                # （控制器的 `_VERDICT`、任何读 bias_status 的审计）会据此认为
+                # 这个窗口已经验收过。`bias_converged=True` 只表达一件事：
+                # **这个窗口不再需要重新进预热**（Epoch 已经花掉、生产产物在盘上），
+                # 证据强度由 `f_k_evidence_status` 单独表达。
+                _prov = bool(provisional_production)
+                sampler.bias_status = (
+                    "provisional_production" if _prov else "converged"
+                )
+                sampler.f_k_evidence_status = (
+                    F_K_EVIDENCE_INDETERMINATE if _prov else F_K_EVIDENCE_VERIFIED
+                )
                 sampler.frozen_f_k_pending = None
                 sampler.last_failure_reason = None
                 sampler.save_ibs_state(
@@ -18081,11 +18183,26 @@ class IBSWindowManagerDualLambda:
                 # 先失败、重跑后成功的窗口会留下一份跟当前 convergence.json 矛盾
                 # 的旧 warmup_failure.json，误导任何检查"这个窗口是否曾失败过"的
                 # 下游逻辑（人工排查、自动化审计脚本等）。
+                # ⚠️ 临时生产**例外**：那份 warmup_failure.json 正是"这个窗口的
+                # f_k 从未被验证过"的**唯一**落盘证据，删掉它等于把临时生产洗成
+                # 一次干净的收敛。改为刷新它（带上临时生产标记），不删。
                 stale_failure_path = os.path.join(
                     self.output_dir,
                     f"dual_window_{window_idx}_{stage_type}_warmup_failure.json",
                 )
-                if os.path.exists(stale_failure_path):
+                if _prov:
+                    bias_warmup_diag["status"] = "provisional_production"
+                    bias_warmup_diag["provisional_production"] = True
+                    bias_warmup_diag["validation_indeterminate"] = (
+                        validation_indeterminate_diag
+                    )
+                    # 冻结的那份 f_k 就在 `validation_indeterminate_diag` 里
+                    # （撞上限那一刻从 Context 读的），别再手抄一份来源。
+                    bias_warmup_diag["frozen_f_k_kJ_mol"] = (
+                        (validation_indeterminate_diag or {}).get("frozen_f_k_kJ_mol")
+                    )
+                    _atomic_write_json(stale_failure_path, bias_warmup_diag)
+                elif os.path.exists(stale_failure_path):
                     try:
                         os.remove(stale_failure_path)
                     except OSError:
@@ -19368,12 +19485,30 @@ class IBSWindowManagerDualLambda:
                 production_bias_path,
                 production_base_path,
             )
+            # 🔑 [2026-09-15] LRC 系数 + 盒体积，供事后离线对账（见下面那个键的注释）。
+            # 取不到就写 None —— 不适用（dexp / 膜复合物腿）时它本来就是 None。
+            lrc_coeff_for_conv = getattr(
+                ibs_wrap, "lj_tail_lrc_coeff_kj_mol", None)
+            _lrc_box_volume_nm3 = None
+            try:
+                _bv = sim.context.getState().getPeriodicBoxVectors(asNumpy=True)
+                _lrc_box_volume_nm3 = float(abs(np.linalg.det(
+                    np.asarray(_bv.value_in_unit(unit.nanometer), dtype=np.float64)
+                )))
+            except Exception:  # noqa: BLE001 —— 纯诊断，取不到不影响采样
+                _lrc_box_volume_nm3 = None
             convergence = {
                 "production_segment_protocol_version": PRODUCTION_SEGMENT_PROTOCOL_VERSION,
                 "production_segments": _production_segments_snapshot(sampler),
                 "stage_protocol_key": getattr(self, "stage_protocol_key", None),
                 "window_idx": int(window_idx),
                 "stage_type": stage_type,
+                # 🔑 [2026-09-15] 这个窗口的帧是不是在一份**从未通过冻结验证**的
+                # f_k 下采的（临时生产）。True 时它仍是合法的 MBAR 数据（单一固定
+                # 采样分布），但**不是可信 PASS** —— 采不采用由生产后的支撑门判。
+                # 落在 convergence.json 里，是为了让"这份 ΔG 里含临时生产窗口"
+                # 这件事跟着数据走，而不是只活在日志里。
+                "provisional_production": bool(provisional_production),
                 # 该窗口这次实际采样的 λ 值——不是"这个位置理论上该有什么"，是这份
                 # 能量文件里的每一行真实对应哪个 λ。resume 断点续传 / abfe_pipeline.py
                 # 的窗口产物复用逻辑都靠这个字段做内容校验，而不是只信任 window_idx。
@@ -19403,6 +19538,27 @@ class IBSWindowManagerDualLambda:
                 # 跟当前公式不是同一回事，resume / 窗口产物复用逻辑必须校验这个
                 # 字段，不能只看 λ/WCA/IBS 偏置协议是否匹配。
                 "lj_tail_lrc_protocol_version": TRADITIONAL_LJ_LRC_PROTOCOL_VERSION,
+                # 🔑🔑 [2026-09-15] **把系数本身也落盘，不只落协议版本号。**
+                #
+                # `coeff[k]` 先前只活在 `ibs_wrapper.lj_tail_lrc_coeff_kj_mol`
+                # （内存）里，盘上只有一个版本号 ⟹ 事后想核对「LRC 对这条腿贡献
+                # 多少」必须从 system XML 把 σ/ε 全部重建、重跑
+                # `_lj_tail_correction_sigma_resolved_moments` +
+                # `_lj_tail_lrc_coefficients_kj_mol` 复算一遍。真机上为了排除
+                # 「两腿 LRC 差是不是那个 −1.85 kJ/重原子系统项的来源」就这么干过一次
+                # （结论：不是，两腿只差 −0.59 kJ/mol ≈ −0.0105/原子，因为
+                #  `coeff ∝ N_env` ⟹ `coeff/V ∝ 数密度`，两个盒子的 ρ_env
+                #  只差 0.2%，6.7 倍体积差被抵消）。
+                #
+                # 落盘之后这类对账是**读文件**，不是重算。逐 λ 一个数，成本可忽略。
+                # ⚠️ 纯诊断字段：`_resume_cached_window_gate_status` 的十道门一个都
+                # 不读它，加它不影响任何缓存身份。
+                "lj_tail_lrc_coeff_kj_nm3_per_mol": (
+                    [float(x) for x in lrc_coeff_for_conv]
+                    if lrc_coeff_for_conv is not None else None
+                ),
+                # 每帧修正 = coeff/V，所以没有 V 那串系数读出来也没法换算成能量。
+                "lj_tail_lrc_box_volume_nm3": _lrc_box_volume_nm3,
                 # 🔑 [vdw_nonbonded_protocol_version，MEM-00h] softcore cutoff/
                 # switching 协议版本（1.2nm+switch → 1.0nm 无switch）。只在
                 # stage_type=="vdw" 时写真实版本号——Stage 1 charging 不构造软核
@@ -20446,7 +20602,18 @@ def _ibs_reweighting_quality_diagnostics(
     return out
 
 
-WINDOW_SELF_SUPPORT_PROTOCOL_VERSION = 1
+# v2 [2026-09-16]：把 `N_eff/g` 的两个档位从函数体里的字面量提成常量，并**写进产物**。
+# 纯附加键，不进任何指纹（全仓只有这个文件读写它），旧产物用 `.get()` 读仍然安全。
+# 动机：控制器要判「加帧还能不能把这个窗口推过门」就必须知道门在哪；先前它只能
+# 把 10.0 抄一份 —— 那正是本仓最贵的那类 bug（同一不变量两份实现）。
+WINDOW_SELF_SUPPORT_PROTOCOL_VERSION = 2
+
+# 协议安全下限（老板定，见 `window_self_support_check` 里那段推导）：
+#     min(N_eff/g) < 1      HARD_INSUFFICIENT
+#     1 <= ... < 10         INSUFFICIENT_DATA
+#     >= 10                 ANALYSIS_ELIGIBLE
+WINDOW_SELF_SUPPORT_N_EFF_OVER_G_HARD_FLOOR = 1.0
+WINDOW_SELF_SUPPORT_N_EFF_OVER_G_ELIGIBLE = 10.0
 
 
 def window_self_support_path(output_dir: str, stage_type: str, idx: int) -> str:
@@ -20707,9 +20874,9 @@ def window_self_support_check(
     _top1_worst = max((x for x in top1_per_state if x is not None), default=None)
     if _ratio is None:
         verdict = "INSUFFICIENT_DATA"      # 连主验收量都算不出来
-    elif _ratio < 1.0:
+    elif _ratio < WINDOW_SELF_SUPPORT_N_EFF_OVER_G_HARD_FLOOR:
         verdict = "HARD_INSUFFICIENT"
-    elif _ratio < 10.0:
+    elif _ratio < WINDOW_SELF_SUPPORT_N_EFF_OVER_G_ELIGIBLE:
         verdict = "INSUFFICIENT_DATA"
     else:
         verdict = "ANALYSIS_ELIGIBLE"
@@ -20793,6 +20960,14 @@ def window_self_support_check(
             None if x is None else float(x) for x in n_eff_over_g
         ],
         "min_n_eff_over_g": (min(_finite_ratio) if _finite_ratio else None),
+        # [v2] 门槛随产物一起交出去：读侧（控制器）判"加帧还能不能推过门"时
+        # 必须用**这一次**实际生效的档位，不许自己抄一份常量。
+        "n_eff_over_g_eligible_threshold": float(
+            WINDOW_SELF_SUPPORT_N_EFF_OVER_G_ELIGIBLE
+        ),
+        "n_eff_over_g_hard_floor": float(
+            WINDOW_SELF_SUPPORT_N_EFF_OVER_G_HARD_FLOOR
+        ),
         "worst_state_by_n_eff_over_g": (
             int(min(range(len(n_eff_over_g)),
                     key=lambda i: (n_eff_over_g[i] is None, n_eff_over_g[i])))
@@ -22348,8 +22523,17 @@ class GlobalMBARAnalyzer:
         # 合并会互相盖掉。这里是 scope="production" 的独立记录。
         cumulative_fk_records: List[Dict[str, Any]] = []
 
-        for w_idx, w in enumerate(valid_windows):
-            source_window_idx = int(w.get("window_index", w_idx))
+        # 🔑🔑 [2026-09-16] **循环下标不是窗口号，别让它叫 `w_idx`。**
+        #
+        # `valid_windows` 只含**被载入**的窗口：部分段分析（`[部分窗口段] 本段只采了
+        # 窗口 [3]`）里它只有一个元素，于是 `enumerate` 的 0 会被十几条 `窗口 {w_idx}`
+        # 的日志当成物理窗口号打出来 —— 真机 brd4_ligand1/rep1 把物理 win3 报成
+        # "窗口 0 去相关子采样后有效帧数 (5) < 10，跳过"，排查被直接引到错误的窗口。
+        # 结构化字段一直是对的（都走 `source_window_idx`），撒谎的只有人读的那几行。
+        # 这个循环里 `w_idx` **只**出现在消息文本中，所以在源头改名一次就全对了：
+        # 列表位置叫 `_list_pos`，`w_idx` 从此就是物理窗口号。
+        for _list_pos, w in enumerate(valid_windows):
+            w_idx = source_window_idx = int(w.get("window_index", _list_pos))
             u_kj_raw = np.asarray(w["u_kn"], dtype=np.float64) # (K_local, N)
             if w.get("bias_energies") is None or w.get("base_energies") is None:
                 raise ValueError(
@@ -23473,6 +23657,15 @@ class GlobalMBARAnalyzer:
             # None —— 那是故意的 fail-loud。见本函数 docstring。
             "analysis_status": analysis_status,
             "analysis_incomplete_reasons": list(analysis_incomplete_reasons),
+            # 🔑 [2026-09-15] 哪些窗口的帧是在**未经验证**的冻结 f_k 下采的
+            # （临时生产）。非空 ⟹ 这条路径完整、数值有限，但**不是可信 PASS**。
+            # 刻意**不**进 `analysis_status` 的合取：路径完整性与 f_k 证据强度
+            # 是两维，混起来会让「分析跑完整了」这个硬不变量说别的事。
+            "provisional_production_windows": sorted(
+                int(w.get("window_index", i))
+                for i, w in enumerate(valid_windows)
+                if w.get("provisional_production")
+            ),
             "precision_status": precision_status,
             "precision_evidence": precision_evidence,
             "diagnostics_are_not_acceptance": (
@@ -23918,6 +24111,22 @@ def solve_stage_integrated(
         max_z = drift.get("max_window_drift_over_2sigma") if drift.get("available") else None
         res["split_half_max_window_z"] = max_z
         res["split_half_max_z_threshold"] = split_half_max_z
+        # 🔑🔑 [2026-09-15] **总量必须和逐窗一起报出来。**
+        #
+        # `split_half_drift_diagnostics` 一直同时算 `total_drift_kJ_mol`，但先前
+        # 只有逐窗那条进日志 ⟹ 唯一能区分下面两件事的数字**算了却没人看得见**：
+        #   · 真漂移         —— 前后半程在算不同的数，总量也跟着动；
+        #   · 归属重排       —— 总量稳，只是逐窗 segment ΔG 的拆分变了。
+        # 后者在本仓是**预期行为**：整条路径是一个拼接的全局 MBAR 解，窗口不是
+        # 独立可分的单元；帧砍一半、全局解重排，per-window 的归属自然会动。
+        # 拿逐窗漂移当"σ 低估"的证据，在这种情形下会系统性高估
+        # （`sigma_inflated_from_split_half` 吃的正是逐窗那个量）。
+        # 真机 cyclod_ligand2/rep1：逐窗报 +9.339 kJ/mol，而总量那条从没打印过。
+        _tot_z = drift.get("total_drift_over_2sigma") if drift.get("available") else None
+        res["split_half_total_z"] = _tot_z
+        res["split_half_total_drift_kJ_mol"] = (
+            drift.get("total_drift_kJ_mol") if drift.get("available") else None
+        )
         if max_z is not None and max_z > SPLIT_HALF_DEFAULT_MAX_Z:
             worst = max(
                 (w for w in drift["per_window"] if w["drift_over_2sigma"] is not None),
@@ -23928,6 +24137,17 @@ def solve_stage_integrated(
                 f"window {worst['window_index']} 漂移 {worst['drift_kJ_mol']:+.3f} kJ/mol "
                 f"= {worst['drift_over_2sigma']:.2f}×2σ（σ_win={worst['uncertainty_kJ_mol']:.3f}）。"
                 f"报出的不确定度低估了实际抽样波动。"
+            )
+            # ⚠️ 触发判据**没变**，仍是逐窗 max_z（这一行只是把总量摆出来一起看）。
+            print(
+                f"    ↳ [split-half 总量] 半程一 {drift.get('total_delta_G_first_half_kJ_mol'):+.3f} → "
+                f"半程二 {drift.get('total_delta_G_second_half_kJ_mol'):+.3f}，"
+                f"总漂移 {drift.get('total_drift_kJ_mol'):+.3f} kJ/mol"
+                + (f" = {_tot_z:.2f}×2σ" if _tot_z is not None else "（σ_total=0，z 无意义）")
+                + "。**总量稳而逐窗大 ⟹ 多半是归属重排,不是漂移**："
+                "整条路径是一个拼接的全局 MBAR 解,窗口不是独立可分的单元,"
+                "帧砍一半会让 per-window 的 segment ΔG 重新分配。"
+                "两者都大才是真的前后半程不一致。"
             )
         if split_half_max_z is not None and max_z is not None and max_z > float(split_half_max_z):
             # 🔑 [2026-09-15] 只报告，不再改判。`converged` 已删除，而 split-half
@@ -23949,6 +24169,13 @@ def solve_stage_integrated(
                 f"总 σ {infl['total_error_mbar_kJ_mol']:.4f} → "
                 f"{infl['total_error_inflated_kJ_mol']:.4f} kJ/mol "
                 f"(×{infl['total_inflation_factor']:.2f})。默认未采用。"
+                # ⚠️ [2026-09-15] **这个下界吃的是逐窗漂移,不是总漂移。**
+                # 整条路径是一个拼接的全局 MBAR 解 ⟹ 帧砍一半会让 per-window 的
+                # segment ΔG 重新分配,即使总量纹丝不动。那种情形下这个 ×N 是
+                # **归属重排的幅度**,不是 σ 被低估的证据,会系统性高估。
+                # 判它到底是哪一种,看上面 `[split-half 总量]` 那行的总漂移。
+                " ⚠️ 本下界取自**逐窗**漂移；总量见上一行 —— "
+                "总量稳而逐窗大 ⟹ 是归属重排,这个 ×N 不构成 σ 被低估的证据。"
             )
         if inflate_sigma_from_split_half and infl.get("available"):
             res["total_error_mbar_only_kJ_mol"] = float(res.get("total_error", 0.0))

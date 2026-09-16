@@ -936,6 +936,7 @@ def test_an_action_already_proven_noop_on_this_disk_state_is_not_reissued(tmp_pa
 
     w = dict(FULL)
     w[0] = {"K": 4, "self_verdict": "INSUFFICIENT_DATA", "min_n_eff_over_g": 3.1,
+        "self_verdict_source": "solver_eligibility",  # [2026-09-15] 本用例测的是预算/计费，低比值只是拿到 RUN_PRODUCTION 的载体；`min_n_eff_over_g` 现在归**偏斜**（加帧治不了）⟹ 显式声明成缺帧，语义不变
             "prod": 250000}
     run = _mkrun(tmp_path, windows=w, ranges=R4, n_states=13,
                  stage_result={"converged": False,
@@ -991,7 +992,11 @@ def _budget_run(tmp_path, cap=None, prod=250000):
         cfg["stage2_production_budget_steps"] = cap
     w = {i: {"K": 4, "prod": prod} for i in range(4)}
     w[0] = {"K": 4, "prod": prod, "self_verdict": "INSUFFICIENT_DATA",
-            "min_n_eff_over_g": 3.1}
+            "min_n_eff_over_g": 3.1,
+            # [2026-09-15] 本组用例测的是**生产预算闸**，低比值只是拿到一个
+            # 花 GPU 的动作的载体；`min_n_eff_over_g` 现在归**偏斜**
+            # （加帧治不了 ⟹ 走布局动作）⟹ 这里显式声明成缺帧，语义不变。
+            "self_verdict_source": "solver_eligibility"}
     return _mkrun(tmp_path, windows=w, ranges=R4, n_states=13, config=cfg)
 
 
@@ -1136,6 +1141,7 @@ def test_a_verified_window_with_no_warmup_budget_is_still_toppable(tmp_path):
     """f_k 已 `verified` 的窗口不需要再过验证门 ⟹ 预热余额为 0 不挡补帧。"""
     w = dict(FULL)
     w[0] = {"K": 4, "self_verdict": "INSUFFICIENT_DATA", "min_n_eff_over_g": 3.1,
+        "self_verdict_source": "solver_eligibility",  # [2026-09-15] 本用例测的是预算/计费，低比值只是拿到 RUN_PRODUCTION 的载体；`min_n_eff_over_g` 现在归**偏斜**（加帧治不了）⟹ 显式声明成缺帧，语义不变
             "warmup": 555000, "cap": 555000, "evidence": "verified"}
     _, plan = _plan(tmp_path, windows=w, ranges=R4, n_states=13)
     assert plan["action"] == "RUN_PRODUCTION", plan["reason"]
@@ -1160,6 +1166,7 @@ def test_budget_admission_uses_the_full_cost_of_the_next_action(tmp_path):
            "stage2_production_budget_steps": 1_100_000}
     w = {i: {"K": 4, "prod": 250000} for i in range(4)}
     w[0] = {"K": 4, "prod": 250000, "self_verdict": "INSUFFICIENT_DATA",
+        "self_verdict_source": "solver_eligibility",  # [2026-09-15] 本用例测的是预算/计费，低比值只是拿到 RUN_PRODUCTION 的载体；`min_n_eff_over_g` 现在归**偏斜**（加帧治不了）⟹ 显式声明成缺帧，语义不变
             "min_n_eff_over_g": 3.1}
     run = _mkrun(tmp_path, windows=w, ranges=R4, n_states=13, config=cfg)
     c = Stage2RepairController(run, "vanishing")

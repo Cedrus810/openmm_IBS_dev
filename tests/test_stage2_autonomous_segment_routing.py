@@ -282,3 +282,46 @@ def test_multi_window_topup_is_grouped_by_segment_not_handed_over_as_one_set():
                                                             "/r/ck/segment_2")
     for seg in ("vanishing", ""):
         assert SEG({seg}, "/r/vanishing", "/r/ck") == (None, None)
+
+
+def test_never_produced_window_is_grouped_not_dropped():
+    """🔑 真机 cyclod_ligand2/rep2（2026-09-15）：**从没生产过的窗口被静默丢掉。**
+
+    `production_steps is None` 时 `windows_by_segment` 原来 `continue`，把窗口
+    整个从分组里删掉 ⟹ 执行器 `for _seg, overrides in ...` 空转、`run_once`
+    一次都没调 ⟹ 通用 no-op 记账把一个**从没被执行过**的动作记成「执行过且没用」
+    ⟹ 下一轮 NO_FEASIBLE_ACTION ⟹ `_assert_stage_result_sane` 抛
+    ANALYSIS_INCOMPLETE 打死整条流水线。
+
+    约定：**不给目标（值 None），但窗口一定在分组里**。
+    """
+    from abfe_preoptimizer import windows_by_segment
+
+    recs = [
+        {"window_idx": 3, "segment": "vanishing", "production_steps": 500_000},
+        # win4 只有 warmup_failure.json、从未生产 ⟹ 读不到步数
+        {"window_idx": 4, "segment": "vanishing", "production_steps": None},
+    ]
+    by_seg = windows_by_segment([4], recs, 250_000)
+    assert by_seg == {"vanishing": {4: None}}, by_seg
+
+    # 执行器口径：窗口进 _only_window_indices，None 不进 _production_step_overrides。
+    overrides = by_seg["vanishing"]
+    assert sorted(overrides) == [4]
+    assert {k: v for k, v in overrides.items() if v is not None} == {}
+
+    # 已知步数的窗口照旧带目标；两种窗口混在同一段里互不干扰。
+    mixed = windows_by_segment([3, 4], recs, 250_000)
+    assert mixed == {"vanishing": {3: 750_000, 4: None}}, mixed
+
+
+def test_continue_warmup_grouping_keeps_never_produced_window():
+    """同一个函数、`added_steps=0`：`CONTINUE_WARMUP` 只用分组的键。
+
+    日志里「win4 连发 40 次 CONTINUE_WARMUP、盘面一动不动」是这一行吞的，
+    不是窗口级 resume 缓存门。
+    """
+    from abfe_preoptimizer import windows_by_segment
+
+    recs = [{"window_idx": 4, "segment": "vanishing", "production_steps": None}]
+    assert sorted(windows_by_segment([4], recs, 0).get("vanishing", {})) == [4]

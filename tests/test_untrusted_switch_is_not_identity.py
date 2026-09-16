@@ -44,6 +44,7 @@ def _run_config_after_identity_scrub(raw_config, stage_name="decharging"):
             "dict": dict,
             "isinstance": isinstance,
             "RESIDUAL_SAMPLING_STAGES": ap.RESIDUAL_SAMPLING_STAGES,
+            "_strip_non_identity_kwargs": ap._strip_non_identity_kwargs,
         },
         scope,
     )

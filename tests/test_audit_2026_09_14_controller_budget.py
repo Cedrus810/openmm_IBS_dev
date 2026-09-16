@@ -56,6 +56,7 @@ def _warmup_exhausted_board(tmp_path):
     """win0 只缺生产帧（自检不够），而**预热账全干**。"""
     w = dict(FULL)
     w[0] = {"K": 4, "self_verdict": "INSUFFICIENT_DATA", "min_n_eff_over_g": 3.1,
+            "self_verdict_source": "solver_eligibility",  # [2026-09-15] 本用例测的是预算/计费，低比值只是拿到 RUN_PRODUCTION 的载体；`min_n_eff_over_g` 现在归**偏斜**（加帧治不了）⟹ 按 docstring 的本意显式声明成缺帧
             "evidence": "verified", "warmup": 555000, "cap": 555000}
     return _mkrun(tmp_path, windows=w, ranges=R4, n_states=13)
 

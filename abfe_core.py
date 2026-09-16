@@ -4318,9 +4318,16 @@ DISPERSION_IMPL_TRUNCATED_NO_TAIL = "truncated_no_analytic_tail"
 DISPERSION_IMPL_FORCE_SWITCH_NO_TAIL = "force_switch_no_tail_by_forcefield_design"
 
 
+# 🔑 [2026-09-15] 这条腿里配体**待在哪**。与 `environment_type`（soluble/membrane）
+# 正交：可溶体系的复合物腿，配体照样埋在蛋白口袋里。
+LIGAND_SURROUNDING_BULK = "bulk"       # 纯溶剂腿：配体周围就是均匀体相
+LIGAND_SURROUNDING_POCKET = "pocket"   # 复合物腿：配体埋在口袋里
+
+
 def resolve_leg_dispersion_implementation(
     dispersion_protocol: Optional[str],
     environment_type: Optional[str] = None,
+    ligand_surrounding: Optional[str] = None,
 ) -> Dict[str, Any]:
     """给**一条腿**定"炼金 ligand–environment 的长程色散怎么处理"。
 
@@ -4347,14 +4354,52 @@ def resolve_leg_dispersion_implementation(
     if protocol == DISPERSION_PROTOCOL_LEGACY_UNIFORM_LRC:
         # legacy 是本改动之前唯一存在的路线，且 membrane+legacy 在
         # `resolve_dispersion_protocol` 就已 fail closed，所以这里不需要环境维度。
+        #
+        # 🔑🔑 [2026-09-15] **但"不是膜"不等于"配体周围是均匀体相"。**
+        #
+        # `resolve_dispersion_protocol` 那道 fail-closed 的判据是 `is_membrane`，
+        # 而它引用的论证是：
+        #     「`lj_tail_lrc_coeff[k]/V(t)` 假设配体周围是**均匀体相密度**；
+        #       配体埋在口袋里时这个假设直接不成立」
+        # 这段话对**可溶蛋白的口袋**同样成立 —— 复合物腿里配体的第一/第二壳层是
+        # 蛋白，而 `coeff/V` 用的是**盒平均**密度。判据卡的是环境类型，
+        # 论证讲的是配体待在哪，两者不是一回事。
+        #
+        # ⚠️ **不改数值行为**：`alchemical_uniform_density_lrc` 仍然是 True。
+        # 实测量级很小 —— brd4_ligand1 两条腿离线复算：
+        #     complex  N_env=39633 V=416.9 ρ=95.07  E_LRC=−13.2983 kJ/mol
+        #     solvent  N_env= 5914 V= 62.3 ρ=94.87  E_LRC=−12.7079 kJ/mol
+        #     两腿差 −0.5904 kJ/mol（÷56 个有 LJ 的配体原子 = −0.0105/原子）
+        # 体积差 6.7 倍被 `coeff ∝ N_env` 抵消掉了（两边 ρ_env 只差 0.2%），
+        # 所以关掉它反而是引入一个更大的、没验证过的改动。
+        #
+        # 改的只是**如实记账**：这条腿的 `target_met` 不再无条件报 `True`。
+        # 本函数 docstring 自己的规矩：「必须如实写进结果，而不是把'关掉了'
+        # 记成'处理好了'」—— 同理，也不许把"没验证过"记成"达成了"。
+        # `ligand_surrounding` 不声明时**逐字保持原行为**（老调用方不受影响）。
+        _pocket = (
+            str(ligand_surrounding or "").strip().lower()
+            == LIGAND_SURROUNDING_POCKET
+        )
         return {
             "dispersion_protocol": protocol,
             "environment_type": resolve_environment_type(environment_type),
-            "ligand_environment_is_uniform_bulk": True,
+            "ligand_surrounding": (
+                str(ligand_surrounding).strip().lower()
+                if ligand_surrounding else None
+            ),
+            "ligand_environment_is_uniform_bulk": not _pocket,
             "alchemical_uniform_density_lrc": True,
             "implementation": DISPERSION_IMPL_UNIFORM_BULK_ANALYTIC_TAIL,
-            "target_met": True,
-            "reason": "",
+            "target_met": not _pocket,
+            "reason": (
+                "" if not _pocket else
+                "uniform_bulk_density_assumed_but_ligand_is_in_a_pocket: "
+                "解析尾项按 `coeff[k]/V` 用的是**盒平均**密度，而这条腿里配体埋在"
+                "口袋里、局域密度不是体相。修正仍然施加（实测两腿差仅 ~0.6 kJ/mol，"
+                "关掉它是更大的未验证改动），但**不声称达成**力场参数化条件。"
+                "正解与膜体系同属 §1.3 路线 C（非均匀色散修正），尚未实现。"
+            ),
         }
 
     if environment_type is None:
@@ -12176,12 +12221,16 @@ def bake_global_parameter_into_fixed_nonbonded_force(
     # ⚠️ 必须**先建后删**：`system.getForce(i)` 返回的是 System 持有的引用，
     # `removeForce(i)` 会把它析构掉，之后再读那个 Python 句柄拿到的是垃圾内存
     # （实测能量表达式变成乱码字节）。本仓库栽过同类 SWIG 所有权的坑不止一次。
-    for idx, force in sorted(other_hits, key=lambda t: -t[0]):
-        baked = _bake_global_parameter_into_custom_bond_force(
+    # ⚠️ 同样**必须先全建完再统一删**：`removeForce(i)` 会把索引 > i 的力整体前移，
+    # 先删 CustomBondForce 就会让下面 `nb_index` 失效（CustomBondForce 排在 NB 前面
+    # 时，最后那一刀会砍到别的力上；末尾的 `remaining` 自检会 fail closed，但那已经
+    # 是白跑一趟）。所以这里只建不删，替换统一在函数末尾按索引降序一次做完。
+    replacements: List[Tuple[int, Any]] = [
+        (idx, _bake_global_parameter_into_custom_bond_force(
             force, parameter_name, lambda_value
-        )
-        system.removeForce(idx)
-        system.addForce(baked)
+        ))
+        for idx, force in other_hits
+    ]
 
     nb_index, nb = nb_hits[0]
     num_particles = nb.getNumParticles()
@@ -12303,8 +12352,10 @@ def bake_global_parameter_into_fixed_nonbonded_force(
             _value(eps_scale, unit.kilojoule_per_mole) * unit.kilojoule_per_mole,
         )
 
-    system.removeForce(nb_index)
-    system.addForce(new_nb)
+    replacements.append((nb_index, new_nb))
+    for idx, replacement in sorted(replacements, key=lambda t: -t[0]):
+        system.removeForce(idx)
+        system.addForce(replacement)
 
     remaining = _scan_forces_referencing_global_parameter(system, parameter_name)
     if remaining:

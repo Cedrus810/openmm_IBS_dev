@@ -13,18 +13,83 @@ _STASH: dict = {}
 _INSTALLED = False
 _ORIGINAL_BUILD_WINDOW_SYSTEM = None
 _ORIGINAL_MINIMIZE = None
+_ORIGINAL_SET_PARAMETER = None
+_ORIGINAL_GET_STATE = None
 _IBS_ENGINE = None
 _APP = None
+_OPENMM = None
+
+# IBS 偏置力（`CustomCVForce`）的力组。残差 CV 就挂在它里面。
+_IBS_BIAS_FORCE_GROUP = 1
+# CustomCVForce 里残差那个 CV 的名字（`local_residual.openmm_plugin` 建的就是它）。
+_RESIDUAL_CV_NAME = "exp025_residual_basis"
+# `id(System) -> bool`。`getState`/`setParameter` 是热路径，不能每次都扫一遍力。
+# `uninstall()` 清空；System 与 Context 同生命周期，窗口换了就是新对象。
+_RESIDUAL_CV_CACHE: dict = {}
 
 
 def _system_sha256(system, openmm) -> str:
     return hashlib.sha256(openmm.XmlSerializer.serialize(system).encode("utf-8")).hexdigest()
 
 
+def _has_residual_cv(system) -> bool:
+    """这个 System 里挂着残差 CV 吗（带缓存）。baseline 恒为 False。"""
+    key = id(system)
+    hit = _RESIDUAL_CV_CACHE.get(key)
+    if hit is not None:
+        return hit
+    found = False
+    if _OPENMM is not None:
+        for force in system.getForces():
+            if not isinstance(force, _OPENMM.CustomCVForce):
+                continue
+            for i in range(force.getNumCollectiveVariables()):
+                if force.getCollectiveVariableName(i) == _RESIDUAL_CV_NAME:
+                    found = True
+                    break
+            if found:
+                break
+    _RESIDUAL_CV_CACHE[key] = found
+    return found
+
+
+def _sync_integration_force_groups(context, bias_scale: float) -> None:
+    """🔑🔑 [2026-09-16 / docs/TODO.md LR-06] `bias_scale == 0` ⟹ 把 Group-1 移出积分力组。
+
+    `bias_scale` 乘在 Group-1 **整个**表达式外面，而里面就是配体↔环境的软核
+    相互作用 ⟹ 它为 0 不是"关掉偏置"，是**把配体关成完全的鬼影**：水分子直接穿过
+    配体，`r → 0` 成为必然。而 `CustomCVForce` 会求值它的**每一个** CV（与系数是否
+    为 0 无关）⟹ `LocalManyBodyResidualForce` 在这些几何上撞 0.1 Å 硬门，整条 run
+    死在窗口 0 热化。把力组排除掉，插件在鬼影期就根本不被求值。
+
+    ⚠️ **只对挂了残差 CV 的 System 生效。** 理论上 `bias_scale=0` 时 Group-1 贡献是
+    精确的零、排不排除等价；实测在真实窗口 0 System 上（CUDA mixed precision）
+    ΔE=7.5e-5 kJ/mol、max|ΔF|=1.8e-4（相对 1e-8，是归约顺序的浮点噪声）。MD 是混沌的，
+    1e-8 也会让轨迹分叉，而 `bias_scale=0` 在 **baseline 也会发生**（dt 爬坡全程、
+    偏置爬坡起点）⟹ 一律排除会改掉 baseline 的预热轨迹。baseline 的 System 没有残差
+    CV，这里直接返回，连 `setIntegrationForceGroups` 都不调。
+    """
+    system = context.getSystem()
+    if not _has_residual_cv(system):
+        return
+    integrator = context.getIntegrator()
+    setter = getattr(integrator, "setIntegrationForceGroups", None)
+    if setter is None:            # 老 OpenMM 没这个 API：退回改动前行为
+        return
+    mask = 0
+    for force in system.getForces():
+        group = int(force.getForceGroup())
+        if bias_scale == 0.0 and group == _IBS_BIAS_FORCE_GROUP:
+            continue
+        mask |= 1 << group
+    setter(mask)
+
+
 def uninstall() -> None:
     """Restore both patched methods and discard a pending twin, idempotently."""
     global _INSTALLED, _ORIGINAL_BUILD_WINDOW_SYSTEM, _ORIGINAL_MINIMIZE
-    global _IBS_ENGINE, _APP
+    global _ORIGINAL_SET_PARAMETER, _ORIGINAL_GET_STATE
+    global _IBS_ENGINE, _APP, _OPENMM
     if _INSTALLED:
         if _IBS_ENGINE is not None and _ORIGINAL_BUILD_WINDOW_SYSTEM is not None:
             _IBS_ENGINE.IBSWindowManagerDualLambda._build_window_system = (
@@ -32,18 +97,27 @@ def uninstall() -> None:
             )
         if _APP is not None and _ORIGINAL_MINIMIZE is not None:
             _APP.Simulation.minimizeEnergy = _ORIGINAL_MINIMIZE
+        if _OPENMM is not None and _ORIGINAL_SET_PARAMETER is not None:
+            _OPENMM.Context.setParameter = _ORIGINAL_SET_PARAMETER
+        if _OPENMM is not None and _ORIGINAL_GET_STATE is not None:
+            _OPENMM.Context.getState = _ORIGINAL_GET_STATE
     _STASH.clear()
+    _RESIDUAL_CV_CACHE.clear()
     _INSTALLED = False
     _ORIGINAL_BUILD_WINDOW_SYSTEM = None
     _ORIGINAL_MINIMIZE = None
+    _ORIGINAL_SET_PARAMETER = None
+    _ORIGINAL_GET_STATE = None
     _IBS_ENGINE = None
     _APP = None
+    _OPENMM = None
 
 
 def install() -> None:
     """Install the twin policy once for the current Python process."""
     global _INSTALLED, _ORIGINAL_BUILD_WINDOW_SYSTEM, _ORIGINAL_MINIMIZE
-    global _IBS_ENGINE, _APP
+    global _ORIGINAL_SET_PARAMETER, _ORIGINAL_GET_STATE
+    global _IBS_ENGINE, _APP, _OPENMM
     if _INSTALLED:
         return
     import openmm
@@ -56,6 +130,60 @@ def install() -> None:
     _ORIGINAL_MINIMIZE = original_minimize
     _IBS_ENGINE = ibs_engine
     _APP = app
+    _OPENMM = openmm
+    _RESIDUAL_CV_CACHE.clear()
+
+    # ---- [2026-09-16 / LR-06] 预热鬼影期不求值残差 CV：两个 Context 级补丁 ----
+    #
+    # 为什么做成猴子补丁而不是改主线：这套东西还没经过大规模验证，主线
+    # （`ibs_engine` / `step_guard`）保持零改动，验证完再谈合并。整套补丁只在
+    # `--outer-lambda-local-residual-ibs` 开启时由
+    # `runabfe._scope_pipeline_with_optional_outer_lambda_em` 安装，baseline 不装。
+    original_set_parameter = openmm.Context.setParameter
+    original_get_state = openmm.Context.getState
+    _ORIGINAL_SET_PARAMETER = original_set_parameter
+    _ORIGINAL_GET_STATE = original_get_state
+
+    def patched_set_parameter(self, name, value):
+        """任何一处改 `*_bias_scale` 都顺带同步积分力组。
+
+        补丁挂在 `Context.setParameter` 上而不是某个具名 helper，是因为主线里改
+        `bias_scale` 的地方有 **8 处**（热化前后、dt 爬坡、偏置爬坡的每一档、
+        resume 的几条分支）—— 逐个去包必然漏，漏掉的那一处就又是一个鬼影期里
+        带着残差 CV 空转的窗口。
+        """
+        original_set_parameter(self, name, value)
+        if not str(name).endswith("_bias_scale"):
+            return
+        try:
+            _sync_integration_force_groups(self, float(value))
+        except Exception as exc:  # noqa: BLE001 —— 同步失败不能盖掉调用方的赋值
+            print(f"  [WARN] [EM-no-residual] 同步积分力组失败：{exc}", flush=True)
+
+    def patched_get_state(self, *args, **kwargs):
+        """没显式给 `groups` 时，按积分器**实际在积分**的力组取 State。
+
+        只在积分力组被限制过（= 我们的鬼影期）且该 System 挂了残差 CV 时才介入；
+        其余情况 `getIntegrationForceGroups()` 返回 -1，逐位走原路径。
+
+        必要性：把 Group-1 移出积分**只管积分**。`step_guard.finite_state_check`
+        每 500 步会做一次不带 `groups` 的 `getState(getEnergy/Forces/Positions)`，
+        那会把 Group-1 连同残差 CV 一起求值 ⟹ 插件照样在鬼影几何上抛异常 ⟹
+        被当成"状态非有限"，回退 + 步长减半一路走到窗口失败。
+        """
+        # `groups` 是 getState 的第 10 个参数；位置参数少于 10 个就说明没给它。
+        if "groups" not in kwargs and len(args) < 10:
+            try:
+                mask = self.getIntegrator().getIntegrationForceGroups()
+                if (isinstance(mask, int) and mask >= 0
+                        and _has_residual_cv(self.getSystem())):
+                    kwargs["groups"] = mask
+            except Exception:  # noqa: BLE001 —— 取不到就退回全量
+                pass
+        return original_get_state(self, *args, **kwargs)
+
+    openmm.Context.setParameter = patched_set_parameter
+    openmm.Context.getState = patched_get_state
 
     def _find_global_parameter_suffix(system, suffix: str):
         for force_index in range(system.getNumForces()):
@@ -216,7 +344,24 @@ def install() -> None:
             # `CustomCVForce` 的 global parameters，一旦参数挂在别的力上、或者前缀/
             # 命名变了，它返回 None 而这里**什么都不做** —— 上面注释里说要关掉的
             # "post-EM 诊断步残差窗口"实际没关，是 fail-open。至少要让它可见。
-            for suffix in ("_bias_scale", "_s_residual"):
+            # 🔑🔑 [2026-09-16] **只关 `_s_residual`，绝不碰 `_bias_scale`。**
+            #
+            # `bias_scale` 乘在 Group-1 **整个**表达式外面（`ibs_engine` 里
+            # `f"{prefix}_bias_scale * ({_state_expr(0)} - kt*(...))"`），而
+            # `_state_expr(0)` 里就是 `cv_0_int + cv_0_rest` —— **配体↔环境的软核
+            # 相互作用**。把它清零不是"关掉偏置"，是**把配体关成完全的鬼影**：水分子
+            # 直接穿过配体，`r → 0` 成为必然，而 `CustomCVForce` 仍会逐步求值它的
+            # 每一个 CV（与系数是否为 0 无关）⟹ 插件在这些几何上撞 0.1 Å 硬门，
+            # 整条 run 死在窗口 0 热化。真机 cyclod_ligand1_outer 三个 rep 全中，
+            # 本机复现 3/3；拦掉这一次清零后热化**完全通过**（docs/TODO.md `LR-06`）。
+            #
+            # `ibs_engine` 自己在最小化前只关 `s_residual`，注释明写「不像
+            # bias_scale=0 那样连 baseline 也在正常使用的物理 softcore-state 混合力
+            # 一起关掉」—— 这里原来的两元组与那条约定直接冲突，且因为在它之后执行
+            # 而赢了。附带后果：baseline 不装本补丁 ⟹ 两臂预热的哈密顿量不同。
+            #
+            # 恢复点在 `ibs_engine` 那句 `setParameter(f"{prefix}_s_residual", 1.0)`。
+            for suffix in ("_s_residual",):
                 name = _find_global_parameter_suffix(real_system, suffix)
                 if name is None:
                     print(

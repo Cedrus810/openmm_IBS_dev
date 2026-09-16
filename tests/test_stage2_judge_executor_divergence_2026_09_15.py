@@ -157,10 +157,13 @@ def test_first_window_cap_is_applied_inside_the_dp_not_after():
                              first_window_max_states=4)
     assert diag["sizes"][0] == 4
     assert diag["first_window_max_states"] == 4
-    # 约束**进 DP**：先解再过滤拿不到"该约束下的最优"。这里 maxK 从 8 降到 6，
-    # 且代价只有 +1 个窗口。
+    # 约束**进 DP**：先解再过滤拿不到"该约束下的最优"。代价只有 +1 个窗口。
+    # ⚠️ [2026-09-15 下半场] 这里原来钉的是 `maxK == 6`（当时的实测值）。
+    # DP 加了第三个目标（峰值 → 窗数 → **maxK** → 平方和）之后，同样的峰值与
+    # 窗口数下解出了更细的 `[4,5,5,4,4,5]` ⟹ maxK 5。钉子跟着实测走，
+    # 但**不许放松成 `<= 8`** —— 那样它就不再证明"约束进了 DP"。
     assert len(diag["sizes"]) == len(base) + 1
-    assert max(diag["sizes"]) == 6
+    assert max(diag["sizes"]) == 5, diag["sizes"]
 
 
 def test_capping_win0_buys_nothing_on_the_metric_ledger():
