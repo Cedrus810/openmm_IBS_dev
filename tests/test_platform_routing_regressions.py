@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Optional, Tuple
@@ -29,11 +31,24 @@ def _functions(path, names, namespace):
     return namespace
 
 
-def test_platform_property_routing_covers_cpu_cuda_and_explicit_devices():
+def test_platform_property_routing_covers_cpu_cuda_and_explicit_devices(monkeypatch, tmp_path):
+    # 🔑 [2026-09-15] `_build_platform_props` 现在通过 `_resolve_nvcc` 找编译器
+    # （原来是直接 `shutil.which("nvcc")`，只问 PATH —— 真机上 nvcc 只在 mamba env
+    # 里、而作业用绝对路径调 env 的 python 启动，那样 env 的 bin 不进 PATH）。
+    # 本用例的语义不变：**一个 nvcc 都找不到 ⟹ 不设 `CudaCompiler`**。
+    # 所以要把四条查找途径全部掐掉，而不只是 PATH。
+    _empty = tmp_path / "no_toolkit"
+    _empty.mkdir()
+    monkeypatch.setattr(sys, "executable", str(_empty / "python"))
+    monkeypatch.delenv("OPENMM_CUDA_COMPILER", raising=False)
+    monkeypatch.delenv("CONDA_PREFIX", raising=False)
+    monkeypatch.delenv("CUDA_HOME", raising=False)
+    monkeypatch.delenv("CUDA_PATH", raising=False)
     ns = _functions(
         PIPELINE,
-        {"_split_platform_spec", "_build_platform_props"},
-        {"Tuple": Tuple, "Optional": Optional, "Dict": Dict, "shutil": SimpleNamespace(which=lambda _: None)},
+        {"_split_platform_spec", "_build_platform_props", "_resolve_nvcc"},
+        {"Tuple": Tuple, "Optional": Optional, "Dict": Dict, "os": os,
+         "shutil": SimpleNamespace(which=lambda _: None)},
     )
     build = ns["_build_platform_props"]
     assert build("CPU") == ("CPU", {})

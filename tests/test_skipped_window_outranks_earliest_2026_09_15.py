@@ -1,0 +1,69 @@
+"""被求解器跳掉的窗口优先于"自检说支撑不足"的窗口。
+
+两者不是同一强度的信号：
+
+  · `skipped_windows` = **求解器的操作权威**。那个窗口真的没进 MBAR ⟹ 整条路径
+    缺窗 ⟹ `analysis_status = ANALYSIS_INCOMPLETE` ⟹ 交出去的和**不是 ΔG**
+    （硬不变量，本仓不许放宽）。
+  · `self_verdict` = 逐窗自检的诊断，说"这个窗还没测够"。
+
+真机 brd4_ligand1/rep2：
+    win1  INSUFFICIENT_DATA，n_decorr=888（够得离谱）、min N_eff/g=8.68 ⟹ **偏斜**
+    win4  HARD_INSUFFICIENT，n_decorr=7  ⟹ 被求解器跳掉，skipped_windows=[4]
+6 轮全部路由到 win1（4 块帧烧光配额），win4 **一次都没被看过**；整条路径照常采完，
+最后死在缺窗那道身份门上。而 win4 有现成的对症动作，只是轮不到。
+"""
+import json
+import os
+
+from abfe_preoptimizer import Stage2RepairController
+
+from test_stage2_repair_controller import R4, _mkrun
+
+
+def _board(tmp_path):
+    """win1 自检不合格（在前），win3 被求解器跳掉（在后）。"""
+    w = {i: {"K": 4} for i in range(4)}
+    w[1] = {"K": 4, "self_verdict": "INSUFFICIENT_DATA", "min_n_eff_over_g": 8.7,
+            "n_decorr": 888}
+    w[3] = {"K": 4, "self_verdict": "HARD_INSUFFICIENT", "min_n_eff_over_g": 0.21,
+            "n_decorr": 7}
+    run = _mkrun(tmp_path, windows=w, ranges=R4, n_states=13,
+                 stage_result={
+                     "analysis_status": "ANALYSIS_INCOMPLETE",
+                     "analysis_incomplete_reasons": ["存在被跳过的窗口 [3]"],
+                     "precision_status": "UNMEASURED",
+                     "total_delta_G": -20.0, "total_error": 0.5,
+                     "skipped_windows": [{"window_index": 3,
+                                          "n_frames_after_decorrelation": 7}],
+                 })
+    return run
+
+
+def test_a_solver_skipped_window_is_routed_before_an_earlier_unhappy_one(tmp_path):
+    c = Stage2RepairController.for_physical_stage(_board(tmp_path), "vanishing", "vdw")
+    view = c.read()
+    assert 3 in [int(x) if not isinstance(x, dict) else int(x["window_index"])
+                 for x in (view.get("skipped_windows") or [])], view.get("skipped_windows")
+    plan = c.decide()
+    assert plan["windows"] == [3], (
+        f"路由到了 {plan['windows']}（应当是被跳掉的 win3，不是下标更小的 win1）："
+        f"{plan['reason'][:200]}")
+
+
+def test_without_a_skip_the_old_earliest_order_is_unchanged(tmp_path):
+    """没有跳窗时**逐字保持**原行为 —— 这条改的只是优先级，不是判据。"""
+    w = {i: {"K": 4} for i in range(4)}
+    w[1] = {"K": 4, "self_verdict": "INSUFFICIENT_DATA", "min_n_eff_over_g": 8.7}
+    w[3] = {"K": 4, "self_verdict": "INSUFFICIENT_DATA", "min_n_eff_over_g": 0.21}
+    run = _mkrun(tmp_path, windows=w, ranges=R4, n_states=13)
+    plan = Stage2RepairController.for_physical_stage(run, "vanishing", "vdw").decide()
+    assert plan["windows"] == [1], plan["reason"][:200]
+
+
+def test_a_replaced_parent_is_still_excluded(tmp_path):
+    """`_replaced_parents` 的排除不得被这条优先级顺手绕过。"""
+    import inspect
+    src = inspect.getsource(Stage2RepairController.decide)
+    blk = src.split("_skipped_now = {")[1].split("if earliest is None:")[0]
+    assert "_replaced_parents" in blk, "跳窗优先分支漏了 _replaced_parents 排除"

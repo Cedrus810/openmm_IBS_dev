@@ -423,14 +423,11 @@ def test_no_ligand_pair_is_converted_into_an_exception():
     )
 
 
-def test_ligand_internal_energy_is_quadratic_in_lambda_without_pme_bookkeeping():
-    """[P0-01 v3] NoCutoff 下配体内部静电 E(λ)−E(0) 严格 ∝ λ²（annihilation 口径）。
+def _charge_transfer_ligand_internal_only_system(*, drop_compensation: bool):
+    """charge-transfer 去电荷体系，环境电荷清零 —— 剩下的 λ 依赖全是配体分子内的。
 
-    v2 旧契约是"内部静电逐 λ 恒定"，但它只能靠把普通对转成 exception 实现，
-    而那在 PME 下会改写 λ=1 端点。v3 契约：普通 L-L 库仑随粒子电荷一起湮灭，
-    对能 ∝ q_i(λ)·q_j(λ) ∝ λ²。complex/solvent 两腿内部 Hamiltonian 相同
-    ⟹ 湮灭项在 ΔG_bind 中严格相消。
-    这里抽掉环境电荷，量到的就只剩配体内部静电的 λ 行为。
+    `drop_compensation=True` 摘掉 v5 的 (1-λ²) 补偿力 = 复现 v4 的湮灭口径。对照臂
+    必须由**同一条构造路径**产生、只差这一个力，否则比的不是同一件事。
     """
     system, topology, positions, box = _build_charge_transfer_system(
         nonbonded_method=NonbondedForce.NoCutoff
@@ -447,6 +444,19 @@ def test_ligand_internal_energy_is_quadratic_in_lambda_without_pme_bookkeeping()
         system, LIGAND_INDICES, topology, lambda_name="lam_coul",
         co_alchemical_ion_spec=spec,
     )
+    if drop_compensation:
+        # 按**名字**摘，不按类型：这个 System 上还挂着 co-ion 的 flat-bottom
+        # 约束（CustomCompoundBondForce）和别的键力，按类型摘会砍到别人。
+        hits = [
+            i for i in range(system.getNumForces())
+            if system.getForce(i).getName() == core.LIGAND_INTERNAL_COULOMB_FORCE_NAME
+        ]
+        assert len(hits) == 1, (
+            f"预期恰好一个 {core.LIGAND_INTERNAL_COULOMB_FORCE_NAME}，实际 {len(hits)} —— "
+            "v5 的补偿力没挂上，或者挂了不止一份。"
+        )
+        system.removeForce(hits[0])
+
     nb = next(f for f in system.getForces() if isinstance(f, NonbondedForce))
     # 把配体以外的所有电荷（含 co-ion 的基电荷与 offset）清零，只留配体内部静电。
     for idx in range(nb.getNumParticles()):
@@ -458,18 +468,63 @@ def test_ligand_internal_energy_is_quadratic_in_lambda_without_pme_bookkeeping()
         param, particle, _q, _s, _e = nb.getParticleParameterOffset(offset_idx)
         if str(param) == "lam_coul" and int(particle) not in LIGAND_INDICES:
             nb.setParticleParameterOffset(offset_idx, param, int(particle), 0.0, 0.0, 0.0)
+    return system, positions
 
-    e1, _ = _energy_and_forces(system, positions, lam=1.0)
-    e0, _ = _energy_and_forces(system, positions, lam=0.0)
-    intra = e1 - e0
-    assert abs(intra) > 1.0e-6, (
-        "配体内部静电恒为 0，本测试失去了检验能力 —— fixture 需要非零内部库仑。"
+
+def test_ligand_internal_coulomb_is_lambda_independent_under_charge_transfer():
+    """[P0-01 v5] charge-transfer 去电荷腿的配体内部库仑逐 λ 恒定。
+
+    契约变迁：v2「内部静电逐 λ 恒定」→ v3「随 λ² 湮灭」（v2 只能靠把普通对转成
+    exception 实现，那在 PME 下会改写 λ=1 端点）→ **v5「逐 λ 恒定，且不碰 exception」**
+    （`ibs_engine._freeze_ligand_internal_coulomb` 挂一个 (1-λ²) 前缀的补偿力：
+    主 NB 给 λ²·U_intra，补偿力给 (1-λ²)·U_intra，合计恒为 U_intra；λ=1 时补偿力
+    恒等于 0，P0-01 端点不变）。
+
+    ⚠️ 本测试在 v5 落地后一度**空转**：它沿用 v3 的 λ² 断言，而 v5 正要消掉那个 λ²，
+    于是它量到的 `intra = E(1)−E(0)` 只剩 2.83e-6 kJ/mol（27156 kJ/mol 总能上的浮点
+    抵消噪声），刚好越过它自己 `> 1e-6` 的守卫，而且噪声本身也 ∝ λ²，两条断言双双
+    通过 —— v4/v5 都绿。教训：**守卫不能拿被测量自己的残差做下界**，必须拿一个
+    独立的、真的有量级的对照臂。
+
+    所以这里两条臂：摘掉补偿力（= v4 湮灭口径）给出量级，装上补偿力必须把它压掉。
+    NoCutoff 下不存在周期自镜像项，抵消是精确的代数恒等，只允许求值器噪声
+    （PME 下残留的自镜像项另见
+    `tests/test_intramolecular_coulomb_is_lambda_independent.py`）。
+    """
+    v4_system, positions = _charge_transfer_ligand_internal_only_system(
+        drop_compensation=True
     )
+    annihilated = (
+        _energy_and_forces(v4_system, positions, lam=1.0)[0]
+        - _energy_and_forces(v4_system, positions, lam=0.0)[0]
+    )
+    assert abs(annihilated) > 1.0, (
+        f"对照臂（v4 湮灭口径）只有 {annihilated:.4g} kJ/mol —— 这个 fixture 的配体"
+        "没有 ≥1-5 普通对可测，已失去检验能力。"
+    )
+
+    system, positions = _charge_transfer_ligand_internal_only_system(
+        drop_compensation=False
+    )
+    e0, f0 = _energy_and_forces(system, positions, lam=0.0)
+    e1, f1 = _energy_and_forces(system, positions, lam=1.0)
+
+    # 不写绝对魔法数：拿对照臂自校准。NoCutoff 下只该剩求值器噪声，1e-5 仍留了
+    # 三个量级的余量（实测比值 ~1e-8）。
+    tol = 1.0e-5 * abs(annihilated)
+    assert abs(e1 - e0) < tol, (
+        f"配体内部静电仍随 λ 变化 {e1 - e0:.6g} kJ/mol（容差 {tol:.3g}，"
+        f"v4 湮灭口径是 {annihilated:.4g}）—— (1-λ²) 补偿没有把它冻住。"
+    )
+    assert float(np.abs(f1 - f0).max()) < tol, (
+        "能量抵消了但力没有：补偿力的对表与主 NB 的不是同一份。"
+    )
+
     for lam in (0.25, 0.37, 0.5):
         e_lam, _ = _energy_and_forces(system, positions, lam=lam)
-        assert e_lam - e0 == pytest.approx(lam**2 * intra, rel=1e-9, abs=1e-9), (
-            f"配体内部静电不按 λ² 湮灭：E({lam})−E(0) = {e_lam - e0:.9f} vs "
-            f"期望 λ²×(E(1)−E(0)) = {lam**2 * intra:.9f} kJ/mol。"
+        assert abs(e_lam - e0) < tol, (
+            f"λ={lam} 处内部静电偏离 {e_lam - e0:.6g} kJ/mol —— "
+            "恒定性必须在整段 λ 上成立，不只在两个端点。"
         )
 
 

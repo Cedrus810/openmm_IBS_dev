@@ -104,6 +104,19 @@ physical target 永远不含残差（`ibs_engine.py:8549`）。
   loss 的 `normalized_weights must sum to one`——那句报错跟真因毫无关系。
 - **别为了让链子跑通去放宽门。** 本次放宽了两处（跳过支撑域外的帧、放宽导出脚本的
   config 逐字段相等），第一处性质最坏。
-- **EXP-030 的结论不能当"已验证的能力"引用**：完整六窗 ESS/时间中位 +1.50%，预注册门槛
-  是「≥2/3 为正且中位 ≥+10%」，**未通过**（`EXP030_STOP_JOINT_SCORE_NO_REPRODUCIBLE_ITT_GAIN`）。
-  排除 window_5 的 +9%/+82%/+9% 是事后子集分析，并列报告，不替代验收。
+- **引用 EXP-030 时必须两半一起说。**〔2026-09-16 更正：本条原先只抄了下面第①半，
+  读起来变成「EXP-030 = 方法没有收益」，并被据此否定过整条 outer 路线。原始结论在
+  `Atenolol-rank11/output/outer_lambda_exp030/three_repeat_final_analysis_lw5i7uud/OVERALL_CONCLUSION.md`〕
+
+  ① **完整六窗的正式验收未过**：ESS/时间 −7.83% / +66.66% / +1.50%，中位 +1.50%，
+     低于预注册门槛「≥2/3 为正且中位 ≥+10%」。⟹ 不能宣称完整 ABFE 流程已实现稳定加速。
+  ② **但方法有收益的正向证据是存在的**：统一排除 window_5 的五窗对照里，
+     **三个 repeat 的 ESS/时间全部为正** —— +9.01% / +81.79% / +9.44%
+     （同 steps ESS +20.92% / +103.81% / +23.24%）。原文的原话是
+     **「不能把本轮结果概括成"方法没有收益"」**。
+
+  两条都要带上。只说①是曲解；只说②是越界（五窗是用户指定的事后敏感性分析，
+  不替代完整六窗验收）。另注：`EXP030_STOP_JOINT_SCORE_NO_REPRODUCIBLE_ITT_GAIN`
+  这个串在 `analysis.json` 里的位置是 `utility_threshold_arithmetic_only`，
+  同一文件另有 `"formal_preregistered_decision": "NOT_WRITTEN_BY_THIS_DIAGNOSTIC"`
+  —— 它是阈值算术的子结果，**不是**正式判决，别当判决引用。

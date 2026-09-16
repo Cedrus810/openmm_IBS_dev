@@ -39,6 +39,13 @@ v5: pme_decharge_v5_ll_exception_frozen_intramolecular_coulomb_decoupled_2026091
 | 11920 | `_bake_global_parameter_into_custom_bond_force(...)` | **新增** | 把 global parameter 的取值整词代入 `CustomBondForce` 的能量表达式并重建力（OpenMM 没有 `removeGlobalParameter`）。**先建后删**——`system.getForce(i)` 返回的是 System 持有的引用，`removeForce` 会析构它，先删后读会拿到垃圾内存。 |
 | 11969 | `bake_global_parameter_into_fixed_nonbonded_force(...)` | **改动（放宽守卫）** | 原来：目标参数被**任何**非 NonbondedForce 引用 ⟹ fail closed。现在：`CustomBondForce` 交给上面那个函数烘焙，其余力类型**照旧 fail closed**。契约「参数从 System 上彻底消失」不变。 |
 
+> **2026-09-15 补丁**：上面那条改动引入过一个索引失效 bug —— 先 `removeForce` 掉
+> CustomBondForce、再用**改动前**存下的 `nb_index` 去删 NonbondedForce。CustomBondForce
+> 排在 NB **前面**时最后那一刀会砍到别的力上（末尾的 `remaining` 自检 fail closed 拦住了，
+> 不会静默产出错的 System，但白跑一趟）。生产路径里补偿力恒为 `addForce` 追加、索引
+> 恒大于 NB，**从未触发**。已改成「只建不删、全部替换在末尾按索引降序一次做完」，
+> 两种顺序都已上机验过。
+
 ### 1.2 `ibs_engine.py`
 
 | 行 | 符号 | 性质 | 内容 |
@@ -167,10 +174,14 @@ CustomBondForce("({scale_expr})*138.935456*chargeProd/r")
    （偏差到 1.8 nm，MIC 后仍不满足；违反原子恒在索引末尾 3%）。
    同一份 v5 代码下 cyclod_ligand2 三个 rep 的同一检查全部 0/400。
    **原因未查明。** 我不能把它归给 v5，也不能排除。
-3. **`tests/test_charge_transfer_hamiltonian.py::test_ligand_internal_energy_is_quadratic_in_lambda_without_pme_bookkeeping`
-   已退化为空转**：它钉的是 v4 契约，在 v5 下量到的 `intra = 2.83e-6 kJ/mol`
-   （27156 kJ/mol 总能上的浮点噪声），刚好越过它自己 `> 1e-6` 的守卫，**仍然是绿的**。
-   未修。
+3. ~~**`tests/test_charge_transfer_hamiltonian.py::test_ligand_internal_energy_is_quadratic_in_lambda_without_pme_bookkeeping`
+   已退化为空转**~~ **已修（2026-09-15）**：它钉的是 v4 契约，在 v5 下量到的
+   `intra = 2.83e-6 kJ/mol`（27156 kJ/mol 总能上的浮点噪声），刚好越过它自己
+   `> 1e-6` 的守卫，而且噪声本身也 ∝ λ²，两条断言双双通过 —— v4/v5 都绿。
+   已重写为 `test_ligand_internal_coulomb_is_lambda_independent_under_charge_transfer`：
+   两条臂（摘掉补偿力 = v4 口径给量级 239.45 kJ/mol；装上必须压到 1e-5 倍以下），
+   容差由对照臂自校准、不写绝对魔法数，并把恒定性断在整段 λ 上而不只两个端点。
+   突变验证过：把被测臂也摘掉补偿力，测试变红（239.447 > 容差 0.00239）。
 4. **配体内部库仑仍有两份实现、两种截断口径**：本文这个（逐对、无截断）与
    `create_ligand_internal_force` 的 `ll_force`（CustomNonbondedForce、1.0 nm 截断，
    被 shadow-coul / bridge 两个 builder 用来承载分子内库仑）。

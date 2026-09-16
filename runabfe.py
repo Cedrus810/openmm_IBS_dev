@@ -35,7 +35,7 @@ import hashlib
 import glob
 import re
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import openmm
@@ -86,6 +86,8 @@ from abfe_core import (
     GROMACS_PAIRS_FUNCT2_CONVERSION_VERSION,
     co_alchemical_ion_builder_identity_payload,
     COION_COION_MIN_IMAGE_INITIAL_NM,  # §2.2 多个 reserved co-ion 彼此的安全边距
+    CO_ALCHEMICAL_ION_RESIDUE_NAMES,  # reserved co-ion dummy 的残基名判据
+    TOTAL_CHARGE_CONSERVATION_TOLERANCE_E,  # 派生 co-ion 后的总电荷守恒容差
     charge_treatment_qualification_payload,
     LIGAND_NET_CHARGE_INTEGER_TOLERANCE_E,
     WATER_MOLECULE_NAMES,
@@ -1663,35 +1665,104 @@ def generate_ligand_xml_from_top(
 # ---------------------------------------------------------------------------
 # 原生系统缓存读写
 # ---------------------------------------------------------------------------
-def diagnose_14_scaling(system: openmm.System) -> None:
-    """打印 NonbondedForce 的 1-4 缩放因子，验证 GROMACS 继承正确性。"""
+def diagnose_14_scaling(system: openmm.System) -> Optional[Dict[str, Any]]:
+    """报告 NonbondedForce 里**真正的 1-4 对**的缩放因子。
+
+    🔑🔑 [2026-09-16] **先前这个诊断是误导性的，不是力场错了。**
+
+    旧实现把 `getNumExceptions()` 里的**每一条**异常都拿来平均 —— 而绝大多数异常是
+    1-2/1-3 的**完全排除**（chargeProd=0、epsilon=0）。排除对在分子里比 1-4 对多得多，
+    于是平均值被一堆结构性的 0 压向 0：真机 thrombin 打出 fudgeQQ=0.1590 / fudgeLJ=0.2402，
+    看着像力场参数错了，实际上只是"把排除对算进了缩放因子的平均"。
+
+    正确口径：**只有显式 1-4 对才有缩放因子可言**。判据不看键图（System 里没有），
+    而是看这条异常本身有没有保留相互作用：
+      · `chargeProd == 0 且 epsilon == 0`  ⟹ 完全排除（1-2/1-3）⟹ **不参与统计**；
+      · 其余                                 ⟹ 显式 pair（1-4）⟹ 参与统计。
+    分母为 0 的对（例如两个原子之一 q=0 或 ε=0）同样不参与 —— 那是"这条对上测不出
+    缩放因子"，不是"缩放因子是 0"。
+
+    只报中位数与离散度，不报平均：GROMACS 的 fudgeQQ 是全局常数，一旦有离群值，
+    要看的是"有几条不一样"，而不是被平均掉的那个数。
+    返回统计结果（便于测试与 provenance）；读不到 NonbondedForce 时返回 None。
+    """
     for force in system.getForces():
         if isinstance(force, openmm.NonbondedForce):
             nb = force
             break
     else:
         log.warning("  [WARN] 未找到 NonbondedForce，无法诊断 1-4 缩放")
-        return
+        return None
 
-    # 收集所有异常对的参数
-    charge_prods = []
-    lj_scales = []
+    n_excluded = 0
+    qq_scales: List[float] = []
+    lj_scales: List[float] = []
+    n_pair_no_qq_ref = 0
+    n_pair_no_lj_ref = 0
     for i in range(nb.getNumExceptions()):
         p1, p2, cp, sigma, eps = nb.getExceptionParameters(i)
-        # 获取两个原子的原始参数
-        q1, sig1, eps1 = nb.getParticleParameters(int(p1))
-        q2, sig2, eps2 = nb.getParticleParameters(int(p2))
+        cp_e2 = cp.value_in_unit(unit.elementary_charge**2)
+        eps_kj = eps.value_in_unit(unit.kilojoule_per_mole)
+        if abs(cp_e2) <= 1.0e-12 and abs(eps_kj) <= 1.0e-12:
+            n_excluded += 1          # 完全排除的 1-2/1-3，没有"缩放因子"这回事
+            continue
+        q1, _sig1, eps1 = nb.getParticleParameters(int(p1))
+        q2, _sig2, eps2 = nb.getParticleParameters(int(p2))
         q_prod_raw = (q1 * q2).value_in_unit(unit.elementary_charge**2)
-        if abs(q_prod_raw) > 1e-10:
-            charge_prods.append(cp.value_in_unit(unit.elementary_charge**2) / q_prod_raw)
-        # LJ 缩放近似为 epsilon_14 / (sqrt(eps1*eps2))
-        eps_cross = np.sqrt(eps1.value_in_unit(unit.kilojoule_per_mole) * eps2.value_in_unit(unit.kilojoule_per_mole))
-        if eps_cross > 1e-10:
-            lj_scales.append(eps.value_in_unit(unit.kilojoule_per_mole) / eps_cross)
+        if abs(q_prod_raw) > 1.0e-10:
+            qq_scales.append(cp_e2 / q_prod_raw)
+        else:
+            n_pair_no_qq_ref += 1
+        eps_cross = float(np.sqrt(
+            eps1.value_in_unit(unit.kilojoule_per_mole)
+            * eps2.value_in_unit(unit.kilojoule_per_mole)
+        ))
+        if eps_cross > 1.0e-10:
+            lj_scales.append(eps_kj / eps_cross)
+        else:
+            n_pair_no_lj_ref += 1
 
-    fudgeQQ = np.mean(charge_prods) if charge_prods else 0.0
-    fudgeLJ = np.mean(lj_scales) if lj_scales else 0.0
-    log.info("  1-4 缩放诊断: fudgeQQ=%.4f (应 ~0.8333), fudgeLJ=%.4f (应 ~0.5)", fudgeQQ, fudgeLJ)
+    def _stat(values: List[float]) -> Dict[str, Any]:
+        if not values:
+            return {"n": 0, "median": None, "min": None, "max": None}
+        arr = np.asarray(values, dtype=float)
+        return {
+            "n": int(arr.size),
+            "median": float(np.median(arr)),
+            "min": float(arr.min()),
+            "max": float(arr.max()),
+        }
+
+    report = {
+        "n_exceptions_total": int(nb.getNumExceptions()),
+        "n_fully_excluded": int(n_excluded),
+        "n_explicit_pairs": int(nb.getNumExceptions() - n_excluded),
+        "fudgeQQ": _stat(qq_scales),
+        "fudgeLJ": _stat(lj_scales),
+        "n_pairs_without_coulomb_reference": int(n_pair_no_qq_ref),
+        "n_pairs_without_lj_reference": int(n_pair_no_lj_ref),
+    }
+    if report["n_explicit_pairs"] == 0:
+        log.info(
+            "  1-4 缩放诊断: 全部 %d 条异常都是完全排除，没有显式 1-4 对可统计"
+            "（这本身不是错误，例如只有排除表的体系）",
+            report["n_exceptions_total"],
+        )
+        return report
+    _q, _l = report["fudgeQQ"], report["fudgeLJ"]
+    log.info(
+        "  1-4 缩放诊断（只统计 %d 条显式 pair，已剔除 %d 条完全排除）: "
+        "fudgeQQ 中位数=%s [%s, %s] (n=%d, 应 ~0.8333), "
+        "fudgeLJ 中位数=%s [%s, %s] (n=%d, 应 ~0.5)",
+        report["n_explicit_pairs"], report["n_fully_excluded"],
+        *( "%.4f" % v if v is not None else "n/a"
+           for v in (_q["median"], _q["min"], _q["max"]) ),
+        _q["n"],
+        *( "%.4f" % v if v is not None else "n/a"
+           for v in (_l["median"], _l["min"], _l["max"]) ),
+        _l["n"],
+    )
+    return report
 
 def save_native_system(
     output_dir,
@@ -1761,6 +1832,87 @@ def save_native_system(
         json.dump(manifest, handle, indent=2, sort_keys=True)
     log.info("  [缓存] 输入身份 manifest 已保存: %s", manifest_path)
 
+def _select_reserved_coion_water_sites(
+    *,
+    positions_nm: np.ndarray,
+    box_nm: np.ndarray,
+    ligand_atom_indices: Sequence[int],
+    water_oxygen_indices: Sequence[int],
+    count: int,
+) -> List[int]:
+    """挑 `count` 个"离配体最远、彼此也够远"的水分子氧原子，返回它们的 atom index。
+
+    🔑🔑 [2026-09-16] **这是选点规则的唯一实现。** 两条腿共用：
+      · 溶剂腿走 `_insert_reserved_coalchemical_ion_dummies`（Modeller 加删）；
+      · 复合物腿走 `_derive_gromacs_inputs_with_reserved_coions`（改写 .gro/.top）。
+    先前只有溶剂腿有这段逻辑，复合物腿**根本没有插入步骤**，于是带电配体在
+    `co_alchemical_ion_builder_identity_payload` 的数量契约上当场炸（"找到 0 个"）。
+    两侧各写一份选点规则就是本仓最贵的那类 bug，所以这里只留一份。
+
+    放置策略（§4.4 "初始位置远离配体且不与周期镜像过近"）：贪心 farthest-first ——
+    按离配体质心 minimum-image 距离从远到近扫描，跳过与**已选中**点距离不够
+    `COION_COION_MIN_IMAGE_INITIAL_NM` 的候选。
+
+    ⚠️ `count > 1` 时不能只按"离配体最远"独立打分：方盒里"最远的 N 个点"天然挤在
+    同一个远角。2026-08-06 用 Ca²⁺(+2) 实测踩到过——两个 dummy 只相距 0.18~0.43 nm，
+    λ→0 时两者同号各带 +1e，贴脸的静电排斥把 charging MBAR 拖到不收敛
+    （ΔG≈660 kJ/mol，min_overlap<0.02）。
+    """
+    if count <= 0:
+        return []
+    lig_indices = [int(i) for i in ligand_atom_indices]
+    if not lig_indices:
+        raise ValueError("挑 reserved co-ion 位点需要非空 ligand_atom_indices")
+    oxygens = [int(i) for i in water_oxygen_indices]
+    if len(oxygens) < count:
+        raise RuntimeError(
+            f"盒子里只有 {len(oxygens)} 个水分子，不够替换出 {count} 个 "
+            "reserved co-ion dummy（§4.2：盒子必须留够 bulk-water 壳层，"
+            "考虑加大 padding_nm）。"
+        )
+    pos_nm = np.asarray(positions_nm, dtype=np.float64)
+    box_nm = np.asarray(box_nm, dtype=np.float64)
+
+    # A raw arithmetic centroid is wrong when a ligand straddles a periodic
+    # boundary (it can land in the opposite side of the box).  Reconstruct the
+    # centroid in the same local image used by the co-ion geometry checks.
+    lig_origin = pos_nm[lig_indices[0]]
+    lig_offsets = minimum_image_displacement_nm(
+        pos_nm[lig_indices] - lig_origin, box_nm
+    )
+    lig_centroid_nm = lig_origin + lig_offsets.mean(axis=0)
+
+    def _mic_distance_between(p: np.ndarray, q: np.ndarray) -> float:
+        return float(np.linalg.norm(minimum_image_displacement_nm(p - q, box_nm)))
+
+    scored = sorted(
+        ((_mic_distance_between(pos_nm[i], lig_centroid_nm), i) for i in oxygens),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    chosen: List[int] = []
+    chosen_pos: List[np.ndarray] = []
+    for _dist, idx in scored:
+        if len(chosen) == count:
+            break
+        candidate = pos_nm[idx]
+        if all(
+            _mic_distance_between(candidate, p) >= COION_COION_MIN_IMAGE_INITIAL_NM
+            for p in chosen_pos
+        ):
+            chosen.append(idx)
+            chosen_pos.append(candidate.copy())
+    if len(chosen) < count:
+        raise RuntimeError(
+            f"在这个盒子里找不到 {count} 个彼此 minimum-image 距离 ≥ "
+            f"{COION_COION_MIN_IMAGE_INITIAL_NM} nm 的候选水分子来放 reserved "
+            f"co-ion dummy（§2.2：多个 dummy 之间也必须留够安全边距，否则它们在 "
+            "λ→0 同号带电时会彼此靠得太近、产生非物理静电排斥）。只找到 "
+            f"{len(chosen)} 个满足条件的候选，考虑加大 padding_nm/盒子。"
+        )
+    return chosen
+
+
 def _insert_reserved_coalchemical_ion_dummies(
     modeller,
     count: int,
@@ -1809,76 +1961,27 @@ def _insert_reserved_coalchemical_ion_dummies(
     box_nm = np.array(
         [v.value_in_unit(unit.nanometer) for v in box_vecs], dtype=np.float64
     )
-    # A raw arithmetic centroid is wrong when a ligand straddles a periodic
-    # boundary (it can land in the opposite side of the box).  Reconstruct the
-    # centroid in the same local image used by the co-ion geometry checks.
-    lig_indices = [int(i) for i in ligand_atom_indices]
-    if not lig_indices:
-        raise ValueError("插入 reserved co-ion 需要非空 ligand_atom_indices")
-    lig_origin = pos_nm[lig_indices[0]]
-    lig_offsets = minimum_image_displacement_nm(
-        pos_nm[lig_indices] - lig_origin, box_nm
-    )
-    lig_centroid_nm = lig_origin + lig_offsets.mean(axis=0)
-
-    def _mic_delta(p: np.ndarray, q: np.ndarray) -> np.ndarray:
-        return minimum_image_displacement_nm(p - q, box_nm)
-
-    def _mic_distance(p: np.ndarray) -> float:
-        return float(np.linalg.norm(_mic_delta(p, lig_centroid_nm)))
-
-    def _mic_distance_between(p: np.ndarray, q: np.ndarray) -> float:
-        return float(np.linalg.norm(_mic_delta(p, q)))
-
     water_residues = [
         res
         for res in modeller.topology.residues()
         if str(res.name).strip().upper() in WATER_MOLECULE_NAMES
     ]
-    if len(water_residues) < count:
-        raise RuntimeError(
-            f"溶剂盒里只有 {len(water_residues)} 个水分子，不够替换出 {count} 个 "
-            "reserved co-ion dummy（§4.2：盒子必须留够 bulk-water 壳层，"
-            "考虑加大 padding_nm）。"
-        )
-
-    scored = []
+    oxygen_of_residue = {}
     for res in water_residues:
         atoms = list(res.atoms())
         o_atom = next(
             (a for a in atoms if a.element == app.element.oxygen), atoms[0]
         )
-        scored.append((_mic_distance(pos_nm[o_atom.index]), o_atom.index))
-    scored.sort(key=lambda item: item[0], reverse=True)
-
-    # [§2.2/§4.4，2026-08-06] 只按"离配体最远"独立给每个 dummy 打分，在 |q_L|≥2
-    # 时会踩坑：方盒里"离配体质心最远的 N 个点"天然会挤在同一个远角——Ca²⁺(+2)
-    # 实测两个 dummy 只相距 0.18~0.43 nm，λ→0 时两者同号各带 +1e，近乎贴脸的
-    # 静电排斥直接把 charging MBAR 拖到不收敛。这里改成贪心farthest-first选取：
-    # 仍然优先摘离配体最远的水，但跳过与**已选中**的 dummy 距离不够的候选，
-    # 保证任意两个 dummy 之间也留够 `COION_COION_MIN_IMAGE_INITIAL_NM` 的安全边距。
-    chosen_oxygen_indices: List[int] = []
-    chosen_positions_nm: List[np.ndarray] = []
-    for _dist, idx in scored:
-        if len(chosen_oxygen_indices) == count:
-            break
-        candidate_pos = pos_nm[idx]
-        if all(
-            _mic_distance_between(candidate_pos, p) >= COION_COION_MIN_IMAGE_INITIAL_NM
-            for p in chosen_positions_nm
-        ):
-            chosen_oxygen_indices.append(idx)
-            chosen_positions_nm.append(candidate_pos.copy())
-
-    if len(chosen_oxygen_indices) < count:
-        raise RuntimeError(
-            f"在这个盒子里找不到 {count} 个彼此 minimum-image 距离 ≥ "
-            f"{COION_COION_MIN_IMAGE_INITIAL_NM} nm 的候选水分子来放 reserved "
-            f"co-ion dummy（§2.2：多个 dummy 之间也必须留够安全边距，否则它们在 "
-            "λ→0 同号带电时会彼此靠得太近、产生非物理静电排斥）。只找到 "
-            f"{len(chosen_oxygen_indices)} 个满足条件的候选，考虑加大 padding_nm/"
-            "盒子。"
-        )
+        oxygen_of_residue[int(o_atom.index)] = res
+    # 选点规则只有一份实现（复合物腿走同一个函数）。
+    chosen_oxygen_indices = _select_reserved_coion_water_sites(
+        positions_nm=pos_nm,
+        box_nm=box_nm,
+        ligand_atom_indices=ligand_atom_indices,
+        water_oxygen_indices=sorted(oxygen_of_residue),
+        count=count,
+    )
+    chosen_positions_nm = [pos_nm[i].copy() for i in chosen_oxygen_indices]
 
     # 摘掉这些水分子（连同它们的 H）——按 residue 删，不是按单个原子删。
     index_to_residue = {
@@ -1900,6 +2003,400 @@ def _insert_reserved_coalchemical_ion_dummies(
     n_before = sum(1 for _ in modeller.topology.atoms())
     modeller.add(dummy_top, dummy_positions)
     return list(range(n_before, n_before + count))
+
+
+
+def _gro_atom_line(res_seq: int, res_name: str, atom_name: str, atom_seq: int,
+                   xyz_nm) -> str:
+    """一行标准 .gro 原子记录（固定列宽，无速度）。"""
+    return "%5d%-5s%5s%5d%8.3f%8.3f%8.3f" % (
+        int(res_seq) % 100000, str(res_name)[:5], str(atom_name)[:5],
+        int(atom_seq) % 100000,
+        float(xyz_nm[0]), float(xyz_nm[1]), float(xyz_nm[2]),
+    )
+
+
+def _pick_reserved_coion_species(system, topology, *, cation: bool) -> str:
+    """从**这个盒子里已有的**离子里挑一个符号正确的物种名当 reserved dummy 的模板。
+
+    不自己发明 moleculetype：新粒子要能被 .top 展开，就必须是这份 .top 里已经
+    存在的分子类型。所以判据是"盒子里已经有、残基名在 co-ion 集合里、电荷符号对"，
+    找不到就 fail closed —— 造一个 .top 里没有的分子类型只会在解析时炸得更晚更难查。
+    """
+    nb = next(
+        (f for f in system.getForces() if isinstance(f, openmm.NonbondedForce)),
+        None,
+    )
+    if nb is None:
+        raise RuntimeError("挑 reserved co-ion 物种需要 NonbondedForce，但体系里没有")
+    want = 1.0 if cation else -1.0
+    seen = {}
+    for residue in topology.residues():
+        name = str(residue.name).strip().upper()
+        if name not in CO_ALCHEMICAL_ION_RESIDUE_NAMES:
+            continue
+        atoms = list(residue.atoms())
+        if len(atoms) != 1:
+            continue          # 多原子的"离子"不是单价 co-ion，跳过
+        q = float(
+            nb.getParticleParameters(int(atoms[0].index))[0].value_in_unit(
+                unit.elementary_charge
+            )
+        )
+        if q * want > 0.0:
+            seen.setdefault(str(residue.name).strip(), (q, str(atoms[0].name)))
+    if not seen:
+        raise RuntimeError(
+            "复合物盒里没有符号正确的单价离子可以当 reserved co-ion dummy 的模板"
+            f"（需要 {'阳' if cation else '阴'}离子）。charge-transfer 要求在建系时"
+            "预留一个中性 ion-shaped dummy；这份 .top 里连同号离子的 moleculetype "
+            "都没有，无法派生 —— 请在建系阶段加入相应离子（哪怕只有 1 个）。"
+        )
+    # 名字确定性地取字典序最小的一个，避免同一份输入两次派生出不同的 .top。
+    return sorted(seen)[0]
+
+
+def _derive_gromacs_inputs_with_reserved_coions(
+    *,
+    gro_file: str,
+    top_file: str,
+    output_dir: str,
+    system,
+    topology,
+    positions,
+    box_vectors,
+    ligand_indices: Sequence[int],
+    count: int,
+    cation: bool,
+) -> Tuple[str, str, Dict[str, Any]]:
+    """派生一对带 reserved co-ion dummy 的 GROMACS 输入，返回 `(gro, top, 报告)`。
+
+    🔑🔑 [2026-09-16] **复合物腿缺的就是这一步。** 溶剂腿的盒子是本流程自己建的，
+    所以能直接在 `Modeller` 上"摘一个水、加一个 dummy"；复合物腿的体系来自用户的
+    `.gro/.top`，`GromacsTopFile` 的粒子表由 `[ molecules ]` 决定 —— 光改 OpenMM
+    Topology 不会让 System 多出一个粒子。先前这条路径**根本没有插入步骤**，
+    于是带电配体一进 `co_alchemical_ion_builder_identity_payload` 的数量契约就炸
+    （"找到 0 个中性 ion-shaped dummy，但配体净电荷 +1 e 需要 1 个"）。
+
+    做法是**派生一对新输入**（原始文件一个字节都不动），与溶剂腿同一套物理：
+      ① 用**同一个**选点函数挑离配体最远、彼此也够远的水（`_select_reserved_coion_water_sites`）；
+      ② `.gro` 删掉这些水的原子行，在**文件末尾**追加 `count` 个离子原子，
+         坐标就是被摘掉的氧原子原位（零额外体积冲突）；
+      ③ `.top` 的 `[ molecules ]` 里水数减 `count`，末尾追加一行 `<离子> count`。
+    ③ 的"追加在末尾"与 ② 的"追加在末尾"必须同时成立：GROMACS 的原子顺序就是
+    `[ molecules ]` 的展开顺序，两边错位就是静默的参数张冠李戴。重复的分子名在
+    `[ molecules ]` 里是合法的（OpenMM `_processMolecule` 逐行 append），所以不必
+    去动原有那行离子计数、也就不必在文件中间插原子。
+
+    电荷：模板给的是 ±1，调用方必须在建完 System 之后显式清零（§2.2 要求 λ=1 端
+    是"中性但保留 LJ 的 ion-shaped dummy"）。这里不碰电荷。
+    """
+    if count <= 0:
+        raise ValueError("count 必须为正")
+    species = _pick_reserved_coion_species(system, topology, cation=cation)
+    pos_nm = np.asarray(
+        positions.value_in_unit(unit.nanometer)
+        if hasattr(positions, "value_in_unit") else positions,
+        dtype=np.float64,
+    )
+    box_nm = np.asarray(
+        [v.value_in_unit(unit.nanometer) for v in box_vectors]
+        if hasattr(box_vectors[0], "value_in_unit") else box_vectors,
+        dtype=np.float64,
+    )
+
+    water_residues = [
+        res for res in topology.residues()
+        if str(res.name).strip().upper() in WATER_MOLECULE_NAMES
+    ]
+    oxygen_to_residue = {}
+    for res in water_residues:
+        atoms = list(res.atoms())
+        o_atom = next((a for a in atoms if a.element == app.element.oxygen), atoms[0])
+        oxygen_to_residue[int(o_atom.index)] = res
+    chosen_oxygens = _select_reserved_coion_water_sites(
+        positions_nm=pos_nm,
+        box_nm=box_nm,
+        ligand_atom_indices=ligand_indices,
+        water_oxygen_indices=sorted(oxygen_to_residue),
+        count=count,
+    )
+    drop_indices = {
+        int(a.index)
+        for idx in chosen_oxygens
+        for a in oxygen_to_residue[idx].atoms()
+    }
+    water_resname = str(
+        next(iter(oxygen_to_residue[chosen_oxygens[0]].atoms())).residue.name
+    ).strip()
+
+    # ---- .gro ----
+    raw = open(gro_file, encoding="utf-8").read().splitlines()
+    n_declared = int(raw[1].split()[0])
+    atom_lines = raw[2:2 + n_declared]
+    if len(atom_lines) != n_declared:
+        raise RuntimeError(
+            f"{gro_file} 声明 {n_declared} 个原子，实际只有 {len(atom_lines)} 行"
+        )
+    if n_declared != topology.getNumAtoms():
+        raise RuntimeError(
+            f"坐标文件原子数 {n_declared} 与拓扑 {topology.getNumAtoms()} 不一致；"
+            "拒绝在两者对不上的输入上派生 co-ion"
+        )
+    box_line = raw[2 + n_declared]
+    if any(len(line) > 50 for line in atom_lines[:8]):
+        raise RuntimeError(
+            f"{gro_file} 看起来带速度列（行宽 > 50）。派生 co-ion 只支持纯坐标 "
+            ".gro —— 带速度时删/加原子还要同步速度块，不做静默截断。"
+        )
+    kept = [ln for i, ln in enumerate(atom_lines) if i not in drop_indices]
+    max_res_seq = max(
+        (int(ln[:5]) for ln in atom_lines if ln[:5].strip().isdigit()), default=0
+    )
+    new_lines = []
+    for i, ln in enumerate(kept):
+        new_lines.append(ln[:15] + "%5d" % ((i + 1) % 100000) + ln[20:])
+    for k, ox in enumerate(chosen_oxygens):
+        new_lines.append(
+            _gro_atom_line(
+                max_res_seq + 1 + k, species, species.capitalize()[:5],
+                len(new_lines) + 1, pos_nm[ox],
+            )
+        )
+    derived_dir = os.path.join(output_dir, "coion_reserved")
+    os.makedirs(derived_dir, exist_ok=True)
+    out_gro = os.path.join(derived_dir, os.path.basename(gro_file))
+    with open(out_gro, "w", encoding="utf-8") as fh:
+        fh.write(raw[0] + "\n")
+        fh.write("%d\n" % len(new_lines))
+        fh.write("\n".join(new_lines) + "\n")
+        fh.write(box_line + "\n")
+
+    # ---- .top ----
+    top_lines = open(top_file, encoding="utf-8").read().splitlines()
+    mol_start = None
+    for i, ln in enumerate(top_lines):
+        if re.match(r"^\s*\[\s*molecules\s*\]\s*$", ln, flags=re.IGNORECASE):
+            mol_start = i
+            break
+    if mol_start is None:
+        raise RuntimeError(f"{top_file} 里没有 [ molecules ] 段，无法派生 co-ion")
+    mol_end = len(top_lines)
+    for i in range(mol_start + 1, len(top_lines)):
+        if top_lines[i].lstrip().startswith("["):
+            mol_end = i
+            break
+    water_line_idx = None
+    for i in range(mol_start + 1, mol_end):
+        fields = top_lines[i].split(";")[0].split()
+        if len(fields) >= 2 and fields[0].strip().upper() in WATER_MOLECULE_NAMES:
+            water_line_idx = i
+    if water_line_idx is None:
+        raise RuntimeError(
+            f"{top_file} 的 [ molecules ] 里找不到水分子行，无法为 co-ion 腾出名额"
+        )
+    w_fields = top_lines[water_line_idx].split()
+    w_count = int(w_fields[1])
+    if w_count - count < 0:
+        raise RuntimeError(f"水分子只有 {w_count} 个，摘不出 {count} 个")
+    top_lines[water_line_idx] = "%-16s %d" % (w_fields[0], w_count - count)
+    # 末尾追加，而不是去改已有的离子计数行：原子顺序=[molecules]展开顺序，
+    # 追加在末尾正好对上 .gro 里追加在末尾的那些原子。
+    insert_at = mol_end
+    while insert_at > mol_start + 1 and not top_lines[insert_at - 1].strip():
+        insert_at -= 1
+    top_lines.insert(
+        insert_at,
+        "%-16s %d                ; [2026-09-16] reserved co-alchemical ion dummy"
+        % (species, count),
+    )
+    out_top = os.path.join(derived_dir, os.path.basename(top_file))
+    with open(out_top, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(top_lines) + "\n")
+
+    report = {
+        "species": species,
+        "count": int(count),
+        "cation": bool(cation),
+        "water_residue_name": water_resname,
+        "removed_water_oxygen_indices": [int(i) for i in chosen_oxygens],
+        "removed_atom_count": len(drop_indices),
+        "n_atoms_before": int(n_declared),
+        "n_atoms_after": len(new_lines),
+        "source_gro": os.path.abspath(gro_file),
+        "source_top": os.path.abspath(top_file),
+        "derived_gro": os.path.abspath(out_gro),
+        "derived_top": os.path.abspath(out_top),
+    }
+    with open(os.path.join(derived_dir, "coion_reserved.json"), "w",
+              encoding="utf-8") as fh:
+        json.dump(report, fh, indent=2, sort_keys=True)
+    return out_gro, out_top, report
+
+
+def _count_reserved_neutral_coion_candidates(system, topology) -> int:
+    """按**数量契约同一把尺子**数一数现成的中性 ion-shaped dummy 有几个。
+
+    判据与 `abfe_core.co_alchemical_ion_builder_identity_payload` /
+    `ibs_engine._identify_reserved_neutral_co_ions` 完全一致（残基名在离子集合里
+    且电荷严格为 0），所以"这里数出 N 个"等价于"那道契约会看到 N 个"。
+    """
+    nb = next(
+        (f for f in system.getForces() if isinstance(f, openmm.NonbondedForce)),
+        None,
+    )
+    if nb is None:
+        return 0
+    n = 0
+    for atom in topology.atoms():
+        if str(atom.residue.name).strip().upper() not in CO_ALCHEMICAL_ION_RESIDUE_NAMES:
+            continue
+        q = float(
+            nb.getParticleParameters(int(atom.index))[0].value_in_unit(
+                unit.elementary_charge
+            )
+        )
+        if abs(q) <= TOTAL_CHARGE_CONSERVATION_TOLERANCE_E:
+            n += 1
+    return n
+
+
+def _total_system_charge_e(system) -> float:
+    nb = next(
+        (f for f in system.getForces() if isinstance(f, openmm.NonbondedForce)),
+        None,
+    )
+    if nb is None:
+        raise RuntimeError("体系里没有 NonbondedForce，算不出总电荷")
+    return float(
+        sum(
+            nb.getParticleParameters(i)[0].value_in_unit(unit.elementary_charge)
+            for i in range(nb.getNumParticles())
+        )
+    )
+
+
+def _ensure_complex_reserved_coions(
+    *,
+    system,
+    topology,
+    positions,
+    box_vectors,
+    ligand_indices,
+    gro_file: str,
+    top_file: str,
+    ligand_resname: str,
+    gmx_include_dir: Optional[str],
+    output_dir: str,
+    ligand_net_charge_e: int,
+):
+    """让**复合物腿**也走完 reserved co-ion 的构建，返回重建后的五元组 + 报告。
+
+    🔑🔑 [2026-09-16] 先前这条路径直接进数量契约校验，而**没有任何插入步骤** ——
+    溶剂腿（`build_and_cache_solvent_leg`）早就有插入 + 清零，复合物腿没有。
+    带电配体（thrombin_ligand1，+1 e）因此三个 repeat 都停在同一句
+    "找到 0 个中性 ion-shaped dummy，但配体净电荷 +1 e 需要 1 个"。
+
+    三条分支，都不静默：
+      · 已经有正好 |q_L| 个 ⟹ **一个字节都不动**（手工预留 dummy 的输入照旧）；
+      · 一个都没有 ⟹ 派生一对新 `.gro/.top`、重建、清零、逐项复核；
+      · 数量对不上（既不是 0 也不是 |q_L|）⟹ fail closed，不猜哪个才是 dummy。
+
+    复核项（这一步不做，后面炸的地方离原因就很远了）：
+      总电荷守恒 / 配体净电荷不变 / 粒子数账目 / dummy 电荷严格为 0 /
+      坐标与拓扑等长。
+    """
+    need = abs(int(ligand_net_charge_e))
+    have = _count_reserved_neutral_coion_candidates(system, topology)
+    if have == need:
+        return system, topology, positions, box_vectors, ligand_indices, None
+    if have != 0:
+        raise RuntimeError(
+            f"复合物体系里已经有 {have} 个中性 ion-shaped dummy，但配体净电荷 "
+            f"{ligand_net_charge_e:+d} e 需要 {need} 个。既不是「全都要派生」"
+            "也不是「已经齐了」，拒绝猜测哪几个才是 reserved dummy —— 请修输入。"
+        )
+
+    q_total_before = _total_system_charge_e(system)
+    q_lig_before = float(_compute_ligand_net_charge(system, ligand_indices))
+    n_before = system.getNumParticles()
+    log.info(
+        "  配体净电荷 %+d e：复合物腿缺 %d 个 reserved co-ion dummy，"
+        "派生带 dummy 的 GROMACS 输入（原始输入只读）",
+        ligand_net_charge_e, need,
+    )
+    derived_gro, derived_top, report = _derive_gromacs_inputs_with_reserved_coions(
+        gro_file=gro_file,
+        top_file=top_file,
+        output_dir=output_dir,
+        system=system,
+        topology=topology,
+        positions=positions,
+        box_vectors=box_vectors,
+        ligand_indices=ligand_indices,
+        count=need,
+        cation=ligand_net_charge_e > 0,
+    )
+    system, topology, positions, box_vectors, ligand_indices = (
+        build_system_from_gromacs(
+            derived_gro, derived_top, ligand_resname, gmx_include_dir
+        )
+    )
+    # 派生出来的离子带模板电荷 ±1；§2.2 要求 λ=1 端是"中性但保留 LJ"，显式清零。
+    # 它们是 `[ molecules ]` 末尾追加的那几个 ⟹ 就是粒子表最后 need 个。
+    nb = next(f for f in system.getForces() if isinstance(f, openmm.NonbondedForce))
+    dummy_indices = list(range(system.getNumParticles() - need,
+                               system.getNumParticles()))
+    atoms = list(topology.atoms())
+    for idx in dummy_indices:
+        name = str(atoms[idx].residue.name).strip().upper()
+        if name not in CO_ALCHEMICAL_ION_RESIDUE_NAMES:
+            raise RuntimeError(
+                f"派生后粒子 {idx} 的残基名是 {name!r}，不在 co-ion 集合里 —— "
+                "说明 `.gro` 的原子顺序与 `[ molecules ]` 展开顺序对不上，"
+                "这会静默把参数张冠李戴，拒绝继续。"
+            )
+        _, sigma, epsilon = nb.getParticleParameters(idx)
+        nb.setParticleParameters(idx, 0.0 * unit.elementary_charge, sigma, epsilon)
+
+    # ---- 逐项复核 ----
+    q_total_after = _total_system_charge_e(system)
+    if abs(q_total_after - q_total_before) > TOTAL_CHARGE_CONSERVATION_TOLERANCE_E:
+        raise RuntimeError(
+            f"派生 reserved co-ion 后总电荷从 {q_total_before:+.6f} e 变成 "
+            f"{q_total_after:+.6f} e。dummy 在 λ=1 端电荷为 0，本该逐位守恒。"
+        )
+    q_lig_after = float(_compute_ligand_net_charge(system, ligand_indices))
+    if abs(q_lig_after - q_lig_before) > LIGAND_NET_CHARGE_INTEGER_TOLERANCE_E:
+        raise RuntimeError(
+            f"派生后配体净电荷从 {q_lig_before:+.6f} e 变成 {q_lig_after:+.6f} e"
+        )
+    n_expected = n_before - report["removed_atom_count"] + need
+    if system.getNumParticles() != n_expected:
+        raise RuntimeError(
+            f"派生后粒子数 {system.getNumParticles()} != 预期 {n_expected}"
+            f"（原 {n_before} − 摘掉 {report['removed_atom_count']} + {need}）"
+        )
+    if len(positions) != system.getNumParticles():
+        raise RuntimeError(
+            f"派生后坐标数 {len(positions)} 与粒子数 "
+            f"{system.getNumParticles()} 不一致"
+        )
+    have_after = _count_reserved_neutral_coion_candidates(system, topology)
+    if have_after != need:
+        raise RuntimeError(
+            f"派生后中性 ion-shaped dummy 数为 {have_after}，期望 {need}"
+        )
+    report = dict(report, reserved_coion_indices=[int(i) for i in dummy_indices],
+                  total_charge_e=q_total_after,
+                  ligand_net_charge_e=int(round(q_lig_after)))
+    log.info(
+        "  [OK] 复合物腿 reserved co-ion 已就位：%d 个 %s 形 dummy（index=%s），"
+        "摘掉 %d 个水原子，总电荷 %+.6f e 守恒",
+        need, report["species"], dummy_indices, report["removed_atom_count"],
+        q_total_after,
+    )
+    return system, topology, positions, box_vectors, ligand_indices, report
 
 
 # ================= runabfe.py =================
@@ -6394,6 +6891,105 @@ def _refit_outer_lambda_residual_for_this_ligand(
     return manifest_path
 
 
+_LEG_STATUS_KEYS = (
+    "results_untrusted",
+    "results_untrusted_stages",
+    "precision_status",
+    "stage_quality_failures",
+    "publishable_as_accepted_result",
+    "publishable_rejection_reason",
+)
+
+
+def _leg_sampling_drift(leg_results) -> Dict[str, Any]:
+    """这条腿 stage-2 的半程漂移与**未采用**的 σ 下界，压成一小块摘要。
+
+    两个量都只是把 `stage_diagnostics.stage2` 里已经算好的数搬出来，不重算、
+    不改判：`sigma_inflation_applied` 原样带出，默认仍是 `False`（P1-19 的决定 ——
+    要不要采用这个下界是使用者的事）。搬出来的唯一理由是**汇总文件里看得见**。
+    """
+    s2 = ((leg_results or {}).get("stage_diagnostics") or {}).get("stage2") or {}
+    drift = s2.get("split_half_diagnostics") or {}
+    infl = s2.get("sigma_inflation_from_split_half") or {}
+    if not drift.get("available") and not infl.get("available"):
+        return {"available": False}
+    return {
+        "available": True,
+        "total_drift_kJ_mol": drift.get("total_drift_kJ_mol"),
+        "total_drift_over_2sigma": drift.get("total_drift_over_2sigma"),
+        "max_window_drift_over_2sigma": drift.get("max_window_drift_over_2sigma"),
+        "total_error_mbar_kJ_mol": infl.get("total_error_mbar_kJ_mol"),
+        "total_error_inflated_kJ_mol": infl.get("total_error_inflated_kJ_mol"),
+        "sigma_inflation_applied": bool(s2.get("sigma_inflation_applied")),
+        "note": (
+            "报出的 ± 是 MBAR 内部标准误差。总漂移与逐窗漂移都超过 2σ 时它低估了"
+            "实际抽样波动；`total_error_inflated_kJ_mol` 是按 σ≥|逐窗漂移|/2 定下界"
+            "的结果，**默认未采用**（`sigma_inflation_applied`），要采用见 "
+            "`inflate_sigma_from_split_half`。⚠️ 逐窗漂移大而总量稳 ⟹ 多半是窗口间"
+            "归属重排，那个下界会高估。"
+        ),
+    }
+
+
+def _binding_result_status(complex_results, solv_results) -> Dict[str, Any]:
+    """把两条腿的**质量状态**并成一块，跟着 ΔG_bind 一起落盘。
+
+    🔑🔑 [2026-09-16] 先前这四个键只写在**逐腿**的 `final_results.json` 里：
+    `abfe_pipeline` 判门失败会写 `results_untrusted=True` + `stage_quality_failures`
+    并**刻意不 raise**（为了拿到溶剂腿），但 `final_binding_results.json` 一个都没带，
+    收尾又无条件打印「计算完成」⟹ 只读最终 ΔG / ± / 时间戳的汇总看不见任何异常。
+    三个真机 run（brd4_ligand2 rep1/rep3、cyclod_ligand2 rep2）全部
+    `results_untrusted=true`，而汇总里读不出来。
+
+    这里**不改判**任何一条腿的结论，只是如实合并：
+      · `results_untrusted`  —— 任一腿不可信 ⟹ 合成结果不可信（或运算）
+      · `publishable_as_accepted_result` —— 两腿都可发布才可发布（与运算）
+      · `precision_status`   —— 有任何一腿 `UNMEASURED` ⟹ 合成也是"没测"
+    """
+    legs = {"complex": complex_results or {}, "solvent": solv_results or {}}
+    per_leg = {
+        name: {k: leg.get(k) for k in _LEG_STATUS_KEYS if k in leg}
+        for name, leg in legs.items()
+    }
+    for name, leg in legs.items():
+        per_leg[name]["sampling_drift"] = _leg_sampling_drift(leg)
+    untrusted = [n for n, leg in legs.items() if bool(leg.get("results_untrusted"))]
+    # 缺键 = 这条腿没表态。**不当成通过**：`publishable` 只在两腿都显式 True 时为 True。
+    publishable = all(
+        legs[n].get("publishable_as_accepted_result") is True for n in legs
+    )
+    _prec = [str(legs[n].get("precision_status") or "UNMEASURED") for n in legs]
+    precision = "UNMEASURED" if "UNMEASURED" in _prec else (
+        _prec[0] if len(set(_prec)) == 1 else "MIXED:" + "/".join(_prec)
+    )
+    failures = [
+        dict(f, leg=n) for n in legs
+        for f in (legs[n].get("stage_quality_failures") or [])
+        if isinstance(f, dict)
+    ]
+    return {
+        "results_untrusted": bool(untrusted),
+        "results_untrusted_legs": untrusted,
+        "precision_status": precision,
+        "publishable_as_accepted_result": bool(publishable),
+        "publishable_rejection_reason": (
+            None if publishable else "；".join(
+                filter(None, [
+                    (f"{n} 腿：{legs[n].get('publishable_rejection_reason')}"
+                     if legs[n].get("publishable_rejection_reason") else None)
+                    for n in legs
+                ])
+            ) or "至少一条腿没有显式声明 publishable_as_accepted_result=True"
+        ),
+        "stage_quality_failures": failures,
+        "per_leg": per_leg,
+        "note": (
+            "本块是两条腿自报状态的合并，不改判任何一条腿的结论。"
+            "`results_untrusted=true` 的 ΔG_bind **不得**作为可发布结果引用。"
+        ),
+    }
+
+
 def main():
     _diagnostic_exit = dispatch_diagnostic_command(sys.argv[1:])
     if _diagnostic_exit is not None:
@@ -6672,12 +7268,42 @@ def main():
                 "neutral" if _rounded_ligand_charge == 0
                 else CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER
             )
+        # 🔑🔑 [2026-09-16] **先把 reserved co-ion 建出来，再进数量契约校验。**
+        # 契约（`co_alchemical_ion_builder_identity_payload`）要求盒子里已经有
+        # |q_L| 个中性 ion-shaped dummy；溶剂腿有插入步骤，复合物腿先前没有，
+        # 于是带电配体在这里当场炸。两侧现在走同一套选点规则与同样的复核。
+        _coion_derivation = None
+        if (
+            _resolved_builder_treatment
+            == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER
+            and _rounded_ligand_charge != 0
+        ):
+            (
+                system, topology, positions, box_vectors, ligand_indices,
+                _coion_derivation,
+            ) = _ensure_complex_reserved_coions(
+                system=system,
+                topology=topology,
+                positions=positions,
+                box_vectors=box_vectors,
+                ligand_indices=ligand_indices,
+                gro_file=config.gro,
+                top_file=_top_for_openmm,
+                ligand_resname=config.ligand,
+                gmx_include_dir=include_dir,
+                output_dir=output_dir,
+                ligand_net_charge_e=_rounded_ligand_charge,
+            )
         _builder_identity = co_alchemical_ion_builder_identity_payload(
             system=system,
             topology=topology,
             charge_treatment=_resolved_builder_treatment,
             ligand_net_charge_e=_rounded_ligand_charge,
         )
+        if _coion_derivation is not None:
+            _builder_identity = dict(
+                _builder_identity, complex_coion_derivation=_coion_derivation
+            )
         # 立即保存为原生缓存
         save_native_system(
             output_dir,
@@ -7415,6 +8041,16 @@ def main():
         ),
         stage2_window_min_states=config.get("stage2_window_min_states"),
         stage2_window_max_states=config.get("stage2_window_max_states"),
+        # 🔑🔑 [2026-09-15] Stage-2 控制器的两道生产预算闸。读侧（pipeline 组装
+        # `effective_config` → `Stage2RepairController`）早就有了，**上游一直没接**
+        # ⟹ 两条腿都退回读侧默认（预算"未知"=不拦、每块 250k），配置/预设/CLI
+        # 里设的值一个都没生效。两个键都是执行策略、不进缓存身份
+        # （见 abfe_pipeline._NON_IDENTITY_KWARGS），所以可以无条件透传：
+        # 没配就是 None，pipeline 侧按"缺键=未知"过滤掉，行为逐字不变。
+        stage2_production_budget_steps=config.get("stage2_production_budget_steps"),
+        stage2_max_production_blocks_per_window=config.get(
+            "stage2_max_production_blocks_per_window"
+        ),
         **_path_evolution_kwargs(config),
         stage2_free_energy_densify_points=config.get(
             "stage2_free_energy_densify_points"
@@ -7650,6 +8286,16 @@ def main():
         ),
         stage2_window_min_states=config.get("stage2_window_min_states"),
         stage2_window_max_states=config.get("stage2_window_max_states"),
+        # 🔑🔑 [2026-09-15] Stage-2 控制器的两道生产预算闸。读侧（pipeline 组装
+        # `effective_config` → `Stage2RepairController`）早就有了，**上游一直没接**
+        # ⟹ 两条腿都退回读侧默认（预算"未知"=不拦、每块 250k），配置/预设/CLI
+        # 里设的值一个都没生效。两个键都是执行策略、不进缓存身份
+        # （见 abfe_pipeline._NON_IDENTITY_KWARGS），所以可以无条件透传：
+        # 没配就是 None，pipeline 侧按"缺键=未知"过滤掉，行为逐字不变。
+        stage2_production_budget_steps=config.get("stage2_production_budget_steps"),
+        stage2_max_production_blocks_per_window=config.get(
+            "stage2_max_production_blocks_per_window"
+        ),
         **_path_evolution_kwargs(config),
         stage2_free_energy_densify_points=config.get(
             "stage2_free_energy_densify_points"
@@ -7837,10 +8483,39 @@ def main():
     log.info("   --------------------------------------------------------")
     log.info("   结合自由能 ΔG_bind           = %.2f ± %.2f kJ/mol", delta_g_bind, total_err_bind)
     log.info("                              = %.2f ± %.2f kcal/mol", delta_g_bind/4.184, total_err_bind/4.184)
+    _result_status = _binding_result_status(complex_results, solv_results)
+    if _result_status["results_untrusted"]:
+        log.error(
+            "   [结果不可信] %s 腿的质量门未通过（results_untrusted=true）⟹ 上面这个 "
+            "ΔG_bind **不得**作为可发布结果引用。逐条证据见 final_binding_results.json "
+            "的 result_status.stage_quality_failures。",
+            "/".join(_result_status["results_untrusted_legs"]),
+        )
+    for _leg_name, _leg_status in _result_status["per_leg"].items():
+        _d = _leg_status.get("sampling_drift") or {}
+        _z = _d.get("total_drift_over_2sigma")
+        if _d.get("available") and _z is not None and float(_z) > 1.0:
+            log.warning(
+                "   [半程漂移] %s 腿 stage-2 总漂移 %.2f kJ/mol = %.2f×2σ，"
+                "逐窗最大 %.2f×2σ；报出的 ± 是 MBAR 内部误差（σ=%.2f kJ/mol），"
+                "按逐窗漂移定下界会是 %.2f kJ/mol（默认未采用）。",
+                _leg_name, float(_d.get("total_drift_kJ_mol") or 0.0), float(_z),
+                float(_d.get("max_window_drift_over_2sigma") or 0.0),
+                float(_d.get("total_error_mbar_kJ_mol") or 0.0),
+                float(_d.get("total_error_inflated_kJ_mol") or 0.0),
+            )
     log.info("="*70)
-    
+
     # 保存最终结合结果
     final_bind_result = {
+        # 🔑 [2026-09-16] 质量状态与 ΔG 同级落盘：先前这四个键只在逐腿
+        # `final_results.json` 里，汇总文件一个都没带（见 `_binding_result_status`）。
+        "result_status": _result_status,
+        "results_untrusted": _result_status["results_untrusted"],
+        "precision_status": _result_status["precision_status"],
+        "publishable_as_accepted_result": _result_status[
+            "publishable_as_accepted_result"],
+        "stage_quality_failures": _result_status["stage_quality_failures"],
         "complex_delta_G_kJ_mol": float(dg_complex),
         "solvent_delta_G_kJ_mol": float(dg_solvent),
         "boresch_correction_kJ_mol": float(dg_boresch),
@@ -7944,7 +8619,22 @@ def main():
     log.info("最终结合自由能结果已保存: %s", bind_out_path)
 
     # ----- 7. 输出最终结果 -----
-    log.info("[OK] ABFE 计算完成")
+    # 🔑 [2026-09-16] 收尾这行**不再无条件报 OK**：质量门失败时流程是刻意不中止的
+    # （为了拿到溶剂腿），于是"跑完了"和"结果能用"是两件事，收尾必须分开说。
+    if _result_status["results_untrusted"]:
+        log.error(
+            "[不可信] ABFE 流程已跑完，但结果被标记 results_untrusted=true"
+            "（%s 腿质量门未通过）⟹ 不得作为可发布结果引用。",
+            "/".join(_result_status["results_untrusted_legs"]),
+        )
+    elif not _result_status["publishable_as_accepted_result"]:
+        log.warning(
+            "[完成但未验收] ABFE 流程已跑完；precision_status=%s ⟹ %s",
+            _result_status["precision_status"],
+            _result_status["publishable_rejection_reason"],
+        )
+    else:
+        log.info("[OK] ABFE 计算完成")
     log.info("结果已生成，见 %s", bind_out_path)
 
 
