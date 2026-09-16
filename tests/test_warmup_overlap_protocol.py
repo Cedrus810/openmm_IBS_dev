@@ -639,7 +639,8 @@ def test_tmbar_recovers_equal_free_energy_of_equal_width_wells():
     f_new, res = result
     assert f_new == pytest.approx(0.0, abs=0.5)
     assert np.mean(f_new) == pytest.approx(0.0, abs=1.0e-9)  # mean-centered
-    assert "converged" in res
+    # 🔑 [2026-09-15] `converged` 已删键（不是改义），求解器改报 `analysis_status`。
+    assert "analysis_status" in res
 
 
 def test_tmbar_returns_none_before_enough_batches_appended():

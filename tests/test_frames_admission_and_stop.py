@@ -129,8 +129,10 @@ def test_the_gate_lives_in_plan_not_scattered_across_branches():
     src = (pathlib.Path(__file__).resolve().parents[1]
            / "abfe_preoptimizer.py").read_text("utf-8")
     tree = ast.parse(src)
+# 🔑 [2026-09] `decide()` 现在只是 23 行的外壳（"退役一个窗口再判一次"），判断体是 `_decide_once`（1831 行）。
+# 源码探针指着 `decide` 会一无所获 —— 断言"存在"的当场红，断言"不存在"的**静默变成假绿**。
     fn = next(n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef) and n.name == "decide")
+              if isinstance(n, ast.FunctionDef) and n.name == "_decide_once")
     calls = [n.lineno for n in ast.walk(fn)
              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
              and n.func.id == "_frames_admission"]
@@ -143,6 +145,23 @@ def test_the_gate_lives_in_plan_not_scattered_across_branches():
     )
 
 
+def _exit_choices(node):
+    """这个表达式**可能取到的出口字面量**（只下钻分支，不进条件）。"""
+    import ast
+    if node is None:
+        return set()
+    if isinstance(node, ast.Constant):
+        return {node.value} if isinstance(node.value, str) else set()
+    if isinstance(node, ast.IfExp):
+        return _exit_choices(node.body) | _exit_choices(node.orelse)
+    if isinstance(node, ast.BoolOp):
+        out = set()
+        for v in node.values:
+            out |= _exit_choices(v)
+        return out
+    return set()
+
+
 def test_no_exit_contradicts_its_action():
     """`action=DONE` 配非 DONE 出口 ⟹ `execution_status` 会算成 COMPLETE。
 
@@ -153,8 +172,13 @@ def test_no_exit_contradicts_its_action():
 
     src = (pathlib.Path(__file__).resolve().parents[1]
            / "abfe_preoptimizer.py").read_text("utf-8")
+# 🔑 [2026-09] `decide()` 现在只是 23 行的外壳（"退役一个窗口再判一次"），判断体是 `_decide_once`（1831 行）。
+# 源码探针指着 `decide` 会一无所获 —— 断言"存在"的当场红，断言"不存在"的**静默变成假绿**。
+    from abfe_preoptimizer import Stage2RepairController
+    _TERMINALS = set(Stage2RepairController.TERMINAL_EXITS)
+
     fn = next(n for n in ast.walk(ast.parse(src))
-              if isinstance(n, ast.FunctionDef) and n.name == "decide")
+              if isinstance(n, ast.FunctionDef) and n.name == "_decide_once")
     bad = []
     for n in ast.walk(fn):
         if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
@@ -163,10 +187,28 @@ def test_no_exit_contradicts_its_action():
         if not isinstance(n.args[0], ast.Constant):
             continue
         act = n.args[0].value
-        ex = next((ast.unparse(k.value) for k in n.keywords if k.arg == "exit_"), None)
+        _exnode = next((k.value for k in n.keywords if k.arg == "exit_"), None)
+        ex = ast.unparse(_exnode) if _exnode is not None else None
+        # 出口常写成条件表达式（`"A" if cond else "B"`）—— 两支都得判，
+        # 否则一个分支的出口可以悄悄失配。
+        # ⚠️ 不能用 `ast.walk` 无差别收：那会把**条件里**的字符串
+        # （`'预算已用尽' in str(feas.get('insert_lambda'))`）也当成出口，
+        # 于是守卫炸在一个根本不是出口的词上。只沿条件表达式/布尔运算的各支下钻。
+        _ex_lits = _exit_choices(_exnode)
         if act == "DONE" and ex and "DONE" not in ex:
             bad.append((n.lineno, act, ex))
-        if act == "NO_ACTION" and ex and not any(
-                t in ex for t in ("NO_FEASIBLE_ACTION", "GLOBAL_BUDGET_EXHAUSTED")):
-            bad.append((n.lineno, act, ex))
+        # 🔑 [2026-09-16] 原来这里写死 `("NO_FEASIBLE_ACTION", "GLOBAL_BUDGET_EXHAUSTED")`
+        # 两个词 —— 那是**第二份终态清单**，正是本仓最贵的复发模式。真终态只有
+        # 一份权威：`Stage2RepairController.TERMINAL_EXITS`（09-16 实测 9 个）。
+        # 写死清单的后果已经发生过：09-15 新增的合法终态
+        # `ANALYSIS_COMPLETE_PRECISION_UNMEASURED` 会被这条守卫判成"自相矛盾"。
+        # 规则本身没变：`NO_ACTION` 只许配**终态**，且不许配 DONE 系（无路可走
+        # 不是完成）。
+        if act == "NO_ACTION" and _ex_lits:
+            _offenders = sorted(
+                x for x in _ex_lits
+                if x not in _TERMINALS or x in ("DONE", "DONE_UNTRUSTED")
+            )
+            if _offenders:
+                bad.append((n.lineno, act, _offenders))
     assert not bad, f"动作与出口自相矛盾：{bad}"

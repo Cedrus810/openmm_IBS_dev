@@ -40,7 +40,15 @@ def _with_rewindow(tmp_path, *, child_states, skipped=(), solver_decorr=None):
         tmp_path,
         windows={i: {"K": 4} for i in range(4)},
         ranges=R4, n_states=13,
-        stage_result={"converged": False,
+        # 🔑 [2026-09-15] `converged` 已删键。写老键的 stage_result **根本不会被
+        # `_read_stage_result()` 认成一份 stage 结果**（嗅探键是 `analysis_status` /
+        # `total_delta_G`）⟹ 整个 view 里没有求解器证据 ⟹ 下面那些
+        # `solver_*` 字段全是 None，子窗完成度只好退回读自检产物的帧数，
+        # 于是"哪个子窗没完成"整个判反。
+        stage_result={"analysis_status": "ANALYSIS_INCOMPLETE",
+                      "analysis_incomplete_reasons": [
+                          "存在被跳过的窗口；缺窗口的总和是部分和，不是完整 ΔG。"],
+                      "total_delta_G": -12.3, "total_error": 0.9,
                       # 最终门：`min_decorrelated_samples`（20），**不是**入场下限 10
                       "min_decorrelated_samples_threshold": 20,
                       "window_overlap_diagnostics": [

@@ -23,7 +23,10 @@
 | 定位常见错误 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) |
 | 迁移到新蛋白–配体体系 | [MIGRATING_TO_A_NEW_SYSTEM.md](MIGRATING_TO_A_NEW_SYSTEM.md) |
 | 修改源码、运行最低验证 | [MAINTAINING.md](MAINTAINING.md) |
-| **查看未完成工作（唯一待办清单）** | [TODO.md](TODO.md) —— 已关闭条目整段进 `archive/`，本文不留 `[x]` 尸体 |
+| **今天有什么挡路的**（P1） | [TODO.md](TODO.md) —— 2026-09-16 按**优先级**拆成四份，这是唯一入口；优先级写在编号后：`grep -rn '[P1]' docs/` |
+| P2 —— 该做但不挡路（重构立项 / 待拍板 / EXP-033 / 发布工程门） | [TODO_P2.md](TODO_P2.md) |
+| P3 —— **现在明确不做**（判定不改 / 不是 bug / 暂停 / 押后）—— 想重新论证某条前先查这里 | [TODO_P3.md](TODO_P3.md) |
+| TODO 里那些实测表与重放证据（已关闭条目的取证） | [archive/TODO_evidence_2026-09-16.md](archive/TODO_evidence_2026-09-16.md) |
 | 判断能不能发布、还缺什么 | [RELEASE_READINESS_2026-08-31.md](RELEASE_READINESS_2026-08-31.md) |
 | 不确定度口径 | [PYMBAR_UNCERTAINTY_PROTOCOL.md](PYMBAR_UNCERTAINTY_PROTOCOL.md) |
 | 查某份历史材料写过什么 | [HISTORY_LOG.md](HISTORY_LOG.md) |
@@ -31,7 +34,7 @@
 | stage2 溶剂腿那 5.5σ 去哪了（**已关闭 2026-09-10**：参照臂的盒错了） | [STAGE2_SOLVENT_LEG_ERROR_BUDGET.md](STAGE2_SOLVENT_LEG_ERROR_BUDGET.md) |
 | 查 stage2 的失效机制（仍是活的参考） | [STAGE2_ROOT_CAUSE_2026-08-28.md](STAGE2_ROOT_CAUSE_2026-08-28.md) |
 | 重新设计 stage2 控制流前先读（分窗口/分 λ/分采样量 三轴当前怎么耦合的） | [STAGE2_THREE_AXES_COUPLING_2026-09-11.md](STAGE2_THREE_AXES_COUPLING_2026-09-11.md) |
-| 路径最小修补：Type I/II/III + 修补顺序（**部分已实现**，代码里 10 余处引它作设计依据；缺口见 TODO §1） | [PLAN_PATH_REPAIR_2026-09-11.md](PLAN_PATH_REPAIR_2026-09-11.md) |
+| 路径最小修补：Type I/II/III + 修补顺序（**部分已实现**，代码里 10 余处引它作设计依据；缺口见 [TODO.md](TODO.md) §1） | [PLAN_PATH_REPAIR_2026-09-11.md](PLAN_PATH_REPAIR_2026-09-11.md) |
 | 🔴 **stage2 控制器 + 预算：63+2 条缺陷的全面审计与修复状态**（**改控制器/预算前先读这份**；含三条贯穿性根因、逐条状态列、两条「别再犯」的规矩：#18「零调用点 ≠ 忘了接」、#65「改名/改值不通知消费者」） | [CONTROLLER_BUDGET_AUDIT_2026-09-14.md](CONTROLLER_BUDGET_AUDIT_2026-09-14.md) |
 | 🔑 **stage2 自治控制器：设计 + 实证 + 陷阱清单**（**接手先读这份**；含首次跑通的实证与 10 条真机咬过的坑） | [STAGE2_CONTROLLER_DESIGN_2026-09-12.md](STAGE2_CONTROLLER_DESIGN_2026-09-12.md) |
 | **stage2 自治控制器：设计 + 实证 + 十条真机陷阱 + 交接**（碰 stage2 先读这份，**别重推**；含代码位置图、当前状态与复现、8 条别重新论证的事、给下一个人的规矩） | [STAGE2_CONTROLLER_DESIGN_2026-09-12.md](STAGE2_CONTROLLER_DESIGN_2026-09-12.md) |
@@ -39,7 +42,7 @@
 | stage2 自治循环逐个 bug 的修复流水账（历史，不是待办） | [STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md](STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md) |
 | stage2 自治闭环的**验收指标**（老板定案，唯一指标） | [AUTONOMOUS_STAGE2_LOOP_SPEC_2026-09-11.md](AUTONOMOUS_STAGE2_LOOP_SPEC_2026-09-11.md) |
 | stage2 分窗与多采样段：09-10/11 那八个 bug 改了什么（**已全部落地，09-12 归档**；仍是这几处当前行为的唯一出处） | [archive/STAGE2_WINDOW_AND_SEGMENT_REDESIGN_2026-09-11.md](archive/STAGE2_WINDOW_AND_SEGMENT_REDESIGN_2026-09-11.md) |
-| 2026-09-09 全仓审计原始记录（**不是待办**，09-12 归档；7 条不修已进 TODO §4，52 处待 GPU 复验进 TODO §3） | [archive/AUDIT_2026-09-09_full_repo.md](archive/AUDIT_2026-09-09_full_repo.md) |
+| 2026-09-09 全仓审计原始记录（**不是待办**，09-12 归档；7 条不修已进 [TODO_P3.md](TODO_P3.md) §1，52 处待 GPU 复验进 [TODO_P2.md](TODO_P2.md) `REL-04`） | [archive/AUDIT_2026-09-09_full_repo.md](archive/AUDIT_2026-09-09_full_repo.md) |
 | 给新配体重训 local-residual R1 权重（操作手册） | [RETRAIN_LOCAL_RESIDUAL.md](RETRAIN_LOCAL_RESIDUAL.md) |
 | local-residual 换体系**别再踩的坑**（接线部分已被 EXP-033 P1 取代，09-12 归档；§6 仍全部有效） | [archive/HANDOFF_LOCAL_RESIDUAL_2026-09-11.md](archive/HANDOFF_LOCAL_RESIDUAL_2026-09-11.md) |
 | 查 λ-WCA 壳为什么退役（已结案，历史） | [archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md](archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md) |
@@ -89,6 +92,16 @@
     | `HANDOFF_LOCAL_RESIDUAL_2026-09-11.md` | 接线部分被 EXP-033 P1 取代 | §6《别再踩的坑》全部有效；§4 的 3 条未修已进 TODO `LR-02`~`LR-04` |
     | `EXP-031_GPU_OPTIMIZATION_2026-09-04.md` | 三条结论有两条被 09-09 那份推翻 | 仅追溯用 |
 
+  - **2026-09-16 归档的四份**——主题都已结案或已被测试钉住，每份页首有归档告示。
+    前两份原来躺在**仓库根目录**（根目录只留三份 README 加 `PROJECT_LAYOUT.md`）：
+
+    | 文件 | 为什么归档 | 仍然有效的部分 |
+    |---|---|---|
+    | `改进计划_2026-09-14.md` | 09-14 一次性只读审视，未做项已归 `TODO.md` | §6 撤回的 7 条（口径追溯） |
+    | `采样问题_2026-09-15.md` | 那条链的落点已被 `tests/test_epoch_unaffordable_does_not_degrade_skew_2026_09_15.py` 钉住 | §5.1 的实测数字 |
+    | `AUDIT_STAGE2_CONTROL_FLOW_2026-09-15.md` | 三条 P1 全落在 `5d6d24b` | 设计依据；真机验收 → TODO `AUDIT-S2-03` |
+    | `PME_DECHARGE_V5_CHANGE_RECORD_2026-09-14.md` | v5 已落地，逐行改动记录 | 文末「未验证」清单 |
+
 ## 运行期发现往哪写
 
 **没有 `docs/status/` 这个目录了。** 它 2026-09-02 被撤掉——它本身就是维护规则
@@ -97,7 +110,7 @@
 | 发现的性质 | 写进哪 |
 |---|---|
 | 用户会遇到的症状 + 完整因果链 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) |
-| 已定位但没修的缺陷 | [TODO.md](TODO.md) —— 归到对应的编号段（`S2-` / `LR-` / `REL-` / `AUDIT-`），**必须带位置和判据** |
+| 已定位但没修的缺陷 | 按优先级：`[P1]` 进 [TODO.md](TODO.md)、`[P2]` 进 [TODO_P2.md](TODO_P2.md)、`[P3]` 进 [TODO_P3.md](TODO_P3.md) —— 归到对应的编号段（`S2-` / `LR-` / `REL-` / `AUDIT-`），**必须带位置和判据** |
 | 发布阻塞判断 | [RELEASE_READINESS_2026-08-31.md](RELEASE_READINESS_2026-08-31.md) |
 | 一次性运行的原始记录（不分析） | 直接进 `archive/`，页首写清结论去了哪 |
 

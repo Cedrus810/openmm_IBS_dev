@@ -29,7 +29,10 @@ CTL = pre.Stage2RepairController
 
 
 def _decide_tree():
-    return ast.parse(inspect.getsource(CTL.decide).lstrip())
+# 🔑 [2026-09] `decide()` 现在只是 23 行的外壳（"退役一个窗口再判一次"），判断体是 `_decide_once`（1831 行）。
+# 源码探针指着 `decide` 会一无所获 —— 断言"存在"的当场红，断言"不存在"的**静默变成假绿**。
+    return ast.parse(inspect.getsource(CTL.decide).lstrip()
+                     + "\n" + inspect.getsource(CTL._decide_once).lstrip())
 
 
 def _str_choices(node):

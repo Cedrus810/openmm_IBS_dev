@@ -1,7 +1,11 @@
 # PME decharging v4 → v5：逐行改动记录
 
+> **2026-09-16 归档。** v5 已落地，本文是逐行改动记录，**不是待办**。
+> 结论性叙述在 [../STATUS.md](../STATUS.md)，时间线在 [../CHANGELOG.md](../CHANGELOG.md)；
+> 文末「未验证」一节仍然有效。
+
 > 2026-09-14。本文只记**改了什么**与**验到什么程度**，不论证对错。
-> 结论性叙述在 [STATUS.md](STATUS.md)，时间线在 [CHANGELOG.md](CHANGELOG.md)。
+> 结论性叙述在 [STATUS.md](../STATUS.md)，时间线在 [CHANGELOG.md](../CHANGELOG.md)。
 >
 > ⚠️ **真机零验证由我这边完成**：我没有启动过任何 GPU run。文末「未验证」一节是完整清单。
 

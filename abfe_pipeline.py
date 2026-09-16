@@ -3183,6 +3183,16 @@ def _q8(values):
     """把一组 λ 量化到路径记录的比较口径（8 位小数），用于集合差集比较。"""
     return [round(float(v), 8) + 0.0 for v in values]
 
+def _ie_gate_budget_for_protocol_key() -> int:
+    """`IBS_LOCAL_MBAR_GATE_MAX_BATCHES` 的当前值，供协议指纹使用。
+
+    惰性读取：`ibs_engine` 在本模块别处也是按需 import 的，不在顶层硬绑。
+    读不到就 fail closed —— 指纹里放一个猜出来的数比不放更糟。
+    """
+    import ibs_engine as _ie
+    return int(_ie.IBS_LOCAL_MBAR_GATE_MAX_BATCHES)
+
+
 class ABFEPipeline:
     """ABFE 计算流程管理器"""
 
@@ -10618,6 +10628,29 @@ class ABFEPipeline:
                 "total_error": 999.9,
             }
 
+        def _finalize_with_indeterminate(result, indeterminate):
+            """把 indeterminate 窗口**显式**挂进结果；有它就不产出 ΔG。
+
+            语义（用户 2026-09-16 定死）：无结论 ≠ 失败 ≠ 零。所以既不伪造数值，
+            也不静默删除；下游配对分析看到 `indeterminate_windows` 非空就把该 run
+            的对应指标记成"不可判定"，不许硬算 A/B 差值。
+            """
+            if not indeterminate:
+                return result
+            out = dict(result or {})
+            out["indeterminate_windows"] = list(indeterminate)
+            out["analysis_status"] = ANALYSIS_INCOMPLETE
+            out["analysis_incomplete_reasons"] = list(
+                out.get("analysis_incomplete_reasons") or []) + [
+                f"window_{int(x['window_idx'])}_frozen_validation_indeterminate"
+                for x in indeterminate]
+            out["precision_status"] = PRECISION_UNMEASURED
+            # ⚠️ **不产出 ΔG**：路径上有窗口没测出来，任何"总和"都是把一个洞
+            # 当成 0。下游按 analysis_status 判，不读这两个键。
+            out.pop("total_delta_G", None)
+            out.pop("total_error", None)
+            return out
+
         def _guarded_once():
             """不演化路径的那两条早退路径**也要**接住路由信号。
 
@@ -10625,6 +10658,69 @@ class ABFEPipeline:
             自治控制器启用时策略已被降级成 `non_mutating_v1`（见 run_full_pipeline），
             于是第一条早退**就是**实际走的那条 —— 不包住它等于路由修复整个失效。
             """
+            # 🔑🔑 [2026-09-16] **固定预算模式：路由/收集开，自适应加预算关。**
+            #
+            # 自治控制器关闭（`stage2_autonomous_controller=false`，做「固定预算、
+            # 不按中间结果提前停」的对照实验）时，`route_to_controller` 为假 ⟹
+            # 下面的 `raise` 把 `IBSValidationBudgetIndeterminateError` 变成致命错误，
+            # 整条管线在第 k 个窗口断掉，**k 之后的窗口一个都不跑**
+            # （真机 cmet_ligand2 B 臂 seed=20260916：窗口 6 无结论 ⟹ 整个 run 崩）。
+            #
+            # 但这个信号的语义是「**没测出来**，对这份 f_k 无结论」——既不是收敛也不是
+            # 不收敛。把它当致命错误，等于让一个窗口的"无结论"吞掉整个 run 的观测。
+            #
+            # 处置（语义由用户定死，四条都不许放松）：
+            #   1. 把该窗口记成 `indeterminate`，完整诊断已由 ibs_engine 落盘
+            #      （`*_warmup_failure.json` + ibs_state + checkpoint，raise 之前就写完了）；
+            #   2. 继续跑**其余窗口**（用已有的 `_only_window_indices` 子集机制）；
+            #   3. **禁止**把它当失败值/零值，也**禁止**从配对分析里静默删掉 ——
+            #      所以结果里显式带 `indeterminate_windows`，且 `analysis_status`
+            #      置为 ANALYSIS_INCOMPLETE、**不产出 ΔG**；
+            #   4. 关键对齐窗口无结论时，该 run 的配对指标就是"不可判定"，
+            #      由下游报告按 `indeterminate_windows` 判，不在这里硬算差值。
+            # ⚠️ 这里**不延长任何预算、不改 f_k、不动布局** —— 那是"自适应"，正是
+            # 固定预算设计要关掉的东西。只做路由与状态收集。
+            _indeterminate: List[Dict[str, Any]] = []
+            _pending = None                      # None = 全部窗口
+            while True:
+                try:
+                    return _finalize_with_indeterminate(
+                        run_once(len(current_l), current_l, current_r,
+                                 **({} if _pending is None
+                                    else {"_only_window_indices": list(_pending)})),
+                        _indeterminate)
+                except _ie.IBSValidationBudgetIndeterminateError as _ind_err:
+                    if route_to_controller:
+                        break                    # 交给下面原有的路由分支
+                    _widx = getattr(_ind_err, "window_idx", None)
+                    if _widx is None:
+                        # 定位不到是哪个窗口就不猜、不吞 —— fail closed。
+                        raise
+                    _widx = int(_widx)
+                    if any(int(x["window_idx"]) == _widx for x in _indeterminate):
+                        # 同一个窗口第二次报无结论 ⟹ 子集机制没推动它，别转圈。
+                        raise
+                    _indeterminate.append({
+                        "window_idx": _widx,
+                        "reason": "frozen_validation_budget_indeterminate",
+                        "detail": str(_ind_err)[:800],
+                        "diagnostics": getattr(_ind_err, "diagnostics", None),
+                    })
+                    _rest = [i for i in range(len(current_r))
+                             if i > _widx
+                             and (_pending is None or i in _pending)]
+                    self._log(
+                        f"  [固定预算] 窗口 {_widx} 冻结验证**无结论**"
+                        "（Δf−ΔF 从未求出）⟹ 记为 indeterminate，诊断已落盘；"
+                        "**不延长预算、不改 f_k、不动布局**，继续跑其余窗口 "
+                        f"{_rest or '（无）'}。"
+                    )
+                    if not _rest:
+                        return _finalize_with_indeterminate(None, _indeterminate)
+                    _pending = _rest
+                    continue
+                except _ie.IBSWarmupConvergenceError:
+                    break                        # 交给下面原有的路由分支
             try:
                 return run_once(len(current_l), current_l, current_r)
             except (_ie.IBSValidationBudgetIndeterminateError,
@@ -13979,6 +14075,17 @@ class ABFEPipeline:
             "boresch_params": _preopt_boresch_protocol_payload(boresch_params),
             "decharge_method": str(decharge_method) if stage_name == "decharging" else "n/a",
             "requested_n_states": None if n_states is None else int(n_states),
+            # 🔑🔑 [2026-09-16] **冻结验证的预算必须进指纹。**
+            # `IBS_LOCAL_MBAR_GATE_MAX_BATCHES`（单个冻结周期的批数硬上限）决定一个
+            # 窗口是"通过"还是"无法判定"，因此决定 stage 结果里有没有那个窗口。
+            # 它先前是个**纯模块级常量、不在任何指纹里** ⟹ 把它从 15 改成 40 之后，
+            # 旧的 15-协议 stage 结果会被**静默复用**，两份不同协议的产物并排躺着
+            # 而缓存系统一声不吭。做「固定预算」对照实验时这会直接毁掉可比性。
+            # ⚠️ 只进**stage 结果**这一层：窗口**轨迹**与它无关（冻结验证的样本
+            # 与生产严格隔离、不计入生产帧），所以 `_stage_window_sampling_identity`
+            # 里把它一并摘掉 —— 与 `final_*` 那批门槛同一条原则，代价见那段注释。
+            "ibs_local_mbar_gate_max_batches": int(
+                _ie_gate_budget_for_protocol_key()),
             "run_config": run_config,
             "temperature_K": self.temperature.value_in_unit(unit.kelvin),
             "pressure_bar": self.pressure.value_in_unit(unit.bar),

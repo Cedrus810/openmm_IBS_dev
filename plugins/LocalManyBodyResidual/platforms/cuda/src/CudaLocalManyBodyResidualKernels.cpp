@@ -300,10 +300,11 @@ extern "C" __global__ void exp025ComputeQ(
                           invPeriodicBoxSize, &localTie, &dx, &dy, &dz);
         mixed rNmM = sqrt(dx * dx + dy * dy + dz * dz);
         real rAngstrom = (real) ((mixed) 10 * rNmM);
-        if (rAngstrom < (real) EXP025_MIN_DISTANCE_ANGSTROM) {
-            exp026SetFirstError(deviceStatus, EXP025_DEVICE_ERROR_MIN_DISTANCE, EXP026_STAGE_COMPUTE_Q);
-            continue;
-        }
+        // [LR-06 plan A] Clamp, do not error. Below the training-support floor
+        // the energy is a PLATEAU (C0-continuous, no jump) and this edge still
+        // counts -- dropping it with `continue` would make the energy jump at
+        // r_floor and hand the integrator an impulse. See r1_model_layout.h.
+        if (rAngstrom < (real) EXP025_R_FLOOR_ANGSTROM) rAngstrom = (real) EXP025_R_FLOOR_ANGSTROM;
         if (rAngstrom < outerCutoffAngstrom) {
             if (localTie) exp026SetFirstError(deviceStatus, EXP025_DEVICE_ERROR_HALF_BOX_TIE, EXP026_STAGE_COMPUTE_Q);
             localNeighborCount++;
@@ -443,10 +444,12 @@ extern "C" __global__ void exp025ScatterForce(
                           invPeriodicBoxSize, &localTie, &dx, &dy, &dz);
         mixed rNmM = sqrt(dx * dx + dy * dy + dz * dz);
         real rAngstrom = (real) ((mixed) 10 * rNmM);
-        if (rAngstrom < (real) EXP025_MIN_DISTANCE_ANGSTROM) {
-            exp026SetFirstError(deviceStatus, EXP025_DEVICE_ERROR_MIN_DISTANCE, EXP026_STAGE_FORCE_SCATTER);
-            continue;
-        }
+        // [LR-06 plan A] Inside the floor the clamped energy is constant in r,
+        // so dE/dr is exactly 0 -> contribute no force. Skipping here is what
+        // makes the divergent `invRM = 1/rNmM` below unreachable; it is NOT
+        // the same as dropping the edge, whose energy is still counted by
+        // computeQ at the clamped r. See r1_model_layout.h.
+        if (rAngstrom < (real) EXP025_R_FLOOR_ANGSTROM) continue;
         if (rAngstrom < outerCutoffAngstrom) {
             if (localTie) exp026SetFirstError(deviceStatus, EXP025_DEVICE_ERROR_HALF_BOX_TIE, EXP026_STAGE_FORCE_SCATTER);
             int envType = typeByDevice[envId];
@@ -762,10 +765,11 @@ extern "C" __global__ void exp025ComputeQFromCSR(
         exp025WrapDeltaM(envX - ligX, envY - ligY, envZ - ligZ, boxVecX, boxVecY, boxVecZ, invBoxSize, &localTie, &dx, &dy, &dz);
         mixed rNmM = sqrt(dx * dx + dy * dy + dz * dz);
         real rAngstrom = (real) ((mixed) 10 * rNmM);
-        if (rAngstrom < (real) EXP025_MIN_DISTANCE_ANGSTROM) {
-            exp026SetFirstError(deviceStatus, EXP025_DEVICE_ERROR_MIN_DISTANCE, EXP026_STAGE_COMPUTE_Q);
-            continue;
-        }
+        // [LR-06 plan A] Clamp, do not error. Below the training-support floor
+        // the energy is a PLATEAU (C0-continuous, no jump) and this edge still
+        // counts -- dropping it with `continue` would make the energy jump at
+        // r_floor and hand the integrator an impulse. See r1_model_layout.h.
+        if (rAngstrom < (real) EXP025_R_FLOOR_ANGSTROM) rAngstrom = (real) EXP025_R_FLOOR_ANGSTROM;
         if (rAngstrom < outerCutoffAngstrom) {
             if (localTie) exp026SetFirstError(deviceStatus, EXP025_DEVICE_ERROR_HALF_BOX_TIE, EXP026_STAGE_COMPUTE_Q);
             localNeighborCount++;
@@ -828,10 +832,12 @@ extern "C" __global__ void exp025ScatterForceFromCSR(
         exp025WrapDeltaM(envX - ligX, envY - ligY, envZ - ligZ, boxVecX, boxVecY, boxVecZ, invBoxSize, &localTie, &dx, &dy, &dz);
         mixed rNmM = sqrt(dx * dx + dy * dy + dz * dz);
         real rAngstrom = (real) ((mixed) 10 * rNmM);
-        if (rAngstrom < (real) EXP025_MIN_DISTANCE_ANGSTROM) {
-            exp026SetFirstError(deviceStatus, EXP025_DEVICE_ERROR_MIN_DISTANCE, EXP026_STAGE_FORCE_SCATTER);
-            continue;
-        }
+        // [LR-06 plan A] Inside the floor the clamped energy is constant in r,
+        // so dE/dr is exactly 0 -> contribute no force. Skipping here is what
+        // makes the divergent `invRM = 1/rNmM` below unreachable; it is NOT
+        // the same as dropping the edge, whose energy is still counted by
+        // computeQ at the clamped r. See r1_model_layout.h.
+        if (rAngstrom < (real) EXP025_R_FLOOR_ANGSTROM) continue;
         if (rAngstrom < outerCutoffAngstrom) {
             if (localTie) exp026SetFirstError(deviceStatus, EXP025_DEVICE_ERROR_HALF_BOX_TIE, EXP026_STAGE_FORCE_SCATTER);
             int envType = typeByDevice[envId];
@@ -875,6 +881,7 @@ string buildDefinesPrefix() {
     defs << "#define EXP025_MLP_OFFSET_W4 " << EXP025_STRINGIFY(EXP025_MLP_OFFSET_W4) << "\n";
     defs << "#define EXP025_MLP_OFFSET_B4 " << EXP025_STRINGIFY(EXP025_MLP_OFFSET_B4) << "\n";
     defs << "#define EXP025_MIN_DISTANCE_ANGSTROM " << EXP025_STRINGIFY(EXP025_MIN_DISTANCE_ANGSTROM) << "\n";
+    defs << "#define EXP025_R_FLOOR_ANGSTROM " << EXP025_STRINGIFY(EXP025_R_FLOOR_ANGSTROM) << "\n";
     defs << "#define EXP025_HALF_BOX_TIE_EPSILON " << EXP025_STRINGIFY(EXP025_HALF_BOX_TIE_EPSILON) << "\n";
     defs << "#define EXP025_DEVICE_ERROR_OK " << EXP025_STRINGIFY(EXP025_DEVICE_ERROR_OK) << "\n";
     defs << "#define EXP025_DEVICE_ERROR_HALF_BOX_TIE " << EXP025_STRINGIFY(EXP025_DEVICE_ERROR_HALF_BOX_TIE) << "\n";

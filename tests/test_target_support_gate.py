@@ -83,7 +83,7 @@ def test_healthy_window_passes_the_target_support_gate():
     gate = res["target_support_gate"]
     assert gate["passed"] is True, gate
     assert gate["failure_reason"] is None
-    assert res["converged"] is True
+    assert res["analysis_status"] == "ANALYSIS_COMPLETE"
 
 
 def test_high_mixture_coverage_with_low_raw_target_support_fails():
@@ -99,7 +99,11 @@ def test_high_mixture_coverage_with_low_raw_target_support_fails():
     assert gate["passed"] is False, gate
     assert gate["failure_reason"] == "insufficient_target_support"
     assert gate["failed_checks"], gate
-    assert res["converged"] is False
+    # 🔑 [2026-09-15] 这道门是**拟合阈值门**，按新契约不进 `analysis_status` 的合取
+    # （原文这里断言 `converged is False`，那个键已删）。路径完整、数值有限、结构
+    # 自洽 ⟹ 硬不变量照样是 COMPLETE。**门的结论由 gate 自己说**，不许再借道
+    # analysis_status 表达 —— 那正是被删掉的那个混合语义。
+    assert res["analysis_status"] == "ANALYSIS_COMPLETE"
     # raw 与 mixture 必须真的分道扬镳，否则这个用例没测到该测的东西。
     assert res["raw_min_overlap"] < 0.1 * res["min_overlap"]
 
@@ -117,8 +121,24 @@ def test_frame_count_mismatch_is_rejected_outright():
 
 
 def test_incomplete_evidence_is_not_a_pass():
-    """证据不全（某个窗口算不出 raw 支撑度）必须当失败处理，不是"没测到就放行"。"""
+    """证据不全（某个窗口算不出 raw 支撑度）**不得被当成通过** —— 但拦法已经换过两次。
+
+    🔑 本条原文断言的是 `pytest.raises(RuntimeError, match="insufficient_target_support")`。
+    那个 raise **2026-09-01 就被拿掉了**（理由逐字写在 `_assert_stage_result_sane`
+    里：4W53 复合物腿 raw_ESS 只有 2.8~11、门拦住的是一个本来就无法验证对错的数，
+    代价是永远拿不到唯一有独立参考真值的溶剂腿）。2026-09-15 又删掉了 `converged`。
+    所以这一条现在锁的是**替代品**，三项缺一不可：
+
+      ① 不 raise —— 阈值门不许再中止流程（也不许据此自动补帧）；
+      ② `results_untrusted=True` 随结果落盘 —— 这份 ΔG 不得作为可发布结果；
+      ③ 证据一条不少地进 `stage_quality_failures` —— "没测到就放行"这个原始
+         危害由它挡住：failure_reason / failed_checks 必须原样可审计。
+
+    ⚠️ 谁要是把 ① 改回 raise，请先读那段注释；②③ 任何一条掉了都是静默放行。
+    """
     from abfe_pipeline import ABFEPipeline
+
+    logged = []
 
     class _Dummy:
         _stage_quality_failure_details = staticmethod(
@@ -128,9 +148,13 @@ def test_incomplete_evidence_is_not_a_pass():
             ABFEPipeline._format_stage_quality_failure_details
         )
 
+        def _log(self, message):
+            logged.append(message)
+
     result = {
         "stage": "vanishing",
-        "converged": False,
+        # 硬不变量这一侧是干净的：本条测的是阈值门那一侧。
+        "analysis_status": "ANALYSIS_COMPLETE",
         "total_delta_G": 1.0,
         "total_error": 0.1,
         "min_overlap": 0.5,
@@ -146,8 +170,15 @@ def test_incomplete_evidence_is_not_a_pass():
             "max_top1pct_raw_weight_threshold": TARGET_SUPPORT_MAX_TOP1PCT_WEIGHT,
         },
     }
-    with pytest.raises(RuntimeError, match="insufficient_target_support"):
-        ABFEPipeline._assert_stage_result_sane(_Dummy(), "Stage 2 (vanishing)", result)
+    ABFEPipeline._assert_stage_result_sane(_Dummy(), "Stage 2 (vanishing)", result)
+
+    assert result["results_untrusted"] is True, "门挂了却没标 untrusted ⟹ 静默放行"
+    failures = [f for f in result.get("stage_quality_failures", [])
+                if f.get("gate") == "target_support_gate"]
+    assert failures, "门挂了却没有留下任何可审计证据 ⟹ 静默放行"
+    assert failures[0]["failure_reason"] == "insufficient_target_support"
+    assert failures[0]["failed_checks"] == ["incomplete_evidence"]
+    assert any("物理目标支撑度硬门" in m for m in logged), logged
 
 
 def test_thresholds_are_reported_alongside_the_verdict():
@@ -174,7 +205,8 @@ def test_thresholds_are_configurable_and_actually_take_effect():
     )
     assert strict["target_support_gate"]["passed"] is False
     assert "raw_absolute_ess_below_threshold" in strict["target_support_gate"]["failed_checks"]
-    assert strict["converged"] is False
+    # 同上：阈值门不改 analysis_status（原文断言的 `converged` 键已于 2026-09-15 删除）。
+    assert strict["analysis_status"] == "ANALYSIS_COMPLETE"
 
 
 def test_gate_thresholds_are_part_of_the_stage_protocol_fingerprint():
@@ -207,7 +239,12 @@ def test_pipeline_refuses_a_vanishing_result_without_the_gate():
 
     legacy = {
         "stage": "vanishing",
-        "converged": True,
+        # 🔑 [2026-09-15] 本条锁的是「缺 target_support_gate ⟹ 拒绝」这**一道**门。
+        # `analysis_status` 的 fail-closed 排在它前面，所以这里如实给 COMPLETE，
+        # 否则请求会被前一道门吃掉、这道门一行都执行不到（老 fixture 写的是
+        # `converged: True`，那个键已删）。「老产物同时缺 analysis_status」由
+        # test_stage_diagnostics_persistence 那边的用例覆盖。
+        "analysis_status": "ANALYSIS_COMPLETE",
         "total_delta_G": 35.61,
         "total_error": 0.84,
         "min_overlap": 0.4684,

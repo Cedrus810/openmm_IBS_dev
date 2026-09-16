@@ -1,6 +1,6 @@
 """换 Epoch 付不起时，**偏斜类**窗口不得被降级去补帧。
 
-`采样问题_2026-09-15.md` 上半部分那条链的落点：
+`docs/archive/采样问题_2026-09-15.md` 上半部分那条链的落点：
 
     warmup 账干 → 换 Epoch 付不起 → 降级发 RUN_PRODUCTION（复用冻结 f_k）
       → 生产预算判不了它不可行 → 连补至 max_production_blocks=4
@@ -14,6 +14,14 @@
 
 ⚠️ **样本量类仍然降级**——那些窗口是真的帧不够，补帧对症、也确实便宜。
 """
+import pytest
+
+# 🔑 [2026-09-16] 本文件原来**没有任何标记** ⟹ 日常的 `pytest -m cpu_only` 整份
+# 跳过。里面是纯 CPU 的源码契约探针，正好是最容易静默烂掉的那类（断言"某段
+# 代码存在"，一旦指错函数就只是找不到、不报错）。实测就烂过：`decide()` 被
+# 拆成外壳之后这里全挂，而没人看得见。
+pytestmark = pytest.mark.cpu_only
+
 from abfe_preoptimizer import Stage2RepairController
 
 from test_stage2_repair_controller import R4, _mkrun
@@ -50,7 +58,10 @@ def test_a_frame_starved_window_still_gets_the_cheap_fallback(tmp_path):
 def test_the_attribution_reuses_the_shared_implementation():
     """不许在这处另写一套归因 —— 那是本仓最贵的那类 bug。"""
     import inspect
-    src = inspect.getsource(Stage2RepairController.decide)
+# 🔑 [2026-09] `decide()` 现在只是 23 行的外壳（"退役一个窗口再判一次"），判断体是 `_decide_once`（1831 行）。
+# 源码探针指着 `decide` 会一无所获 —— 断言"存在"的当场红，断言"不存在"的**静默变成假绿**。
+    src = (inspect.getsource(Stage2RepairController.decide)
+           + inspect.getsource(Stage2RepairController._decide_once))
     blk = src.split("_EPOCH_ACTIONS = (")[1].split("if action == \"RUN_PRODUCTION\":")[0]
     assert "support_failure_is_skew(" in blk
     assert "n_decorrelated=" in blk

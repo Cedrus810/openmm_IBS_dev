@@ -56,8 +56,13 @@ def test_wet_basin_present_still_evaluates_normally():
 
 
 def _seg():
+    # 🔑 [2026-09-15] 第一半模拟 `solve_stage_integrated` 的产物 —— 那边的
+    # `converged` 已删键，改报 `analysis_status`。写错这一半的后果是静默的：
+    # `combine_…` 里 `ibs_analysis_complete` 恒 False ⟹ 输出 `converged` 恒 False，
+    # 于是 `test_failed_gate_still_blocks` 会**因为错的理由**变绿。
+    # 第二半是独立端点段（另一个生产者），它的 `converged` 没被删，原样保留。
     return ({"stage": "vanishing", "lambdas": list(range(7)), "total_delta_G": 20.0,
-             "total_error": 0.4, "converged": True,
+             "total_error": 0.4, "analysis_status": "ANALYSIS_COMPLETE",
              "target_support_gate": {"passed": True, "failed_checks": []}},
             {"state_indices": list(range(6, 12)), "delta_G_kJ_mol": -26.0,
              "delta_G_sigma_kJ_mol": 0.3, "converged": True,

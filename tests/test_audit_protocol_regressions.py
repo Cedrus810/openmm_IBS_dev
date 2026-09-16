@@ -216,7 +216,12 @@ class SourceContractTests(unittest.TestCase):
             "entry point, or the exp030 frozen-snapshot reconciliation fix's bounded-correction "
             "assumption no longer holds",
         )
-        self.assertIn("_meets_minimum_with_roundoff(min_overlap", self.engine)
+        # 🔑 [2026-09-15] 原本这里钉的是 `converged` 合取里的
+        # `_meets_minimum_with_roundoff(min_overlap, …)`。**那条合取整个被删了**
+        # （`converged` 删键，改 `analysis_status`，四道拟合阈值门降级为只报告）。
+        # 舍入容忍的比较本身没退役，只是搬到了 target_support_gate 那一侧 ——
+        # 钉住还活着的那处，别钉一个已经不存在的表达式。
+        self.assertIn("_meets_minimum_with_roundoff(\n            raw_min_absolute_ess", self.engine)
         # [Candidate-first, Validate-or-Learn v1] LEARN no longer has a fixed
         # min_bias_updates batch-count gate; freeze the instant the raw
         # occupancy residual drops to/below IBS_UPDATE_ADAPTIVE_RESIDUAL_LOW.
@@ -539,7 +544,8 @@ class SourceContractTests(unittest.TestCase):
     def test_stage2_reports_and_repairs_exact_failing_windows(self):
         self.assertIn("def _stage_quality_failure_details(", self.pipeline)
         self.assertIn("worst_global_state", self.pipeline)
-        self.assertIn("具体瓶颈：", self.pipeline)
+        # [2026-09-15] 文案从"具体瓶颈："改成"逐窗口瓶颈："（同一处，只是措辞）。
+        self.assertIn("逐窗口瓶颈：", self.pipeline)
         self.assertIn("stage2_production_rescue_rounds", self.pipeline)
         self.assertIn("production_rescue_targets", self.pipeline)
         self.assertIn("沿用各窗口 production checkpoint 与已锁定 f_k", self.pipeline)
@@ -968,30 +974,52 @@ class SourceContractTests(unittest.TestCase):
         # 现在换成三份真正正交的证据，本测试钉住这个结构，防止 absolute-ESS 门被
         # "顺手加回来"，也防止 min_ess_ratio 被换回 raw 单参考 ESS。occupancy 与
         # warmup 协议一致，只作诊断：不能等全部 GPU 采样完成后再用同一指标反向否决。
-        conv_idx = self.engine.index("converged = bool(\n            len(local_results) == len(valid_windows)")
-        conv_block = self.engine[conv_idx:conv_idx + 700]
-        # (1) 权重质量：扣掉共模因子后的混合覆盖度比例
-        self.assertIn(
-            "_meets_minimum_with_roundoff(min_overlap, min_overlap_threshold)",
-            conv_block,
+        # 🔑🔑 [2026-09-15 用户拍板] **那条 `converged = bool(...)` 合取已经不存在了。**
+        # 本条原来在合取块里数"三份正交证据"。删键之后接受判据换成
+        # `analysis_status`，它**只收硬不变量**（路径完整 / 数值有限 / 结构自洽），
+        # 一个拟合阈值都不进。
+        #
+        # 所以本条的原始目的（"防止 absolute-ESS 门被顺手加回来"）不但仍然成立，
+        # 而且变成了更强的一条：**四个阈值一个都不许出现在合取里**。下面就钉这个。
+        # 判据来源：`solve_stage_integrated` docstring 的「充要条件（三条）」
+        # 与 abfe_pipeline.py `ANALYSIS_COMPLETE` 上方那段长注释。
+        reasons_idx = self.engine.index("analysis_incomplete_reasons: List[str] = []")
+        status_idx = self.engine.index(
+            'analysis_status = (\n            "ANALYSIS_INCOMPLETE" if '
+            "analysis_incomplete_reasons else \"ANALYSIS_COMPLETE\"\n        )"
         )
-        # occupancy 保留为一阶矩伴随诊断，但不得进入最终 converged 门。
+        self.assertGreater(status_idx, reasons_idx)
+        conv_block = self.engine[reasons_idx:status_idx]
+
+        # (1) 路径完整：缺窗 / 跳窗
+        self.assertIn("len(local_results) != len(valid_windows)", conv_block)
+        self.assertIn("if skipped_windows:", conv_block)
+        # (2) 数值有限：总量与逐段
+        self.assertIn("np.isfinite(total_dg)", conv_block)
+        self.assertIn('np.isfinite(_seg["delta_G_kJ_mol"])', conv_block)
+        # (3) 结构自洽：λ 覆盖连续 + 相邻窗恰好共享一个边界态
+        self.assertIn("λ 覆盖不连续", conv_block)
+        self.assertIn("要求恰好 1 个边界态", conv_block)
+
+        # 🛑 四个**未标定的拟合阈值**一个都不许进这个合取。
+        # 它们照旧算、照旧落盘、照旧打印，但只是报告。谁加回来，这里红。
+        for retired in (
+            "min_overlap",
+            "min_absolute_ess",
+            "final_min_absolute_ess",
+            "min_decorrelated_samples",
+            "max_endpoint_uncertainty",
+            "top1pct",
+            "target_support_gate",
+            "min_occupancy_normalized",
+        ):
+            self.assertNotIn(retired, conv_block, f"{retired} 被加回了接受判据的合取")
+
+        # 退役的 occupancy 门必须留着"已退役"的显式痕迹（只诊断，不是门）。
         self.assertNotIn("min_occupancy_normalized", conv_block)
         self.assertIn('"min_occupancy_normalized_threshold": None,', self.engine)
         self.assertIn('"min_occupancy_is_gate": False,', self.engine)
         self.assertIn('"min_occupancy_gate_retired_reason": (', self.engine)
-        # (2) 样本量：与比例正交的那份证据
-        self.assertIn(
-            "min_decorrelated_samples >= int(final_min_decorrelated_samples)",
-            conv_block,
-        )
-        # (3) 输出精度：MBAR 自带全协方差的端点不确定度
-        self.assertIn(
-            "_meets_maximum_with_roundoff(", conv_block
-        )
-        # 退役的 absolute-ESS 门不得出现在 converged 里
-        self.assertNotIn("final_min_absolute_ess", conv_block)
-        self.assertNotIn("min_absolute_ess", conv_block)
         # 受门量必须是 mixture 版本，raw 版本只能是诊断
         self.assertIn(
             '"min_overlap_method": (\n'

@@ -11,6 +11,14 @@
    于是即便前两环修好，引擎走到 15/15 仍然抛路由信号，窗口永远进不了生产。
 """
 import inspect
+import pytest
+
+# 🔑 [2026-09-16] 本文件原来**没有任何标记** ⟹ 日常的 `pytest -m cpu_only` 整份
+# 跳过。里面全是纯 CPU 的源码契约探针，正好是最容易静默烂掉的那类（它们
+# 断言"某段代码存在"，一旦指错函数就只是找不到、不报错）。实测就烂过：
+# `decide()` 被拆成外壳之后这里 6 条全挂，而没人看得见。
+pytestmark = pytest.mark.cpu_only
+
 import json
 import os
 
@@ -34,7 +42,10 @@ def test_unknown_production_steps_has_no_comparable_identity():
 
 def test_both_sides_refuse_to_use_an_identityless_fingerprint():
     """写侧不落账、读侧不认作匹配 —— 两边必须同时守，漏一边就还是锁死。"""
-    reader = inspect.getsource(Stage2RepairController.decide)
+# 🔑 [2026-09] `decide()` 现在只是 23 行的外壳（"退役一个窗口再判一次"），判断体是 `_decide_once`（1831 行）。
+# 源码探针指着 `decide` 会一无所获 —— 断言"存在"的当场红，断言"不存在"的**静默变成假绿**。
+    reader = (inspect.getsource(Stage2RepairController.decide)
+              + inspect.getsource(Stage2RepairController._decide_once))
     assert "fp is not None and rec.get(\"fingerprint\") == fp" in reader
     writer = inspect.getsource(abfe_pipeline.ABFEPipeline._record_noop_action)
     assert "if _fp is None:" in writer and "continue" in writer
@@ -46,7 +57,10 @@ def test_the_action_exists_and_is_charged_like_a_production_block():
     # 它采的是**生产**帧 ⟹ 必须进块账，否则就是绕过块数硬上限的旁路
     assert "PROVISIONAL_PRODUCTION" in Stage2RepairController._BLOCK_CHARGING_ACTIONS
     # 也要挂 no-op 刹车，跟其它会烧 GPU 的动作一致
-    src = inspect.getsource(Stage2RepairController.decide)
+# 🔑 [2026-09] `decide()` 现在只是 23 行的外壳（"退役一个窗口再判一次"），判断体是 `_decide_once`（1831 行）。
+# 源码探针指着 `decide` 会一无所获 —— 断言"存在"的当场红，断言"不存在"的**静默变成假绿**。
+    src = (inspect.getsource(Stage2RepairController.decide)
+           + inspect.getsource(Stage2RepairController._decide_once))
     assert '"PROVISIONAL_PRODUCTION",\n' in src
 
 

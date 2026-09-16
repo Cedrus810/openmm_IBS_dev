@@ -209,7 +209,10 @@ def test_probe_suppression_is_keyed_to_the_board_not_to_ever():
     钉住的是"不再用 `_probed`（探针产物的 windows 列表）永久压制"——那份列表
     一次就含全部窗口，于是第一次探针之后全仓永不重探。
     """
-    src = inspect.getsource(pre.Stage2RepairController.decide)
+# 🔑 [2026-09] `decide()` 现在只是 23 行的外壳（"退役一个窗口再判一次"），判断体是 `_decide_once`（1831 行）。
+# 源码探针指着 `decide` 会一无所获 —— 断言"存在"的当场红，断言"不存在"的**静默变成假绿**。
+    src = (inspect.getsource(pre.Stage2RepairController.decide)
+           + inspect.getsource(pre.Stage2RepairController._decide_once))
     assert "_is_noop(\"PROBE_CANDIDATE_FK\"" in src
     # 只看**代码**，注释里提到 `_probed` 是在解释为什么删掉它。
     code = "\n".join(

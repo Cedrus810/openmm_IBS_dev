@@ -6,6 +6,14 @@
   · 停滞计数按"盘上状态是否变了"清零（不是累计出现次数）
 """
 import os
+import pytest
+
+# 🔑 [2026-09-16] 本文件原来**没有任何标记** ⟹ 日常的 `pytest -m cpu_only` 整份
+# 跳过。里面全是纯 CPU 的源码契约探针，正好是最容易静默烂掉的那类（它们
+# 断言"某段代码存在"，一旦指错函数就只是找不到、不报错）。实测就烂过：
+# `decide()` 被拆成外壳之后这里 6 条全挂，而没人看得见。
+pytestmark = pytest.mark.cpu_only
+
 import pathlib
 import sys
 
@@ -227,8 +235,10 @@ def test_marginal_gain_rule_stops_futile_frame_addition():
     # 视图必须带跨段历史
     assert "min_n_eff_over_g_history" in src.read_text()
     fn = next(
+# 🔑 [2026-09] `decide()` 现在只是 23 行的外壳（"退役一个窗口再判一次"），判断体是 `_decide_once`（1831 行）。
+# 源码探针指着 `decide` 会一无所获 —— 断言"存在"的当场红，断言"不存在"的**静默变成假绿**。
         n for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "decide"
+        if isinstance(n, ast.FunctionDef) and n.name == "_decide_once"
     )
     dump = ast.dump(fn)
     assert "_no_gain" in dump, "边际增长判据必须在 decide() 里"
