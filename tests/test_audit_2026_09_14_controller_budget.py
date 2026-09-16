@@ -257,7 +257,12 @@ def test_an_unreadable_warmup_ledger_does_not_pin_a_skipped_window_to_production
             "bias_status": "frozen_validation_indeterminate"}
     run = _mkrun(
         tmp_path, windows=w, ranges=R4, n_states=13,
-        stage_result={"converged": False,
+        # 🔑 [2026-09-15] `converged` 已删键；写老键的 stage_result **根本不会被
+        # `_read_stage_result()` 认成一份 stage 结果**（嗅探键是 `analysis_status` /
+        # `total_delta_G`）⟹ 求解器证据整份读不到，归因判反。
+        stage_result={"analysis_status": "ANALYSIS_INCOMPLETE",
+                      "analysis_incomplete_reasons": ["存在被跳过的窗口 [0]。"],
+                      "total_delta_G": -12.3, "total_error": 0.9,
                       "skipped_windows": [{
                           "window_index": 0, "n_frames_after_decorrelation": 9,
                           "min_frames_per_window": 10,
@@ -398,7 +403,9 @@ def test_stale_layout_evidence_is_cleared_once_the_window_is_resampled(tmp_path)
     # 基准段是旧布局（3 态），新段 vanishing_2 是当前布局（4 态）
     run = _mkrun(tmp_path, windows={i: {"K": 4} for i in range(4)},
                  ranges=R4, n_states=13,
-                 stage_result={"converged": True, "path_is_complete": True})
+                 stage_result={"analysis_status": "ANALYSIS_COMPLETE",
+                               "total_delta_G": -12.3, "total_error": 0.9,
+                               "path_is_complete": True})
     _patch_convergence(run, 0, lambda d: d.update(
         {"lambdas_vdw": d["lambdas_vdw"][:3]}))      # 旧布局的残留证据
 
@@ -437,7 +444,9 @@ def test_the_hard_block_cap_is_not_reset_by_a_segment_change(tmp_path):
     w[0] = {"K": 4, "self_verdict": "INSUFFICIENT_DATA",
             "self_verdict_source": "solver_eligibility", "prod": 250000}
     run = _mkrun(tmp_path, windows=w, ranges=R4, n_states=13, config=cfg,
-                 stage_result={"converged": False,
+                 stage_result={"analysis_status": "ANALYSIS_INCOMPLETE",
+                               "analysis_incomplete_reasons": ["路径缺窗。"],
+                               "total_delta_G": -12.3, "total_error": 0.9,
                                "min_decorrelated_samples_threshold": 20,
                                "window_overlap_diagnostics": [
                                    {"window_index": 0, "n_frames_decorrelated": 9}]})
@@ -498,7 +507,8 @@ def all_plans(tmp_path_factory):
     boards["all_eligible_no_stage"] = _mkrun(td("b"), windows=FULL, ranges=R4,
                                              n_states=13)
     boards["converged"] = _mkrun(td("c"), windows=FULL, ranges=R4, n_states=13,
-                                 stage_result={"converged": True,
+                                 stage_result={"analysis_status": "ANALYSIS_COMPLETE",
+                                               "total_error": 0.9,
                                                "total_delta_G": -12.3,
                                                "path_is_complete": True})
     _w = dict(FULL)

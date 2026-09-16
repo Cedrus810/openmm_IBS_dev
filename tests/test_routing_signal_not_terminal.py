@@ -18,8 +18,10 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+pytestmark = pytest.mark.cpu_only
+
 import ibs_engine as _ie  # noqa: E402
-from abfe_pipeline import ABFEPipeline  # noqa: E402
+from abfe_pipeline import ABFEPipeline, ANALYSIS_INCOMPLETE  # noqa: E402
 
 
 def _call(tmp_path, *, route_to_controller, repair_policy="path_evolution_v1"):
@@ -48,7 +50,8 @@ def test_routing_signal_is_handed_to_the_controller_not_raised(tmp_path):
     (result, lam, ranges), logged = _call(tmp_path, route_to_controller=True)
 
     assert result["routing_signal"] == "LOCAL_VALIDATION_CAP"
-    assert result["converged"] is False          # 绝不伪装成一次成功的执行
+    # 🔑 [2026-09-15] `converged` 已删键，硬不变量改由 `analysis_status` 表达。
+    assert result["analysis_status"] == ANALYSIS_INCOMPLETE  # 绝不伪装成一次成功的执行
     assert lam and ranges                        # 路径原样交回，没被插点/拆窗动过
     assert any("LOCAL_VALIDATION_CAP" in m for m in logged)
 
@@ -96,11 +99,12 @@ def test_routing_error_strings_match_what_the_solver_actually_emits():
 
 
 def test_skipped_window_solve_failure_is_not_fatal_but_stays_unconverged():
-    """路由 ≠ 放行：错误原样留档、`converged` 保持 False。"""
+    """路由 ≠ 放行：错误原样留档、`analysis_status` 保持 ANALYSIS_INCOMPLETE。"""
     from abfe_pipeline import STAGE_SOLVE_ROUTING_ERRORS
 
     # 这是求解器 `_fallback()` 的真实形状。
-    stage_result = {"error": "window_overlap_broken", "converged": False,
+    stage_result = {"error": "window_overlap_broken",
+                    "analysis_status": ANALYSIS_INCOMPLETE,
                     "total_delta_G": 0.0, "total_error": 999.9}
     assert stage_result["error"] in STAGE_SOLVE_ROUTING_ERRORS
 
@@ -108,8 +112,10 @@ def test_skipped_window_solve_failure_is_not_fatal_but_stays_unconverged():
         __import__("pathlib").Path(__file__).resolve().parents[1] / "abfe_pipeline.py"
     ).read_text("utf-8")
     assert "STAGE_SOLVE_ROUTING_ERRORS" in src
-    # 绝不能顺手把它标成收敛/可发布
-    assert 'stage_result["converged"] = True' not in src
+    # 绝不能顺手把它标成收敛/可发布。
+    # 🔑 [2026-09-16] 原探针钉的是 `stage_result["converged"] = True`，而
+    # `converged` 09-15 已删键 ⟹ 那句断言从此恒真（假绿）。改钉今天的等价物。
+    assert 'stage_result["analysis_status"] = ANALYSIS_COMPLETE' not in src
 
 
 def test_stitching_failure_keeps_the_list_of_skipped_windows():
@@ -128,7 +134,7 @@ def test_stitching_failure_keeps_the_list_of_skipped_windows():
 
     out = analyzer._incomplete_path_fallback("window_overlap_broken", skipped)
     assert out["error"] == "window_overlap_broken"
-    assert out["converged"] is False
+    assert out["analysis_status"] == ANALYSIS_INCOMPLETE
     assert out["skipped_windows"] == skipped
     assert out["path_is_complete"] is False
 
@@ -168,7 +174,7 @@ def test_the_non_mutating_early_return_is_guarded_too(tmp_path):
     (result, lam, _r), logged = _call(
         tmp_path, route_to_controller=True, repair_policy="non_mutating_v1")
     assert result["routing_signal"] == "LOCAL_VALIDATION_CAP"
-    assert result["converged"] is False
+    assert result["analysis_status"] == ANALYSIS_INCOMPLETE
     assert lam
     assert any("LOCAL_VALIDATION_CAP" in m for m in logged)
 
@@ -236,7 +242,7 @@ def test_the_warmup_convergence_signal_is_routed_too(tmp_path):
         route_to_controller=True,
     )
     assert result["routing_signal"] == "WARMUP_F_K_NOT_CONVERGED"
-    assert result["converged"] is False
+    assert result["analysis_status"] == ANALYSIS_INCOMPLETE
     assert lam and ranges                        # 路径一个字节没动
     assert any("WARMUP_F_K_NOT_CONVERGED" in m for m in logged)
 

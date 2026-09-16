@@ -412,8 +412,8 @@ def test_solve_stage_integrated_recovers_known_delta_g_with_nontrivial_weights()
         f"total_delta_G={result['total_delta_G']!r} 偏离解析值 {expected!r} "
         f"超过 {tolerance!r}（报告误差 {total_err!r}）"
     )
-    assert result["converged"] is True, (
-        f"1500 帧 iid、重叠良好的合成数据应判 converged；诊断: "
+    assert result["analysis_status"] == "ANALYSIS_COMPLETE", (
+        f"1500 帧 iid、重叠良好的合成数据硬不变量应全过；诊断: "
         f"min_overlap={result['min_overlap']}, "
         f"min_absolute_ess={result['min_absolute_ess']}, "
         f"min_decorrelated_samples={result['min_decorrelated_samples']}, "
@@ -511,10 +511,16 @@ def test_mixture_ess_alone_cannot_see_a_uniformly_starved_state():
 
 
 def test_ess_gate_fails_closed_when_frozen_f_k_is_unavailable():
-    """没有 f_k 就没法把共模因子除干净 → min_overlap=None、converged=False。
+    """没有 f_k 就没法把共模因子除干净 → min_overlap=None。
 
-    绝不能静默退回 raw 量当受门指标（那正是被退役的语义），也绝不能当作通过。
-    物理量（ΔG/误差棒）不受影响，只是这个门无法评估。
+    绝不能静默退回 raw 量当受门指标（那正是被退役的语义）。
+
+    🔑 [2026-09-15] 原文还断言 `converged is False`。**那个键已删**，而且结论也
+    反了：min_overlap 算不出来是**阈值门无法评估**，不是硬不变量出问题 ——
+    路径完整、数值有限、结构自洽三条一条没缺，所以 `analysis_status` 照样是
+    COMPLETE。这正是删键要分开的两件事（"解没解出来" vs "这个门读数多少"）。
+    本条现在钉的是：**门读不出来时不许伪造一个读数**（min_overlap 必须是 None、
+    逐窗必须写明 `reweighting_quality_error="missing_f_k"`）。
     """
     windows = _two_windows(CENTERS_SPREAD, with_f_k=False)
     assert all("f_k" not in w for w in windows)
@@ -522,7 +528,7 @@ def test_ess_gate_fails_closed_when_frozen_f_k_is_unavailable():
 
     assert "error" not in result
     assert result["min_overlap"] is None
-    assert result["converged"] is False
+    assert result["analysis_status"] == "ANALYSIS_COMPLETE"
     # raw 诊断仍可用，且明确记录了为什么算不出 mixture 量。
     assert result["raw_min_overlap"] is not None
     for record in result["window_overlap_diagnostics"]:
@@ -647,7 +653,7 @@ def test_solve_stage_integrated_fails_closed_when_windows_do_not_overlap():
     win_a = _harmonic_window([0, 1], [centers[0], centers[1]], 0, 11)
     win_b = _harmonic_window([3, 4], [centers[3], centers[4]], 1, 12)
     result = solve_stage_integrated([win_a, win_b], kt=KT_300)
-    assert result["converged"] is False
+    assert result["analysis_status"] == "ANALYSIS_INCOMPLETE"
     assert result.get("error") in {
         "window_overlap_broken",
         "window_overlap_broken_for_covariance_chain",
@@ -656,19 +662,23 @@ def test_solve_stage_integrated_fails_closed_when_windows_do_not_overlap():
 
 def test_solve_stage_integrated_empty_input_is_not_converged():
     result = solve_stage_integrated([], kt=KT_300)
-    assert result["converged"] is False
+    assert result["analysis_status"] == "ANALYSIS_INCOMPLETE"
+    assert "window_outputs 为空" in " ".join(result["analysis_incomplete_reasons"])
     assert result["total_delta_G"] == 0.0
 
 
 def test_solve_stage_integrated_skips_windows_below_min_frames():
     """帧数低于 min_frames_per_window 的窗口会被跳过；跳过后不足以覆盖全部
-    有效窗口时，converged 必须为 False（不能只剩一个窗口就宣称收敛）。"""
+    有效窗口时，analysis_status 必须是 ANALYSIS_INCOMPLETE —— 缺窗的和是**部分和**，
+    不能只剩一个窗口就当成一条完整路径上的 ΔG。（原文写 `converged is False`，
+    那个键 2026-09-15 已删；"路径完整"正是接替它的三条硬不变量之一。）"""
     windows = _two_windows(CENTERS_DEGENERATE)
     windows[1] = _harmonic_window(
         [2, 3, 4], [CENTERS_DEGENERATE[i] for i in (2, 3, 4)], 1, 99, n_frames=5
     )
     result = solve_stage_integrated(windows, kt=KT_300, min_frames_per_window=10)
-    assert result["converged"] is False
+    assert result["analysis_status"] == "ANALYSIS_INCOMPLETE"
+    assert any("路径缺窗" in r for r in result["analysis_incomplete_reasons"])
 
 
 # ============================================================================

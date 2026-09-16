@@ -14,6 +14,14 @@
 最后死在缺窗那道身份门上。而 win4 有现成的对症动作，只是轮不到。
 """
 import json
+import pytest
+
+# 🔑 [2026-09-16] 本文件原来**没有任何标记** ⟹ 日常的 `pytest -m cpu_only` 整份
+# 跳过。里面全是纯 CPU 的源码契约探针，正好是最容易静默烂掉的那类（它们
+# 断言"某段代码存在"，一旦指错函数就只是找不到、不报错）。实测就烂过：
+# `decide()` 被拆成外壳之后这里 6 条全挂，而没人看得见。
+pytestmark = pytest.mark.cpu_only
+
 import os
 
 from abfe_preoptimizer import Stage2RepairController
@@ -64,6 +72,9 @@ def test_without_a_skip_the_old_earliest_order_is_unchanged(tmp_path):
 def test_a_replaced_parent_is_still_excluded(tmp_path):
     """`_replaced_parents` 的排除不得被这条优先级顺手绕过。"""
     import inspect
-    src = inspect.getsource(Stage2RepairController.decide)
+# 🔑 [2026-09] `decide()` 现在只是 23 行的外壳（"退役一个窗口再判一次"），判断体是 `_decide_once`（1831 行）。
+# 源码探针指着 `decide` 会一无所获 —— 断言"存在"的当场红，断言"不存在"的**静默变成假绿**。
+    src = (inspect.getsource(Stage2RepairController.decide)
+           + inspect.getsource(Stage2RepairController._decide_once))
     blk = src.split("_skipped_now = {")[1].split("if earliest is None:")[0]
     assert "_replaced_parents" in blk, "跳窗优先分支漏了 _replaced_parents 排除"

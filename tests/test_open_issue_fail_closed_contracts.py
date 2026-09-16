@@ -16,8 +16,6 @@ from __future__ import annotations
 
 import ast
 import os
-
-from abfe_core import frames_per_chunk
 import sys
 import types
 from pathlib import Path
@@ -25,6 +23,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from abfe_core import frames_per_chunk
 
 pytestmark = pytest.mark.cpu_only
 

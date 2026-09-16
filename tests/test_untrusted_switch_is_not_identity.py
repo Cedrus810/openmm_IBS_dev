@@ -82,42 +82,49 @@ def test_flag_does_not_mutate_the_callers_config_dict():
     assert cfg["kwargs"][FLAG] is True
 
 
-def _failing_vanishing_result():
-    return {
-        "stage": "vanishing",
-        "total_delta_G": 12.3,
-        "total_error": 0.9,
-        "target_support_gate": {
-            "passed": False,
-            "failure_reason": "raw_min_absolute_ess_below_threshold",
-            "failed_checks": ["raw_min_absolute_ess"],
-            "raw_min_absolute_ess": 2.8,
-            "protocol_version": ap.TARGET_SUPPORT_GATE_PROTOCOL_VERSION,
-        },
-    }
+def _failing_traditional_result():
+    """traditional 腿的求解产物：有限 ΔG，但 `converged` 不是 True。
 
+    🔑 [2026-09-15] 这里**故意**还用 `converged` —— 删键只波及
+    `ibs_engine.solve_stage_integrated`，traditional 腿这条路径的 `converged`
+    是另一个生产者、语义也不同（见 `_sampling_result_convergence_rejection_reason`
+    的 docstring）。别"统一"。
+    """
+    return {"total_delta_G": 12.3, "total_error": 0.9, "converged": False,
+            "min_overlap": 0.004, "min_overlap_threshold": 0.05}
+
+
+# 🔑🔑 [2026-09-15 重新指向] 下面两条原本打在
+# `ABFEPipeline._assert_stage_result_sane` 上，断言「默认 fail-closed / 开关打开
+# 才放行」。**那个分支已经不在那里了**：同日 target_support_gate 等四道阈值门被
+# 整体降级为只报告（不 raise、不触发补帧），`_assert_stage_result_sane` 里现在
+# 一处都不读 `allow_untrusted_stage_results`（实测 grep 0 命中）。
+#
+# 开关本身**没死，是搬家了**，今天有两个落点：
+#   · traditional 腿 —— `_assert_or_warn_sampling_converged(allow_untrusted=…)`，
+#     即下面这两条打的地方；
+#   · 自治控制器 —— 只改 `trust_level`（`abfe_preoptimizer.py` 约 4663 / 6139）
+#     与 rescue 跳过（`abfe_pipeline.py` 约 16840）。
+# 本文件的主题（开关不得进缓存身份）由上面四条覆盖，与落点无关。
 
 def test_default_is_still_fail_closed():
-    obj = object.__new__(ap.ABFEPipeline)
-    obj._last_run_config = {}
-    with pytest.raises(RuntimeError, match="物理目标支撑度硬门"):
-        ap.ABFEPipeline._assert_stage_result_sane(
-            obj, "vanishing", _failing_vanishing_result()
+    with pytest.raises(RuntimeError, match="未通过收敛 sanity gate"):
+        ap._assert_or_warn_sampling_converged(
+            _failing_traditional_result(), context="vanishing",
+            allow_untrusted=False, log=lambda *a, **k: None,
         )
 
 
 def test_explicit_opt_in_continues_but_marks_the_result_untrusted():
-    obj = object.__new__(ap.ABFEPipeline)
-    obj._last_run_config = {FLAG: True}
-    result = _failing_vanishing_result()
-    ap.ABFEPipeline._assert_stage_result_sane(obj, "vanishing", result)
-    # 放行 ≠ 抹掉证据
-    assert result["results_untrusted"] is True
-    gates = [
-        f.get("gate") if isinstance(f, dict) else f
-        for f in (result.get("stage_quality_failures") or [])
-    ]
-    assert "target_support_gate" in gates
+    logged = []
+    reason = ap._assert_or_warn_sampling_converged(
+        _failing_traditional_result(), context="vanishing",
+        allow_untrusted=True, log=logged.append,
+    )
+    # 放行 ≠ 抹掉证据：拒绝理由必须**返回给调用方落盘**，并且日志里刺眼。
+    assert reason is not None and "converged=False" in reason
+    assert any("allow_untrusted_stage_results=True 显式放行" in m for m in logged), logged
+    assert any("不得作为可发布结果" in m for m in logged), logged
 
 
 def test_cli_exposes_the_switch_and_defaults_to_off():

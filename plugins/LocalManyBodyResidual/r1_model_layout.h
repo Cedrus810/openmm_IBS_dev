@@ -86,7 +86,53 @@
 #define EXP025_DEVICE_ERROR_CANDIDATE_OVERFLOW 7
 #define EXP025_DEVICE_ERROR_UNSUPPORTED_BOX 8
 
+/* Legacy fail-closed floor. KEPT: EXP025_DEVICE_ERROR_MIN_DISTANCE (=2) is
+ * pinned by a static_assert in exp026_control_plane_layout.h, so the error
+ * code stays part of the ABI. As of 2026-09-16 (LR-06 plan A) no kernel
+ * raises it any more -- the four sites clamp instead of erroring. This macro
+ * survives only because the device source still #defines it and tests read it.
+ */
 #define EXP025_MIN_DISTANCE_ANGSTROM 0.1
+
+/* [LR-06 plan A, 2026-09-16] Pair-distance floor used for CLAMPING.
+ *
+ * Why clamping replaced the fail-closed error
+ * -------------------------------------------
+ * `bias_scale` multiplies the WHOLE Group-1 expression, which contains
+ * cv_k_int + cv_k_rest (the ligand<->environment softcore interaction). So
+ * `bias_scale = 0` is not "bias off", it makes the ligand a full ghost:
+ * water passes straight through it and r -> 0 is inevitable. Three code
+ * paths enter that state (EM, the dt ramp, the bias ramp) and two of them
+ * are deliberate. Meanwhile CustomCVForce evaluates EVERY collective
+ * variable regardless of its coefficient, so the plugin still ran on ghost
+ * geometry and hit the old hard gate. Blocking individual evaluation sites
+ * was tried and failed: three separate ones were found in one day
+ * (integrator force groups, groupless getState, getCollectiveVariableValues).
+ * Clamping removes the failure mode instead of arranging for it to go
+ * unobserved.
+ *
+ * Why 1.5 and not EXP025_MIN_DISTANCE_ANGSTROM (0.1)
+ * --------------------------------------------------
+ * 0.1 A only ever meant "keep 1/r from blowing up"; it is not a statement
+ * about the model. This value is the TRAINING SUPPORT LOWER BOUND. Measured
+ * on the shipped R1 model's training frames (pre_equilibration.dcd, 200
+ * frames, lambda=1, per-frame box): closest ligand<->environment approach is
+ * 1.517 A (water hydrogen) / 1.524 A (LJ-bearing), median 1.8 A.
+ *
+ * This matters because the radial basis does NOT decay at small r -- its 16
+ * centers are spread uniformly over [0, 5] A with width 0.333, so the basis
+ * is ~1.0 at 0.1 A. And the pair weights sitting on the five centers below
+ * the support bound (0.333 / 0.667 / 1.0 / 1.333 A) have the SAME magnitude
+ * as the well-trained ones (max|w| 0.30-0.37 vs 0.32-0.39): fully active,
+ * never constrained by data. Clamping at 0.1 A would keep evaluating them.
+ *
+ * ponytail: this is a compile-time constant matching the SHIPPED R1 model.
+ * A retrained model with a different support domain would silently reuse it.
+ * Upgrade path when that happens: carry `r_floor_angstrom` in the payload
+ * config + manifest (the offline trainer already measures it) and emit it
+ * through `defines` in buildAndLoadKernels(), the way NUM_RADIAL_BASIS is.
+ */
+#define EXP025_R_FLOOR_ANGSTROM 1.5
 
 /* Half-box MIC tie epsilon. Deliberately LOOSER than the CPU Reference's
  * 1e-9 (g1_math_core.h HALF_BOX_TIE_EPSILON): the default CUDA platform

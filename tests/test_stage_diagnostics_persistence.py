@@ -81,7 +81,9 @@ def test_json_safe_is_applied_by_build_stage_cache_payload():
         "total_delta_G": np.float64(145.9),
         "total_error": np.float64(1.38),
         "method": "Local-TMBAR covariance-chain (ESS-overlap-checked)",
-        "converged": np.bool_(True),
+        # 🔑 [2026-09-15] `converged` 已删键，payload 落的是 analysis_status /
+        # precision_status 两个正交状态。
+        "analysis_status": "ANALYSIS_COMPLETE",
         "coverage_diagnostics": {"covered_lambda_indices": np.arange(23)},
         "diagnostics": {
             "window_overlap_diagnostics": [
@@ -98,18 +100,25 @@ def test_json_safe_is_applied_by_build_stage_cache_payload():
     text = json.dumps(payload, indent=2)  # 刻意不传 cls=，复刻 _atomic_write_json
     assert "NaN" not in text
     back = json.loads(text)
-    assert back["converged"] is True
+    assert back["analysis_status"] == "ANALYSIS_COMPLETE"
     assert back["coverage_diagnostics"]["covered_lambda_indices"][-1] == 22
     assert back["diagnostics"]["max_endpoint_uncertainty_kJ_mol"] is None
 
 
 def test_build_stage_cache_payload_persists_convergence_evidence():
-    """converged / coverage_diagnostics 必须真的进 payload，不能只留在内存。"""
+    """analysis_status / coverage_diagnostics 必须真的进 payload，不能只留在内存。
+
+    🔑 [2026-09-15] 原文钉的是 `converged`。删键之后，**缺席本身就是判据**：
+    resume 命中时 `_stage_analysis_rejection_reason` 对缺 analysis_status 的缓存
+    fail-closed 拒绝复用 —— 所以这个字段没落盘的后果不是"少一条证据"，
+    是整份缓存作废。
+    """
     from abfe_pipeline import ABFEPipeline
 
     result = {
         "total_delta_G": 1.0, "total_error": 0.1,
-        "converged": False,
+        "analysis_status": "ANALYSIS_INCOMPLETE",
+        "analysis_incomplete_reasons": ["存在被跳过的窗口 [3]"],
         "coverage_diagnostics": {"dropped_window_indices": [3]},
         "diagnostics": {"min_overlap": 0.02},
         "lambda_endpoint_diagnostics": {},
@@ -117,7 +126,8 @@ def test_build_stage_cache_payload_persists_convergence_evidence():
     payload = ABFEPipeline._build_stage_cache_payload(
         "vanishing", result, 23, {}, [1.0, 0.0], [(0, 2)]
     )
-    assert payload["converged"] is False
+    assert payload["analysis_status"] == "ANALYSIS_INCOMPLETE"
+    assert payload["analysis_incomplete_reasons"] == ["存在被跳过的窗口 [3]"]
     assert payload["coverage_diagnostics"]["dropped_window_indices"] == [3]
 
 
@@ -151,7 +161,7 @@ def test_reusable_stage_cache_rehydrates_and_rechecks_every_gate():
         "stage": "vanishing",
         "total_delta_G": 12.0,
         "total_error": 0.5,
-        "converged": True,
+        "analysis_status": "ANALYSIS_COMPLETE",
         "coverage_diagnostics": {"covered_lambda_indices": [0, 1, 2]},
         "diagnostics": {
             "min_overlap": 0.20,
@@ -197,7 +207,9 @@ def test_reusable_vanishing_cache_without_target_support_gate_is_refused():
         "stage": "vanishing",
         "total_delta_G": 35.61,
         "total_error": 0.84,
-        "converged": True,
+        # 🔑 硬不变量这一侧给通过，本条测的才是"缺 target_support_gate ⟹ 拒绝"
+        # 那一道门；否则请求会被更早的 analysis_status fail-closed 吃掉。
+        "analysis_status": "ANALYSIS_COMPLETE",
         "coverage_diagnostics": {"covered_lambda_indices": [0, 1, 2]},
         "diagnostics": {
             "min_overlap": 0.4684,
@@ -216,87 +228,63 @@ def test_reusable_vanishing_cache_without_target_support_gate_is_refused():
 @pytest.mark.parametrize(
     "cached, message",
     [
+        # 🔑🔑 [2026-09-15] 这张表原来有四个用例，其中两个（min_overlap 低于阈值、
+        # target_support_gate 判失败）钉的是**已经被拿掉的 raise**：
+        #   · `min_overlap` 等四道拟合阈值门同日整体降级为只报告（阈值全未标定，
+        #     理由逐字写在 `_assert_stage_result_sane` 里）；
+        #   · present-but-failed 的 `target_support_gate` 从 2026-09-01 起就改成
+        #     "标 untrusted 继续"而不是 raise。
+        # 那两条的科学教训**没有被删**，改由下面
+        # `test_a_failed_target_support_gate_is_reused_but_marked_untrusted` 保管。
+        # 这里换成四道**今天仍然 fail-closed** 的硬不变量。
         (
+            # ① 硬不变量自己说没过
             {
                 "stage": "vanishing",
                 "total_delta_G": 1.0,
                 "total_error": 0.1,
-                "converged": False,
+                "analysis_status": "ANALYSIS_INCOMPLETE",
+                "analysis_incomplete_reasons": ["存在被跳过的窗口 [2]"],
                 "coverage_diagnostics": {},
                 "diagnostics": {},
             },
-            "converged=True",
+            "analysis_status",
         ),
         (
+            # ② 老产物：连 analysis_status 都没有 ⟹ 从未按当前口径判过
             {
                 "stage": "vanishing",
                 "total_delta_G": 1.0,
                 "total_error": 0.1,
-                "converged": True,
+                "converged": True,          # 老键，**不算数**
+                "coverage_diagnostics": {},
+                "diagnostics": {},
+            },
+            "缺少 analysis_status",
+        ),
+        (
+            # ③ 覆盖证据缺失
+            {
+                "stage": "vanishing",
+                "total_delta_G": 1.0,
+                "total_error": 0.1,
+                "analysis_status": "ANALYSIS_COMPLETE",
                 "coverage_diagnostics": None,
                 "diagnostics": {},
             },
             "coverage_diagnostics",
         ),
         (
+            # ④ σ 非有限（MBAR 协方差没解出来）
             {
                 "stage": "vanishing",
                 "total_delta_G": 1.0,
-                "total_error": 0.1,
-                "converged": True,
+                "total_error": float("nan"),
+                "analysis_status": "ANALYSIS_COMPLETE",
                 "coverage_diagnostics": {},
-                "diagnostics": {
-                    "min_overlap": 0.01,
-                    "min_overlap_threshold": 0.05,
-                    # 目标支撑度通过，好让这个用例测的确实是 min_overlap 那道门
-                    # 而不是被新加的目标支撑度门提前短路。
-                    "target_support_gate": {
-                        "passed": True,
-                        "failure_reason": None,
-                        "failed_checks": [],
-                    },
-                },
+                "diagnostics": {},
             },
-            "低于阈值",
-        ),
-        (
-            # [TARGET_SUPPORT_GATE_PROTOCOL_VERSION=1] mixture 覆盖度很高、raw
-            # 目标支撑度很低 —— 正是 4W53 的失效形状：旧的五道门全部通过。
-            {
-                "stage": "vanishing",
-                "total_delta_G": 35.61,
-                "total_error": 0.84,
-                # 缓存自称 converged=True——正是 4W53 落盘的那一份的形状。判定
-                # 必须来自重新执行的门，而不是缓存里那个布尔值。
-                "converged": True,
-                "coverage_diagnostics": {},
-                "diagnostics": {
-                    "min_overlap": 0.4684,
-                    "min_overlap_threshold": 0.05,
-                    "min_decorrelated_samples": 332,
-                    "min_decorrelated_samples_threshold": 20,
-                    "max_endpoint_uncertainty_kJ_mol": 0.75,
-                    "max_endpoint_uncertainty_kJ_mol_threshold": 1.0,
-                    "window_overlap_diagnostics": [],
-                    "raw_min_absolute_ess_threshold": 20.0,
-                    "max_top1pct_raw_weight_threshold": 0.35,
-                    "target_support_gate": {
-                        "passed": False,
-                        "failure_reason": "insufficient_target_support",
-                        "failed_checks": [
-                            "raw_absolute_ess_below_threshold",
-                            "top1pct_raw_weight_above_threshold",
-                        ],
-                        "raw_min_absolute_ess": 8.28,
-                        "raw_min_absolute_ess_threshold": 20.0,
-                        "max_top1pct_raw_weight": 0.558,
-                        "max_top1pct_raw_weight_threshold": 0.35,
-                        "raw_min_ess_ratio": 0.0196,
-                        "max_common_mode_log_sigma_kT": 1.24,
-                    },
-                },
-            },
-            "insufficient_target_support",
+            "total_error",
         ),
     ],
 )
@@ -304,6 +292,60 @@ def test_reusable_stage_cache_fails_closed(cached, message):
     pipeline = _pipeline_without_init()
     with pytest.raises(RuntimeError, match=message):
         pipeline._assert_reusable_stage_cache_sane("Stage 2", cached)
+
+
+def test_a_failed_target_support_gate_is_reused_but_marked_untrusted():
+    """4W53 那份缓存的形状：mixture 覆盖度很高、raw 目标支撑度塌掉。
+
+    **它今天不再被拒绝复用** —— 2026-09-01 决定：门拦住的是一个我们本来就无法
+    验证对错的数（复合物腿没有参考真值），代价却是永远拿不到唯一能验证的溶剂腿。
+    所以改成"放行但留痕"。本条钉的就是留痕那一半，三项缺一不可：
+
+      ① 不 raise；② `results_untrusted=True` 随缓存往返；
+      ③ 证据进 `stage_quality_failures`（failure_reason / failed_checks 原样可审计）。
+
+    ⚠️ 少任何一项，这份 +41.9 kJ/mol 的缓存就会以"一次干净通过"的样子被复用 ——
+    那正是 STAGE2_ROOT_CAUSE_2026-08-28.md 记的那次事故。
+    """
+    pipeline = _pipeline_without_init()
+    logged = []
+    pipeline._log = logged.append
+    cached = {
+        "stage": "vanishing",
+        "total_delta_G": 35.61,
+        "total_error": 0.84,
+        "analysis_status": "ANALYSIS_COMPLETE",
+        "coverage_diagnostics": {},
+        "diagnostics": {
+            "min_overlap": 0.4684,
+            "min_overlap_threshold": 0.05,
+            "window_overlap_diagnostics": [],
+            "raw_min_absolute_ess_threshold": 20.0,
+            "max_top1pct_raw_weight_threshold": 0.35,
+            "target_support_gate": {
+                "passed": False,
+                "failure_reason": "insufficient_target_support",
+                "failed_checks": [
+                    "raw_absolute_ess_below_threshold",
+                    "top1pct_raw_weight_above_threshold",
+                ],
+                "raw_min_absolute_ess": 8.28,
+                "raw_min_absolute_ess_threshold": 20.0,
+                "max_top1pct_raw_weight": 0.558,
+                "max_top1pct_raw_weight_threshold": 0.35,
+            },
+        },
+    }
+    pipeline._assert_reusable_stage_cache_sane("Stage 2", cached)
+
+    assert cached["results_untrusted"] is True, "放行了却没留痕 ⟹ 静默复用"
+    gates = [f.get("gate") for f in (cached.get("stage_quality_failures") or [])]
+    assert "target_support_gate" in gates
+    failure = next(f for f in cached["stage_quality_failures"]
+                   if f.get("gate") == "target_support_gate")
+    assert failure["failure_reason"] == "insufficient_target_support"
+    assert "raw_absolute_ess_below_threshold" in failure["failed_checks"]
+    assert any("不得作为可发布结果" in m for m in logged), logged
 
 
 def test_both_stage_resume_branches_recheck_cached_scientific_gates():
@@ -318,7 +360,13 @@ def test_both_stage_resume_branches_recheck_cached_scientific_gates():
 
 
 REQUIRED_DIAGNOSTIC_KEYS = [
-    "converged",
+    # 🔑 [2026-09-15] `converged` 删键 ⟹ 换成两个正交状态。四项落盘都是必须的：
+    # `_assert_reusable_stage_cache_sane` 从 diagnostics 把它们拉回顶层重判，
+    # 缺任何一项，resume 命中时整份缓存按"老产物"被拒。
+    "analysis_status",
+    "analysis_incomplete_reasons",
+    "precision_status",
+    "precision_evidence",
     "coverage_diagnostics",
     "covariance_chain_segments",
     "min_overlap",
@@ -354,7 +402,11 @@ def test_populate_stage_diagnostics_carries_every_gate():
     from abfe_pipeline import ABFEPipeline
 
     result = {
-        "total_delta_G": 145.9, "total_error": 1.38, "converged": True,
+        "total_delta_G": 145.9, "total_error": 1.38,
+        "analysis_status": "ANALYSIS_COMPLETE",
+        "analysis_incomplete_reasons": [],
+        "precision_status": "UNMEASURED",
+        "precision_evidence": {"n_independent_repeats": 1},
         "min_overlap": 0.5, "min_overlap_threshold": 0.05,
         "min_occupancy_normalized": 0.9,
         "min_decorrelated_samples": 142,
@@ -377,7 +429,8 @@ def test_populate_stage_diagnostics_carries_every_gate():
     diag = result["diagnostics"]
     for key in REQUIRED_DIAGNOSTIC_KEYS:
         assert key in diag, f"diagnostics 缺 {key}——归档结果将无法复核为何放行"
-    assert diag["converged"] is True
+    assert diag["analysis_status"] == "ANALYSIS_COMPLETE"
+    assert diag["precision_status"] == "UNMEASURED"
     assert diag["immutable_bridge_rescue"]["plan_id"] == "c3594e2d792a"
     assert diag["split_half_diagnostics"]["max_window_drift_over_2sigma"] == 0.7
 

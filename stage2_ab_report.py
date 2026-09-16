@@ -202,10 +202,111 @@ def render_run(run_dir, refresh=True):
     return "\n".join(L)
 
 
+def window_signature(w):
+    """窗口的**内容身份** = 它装的那串 λ（量化到 1e-9）。
+
+    🔑🔑 [2026-09-16] **A/B 的逐窗对齐不能用 `window_idx`。**
+    布局一变（插 λ / 拆窗 / 换 min_states），同一个下标在两条臂上装的是
+    **不同的 λ**。真机 cmet_ligand2：A 臂 6 窗、B 臂 7 窗，A-w4 对应 B-w5、
+    A-w5 对应 B-w6 —— 按下标对齐会把 A 的失败窗口和 B 的健康窗口摆成一行，
+    并算出一个毫无意义的 "B/A"。这次是人工发现的，报告本身没报警。
+
+    返回 `None` 表示这个窗口没有 λ 记录（旧 manifest）⟹ **不猜，不对齐**。
+    """
+    lam = w.get("lambdas_vdw")
+    if not lam:
+        return None
+    try:
+        return tuple(round(float(x), 9) for x in lam)
+    except (TypeError, ValueError):
+        return None
+
+
+def render_ab_windows(a, b):
+    """逐窗主验收量，按 **λ 签名**对齐，并显示 `verdict_source` 与 `n_decorr`。
+
+    `verdict_source` 必须显示：`HARD_INSUFFICIENT` 有**两个**来源，补救方向不同 ——
+      · `min_n_eff_over_g`  比值 <1，支撑真的崩了；
+      · `solver_eligibility` 去相关帧数 < 下限，**比值没参与判定**
+        （`ibs_engine.window_self_support_check`：不够资格 ⟹ 强制 HARD，压过分档）。
+    真机 cmet_ligand2 两条臂里**所有** HARD 都是后者（n_decorr=7/8 < 10），
+    而比值 2.37/3.32/4.09 全落在 `INSUFFICIENT_DATA` 档。只显示 verdict
+    会把「帧数还不够」读成「权重塌缩」。
+    """
+    wa = list(a.get("windows") or [])
+    wb = list(b.get("windows") or [])
+    sa = {window_signature(w): w for w in wa if window_signature(w)}
+    sb = {window_signature(w): w for w in wb if window_signature(w)}
+    unaligned = [w for w in wa + wb if window_signature(w) is None]
+
+    L = ["╟─ 逐窗主验收量 min N_eff/g（按 **λ 签名**对齐，不是按 window_idx）"]
+    if unaligned:
+        L.append(f"   ⚠️ 有 {len(unaligned)} 个窗口没有 `lambdas_vdw`（旧 manifest）"
+                 "⟹ **不对齐、不显示**，重新生成 manifest 再比。")
+    L.append(f"   {'A win':>6} {'B win':>6} {'A':>8} {'B':>8} {'B/A':>7} "
+             f"{'A n_dec':>8} {'B n_dec':>8}  verdict(source) A → B")
+
+    def _cell(w, key, fmt="8.2f"):
+        v = (w or {}).get(key)
+        return "      · " if v is None else format(v, fmt)
+
+    def _vs(w):
+        if not w:
+            return "·"
+        if (w or {}).get("indeterminate"):
+            return f"**INDETERMINATE**({w['indeterminate'].get('reason')})"
+        return f"{w.get('verdict')}({w.get('verdict_source')})"
+
+    def _ratio(wa_, wb_):
+        """配对比值。**任一侧无结论就拒算**，并说明为什么空着。
+
+        无结论 ≠ 失败 ≠ 0。硬算 B/A 等于把一个没测出来的量当成测出来了。
+        """
+        if (wa_ or {}).get("indeterminate") or (wb_ or {}).get("indeterminate"):
+            return "  n.d. "
+        va_, vb_ = (wa_ or {}).get("min_n_eff_over_g"), (wb_ or {}).get("min_n_eff_over_g")
+        return f"{vb_ / va_:7.2f}" if (va_ and vb_ and va_ > 0) else "      ·"
+
+    seen = set()
+    for w in wa:
+        sig = window_signature(w)
+        if not sig:
+            continue
+        seen.add(sig)
+        o = sb.get(sig)
+        ratio = _ratio(w, o)
+        L.append(f"   {w.get('window_idx'):>6} "
+                 f"{'     ·' if o is None else format(o.get('window_idx'), '6d')} "
+                 f"{_cell(w, 'min_n_eff_over_g')} {_cell(o, 'min_n_eff_over_g')} {ratio} "
+                 f"{str((w or {}).get('n_decorrelated')):>8} "
+                 f"{str((o or {}).get('n_decorrelated')):>8}  {_vs(w)} → {_vs(o)}")
+    for w in wb:                      # B 独有的窗口（A 里没有这串 λ）
+        sig = window_signature(w)
+        if not sig or sig in seen:
+            continue
+        L.append(f"   {'     ·':>6} {w.get('window_idx'):>6} {'      · ':>8} "
+                 f"{_cell(w, 'min_n_eff_over_g')} {'      ·':>7} {'       ·':>8} "
+                 f"{str(w.get('n_decorrelated')):>8}  · → {_vs(w)}")
+    matched = len(set(sa) & set(sb))
+    L.append(f"   —— 对齐上 {matched} 个窗口；A 独有 {len(sa) - matched}、"
+             f"B 独有 {len(sb) - matched}。**只有对齐上的行可以比 B/A**。")
+    nd = [(w.get("window_idx"), arm)
+          for arm, ws in (("A", wa), ("B", wb)) for w in ws
+          if (w or {}).get("indeterminate")]
+    if nd:
+        L.append("   ⚠️ **不可判定**（`n.d.`）："
+                 + "、".join(f"{arm}-w{i}" for i, arm in nd)
+                 + " 的冻结验证在预算内始终没求出 Δf−ΔF ⟹ 对这份 f_k **无结论**。"
+                 "既不是失败也不是 0，**不得**为它硬算 B/A，也**不得**把它从配对里删掉。"
+                 "含无结论窗口的 run，其路径级结果不是一个完整观测。")
+    return "\n".join(L)
+
+
 def render_ab(base_dir, cand_dir):
     """A/B：先判身份可比性，再比验收量与代价。"""
-    a = manifest_for(base_dir) or {}
-    b = manifest_for(cand_dir) or {}
+    # 测试注入点：传进来的对象自带 manifest 时直接用它，不读盘。
+    a = getattr(base_dir, "manifest", None) or manifest_for(base_dir) or {}
+    b = getattr(cand_dir, "manifest", None) or manifest_for(cand_dir) or {}
     ia, ib = a.get("identity") or {}, b.get("identity") or {}
     L = ["╔═ A/B 对比", f"║  A(baseline) = {base_dir}", f"║  B(candidate) = {cand_dir}",
          "╟─ 身份可比性"]
@@ -235,7 +336,20 @@ def render_ab(base_dir, cand_dir):
     L.append("   ⚠️ 精度=UNMEASURED 表示跨重复离散度**没有测**（需要 ≥3 个同协议独立"
              "重复），既不是达标也不是不达标；上面的 ± 是单次 MBAR 的渐近 σ，"
              "它对「该采的构型一次都没采到」失明，不能当精度结论。")
-    if da is not None and db is not None:
+    # 🔑🔑 [2026-09-16] **含"无结论"窗口的 run 不是一个完整观测。**
+    # 那个窗口的 Δf−ΔF 在预算内从未求出 ⟹ 路径上有一个洞。任何"总和"都是把洞
+    # 当成 0，任何 Δ(B−A) 都是在比两个口径不同的东西。所以这里**拒算**，
+    # 并把是哪几个窗口、为什么说清楚 —— 不是静默留空。
+    _nd_arm = {nm: [w.get("window_idx") for w in (m.get("windows") or [])
+                    if (w or {}).get("indeterminate")]
+               for nm, m in (("A", a), ("B", b))}
+    if any(_nd_arm.values()):
+        L.append("   ⛔ **不可判定，拒绝计算 Δ(B−A)**："
+                 + "；".join(f"{nm} 臂窗口 {v}" for nm, v in _nd_arm.items() if v)
+                 + " 的冻结验证无结论 ⟹ 该 run 的路径级结果**不完整**。"
+                 "补齐的办法只有在**同一协议下**重跑（不是 resume —— resume 会开新的"
+                 "冻结周期并进下一阶预算，那是自适应加预算，会毁掉固定预算设计）。")
+    elif da is not None and db is not None:
         d = db - da
         sig = (None if (ea is None or eb is None)
                else (float(ea) ** 2 + float(eb) ** 2) ** 0.5)
@@ -243,17 +357,7 @@ def render_ab(base_dir, cand_dir):
                  + (f"  = {abs(d) / sig:.2f}σ（合并 σ={sig:.4f}）"
                     if sig else "  （σ 未知，两臂至少一边没有 total_error）"))
 
-    L.append("╟─ 逐窗主验收量 min N_eff/g")
-    wa = {int(w["window_idx"]): w for w in (a.get("windows") or [])}
-    wb = {int(w["window_idx"]): w for w in (b.get("windows") or [])}
-    L.append(f"   {'win':>4} {'A':>9} {'B':>9}  {'B/A':>7}  verdict A → B")
-    for i in sorted(set(wa) | set(wb)):
-        va = (wa.get(i) or {}).get("min_n_eff_over_g")
-        vb = (wb.get(i) or {}).get("min_n_eff_over_g")
-        ratio = f"{vb / va:7.2f}" if (va and vb and va > 0) else "      ·"
-        L.append(f"   {i:>4} {'     ·  ' if va is None else format(va, '9.2f')}"
-                 f" {'     ·  ' if vb is None else format(vb, '9.2f')}  {ratio}  "
-                 f"{(wa.get(i) or {}).get('verdict')} → {(wb.get(i) or {}).get('verdict')}")
+    L.append(render_ab_windows(a, b))
 
     ca, cb = a.get("cost") or {}, b.get("cost") or {}
     L.append("╟─ 代价（⚠️ 只比 ΔG 不比代价等于没比）")

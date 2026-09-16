@@ -29,7 +29,7 @@ FROZEN_CANDIDATE_LIST_CAPACITY = 8192
 # 与 rank11 冻结版逐字节相同（`diff` 只有那段注释），因此这里连同 manifest 一起
 # 换成新 sha，而不是放宽这道门。旧值 10afff53...b5b0be（无版权头）。
 KNOWN_PLUGIN_SOURCE_SHA256 = (
-    "b2e730c95ffe643bc1000478f651bb8b34d0fd7fae7d0afa7432e16581b7b154"
+    "5c74365dffaa648d0ddb86154b90682803c1a951d1e3bee0d453b721ba2dfd81"
 )
 FEATURE_NAME = "Outer-Lambda Local Residual for IBS"
 EM_POLICY = "no_residual_twin"

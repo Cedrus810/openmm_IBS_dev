@@ -4,6 +4,14 @@
 所以断言必须测行为，不能只查源码里出现过某个参数名。
 """
 import inspect
+import pytest
+
+# 🔑 [2026-09-16] 本文件原来**没有任何标记** ⟹ 日常的 `pytest -m cpu_only` 整份
+# 跳过。里面全是纯 CPU 的源码契约探针，正好是最容易静默烂掉的那类（它们
+# 断言"某段代码存在"，一旦指错函数就只是找不到、不报错）。实测就烂过：
+# `decide()` 被拆成外壳之后这里 6 条全挂，而没人看得见。
+pytestmark = pytest.mark.cpu_only
+
 import json
 import os
 
@@ -142,7 +150,10 @@ def test_layout_actions_are_declared_free_and_therefore_must_not_sample():
     两边是同一条契约的两半，必须一起成立：判零成本 + 不采样。
     """
     import ast
-    decide = inspect.getsource(Stage2RepairController.decide)
+# 🔑 [2026-09] `decide()` 现在只是 23 行的外壳（"退役一个窗口再判一次"），判断体是 `_decide_once`（1831 行）。
+# 源码探针指着 `decide` 会一无所获 —— 断言"存在"的当场红，断言"不存在"的**静默变成假绿**。
+    decide = (inspect.getsource(Stage2RepairController.decide)
+              + inspect.getsource(Stage2RepairController._decide_once))
     # 半边 A：这两个动作确实**不**在生产计费表里
     charged = decide.split("_PRODUCTION_CHARGED = (")[1].split(")")[0]
     assert "INSERT_LAMBDA" not in charged and "SPLIT_TAIL_WINDOW" not in charged

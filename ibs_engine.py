@@ -460,6 +460,11 @@ def _stage_window_sampling_identity(protocol_key):
     payload = json.loads(json.dumps(protocol_key["payload"]))
     payload.pop("code_sha256", None)
     payload.pop("final_gate_thresholds", None)
+    # 🔑 [2026-09-16] 冻结验证的批数上限与 `final_*` 门槛同类：它决定**判定**，
+    # 不决定这个窗口采的是什么。冻结验证的样本与生产严格隔离（"验证样本不计入
+    # 生产，生产从 0 步开始"），所以窗口轨迹对它免疫、可以照常复用；
+    # 而 stage **结果**仍要求完整 protocol key，那一层会因它失配 —— 正是要的效果。
+    payload.pop("ibs_local_mbar_gate_max_batches", None)
     config = payload.get("run_config") or {}
     config.pop("n_steps_per_window", None)
     config.pop("enable_early_stop", None)
@@ -8608,9 +8613,15 @@ class IBSValidationBudgetIndeterminateError(RuntimeError):
     冻结 f_k、已累计的批数和已耗预算都已落盘，resume 接着验。
     """
 
-    def __init__(self, message: str, diagnostics: Dict):
+    def __init__(self, message: str, diagnostics: Dict,
+                 window_idx: Optional[int] = None):
         super().__init__(message)
         self.diagnostics = diagnostics
+        # 🔑 [2026-09-16] **哪个窗口无结论，必须机器可读。**
+        # 先前只有消息字符串里写着窗口号 ⟹ 调用方想"把这个窗口记成 indeterminate、
+        # 继续跑其余窗口"就只能去正则那句中文。固定预算模式（自治控制器关闭）下
+        # 这条信号没人接管，这个下标就是唯一能把"无结论"和"失败"分开的东西。
+        self.window_idx = None if window_idx is None else int(window_idx)
 
 
 class ExistingEnsembleRequiresRescueAudit(RuntimeError):
@@ -18274,6 +18285,7 @@ class IBSWindowManagerDualLambda:
                         f"resume 会接着验；完整诊断在 {failure_path}。"
                         "要继续请延长该窗口的冻结验证预算，或先处理相关时间过长的根因。",
                         diagnostics=bias_warmup_diag,
+                        window_idx=window_idx,
                     )
                 # 🔑 [IBS_BIAS_PROTOCOL_VERSION=12] 区分两种不同的"未收敛"：
                 # (a) 这次（或之前 resume 续验的那次）已经用 MBAR 校准探针给出过

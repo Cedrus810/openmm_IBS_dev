@@ -42,6 +42,10 @@
 #include <string>
 #include <vector>
 
+// [LR-06 plan A] EXP025_R_FLOOR_ANGSTROM -- the clamp floor must be the SAME
+// constant the CUDA kernels compile against, not a second copy of the number.
+#include "r1_model_layout.h"
+
 namespace exp025_g1 {
 
 struct MathError : std::runtime_error {
@@ -202,8 +206,15 @@ inline double quinticC2Grad(double r, double inner, double outer) {
 struct EdgeGeometry {
     int ligandLocal;      // 0..nLigand-1, index into the ASCENDING-sorted ligand topology id list
     int environmentAtom;  // global atom index
-    double rAngstrom;
-    std::array<double, 3> dispAngstrom;  // environment - ligand, wrapped
+    double rAngstrom;                    // CLAMPED to EXP025_R_FLOOR_ANGSTROM (see belowFloor)
+    std::array<double, 3> dispAngstrom;  // environment - ligand, wrapped (RAW, never clamped)
+    // [LR-06 plan A, 2026-09-16] True when the raw distance was under the
+    // training-support floor and rAngstrom got clamped. Energy still counts
+    // this edge (at the clamped r); the FORCE loop must skip it, because the
+    // clamped energy is constant in r there so dE/dr is exactly 0. Skipping
+    // is also what keeps `dispAngstrom / rAngstrom` from being evaluated --
+    // with a clamped denominator that quotient is not a unit vector.
+    bool belowFloor;
 };
 
 struct EnumerationResult {
@@ -214,8 +225,7 @@ struct EnumerationResult {
 };
 
 // Rebuilds edges purely from positions/box/types -- NEVER consumes an
-// externally-provided edge list. Fails closed (throws) on: r < 0.1 Angstrom,
-// a half-box MIC tie, or any of the three EXP-020 hard capacity ceilings
+// externally-provided edge list. Fails closed (throws) on: a half-box MIC tie, or any of the three EXP-020 hard capacity ceilings
 // (max_edges / max_neighbors_per_ligand / max_environment_atoms) being
 // exceeded.
 inline EnumerationResult enumerateEdges(const AtomSystemView& fx, const ModelParams& model) {
@@ -235,11 +245,16 @@ inline EnumerationResult enumerateEdges(const AtomSystemView& fx, const ModelPar
             std::array<double, 3> dispNm = minimumImageDisplacement(fx.positionsNm[ligandAtom], fx.positionsNm[envAtom], fx.boxNm, invBox);
             std::array<double, 3> dispAngstrom = {dispNm[0] * 10.0, dispNm[1] * 10.0, dispNm[2] * 10.0};
             double r = std::sqrt(dispAngstrom[0] * dispAngstrom[0] + dispAngstrom[1] * dispAngstrom[1] + dispAngstrom[2] * dispAngstrom[2]);
-            if (r < 0.1)
-                throw MathError("near-singular pair distance < 0.1 Angstrom (ligand atom " + std::to_string(ligandAtom) +
-                                 ", environment atom " + std::to_string(envAtom) + "): fail-closed");
-            if (r < model.outerCutoffAngstrom) {
-                result.edges.push_back({localIdx, envAtom, r, dispAngstrom});
+            // [LR-06 plan A, 2026-09-16] Was: throw on r < 0.1 A. Now clamps,
+            // byte-for-byte mirroring the CUDA kernels (clamp in computeQ,
+            // zero force in the scatter). The two implementations of this
+            // rule MUST stay in lockstep -- G1/G2 assert CUDA/Reference
+            // parity, so a one-sided change shows up as a parity failure,
+            // and the rationale lives in r1_model_layout.h next to the macro.
+            const bool below = (r < EXP025_R_FLOOR_ANGSTROM);
+            const double rEff = below ? (double) EXP025_R_FLOOR_ANGSTROM : r;
+            if (rEff < model.outerCutoffAngstrom) {
+                result.edges.push_back({localIdx, envAtom, rEff, dispAngstrom, below});
                 neighborCount++;
                 result.uniqueEnvironmentAtoms.insert(envAtom);
                 if ((int64_t)result.edges.size() > model.maxEdges)
@@ -332,6 +347,9 @@ inline ForwardResult evaluate(const AtomSystemView& fx, const ModelParams& model
     for (int i = 0; i < nLigand; i++) dB_dq[i] = sech2 * dRhoQ_dq[i];
 
     for (const EdgeGeometry& e : enumeration.edges) {
+        // [LR-06 plan A] Clamped edge -> energy plateau -> zero force. Mirrors
+        // the `continue` in the CUDA force-scatter kernels.
+        if (e.belowFloor) continue;
         int ligandAtom = enumeration.sortedLigandTopologyIds[e.ligandLocal];
         int ligandType = fx.atomTypeIndex[ligandAtom];
         int envType = fx.atomTypeIndex[e.environmentAtom];

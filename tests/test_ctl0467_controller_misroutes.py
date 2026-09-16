@@ -33,7 +33,12 @@ def test_a_middle_window_rejected_by_heldout_is_not_answered_with_a_tail_split(
         tmp_path, windows=w, ranges=[(0, 4), (3, 8), (7, 16)], n_states=16,
         config={"stage2_window_min_states": 4, "stage2_window_max_states": 5,
                 "max_path_insertions": 3},
-        stage_result={"converged": False,
+        # 🔑 [2026-09-15] `converged` 已删键；写老键的 stage_result **根本不会被
+        # `_read_stage_result()` 认成一份 stage 结果**（嗅探键是 `analysis_status` /
+        # `total_delta_G`）⟹ 求解器证据整份读不到，归因判反。
+        stage_result={"analysis_status": "ANALYSIS_INCOMPLETE",
+                      "analysis_incomplete_reasons": ["路径缺窗。"],
+                      "total_delta_G": -12.3, "total_error": 0.9,
                       "cumulative_fk_residual_production": [
                           {"window_index": 1, "verdict": "FAIL_CUMULATIVE_FK",
                            "cumulative_residual_span_kJ_mol": 14.0}]},
@@ -92,7 +97,10 @@ def test_a_non_mutating_probe_is_not_charged_a_production_block(tmp_path):
 
     import abfe_preoptimizer
 
-    src = inspect.getsource(abfe_preoptimizer.Stage2RepairController.decide)
+# 🔑 [2026-09] `decide()` 现在只是 23 行的外壳（"退役一个窗口再判一次"），判断体是 `_decide_once`（1831 行）。
+# 源码探针指着 `decide` 会一无所获 —— 断言"存在"的当场红，断言"不存在"的**静默变成假绿**。
+    src = (inspect.getsource(abfe_preoptimizer.Stage2RepairController.decide)
+           + inspect.getsource(abfe_preoptimizer.Stage2RepairController._decide_once))
     assert "_PRODUCTION_CHARGED" in src
     charged = src.split("_PRODUCTION_CHARGED")[1][:300]
     # 真正零采样的探针**不在**收费名单里

@@ -113,9 +113,13 @@ def test_branch_9b_does_not_unconditionally_top_up_a_rewindow_child():
 
     src = (pathlib.Path(__file__).resolve().parents[1]
            / "abfe_preoptimizer.py").read_text("utf-8")
+# 🔑 [2026-09] `decide()` 现在只是 23 行的外壳（"退役一个窗口再判一次"），判断体是 `_decide_once`（1831 行）。
+# 源码探针指着 `decide` 会一无所获 —— 断言"存在"的当场红，断言"不存在"的**静默变成假绿**。
     fn = next(n for n in ast.walk(ast.parse(src))
-              if isinstance(n, ast.FunctionDef) and n.name == "decide")
+              if isinstance(n, ast.FunctionDef) and n.name == "_decide_once")
     body = ast.unparse(fn)
     # 子窗分支里必须出现 needs_frames 的判断，且两支都存在
-    assert "_u.get('needs_frames')" in body or '_u.get("needs_frames")' in body
+    # [2026-09] 循环变量从 `_u` 改名成 `u`；钉变量名是脆的，这里只钉**读的是哪个字段**。
+    assert "get('needs_frames')" in body or 'get("needs_frames")' in body, \
+        "子窗分支不再读 needs_frames ⟹ 样本量与支撑失败的分流没了"
     assert "加帧治不了" in body and "不拿加帧顶替" in body

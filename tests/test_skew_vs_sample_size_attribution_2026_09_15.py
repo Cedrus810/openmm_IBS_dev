@@ -15,6 +15,14 @@
 ⚠️ `solver_eligibility` **必须留在样本量那一档**：长 τ 的解耦端窗口是真的帧不够，
 插 λ 不缩短构象慢模态的 τ_int。这次只动 `min_n_eff_over_g` 一个。
 """
+import pytest
+
+# 🔑 [2026-09-16] 本文件原来**没有任何标记** ⟹ 日常的 `pytest -m cpu_only` 整份
+# 跳过。里面是纯 CPU 的源码契约探针，正好是最容易静默烂掉的那类（断言"某段
+# 代码存在"，一旦指错函数就只是找不到、不报错）。实测就烂过：`decide()` 被
+# 拆成外壳之后这里全挂，而没人看得见。
+pytestmark = pytest.mark.cpu_only
+
 from abfe_preoptimizer import (
     _SAMPLE_SIZE_VERDICT_SOURCES,
     support_failure_is_skew as is_skew,
@@ -68,7 +76,10 @@ def test_both_call_sites_pass_the_frame_counts():
     import inspect
 
     from abfe_preoptimizer import Stage2RepairController
+# 🔑 [2026-09] `decide()` 现在只是 23 行的外壳（"退役一个窗口再判一次"），判断体是 `_decide_once`（1831 行）。
+# 源码探针指着 `decide` 会一无所获 —— 断言"存在"的当场红，断言"不存在"的**静默变成假绿**。
     for src in (inspect.getsource(Stage2RepairController.decide),
+                inspect.getsource(Stage2RepairController._decide_once),
                 inspect.getsource(Stage2RepairController._read_single_stage)
                 if hasattr(Stage2RepairController, "_read_single_stage")
                 else inspect.getsource(Stage2RepairController)):

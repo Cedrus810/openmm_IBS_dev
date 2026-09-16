@@ -32,10 +32,14 @@ pytestmark = pytest.mark.cpu_only
 def _good_result():
     # A canned result whose values pass every hard gate in
     # _assert_stage_result_sane (min_overlap here = importance-ESS ratio).
+    # 🔑 [2026-09-15] `converged` 已删键，硬不变量改由 `analysis_status` 表达。
+    # 下面 min_overlap / min_absolute_ess / min_decorrelated_samples /
+    # max_endpoint_uncertainty 四项**同日降级为只报告**（不 raise、不触发补帧），
+    # 原样留着是为了让这份 fixture 仍然覆盖报告路径 —— 别当成它们还是门。
     return {
         "total_delta_G": -12.34,
         "total_error": 0.42,
-        "converged": True,
+        "analysis_status": "ANALYSIS_COMPLETE",
         "min_overlap": 0.20,
         "min_overlap_threshold": 0.05,
         "min_absolute_ess": 250.0,
@@ -128,7 +132,13 @@ def test_non_mutating_hard_gate_failure_propagates(monkeypatch):
     _patch_all_mutators(monkeypatch)
     calls = {"run_once": 0}
     bad = _good_result()
-    bad["min_overlap"] = 0.001  # below threshold -> importance-ESS hard gate fails
+    # 🔑 [2026-09-15] 本条原来用 `min_overlap = 0.001` 制造失败。**那不再是硬门**
+    # —— min_overlap / target_support / min_decorrelated / max_endpoint_uncertainty
+    # 四项同日降级为只报告（阈值全未标定，理由见 `_assert_stage_result_sane`），
+    # 压到 0.001 现在一声不吭地通过。
+    # 本条锁的是"硬门失败要原样上抛、不被修复循环吞掉"，所以改用一个**今天仍然
+    # 是硬不变量**的失败：σ 非有限（MBAR 协方差解不出来）。
+    bad["total_error"] = float("nan")
 
     def run_once(n_states, lambdas, ranges, *a, **k):
         calls["run_once"] += 1

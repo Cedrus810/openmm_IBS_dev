@@ -332,6 +332,8 @@ PRESET_CONFIGS = {
         # 见 production 预设里这两个键的说明（审计 #31）。
         "stage2_production_budget_steps": None,
         "stage2_max_production_blocks_per_window": 4,
+        # 见 production 预设里 `stage2_first_window_max_states` 的说明（2026-09-16 拍板 / BM-04）。
+        "stage2_first_window_max_states": 4,
     },
     "production": {
         "n_steps_per_window": 250000,
@@ -374,6 +376,20 @@ PRESET_CONFIGS = {
         #   · stage2_max_production_blocks_per_window = 4 —— 同 preoptimizer 兜底。
         "stage2_production_budget_steps": None,
         "stage2_max_production_blocks_per_window": 4,
+        # 🔑🔑 [2026-09-16 维护者拍板 / BM-04] **耦合端（win0）专用的态数上限。**
+        # 此前这个键**只存在于 `abfe_config.json`**，而 `abfe_config.json` 不会被
+        # 自动加载（`--config` 的 argparse 默认是 None），预设与 CLI 也都没有它
+        # ⟹ 除非有人显式把那份样例传进来，否则**它从未在任何一次真实运行里生效过**。
+        # 实测代价：benchmark 14/14 config、3/3 预设都没有这个键，于是 win0 照样
+        # 能拿到 8 个态；而 win0 一旦不可信，`tail_repartition_anchor` 恒返回 None
+        # （它之前没有可冻结的窗口）⟹ 缩跨度一族动作在**构造上**全部不可行 ⟹
+        # 只剩插 λ ⟹ 插到末窗顶满就 `NO_FEASIBLE_ACTION`。真机 4 个 run 死在这里。
+        # ⚠️ 本键在 `_PREOPT_DERIVED_PATH_KEYS` 里（**第 2 层**派生路径）：
+        # 加上它会让**全部现存 run 的 Stage-2 窗口缓存失配重采**；
+        # 第 1 层（pilot 采样语义）不变 ⟹ **pilot/preopt 与 Stage 0/1 全部保留**，
+        # 布局离线重算。维护者已按「跑得准优先」接受这个代价。
+        # 要回到旧行为：把本键设为 None（不是删掉——删掉会退回"预设里没有"的老坑）。
+        "stage2_first_window_max_states": 4,
     },
     "high_accuracy": {
         "n_steps_per_window": 500000,
@@ -383,6 +399,8 @@ PRESET_CONFIGS = {
         # 见 production 预设里这两个键的说明（审计 #31）。
         "stage2_production_budget_steps": None,
         "stage2_max_production_blocks_per_window": 4,
+        # 见 production 预设里 `stage2_first_window_max_states` 的说明（2026-09-16 拍板 / BM-04）。
+        "stage2_first_window_max_states": 4,
     },
 }
 
@@ -8040,6 +8058,13 @@ def main():
             "stage2_refine_extra_points_per_segment"
         ),
         stage2_window_min_states=config.get("stage2_window_min_states"),
+        # 🔑 [2026-09-16] `stage2_autonomous_controller` 在 abfe_pipeline 里一直是
+        # `kwargs.get(..., True)`，但**从来没有人往下传** ⟹ 配置里写了也没用，
+        # 自治循环无法关闭。做「固定预算、不按中间结果提前停」的对照实验时，
+        # 自适应补帧本身就是要消除的选择偏差，必须能关。默认仍是 True，
+        # 不写这个键时行为逐字不变。
+        stage2_autonomous_controller=config.get(
+            "stage2_autonomous_controller", True),
         stage2_window_max_states=config.get("stage2_window_max_states"),
         # 🔑🔑 [2026-09-15] Stage-2 控制器的两道生产预算闸。读侧（pipeline 组装
         # `effective_config` → `Stage2RepairController`）早就有了，**上游一直没接**
@@ -8285,6 +8310,13 @@ def main():
             "stage2_refine_extra_points_per_segment"
         ),
         stage2_window_min_states=config.get("stage2_window_min_states"),
+        # 🔑 [2026-09-16] `stage2_autonomous_controller` 在 abfe_pipeline 里一直是
+        # `kwargs.get(..., True)`，但**从来没有人往下传** ⟹ 配置里写了也没用，
+        # 自治循环无法关闭。做「固定预算、不按中间结果提前停」的对照实验时，
+        # 自适应补帧本身就是要消除的选择偏差，必须能关。默认仍是 True，
+        # 不写这个键时行为逐字不变。
+        stage2_autonomous_controller=config.get(
+            "stage2_autonomous_controller", True),
         stage2_window_max_states=config.get("stage2_window_max_states"),
         # 🔑🔑 [2026-09-15] Stage-2 控制器的两道生产预算闸。读侧（pipeline 组装
         # `effective_config` → `Stage2RepairController`）早就有了，**上游一直没接**

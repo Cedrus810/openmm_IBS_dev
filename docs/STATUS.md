@@ -43,7 +43,7 @@ Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS
 ## ⚠️ decharging 湮灭配体分子内库仑（2026-09-14 定位并修复，**所有已有 ΔG 作废**）
 
 > **改了哪些文件哪些符号，逐行记录在**
-> [PME_DECHARGE_V5_CHANGE_RECORD_2026-09-14.md](PME_DECHARGE_V5_CHANGE_RECORD_2026-09-14.md)。
+> [PME_DECHARGE_V5_CHANGE_RECORD_2026-09-14.md](archive/PME_DECHARGE_V5_CHANGE_RECORD_2026-09-14.md)。
 > 那份文档同时列出**未验证 / 未解决**的六条，包括一条已退化为空转的旧测试。
 
 `PME_DECHARGE_MODEL_VERSION` v4 → **v5**（`..._intramolecular_coulomb_decoupled_20260914`）。

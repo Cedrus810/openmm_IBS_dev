@@ -246,13 +246,31 @@ def test_all_done_but_no_stage_result_asks_for_analysis(tmp_path):
 
 
 def test_converged_stage_is_done_but_not_claimed_correct(tmp_path):
-    c, plan = _plan(tmp_path, windows=FULL, ranges=R4, n_states=13,
-                    stage_result={"converged": True, "total_delta_G": -12.3,
-                                  "path_is_complete": True})
-    assert plan["action"] == "DONE"
-    assert plan["evidence_status"] == "CONVERGED"
-    # 措辞不得暗示正确性
-    assert "不等于答案正确" in plan["reason"]
+    """🔑 [2026-09-15] `DONE` 的充要条件从"`converged=True`"换成了
+    **`analysis_status=ANALYSIS_COMPLETE` 且 `precision_status=MEETS_CROSS_REPEAT_TARGET`**。
+
+    后者在**单次 run 里结构上永不成立**（一个重复无法自证精度），所以硬不变量全过
+    的单跑落在 `NO_ACTION` + `ANALYSIS_COMPLETE_PRECISION_UNMEASURED` —— 合法终态、
+    该停就停，但**不是 DONE**。本条把两条出口一起钉住，免得有人为了"让它 DONE"
+    把精度维度并回硬不变量。
+    """
+    base = {"analysis_status": "ANALYSIS_COMPLETE", "total_delta_G": -12.3,
+            "path_is_complete": True}
+    c, plan = _plan(tmp_path, windows=FULL, ranges=R4, n_states=13, stage_result=base)
+    assert plan["action"] == "NO_ACTION"
+    assert plan["exit"] == "ANALYSIS_COMPLETE_PRECISION_UNMEASURED"
+    assert plan["terminal"] is True, "分析完整就该停，不许继续烧 GPU"
+    assert plan["evidence_status"] == "PRECISION_UNMEASURED"
+
+    # 精度真的达标时才允许 DONE，且措辞仍不得暗示正确性
+    import tempfile, pathlib as _pl
+    with tempfile.TemporaryDirectory() as td:
+        c2, plan2 = _plan(_pl.Path(td), windows=FULL, ranges=R4, n_states=13,
+                          stage_result={**base,
+                                        "precision_status": "MEETS_CROSS_REPEAT_TARGET"})
+    assert plan2["action"] == "DONE"
+    assert plan2["evidence_status"] == "CONVERGED"
+    assert "不等于答案正确" in plan2["reason"]
 
 
 def test_untrusted_switch_only_moves_trust_level(tmp_path):
@@ -274,7 +292,7 @@ def test_skipped_windows_are_surfaced_as_rescue_targets(tmp_path):
     w[0] = {"K": 4, "self_verdict": "INSUFFICIENT_DATA", "min_n_eff_over_g": 3.1,
             "n_decorr": 7}
     c, plan = _plan(tmp_path, windows=w, ranges=R4, n_states=13,
-                    stage_result={"converged": False, "path_is_complete": True,
+                    stage_result={"analysis_status": "ANALYSIS_INCOMPLETE", "path_is_complete": True,
                                   "skipped_windows": [{"window_index": 0,
                                                        "reason": "insufficient_frames"}],
                                   # stage 分析既然跑过（`skipped_windows` 就是它产出的），
@@ -287,7 +305,12 @@ def test_skipped_windows_are_surfaced_as_rescue_targets(tmp_path):
     assert plan["action"] == "RUN_PRODUCTION"
     assert plan["windows"] == [0]
     # 语义：INSUFFICIENT_DATA ≠ FAIL，动作是补采、不作废已有帧
-    assert "去相关帧数不足" in plan["reason"]
+    # 🔑 [2026-09-15] 这份 fixture 从前**根本没被认成一份 stage 结果**
+    # （它没有 `total_delta_G`，而老的嗅探键是 `converged`），于是控制器走的是
+    # "stage 分析还没跑 ⟹ ANALYZE"。改说 `analysis_status` 之后它才真的被读到，
+    # 归因也就落到了求解器那条跳窗记录上 —— 这才是本条一直想测的东西。
+    assert "被**求解器**踢出协方差链" in plan["reason"]
+    assert "任何拿已有帧重解的动作" in plan["reason"], "必须说明重标定/换 Epoch 是 no-op"
     assert "INSUFFICIENT_DATA ≠ FAIL" in plan["reason"]
     # 未解决的是 win0 ⟹ 下游 1/2/3 全部被挡住，不许"跳过前面去跑后面"
     assert plan["blocked_by"] == 0 and plan["blocked_by_upstream"] == [1, 2, 3]
@@ -319,7 +342,15 @@ def test_controller_never_writes_anything(tmp_path):
 _GATE_RECS = [{"window_index": i, "min_ess_ratio": 0.30 - 0.05 * i,
                "absolute_ess": 40.0 - 5 * i,
                "n_frames_decorrelated": 200 - 30 * i} for i in range(4)]
-_STAGE_BASE = {"converged": False, "path_is_complete": True,
+# 🔑 [2026-09-15] 写侧判了 INCOMPLETE 就**必须**给理由 —— 控制器对
+# 「INCOMPLETE 但没给理由」直接 halt（`NO_FEASIBLE_ACTION`），因为无从对症。
+_STAGE_BASE = {"analysis_status": "ANALYSIS_INCOMPLETE",
+               # 刻意选一条**不点名具体窗口**的理由：点了名就会被上游的逐窗分支
+               # 接走，这张表要测的是"没有对症分支时不许记成 DONE"。
+               "analysis_incomplete_reasons": [
+                   "路径缺窗：只解出 3 个窗口，输入的有效窗口有 4 个"
+                   "（差额在求解器内被 continue 掉了）。"],
+               "path_is_complete": True,
                "window_overlap_diagnostics": _GATE_RECS,
                "input_window_indices": [0, 1, 2, 3],
                "solved_window_indices": [0, 1, 2, 3]}
@@ -350,12 +381,15 @@ def test_stage_not_converged_is_never_done(tmp_path, label, extra):
     assert plan["exit"] != "DONE"
     # 三维状态：窗口采样确实执行完了，但那不等于「达标」
     assert plan["evidence_status"] != "CONVERGED"
-    # 终止的话只许是 NO_FEASIBLE_ACTION，且必须写清它不是 DONE
+    # 终止的话只许是 NO_FEASIBLE_ACTION，且理由里必须写清停在哪一条判据上
     if plan["terminal"]:
         assert plan["exit"] == "NO_FEASIBLE_ACTION"
         assert plan["action"] == "NO_ACTION"
         assert plan["execution_status"] == "HALTED"
-        assert "不是 DONE" in plan["reason"]
+        # [2026-09-15] 原来钉的是措辞"不是 DONE"。现在理由直接点名判据本身
+        # （`analysis_status = ANALYSIS_INCOMPLETE`）—— 比一句否定句信息量大，
+        # 钉这个。
+        assert "ANALYSIS_INCOMPLETE" in plan["reason"]
 
 
 def test_stage_gate_failure_routes_by_the_gate_that_actually_failed(tmp_path):
@@ -396,9 +430,15 @@ def test_untrusted_override_releases_but_never_claims_converged(tmp_path):
     run = _mkrun(tmp_path, windows=FULL, ranges=R4, n_states=13, stage_result=sr)
     loose = Stage2RepairController(
         run, "vanishing", allow_untrusted_stage_results=True).decide()
-    assert loose["exit"] == "DONE_UNTRUSTED" and loose["terminal"] is True
+    # 🔑 [2026-09-15] 出口从 `DONE_UNTRUSTED` 变成 `HALT_EVIDENCE_CONTRADICTS_DONE`
+    # —— 这是**收紧**不是退化：硬不变量自己说 `ANALYSIS_INCOMPLETE`，而调用方要求
+    # 按发布策略放行，两者直接矛盾，所以停下来并把矛盾写在出口名里。
+    # `DONE_UNTRUSTED` 今天只在「analysis COMPLETE + precision MEETS + 放行」时才出现
+    # （见 test_converged_stage_is_done_but_not_claimed_correct）。
+    assert loose["exit"] == "HALT_EVIDENCE_CONTRADICTS_DONE"
+    assert loose["terminal"] is True
     assert loose["trust_level"] == "OVERRIDDEN_UNTRUSTED"
-    # 关键：证据维度没被放行改写
+    # 关键（本条的主题，一字未变）：证据维度没被放行改写
     assert loose["evidence_status"] != "CONVERGED"
 
 
@@ -411,7 +451,7 @@ def test_untrusted_override_releases_but_never_claims_converged(tmp_path):
 def _stage_with_support_failure(check="raw_absolute_ess_below_threshold"):
     """target_support 门失败；**mixture 排序与 raw 排序故意相反**。"""
     return {
-        "converged": False,
+        "analysis_status": "ANALYSIS_INCOMPLETE",
         "target_support_gate": {
             "passed": False,
             "failed_checks": ["ibs_segment_target_support"],
@@ -466,7 +506,7 @@ def test_each_gate_maps_to_its_own_report_category():
     )
 
     got = {f["gate"]: f["report_category"] for f in stage_quality_gate_failures({
-        "converged": False,
+        "analysis_status": "ANALYSIS_INCOMPLETE",
         "min_overlap": 0.01, "min_overlap_threshold": 0.05,
         "min_decorrelated_samples": 4, "min_decorrelated_samples_threshold": 20,
         "max_endpoint_uncertainty_kJ_mol": 9.9,
@@ -487,7 +527,7 @@ def test_missing_readings_are_never_reported_as_passing():
     from abfe_preoptimizer import stage_quality_gate_failures, STAGE_GATE_UNATTRIBUTED
 
     (fail,) = stage_quality_gate_failures(
-        {"converged": False, "min_overlap": None, "min_overlap_threshold": 0.05})
+        {"analysis_status": "ANALYSIS_INCOMPLETE", "min_overlap": None, "min_overlap_threshold": 0.05})
     assert fail["gate"] == "min_overlap" and fail["report_category"] == STAGE_GATE_UNATTRIBUTED
 
 
@@ -531,7 +571,7 @@ def test_mixed_gate_failures_do_not_drop_the_sampling_action():
     )
 
     fails = stage_quality_gate_failures({
-        "converged": False,
+        "analysis_status": "ANALYSIS_INCOMPLETE",
         # 支撑类：raw ESS 不够
         "target_support_gate": {
             "passed": False, "failed_checks": ["ibs_segment_target_support"],
@@ -590,8 +630,10 @@ def test_no_decide_branch_pairs_a_production_topup_with_a_terminal_budget_exit()
 
     src = (pathlib.Path(__file__).resolve().parents[1]
            / "abfe_preoptimizer.py").read_text("utf-8")
+# 🔑 [2026-09] `decide()` 现在只是 23 行的外壳（"退役一个窗口再判一次"），判断体是 `_decide_once`（1831 行）。
+# 源码探针指着 `decide` 会一无所获 —— 断言"存在"的当场红，断言"不存在"的**静默变成假绿**。
     fn = next(n for n in ast.walk(ast.parse(src))
-              if isinstance(n, ast.FunctionDef) and n.name == "decide")
+              if isinstance(n, ast.FunctionDef) and n.name == "_decide_once")
     bad = []
     for node in ast.walk(fn):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
@@ -694,7 +736,7 @@ def _run_with_solver_skip(tmp_path, *, self_verdict, skip_frames):
                  2: {"K": 4}, 3: {"K": 4}},
         ranges=R4, n_states=13,
         stage_result={
-            "converged": False,
+            "analysis_status": "ANALYSIS_INCOMPLETE",
             "skipped_windows": [{
                 "window_index": 1,
                 "n_frames_after_decorrelation": skip_frames,
@@ -753,7 +795,7 @@ def test_the_two_decorrelation_numbers_are_kept_as_separate_evidence(tmp_path):
 def _stage_support_failure(worst_window):
     """target_support 门失败，最差窗口按 raw ESS 落在 `worst_window` 上。"""
     return {
-        "converged": False,
+        "analysis_status": "ANALYSIS_INCOMPLETE",
         "target_support_gate": {
             "passed": False, "failed_checks": ["ibs_segment_target_support"],
             "raw_min_absolute_ess_threshold": 20.0,
@@ -844,7 +886,7 @@ def test_structurally_unmeasurable_residual_is_UNMEASURED_not_missing(tmp_path):
         windows={i: {"K": 4} for i in range(4)},
         ranges=R4, n_states=13,
         stage_result={
-            "converged": False,
+            "analysis_status": "ANALYSIS_INCOMPLETE",
             "cumulative_fk_residual_production": [{
                 "window_index": 1,
                 "error": "no_effective_f_k_for_these_frames",
@@ -869,7 +911,7 @@ def test_rewindow_cannot_claim_the_residual_gate_for_its_parent(tmp_path):
         tmp_path,
         windows={i: {"K": 4} for i in range(4)},
         ranges=R4, n_states=13,
-        stage_result={"converged": False,
+        stage_result={"analysis_status": "ANALYSIS_INCOMPLETE",
                       "cumulative_fk_residual_production": []},   # 父窗口没记录
     )
     (pathlib.Path(run) / "checkpoints" / "stage2_rewindow_ledger.json").write_text(
@@ -903,7 +945,7 @@ def test_a_solver_skipped_window_never_gets_a_recalibration_noop(tmp_path):
     _, plan = _plan(
         tmp_path, windows=w, ranges=R4, n_states=13,
         stage_result={
-            "converged": False,
+            "analysis_status": "ANALYSIS_INCOMPLETE",
             "skipped_windows": [{"window_index": 0,
                                  "n_frames_after_decorrelation": 9,
                                  "min_frames_per_window": 10,
@@ -939,7 +981,7 @@ def test_an_action_already_proven_noop_on_this_disk_state_is_not_reissued(tmp_pa
         "self_verdict_source": "solver_eligibility",  # [2026-09-15] 本用例测的是预算/计费，低比值只是拿到 RUN_PRODUCTION 的载体；`min_n_eff_over_g` 现在归**偏斜**（加帧治不了）⟹ 显式声明成缺帧，语义不变
             "prod": 250000}
     run = _mkrun(tmp_path, windows=w, ranges=R4, n_states=13,
-                 stage_result={"converged": False,
+                 stage_result={"analysis_status": "ANALYSIS_INCOMPLETE",
                                "cumulative_fk_residual_production": [
                                    {"window_index": 0, "verdict": "PASS",
                                     "cumulative_residual_span_kJ_mol": 1.2}]})
@@ -1053,9 +1095,14 @@ def test_analysis_is_still_allowed_when_the_budget_is_gone(tmp_path):
                          "stage2_window_max_states": 8,
                          "max_path_insertions": 3,
                          "stage2_production_budget_steps": 1},
-                 stage_result={"converged": True, "stage": "vanishing"})
+                 stage_result={"analysis_status": "ANALYSIS_COMPLETE", "stage": "vanishing"})
     plan = Stage2RepairController(run, "vanishing").decide()
-    assert plan["action"] == "DONE", plan["reason"]
+    # [2026-09-15] 单次 run 的终态是 NO_ACTION + ANALYSIS_COMPLETE_PRECISION_UNMEASURED
+    # 而不是 DONE（`DONE` 还要 `precision_status = MEETS_CROSS_REPEAT_TARGET`）。
+    # 本条测的是**预算闸不该拦不花 GPU 的动作**，所以钉"没被预算闸拦下"：
+    assert plan["action"] == "NO_ACTION", plan["reason"]
+    assert plan["exit"] == "ANALYSIS_COMPLETE_PRECISION_UNMEASURED", plan["reason"]
+    assert plan["exit"] != "GLOBAL_BUDGET_EXHAUSTED"
 
 
 def test_continue_warmup_proven_noop_falls_through_to_production(tmp_path):

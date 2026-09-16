@@ -21,6 +21,8 @@ import pytest
 SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                    "abfe_pipeline.py")
 
+pytestmark = pytest.mark.cpu_only
+
 # 留下痕迹的几种合法方式。
 _TRACES = ("_record_noop_action", "raise", "history[-1]", "break", "continue")
 # 真的把活干了 —— 这种分支不是"拒绝执行"。
@@ -106,8 +108,13 @@ def test_the_scanner_actually_sees_the_two_real_regressions():
     """扫描器本身要能抓到真机那两条 —— 否则它只是一条永远绿的装饰。"""
     import re
     src = open(SRC, encoding="utf-8").read()
-    for marker in ('reason="split_tail_window_without_anchor"',
-                   'reason="insert_lambda_without_range_or_pilot"'):
+    # 🔑 [2026-09-16] 原来钉的是字面 `reason="..."`。插 λ 那条后来多了第二个
+    # no-op 理由（`insert_lambda_would_strand_tail_window`），于是理由改成先算进
+    # `_noop_reason` 再传 ⟹ 字面 `reason="insert_lambda_without_range_or_pilot"`
+    # 不复存在，探针当场变红。钉理由字符串本身，怎么传给 `_record_noop_action`
+    # 是实现细节。
+    for marker in ('"split_tail_window_without_anchor"',
+                   '"insert_lambda_without_range_or_pilot"'):
         assert marker in src, f"缺少 {marker}：执行器又退回静默跳过了"
     # 两处都必须紧跟在一个 `is None` 前置条件判断之后。
     assert len(re.findall(r"_record_noop_action\(", src)) >= 4

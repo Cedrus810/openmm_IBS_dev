@@ -2885,6 +2885,19 @@ class Stage2RepairController:
         # 而代价栏是本函数 docstring 里点名的三大必看之一
         # （「只比 ΔG 不比代价等于没比」）。未知不参与求和，并显式报出有几个未知。
         n_unknown_prod = 0
+        # 🔑🔑 [2026-09-16] **"无结论"必须和"不存在"分开。**
+        # 固定预算模式（自治控制器关闭）下，冻结验证在单周期批数上限内始终求不出
+        # Δf−ΔF 的窗口被记成 `indeterminate`（见 abfe_pipeline `_guarded_once`）。
+        # 它**没有** self_support 产物（生产就没跑完）⟹ 下面每个验收量都是 None
+        # ⟹ 报告里显示成 `·`，和"这个窗口根本不在布局里"长得一模一样。
+        # 那正是"静默从配对分析里删掉"，是明令禁止的。所以这里把 stage 结果里的
+        # `indeterminate_windows` 读出来，逐窗打标 + 带上原因。
+        _indet = {}
+        for _x in (stage.get("indeterminate_windows") or []):
+            try:
+                _indet[int(_x["window_idx"])] = _x
+            except (KeyError, TypeError, ValueError):
+                continue
         for w in view.get("windows") or []:
             i = int(w["window_idx"])
             prod = w.get("production_steps")
@@ -2906,6 +2919,13 @@ class Stage2RepairController:
                 "min_frames_floor": w.get("self_min_frames"),
                 "solver_eligible": w.get("self_sufficient"),
                 "verdict_source": w.get("self_verdict_source"),
+                # None = 有结论（通过或不通过）；非 None = **这个窗口没测出来**。
+                # 下游必须据此拒绝为它计算任何 A/B 差值，也不得把它当 0 或失败。
+                "indeterminate": (
+                    None if i not in _indet
+                    else {"reason": (_indet[i] or {}).get(
+                              "reason", "frozen_validation_budget_indeterminate"),
+                          "detail": str((_indet[i] or {}).get("detail") or "")[:400]}),
                 # 判据量是**块内独立 ESS**，不是前缀差（见 `_read_window` 的长注释）。
                 "block_local_ess_by_block": w.get("block_local_ess_by_block"),
                 "derailment_status": w.get("derailment_status"),
@@ -5958,6 +5978,42 @@ class Stage2RepairController:
                     f"{_sw.get('self_verdict_source')}）—— **不是样本量不足**。"
                     "同分布加帧治不了偏斜（§5.1 实测 250k→1M 让 top1% 从 0.545 涨到 "
                     "0.762、ESS 比值反而更差）⟹ 对症动作是**缩跨度**。",
+                    windows=list(_skew_sel), blocked=blocked, earliest=earliest,
+                )
+            # 🔑🔑 [2026-09-16 真机 cmet_ligand2/rep1 w4] **停下之前，先看证据是不是
+            # 根本没做出来过。**
+            #
+            # 老板给的链是「判累计 f_k 偏差 → 生成候选 → held-out 验收 → 换 Epoch /
+            # 缩跨度」，落在 5a-1（ANALYZE）+ 5a-2。但 5a-1 的 guard 里有一条
+            # `self_sufficient is not False` —— 那是**自检侧**的量，而 CTL-11 已裁定
+            # 逐窗自检「只看单段帧、对多段窗口系统性偏悲观，**它不是权威**」。
+            # 于是一个偏斜类窗口必然 `sufficient=False` ⟹ 拿不到 ANALYZE ⟹
+            # `cumulative_fk_residual_production` 永不出现 ⟹ 5a-2 的 guard（要求
+            # `cum_fk_verdict ∈ {FAIL, UNMEASURED}`）也永不匹配 ⟹ **整条链对它结构上
+            # 不可达**，只能掉到这里，布局动作一不可行就 NO_FEASIBLE_ACTION 收摊。
+            #
+            # 真机读数：w4 `skipped_windows=[]`、去相关 **69** 帧（min_frames=10）——
+            # 求解器**确实**把它算进了 MBAR，证据完全做得出来，只是没人去做。
+            #
+            # 为什么补在**这里**而不是放宽 5a-1 的 guard：5a-1 排在边际增长判据和所有
+            # 布局动作**之前**，放宽它等于把「先 ANALYZE」插到全仓每一条路由前面
+            # （实测打断 `加帧被证伪 ⟹ 插 λ` 等既有优先级）。而这里是**死胡同本身**：
+            # 已经确认没有任何布局动作可发，ANALYZE 零额外采样、只在现有帧上算，
+            # 它要么产出证据让 5a-2 接手，要么算不出来 —— 后者由 `_unsolvable` 与
+            # 停滞保护兜底，不会空转。
+            if (earliest is not None and int(earliest) in set(int(i) for i in _skew_sel)
+                    and _sw.get("cum_fk_verdict") is None
+                    and int(earliest) not in set(
+                        int(x) for x in (view.get("skipped_windows") or []))):
+                return plan(
+                    "ANALYZE",
+                    f"窗口 {_skew_sel} 是**支撑/偏斜类**失败，加帧治不了；缩跨度也不可行"
+                    f"（拆窗：{feas.get('split_tail_window')}；插 λ：{feas.get('insert_lambda')}）。"
+                    "但**累计 f_k 偏差证据从未做出来过**（`cumulative_fk_residual_production`"
+                    "缺失），而求解器并没有跳过这个窗口（`skipped_windows` 里没有它）"
+                    "⟹ 证据算得出来，只是没算。先在**现有帧**上把它算出来（零额外采样），"
+                    "再由 held-out 决定是换 f_k 还是缩跨度 —— 在证据缺失时直接判"
+                    "`NO_FEASIBLE_ACTION` 是把「没查」说成「无路可走」。",
                     windows=list(_skew_sel), blocked=blocked, earliest=earliest,
                 )
             return plan(

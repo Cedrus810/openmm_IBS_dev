@@ -17,8 +17,15 @@
 照样一路流下去。
 
 两道互相独立的门：
-  ① 上游：窗口子集跑一律标 `window_subset_no_stage_verdict` + `converged=False`
+  ① 上游：窗口子集跑一律标 `window_subset_no_stage_verdict` + 钉死
+     `analysis_status=ANALYSIS_INCOMPLETE`
   ② 下游：`_assert_stage_result_sane` 只看"覆盖了几个 λ 态"，与上游标记无关
+
+🔑 [2026-09-15] 上游那一钉原来写的是 `converged=False`。`converged` 已删键
+（换成 `analysis_status`/`precision_status` 两个正交状态），而"只跑了窗口子集"
+**正是硬不变量「路径完整」那一条**，所以它钉的是 `ANALYSIS_INCOMPLETE` ——
+不是降级，是归位。本文件的 fixture 一律说新契约：写老键的 fixture 会被
+`analysis_status` 的 fail-closed 在更早的地方吃掉，两道门一行都执行不到。
 """
 import os
 import sys
@@ -45,7 +52,8 @@ class _Stub:
 def _rep1_shaped(n_states=24, covered=None):
     """复刻真机那份结果的形状。"""
     return {
-        "stage": "vanishing", "converged": True,
+        # 真机那份落盘的是 `converged=True`；今天的等价物是硬不变量自称全过。
+        "stage": "vanishing", "analysis_status": "ANALYSIS_COMPLETE",
         "total_delta_G": -49.040107224763666, "total_error": 0.9866,
         "n_states": n_states,
         "coverage_diagnostics": {
@@ -64,8 +72,10 @@ def test_the_real_incident_shape_is_now_refused():
 
 def test_a_subset_marked_result_is_refused_even_without_coverage_info():
     """上游标记这一道单独就够 —— 不依赖 coverage 诊断存在。"""
-    r = {"stage": "vanishing", "converged": False, "total_delta_G": 1.0,
-         "total_error": 0.5,
+    # 注意：这里硬不变量**故意给 COMPLETE** —— 本条要证明的是「上游那个
+    # `stage_scope` 标记单独就够」，所以不能让 analysis_status 先把它拦下。
+    r = {"stage": "vanishing", "analysis_status": "ANALYSIS_COMPLETE",
+         "total_delta_G": 1.0, "total_error": 0.5,
          "stage_scope": "window_subset_no_stage_verdict",
          "window_subset_indices": [5]}
     with pytest.raises(RuntimeError, match="部分和"):
@@ -88,7 +98,7 @@ def test_a_fully_covered_result_still_passes_this_gate():
 
 
 def test_the_subset_run_is_pinned_to_not_converged_upstream():
-    """上游：窗口子集跑一律钉成 `converged=False` —— 成功也不例外。"""
+    """上游：窗口子集跑一律钉成 `ANALYSIS_INCOMPLETE` —— 成功也不例外。"""
     import inspect
     src = inspect.getsource(ABFEPipeline._run_dual_lambda_stage)
     # 判据必须真的挂在 `only_window_indices is not None` 上 —— 把条件改成 False
@@ -97,5 +107,10 @@ def test_the_subset_run_is_pinned_to_not_converged_upstream():
         'if only_window_indices is not None:\n'
         '            stage_result["stage_scope"] = "window_subset_no_stage_verdict"'
     ) in src
-    assert 'stage_result["converged"] = False' in src
+    # [2026-09-15] 原来钉的是 `stage_result["converged"] = False`。
+    # 删键之后同一个决定写成钉 analysis_status，并且**必须留下理由**
+    # （`analysis_incomplete_reasons`）—— 只钉状态不写原因，下一个人看到的
+    # 就是一个没有出处的 INCOMPLETE。
+    assert 'stage_result["analysis_status"] = ANALYSIS_INCOMPLETE' in src
+    assert 'window_subset_no_stage_verdict: 只求解了窗口子集' in src
     assert 'subset_partial_sum_not_delta_G' in src
