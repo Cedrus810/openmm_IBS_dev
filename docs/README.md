@@ -35,6 +35,7 @@
 | 查 stage2 的失效机制（仍是活的参考） | [STAGE2_ROOT_CAUSE_2026-08-28.md](STAGE2_ROOT_CAUSE_2026-08-28.md) |
 | 重新设计 stage2 控制流前先读（分窗口/分 λ/分采样量 三轴当前怎么耦合的） | [STAGE2_THREE_AXES_COUPLING_2026-09-11.md](STAGE2_THREE_AXES_COUPLING_2026-09-11.md) |
 | 路径最小修补：Type I/II/III + 修补顺序（**部分已实现**，代码里 10 余处引它作设计依据；缺口见 [TODO.md](TODO.md) §1） | [PLAN_PATH_REPAIR_2026-09-11.md](PLAN_PATH_REPAIR_2026-09-11.md) |
+| 🔴🔴 **stage2 控制器：2026-09-17 整波真机缺口（11 条，10 条已修）**（**碰控制器前先读这份**：它是**生产跑实测**出来的，不是静态审计。含 A–M 逐条的盘面证据、哪几条必须**配对修**（H↔F、E↔I）、以及**三处我做错又改正的**——尤其「别再试图靠挪 `ANALYZE` 的位置补 `S2-A`」（连打红 25→11 条）与「别再往控制器加『末窗一分为二』动作」（`_legalize_tail_window` 早就实现了，那是同一不变量的第二份实现）） | [STAGE2_CONTROLLER_WAVE_2026-09-17.md](STAGE2_CONTROLLER_WAVE_2026-09-17.md) |
 | 🔴 **stage2 控制器 + 预算：63+2 条缺陷的全面审计与修复状态**（**改控制器/预算前先读这份**；含三条贯穿性根因、逐条状态列、两条「别再犯」的规矩：#18「零调用点 ≠ 忘了接」、#65「改名/改值不通知消费者」） | [CONTROLLER_BUDGET_AUDIT_2026-09-14.md](CONTROLLER_BUDGET_AUDIT_2026-09-14.md) |
 | 🔑 **stage2 自治控制器：设计 + 实证 + 陷阱清单**（**接手先读这份**；含首次跑通的实证与 10 条真机咬过的坑） | [STAGE2_CONTROLLER_DESIGN_2026-09-12.md](STAGE2_CONTROLLER_DESIGN_2026-09-12.md) |
 | **stage2 自治控制器：设计 + 实证 + 十条真机陷阱 + 交接**（碰 stage2 先读这份，**别重推**；含代码位置图、当前状态与复现、8 条别重新论证的事、给下一个人的规矩） | [STAGE2_CONTROLLER_DESIGN_2026-09-12.md](STAGE2_CONTROLLER_DESIGN_2026-09-12.md) |

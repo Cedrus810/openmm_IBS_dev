@@ -169,3 +169,100 @@ def test_retirement_loop_is_bounded_by_the_window_count():
     # 同一个窗口不得被退役两次（`_retirable_window` 第一道守卫）
     ctl = C.__new__(C)
     assert ctl._retirable_window(_view(), _plan("TARGET_LOCAL", win=1), [1]) is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# S2-G：退役判定必须把**从没采过的窗口**算作"别处还有的活"
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_a_never_sampled_window_counts_as_work_left(tmp_path):
+    """布局里有、产物里一个都没有的窗口 ⟹ 它就是"别处还有活干"。
+
+    真机 `cmet_ligand2`：w4 批满 4 块被准入闸拒 → `NO_FEASIBLE_ACTION`
+    （`TARGET_LOCAL`，本该可退役）→ 但 `recs` 只收**有产物**的窗口，
+    w5 从没采过、不在表里 → 找不到候选 → 不退役 → 终态 →
+    `_assert_stage_result_sane` 抛 `RuntimeError`，**整跑失败而 w5 一步没跑过**。
+    """
+    ctl = C.__new__(C)
+    # 只有一个有产物的窗口（它就是 blocking 的那个），另有两个从没采过
+    view = {
+        "windows": [{"window_idx": 1, "phase": "PRODUCTION",
+                     "verdict": "ANALYSIS_ELIGIBLE", "self_verdict": "ANALYSIS_ELIGIBLE",
+                     "f_k_evidence_status": "verified", "warmup_steps_left": 0}],
+        "missing_windows": [2, 3],
+        "skipped_windows": [], "sampling_units": [], "immutable_rewindow": {},
+        "max_production_blocks_per_window": 4,
+        "production_blocks_total_by_window": {1: [{}] * 4},
+        "production_blocks_by_window": {1: [{}] * 4},
+    }
+    got = ctl._retirable_window(view, _plan("TARGET_LOCAL", win=1), [])
+    assert got == 1, "有两个从没采过的窗口，必须退役 w1 换过去，而不是判无路可走"
+
+
+def test_missing_windows_do_not_resurrect_a_replaced_parent(tmp_path):
+    """被子系综接管的父窗即使"没产物"也不算活 —— 修它没有意义。"""
+    ctl = C.__new__(C)
+    view = {
+        "windows": [{"window_idx": 1, "phase": "PRODUCTION",
+                     "verdict": "ANALYSIS_ELIGIBLE", "self_verdict": "ANALYSIS_ELIGIBLE",
+                     "f_k_evidence_status": "verified", "warmup_steps_left": 0}],
+        "missing_windows": [2],
+        "skipped_windows": [], "sampling_units": [],
+        "immutable_rewindow": {"parents_done": [2]},       # w2 已被子系综接管
+        "max_production_blocks_per_window": 4,
+        "production_blocks_total_by_window": {1: [{}] * 4},
+        "production_blocks_by_window": {1: [{}] * 4},
+    }
+    assert ctl._retirable_window(view, _plan("TARGET_LOCAL", win=1), []) is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# S2-B：第一遍覆盖优先于重复补帧
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _board_with_a_never_sampled_window(tmp_path, *, blocks_on_w1):
+    """w1 有产物且已批过 `blocks_on_w1` 块；布局里还有一个从没采过的窗口。"""
+    import json
+    from test_stage2_repair_controller import _mkrun, R4
+    w = {i: {"K": 4} for i in range(3)}          # 布局 4 窗，只造 3 个产物 ⟹ missing=[3]
+    w[1] = {"K": 4, "self_verdict": "INSUFFICIENT_DATA",
+            "self_verdict_source": "min_n_eff_over_g",
+            "min_n_eff_over_g": 6.0, "n_decorr": 64}
+    run = _mkrun(tmp_path, windows=w, ranges=R4, n_states=13)
+    hist = {"iterations": [
+        {"iteration": i + 1, "action": "RUN_PRODUCTION", "windows": [1],
+         "path_version": 1,
+         "snapshot": [{"window_idx": 1, "segment": "vanishing",
+                       "production_steps": 250000 * (i + 1),
+                       "min_n_eff_over_g": 6.0}]}
+        for i in range(blocks_on_w1)]}
+    with open(os.path.join(run, "checkpoints",
+                           "stage2_autonomous_history.json"), "w") as fh:
+        json.dump(hist, fh)
+    return run
+
+
+def test_a_never_sampled_window_gets_its_first_block_before_a_repeat_topup(tmp_path):
+    """w1 已批过块、w3 一步没跑 ⟹ 本轮该跑 w3。
+
+    真机 `cmet_ligand1/rep2`：布局 5 窗、产物 3 个，全部预算喂给 w0（已 3/4 块），
+    而 `missing=[3,4]` 一步都没跑过。挡住它们的「因果顺序」理由是「上游**重锚**会
+    作废下游 lineage」—— 但补帧是同一份冻结 f_k、接着原段，**不重锚**。
+    """
+    import abfe_preoptimizer as pre
+    run = _board_with_a_never_sampled_window(tmp_path, blocks_on_w1=2)
+    plan = pre.Stage2RepairController.for_physical_stage(
+        run, "vanishing", "vdw").decide()
+    assert plan["action"] == "RUN_PRODUCTION", plan["reason"][:200]
+    assert plan["windows"] == [3], (
+        f"重复补帧仍然抢在第一遍覆盖前面：{plan['windows']} / {plan['reason'][:200]}")
+
+
+def test_the_first_block_itself_is_not_deferred(tmp_path):
+    """反面：目标窗口自己还在**第一遍**（0 块）时不让路 —— 否则第一遍永远排不上。"""
+    import abfe_preoptimizer as pre
+    run = _board_with_a_never_sampled_window(tmp_path, blocks_on_w1=0)
+    plan = pre.Stage2RepairController.for_physical_stage(
+        run, "vanishing", "vdw").decide()
+    assert plan["windows"] == [1], (
+        f"第一遍就被让路了：{plan['windows']} / {plan['reason'][:200]}")

@@ -66,6 +66,149 @@
 >
 > ⚠️ 一次跑通 ≠ 通用。这是**单体系单 run**，没有独立重复。
 
+- [x] **S2-L [P1] 补帧的块数硬上限被「换布局」重置 ⟹ 补帧实际没有有效上限（2026-09-17 真机）**
+
+  `_production_blocks_total_by_window()`（**硬上限**那本账）和
+  `_production_blocks_ledger()`（**边际增益**那本）都按 `path_version` 过滤
+  ⟹ **插一次 λ / 拆一次窗，配额就清零、重新发满 4 块**。
+  这跟 `BUD-03` 是**同一个 bug 换了一个维度**（那次是"换段退钱"），
+  而本函数的定义白纸黑字写着「硬上限 = **资源账**」—— 烧掉的 GPU 不会因为布局变了就回来。
+
+  真机实测（修复后才看得见真实消耗）：
+
+      cmet_ligand1/rep1  w4：旧口径 2 块 → 真实 9 块（上限 4）
+      cmet_ligand2/rep1  w5：旧口径 4 块 → 真实 5 块
+      brd4_ligand1/rep2  w3：累计 1,250,000 步 = 5 块
+
+  叠加 `S2-A`（边际增益刹车全程没有输入、恒不触发）⟹ 在布局反复演化的 run 上
+  **补帧没有任何有效上限**。这正是跨 run 统计里最准那条判据的机制：
+  「至少一个窗口累计 ≥500k 步」覆盖 **9/9** 失败（maxK≥6 只覆盖 7/9）。
+
+  **已修**：硬上限那本**不按 `path_version` 过滤**；边际增益那本**仍然要过滤**
+  （跨布局比 `min N_eff/g` 没有意义，窗口几何都变了）——两本账的过滤维度本来就不同，
+  这正是 BUD-03 把它们拆成两个函数的理由。
+  测试：`tests/test_structural_action_budget_2026_09_17.py::test_the_hard_cap_counts_blocks_across_layout_changes`
+  ⚠️ 该测试的 fixture 必须用**单调递增**的 `production_steps`：块账按步数去重，
+  每个布局都从 250k 重来会被折叠掉，测不到要测的东西。
+
+- [x] **S2-M [P1] 「布局过期 + 冻结验证批次打满」= 死锁 ⟹ 整跑终止（2026-09-17 真机）**
+
+  分支 1d-0（过期 ⟹ 只能重采）排在 1e（进不进得去）**之前**，且无条件发
+  `RUN_PRODUCTION`。于是：重采要**重新进入**窗口 → 预热门看到 15/15 批打满 →
+  抛 `LOCAL_VALIDATION_CAP` 弹回，盘面未变 → no-op 还记不下（stale 窗口
+  `production_steps` 读不到 ⟹ 指纹没有可比身份）→ 连发 3 次 → 停滞保护 →
+  降级又被 `_stale_for_escalation` 挡住 → `NO_FEASIBLE_ACTION`，整跑终止。
+
+  而对「验证批次打满」控制器**有**答案 —— 分支 3a 的 `PROVISIONAL_PRODUCTION`，
+  只是排在 1d-0 后面够不着。它产出的是**新布局下**的帧，一并解决了证据过期；
+  普通 `RUN_PRODUCTION` 则在预热门上被弹回、一帧都产不出来。
+
+  **已修**：1d-0 分流 —— 过期**且**正卡在验证批次上限 ⟹ 发 `PROVISIONAL_PRODUCTION`
+  （语义/额度/证据口径全照 3a，判据复用**同一份** `local_validation_cap_hits()`）。
+
+- [x] **S2-K [P1] `ANALYZE` 在有过期证据的盘面上炸穿流水线 —— 判据侧知道、执行器侧不看（2026-09-17 真机）**
+
+      [自治] 执行 ANALYZE 失败：ValueError('窗口 4 lambda 内容与当前路径不匹配')
+      _solve_merged_segments_if_any → _load_ibs_window_outputs_merged
+        → ibs_engine.load_ibs_window_outputs_from_dir:664 → raise ValueError → 炸穿主循环
+
+  控制器**对补帧类动作有这道闸**（分支 1d-0：过期窗口只能重采；停滞降级另有
+  `_stale_for_escalation`），理由原文：「拿已有帧重解的动作在构造上都会维度不符，
+  真机实测是直接 `ValueError` 炸出流水线」。**但 `ANALYZE` 没有这道闸** ——
+  而它恰恰是**跨全部段、拿已有帧重解**的那个动作。
+
+  **判据侧其实完全知道**：`classify_layout_evidence()` 逐 (段, 窗口) 比 λ 身份，
+  `read_aggregated()` 把过期的排除出 `merged` 并记进 `stale_layout_evidence`。
+  而 `_solve_merged_segments_if_any` 是执行器侧，从盘上**无过滤**加载所有段。
+  ⟹ **同一个不变量两份实现**，这次的形态是"判据侧过滤了、执行器侧没过滤"。
+
+  判据：发 `ANALYZE` 之前要么确认没有过期证据、要么让合并求解**按同一份判据跳过**
+  过期的 (段, 窗口)；不得让它抛到主循环。
+  完整记录 → [STAGE2_CONTROLLER_WAVE_2026-09-17.md](STAGE2_CONTROLLER_WAVE_2026-09-17.md) §3.K
+
+- [x] **S2-J [P1] model B 的收尾动作「末窗一分为二」在自治控制器下**整个不存在**（E 与 I 的共同根因）**
+
+  原始设计写在 `abfe_preoptimizer.py:9556`（`feasible_repair_actions` 内）：
+  「这一条问的是**溢出槽长到能一分为二了没有**，是 model B 插点的**收尾条件**；
+  继续插 λ 让末窗长大即可到达；拆窗只是末窗溢出压不住时的收尾动作。」
+  即：插 λ 把末窗养大，到 `K ≥ 2·lo−1`（lo=4 时 K=7）就**一分为二**。
+
+  | | 状态 |
+  |---|---|
+  | 判据 `split_last_window_in_two` | ✅ 每轮都算，两个真机盘面都答**可拆** |
+  | 执行器 `split_window_from_ibs_lse_failure` | ✅ 存在（`abfe_preoptimizer.py:1497`） |
+  | **调用者** | ❌ 全仓只有 `abfe_pipeline.py:10933`，在 **path_evolution 的异常处理**里 |
+
+  而自治控制器**显式关闭**那条路径（每份日志都印着「关闭 … path_evolution 的插 λ
+  修复分支」），并有断言钉死（`abfe_pipeline.py:17169`）。
+  ⟹ **判据活着、执行器活着、动作不存在。**
+
+  控制器自己的 `SPLIT_TAIL_WINDOW` 是**另一个更重的动作**
+  （`repartition_tail_from_anchor`：从 anchor 起重分**整个尾段**，要 tail anchor），
+  不是「末窗一分为二」。审计 #24 把两个问题分开时判据留在了
+  `split_last_window_in_two`，**但没给控制器补上对应的动作**。
+
+  **⟹ `S2-E` 与 `S2-I` 是它的两个症状**：
+  `末窗失败 → 插 λ(跨度不变) → 变宽 → 能量+f_k 全废 → 重采重学 → 再插 → 撞 hi 卡死`。
+  中间本该有一步「K≥7 就一分为二」。
+
+  ⚠️ 修它**不是**重新打开 `path_evolution`（那条被关是有理由的：同一个决定不许两套
+  机制各判一次）。要做的是把「末窗一分为二」作为**控制器的一个动作**补进动作表 +
+  执行器分发，判据直接用现成的 `split_last_window_in_two`。**这条一补，E 和 I 自动消解。**
+
+  完整记录 → [STAGE2_CONTROLLER_WAVE_2026-09-17.md](STAGE2_CONTROLLER_WAVE_2026-09-17.md) §3.J
+
+- [x] **S2-H [P1] 「总是改变盘面」的动作对停滞保护与 no-op 台账结构性免疫（2026-09-17 真机 `cmet_ligand1/rep1`）**
+
+  停滞保护判的是「同一个动作 + **盘面未变**」（`seen[key] >= 3`）。而 `RECALIBRATE_FK`
+  `probe_only=False`、**开新采样段** ⟹ `_disk_signature()` 里的 `segment` /
+  `aggregated_segments` 必变 ⟹ `seen[key]` 每轮重置成 1 ⟹ **永远到不了 3**。
+  `action_noop_fingerprint()` 含段维度，同理永不匹配。
+  ⟹ **这一族动作对唯一的通用刹车免疫**，叠加 `S2-F`（无事后有效性检查）即可无限重标定。
+
+  **真机（31/40 轮里 17 轮花在窗口 4）**：
+
+      20 RECALIBRATE_FK  seg=vanishing    steps=750000  ratio=9.645  ← 离门 10 差 0.355
+      21 RECALIBRATE_FK  seg=vanishing_4  steps=250000  ratio=4.182  ← 新段，750k 步作废
+      22 RECALIBRATE_FK  seg=vanishing_5  steps=250000  ratio=0.837
+      23 RECALIBRATE_FK  seg=vanishing_6  steps=250000  ratio=7.017
+
+  它在第 20 轮再补一块几乎必过；三次重标定把它推到 0.837，全程无人察觉。
+  盘上留下 7 个采样段。**定 P1 的理由**：17/31 轮花在一个窗口上，
+  这样的烧法会把 40 轮预算耗尽 ⟹ `ITERATION_CAP_NOT_CONVERGED`，拿不到结果。
+
+  ⚠️ **别用「把 `RECALIBRATE_FK` 加进 `_NOOP_GUARDED`」来补**：no-op 判据问的是
+  "盘面变没变"，而它**真的变了**（新段是真实产物）。要判的是"变好还是变坏"——
+  那是 `S2-F` 的判据。两条必须一起修：只修 F，控制器仍可每轮换新段绕过重复计数；
+  只修 H，第 3 次会被拦，前两次仍白烧。
+
+  完整记录 → [STAGE2_CONTROLLER_WAVE_2026-09-17.md](STAGE2_CONTROLLER_WAVE_2026-09-17.md) §3.H
+
+- [x] **S2-G [P1] 退役判定看不见「从没采过的窗口」⟹ 整跑崩溃（2026-09-17 真机 `cmet_ligand2`）**
+
+  `Stage2RepairController._retirable_window()` 第一行就取错了源：
+
+      recs = {int(w["window_idx"]): w for w in (view.get("windows") or [])}
+
+  `view["windows"]` 只收**盘上有产物**的窗口；从没采过的窗口在
+  `view["missing_windows"]`，**不在这张表里**。而"别处还有没有活干"就是遍历 `recs`
+  ⟹ 对一个**整窗未采、块配额分文未动**的窗口**恒答否** ⟹ 不退役 ⟹ 交出终态。
+
+  **真机崩溃链条**：w4 跨全部段已批 4 块（上限 4）→ `plan()` 补帧准入拒 →
+  `NO_ACTION` + `NO_FEASIBLE_ACTION`（`halt_scope=TARGET_LOCAL`，可退役）→
+  `_retirable_window` 找不到候选（w5 未采、不在 `recs`）→ 不退役 → 终态 →
+  退出前 ANALYZE 也跳过（`missing_window_5`）→ `_assert_stage_result_sane` 抛
+  `RuntimeError`，整跑失败。**w5 一步都没跑过。**
+
+  分支 6b（缺窗 → 补采）在结构上就在下游，`plan()` 里的准入闸先一步把整轮变成终态，
+  根本落不到它。
+
+  ⚠️ **这条不是分支顺序问题** —— 只是一个集合取错了源，修它不碰 `_decide_once` 的
+  任何分支、不改任何优先级。与 `AUDIT-S2-02` 那批（`S2-A/B/E/F`）性质不同，可单独做。
+
+  判据：布局里有、产物里没有的窗口必须算作"别处还有的活"。
+  完整记录 → [STAGE2_CONTROLLER_WAVE_2026-09-17.md](STAGE2_CONTROLLER_WAVE_2026-09-17.md) §3.G
+
 - [ ] **AUDIT-S2-03 [P1] 控制器已有真机，但**没有一次以 `DONE` 收口** —— 验收口径仍未达成。**
   📌 **2026-09-16 更正：本条原文「控制器真机零验证」已不成立。** 全量 benchmark
   （13 体系 ×3 = 39 rep）真上过 GPU，9 个跑出 `final_binding_results.json`。

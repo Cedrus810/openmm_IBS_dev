@@ -117,8 +117,26 @@ def test_the_loop_always_analyses_before_exiting():
 
 
 def test_marginal_brake_is_inert_without_the_criterion():
-    """钉住根因本身：判据全 None 时边际刹车判不了 —— 所以 ANALYZE 不能省。"""
+    """钉住根因本身：判据全 None 时边际刹车判不了 —— 所以 ANALYZE 不能省。
+
+    ⚠️ [S2-A，2026-09-17] **verdict 细分了，不变量一个字没变。**
+    先前「只有 1-2 块」和「**一个输入都没有**」都报 `NOT_ENOUGH_POINTS`，
+    读起来像"再跑跑看"，而真相是这道刹车**从头到尾没带过电**——两者处置相反：
+    前者继续跑就会有数据，后者再跑多少轮也不会有。
+    真机三个 run 的补帧刹车全程如此（判据量逐块 `[None, None, None]`），
+    那几个窗口的块是被"块数硬上限"停的，不是被"没增益"停的。
+    现在「全 None」报 `NO_CRITERION_INPUT_AT_ALL`，并带 `inoperative_reason`；
+    **行为不变**（仍然返回"没停滞"）。
+    """
     from abfe_preoptimizer import marginal_gain_stalled
     stalled, diag = marginal_gain_stalled([None, None, None, None])
-    assert stalled is False and diag["verdict"] == "NOT_ENOUGH_POINTS"
-    assert diag["n_points"] == 0
+    assert stalled is False, "行为必须不变：判不了 ≠ 判它停滞"
+    assert diag["verdict"] == "NO_CRITERION_INPUT_AT_ALL", (
+        "「一个输入都没有」必须与「点数不够」分开报 —— 两者处置相反")
+    assert diag["n_points"] == 0 and diag["n_rows_seen"] == 4
+    assert "没有带电" in diag["inoperative_reason"]
+
+    # 反面：真的只是点数不够（有真实读数、但不到 3 个）⟹ 仍然是 NOT_ENOUGH_POINTS
+    _s2, d2 = marginal_gain_stalled([3.0, 5.0])
+    assert _s2 is False and d2["verdict"] == "NOT_ENOUGH_POINTS"
+    assert "inoperative_reason" not in d2, "有真实读数时不该说没带电"
