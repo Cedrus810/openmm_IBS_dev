@@ -1183,23 +1183,39 @@ def test_the_admission_choke_point_also_stops_entries_that_skip_attribution(tmp_
     assert "够不着门" in plan["reason"], plan["reason"]
 
 
-def test_a_reachable_gate_is_unknown_and_authorizes_nothing(tmp_path):
-    """[2026-09-17 P0，取代旧语义] 射程**够得着**只说明「尚未被证伪」⟹ `UNKNOWN`。
+def test_a_reachable_gate_is_unknown_and_authorizes_no_structural_action(tmp_path):
+    """[2026-09-17 P0 真机修正] 射程够得着 ⟹ `UNKNOWN`：**不授权结构动作，但不挡补帧**。
 
-    本条原名 `test_frames_still_admitted_while_the_gate_is_optimistically_in_range`，
-    断言的是「射程够得着 ⟹ 必须放行补帧」。那把一个**乐观上界**当成了"这是样本量
-    问题"的结论 —— 而该上界假定 η 与 g 恒定，两个假设实测都朝不利方向走。
+    本条的历史有三版，第二版崩了生产，所以三版都记在这里：
 
-    新规则：只有**明确的帧数硬证据**（`solver_eligibility` 或 `n_decorrelated <
-    min_frames`）才授权补帧；`reachable is True` 与 `reachable is None` 都是
-    `UNKNOWN`，**两边都不授权**（不补帧、也不改布局）。
+    v1 `test_frames_still_admitted_while_the_gate_is_optimistically_in_range`
+       断言「射程够得着 ⟹ 必须放行补帧」。问题：把一个**乐观上界**当成"这是样本量
+       问题"的**结论** —— 该上界假定 η 与 g 恒定，两个假设实测都朝不利方向走。
 
-    ⚠️ 防作弊的那一半改由下一条守着：帧数硬证据的盘面**仍然**必须补帧。
+    v2 改成「`reachable is True` ⟹ UNKNOWN ⟹ **两边都不授权**（不补帧、也不改布局）」。
+       **当天两次生产跑各崩在第 2/40、3/40 轮**：
+           run A 窗口 2  ratio=7.09 × headroom 5 = 35.5 ≥ 门 10
+           run B 窗口 4  ratio=4.05 × headroom 5 = 20.3 ≥ 门 10
+       三个输入一个不缺、射程远超门 —— **加帧很可能救得回来**的那一类，
+       却一帧不给、直接 `SUPPORT_ATTRIBUTION_UNKNOWN` 终止整跑。
+
+    v3（本条）：v1 的错在于把上界当结论，v2 的错在于**把范围划到了补帧头上**。
+       `UNKNOWN` 该挡的是**结构动作** —— 插 λ / 有界重窗 / D3 停机：贵、改全局布局、
+       且拿「没测出来」当「测出来是坏的」不可逆。**补帧不是那一类**：同分布、可逆、
+       最便宜，而且**已经**被补帧准入的三道闸（块数硬上限 / 边际增益刹车 /
+       射程闸本身）限住了。连它也砍掉 = 把那三道刹车变成不可达，同一个保守记两遍。
+
+    ⟹ 本条现在守两件事：射程只够得着时 **(a) 不得发结构动作**、**(b) 必须能补帧**。
     """
+    _STRUCTURAL = {"INSERT_LAMBDA", "SPLIT_TAIL_WINDOW", "IMMUTABLE_REWINDOW"}
     run = _rising_but_short_board(tmp_path, blocks=1)
     plan = Stage2RepairController(run, "vanishing").decide()
-    assert not (plan["action"] == "RUN_PRODUCTION" and plan["windows"] == [0]), (
-        f"射程只是「尚未被证伪」，却被当成样本量证据放行了补帧：{plan['reason']}")
+    assert plan["action"] not in _STRUCTURAL, (
+        "射程只是「尚未被证伪」，却授权了一个改布局的贵动作："
+        f"{plan['action']} / {plan['reason'][:200]}")
+    assert plan["exit"] != "SUPPORT_ATTRIBUTION_UNKNOWN", (
+        "射程够得着的窗口被判「归因不出来」并终止 —— 这正是 2026-09-17 两次"
+        f"生产跑连崩的形状：{plan['reason'][:300]}")
 
 
 def test_explicit_frame_count_evidence_still_buys_frames(tmp_path):

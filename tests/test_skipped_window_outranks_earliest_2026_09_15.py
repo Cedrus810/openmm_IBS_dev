@@ -60,28 +60,38 @@ def test_a_solver_skipped_window_is_routed_before_an_earlier_unhappy_one(tmp_pat
 
 
 def test_without_a_skip_the_old_earliest_order_is_unchanged(tmp_path):
-    """没有跳窗时 `earliest` 仍按下标排 —— 这条改的只是优先级，不是判据。
+    """没有跳窗时 `earliest` 仍按下标排，**而且动作落在它身上**。
 
-    ⚠️ [2026-09-17 P0] 断言从「动作落在 w1」改成「`earliest` 仍是 w1」。
-    三态归因之后 w1（ratio=8.7、门 10、headroom=5 ⟹ 8.7×5=43.5 ≥ 10 ⟹
-    `reachable is True`）是 **UNKNOWN** —— 乐观上界尚未被证伪，**既不是**"帧不够"
-    **也不是**结构性失败 ⟹ 两边都不授权动作。按用户规格「若还有其他窗口可做，
-    则绕过该单元继续调度，不能让它停掉整跑」，它被退役，动作落到 w3
-    （ratio=0.21 ⟹ 0.21×5=1.05 < 10 ⟹ `reachable is False` ⟹ STRUCTURAL）。
+    ⚠️⚠️ [2026-09-17 P0 真机] **断言改回 `windows == [1]`。**
 
-    **优先级本身没变**（`earliest` 照样是 w1），变的是"w1 现在没有被授权的动作"。
-    本条守的是前者，所以断言改成直接看 `earliest_unresolved_window`。
+    09-17 早些时候这条被改成「w1 被退役、动作落 w3」，理由是三态归因把
+    w1（ratio=8.7、门 10、headroom=5 ⟹ 射程 43.5 ≥ 10 ⟹ `reachable is True`）
+    判成 `UNKNOWN`，而 UNKNOWN「两边都不授权动作」。
+
+    那个"两边都不授权"的范围划错了，**当天两次生产跑各崩在第 2/40、3/40 轮**：
+        run A 窗口 2  ratio=7.09 × headroom 5 = 35.5 ≥ 门 10
+        run B 窗口 4  ratio=4.05 × headroom 5 = 20.3 ≥ 门 10
+    三个输入一个不缺、射程远超门 —— 也就是**加帧很可能救得回来**的那一类，
+    却一帧不给、直接终止整跑。
+
+    `UNKNOWN` 不该授权的是**结构动作**（插 λ / 有界重窗 / D3 停机）——
+    那些贵、改全局布局、且拿「没测出来」当「测出来是坏的」不可逆。
+    **补帧不是那一类**：同分布、可逆、最便宜，而且**已经**被补帧准入的三道闸
+    （块数硬上限 / 边际增益刹车 / 射程闸本身）限住了。连它也砍掉等于把那三道
+    刹车变成不可达 —— 同一个保守记两遍。
+
+    ⟹ w1 拿回 `RUN_PRODUCTION`，**不再被退役**；优先级不变（earliest 仍是 w1），
+    而且现在它**有**被授权的动作，所以根本走不到退役那一步。
     """
     w = {i: {"K": 4} for i in range(4)}
     w[1] = {"K": 4, "self_verdict": "INSUFFICIENT_DATA", "min_n_eff_over_g": 8.7}
     w[3] = {"K": 4, "self_verdict": "INSUFFICIENT_DATA", "min_n_eff_over_g": 0.21}
     run = _mkrun(tmp_path, windows=w, ranges=R4, n_states=13)
     plan = Stage2RepairController.for_physical_stage(run, "vanishing", "vdw").decide()
-    # ⚠️ `decide()` 会退役后**重判**，所以返回值里的 `earliest` 已经是 3。
-    # "优先级没变"体现在：w1 是**先**被考虑的那个（因此进了 retired），
-    # 而不是被跳过去没看。
-    assert plan.get("retired_windows") == [1], plan["reason"][:200]
-    assert plan["windows"] == [3], plan["reason"][:200]
+    assert plan["windows"] == [1], plan["reason"][:300]
+    assert plan["action"] == "RUN_PRODUCTION", plan["reason"][:300]
+    assert not plan.get("retired_windows"), (
+        "w1 射程够得着、准入闸也放行 ⟹ 它有可行动作，不该被退役")
 
 
 def test_a_replaced_parent_is_still_excluded(tmp_path):

@@ -12298,9 +12298,46 @@ class ABFEPipeline:
                     )
                     # 🔑 **段不是"取代"，是"相加"。** 循环开出来的每个采样段都必须
                     # 进最终求解，否则它修好了窗口却报出没修过的那个答案。
-                    merged = self._solve_merged_segments_if_any(
-                        stage_dir, checkpoint_dir, ranges, lam, float(kt)
-                    )
+                    #
+                    # 🔑🔑🔑 [S2-K，2026-09-17 真机] **合并求解会撞上过期证据并炸穿流水线。**
+                    #
+                    #     [自治] 执行 ANALYZE 失败：ValueError('窗口 4 lambda 内容与当前路径不匹配')
+                    #     _solve_merged_segments_if_any → _load_ibs_window_outputs_merged
+                    #       → ibs_engine.load_ibs_window_outputs_from_dir → raise → 炸穿主循环
+                    #
+                    # 控制器对**补帧类**动作早就有这道闸（分支 1d-0：布局过期的窗口
+                    # 只能重采；停滞降级另有 `_stale_for_escalation`），理由原文：
+                    # 「拿已有帧重解的动作在构造上都会维度不符，真机实测是直接
+                    # `ValueError` 炸出流水线」。**唯独 `ANALYZE` 没有** —— 而它恰恰
+                    # 是**跨全部段、拿已有帧重解**的那一个。
+                    #
+                    # 而**判据侧完全知道**：`classify_layout_evidence()` 逐 (段, 窗口)
+                    # 比 λ 身份，`read_aggregated()` 把过期的排除出 `merged`、记进
+                    # `stale_layout_evidence`。执行器却从盘上**无过滤**加载所有段
+                    # ⟹ 同一个不变量两份实现，形态是「判据侧过滤了、执行器侧没过滤」。
+                    #
+                    # 处置：合并求解失败**不是终态、也不该炸** —— 它只说明"这一轮
+                    # 拿不到跨段的合并证据"。单段的 `result` 已经在上面算出来了，
+                    # 保留它继续走；控制器下一轮会从 `stale_layout_evidence` 看到
+                    # 过期窗口并按 1d-0 路由去重采。**记进 history 让它可见**，
+                    # 不吞成静默。
+                    try:
+                        merged = self._solve_merged_segments_if_any(
+                            stage_dir, checkpoint_dir, ranges, lam, float(kt)
+                        )
+                    except ValueError as _merge_err:
+                        # ⚠️ 只接 `ValueError`：它是 loader 对"身份/形状不符"的
+                        # fail-closed 出口。别扩成 `except Exception` —— 那会把真正的
+                        # 求解错误（数值、IO）一起吞掉。
+                        self._log(
+                            f"  [自治] 跨段合并求解拿不到结果：{_merge_err!r}。"
+                            "成因是有段的窗口 λ 身份与当前布局不符（布局演化之后的"
+                            "遗留段）—— **这不是终态，也不该炸**：本轮的单段结果仍然"
+                            "有效，控制器下一轮会从 `stale_layout_evidence` 看到过期"
+                            "窗口并按「过期证据只能重采」路由过去。"
+                        )
+                        history[-1]["merged_solve_skipped"] = repr(_merge_err)[:300]
+                        merged = None
                     if merged is not None:
                         result = merged
                     # 🔑🔑 **死锁修复。** ANALYZE 算出的 stage 结果原来只活在内存里，
