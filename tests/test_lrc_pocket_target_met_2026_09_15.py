@@ -26,6 +26,9 @@ from abfe_core import (
     LIGAND_SURROUNDING_POCKET,
     resolve_leg_dispersion_implementation as resolve,
 )
+import pytest
+
+pytestmark = pytest.mark.cpu_only
 
 LEGACY = "legacy_uniform_density_lrc"
 

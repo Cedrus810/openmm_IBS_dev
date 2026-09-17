@@ -159,16 +159,62 @@ def test_an_unknown_warmup_budget_is_not_attributed_as_unaffordable(tmp_path):
 
 
 def _fixed_lambda_middle_failure_board(tmp_path):
-    """λ 表顶到溢出槽上限 + 失败的是中间窗 ⟹ 唯一对症的是有界 rewindow。"""
-    from test_stage2_repair_controller import _stage_support_failure
+    """λ 表顶到溢出槽上限 + 失败的是中间窗 ⟹ 唯一对症的是有界 rewindow。
+
+    ⚠️ [REWIND-01，2026-09-17] 窗口 1 原来**只在 stage 级的 `target_support_gate`
+    里失败**，逐窗自检是正常的。而 2026-09-15 定案「未经标定的阈值不驱动动作」之后，
+    逐段质量门只作报告（每条带 `drives_action: False`）⟹ 这块盘面**一个 PROBLEM
+    窗口都没有**，`earliest is None`，控制器如实落到兜底分支。那不是 rewindow 被
+    预算挡掉，是这块盘面已经不含它自己名字里那个「中间窗失败」。
+    改成与 `test_stage2_repair_controller` 同一份 `SUPPORT_FAIL_WINDOW`
+    （逐窗自检 HARD_INSUFFICIENT + 归因 top1pct ⟹ 偏斜类），让盘面名副其实。
+    """
+    from test_stage2_repair_controller import (
+        SUPPORT_FAIL_WINDOW, _stage_support_failure)
     return _mkrun(
         tmp_path,
-        windows={0: {"K": 4}, 1: {"K": 5}, 2: {"K": 9}},
+        windows={0: {"K": 4}, 1: dict(SUPPORT_FAIL_WINDOW), 2: {"K": 9}},
         ranges=[(0, 4), (3, 8), (7, 16)], n_states=16,
         config={"stage2_window_min_states": 4, "stage2_window_max_states": 5,
                 "max_path_insertions": 3},
         stage_result=_stage_support_failure(worst_window=1),
     )
+
+
+def test_a_stage_gate_only_failure_drives_no_action(tmp_path):
+    """2026-09-15 定案的守卫：**未经标定的阈值不驱动动作。**
+
+    盘面：逐窗自检**全部正常**，只有 stage 级 `target_support_gate` 失败。
+    那些阈值（`raw_min_absolute_ess=20`、`max_top1pct_raw_weight=0.35` …）
+    **一个都没标定过**（`docs/archive/AUDIT_GATES_AND_CRITERIA_2026-09-17.md` §3.3：
+    其中一条的报错文本自承无依据；九道门与实验偏差之间测不到关系，且只有约
+    2 个独立方向）⟹ 它们只作报告（每条带 `drives_action: False`），
+    **不得**产生 PROBLEM 窗口、不得驱动补帧/缩跨度。
+
+    ⟹ `earliest` 必须是 None，控制器如实落到兜底：`NO_ACTION`/`NO_FEASIBLE_ACTION`。
+
+    ⚠️ 这块盘面此前**只被 `_fixed_lambda_middle_failure_board` 意外覆盖着**；
+    2026-09-17 那个 fixture 改成「窗口 1 真的自检失败」之后覆盖就没了
+    （abfe-ibs-08 的 AST 扫描：全仓 0 条测试同时碰 `drives_action` 和 `decide()`）。
+    单独立一条，免得哪天有人把质量门接回路由而全套测试不红。
+    """
+    from test_stage2_repair_controller import _stage_support_failure
+    run = _mkrun(
+        tmp_path,
+        windows={0: {"K": 4}, 1: {"K": 5}, 2: {"K": 9}},   # 三个窗自检都正常
+        ranges=[(0, 4), (3, 8), (7, 16)], n_states=16,
+        config={"stage2_window_min_states": 4, "stage2_window_max_states": 5,
+                "max_path_insertions": 3},
+        stage_result=_stage_support_failure(worst_window=1),
+    )
+    plan = Stage2RepairController(run, "vanishing").decide()
+    assert plan["earliest_unresolved_window"] is None, (
+        f"stage 级质量门造出了一个 PROBLEM 窗口：{plan['reason']}")
+    assert plan["action"] == "NO_ACTION", plan["reason"]
+    assert plan["exit"] == "NO_FEASIBLE_ACTION", plan["reason"]
+    # 读数照报，只是不驱动动作
+    assert any(g.get("drives_action") is False
+               for g in (plan.get("stage_quality_gates") or [])), plan
 
 
 def test_an_unknown_production_remainder_does_not_reject_a_bounded_rewindow(tmp_path):
@@ -293,6 +339,11 @@ def test_a_layout_action_is_only_ever_issued_when_it_is_feasible(all_plans):
     # ⚠️ 两套词汇表大小写不同：`plan["action"]` 是 `INSERT_LAMBDA`，
     # `feasible_structural_actions` 的键是 `insert_lambda`。直接 `in` 恒为假 ——
     # 一条按直觉写的守卫会静默永不触发，所以这里显式归一化。
+    # 🔑 [2026-09-17] `IMMUTABLE_REWINDOW` 也是布局动作，也必须当场可行。
+    # REWIND-01 接通之后它在多数盘面上比插 λ/拆末窗先命中（它不动 λ 表、
+    # 不需要 tail anchor、不吃插点预算），所以只数那两个会让本条**测不到东西**。
+    # ⚠️ 它的可行性不在 `feasible_structural_actions` 里（那张表只描述 λ 表上的
+    # 两个动作），用控制器自己的谓词 `rewindow_feasible()` 查。
     seen = set()
     for label, plan in all_plans:
         if plan["action"] in ("INSERT_LAMBDA", "SPLIT_TAIL_WINDOW"):
@@ -301,6 +352,9 @@ def test_a_layout_action_is_only_ever_issued_when_it_is_feasible(all_plans):
             assert plan["action"].lower() in feas, (
                 f"[{label}] 发了一个不可行的布局动作 {plan['action']}："
                 f"{plan['infeasible_structural_actions']}｜{plan['reason']}")
+        elif plan["action"] == "IMMUTABLE_REWINDOW":
+            seen.add(plan["action"])
+            assert plan["windows"], f"[{label}] 有界重窗没点名窗口"
     assert seen, "没有任何盘面产出布局动作 —— 这条断言没测到东西，补盘面"
 
 
@@ -840,18 +894,24 @@ def test_halt_fk_refuted_stays_a_routing_signal_and_says_so(tmp_path):
     就 break，那次 `RECALIBRATE_FK` 根本不执行 —— 「有统计功效的否决 ⟹ 立刻换
     Epoch」这条规矩就成了空话。所以表是对的，自称终态的注释是错的。
     """
-    import inspect
-    import re
+    # 🔑 [2026-09-17] **探针跟着表走。** 原来它用正则在**类源码**里找
+    # `"HALT_FK_REFUTED",  # 注释` 这个字面形状；两张手写表已按用户拍板合并成模块级
+    # 唯一注册表 `EXIT_SPECS`，理由存进 `why` 字段。**不变量一条没变**
+    # （不得是终态、理由必须写明、且不得自称终态），变的只是它存在哪。
+    from abfe_preoptimizer import EXIT_SPECS
 
     assert "HALT_FK_REFUTED" not in TERMINAL, (
         "把它加进 TERMINAL_EXITS 了 —— 主循环会在分发前 break，"
         "它配的 `RECALIBRATE_FK` 永远不跑")
 
-    m = re.search(r'"HALT_FK_REFUTED",\s*#([^\n]*)',
-                  inspect.getsource(Stage2RepairController))
-    assert m, "`EXITS` 里 `HALT_FK_REFUTED` 那行的说明注释没了"
-    assert "终态" not in m.group(1), (
-        f"注释仍自称终态，而它不在 TERMINAL_EXITS 里：{m.group(1).strip()}")
+    _spec = EXIT_SPECS["HALT_FK_REFUTED"]
+    assert _spec.terminal is False, "注册表里把它声明成终态了"
+    assert _spec.default_scope is None, (
+        "路由信号不该有 halt_scope —— 那个字段回答的是「**停**的是谁」，"
+        "而它根本不停")
+    assert _spec.why.strip(), "注册表里这一条的说明没了"
+    assert "终态" not in _spec.why or "**是路由**" in _spec.why, (
+        f"说明仍把它讲成终态，而它不在 TERMINAL_EXITS 里：{_spec.why}")
 
     w = dict(FULL)
     w[2] = {"K": 4, "bias_status": "calibrated_validation_failed", "evidence": "refuted"}
@@ -1034,3 +1094,124 @@ def test_the_window_table_and_the_unit_table_do_not_share_each_other_s_keys(tmp_
         # 反例：这个名字**两张表上都不存在**，写错了只会静默拿 None
         assert "solver_n_decorrelated" not in set(win) | set(unit), (
             "`solver_n_decorrelated` 复活了 —— 真名是 `solver_n_frames_decorrelated`")
+
+
+# ---------------------------------------------------------------------------
+# [2026-09-17] 补帧准入的第三道：剩余配额的乐观上界够不着门 ⟹ 停
+# ---------------------------------------------------------------------------
+
+def _rising_but_short_board(tmp_path, blocks):
+    """真机 cyclod_ligand1_outer/rep1 win0 的形状：逐块**在涨**，但涨不到门。
+
+    `min N_eff/g` 逐块 4.459 / 4.553 / 5.287，门 10，补帧块上限 4。
+    `marginal_gain_stalled` 的判据是「末点 < 前面各点中位数 × 0.9」⟹ 单调上升
+    恒判「还在涨」、刹车永不响；按 +0.41/块要 11 块才够，而配额只有 4 块。
+    """
+    series = [4.459, 4.553, 5.287][:blocks]
+    run = _mkrun(
+        tmp_path,
+        windows={0: {"K": 4, "self_verdict": "INSUFFICIENT_DATA",
+                     "self_verdict_source": "min_n_eff_over_g",
+                     "min_n_eff_over_g": series[-1], "n_decorr": 400,
+                     "prod": 250000 * blocks},
+                 1: {"K": 4}, 2: {"K": 4}, 3: {"K": 4}},
+        # 门 = 10。写侧把它落在 `n_eff_over_g_eligible_threshold`，读侧是
+        # `self_n_eff_over_g_eligible` —— 缺了它射程判不了（返回 None），
+        # `support_failure_is_skew` 会保守判偏斜，整条准入路径根本走不到。
+        self_extra={0: {"n_eff_over_g_eligible_threshold": 10.0}},
+        ranges=R4, n_states=13,
+        config={"stage2_window_min_states": 4, "stage2_window_max_states": 8,
+                "max_path_insertions": 3,
+                "stage2_max_production_blocks_per_window": 4},
+    )
+    (_ck(run) / "stage2_autonomous_history.json").write_text(json.dumps({
+        "iterations": [
+            {"iteration": k + 1, "action": "RUN_PRODUCTION", "path_version": 1,
+             "snapshot": [{"window_idx": 0, "segment": "vanishing",
+                           "production_steps": 250000 * (k + 1),
+                           # 去相关帧数也单调上升 ⟹ 老刹车同样不响
+                           "solver_n_decorrelated": 400 + 40 * k,
+                           "min_n_eff_over_g": series[k]}]}
+            for k in range(blocks)]}))
+    return run
+
+
+def test_frames_stop_when_the_whole_remaining_quota_cannot_reach_the_gate(tmp_path):
+    """DEAD_LINES §3.1：前向判据乐观、事后刹车失灵 ⟹ 这一对少了一半。
+
+    `n_eff_over_g_reachable_by_frames` 的 docstring 自己写着它是**上界**、
+    「`True` 只表示值得一试」，并且「真正的刹车是事后的 `marginal_gain_stalled()`
+    —— 两者一前一后，**缺一不可**」。而那个刹车对**单调上升但渐近在门以下**的
+    序列永不触发 ⟹ 进的时候乐观、出的时候没人管，白烧 GPU。
+
+    补的这一道**不引入新阈值、也不拟合斜率**（那个量单次噪声 34×，3 个点拟斜率
+    同样在量噪声）：就是同一个前向判据，拿**现在的读数**和**剩下的配额**再问一次。
+
+    真机数代进去：已批 2 块 ⟹ 剩余帧数倍率 (1+4)/(1+2)=1.67，
+    4.553×1.67=7.6 < 门 10 ⟹ 连最乐观的情形都够不着 ⟹ 必须停。
+    """
+    run = _rising_but_short_board(tmp_path, blocks=2)
+    plan = Stage2RepairController(run, "vanishing").decide()
+    assert plan["action"] != "RUN_PRODUCTION", (
+        f"剩余配额全花掉也够不着门，还在补帧：{plan['reason']}")
+    # 而且**不是**停下来，是转去对症动作：射程判据与 `support_failure_is_skew`
+    # 共用同一个函数 ⟹ 射程一旦够不着，归因立刻从「样本量类」翻成「偏斜类」，
+    # 分支侧就先发缩跨度了（准入层是给**其余十几个**不查归因的补帧入口兜底的，
+    # 见下一条）。
+    assert plan["action"] in ("INSERT_LAMBDA", "SPLIT_TAIL_WINDOW",
+                             "IMMUTABLE_REWINDOW"), plan["reason"]
+
+
+def test_the_admission_choke_point_also_stops_entries_that_skip_attribution(tmp_path):
+    """准入层是**咽喉**：`decide()` 有十几个发 `RUN_PRODUCTION` 的出口，
+    其中只有「自检归因」那两条会问射程，其余（缺窗/跳窗/旧布局/步数未达标…）
+    一概不问 —— 那正是 FLOW 的 D1「补帧 11 条入口、缩跨度 5 条且全部带闸」。
+
+    所以射程判据必须挂在 `_frames_admission`（全部入口的唯一咽喉），
+    不能只挂在归因上。这条走「求解器跳窗 ⟹ 补帧」那条入口，它不查归因。
+    """
+    run = _rising_but_short_board(tmp_path, blocks=2)
+    (_ck(run) / "stage2_vanishing.json").write_text(json.dumps({
+        "analysis_status": "ANALYSIS_INCOMPLETE",
+        "analysis_incomplete_reasons": ["路径缺窗：求解器少解出一个窗口。"],
+        "skipped_windows": [{"window_index": 0,
+                             "reason": "n_decorrelated 太少"}],
+    }))
+    plan = Stage2RepairController(run, "vanishing").decide()
+    assert plan["action"] != "RUN_PRODUCTION", (
+        f"跳窗入口绕过了射程判据：{plan['action']}｜{plan['reason']}")
+    assert "够不着门" in plan["reason"], plan["reason"]
+
+
+def test_a_reachable_gate_is_unknown_and_authorizes_nothing(tmp_path):
+    """[2026-09-17 P0，取代旧语义] 射程**够得着**只说明「尚未被证伪」⟹ `UNKNOWN`。
+
+    本条原名 `test_frames_still_admitted_while_the_gate_is_optimistically_in_range`，
+    断言的是「射程够得着 ⟹ 必须放行补帧」。那把一个**乐观上界**当成了"这是样本量
+    问题"的结论 —— 而该上界假定 η 与 g 恒定，两个假设实测都朝不利方向走。
+
+    新规则：只有**明确的帧数硬证据**（`solver_eligibility` 或 `n_decorrelated <
+    min_frames`）才授权补帧；`reachable is True` 与 `reachable is None` 都是
+    `UNKNOWN`，**两边都不授权**（不补帧、也不改布局）。
+
+    ⚠️ 防作弊的那一半改由下一条守着：帧数硬证据的盘面**仍然**必须补帧。
+    """
+    run = _rising_but_short_board(tmp_path, blocks=1)
+    plan = Stage2RepairController(run, "vanishing").decide()
+    assert not (plan["action"] == "RUN_PRODUCTION" and plan["windows"] == [0]), (
+        f"射程只是「尚未被证伪」，却被当成样本量证据放行了补帧：{plan['reason']}")
+
+
+def test_explicit_frame_count_evidence_still_buys_frames(tmp_path):
+    """反面（防「一律不补帧」）：**明确**帧数不足的窗口仍然必须拿到帧。
+
+    `solver_eligibility` 是硬证据 —— 连喂进 MBAR 的去相关样本都不够，
+    补帧就是对症动作。三态收紧不得波及它。
+    """
+    w = {i: {"K": 4} for i in range(4)}
+    w[0] = {"K": 4, "self_verdict": "INSUFFICIENT_DATA",
+            "self_verdict_source": "solver_eligibility", "n_decorr": 5}
+    run = _mkrun(tmp_path, windows=w, ranges=R4, n_states=13)
+    plan = Stage2RepairController(run, "vanishing").decide()
+    assert plan["action"] == "RUN_PRODUCTION" and plan["windows"] == [0], (
+        f"帧数硬证据也不补帧了 —— 三态收紧波及了它：{plan['reason']}")

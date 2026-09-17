@@ -47,6 +47,8 @@ import pytest
 
 from step_guard import guarded_step, step_with_chunk_rollback
 
+pytestmark = pytest.mark.cpu_only
+
 _SRC = Path(__file__).resolve().parents[1] / "ibs_engine.py"
 
 

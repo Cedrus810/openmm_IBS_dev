@@ -17,6 +17,8 @@ import pytest
 
 from abfe_preoptimizer import _worst_window_by
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _rec(i, v, key="top1pct_raw_weight"):
     return {"window_index": i, key: v}

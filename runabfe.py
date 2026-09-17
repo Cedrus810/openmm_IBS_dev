@@ -3465,6 +3465,8 @@ class RunConfig:
             preset["only_complex_charging"] = bool(args.only_complex_charging)
         if _flag_present("--only-boresch-attachment"):
             preset["only_boresch_attachment"] = bool(args.only_boresch_attachment)
+        if _flag_present("--only-ligand-in-water"):
+            preset["only_ligand_in_water"] = bool(args.only_ligand_in_water)
 
         # The formal product has one user-facing boolean.  Keep the temporary
         # EXP-030 key as a read-only compatibility alias for old config files,
@@ -3550,6 +3552,8 @@ class RunConfig:
             "remd_backend": free_energy_engine.REMD_BACKEND_DEFAULT,
             # [P1-17] Boresch attachment 腿 A′→A
             "only_boresch_attachment": False,
+            # [LR-04] 只跑溶剂腿的调试入口，不产出 ΔG_bind
+            "only_ligand_in_water": False,
             "attachment_rerun_dir": None,
             "attachment_lambdas": None,
             "attachment_n_steps_per_state": 250000,
@@ -4568,8 +4572,9 @@ def build_parser() -> argparse.ArgumentParser:
         dest="outer_lambda_resource_manifest",
         default=None,
         help=(
-            "冻结 R1 资源 manifest 的路径。不给则用仓库默认的 "
-            "resources/outer_lambda_local_residual/manifest.json（出厂 Atenolol 那份）。"
+            "冻结 R1 资源 manifest 的路径。**仓库不再随包发任何冻结权重**"
+            "（2026-09-17 移出 resources/，理由见 archive/resources/…/WHY_RETIRED.md）："
+            "不给这个参数就没有可加载的冻结模型，配体不匹配会走 EXP-033 P1 闭式重训。"
             "换配体重训出来的产物用这个显式指过去——只是指路，不放宽任何身份门："
             "配体指纹、原子数、payload/weights sha、插件源码 sha 全部照常校验。"
         ),
@@ -4836,6 +4841,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "隔离重跑复合物腿 Stage 1 PME charging；跳过 Stage 2 路径优化、"
             "VDW 采样和溶剂腿，并用现有 Stage 2/solvent 结果生成候选汇总"
+        ),
+    )
+    parser.add_argument(
+        "--only-ligand-in-water",
+        action="store_true",
+        help=(
+            "[LR-04] 只跑「配体在水中」那条腿：跳过 Boresch 估算、rebalance 和整条"
+            "复合物腿。给的是配体在水里的去耦自由能 ΔG_solvent，"
+            "**不是结合能** —— 没有复合物腿就没有 ΔG_bind，主 final_results.json 不被覆盖。"
+            "调试用，不是生产入口"
         ),
     )
     parser.add_argument(
@@ -7118,6 +7133,19 @@ def main():
             "--only-boresch-attachment 必须与 --resume 同用，以只读加载现有 committed "
             "Boresch、stage1/stage2 和 solvent 结果"
         )
+    if config.only_ligand_in_water and (
+        config.only_complex_charging or config.only_boresch_attachment
+    ):
+        raise RuntimeError(
+            "--only-ligand-in-water 与 --only-complex-charging / --only-boresch-attachment 互斥："
+            "三者各自只跑一条腿，同时给两个说明调用方没想清楚要哪条"
+        )
+    if config.only_ligand_in_water and config.outer_lambda_local_residual_ibs:
+        raise RuntimeError(
+            f"--only-ligand-in-water 暂不支持 {OUTER_LAMBDA_RESIDUAL_FEATURE_NAME}："
+            "残差运行时是在复合物腿那一段构造出来、再按溶剂腿拓扑重建的，"
+            "跳过复合物腿就拿不到它。fail closed，不静默跑成 baseline 溶剂腿"
+        )
     if config.outer_lambda_local_residual_ibs and (
         config.mode != "ibs" or config.decoupling != "dual_lambda"
     ):
@@ -7899,6 +7927,11 @@ def main():
             _mode,
             float(boresch_restraint["equilibrium_values"]["r0"]),
         )
+    elif config.only_ligand_in_water:
+        # [LR-04] `resolve_boresch_restraint` 会**无条件**跑完基线预平衡，
+        # 那是复合物腿的开销；溶剂腿一个字节都用不上它。
+        boresch_restraint = None
+        log.info("ligand-in-water-only：跳过 Boresch 估算与带限制力 rebalance")
     else:
         boresch_restraint = resolve_boresch_restraint(config, pipeline)
 
@@ -8000,141 +8033,149 @@ def main():
         )
 
     # ----- 6. 运行复合物腿主流程 -----
-    log.info("启动复合物腿主采样流程 (%s)", config.decoupling)
-    _scope_pipeline_with_optional_outer_lambda_em(
-        pipeline, outer_lambda_runtime is not None
-    )
-    # 🔑 开关开着 ⟹ 要么真挂上了，要么**报错**。绝不静默跑 baseline。
-    #
-    # 缺冻结 manifest 是**正常初始状态**，不是错误状态 —— 输入的时候谁都没有这份
-    # 蒸馏出来的权重。所以 fail-closed 的位置从"资源缺失"挪到了这里："训完了仍然
-    # 没有"。中间那一步（EXP-033 P1 闭式重训）自己失败会当场抛，不会走到这。
-    #
-    # 这道断言防的是**未来重构**：`_residual_refit_pending` 的赋值、重训调用点、
-    # 腿的分支只要有一处挪位，开着开关的 run 就会拿 `residual_sampling_enabled=False`
-    # 造出来的 pipeline 一路跑完，报告里一切正常，而残差一次都没生效。
-    if config.outer_lambda_local_residual_ibs and outer_lambda_runtime is None:
-        raise RuntimeError(
-            f"{OUTER_LAMBDA_RESIDUAL_FEATURE_NAME} 开关是开的，但到开始采样时运行时"
-            "仍然没有绑上。这不该发生：冻结 manifest 覆盖不到当前配体时应该走自动"
-            "闭式重训（docs/EXP-033_P1_LANDED_2026-09-12.md）。"
-            "拒绝静默按 baseline 跑完 —— 那会产出一份看起来一切正常、而残差从未生效的结果。"
+    if config.only_ligand_in_water:
+        # [LR-04] ligand-in-water-only 调试入口：复合物腿整段不跑 ⟹ 没有 ΔG_complex，
+        # 也就不可能有 ΔG_bind。溶剂腿跑完在下面早退，绝不走到第 8 节。
+        log.info("ligand-in-water-only：跳过复合物腿主流程（stage1 / stage2 / attachment 均未运行）")
+        complex_results = None
+        dg_complex = err_complex = dg_boresch = None
+        attachment_result = {}
+    else:
+        log.info("启动复合物腿主采样流程 (%s)", config.decoupling)
+        _scope_pipeline_with_optional_outer_lambda_em(
+            pipeline, outer_lambda_runtime is not None
         )
+        # 🔑 开关开着 ⟹ 要么真挂上了，要么**报错**。绝不静默跑 baseline。
+        #
+        # 缺冻结 manifest 是**正常初始状态**，不是错误状态 —— 输入的时候谁都没有这份
+        # 蒸馏出来的权重。所以 fail-closed 的位置从"资源缺失"挪到了这里："训完了仍然
+        # 没有"。中间那一步（EXP-033 P1 闭式重训）自己失败会当场抛，不会走到这。
+        #
+        # 这道断言防的是**未来重构**：`_residual_refit_pending` 的赋值、重训调用点、
+        # 腿的分支只要有一处挪位，开着开关的 run 就会拿 `residual_sampling_enabled=False`
+        # 造出来的 pipeline 一路跑完，报告里一切正常，而残差一次都没生效。
+        if config.outer_lambda_local_residual_ibs and outer_lambda_runtime is None:
+            raise RuntimeError(
+                f"{OUTER_LAMBDA_RESIDUAL_FEATURE_NAME} 开关是开的，但到开始采样时运行时"
+                "仍然没有绑上。这不该发生：冻结 manifest 覆盖不到当前配体时应该走自动"
+                "闭式重训（docs/EXP-033_P1_LANDED_2026-09-12.md）。"
+                "拒绝静默按 baseline 跑完 —— 那会产出一份看起来一切正常、而残差从未生效的结果。"
+            )
 
-    complex_results = pipeline.run_full_pipeline(
-        # 🔑 [2026-09-01] 质量门放行开关（见 --allow-untrusted-stage-results）。
-        # 不传的话 _last_run_config 里就是 False，行为与之前完全一致（fail-closed）。
-        allow_untrusted_stage_results=bool(
-            config.get("allow_untrusted_stage_results", False)
-        ),
-        decoupling_scheme=config.decoupling,
-        potential_type=config.potential,
-        dexp_params=dexp_params,
-        boresch_params=boresch_restraint,
-        torsion_params=torsion_params,
-        n_equil_steps=config.get("n_equil_steps", 5_000_000),
-        resume=config.resume and not config.reset,
-        run_equilibration=not equilibrium_is_done(
-            output_dir,
-            # 🔑 [2026-09-01] 同上：走统一入口，口径与 pre_equilibrate 内部一致。
-            expected_fingerprint=pipeline.pre_equilibration_identity_fingerprint(
-                config.get("n_equil_steps", 5_000_000)
+        complex_results = pipeline.run_full_pipeline(
+            # 🔑 [2026-09-01] 质量门放行开关（见 --allow-untrusted-stage-results）。
+            # 不传的话 _last_run_config 里就是 False，行为与之前完全一致（fail-closed）。
+            allow_untrusted_stage_results=bool(
+                config.get("allow_untrusted_stage_results", False)
             ),
-            # [P1-07] checkpoint 以目标 Simulation 的真实 loadCheckpoint 成功为准。
-            simulation=_checkpoint_probe_simulation(pipeline),
-        ) or config.reset,
-        # 注意：这个 system_type 是**腿身份**（complex/solvent），与膜协议的
-        # 环境类型（soluble/membrane）是两个不同的轴，后者走
-        # ABFEPipeline(environment_type=...)。
-        system_type="complex",
-        n_steps_per_window=config.n_steps_per_window,
-        steps_per_update=config.steps_per_update,
-        n_states_per_stage=config.get("stage1_n_states", 16),
-        stage1_n_states=config.get("stage1_n_states", 16),
-        stage2_n_states=config.get("stage2_n_states", config.get("stage1_n_states", 16)),
-        # None 时不改变行为（optimize_stage2_vanishing 自己的默认 23 生效）。
-        stage2_final_n_states=config.get("stage2_final_n_states"),
-        stage2_refine_extra_points_per_segment=config.get(
-            "stage2_refine_extra_points_per_segment"
-        ),
-        stage2_window_min_states=config.get("stage2_window_min_states"),
-        # 🔑 [2026-09-16] `stage2_autonomous_controller` 在 abfe_pipeline 里一直是
-        # `kwargs.get(..., True)`，但**从来没有人往下传** ⟹ 配置里写了也没用，
-        # 自治循环无法关闭。做「固定预算、不按中间结果提前停」的对照实验时，
-        # 自适应补帧本身就是要消除的选择偏差，必须能关。默认仍是 True，
-        # 不写这个键时行为逐字不变。
-        stage2_autonomous_controller=config.get(
-            "stage2_autonomous_controller", True),
-        stage2_window_max_states=config.get("stage2_window_max_states"),
-        # 🔑🔑 [2026-09-15] Stage-2 控制器的两道生产预算闸。读侧（pipeline 组装
-        # `effective_config` → `Stage2RepairController`）早就有了，**上游一直没接**
-        # ⟹ 两条腿都退回读侧默认（预算"未知"=不拦、每块 250k），配置/预设/CLI
-        # 里设的值一个都没生效。两个键都是执行策略、不进缓存身份
-        # （见 abfe_pipeline._NON_IDENTITY_KWARGS），所以可以无条件透传：
-        # 没配就是 None，pipeline 侧按"缺键=未知"过滤掉，行为逐字不变。
-        stage2_production_budget_steps=config.get("stage2_production_budget_steps"),
-        stage2_max_production_blocks_per_window=config.get(
-            "stage2_max_production_blocks_per_window"
-        ),
-        **_path_evolution_kwargs(config),
-        stage2_free_energy_densify_points=config.get(
-            "stage2_free_energy_densify_points"
-        ),
-        enable_early_stop=config.enable_early_stop,
-        enable_gradual_warmup=config.enable_gradual_warmup,
-        warmup_steps=config.warmup_steps,
-        n_workers=config.n_workers,
-        parallel_stages=config.parallel_stages,
-        decharge_method=config.get("decharge_method", "pme"),
-        allow_disk_boresch_autoload=True,
-        enable_lambda_refine=config.get("enable_lambda_refine", False),
-        refine_n_steps_per_window=config.get("refine_n_steps_per_window", 30000),
-        refine_steps_per_update=config.get("refine_steps_per_update", config.steps_per_update),
-        refine_max_window_span_kJ=config.get("refine_max_window_span_kJ", 35.0),
-        pilot_finite_difference_delta=config.get("pilot_finite_difference_delta", 0.01),
-        pilot_n_steps_per_state=config.get("pilot_n_steps_per_state", 10000),
-        # 🔑 [0831issue P2] abfe_config.json 把这个键文档化成可用开关，但 main() 从来
-        # 没透传过 —— 用户按注释设成正整数后一个 shadow 诊断都不会写，却毫无提示。
-        # None（默认）时 abfe_pipeline 侧行为不变，不产生任何 shadow 诊断。
-        pilot_shadow_checkpoint_interval=config.get("pilot_shadow_checkpoint_interval"),
-        ibs_lse_log_residual_tolerance=config.get(
-            "ibs_lse_log_residual_tolerance", 0.5
-        ),
-        min_bias_updates=config.get("min_bias_updates", 12),
-        max_bias_updates=config.get("max_bias_updates", 50),
-        required_consecutive_bias_updates=config.get(
-            "required_consecutive_bias_updates", 3
-        ),
-        max_bias_warmup_steps=config.get("max_bias_warmup_steps", 500000),
-        # 🔑 [2026-07-27] 此前这个参数只在 --only-complex-charging 那条路径接通，
-        # 完整 dual_lambda 链路根本没传，REMDManager 于是用默认上限、在建任何 GPU
-        # Context 前预防性回退 CPU——整个 decharging 阶段慢约两个数量级，而且那条
-        # 告警只 print 到终端、pipeline.log 里看不见，表现得像卡死。
-        charging_max_resident_contexts=config.get("charging_max_resident_contexts"),
-        attachment_lambdas=config.get("attachment_lambdas"),
-        attachment_n_steps_per_state=config.get("attachment_n_steps_per_state", 250_000),
-        attachment_equil_steps_per_state=config.get("attachment_equil_steps_per_state", 50_000),
-        attachment_steps_per_sample=config.get("attachment_steps_per_sample", 1_000),
-        attachment_seed=config.get("attachment_seed", 20260728),
-        attachment_n_seeds=config.get("attachment_n_seeds", 1),
-    )
-    
-    # 🔑 [P1-12] 之前这里 .get(..., 0.0) 会把缺字段静默补成 0：一条损坏/部分
-    # 失败的腿会被汇总成"看似成功"的 ΔG_bind。统一 sanity gate 缺字段/非有限/
-    # 负误差/converged 不为 True 一律 fail closed。
-    _complex_leg_gate = validate_final_leg_result(
-        complex_results, context="complex leg (in-memory)", source="run_full_pipeline"
-    )
-    dg_complex = _complex_leg_gate["delta_G_kJ_mol"]
-    err_complex = _complex_leg_gate["error_kJ_mol"]
-    if _repeat_seed is not None:
-        run_provenance = _update_run_provenance_seed_contract(
-            output_dir,
-            {"complex": pipeline.seed_contract_snapshot()},
-            current=run_provenance,
+            decoupling_scheme=config.decoupling,
+            potential_type=config.potential,
+            dexp_params=dexp_params,
+            boresch_params=boresch_restraint,
+            torsion_params=torsion_params,
+            n_equil_steps=config.get("n_equil_steps", 5_000_000),
+            resume=config.resume and not config.reset,
+            run_equilibration=not equilibrium_is_done(
+                output_dir,
+                # 🔑 [2026-09-01] 同上：走统一入口，口径与 pre_equilibrate 内部一致。
+                expected_fingerprint=pipeline.pre_equilibration_identity_fingerprint(
+                    config.get("n_equil_steps", 5_000_000)
+                ),
+                # [P1-07] checkpoint 以目标 Simulation 的真实 loadCheckpoint 成功为准。
+                simulation=_checkpoint_probe_simulation(pipeline),
+            ) or config.reset,
+            # 注意：这个 system_type 是**腿身份**（complex/solvent），与膜协议的
+            # 环境类型（soluble/membrane）是两个不同的轴，后者走
+            # ABFEPipeline(environment_type=...)。
+            system_type="complex",
+            n_steps_per_window=config.n_steps_per_window,
+            steps_per_update=config.steps_per_update,
+            n_states_per_stage=config.get("stage1_n_states", 16),
+            stage1_n_states=config.get("stage1_n_states", 16),
+            stage2_n_states=config.get("stage2_n_states", config.get("stage1_n_states", 16)),
+            # None 时不改变行为（optimize_stage2_vanishing 自己的默认 23 生效）。
+            stage2_final_n_states=config.get("stage2_final_n_states"),
+            stage2_refine_extra_points_per_segment=config.get(
+                "stage2_refine_extra_points_per_segment"
+            ),
+            stage2_window_min_states=config.get("stage2_window_min_states"),
+            # 🔑 [2026-09-16] `stage2_autonomous_controller` 在 abfe_pipeline 里一直是
+            # `kwargs.get(..., True)`，但**从来没有人往下传** ⟹ 配置里写了也没用，
+            # 自治循环无法关闭。做「固定预算、不按中间结果提前停」的对照实验时，
+            # 自适应补帧本身就是要消除的选择偏差，必须能关。默认仍是 True，
+            # 不写这个键时行为逐字不变。
+            stage2_autonomous_controller=config.get(
+                "stage2_autonomous_controller", True),
+            stage2_window_max_states=config.get("stage2_window_max_states"),
+            # 🔑🔑 [2026-09-15] Stage-2 控制器的两道生产预算闸。读侧（pipeline 组装
+            # `effective_config` → `Stage2RepairController`）早就有了，**上游一直没接**
+            # ⟹ 两条腿都退回读侧默认（预算"未知"=不拦、每块 250k），配置/预设/CLI
+            # 里设的值一个都没生效。两个键都是执行策略、不进缓存身份
+            # （见 abfe_pipeline._NON_IDENTITY_KWARGS），所以可以无条件透传：
+            # 没配就是 None，pipeline 侧按"缺键=未知"过滤掉，行为逐字不变。
+            stage2_production_budget_steps=config.get("stage2_production_budget_steps"),
+            stage2_max_production_blocks_per_window=config.get(
+                "stage2_max_production_blocks_per_window"
+            ),
+            **_path_evolution_kwargs(config),
+            stage2_free_energy_densify_points=config.get(
+                "stage2_free_energy_densify_points"
+            ),
+            enable_early_stop=config.enable_early_stop,
+            enable_gradual_warmup=config.enable_gradual_warmup,
+            warmup_steps=config.warmup_steps,
+            n_workers=config.n_workers,
+            parallel_stages=config.parallel_stages,
+            decharge_method=config.get("decharge_method", "pme"),
+            allow_disk_boresch_autoload=True,
+            enable_lambda_refine=config.get("enable_lambda_refine", False),
+            refine_n_steps_per_window=config.get("refine_n_steps_per_window", 30000),
+            refine_steps_per_update=config.get("refine_steps_per_update", config.steps_per_update),
+            refine_max_window_span_kJ=config.get("refine_max_window_span_kJ", 35.0),
+            pilot_finite_difference_delta=config.get("pilot_finite_difference_delta", 0.01),
+            pilot_n_steps_per_state=config.get("pilot_n_steps_per_state", 10000),
+            # 🔑 [0831issue P2] abfe_config.json 把这个键文档化成可用开关，但 main() 从来
+            # 没透传过 —— 用户按注释设成正整数后一个 shadow 诊断都不会写，却毫无提示。
+            # None（默认）时 abfe_pipeline 侧行为不变，不产生任何 shadow 诊断。
+            pilot_shadow_checkpoint_interval=config.get("pilot_shadow_checkpoint_interval"),
+            ibs_lse_log_residual_tolerance=config.get(
+                "ibs_lse_log_residual_tolerance", 0.5
+            ),
+            min_bias_updates=config.get("min_bias_updates", 12),
+            max_bias_updates=config.get("max_bias_updates", 50),
+            required_consecutive_bias_updates=config.get(
+                "required_consecutive_bias_updates", 3
+            ),
+            max_bias_warmup_steps=config.get("max_bias_warmup_steps", 500000),
+            # 🔑 [2026-07-27] 此前这个参数只在 --only-complex-charging 那条路径接通，
+            # 完整 dual_lambda 链路根本没传，REMDManager 于是用默认上限、在建任何 GPU
+            # Context 前预防性回退 CPU——整个 decharging 阶段慢约两个数量级，而且那条
+            # 告警只 print 到终端、pipeline.log 里看不见，表现得像卡死。
+            charging_max_resident_contexts=config.get("charging_max_resident_contexts"),
+            attachment_lambdas=config.get("attachment_lambdas"),
+            attachment_n_steps_per_state=config.get("attachment_n_steps_per_state", 250_000),
+            attachment_equil_steps_per_state=config.get("attachment_equil_steps_per_state", 50_000),
+            attachment_steps_per_sample=config.get("attachment_steps_per_sample", 1_000),
+            attachment_seed=config.get("attachment_seed", 20260728),
+            attachment_n_seeds=config.get("attachment_n_seeds", 1),
         )
-    dg_boresch = complex_results.get("boresch_correction_kJ_mol", 0.0)
-    attachment_result = complex_results.get("boresch_attachment", {})
+    
+        # 🔑 [P1-12] 之前这里 .get(..., 0.0) 会把缺字段静默补成 0：一条损坏/部分
+        # 失败的腿会被汇总成"看似成功"的 ΔG_bind。统一 sanity gate 缺字段/非有限/
+        # 负误差/converged 不为 True 一律 fail closed。
+        _complex_leg_gate = validate_final_leg_result(
+            complex_results, context="complex leg (in-memory)", source="run_full_pipeline"
+        )
+        dg_complex = _complex_leg_gate["delta_G_kJ_mol"]
+        err_complex = _complex_leg_gate["error_kJ_mol"]
+        if _repeat_seed is not None:
+            run_provenance = _update_run_provenance_seed_contract(
+                output_dir,
+                {"complex": pipeline.seed_contract_snapshot()},
+                current=run_provenance,
+            )
+        dg_boresch = complex_results.get("boresch_correction_kJ_mol", 0.0)
+        attachment_result = complex_results.get("boresch_attachment", {})
 
     # ----- 7. 自动加载溶剂相缓存并运行溶剂腿 (ABFE 必选项) -----
     log.info("\n" + "="*70)
@@ -8367,6 +8408,24 @@ def main():
     )
     dg_solvent = _solvent_leg_gate["delta_G_kJ_mol"]
     err_solvent = _solvent_leg_gate["error_kJ_mol"]
+
+    if config.only_ligand_in_water:
+        # [LR-04] 在这里退，而不是让它走到第 8 节：ΔG_bind 需要两条腿，
+        # 复合物腿这次根本没跑。早退比"补个 None 往下传"安全 ——
+        # 后者每加一个下游分支就多一次把半份结果写成完整结果的机会。
+        log.info("=" * 70)
+        log.info(
+            "ligand-in-water-only 已结束：ΔG_solvent = %.4f ± %.4f kJ/mol",
+            dg_solvent, err_solvent,
+        )
+        log.info(
+            "这是**配体在水中的去耦自由能，不是结合能**：复合物腿本次没有运行，"
+            "ΔG_bind 需要两条腿，%s 未被覆盖。",
+            os.path.join(output_dir, "final_results.json"),
+        )
+        log.info("溶剂腿结果: %s", os.path.join(solvent_out_dir, "final_results.json"))
+        log.info("=" * 70)
+        return
     if _repeat_seed is not None:
         run_provenance = _update_run_provenance_seed_contract(
             output_dir,

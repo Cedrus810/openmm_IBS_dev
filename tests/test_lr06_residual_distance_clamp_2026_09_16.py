@@ -43,6 +43,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN = ROOT / "plugins/LocalManyBodyResidual"
 CUDA_SRC = PLUGIN / "platforms/cuda/src/CudaLocalManyBodyResidualKernels.cpp"
@@ -115,7 +117,10 @@ def test_the_plugin_source_identity_gate_was_resynced():
     py = (ROOT / "local_residual/openmm_plugin.py").read_text()
     m = re.search(r'KNOWN_PLUGIN_SOURCE_SHA256 = \(\s*"([0-9a-f]{64})"', py)
     assert m and m.group(1) == actual, "local_residual/openmm_plugin.py 的 sha256 没跟上"
-    manifest = json.loads(
-        (ROOT / "resources/outer_lambda_local_residual/manifest.json").read_text()
-    )
-    assert manifest["plugin"]["source_sha256"] == actual, "资源 manifest 的 sha256 没跟上"
+    # 2026-09-17：出厂那份冻结权重绑的是已收工体系，已移出 `resources/`（见
+    # archive/.../WHY_RETIRED.md）。sha 对账仍然有意义——归档那份的插件 sha
+    # 必须与源码一致，否则将来有人取回来用就是对着旧内核的权重。
+    archived = ROOT / "archive/resources/outer_lambda_local_residual_atenolol_retired/manifest.json"
+    if archived.is_file():
+        manifest = json.loads(archived.read_text())
+        assert manifest["plugin"]["source_sha256"] == actual, "归档 manifest 的 sha256 没跟上"

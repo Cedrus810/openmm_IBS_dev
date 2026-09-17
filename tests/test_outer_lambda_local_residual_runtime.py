@@ -25,8 +25,9 @@ _RESOURCE_MANIFEST = _REPO_ROOT / "resources/outer_lambda_local_residual/manifes
 requires_frozen_r1_resource = pytest.mark.skipif(
     not _RESOURCE_MANIFEST.is_file(),
     reason=(
-        "冻结 R1 模型资源不随本工程区分支分发（只对 Atenolol 有效）；"
-        "从 Atenolol-rank11 取回 resources/outer_lambda_local_residual/ 后本用例恢复"
+        "冻结 R1 模型资源不在 resources/ 下：2026-09-17 移进 "
+        "archive/resources/（它绑的是已收工体系，对任何当前配体都指纹不匹配）。"
+        "要跑本用例，用 --outer-lambda-resource-manifest 指一份真能覆盖当前配体的 manifest"
     ),
 )
 

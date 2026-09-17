@@ -326,8 +326,9 @@ def atom_type_index_for_topology(
     if missing:
         raise ValueError(
             f"拓扑包含不在 LocalManyBodyResidual 固定词表中的元素: {missing}"
-            f"（词表 {sorted(type_map)}）。换配体/换体系请用 --outer-lambda-autofit "
-            "按本体系重训一份，词表会跟着体系走。"
+            f"（词表 {sorted(type_map)}）。换配体/换体系走 "
+            "--outer-lambda-local-residual-ibs：配体指纹对不上冻结 manifest 时会自动"
+            "闭式重训一份（EXP-033 P1），词表跟着体系走。"
         )
     return [type_map[number] for number in numbers]
 

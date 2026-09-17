@@ -15,6 +15,8 @@ import pytest
 
 from ibs_engine import _resolve_analysis_f_k
 
+pytestmark = pytest.mark.cpu_only
+
 ENTRY = [-39.3731, -22.3923, -8.9490, 1.8983, 10.0506, 16.1082, 20.5266, 22.1308]
 LIVE = [-39.4601, -22.5711, -9.1299, 1.7660, 10.0152, 16.2088, 20.7580, 22.4130]
 

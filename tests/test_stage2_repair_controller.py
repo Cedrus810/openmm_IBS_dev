@@ -30,7 +30,7 @@ from abfe_preoptimizer import Stage2RepairController
 
 
 def _mkrun(tmp_path, *, windows, ranges, n_states, config=None, stage_result=None,
-           stage_name="vanishing", stage_type="vdw"):
+           stage_name="vanishing", stage_type="vdw", self_extra=None):
     """造一个最小的 run 目录：路径版本链 + 每窗口的 convergence/ibs_state。"""
     run = tmp_path / "run"
     ck = run / "checkpoints"
@@ -92,6 +92,18 @@ def _mkrun(tmp_path, *, windows, ranges, n_states, config=None, stage_result=Non
                     "n_frames_decorrelated": w.get("n_decorr", 120),
                     "min_frames_per_window": 10,
                     "min_n_eff_over_g": w.get("min_n_eff_over_g", 25.0),
+                    # ⚠️ [2026-09-17] **写侧一定会写这个键**
+                    # （`ibs_engine.window_self_support_check` 的
+                    # `n_eff_over_g_eligible_threshold`，默认 10.0）。
+                    # fixture 先前不写 ⟹ 读侧 `self_n_eff_over_g_eligible` 恒 None
+                    # ⟹ 射程恒判不了 ⟹ 三态里**只出现 UNKNOWN**，
+                    # STRUCTURAL / SAMPLE_SIZE 两支一条都测不到。
+                    # 不补它就等于把「一切都是 UNKNOWN」固化进整个套件。
+                    "n_eff_over_g_eligible_threshold": w.get("n_eff_target", 10.0),
+                    # [2026-09-17] 额外的自检键（如
+                    # `n_eff_over_g_eligible_threshold` —— 射程判据要的那个门）。
+                    # 默认不写：老产物没有它，`support_failure_is_skew` 保持既有判法。
+                    **((self_extra or {}).get(idx) or {}),
                 })
             )
     if stage_result is not None:
@@ -393,35 +405,59 @@ def test_stage_not_converged_is_never_done(tmp_path, label, extra):
 
 
 def test_stage_gate_failure_routes_by_the_gate_that_actually_failed(tmp_path):
-    """归因**按真实失败的那道门**分岔：支撑/偏斜 → 缩跨度；样本量/精度 → 加采样。
+    """归因**按真实失败的那一类**分岔：支撑/偏斜 → 缩跨度；样本量 → 加采样。
 
     分类不是这里定的，出处是设计文档 §3（低支撑是「尚不可测」）与 §5.1
     （加帧治不了偏斜：实测 250k→1M 让 top1% 从 0.545 涨到 0.762）。
+
+    🔑🔑 [2026-09-15] **驱动源换了：从阶段门换成窗口级自检。**
+    本条原来靠在 stage 结果上塞 `min_overlap` / `target_support_gate` /
+    `min_decorrelated_samples` / `max_endpoint_uncertainty` 来制造失败。那四道门
+    同日整体降级为**只报告**、明确**不得驱动任何补采或布局动作**（阈值全未标定，
+    理由逐字在 `_assert_stage_result_sane`；TODO「不许回退的约定」也记着
+    "不得把任一条加回 analysis_status 的合取"）。所以现在造失败只有一个合法入口：
+    **窗口自己的生产后自检产物**（`verdict` + `verdict_source`）。
+    ⚠️ 谁要是把这四道门重新接回动作，本条会（正确地）继续绿 —— 真正拦它的是
+    `tests/test_audit_protocol_regressions.py` 里那条"四个阈值一个都不许进合取"。
+
+    ⚠️ 原第三段「端点 σ 是路径级量 ⟹ 补全部窗口」已删：`max_endpoint_uncertainty`
+    正是被赶出判据的那四项之一（它是逐段量而科学目标是两腿合成 σ_bind，
+    实测把某段 2.0 压到 1.0 要 4× 采样、ΔG 精度提升为零）。没有替代分支，
+    不是漏测。
     """
-    def act(extra):
-        import tempfile, pathlib
+    import tempfile
+    import pathlib as _pl
+
+    _fk = [{"window_index": i, "verdict": "PASS",
+            "cumulative_residual_span_kJ_mol": 1.2} for i in range(4)]
+    _stage = {**_STAGE_BASE, "total_delta_G": -12.3, "total_error": 0.9,
+              # 归因分支排在 f_k 探针之后 ⟹ 不给这份证据，控制器会先去要它
+              "cumulative_fk_residual_production": _fk}
+
+    def act(bad_window):
         with tempfile.TemporaryDirectory() as td:
-            c, p = _plan(pathlib.Path(td), windows=FULL, ranges=R4, n_states=13,
-                         stage_result={**_STAGE_BASE, **extra})
+            _, p = _plan(_pl.Path(td), windows={**FULL, 3: bad_window},
+                         ranges=R4, n_states=13, stage_result=_stage)
             return p
 
-    # 支撑/偏斜类 ⟹ 布局动作，且落在最差的那个窗口上（win3 的 ess 最低）
-    p = act({"min_overlap": 0.02, "min_overlap_threshold": 0.10})
-    assert p["action"] in ("SPLIT_TAIL_WINDOW", "INSERT_LAMBDA")
+    # 支撑/偏斜类 ⟹ 布局动作，落在自检点名的那个窗口上
+    p = act({"K": 4, "self_verdict": "HARD_INSUFFICIENT",
+             # ⚠️ [2026-09-17] 真实 `verdict_source` 只有三个值
+    # （`ibs_engine.window_self_support_check`：top1pct_veto /
+    # min_n_eff_over_g / solver_eligibility）。`top1pct_raw_weight`
+    # 是**阶段门的指标名**，写侧从不把它写进 verdict_source ——
+    # 用它等于造了一个真机不存在的盘面，归因必然落到"来源读不出来"那支。
+    "self_verdict_source": "top1pct_veto", "min_n_eff_over_g": 1.1})
+    assert p["action"] in ("SPLIT_TAIL_WINDOW", "INSERT_LAMBDA"), p["reason"]
     assert "加帧治不了" in p["reason"]
-    if p["action"] == "INSERT_LAMBDA":
-        assert p["windows"] == [3]
+    assert p["windows"] == [3], p["reason"]
 
-    # 样本量类 ⟹ 补采，落在去相关帧数最少的窗口
-    p = act({"min_decorrelated_samples": 8, "min_decorrelated_samples_threshold": 20})
-    assert p["action"] == "RUN_PRODUCTION" and p["windows"] == [3]
-    assert "尚不可测" in p["reason"]
-
-    # 端点 σ 是路径级量 ⟹ 没有逐窗归因，但**必须把窗口列全**：
-    # 空列表会让执行器按原目标重跑（overrides 为空）⟹ resume 下空转。
-    p = act({"max_endpoint_uncertainty_kJ_mol": 4.1,
-             "max_endpoint_uncertainty_kJ_mol_threshold": 2.0})
-    assert p["action"] == "RUN_PRODUCTION" and p["windows"] == [0, 1, 2, 3]
+    # 样本量类 ⟹ 补采，同样落在那个窗口；语义是「尚不可测」而不是 FAIL
+    p = act({"K": 4, "self_verdict": "INSUFFICIENT_DATA",
+             "min_n_eff_over_g": 3.1, "n_decorr": 7})
+    assert p["action"] == "RUN_PRODUCTION" and p["windows"] == [3], p["reason"]
+    assert "INSUFFICIENT_DATA ≠ FAIL" in p["reason"]
+    assert not p["terminal"], "低支撑是「尚不可测」，不是终态"
 
 
 def test_untrusted_override_releases_but_never_claims_converged(tmp_path):
@@ -432,10 +468,14 @@ def test_untrusted_override_releases_but_never_claims_converged(tmp_path):
         run, "vanishing", allow_untrusted_stage_results=True).decide()
     # 🔑 [2026-09-15] 出口从 `DONE_UNTRUSTED` 变成 `HALT_EVIDENCE_CONTRADICTS_DONE`
     # —— 这是**收紧**不是退化：硬不变量自己说 `ANALYSIS_INCOMPLETE`，而调用方要求
-    # 按发布策略放行，两者直接矛盾，所以停下来并把矛盾写在出口名里。
+    # 按发布策略放行，两者直接矛盾，所以停下来。
+    # 🔑 [2026-09-17，用户拍板 (a)] 那条「不完整也放行」的分支已**删除**（它是死代码：
+    # O4 必然改写它，而且即使放开 O4，下游 `analysis_status != ANALYSIS_COMPLETE`
+    # 的 RuntimeError 照样拦死）。于是不再有 `DONE` 被 O4 改写这一步，控制器直接落到
+    # 兜底 ⟹ 出口是 `NO_FEASIBLE_ACTION`。
     # `DONE_UNTRUSTED` 今天只在「analysis COMPLETE + precision MEETS + 放行」时才出现
     # （见 test_converged_stage_is_done_but_not_claimed_correct）。
-    assert loose["exit"] == "HALT_EVIDENCE_CONTRADICTS_DONE"
+    assert loose["exit"] == "NO_FEASIBLE_ACTION"
     assert loose["terminal"] is True
     assert loose["trust_level"] == "OVERRIDDEN_UNTRUSTED"
     # 关键（本条的主题，一字未变）：证据维度没被放行改写
@@ -792,10 +832,36 @@ def test_the_two_decorrelation_numbers_are_kept_as_separate_evidence(tmp_path):
 # 有界 IMMUTABLE_REWINDOW + 9b 的中间窗归因 + S2-A 的 UNMEASURED
 # ---------------------------------------------------------------------------
 
+# 🔑🔑 [2026-09-15] 支撑失败**不能只写在阶段级**了。
+# 那天起 `target_support_gate` 等四道拟合阈值门整体降级为只报告、不得驱动任何动作
+# （理由逐字在 `_assert_stage_result_sane`：阈值全未标定）。控制器改成按**窗口级**
+# 自检归因：偏斜类（`self_verdict_source="top1pct_raw_weight"`）⟹ 缩跨度，
+# 样本量类 ⟹ 加帧。所以造盘面要两半一起给：
+#   · 窗口级：`SUPPORT_FAIL_WINDOW` 这个形状；
+#   · 阶段级：下面这份（仍然有用 —— 它带 raw ESS 逐窗读数供归因取最差窗）。
+# 只写阶段级那一半，控制器（正确地）什么动作都不发。
+SUPPORT_FAIL_WINDOW = {
+    "K": 5, "self_verdict": "HARD_INSUFFICIENT",
+    # ⚠️ [2026-09-17] 真实 `verdict_source` 只有三个值
+    # （`ibs_engine.window_self_support_check`：top1pct_veto /
+    # min_n_eff_over_g / solver_eligibility）。`top1pct_raw_weight`
+    # 是**阶段门的指标名**，写侧从不把它写进 verdict_source ——
+    # 用它等于造了一个真机不存在的盘面，归因必然落到"来源读不出来"那支。
+    "self_verdict_source": "top1pct_veto", "min_n_eff_over_g": 1.1,
+}
+
+
 def _stage_support_failure(worst_window):
     """target_support 门失败，最差窗口按 raw ESS 落在 `worst_window` 上。"""
     return {
         "analysis_status": "ANALYSIS_INCOMPLETE",
+        "analysis_incomplete_reasons": ["路径缺窗：求解器少解出一个窗口。"],
+        "total_delta_G": -12.3, "total_error": 0.9,
+        # 控制器在归因前会先要这份证据（分支 5a 排在 5b 之前）：给 PASS =
+        # 「f_k 没问题，问题在支撑」，否则它会正确地先去要 f_k 证据。
+        "cumulative_fk_residual_production": [
+            {"window_index": i, "verdict": "PASS",
+             "cumulative_residual_span_kJ_mol": 1.2} for i in range(4)],
         "target_support_gate": {
             "passed": False, "failed_checks": ["ibs_segment_target_support"],
             "raw_min_absolute_ess_threshold": 20.0,
@@ -823,7 +889,7 @@ def test_a_middle_window_failure_never_buys_an_unrelated_tail_split(tmp_path):
     # 但失败的是中间窗 1，拆它一点用没有。
     _, plan = _plan(
         tmp_path,
-        windows={0: {"K": 4}, 1: {"K": 5}, 2: {"K": 9}},
+        windows={0: {"K": 4}, 1: dict(SUPPORT_FAIL_WINDOW), 2: {"K": 9}},
         ranges=[(0, 4), (3, 8), (7, 16)], n_states=16,
         config={"stage2_window_min_states": 4, "stage2_window_max_states": 5,
                 "max_path_insertions": 3},
@@ -839,7 +905,7 @@ def test_fixed_lambda_table_middle_window_falls_back_to_bounded_rewindow(tmp_pat
     # 失败的是中间窗 ⟹ 拆末窗不对症（它修的不是这个窗口）。
     _, plan = _plan(
         tmp_path,
-        windows={0: {"K": 4}, 1: {"K": 5}, 2: {"K": 9}},
+        windows={0: {"K": 4}, 1: dict(SUPPORT_FAIL_WINDOW), 2: {"K": 9}},
         ranges=[(0, 4), (3, 8), (7, 16)], n_states=16,
         config={"stage2_window_min_states": 4, "stage2_window_max_states": 5,
                 "max_path_insertions": 3},
@@ -848,6 +914,117 @@ def test_fixed_lambda_table_middle_window_falls_back_to_bounded_rewindow(tmp_pat
     assert plan["action"] == "IMMUTABLE_REWINDOW", plan["reason"]
     assert plan["windows"] == [1]
     assert not plan["terminal"], "有界动作不是终态"
+
+
+def test_terminal_window_failures_are_reported_at_run_level(tmp_path):
+    """死线 D1：终态窗口的失败信息必须在 plan 顶层，不能只埋在 reason 字符串里。
+
+    D1（`phase == TERMINAL` 且非统计驳回）**不是控制器能修的** —— 要人工改输入
+    λ 表 / 升档预热预算 / 接受失败。所以对它能做的全部改进就是**报清楚**。
+    而 `last_failure_reason` / `last_gate_error` 原来只出现在 D1 那条分支的
+    `reason` 里：换一条出口（退役换窗，或 TERMINAL 窗口根本不是 `earliest`）
+    就整个看不见了，而那正是人工接手唯一需要的东西。
+
+    所以这条**不测 D1 分支**，测的是「终态窗口不是 earliest 时照样报得出来」。
+    """
+    w = {i: {"K": 4} for i in range(4)}
+    # 窗口 1 自检不足 ⟹ 它是 earliest；窗口 2 进终态，排在它后面
+    w[1] = {"K": 4, "self_verdict": "INSUFFICIENT_DATA", "min_n_eff_over_g": 3.1}
+    w[2] = {"K": 4, "bias_status": "failed"}
+    run = _mkrun(tmp_path, windows=w, ranges=R4, n_states=13)
+    # `_mkrun` 不写这两个键，补进去。⚠️ 两个键**不在同一个文件**：
+    # `last_failure_reason` 来自 ibs_state，`last_gate_error` 来自 convergence 的
+    # `bias_warmup`（或 warmup_failure 产物）—— 这正是它们该被提到 run 级的原因。
+    st = pathlib.Path(run) / "checkpoints" / "ibs_state_vdw_window_2.json"
+    d = json.loads(st.read_text())
+    d["last_failure_reason"] = "validation_never_passed"
+    st.write_text(json.dumps(d))
+    cv = pathlib.Path(run) / "vanishing" / "dual_window_2_vdw_convergence.json"
+    c = json.loads(cv.read_text())
+    c["bias_warmup"]["last_gate_error"] = "adjacent dF 41.2 kJ/mol > 10"
+    cv.write_text(json.dumps(c))
+
+    plan = Stage2RepairController(run, "vanishing").decide()
+    # 这一轮路由的不是窗口 2 —— 否则这条测试退化成在测 D1 分支本身
+    assert plan["earliest_unresolved_window"] != 2, plan["reason"]
+    rows = plan["terminal_window_failures"]
+    assert [r["window_idx"] for r in rows] == [2], rows
+    assert rows[0]["last_failure_reason"] == "validation_never_passed"
+    assert rows[0]["last_gate_error"] == "adjacent dF 41.2 kJ/mol > 10"
+
+
+def test_a_nan_reading_is_not_reported_as_no_action_available(tmp_path):
+    """死线 D8：归因读到 **NaN** 与「确实没有对症动作」长得一样，处置相反。
+
+    NaN 的毒性在于**每一个比较都是 False**（`nan >= x` 与 `nan < x` 同时为假）
+    ⟹ 上游分支静默地一条都不命中，兜底于是说「没有科学上站得住的下一步动作」，
+    而真相是这个窗口的读数根本没算出来。真机出现过同形状的
+    （`converged=False` + 零条归因，审计 #59 修的是 `stage_quality_gate_failures`
+    的 fail-open，兜底本身当时没改）。
+
+    ⚠️ **不要求兜底发出任何动作** —— D8 是设计上正确的兜底，给它配动作就是
+    「再跑一次直到碰巧通过」。只要求它说的是真相。
+    """
+    run = _mkrun(
+        tmp_path,
+        windows={i: {"K": 4} for i in range(4)},
+        ranges=R4, n_states=13,
+        stage_result={"analysis_status": "ANALYSIS_INCOMPLETE",
+                      "analysis_incomplete_reasons": ["求解器少解出一个窗口。"]},
+    )
+    sp = pathlib.Path(run) / "vanishing" / "dual_window_2_vdw_self_support.json"
+    d = json.loads(sp.read_text())
+    d["min_n_eff_over_g"] = float("nan")
+    sp.write_text(json.dumps(d).replace("NaN", "NaN"))   # json 落 NaN 字面量
+
+    plan = Stage2RepairController(run, "vanishing").decide()
+    assert plan["exit"] == "NO_FEASIBLE_ACTION", (plan["action"], plan["exit"])
+    assert "读到了坏数" in plan["reason"], plan["reason"]
+    assert any("非有限值" in m for m in plan["missing_evidence"]), plan["missing_evidence"]
+
+
+def test_a_clean_fallback_does_not_cry_wolf_about_bad_readings(tmp_path):
+    """反面：读数都正常时，兜底不得声称读到坏数（否则这条报告等于没有）。"""
+    run = _mkrun(
+        tmp_path,
+        windows={i: {"K": 4} for i in range(4)},
+        ranges=R4, n_states=13,
+        stage_result={"analysis_status": "ANALYSIS_INCOMPLETE",
+                      "analysis_incomplete_reasons": ["求解器少解出一个窗口。"]},
+    )
+    plan = Stage2RepairController(run, "vanishing").decide()
+    assert plan["exit"] == "NO_FEASIBLE_ACTION", (plan["action"], plan["exit"])
+    assert "读到了坏数" not in plan["reason"], plan["reason"]
+
+
+def test_bounded_rewindow_is_feasible_for_every_window_of_a_state_count_layout(tmp_path):
+    """`state_count` 分窗（2026-09-17）给出 [5,5,5,5,5] ⟹ **每个**窗口都切得开。
+
+    这是接回 `IMMUTABLE_REWINDOW` 的全部意义：拆末窗要 tail anchor、插 λ 要末窗
+    有余量，两者对 window 0 在构造上永远不可行，而**本方法的必然坏窗口就是
+    window 0**（解耦端点）。有界重窗只要 K ≥ 3 就可行 —— 新布局每个窗 K=5，
+    切成 3+3。老的 ∫g 布局（[7,6,4,4,4] / [8,5,4,4,4]）里 K=4 的窗只能切 3+2。
+
+    ⚠️ 钉的是**可行性**，不是「rewindow 会让 ΔG 变准」。判据侧的 34× 噪声
+    （`docs/archive/AUDIT_GATES_AND_CRITERIA_2026-09-17.md`）意味着这个动作会被误触发在
+    其实没问题的窗口上 —— 所以「一个父窗只切一层」的限制不许放宽。
+    """
+    run = _mkrun(
+        tmp_path,
+        windows={i: {"K": 5} for i in range(5)},
+        ranges=[(0, 5), (4, 9), (8, 13), (12, 17), (16, 21)], n_states=21,
+        config={"stage2_window_min_states": 4, "stage2_window_max_states": 5,
+                "max_path_insertions": 3},
+    )
+    c = Stage2RepairController(run, "vanishing")
+    view = c.read()
+    for i in range(5):
+        assert c.rewindow_feasible(view, i) is None, (
+            f"窗口 {i}（K=5）应当切得开：{c.rewindow_feasible(view, i)}")
+        assert len(c.rewindow_children(view, i)) == 2
+    # K=2 切不出两个各 ≥2 态的子窗 ⟹ 不可行，且理由说的是态数不是别的
+    assert "拆不出" in (c.rewindow_feasible(
+        {"path": {"window_ranges": [(0, 2)]}}, 0) or "")
 
 
 def test_rewindow_is_built_once_per_parent_window(tmp_path):
@@ -1262,3 +1439,36 @@ def test_all_segments_count_toward_the_budget_not_just_the_winning_one(tmp_path)
     # 4×250k（基准段）+ 500k（段 2 的 win0）
     assert agg["production_budget"]["stage_used_steps"] == 1_500_000
     assert agg["production_budget"]["per_window_used_steps"][0] == 750_000
+
+
+def test_a_window_below_its_committed_production_target_blocks_the_terminal(tmp_path):
+    """[2026-09-17] 已承诺的生产步数没跑完 ⟹ **不许判终态**，去把它跑完。
+
+    实测（修之前）：全窗自检合格 ⟹ `earliest is None` ⟹ `_pick()` 恒返空 ⟹
+    补足生产那条分支一次都不触发 ⟹ 一个跑了 10 万 / 目标 25 万步的窗口跟着整条
+    stage 一起 `action=NO_ACTION`、`terminal=True`、run 判完成。
+
+    ⚠️ 补的是**已承诺的配额**（`n_steps_per_window_effective`，调用方配的目标步数），
+    不是任何质量门 —— 与「未经标定的阈值不驱动补帧」那条定案不冲突：那条禁的是
+    拿阈值要更多帧，这条只是把说好要跑的跑完。
+    """
+    w = {i: {"K": 4} for i in range(4)}
+    w[3] = {"K": 4, "prod": 100000, "prod_target": 250000}
+    run = _mkrun(tmp_path, windows=w, ranges=R4, n_states=13,
+                 stage_result={"analysis_status": "ANALYSIS_COMPLETE",
+                               "total_delta_G": -12.3, "total_error": 0.9})
+    plan = Stage2RepairController(run, "vanishing").decide()
+    assert plan["terminal"] is False, (
+        f"少跑了 15 万步却判了终态：{plan['action']}／{plan['exit']}｜{plan['reason']}")
+    assert plan["action"] == "RUN_PRODUCTION" and plan["windows"] == [3], plan["reason"]
+
+
+def test_all_windows_at_target_still_terminates(tmp_path):
+    """反面：都跑到目标了就该停 —— 否则上面那条会退化成"永不终止"。"""
+    run = _mkrun(tmp_path, windows={i: {"K": 4} for i in range(4)},
+                 ranges=R4, n_states=13,
+                 stage_result={"analysis_status": "ANALYSIS_COMPLETE",
+                               "total_delta_G": -12.3, "total_error": 0.9})
+    plan = Stage2RepairController(run, "vanishing").decide()
+    assert plan["terminal"] is True, plan["reason"]
+    assert plan["exit"] == "ANALYSIS_COMPLETE_PRECISION_UNMEASURED", plan["reason"]

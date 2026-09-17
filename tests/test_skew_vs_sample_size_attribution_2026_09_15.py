@@ -29,10 +29,23 @@ from abfe_preoptimizer import (
 )
 
 
-def test_a_low_ratio_with_plenty_of_frames_is_skew():
-    """win1 的形状：帧多得离谱、比值低 ⟹ 偏斜。"""
+def test_a_low_ratio_with_plenty_of_frames_is_no_longer_auto_skew():
+    """[2026-09-17 P0，取代旧语义] 只有 ratio 低 + 帧数够，**不足以**判偏斜。
+
+    旧规则：`min_n_eff_over_g` 且帧数够 ⟹ 偏斜（STRUCTURAL）。
+    新规则：必须**完整输入**（ratio + target + headroom）且明确算出
+    `reachable is False` 才是 STRUCTURAL；缺任一 ⟹ `UNKNOWN`，两边都不授权。
+    理由：STRUCTURAL 会授权缩跨度类动作（插 λ/拆窗/有界重窗/D3 停机），
+    那同样要花 GPU、要改布局 —— 拿「没测出来」当「测出来是坏的」。
+    """
+    # 缺 target / headroom ⟹ 判不了射程 ⟹ UNKNOWN（不再自动当偏斜）
     assert is_skew("INSUFFICIENT_DATA", "min_n_eff_over_g",
-                   n_decorrelated=888, min_frames=10) is True
+                   n_decorrelated=888, min_frames=10) is False
+    # 完整输入 + 明确够不着 ⟹ 才是 STRUCTURAL
+    assert is_skew("INSUFFICIENT_DATA", "min_n_eff_over_g",
+                   n_decorrelated=888, min_frames=10,
+                   min_n_eff_over_g=1.0, n_eff_over_g_target=10.0,
+                   frames_headroom=1.2) is True
 
 
 def test_frame_starvation_is_still_sample_size():
@@ -69,7 +82,8 @@ def test_the_helper_verifies_frames_itself_instead_of_trusting_the_writer():
     assert is_skew("INSUFFICIENT_DATA", "min_n_eff_over_g",
                    n_decorrelated=3, min_frames=10) is False
     # 读不到帧数（老产物）⟹ 退回只看来源，判偏斜
-    assert is_skew("INSUFFICIENT_DATA", "min_n_eff_over_g") is True
+    # [2026-09-17 P0] 三个射程输入一个都没有 ⟹ UNKNOWN（不再自动当偏斜）
+    assert is_skew("INSUFFICIENT_DATA", "min_n_eff_over_g") is False
 
 
 def test_both_call_sites_pass_the_frame_counts():

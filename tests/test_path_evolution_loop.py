@@ -4,6 +4,7 @@
 重点：默认策略下行为逐字不变；失败窗口**只插 λ 不拆窗**；每个窗口始终 >= 4 态。
 """
 
+import inspect
 import json
 
 import pytest
@@ -249,3 +250,34 @@ def test_both_legs_pass_the_switches_through():
     assert src.count("**_path_evolution_kwargs(config),") == 2, (
         "run_full_pipeline 的两个调用点都必须透传路径演化开关"
     )
+
+
+def test_controller_off_plus_path_evolution_warns_that_the_layout_still_mutates(capsys):
+    """[2026-09-17] 「关掉自治控制器 = 冻结 λ 表」是**错的**，而且以前不响。
+
+    降级 `path_evolution_v1 → non_mutating_v1` 只在控制器**开着**时发生
+    （理由是「一个 stage 只许有一个控制器」，**不是**为了冻结布局）。
+    控制器关着时 path_evolution 原样生效，照样插 λ、改 window_ranges。
+
+    ⚠️ 这条**不要求改行为** —— 确实存在「显式关控制器 + 显式用 path_evolution」
+    的调用方（固定预算实验）。去掉那个条件会静默改掉正在跑的实验，并让
+    `sampling_repair_policy='path_evolution_v1'` 变成永远无法生效的配置值。
+    要求的只是：**这个组合必须大声说出来**。
+
+    为什么值得响（核实过的事实，2026-09-17）：`abfe-benchmark/openmm_IBS/configs/*.json`
+    **14/14 全部**显式写着 `"sampling_repair_policy": "path_evolution_v1"` ⟹
+    「默认 non_mutating_v1、普通用户碰不到」只对主线默认成立，对 benchmark 不成立。
+
+    ⚠️ 本条原先引过一组「三条臂 λ 漂成 21→24/21→23」的实测数字，**已删**：
+    报数者事后核实那几次跑的控制器是**开着**的（⟹ 降级正常触发，插 λ 的是控制器
+    本身），那批数字不是这条耦合的证据。只留核得住的。
+    """
+    import abfe_pipeline as ap
+    src = inspect.getsource(ap.ABFEPipeline)
+    blk = src.split("_path_evolution_silenced_for_autonomous = False")[1][:2500]
+    assert "elif" in blk and "not _autonomous_for_policy" in blk, (
+        "控制器关着 + path_evolution 的组合没有任何提示")
+    assert "non_mutating_v1" in blk, "提示里没给出真正冻结布局的做法"
+    # 行为不变：降级仍然只在控制器**开着**时发生
+    assert '_autonomous_for_policy\n                and _sampling_repair_policy == "path_evolution_v1"' in blk, (
+        "降级条件被改了 —— 那会静默改掉固定预算实验的行为")

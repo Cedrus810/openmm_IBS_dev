@@ -367,3 +367,58 @@ def test_should_run_legacy_repair_enum_fail_closed():
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# [2026-09-17，用户拍板：改门] 端点不确定度只作诊断，**不得单独**设 results_untrusted
+# ---------------------------------------------------------------------------
+
+def _sane(result):
+    """跑真实的 `_assert_stage_result_sane`，把它对 result 的就地改动返回出来。"""
+    fake = types.SimpleNamespace()
+    fake._log = lambda *a, **k: None
+    fake._format_stage_quality_failure_details = lambda d: str(d)
+    ap.ABFEPipeline._assert_stage_result_sane(fake, "vanishing", result)
+    return result
+
+
+def test_endpoint_uncertainty_alone_no_longer_marks_the_result_untrusted():
+    """它的消息文本自己写着「仅诊断，不拒绝」，而代码却设 `results_untrusted` ——
+    那个键一路传到最终结合结果并打印「不得作为可发布结果引用」，所以「仅诊断」
+    当时是**假的**：不拒绝计算，但确实是发布拒绝门。
+
+    用户 2026-09-17 拍板**改门**：阈值 1.0 抄自一个默认关闭的 early-stop 形参、
+    全仓无标定依据；它是逐段量而科学目标是两腿合成的 σ_bind；发布验收已由
+    硬不变量 + `precision_status`（跨独立重复 SD）把关。
+
+    ⚠️ **不**把「它与实验误差的 Spearman 反号」算作理由：这些量衡量的是估计器
+    条件化与样本充分性，本来就不负责预测力场对实验的系统偏差（审计 §3.0/§3.2），
+    而且 n=6 下没有一条显著。
+
+    ⚠️ 读数照留 —— 这条不是「删掉这个诊断」，是「它不再单独拒绝发布」。
+    """
+    r = _good_result()
+    r["max_endpoint_uncertainty_kJ_mol"] = 2.25      # 远超阈值 1.0
+    _sane(r)
+    assert not r.get("results_untrusted"), r.get("stage_quality_failures")
+    entry = next(f for f in r["stage_quality_failures"]
+                 if f.get("gate") == "max_endpoint_uncertainty_kJ_mol")
+    assert entry["value"] == 2.25 and entry["threshold"] == 1.0
+    assert entry["drives_action"] is False
+    assert entry["affects_trust"] is False
+
+
+def test_the_other_three_gates_still_reject_publication():
+    """反面：本轮**只**降级了端点不确定度。其余三条仍然是发布拒绝门。
+
+    没有这条，上面那条会掩盖「顺手把整排门都关了」。
+    """
+    for key, bad in (("min_overlap", 0.001),
+                     ("min_absolute_ess", 1.0),
+                     ("min_decorrelated_samples", 1)):
+        r = _good_result()
+        r[key] = bad
+        _sane(r)
+        assert r.get("results_untrusted") is True, (key, r.get("stage_quality_failures"))
+        assert any(f.get("affects_trust") is True
+                   for f in r["stage_quality_failures"]), key

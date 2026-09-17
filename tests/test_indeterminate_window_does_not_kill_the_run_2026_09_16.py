@@ -142,3 +142,46 @@ def test_no_budget_extension_is_ever_attempted():
     _drive(stub, run_once, 2, route_to_controller=False)
     joined = "\n".join(stub.logs)
     assert "不延长预算" in joined and "不改 f_k" in joined, joined
+
+
+# ─────────────────────── 真机炸掉的那条路径（2026-09-17 sweep2 A_20260916）
+# 固定预算实验里 `stage2_autonomous_controller=false`，于是 `path_evolution_v1`
+# **不会**被降级成 `non_mutating_v1`（那个降级只在控制器**开启**时触发），
+# 于是 `should_run_path_evolution()` 为真 ⟹ `_guarded_once` 早退**不走**，
+# 收集逻辑整个够不着，异常照旧从 path-evolution 主循环炸穿。
+# 上面那批用例全用 `non_mutating_v1`，一条都没覆盖到它。
+
+def _drive_path_evolution(pipeline, run_once, tmp_path, n_windows):
+    import lambda_path_versions as lpv
+    ck = tmp_path / "checkpoints"
+    ck.mkdir(parents=True)
+    n_states = n_windows * 3
+    lam = [1.0 - i * (1.0 / n_states) for i in range(n_states)]
+    ranges = [(3 * i, 3 * i + 3) for i in range(n_windows)]
+    lpv.init_version(str(ck), [0.0] * n_states, lam, [list(r) for r in ranges])
+    return abfe_pipeline.ABFEPipeline._run_stage2_with_path_evolution(
+        pipeline, run_once,
+        lambdas_var=lam, window_ranges=ranges,
+        checkpoint_dir=str(ck), preopt_file=str(tmp_path / "preopt.json"),
+        repair_policy="path_evolution_v1",     # ⟹ 走主循环，不走早退
+        route_to_controller=False,             # ⟹ 固定预算，没有控制器接管
+    )
+
+
+def test_the_path_evolution_loop_also_collects_instead_of_dying(tmp_path):
+    calls = []
+
+    def run_once(n, lam, ranges, **kw):
+        calls.append(kw.get("_only_window_indices"))
+        if kw.get("_only_window_indices") is None:
+            raise ibs_engine.IBSValidationBudgetIndeterminateError(
+                "窗口 1 …", {"status": "s"}, window_idx=1)
+        return {"total_delta_G": 7.0, "analysis_status": "ANALYSIS_COMPLETE"}
+
+    res, _lam, _rng = _drive_path_evolution(_Stub(), run_once, tmp_path, 3)
+
+    assert [w["window_idx"] for w in res["indeterminate_windows"]] == [1]
+    assert res["analysis_status"] == abfe_pipeline.ANALYSIS_INCOMPLETE
+    assert "total_delta_G" not in res
+    # 第一次异常是外层 except 接住的，**不得**重跑一遍全窗口
+    assert calls == [None, [2]], calls

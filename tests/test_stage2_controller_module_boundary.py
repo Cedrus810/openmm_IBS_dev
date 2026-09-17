@@ -16,6 +16,8 @@ import pathlib
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 # 搬家名单 = 设计文档 §9.4 点名的那几个（本次已落地的部分）。

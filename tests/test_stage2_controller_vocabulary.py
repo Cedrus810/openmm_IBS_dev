@@ -123,6 +123,36 @@ def test_every_emitted_action_is_declared():
     assert not undeclared, f"decide() 发得出来、但 ACTIONS 里没有：{undeclared}"
 
 
+def test_no_dead_actions_left_in_the_declaration():
+    """`ACTIONS` 里声明的动作，`decide()` 必须真的发得出。
+
+    这是 `test_no_dead_exits_left_in_the_declaration` 的**动作侧孪生**。
+    只守出口不守动作，就会出现「成本表、执行器、测试都齐了，唯独判断侧没有发出点」
+    这种缺口 —— `IMMUTABLE_REWINDOW` 2026-09-16 实测就是这样。
+    """
+    emitted = set()
+    for node in _plan_calls():
+        if node.args:
+            emitted |= _str_choices(node.args[0])
+    for node in ast.walk(_decide_tree()):
+        if not isinstance(node, ast.Assign):
+            continue
+        tg = node.targets[0]
+        names = [x.id for x in (tg.elts if isinstance(tg, ast.Tuple) else [tg])
+                 if isinstance(x, ast.Name)]
+        vals = (node.value.elts if isinstance(node.value, ast.Tuple)
+                else [node.value])
+        for nm, v in zip(names, vals):
+            if nm in ("act", "action"):
+                emitted |= _str_choices(v)
+    dead = sorted(x for x in CTL.ACTIONS if x not in emitted)
+    assert not dead, (
+        f"这些动作在 ACTIONS 里声明了，但 decide() 从没发过：{dead}。"
+        "成本表/执行器/测试可能都齐了，唯独判断侧没有发出点 —— "
+        "那条能力对生产等于不存在。"
+    )
+
+
 def test_no_dead_exits_left_in_the_declaration():
     """声明了却从没发过的词 = 死词，必须删掉。
 
@@ -175,3 +205,66 @@ def test_no_action_is_only_ever_paired_with_a_terminal_exit():
             f"NO_ACTION 配了非终态出口 {sorted(exits - set(CTL.TERMINAL_EXITS))} ⟹ "
             "主循环不会 break，执行器会收到一个它不认识的动作"
         )
+
+
+# ---------------------------------------------------------------------------
+# [2026-09-17，用户拍板 A] 归因三态：「还没被证伪」不得当成「帧不够」
+# ---------------------------------------------------------------------------
+
+def test_reachability_only_yields_unknown_never_sample_size():
+    """射程判据 `ratio × headroom ≥ target` 只能给 `UNKNOWN`。
+
+    真实关系是 `R_future = R_now × H × (η_f/η_n) × (g_n/g_f)`（`η = N_eff/N`），
+    而 `n_eff_over_g_reachable_by_frames` 只留 `R_now × H`、**假定 η 与 g 恒定** ——
+    两个假设实测都朝不利方向走（g 12.25→17.63；η 见 §5.1）。所以它的 `True`
+    只够说「还没被证伪」。先前它被升级成「这是样本量问题」，于是 O1 拿一个
+    **乐观上界**覆盖掉分支刚做出的「f_k 不对，换 Epoch」诊断。
+    """
+    # 射程够得着（5.0 × 2.5 = 12.5 ≥ 10）且帧数在地板之上 ⟹ UNKNOWN，不是 SAMPLE_SIZE
+    assert pre.support_failure_attribution(
+        "INSUFFICIENT_DATA", "min_n_eff_over_g",
+        n_decorrelated=400, min_frames=10,
+        min_n_eff_over_g=5.0, n_eff_over_g_target=10.0,
+        frames_headroom=2.5) == pre.SUPPORT_FAILURE_UNKNOWN
+    # 射程够不着 ⟹ STRUCTURAL
+    assert pre.support_failure_attribution(
+        "INSUFFICIENT_DATA", "min_n_eff_over_g",
+        n_decorrelated=400, min_frames=10,
+        min_n_eff_over_g=5.0, n_eff_over_g_target=10.0,
+        frames_headroom=1.2) == pre.SUPPORT_FAILURE_STRUCTURAL
+    # 帧数在地板之下 ⟹ **硬证据**的 SAMPLE_SIZE（这才是唯一能授权降级去补帧的）
+    assert pre.support_failure_attribution(
+        "HARD_INSUFFICIENT", "min_n_eff_over_g",
+        n_decorrelated=7, min_frames=10,
+        min_n_eff_over_g=5.0, n_eff_over_g_target=10.0,
+        frames_headroom=2.5) == pre.SUPPORT_FAILURE_SAMPLE_SIZE
+    # 通过的窗口 ⟹ 不是失败，None
+    assert pre.support_failure_attribution(
+        "ANALYSIS_ELIGIBLE", "min_n_eff_over_g") is None
+
+
+def test_is_skew_bool_is_unchanged_by_the_three_state_split():
+    """`support_failure_is_skew()` 的布尔值**逐位不变** —— 它问的是「是不是 STRUCTURAL」。
+
+    拆三态是为了**只**收紧 O1（它以前拿 `not is_skew` 当"样本量类"，把 UNKNOWN
+    也算了进去）。其余调用点一个都不该受影响，这条就是那个保证。
+    """
+    cases = [
+        ("ANALYSIS_ELIGIBLE", "min_n_eff_over_g", {}),
+        ("INSUFFICIENT_DATA", "solver_eligibility", {}),
+        ("HARD_INSUFFICIENT", "top1pct_veto", {}),
+        ("HARD_INSUFFICIENT", None, {}),
+        ("INSUFFICIENT_DATA", None, {}),
+        ("INSUFFICIENT_DATA", "min_n_eff_over_g",
+         dict(n_decorrelated=400, min_frames=10, min_n_eff_over_g=5.0,
+              n_eff_over_g_target=10.0, frames_headroom=2.5)),
+        ("INSUFFICIENT_DATA", "min_n_eff_over_g",
+         dict(n_decorrelated=400, min_frames=10, min_n_eff_over_g=5.0,
+              n_eff_over_g_target=10.0, frames_headroom=1.2)),
+        ("HARD_INSUFFICIENT", "min_n_eff_over_g",
+         dict(n_decorrelated=7, min_frames=10)),
+    ]
+    for verdict, src, kw in cases:
+        assert pre.support_failure_is_skew(verdict, src, **kw) == (
+            pre.support_failure_attribution(verdict, src, **kw)
+            == pre.SUPPORT_FAILURE_STRUCTURAL), (verdict, src, kw)

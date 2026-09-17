@@ -22,6 +22,8 @@ from abfe_preoptimizer import Stage2RepairController
 
 from test_stage2_repair_controller import _mkrun
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _with_lambdas(run, n_states, ranges, *, events=()):
     """把版本链改写成**真实形状**：states 带 lambda_vdw、kind 在 event 里。

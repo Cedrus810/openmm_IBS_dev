@@ -14,6 +14,8 @@ import pytest
 
 from abfe_core import calc_boresch_from_last_frame, unwrap_boresch_anchors_nm
 
+pytestmark = pytest.mark.cpu_only
+
 BOX = np.diag([5.0, 5.0, 5.0])
 REC = [0, 1, 2]
 LIG = [3, 4, 5]

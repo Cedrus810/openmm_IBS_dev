@@ -2,6 +2,9 @@
 
 import ast
 from pathlib import Path
+import pytest
+
+pytestmark = pytest.mark.cpu_only
 
 
 PIPELINE = Path(__file__).resolve().parents[1] / "abfe_pipeline.py"

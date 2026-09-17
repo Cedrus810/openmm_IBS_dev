@@ -28,6 +28,7 @@ pytestmark = pytest.mark.cpu_only
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import abfe_preoptimizer as pre
 from abfe_preoptimizer import (  # noqa: E402
     Stage2RepairController,
     frames_growth_headroom,
@@ -86,12 +87,67 @@ def test_low_ratio_out_of_reach_is_still_skew():
     ) is True
 
 
-def test_missing_reachability_evidence_keeps_the_old_verdict():
-    """老产物没有门槛键 ⟹ 判不了射程 ⟹ 保持既有（保守当偏斜）行为。"""
+def test_missing_reachability_evidence_is_unknown_not_structural():
+    """[2026-09-17 P0，取代旧语义] 判不了射程 ⟹ `UNKNOWN`，**不是**偏斜。
+
+    本条原名 `..._keeps_the_old_verdict`，断言的是「判不了 ⟹ 保守当偏斜」。
+    那个"保守"选错了方向：`STRUCTURAL` **授权**缩跨度类动作
+    （插 λ / 拆窗 / 有界重窗 / D3 停机），而缩跨度同样要花 GPU、要改布局 ——
+    拿「没测出来」当「测出来是坏的」。真正两边都不授权的是 `UNKNOWN`。
+
+    ⟹ `support_failure_is_skew()`（= `attribution is STRUCTURAL`）现在返回 False，
+    而三态里它是 `UNKNOWN`。下游据此**既不补帧也不改布局**，停在
+    `SUPPORT_ATTRIBUTION_UNKNOWN` 诊断态（或绕过该单元继续调度）。
+    """
     assert support_failure_is_skew(
         "INSUFFICIENT_DATA", "min_n_eff_over_g",
         n_decorrelated=888, min_frames=10,
-    ) is True
+    ) is False
+    assert pre.support_failure_attribution(
+        "INSUFFICIENT_DATA", "min_n_eff_over_g",
+        n_decorrelated=888, min_frames=10,
+    ) == pre.SUPPORT_FAILURE_UNKNOWN
+
+
+def test_only_a_definitively_unreachable_gate_is_structural():
+    """只有**完整输入 + 明确算出 `reachable is False`** 才是 STRUCTURAL。
+
+    `True`（乐观上界尚未证伪）与 `None`（判不了）都只能是 `UNKNOWN`。
+    """
+    A = pre.support_failure_attribution
+    full = dict(n_decorrelated=888, min_frames=10, min_n_eff_over_g=5.0,
+                n_eff_over_g_target=10.0)
+    assert A("INSUFFICIENT_DATA", "min_n_eff_over_g",
+             frames_headroom=1.2, **full) == pre.SUPPORT_FAILURE_STRUCTURAL
+    assert A("INSUFFICIENT_DATA", "min_n_eff_over_g",
+             frames_headroom=2.5, **full) == pre.SUPPORT_FAILURE_UNKNOWN
+    # 三输入缺任何一个 ⟹ UNKNOWN
+    for drop in ("min_n_eff_over_g", "n_eff_over_g_target"):
+        kw = {**full, drop: None}
+        assert A("INSUFFICIENT_DATA", "min_n_eff_over_g",
+                 frames_headroom=1.2, **kw) == pre.SUPPORT_FAILURE_UNKNOWN, drop
+    assert A("INSUFFICIENT_DATA", "min_n_eff_over_g",
+             frames_headroom=None, **full) == pre.SUPPORT_FAILURE_UNKNOWN
+
+
+def test_an_old_artifact_with_no_source_is_unknown():
+    """[2026-09-17 P0] 来源缺失的老产物，即使 verdict 是 HARD_INSUFFICIENT ⟹ UNKNOWN。
+
+    原兜底是 `STRUCTURAL if HARD_INSUFFICIENT`，同属「数据缺口授权结构动作」。
+    """
+    assert pre.support_failure_attribution(
+        "HARD_INSUFFICIENT", None) == pre.SUPPORT_FAILURE_UNKNOWN
+    assert pre.support_failure_attribution(
+        "INSUFFICIENT_DATA", None) == pre.SUPPORT_FAILURE_UNKNOWN
+
+
+def test_top1pct_and_explicit_sample_size_are_unchanged():
+    """既有行为不变：`top1pct_veto` 仍是 STRUCTURAL，明确帧数不足仍是 SAMPLE_SIZE。"""
+    A = pre.support_failure_attribution
+    assert A("HARD_INSUFFICIENT", "top1pct_veto") == pre.SUPPORT_FAILURE_STRUCTURAL
+    assert A("HARD_INSUFFICIENT", "solver_eligibility") == pre.SUPPORT_FAILURE_SAMPLE_SIZE
+    assert A("HARD_INSUFFICIENT", "min_n_eff_over_g",
+             n_decorrelated=7, min_frames=10) == pre.SUPPORT_FAILURE_SAMPLE_SIZE
 
 
 def test_sample_size_sources_are_untouched():
@@ -303,3 +359,75 @@ def test_the_final_summary_actually_writes_those_keys():
     tail = src[src.index("# ----- 7. 输出最终结果 -----"):]
     assert 'log.info("[OK] ABFE 计算完成")' in tail
     assert tail.index("results_untrusted") < tail.index('"[OK] ABFE 计算完成"')
+
+
+# ---------------------------------------------------------------------------
+# [2026-09-17，用户拍板 #1] earliest 单窗漏斗：补上真机最关键的那一形态
+# ---------------------------------------------------------------------------
+
+def test_a_tail_window_still_in_warmup_counts_as_work_left(tmp_path):
+    """真机 brd4_ligand2/rep1、cyclod_ligand2/rep2 的死法。
+
+    末窗的形态是：还在 `WARMUP_LEARN`、**没有 self-support 产物**（那份是生产跑完
+    才写的）⟹ `self_verdict is None`、`has_convergence=False`，而预热预算还剩
+    37 万 / 87 万步。旧判据只认「`self_verdict ∈ {HARD,INSUFFICIENT}` 或被求解器
+    跳过」⟹ 三条一条不中 ⟹ 不算"未解决" ⟹ 不构成退役理由 ⟹ `earliest` 死在原地，
+    末窗全程躺在 `blocked_by_upstream` 里一次没被看过，而整腿半程漂移
+    （+8.01 / +11.14 kJ/mol）几乎全部来自它。
+    """
+    w = {i: {"K": 4} for i in range(3)}
+    w[1] = {"K": 4, "self_verdict": "INSUFFICIENT_DATA",
+            "self_verdict_source": "solver_eligibility", "n_decorr": 5}
+    # 末窗：还在预热（bias_status 非 converged ⟹ `_mkrun` 不落 self_support 产物）
+    w[2] = {"K": 4, "bias_status": "warmup_learning", "evidence": "none",
+            "warmup": 130000, "cap": 500000}
+    run = _mkrun(tmp_path, windows=w, ranges=[(0, 4), (3, 7), (6, 10)], n_states=10)
+    _blocks_history(run, window=1, n_blocks=4)      # earliest 的配额烧光
+
+    c = Stage2RepairController(run, "vanishing")
+    view = c.read()
+    tail = next(x for x in view["windows"] if int(x["window_idx"]) == 2)
+    # 先钉住盘面确实是那个形态，否则这条测试测的是别的东西
+    assert tail.get("self_verdict") is None, tail
+    assert int(tail["warmup_steps_left"]) > 0, tail
+
+    assert c._is_routable_candidate(view, tail, set(), set()) is True, (
+        "末窗还在预热、预热预算还有余，却不算「还有活可干」")
+    plan = c.decide()
+    assert plan.get("retired_windows") == [1], (
+        f"earliest 无路可走且末窗还有预热预算，却没退役：{plan['reason']}")
+
+
+def test_warmup_money_a_window_cannot_spend_is_not_work_left(tmp_path):
+    """反面：**账上有钱 ≠ 这笔钱它能花。**
+
+    一个已进 `PRODUCTION` 相、f_k 已 verified、生产配额烧光的窗口，预热余额再多
+    也推不动它一步。把它算成"还有活干"会让退役循环空转，并且让「别处确实还有
+    预算」这个退役前提变成假的。
+    """
+    run = _two_broken_windows(tmp_path, capped=1, starved=3)
+    _blocks_history(run, window=3, n_blocks=4)      # 下游生产也烧光
+    c = Stage2RepairController(run, "vanishing")
+    view = c.read()
+    w3 = next(x for x in view["windows"] if int(x["window_idx"]) == 3)
+    assert int(w3["warmup_steps_left"]) > 0, "盘面前提：预热账面上确实还有钱"
+    assert w3.get("phase") == "PRODUCTION" and w3.get("f_k_evidence_status") == "verified"
+    assert c._is_routable_candidate(view, w3, set(), set()) is False, (
+        "花不出去的预热余额被当成了「还有活可干」")
+
+
+def test_a_retired_window_is_not_reported_as_blocked_by_upstream(tmp_path):
+    """[2026-09-17] 已退役的窗口不算「被上游挡住」。
+
+    `blocked_by_upstream` 的语义是「证据前提可能被 earliest 的重锚作废，先别动」。
+    而**已退役**的窗口恰恰是「本轮已判定对它没有任何动作可做」—— 它不在等
+    `earliest`，它是被绕过去的那个。混在一张表里会让人读成"下游还有 N 个在排队"，
+    而其中几个其实已经放弃了。纯报告，不改路由。
+    """
+    run = _two_broken_windows(tmp_path, capped=1, starved=3)
+    plan = Stage2RepairController(run, "vanishing").decide()
+    assert plan["retired_windows"] == [1], plan.get("retired_windows")
+    for w in plan["retired_windows"]:
+        assert w not in plan["blocked_by_upstream"], (
+            f"窗口 {w} 已退役却仍被报成 blocked_by_upstream："
+            f"{plan['blocked_by_upstream']}")

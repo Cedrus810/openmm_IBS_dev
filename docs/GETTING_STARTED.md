@@ -26,8 +26,27 @@
 - GROMACS force-field include 目录，用于首次从 `.top` 构建系统。
 - OpenMM-ML、torch、MACE/ORB 相关依赖，仅在使用 `--boresch-source auto`、`orb_simple`、`orb_ml` 或相关 ML 功能时需要。
 
-版本以仓库里的环境文件为准（[`environment.yml`](../environment.yml) /
-[`environment-ci.yml`](../environment-ci.yml)）：`python=3.12`，**`pymbar-core=4.2.0`（钉死）**。
+### 两个环境文件，装哪个
+
+| 文件 | 是什么 | 什么时候用 |
+|---|---|---|
+| [`environment-ci.yml`](../environment-ci.yml) | **基础环境**：python + openmm + pymbar-core + numpy/scipy/mdtraj/rdkit/pdbfixer。**不含 CUDA 工具链、torch、MACE、JAX** | 只想读代码、跑 CPU 测试子集（`pytest -m cpu_only`）、在没有卡的机器上查东西 |
+| [`environment.yml`](../environment.yml) | **完整生产环境**：在基础之上加 CUDA 12.9 工具链、pytorch、openmm-torch、openmm-ml、MACE、JAX。328 个包全钉死 | 要真的跑 GPU 生产、或要重编 native plugin |
+
+> 名字里的 `ci` 是历史叫法 —— 它就是基础环境，CI 只是它的第一个用户。
+> **生产结果必须出自 `environment.yml`**（全钉死那份），基础环境是给开发/检查用的。
+
+版本以这两份文件为准：`python=3.12`，**`pymbar-core=4.2.0`（钉死）**。
+
+> 📌 **两份文件都钉死 `openmm=8.5.2`，别"顺手升到 8.6"**（2026-09-17 维护者判定）：
+> **8.6 尚不成熟、有已知严重 bug，本项目暂不使用。**
+> **是"暂"不是"永不"** —— 8.6 的官方 REMD 正是本项目想要的，**未来版本可能支持**；
+> 代码侧的资格判据已经为它留好位置，缺的是 8.6 本身稳定下来。
+>
+> 这与代码里 `free_energy_engine.OFFICIAL_REMD_MIN_OPENMM_VERSION = "8.6.0"` **不矛盾** ——
+> 那个常量是「官方 `ReplicaExchangeSampler` 要 8.6 才有」这条**资格判据**，
+> 说的是后端选得上选不上；环境这边说的是「今天不装 8.6」。**代码支持得了 ≠ 现在就该用。**
+> 要放开得先复验 8.6 那些 bug，并连带重编 `plugins/LocalManyBodyResidual/*.so`（见下节）。
 
 > ⚠️ **`pymbar-core` 的版本是钉死的，不是"建议"。** 理由见
 > [PYMBAR_UNCERTAINTY_PROTOCOL.md](PYMBAR_UNCERTAINTY_PROTOCOL.md)：报告出去的 ABFE
@@ -46,9 +65,11 @@
 > （开关默认 `false`），不用这个功能可以整节跳过。
 
 `LocalManyBodyResidual` 是一个 OpenMM native plugin。仓库里**带了一份预编译
-`.so`**，对着 **OpenMM 8.5.2** 编的 —— 而
-[`environment.yml`](../environment.yml) / [`environment-ci.yml`](../environment-ci.yml)
-钉的正是 `openmm=8.5.2`。**按环境文件建环境的话，直接能用，不用编。**
+`.so`**，对着 **OpenMM 8.5.2** 编的 —— 而 [`environment.yml`](../environment.yml)
+钉的正是 `openmm=8.5.2`。**按它建环境的话，直接能用，不用编。**
+
+⚠️ 这份 `.so` 吃的是 OpenMM 私有平台头，**跨版本无 ABI 承诺** —— 这也是环境文件
+把 openmm 钉死的连带理由之一：哪天真要升版本，重编插件是同一件事的一部分。
 
 要自己编的只有两种情况：
 

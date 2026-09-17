@@ -60,13 +60,28 @@ def test_a_solver_skipped_window_is_routed_before_an_earlier_unhappy_one(tmp_pat
 
 
 def test_without_a_skip_the_old_earliest_order_is_unchanged(tmp_path):
-    """没有跳窗时**逐字保持**原行为 —— 这条改的只是优先级，不是判据。"""
+    """没有跳窗时 `earliest` 仍按下标排 —— 这条改的只是优先级，不是判据。
+
+    ⚠️ [2026-09-17 P0] 断言从「动作落在 w1」改成「`earliest` 仍是 w1」。
+    三态归因之后 w1（ratio=8.7、门 10、headroom=5 ⟹ 8.7×5=43.5 ≥ 10 ⟹
+    `reachable is True`）是 **UNKNOWN** —— 乐观上界尚未被证伪，**既不是**"帧不够"
+    **也不是**结构性失败 ⟹ 两边都不授权动作。按用户规格「若还有其他窗口可做，
+    则绕过该单元继续调度，不能让它停掉整跑」，它被退役，动作落到 w3
+    （ratio=0.21 ⟹ 0.21×5=1.05 < 10 ⟹ `reachable is False` ⟹ STRUCTURAL）。
+
+    **优先级本身没变**（`earliest` 照样是 w1），变的是"w1 现在没有被授权的动作"。
+    本条守的是前者，所以断言改成直接看 `earliest_unresolved_window`。
+    """
     w = {i: {"K": 4} for i in range(4)}
     w[1] = {"K": 4, "self_verdict": "INSUFFICIENT_DATA", "min_n_eff_over_g": 8.7}
     w[3] = {"K": 4, "self_verdict": "INSUFFICIENT_DATA", "min_n_eff_over_g": 0.21}
     run = _mkrun(tmp_path, windows=w, ranges=R4, n_states=13)
     plan = Stage2RepairController.for_physical_stage(run, "vanishing", "vdw").decide()
-    assert plan["windows"] == [1], plan["reason"][:200]
+    # ⚠️ `decide()` 会退役后**重判**，所以返回值里的 `earliest` 已经是 3。
+    # "优先级没变"体现在：w1 是**先**被考虑的那个（因此进了 retired），
+    # 而不是被跳过去没看。
+    assert plan.get("retired_windows") == [1], plan["reason"][:200]
+    assert plan["windows"] == [3], plan["reason"][:200]
 
 
 def test_a_replaced_parent_is_still_excluded(tmp_path):
