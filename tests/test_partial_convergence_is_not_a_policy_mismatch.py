@@ -18,6 +18,9 @@ import ast
 import inspect
 
 import ibs_engine as ie
+import pytest
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _periodic_snapshot_like():

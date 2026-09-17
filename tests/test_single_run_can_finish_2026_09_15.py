@@ -23,6 +23,9 @@ import numpy as np
 import abfe_core
 import abfe_pipeline as ap
 from abfe_pipeline import ABFEPipeline
+import pytest
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _pipeline_stub(exit_):

@@ -83,11 +83,20 @@ def _with_rewindow(tmp_path, *, child_states, skipped=(), solver_decorr=None):
             "bias_status": "converged", "f_k_evidence_status": "verified",
             "lambdas_vdw": lam,
         }))
+        # ⚠️ [2026-09-17] `verdict_source` 与 `n_eff_over_g_eligible_threshold`
+        # **真实写侧一定会写**（`ibs_engine.window_self_support_check` 里
+        # verdict_source 是 top1pct_veto / min_n_eff_over_g / solver_eligibility
+        # 三选一）。fixture 先前不写它们 ⟹ 归因恒判不出来 ⟹ 三态里只出现
+        # `UNKNOWN`，测的是一个**真机不存在**的盘面。
+        # 这里按真写侧补齐：11 帧 < 下限 20 ⟹ 真实写侧会判 `solver_eligibility`。
         (rw / f"dual_window_{li}_vdw_self_support.json").write_text(json.dumps({
             "window_idx": li, "verdict": verdict,
+            "verdict_source": ("min_n_eff_over_g" if verdict == "ANALYSIS_ELIGIBLE"
+                               else "solver_eligibility"),
             "sufficient": verdict == "ANALYSIS_ELIGIBLE",
             "n_frames_decorrelated": 11, "min_frames_per_window": 20,
             "min_n_eff_over_g": 4.0,
+            "n_eff_over_g_eligible_threshold": 10.0,
         }))
     (pathlib.Path(run) / "checkpoints" / "stage2_rewindow_ledger.json").write_text(
         json.dumps({"abc123": {

@@ -17,6 +17,8 @@
 | [PROPOSAL_rbfe_r1_fragment_mapping.md](PROPOSAL_rbfe_r1_fragment_mapping.md) | 提案 | ✅ **已采纳并实施**（2026-09-03） | 用户选定 §3 的 **A+B 混合**路线；M0-M6 全部落地在 `rbfe_core.py`，见 PLAN 第 0 节的 R1a 段 |
 | [PLAN_rbfe_pipeline_wiring.md](PLAN_rbfe_pipeline_wiring.md) | 计划 | ⬜ **盘点完成，未开工** | RBFE 作为一条 pipeline 还缺什么：接口漂移、身份指纹的两个洞、§7 产物树落了 2/6、续跑只有拒绝没有继续。**除建系外全都不依赖那份还没有的配体 B** |
 | [PROPOSAL_periodic_box_geometry_detection.md](PROPOSAL_periodic_box_geometry_detection.md) | 提案 | ⬜ **待决定** | 非长方体输入盒（截角八面体 / 菱形十二面体 / 一般三斜）的早期识别与统一处理：为什么不能靠盒矩阵字面值分类、各输入格式的盒子从哪读、以及一个「所有格式收敛成同一个报告对象」的漏斗设计 |
+| [PROPOSAL_openfe_method_absorption.md](PROPOSAL_openfe_method_absorption.md) | 提案 | ⬜ **未执行、未授权**（2026-09-17） | 「为了降低 MAE 该从 OpenFE 拿什么」。证据是读 OpenFE 源码 + 读已落盘 `runs/` 产物，不是读它的文档。⚠️ 现有 MAE 5.91 kcal/mol 那 11 行**全部出自 2026-09-16T05:03 之前的代码** ⟹ 基线本身要先重取。与 [TODO.md](../TODO.md) 的 P1 是两条线：那边是「跑不跑得完」，本文是「跑完了准不准」 |
+| [PROPOSAL_stage2_controller_minimal.py](PROPOSAL_stage2_controller_minimal.py) | 提案（**代码草图，45 行**） | ⬜ **未执行**（2026-09-17） | 把 `_decide_once`（1832 行 / 63 个 return）压成「4 个病因 × 1 个处方」的对照实现，复用已有的 `marginal_gain_stalled`、不新造判据。配套 [TODO_P2.md](../TODO_P2.md) `AUDIT-S2-02` 的重构立项；它点名的分歧是**付不起对症动作时不降级**（现行 `plan()` 的 O1 会改发 `RUN_PRODUCTION`）。⚠️ 是 `.py` 但**不是生产代码**：`pytest` 不收集 `docs/`，`ruff`/CI 也不看 |
 
 ## 待办前沿（2026-08-31 更新）
 

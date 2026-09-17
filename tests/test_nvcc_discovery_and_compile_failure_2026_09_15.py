@@ -20,6 +20,8 @@ import pytest
 
 import abfe_pipeline as ap
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_nvcc_is_found_next_to_the_interpreter_without_path(monkeypatch, tmp_path):
     """conda/mamba env 里 nvcc 与 python 是邻居 —— 这条与有没有 activate 无关。"""

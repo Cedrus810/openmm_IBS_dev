@@ -86,10 +86,26 @@ def test_the_controller_stops_instead_of_topping_up_a_skewed_child(tmp_path):
     plan = Stage2RepairController(run, "vanishing").decide()
 
     assert plan["action"] == "NO_ACTION", plan["reason"]
-    assert plan["exit"] == "NO_FEASIBLE_ACTION"
+    # 🔑 [2026-09-17，用户拍板 D3] 出口从笼统的 `NO_FEASIBLE_ACTION` 换成专名。
+    # 这条死线在 REWIND-01 接通之前**结构上不可达**（子窗只由 `IMMUTABLE_REWINDOW`
+    # 产生，而它发不出来）；现在它第一次会被真的走到，所以值一个说得清的名字：
+    # 不是"想不出动作"，是「**有界重窗这条路的数据模型到顶了**」——
+    # 当前只能表达"一次物理父窗替代"（执行器/合并器没有 `parent_unit_id`、
+    # 没有 ancestry、没有递归预算语义）。本条的**意图一字未变**：停下、不加帧。
+    assert plan["exit"] == "D3_REWINDOW_DEPTH_EXHAUSTED", plan["reason"]
+    assert plan["terminal"] is True, "有界重窗用尽是真终态，不是路由信号"
     assert plan["unit_id"] == "rw:abc123:1"
     assert "加帧治不了偏斜" in plan["reason"]
-    assert "不拿加帧顶替" in plan["reason"]
+    assert "不递归、不补帧、不再建第二个" in plan["reason"]
+    # 结构化诊断：走到这条终态时，人不该还要回去翻盘面
+    d = plan["rewindow_depth_exhausted"]
+    assert d["unit_id"] == "rw:abc123:1" and d["parent_window"] == 1
+    assert d["support_failure_source"] == "top1pct_veto"
+    assert d["self_verdict"] == "HARD_INSUFFICIENT"
+    for k in ("range", "identity", "blocks_used",
+              "bottleneck_state", "bottleneck_g", "bottleneck_eta",
+              "bottleneck_ratio"):
+        assert k in d, k
 
 
 def test_a_healthy_child_is_complete(tmp_path):

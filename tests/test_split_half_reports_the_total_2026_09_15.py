@@ -16,6 +16,9 @@
 import inspect
 
 import ibs_engine as ie
+import pytest
+
+pytestmark = pytest.mark.cpu_only
 
 
 def test_the_total_drift_is_surfaced_as_a_top_level_key():

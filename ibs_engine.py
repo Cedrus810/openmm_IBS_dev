@@ -20758,14 +20758,22 @@ def window_self_support_check(
     # 这里在**未抽稀**帧上逐态算 ——  抽稀之后再算等于把 g 除了两遍。
     n_eff_per_state: List[Optional[float]] = []
     top1_per_state: List[Optional[float]] = []
+    # 🔑🔑 [2026-09-17] **逐态记下「真正进了 N_eff 的帧数」。**
+    # `_bias_fs.size` 是 finite mask **之前**的数；而下面每个态各自过一次
+    # `np.isfinite`（不同态的非有限帧可以不同）。效率 η = N_eff/N 的分母必须是
+    # **这个态自己**的有效帧数，否则 η 会被非有限帧系统性压低 —— 而那是个
+    # 隐蔽误差：它只在有非有限帧时出现，且永远偏向"看起来更差"。
+    n_eff_input_n_frames_per_state: List[Optional[int]] = []
     for _k in range(_u_fs.shape[0]):
         _ser = (_u_fs[_k] - _bias_fs) / float(kt)
         _fin = np.isfinite(_ser)
         if not _fin.any():
             n_eff_per_state.append(None)
             top1_per_state.append(None)
+            n_eff_input_n_frames_per_state.append(0)
             continue
         _sr = _ser[_fin]
+        n_eff_input_n_frames_per_state.append(int(_sr.size))
         # 减最小值只为数值稳定；ESS 对 w 的公共因子不变。
         _w = np.exp(-(_sr - _sr.min()))
         _sw, _sw2 = float(_w.sum()), float((_w * _w).sum())
@@ -20963,7 +20971,18 @@ def window_self_support_check(
         "n_eff_frame_set": (
             "segments_kept_by_decorrelation" if segments else "all_frames"
         ),
+        # ⚠️ 这是 finite mask **之前**的帧数（整个 frame set 的大小）。
+        # 算 η 用的是下面那份**逐态**的，别拿这个当分母。
+        "n_eff_frame_set_n_frames_raw": _n_frames_frame_set,
+        # 保留旧键名，老读侧不炸；新代码一律用 `_raw` 那个（语义写在名字里）。
         "n_eff_frame_set_n_frames": _n_frames_frame_set,
+        # 帧集身份：哪些 segment 被 decorrelation 判定为有效并保留下来。
+        "n_eff_frame_set": "segments_kept_by_decorrelation",
+        # 🔑 逐态**实际进了 N_eff 的帧数**（已排除无效 segment、**未**按 sub_idx
+        # 去相关稀疏、且对该态应用过 finite mask）。η 的唯一合法分母。
+        "n_eff_input_n_frames_per_state": [
+            None if x is None else int(x) for x in n_eff_input_n_frames_per_state
+        ],
         "n_eff_frame_set_excluded_segments": len(_excluded_segments),
         "top1pct_weight_per_state": [
             None if x is None else float(x) for x in top1_per_state

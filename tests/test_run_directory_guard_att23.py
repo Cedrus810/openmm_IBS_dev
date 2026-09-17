@@ -28,7 +28,6 @@ from pathlib import Path
 import pytest
 
 from abfe_pipeline import (
-    RunDirectoryLock,
     TerminationRequested,
     ensure_free_disk_for_stage,
     estimate_stage_trajectory_bytes,
@@ -38,56 +37,6 @@ from abfe_pipeline import (
 pytestmark = pytest.mark.cpu_only
 
 REPO = Path(__file__).resolve().parents[1]
-
-
-# ---------------------------------------------------------------------------
-# 1. 输出目录独占锁
-# ---------------------------------------------------------------------------
-
-
-def test_second_pipeline_cannot_take_the_same_output_directory(tmp_path):
-    with RunDirectoryLock(str(tmp_path)):
-        with pytest.raises(RuntimeError, match="已被另一次运行独占"):
-            with RunDirectoryLock(str(tmp_path)):
-                pass
-
-
-def test_lock_error_names_the_current_holder(tmp_path):
-    """错误信息必须能直接回答"另一个是谁、什么时候起的"，否则只能去 ps 里猜。"""
-    with RunDirectoryLock(str(tmp_path)):
-        with pytest.raises(RuntimeError) as excinfo:
-            with RunDirectoryLock(str(tmp_path)):
-                pass
-    message = str(excinfo.value)
-    assert f"pid={os.getpid()}" in message
-    assert "起于" in message and "命令:" in message
-
-
-def test_lock_is_released_on_exit_and_can_be_retaken(tmp_path):
-    lock_file = tmp_path / RunDirectoryLock.LOCK_BASENAME
-    with RunDirectoryLock(str(tmp_path)):
-        assert lock_file.exists()
-    assert not lock_file.exists()
-    with RunDirectoryLock(str(tmp_path)):
-        pass
-
-
-def test_lock_does_not_wait(tmp_path):
-    """两个作业写同一目录是配置错误、不是竞态，排队等没有意义。"""
-    lock = RunDirectoryLock(str(tmp_path))
-    assert lock.timeout_s == 0.0
-
-
-def test_lock_never_breaks_another_hosts_lock(tmp_path):
-    """共享文件系统上别的节点的 PID 在本机毫无意义 —— 继承自 _PipelineStateLock。"""
-    lock_file = tmp_path / RunDirectoryLock.LOCK_BASENAME
-    lock_file.write_text(
-        json.dumps({"pid": 999999, "hostname": "some-other-node"}), encoding="utf-8"
-    )
-    with pytest.raises(RuntimeError, match="已被另一次运行独占"):
-        with RunDirectoryLock(str(tmp_path)):
-            pass
-    assert lock_file.exists(), "绝不能删掉别的节点的锁"
 
 
 # ---------------------------------------------------------------------------
@@ -122,11 +71,12 @@ def test_termination_message_does_not_overclaim_checkpointing():
     assert "没有" in str(excinfo.value) and "checkpoint" in str(excinfo.value)
 
 
-def test_sigterm_releases_the_output_directory_lock_in_a_real_process(tmp_path):
-    """端到端：子进程被 SIGTERM 之后，锁文件必须已经释放。
+def test_sigterm_becomes_terminationrequested_in_a_real_process(tmp_path):
+    """端到端：真进程里 `guard_run_directory` 装上的处理器把 SIGTERM 变成异常。
 
-    这是这三项凑在一起的实际意义 —— 作业被调度器 kill 之后，
-    下一次运行不该因为一把没人持有的锁而拒绝启动。
+    在**子进程**里跑而不是本进程：`signal.signal` 是进程全局的，本进程装了处理器
+    会污染同一次 pytest 里后面的测试。
+    2026-09-17 起这条不再断言锁文件 —— `RunDirectoryLock` 已删（见 archive/）。
     """
     script = textwrap.dedent(
         f"""
@@ -151,9 +101,6 @@ def test_sigterm_releases_the_output_directory_lock_in_a_real_process(tmp_path):
     assert result.returncode == 3, (
         f"子进程未按 TerminationRequested 退出：rc={result.returncode}\\n"
         f"{result.stderr[-2000:]}"
-    )
-    assert not (tmp_path / RunDirectoryLock.LOCK_BASENAME).exists(), (
-        "SIGTERM 之后锁没被释放 —— atexit 链没跑到。"
     )
 
 

@@ -10,6 +10,8 @@ from local_residual.softlift_dataset import (  # noqa: E402
     validate_softlift_dataset_arrays,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_canonical_key_sorts_and_rejects_duplicate_keys():
     common = dict(

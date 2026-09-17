@@ -2,13 +2,26 @@
 
 [项目入口](../README.md) · [文档导航](README.md) · [当前科学状态](STATUS.md) · [变更记录](CHANGELOG.md) · [P1 在推的](TODO.md) · [P3 现在不做](TODO_P3.md)
 
+> **已关闭的条目不留在本文**，整段移进 `archive/` —— 2026-09-17 关闭的 5 条
+> （`TEST-01` / `LR-03` / `LR-04` / `REL-08` / `REL-09`）在
+> [archive/TODO_closed_2026-09-17.md](archive/TODO_closed_2026-09-17.md)。
+
 > 手上没有 P1 的时候才来看。条目的位置/判据格式与 `TODO.md` 相同。
 > **P2 的判据是「不挡路」，不是「不重要」** —— `BUD-06` / `IDENT-01` 在这里，
 > 是因为两条都自证了今天不阻塞任何在推的工作，不是因为可以不管。
 
 ---
 
-## 1. Stage-2：需单独立项的重构
+## 1. 测试选择口径
+
+> ✅ **本节唯一的条目 `TEST-01` 已于 2026-09-17 关闭**，整段进
+> [archive/TODO_closed_2026-09-17.md](archive/TODO_closed_2026-09-17.md)。
+> 留下的规矩：**判据用收集数对账，不能用 grep 文件** —— 同一个文件里可以既有带标记的测试、
+> 又有漏网的（`test_exp019_softlift_loro.py` 就是这么发现的）。保留本节编号，后面几节不动。
+
+---
+
+## 2. Stage-2：需单独立项的重构
 
 > 当天做了一次**逐出口的系统梳理**（45 个出口、12 个动作全扫）。
 > 抓到三条，两条当天修完；下面是**剩下的**与**结论**。
@@ -36,7 +49,7 @@
 
 ---
 
-## 2. Stage-2：两条待维护者拍板（代理不要自行改）
+## 3. Stage-2：两条待维护者拍板（代理不要自行改）
 
 > 两条都**不阻塞在推的工作**，但都要动口径，代理自行改会踩本仓最贵的复发模式
 > 「同一个量两份实现」。
@@ -93,17 +106,25 @@
 
 ---
 
-## 3. local-residual / EXP-033
+## 4. local-residual / EXP-033
 
 > 背景与已关闭条目见 [TODO.md §2](TODO.md#2-local-residual--exp-033)。
 > `LR-06` 是 **P1**，在那边，不在本文。
 > ⚠️ **`EXP-033-P1` / `P2` / `P3` 是 EXP-033 自己的阶段编号，不是本文的优先级**；
 > 优先级只看方括号里的 `[P2]`。
 
-- [ ] **EXP-033-P1-GPU [P2]（先做这个）P1 闭式重训真机一次没跑过。**
+- [ ] **EXP-033-P1-GPU [P2] 真机首跑 2026-09-17 已通过，但拟合出来是空模型 ⟹ 条目不关，判据换了。**
+  📌 **原文「真机一次没跑过」已不成立**：`cyclod_ligand1_outer/rep1` 那次复跑（见 `TODO.md` 的 `LR-06` 第 6 步）
+  走了自动重训，`outer_lambda_refit/` 有产物，`closed_form_refit()` 里那段建 Context 的 probe 真机跑通。
+  **但拟合结果是空模型**（B 离散度 **2.9e-06 kT**）⟹ 只证明「不炸」，证明不了有增益。
+  ⟹ 剩下的判据不再是"出不出 manifest"，是**为什么拟合成了空模型**：是帧源（`pre_equilibration.dcd`）
+  的构型跨度不够，还是闭式解在这个体系上退化。
+  <details><summary>原始条目（存档）</summary>
+
   `closed_form_refit()` 里 probe 那段要建 OpenMM Context，只过了静态校验。
   最小验证：4W53 开 `--outer-lambda-local-residual-ibs`（配体指纹对不上冻结的 Atenolol
   ⟹ 会走重训），跑到预平衡结束看它出不出 manifest。
+  </details>
 - [ ] **EXP-033-P2 [P2]（EXP-033 唯一还开着的一条）** ridge 臂 vs 出厂非线性臂，**U3 口径上机**：
   window-0 utility + ΔG 一致性，且**两臂各自独立标定并冻结自己的 `f_k`**。
   U4 就是栽在候选臂复用 baseline 的 `f_k`，被封为 `INVALID_FOR_PROMOTION`。
@@ -113,12 +134,6 @@
 
 - [ ] **LR-02 [P2] `skip_unsupported_frames` 该撤或反转** —— 支撑域外的帧正是"模型没覆盖这个
   体系"的证据，跳过它等于把本该触发停止的信号变成拟合时看不见的样本。
-- [ ] **LR-03 [P2] `sample-hard-window-scratch` 在主线里是死的** ——
-  实现在发布清理时被移出的 `archive/` 里（`outer_lambda_neural_basis.py` 有 **13 处**
-  `from archive import`，全是空壳）。而且那份 legacy 实现读 `manifest["lambda_shield"]`，
-  WCA 壳退役后该字段是 `None` → `TypeError`。**要么补实现，要么把入口一起删掉。**
-- [ ] **LR-04 [P2] 没有 solvent-only 入口** —— `--only-complex-charging` /
-  `--only-boresch-attachment` 与 residual 互斥。
 - [ ] **LR-05 [P2] 重训用的 λ 表是默认值** `linspace(1.0, 0.5, 8)`
   （可用 `outer_lambda_refit_lambda_max/_min/_n_states` 改）。因为重训发生在预优化算出
   真实 stage-2 λ 路径**之前**。按 `B_φ` 的定位这不影响对错；要用真实窗口 λ 表得把重训
@@ -135,7 +150,7 @@
 
 ---
 
-## 4. 发布工程门
+## 5. 发布工程门
 
 发布定位是 **clone-and-run**（不打包、不发科学结论）。判据只有一条：
 `pytest tests/test_fresh_clone_imports.py` 绿。完整论证见
@@ -184,16 +199,3 @@
 > 并入。它们在那份表里是"仍欠"，但本文没有对应条目 —— 违反本文规则 1「一条待办只在本文出现
 > 一次」的反面：**一条待办一次都没出现**。判据栏原文保留在 RELEASE_READINESS 的同名行。
 
-- [ ] **REL-08 [P2] 基础环境与 GPU/ML 可选环境未分离** ——
-  [RELEASE_READINESS:173](RELEASE_READINESS_2026-08-31.md)。Python 版本已于 2026-09-12
-  统一成 3.12；`environment.yml` 的个人 `prefix` **2026-09-13 核实已无**（全文件 grep
-  不到 `/home/`），那半条已过期。**仍欠的只有拆分**：把 CUDA 12.9 开发工具链 / torch / MACE
-  这类只有 GPU 才用得上的依赖从基础环境里拆出去。
-  判据：干净机器按文档只装基础环境能 import、能跑 CPU 测试子集。
-- [ ] **REL-09 [P2] 输出目录与长任务保护** ——
-  [RELEASE_READINESS:177](RELEASE_READINESS_2026-08-31.md)。现有的是 checkpoint + 短时
-  pipeline state lock；**欠覆盖整个作业生命周期的输出目录独占锁、SIGTERM 处理、磁盘预检**。
-  📌 **2026-09-16 拿到真机证据**：全量 benchmark 的历史异常里
-  `输出目录已被另一次运行独占（目录锁）` 出现 **4 次，全部出自 `cyclod_ligand1`**（见 `BM-B`）。
-  ⟹ 这条不再是"理论上欠"，是**真的在 39 个 rep 的调度里咬过人**。
-  判据：重复启动同一输出目录被明确拒绝；调度器中断后可从一致边界续跑；磁盘不足的失败可解释。

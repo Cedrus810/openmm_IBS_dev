@@ -14,6 +14,7 @@ _rows = _MODULE._rows
 _build_seeded_model = _MODULE._build_seeded_model
 
 
+@pytest.mark.cpu_only  # 纯 numpy 切分，不碰 torch
 def test_trailing_validation_split_never_randomizes_or_leaks_runs():
     arrays = {"partition_index": np.repeat(np.array([0, 1, 2]), 5)}
     train = _rows(arrays, [0, 1], trailing_validation=False)

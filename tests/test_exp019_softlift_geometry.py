@@ -6,6 +6,8 @@ np = pytest.importorskip("numpy")
 
 from local_residual.softlift_dataset import SoftLiftDatasetError, _unit_shift_and_displacement  # noqa: E402
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_triclinic_unit_shift_and_half_box_tie_fail_closed():
     box = np.array([[10.0, 0.0, 0.0], [2.0, 9.0, 0.0], [1.0, 1.0, 11.0]])

@@ -23,6 +23,8 @@ import pytest
 import abfe_preoptimizer as pre
 from abfe_pipeline import ABFEPipeline
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _pilot(lambdas):
     """一条度量均匀的 pilot：弧长 = 序号，够 `_pilot_arclength_of` 插中点用。"""
@@ -99,6 +101,73 @@ def test_legalize_splits_tail_between_hi_and_split_ceiling(tmp_path, lo, hi, tai
     cur = lpv.load_current(str(tmp_path))
     assert cur["event"]["kind"] == "tail_repartition"
     assert [tuple(r) for r in cur["window_ranges"]] == out_ranges
+
+
+@pytest.mark.parametrize("first_untrusted", [0, None, 1])
+def test_legalize_does_not_need_to_know_which_window_is_untrusted(
+        tmp_path, first_untrusted):
+    """真机 cyclod_ligand3/rep1+rep3：K=9 / lo=4 / hi=8，`first_untrusted=0` ⟹ 起不来。
+
+    **这不是死区**：源码定义的死区是 `hi < K < 2*lo−1`，lo=4/hi=8 时是 `8 < K < 7`
+    = 空集；K=9 落在可拆区间 `[2lo−1, 2hi−1] = [7, 15]` 里，`9 → 5+5` 两个都在
+    `[4, 8]`，**数学上完全拆得开**。
+
+    卡住它的是概念串线：「**合法化**」（末窗超 hi 就必须做，与谁不可信无关）
+    借用了「**修复**」的定位谓词 `first_untrusted_window`，而后者在 `idx <= 0`
+    时恒为 None ⟹ 抛 RuntimeError，且那个非法布局**已经落盘**。
+
+    ⟹ 合法化必须对 `first_untrusted ∈ {0, None, 任意}` 一律成立。
+    """
+    lo, hi = 4, 8
+    ranges = [(0, 4), (3, 7), (6, 15)]        # 末窗 K=9
+    n = 15
+    assert ranges[-1][1] - ranges[-1][0] == 9
+    assert not (hi < 9 < 2 * lo - 1), "K=9 不在死区（死区是空集）"
+    assert 2 * lo - 1 <= 9 <= 2 * hi - 1, "K=9 在可拆区间里"
+    lam = [1.0 - i / (n - 1.0) for i in range(n)]
+
+    import lambda_path_versions as lpv
+    lpv.init_version(str(tmp_path), [0.0] * n, lam, [list(r) for r in ranges])
+
+    pipe = object.__new__(ABFEPipeline)
+    pipe._log = lambda *a, **k: None
+    out_lam, out_ranges = pipe._legalize_tail_window(
+        lam, ranges,
+        failed_range=None, pilot=None, checkpoint_dir=str(tmp_path),
+        min_states_per_window=lo, max_states_per_window=hi,
+        first_untrusted=first_untrusted,
+    )
+
+    assert all(lo <= b - a <= hi for a, b in out_ranges), out_ranges
+    assert out_lam == [float(x) for x in lam], "尾段重分不动 λ 表"
+    # 前缀逐字冻结 —— anchor 是末窗首态 ⟹ 重分范围恰好是末窗那一段。
+    assert out_ranges[:2] == [(0, 4), (3, 7)], out_ranges
+    # 相邻窗口共享 λ 节点，自由能链不断。
+    for (a1, b1), (a2, _b2) in zip(out_ranges, out_ranges[1:]):
+        assert a2 == b1 - 1, (out_ranges, "接缝上没有共享节点")
+    # 覆盖完整。
+    assert out_ranges[0][0] == 0 and out_ranges[-1][1] == n
+    cur = lpv.load_current(str(tmp_path))
+    assert cur["event"]["kind"] == "tail_repartition"
+    assert [tuple(r) for r in cur["window_ranges"]] == out_ranges
+
+
+def test_legalize_refuses_a_single_window_layout(tmp_path):
+    """只有一个窗口时没有「末窗首态」这个共享节点 ⟹ fail-closed，不许静默重分全路径。
+
+    重分整条路径是**布点**的事，不是合法化的事。
+    """
+    lo, hi = 4, 8
+    lam = [1.0 - i / 8.0 for i in range(9)]
+    pipe = object.__new__(ABFEPipeline)
+    pipe._log = lambda *a, **k: None
+    with pytest.raises(RuntimeError, match="只有 1 个窗口"):
+        pipe._legalize_tail_window(
+            lam, [(0, 9)],
+            failed_range=None, pilot=None, checkpoint_dir=str(tmp_path),
+            min_states_per_window=lo, max_states_per_window=hi,
+            first_untrusted=None,
+        )
 
 
 def test_legalize_is_a_noop_when_tail_already_legal(tmp_path):

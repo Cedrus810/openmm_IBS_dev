@@ -53,6 +53,7 @@ from abfe_preoptimizer import (
     canonicalize_window_ranges,
     split_window_from_ibs_lse_failure,
     feasible_repair_actions,
+    vanishing_rescue_ranges,
     tail_overflow_exemption_active,
     Stage2RepairController,
     insert_thermodynamic_midpoint_from_ibs_lse_failure,
@@ -1710,72 +1711,6 @@ class _PipelineStateLock:
                 os.remove(self.path)
         except Exception:
             pass
-
-class RunDirectoryLock(_PipelineStateLock):
-    """一次作业对 `--output` 目录的**独占锁**（ATT-23 / issue #142）。
-
-    与父类 `_PipelineStateLock` 的区别只有三点，其余（跨主机不删别人的锁、
-    只在**确认** PID 不存在时才判 stale、空 payload 宽限期）**全部复用**：
-
-    1. **不等待**：`timeout_s=0`。两个作业写同一个目录是配置错误，不是竞态，
-       排队等 10 秒没有意义 —— 立刻失败并说清另一个持有者是谁。
-    2. **payload 更全**：额外记 `started_at` 与 `command`，好让错误信息能直接
-       告诉你"另一个是什么时候、用什么命令起的"。
-    3. **活得久**：父类那把锁只活几十毫秒（读改写 `pipeline_state.json`），
-       这把要横跨整次运行。
-
-    ## 为什么需要它
-
-    两个 pipeline 同时写一个 run 目录，产物会互相覆盖：DCD 交叉 append、
-    checkpoint 互相踩、`pipeline_state.json` 后写的赢。而且**没有任何一环会报错**
-    —— 最后得到一份看起来正常、实际混了两次运行的结果。
-    """
-
-    LOCK_BASENAME = ".abfe_run.lock"
-
-    def __init__(self, output_dir: str):
-        super().__init__(
-            os.path.join(output_dir, self.LOCK_BASENAME),
-            timeout_s=0.0,
-            poll_s=0.0,
-        )
-        self.output_dir = output_dir
-
-    def _lock_payload(self) -> str:
-        return json.dumps(
-            {
-                "pid": int(os.getpid()),
-                "hostname": self._own_hostname(),
-                "started_at": datetime.now().isoformat(timespec="seconds"),
-                "command": " ".join(sys.argv[:8]),
-            },
-            ensure_ascii=False,
-        )
-
-    def _describe_owner(self) -> str:
-        try:
-            with open(self.path, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-        except Exception:
-            return "（锁文件存在但读不出内容）"
-        return (
-            f"pid={payload.get('pid')} @ {payload.get('hostname')}，"
-            f"起于 {payload.get('started_at')}，命令: {payload.get('command')}"
-        )
-
-    def __enter__(self):
-        os.makedirs(self.output_dir, exist_ok=True)
-        try:
-            return super().__enter__()
-        except TimeoutError:
-            raise RuntimeError(
-                f"输出目录已被另一次运行独占：{self.output_dir}\n"
-                f"    持有者：{self._describe_owner()}\n"
-                "  两个 pipeline 写同一个目录会互相覆盖产物（DCD 交叉 append、"
-                "checkpoint 互踩、pipeline_state.json 后写的赢），\n"
-                "  而且全程不会报错 —— 最后拿到一份看着正常、实际混了两次运行的结果。\n"
-                f"  换一个 --output，或确认对方确实已经结束后删掉 {self.path}。"
-            ) from None
 
 
 class TerminationRequested(BaseException):
@@ -7852,6 +7787,22 @@ class ABFEPipeline:
             "precision_status": _precision_status,
             "precision_evidence": _precision_evidence,
         })
+        # 🔑🔑 [2026-09-17，用户拍板 B] **`publishable` 必须显式合取 `not results_untrusted`。**
+        #
+        # 下面那段注释写着「必须同时满足 analysis_status == ANALYSIS_COMPLETE **且**
+        # precision 达标」，但代码里 `_publishable_reason` **只来自精度那一条**：
+        # analysis_status 靠「上游已拦」隐式成立，而 `results_untrusted`
+        # （质量门把这份结果标了"不得作为可发布结果引用"）**根本不在合取里**。
+        # 今天它侥幸不出错，只因为单次 run 的 precision 恒 UNMEASURED ⟹ 恒 False；
+        # 一旦将来真有跨重复达标的 run，一份被质量门标黑的结果会直接判成可发布。
+        # 正式口径统一成：`analysis_complete and precision_meets and not results_untrusted`。
+        if _publishable_reason is None and bool(_untrusted_stages):
+            _publishable_reason = (
+                f"阶段 {_untrusted_stages} 被标记 `results_untrusted`（未标定的**临时**"
+                "发布阻断条件，见各 stage 的 `stage_quality_failures`）⟹ 不得作为"
+                "**已验收**结果发布。⚠️ 这些阈值都没有标定过，它是**临时**阻断、"
+                "不是科学验收标准；要解除必须先标定，不是把门删掉。"
+            )
 
         final = {
             "decoupling_scheme": decoupling_scheme,
@@ -7871,7 +7822,8 @@ class ABFEPipeline:
             # 能不能当**已验收**结果发布：必须同时满足
             #   各 stage analysis_status == ANALYSIS_COMPLETE（硬不变量，上游已拦）
             #   且 precision_status == MEETS_CROSS_REPEAT_TARGET
-            # 单次 run 恒不满足后者 ⟹ 恒为 False。
+            #   且 not results_untrusted（[2026-09-17] 以前**漏了这一条**，见上面）
+            # 单次 run 恒不满足第二条 ⟹ 恒为 False。
             "publishable_as_accepted_result": _publishable_reason is None,
             "publishable_rejection_reason": _publishable_reason,
             "stage_quality_failures": _quality_failures,
@@ -8230,21 +8182,12 @@ class ABFEPipeline:
 
         The lambda grid is immutable.  These are new sampling ensembles over
         existing states, kept in a separate rescue directory.
+
+        🔑 [REWIND-01] 实现搬到 `abfe_preoptimizer.vanishing_rescue_ranges`：
+        控制器要用同一份切法判可行性 / 算子窗数，而它 import 不动本模块
+        （循环依赖 + openmm）。这里只剩转发，别在这里再写一遍。
         """
-        rescue_ranges: List[Tuple[int, int]] = []
-        for window_idx in sorted(set(int(x) for x in failing_window_indices)):
-            start, end = (int(x) for x in base_ranges[window_idx])
-            n_states = end - start
-            if n_states <= 2:
-                rescue_ranges.append((start, end))
-                continue
-            midpoint = start + (n_states - 1) // 2
-            left = (start, midpoint + 1)
-            right = (midpoint, end)
-            for child in (left, right):
-                if child[1] - child[0] >= 2 and child not in rescue_ranges:
-                    rescue_ranges.append(child)
-        return rescue_ranges
+        return vanishing_rescue_ranges(failing_window_indices, base_ranges)
 
     @staticmethod
     def _stage_quality_failure_details(result: Dict) -> List[Dict]:
@@ -8704,7 +8647,13 @@ class ABFEPipeline:
             _qmsg = (
                 f"{stage_label} 阶段单参考重要性 ESS 比值 min_overlap={min_overlap:.4g} 低于阈值 "
                 f"{min_overlap_threshold:.4g}（此处 min_overlap 是 compute_effective_sample_number "
-                "重要性 ESS 比值，非 fixed-H adjacent overlap）。**仅诊断**，不拒绝、不触发补帧。"
+                "重要性 ESS 比值，非 fixed-H adjacent overlap）。不中止计算、不触发补帧，"
+                "但**会**设 `results_untrusted`。⚠️ 那是**未标定的临时发布阻断条件**，"
+                "不是科学验收标准 —— 阈值查不到出处，保留它只是因为「没有已知否决证据」"
+                "目前还没有更好的表达。要解除必须先**标定**（独立重复 + 高预算参考 + "
+                "降采样曲线看 ΔG 稳定性/覆盖率），不是把门删掉，也不是拿 n=6 与实验"
+                "偏差的相关性去判 —— 这些量衡量的是估计器条件化与样本充分性，"
+                "本来就不负责预测力场对实验的系统偏差。"
                 "Reweighting-quality gate failed. Preserve data and run rescue/coverage analysis; "
                 "do not mutate the sampling grid in place."
             )
@@ -8713,13 +8662,23 @@ class ABFEPipeline:
             self._log(f"  [报告] [质量诊断未达标] {_qmsg}")
             result["results_untrusted"] = True
             result.setdefault("stage_quality_failures", []).append(
-                {"gate": "stage_quality", "message": str(_qmsg)})
+                {"gate": "stage_quality", "message": str(_qmsg),
+                 # [2026-09-17] 与刚降级的 `max_endpoint_uncertainty_kJ_mol` 区分开：
+                 # 这三条**仍然**是发布拒绝门（用户本轮只降级了端点不确定度那一条）。
+                 "drives_action": False, "affects_trust": True})
 
         # 🔑 [P1 修复] 最终收敛门此前只检查 ESS ratio；样本总数很少时，即使绝对
         # 有效样本数只有个位数，只要比例超过阈值仍会被判定 completed。这里对
         # ibs_engine.py::GlobalMBARAnalyzer.solve_stage_integrated 新增的三项
         # 硬门槛做同样的镜像检查（同 min_overlap 的模式：只在结果带这些字段时
         # 才检查，兼容不提供这些诊断的旧/其它求解路径）。
+        # 🗄️ [2026-09-17，用户拍板 B] **LEGACY：这一条已在写侧退役，别再当第三道生产门。**
+        # `ibs_engine` 的新集成 Stage-2 显式输出 `min_absolute_ess_threshold=None`
+        # （它是 `min_overlap × n_decorrelated` 的重复证据；同一个量配两个阈值会让
+        # ratio 那个阈值失去意义 —— 见 ibs_engine.py 约 23421 的长注释，那里明写
+        # 「置 None 使 pipeline 侧两处镜像判据自动失活，无需改动 pipeline 逻辑」）。
+        # ⟹ 下面这段今天**只对旧缓存 / 人工构造的结果**还能触发。
+        # 别重新启用、也别把它算进"还有几道门"。以后连同分支一起删。
         min_absolute_ess = result.get("min_absolute_ess")
         min_absolute_ess_threshold = result.get("min_absolute_ess_threshold")
         if (
@@ -8729,15 +8688,19 @@ class ABFEPipeline:
         ):
             _qmsg = (
                 f"{stage_label} 阶段最小绝对有效样本数 min_absolute_ess="
-                f"{min_absolute_ess:.4g} 低于阈值 {min_absolute_ess_threshold:.4g}。**仅诊断**，"
-                "不拒绝、不触发补帧。ESS ratio 达标不代表绝对样本数足够。"
+                f"{min_absolute_ess:.4g} 低于阈值 {min_absolute_ess_threshold:.4g}。"
+                "不中止计算、不触发补帧，但**会**设 `results_untrusted`（LEGACY，见上）。"
+                "ESS ratio 达标不代表绝对样本数足够。"
             )
             # [2026-09-01] 质量门不再中止：标记不可信并继续（见 target_support_gate 处的说明）。
             # [2026-09-15] 拟合阈值 ⟹ 只报告，不 raise、不触发补帧。
             self._log(f"  [报告] [质量诊断未达标] {_qmsg}")
             result["results_untrusted"] = True
             result.setdefault("stage_quality_failures", []).append(
-                {"gate": "stage_quality", "message": str(_qmsg)})
+                {"gate": "stage_quality", "message": str(_qmsg),
+                 # [2026-09-17] 与刚降级的 `max_endpoint_uncertainty_kJ_mol` 区分开：
+                 # 这三条**仍然**是发布拒绝门（用户本轮只降级了端点不确定度那一条）。
+                 "drives_action": False, "affects_trust": True})
         min_decorrelated_samples = result.get("min_decorrelated_samples")
         min_decorrelated_samples_threshold = result.get("min_decorrelated_samples_threshold")
         if (
@@ -8748,14 +8711,18 @@ class ABFEPipeline:
             _qmsg = (
                 f"{stage_label} 阶段最少去相关样本数 min_decorrelated_samples="
                 f"{min_decorrelated_samples} 低于阈值 {min_decorrelated_samples_threshold}。"
-                "**仅诊断**，不拒绝、不触发补帧。"
+                "不中止计算、不触发补帧，但**会**设 `results_untrusted`。⚠️ 那是**未标定的**"
+                "**临时发布阻断条件**，不是科学验收标准（同 min_overlap 那条的说明）。"
             )
             # [2026-09-01] 质量门不再中止：标记不可信并继续（见 target_support_gate 处的说明）。
             # [2026-09-15] 拟合阈值 ⟹ 只报告，不 raise、不触发补帧。
             self._log(f"  [报告] [质量诊断未达标] {_qmsg}")
             result["results_untrusted"] = True
             result.setdefault("stage_quality_failures", []).append(
-                {"gate": "stage_quality", "message": str(_qmsg)})
+                {"gate": "stage_quality", "message": str(_qmsg),
+                 # [2026-09-17] 与刚降级的 `max_endpoint_uncertainty_kJ_mol` 区分开：
+                 # 这三条**仍然**是发布拒绝门（用户本轮只降级了端点不确定度那一条）。
+                 "drives_action": False, "affects_trust": True})
         max_endpoint_uncertainty_kJ_mol = result.get("max_endpoint_uncertainty_kJ_mol")
         max_endpoint_uncertainty_kJ_mol_threshold = result.get("max_endpoint_uncertainty_kJ_mol_threshold")
         if (
@@ -8773,12 +8740,42 @@ class ABFEPipeline:
                 "不拒绝、不触发补帧 —— 1.0 这个阈值抄自一个默认关闭的 early-stop 形参，"
                 "全仓无依据，且它是逐段量而科学目标是两腿合成的 σ_bind。"
             )
-            # [2026-09-01] 质量门不再中止：标记不可信并继续（见 target_support_gate 处的说明）。
-            # [2026-09-15] 拟合阈值 ⟹ 只报告，不 raise、不触发补帧。
+            # 🔑🔑 [2026-09-17，用户拍板：改门] **这一条不再设 `results_untrusted`。**
+            #
+            # 它原来的文本自己写着「**仅诊断**，不拒绝」，代码却设了 `results_untrusted`
+            # —— 而那个键会一路传到最终结合结果并打印「不得作为可发布结果引用」。
+            # 所以「仅诊断」当时是**假的**：它不拒绝计算流程，但它确实是**发布拒绝门**。
+            # 两种相反语义写在同一段里，删掉其中一个。删掉的是设标记那一半，理由：
+            #   · 阈值 1.0 抄自一个**默认关闭**的 early-stop 形参，全仓无标定依据
+            #     （这句话就写在它自己的报错文本里）；
+            #   · 它是**逐段最大值**，而科学目标是两腿合成的 σ_bind；
+            #   · 本仓已规定验收精度由**跨独立重复的样本标准差**判（`precision_status`）；
+            # ⚠️ [2026-09-17 补正] 原来这里还列了第四条「它与实验误差的 Spearman 方向
+            # 是反的（ρ=−0.600，n=6）」。**那条论证站不住，已删。** 审计自己就写明
+            # （`docs/archive/AUDIT_GATES_AND_CRITERIA_2026-09-17.md` §3.0/§3.2）：这些量衡量的是
+            # **估计器条件化与样本充分性**，本来就不负责预测**力场对实验的系统偏差**，
+            # 所以"与实验偏差不相关"不构成降级理由；而且 n=6 下双侧 0.05 需要 |ρ|>0.88，
+            # 实测最大只有 0.657，一条都不显著。上面三条（阈值无出处、逐段量 vs σ_bind、
+            # 验收已归 precision_status）才是这次降级的全部依据。
+            #
+            # 保留的：实测值、阈值、诊断消息照常落盘，并显式标注两维语义。
+            # ⚠️ **不碰 `analysis_status`**（它本来就不碰）—— 硬不变量仍是硬不变量。
+            # ⚠️ 发布验收仍由硬不变量 + `precision_status` 把关：去掉这条 untrusted
+            # **不等于**「已验收可发布」，单次 run 的跨重复精度仍是 UNMEASURED
+            # ⟹ `publishable_as_accepted_result` 照旧 false。
+            # ⚠️ **旧 JSON 里已经落盘的 `results_untrusted=True` 不会被本改动洗掉**，
+            # 也**不该**全局清除（那几份产物多半还有别的真实失败）。它在该 stage
+            # 结果被重新求解时自然重算。
             self._log(f"  [报告] [质量诊断未达标] {_qmsg}")
-            result["results_untrusted"] = True
-            result.setdefault("stage_quality_failures", []).append(
-                {"gate": "stage_quality", "message": str(_qmsg)})
+            result.setdefault("stage_quality_failures", []).append({
+                "gate": "max_endpoint_uncertainty_kJ_mol",
+                "message": str(_qmsg),
+                "value": max_endpoint_uncertainty_kJ_mol,
+                "threshold": max_endpoint_uncertainty_kJ_mol_threshold,
+                # 两维分开说，别让下一个人再从「有没有设 results_untrusted」倒推语义。
+                "drives_action": False,
+                "affects_trust": False,
+            })
 
     def _assert_reusable_stage_cache_sane(
         self,
@@ -10628,6 +10625,55 @@ class ABFEPipeline:
                 "total_error": 999.9,
             }
 
+        def _collect_indeterminate(call, first_error=None):
+            """跑 `call(pending)`，把"无结论"的窗口记下来并继续跑其余窗口。
+
+            `call(pending)` 里 `pending=None` 表示全部窗口，否则是窗口下标列表。
+            返回 `(result_or_None, indeterminate_list)`；调用方再过
+            `_finalize_with_indeterminate`。**只做路由与状态收集，不延长任何预算。**
+
+            🔑🔑 [2026-09-17 真机] **两条调用路径都要走这里。**
+            先前只在 `_guarded_once` 里做了，而那条早退的进入条件是
+            `not should_run_path_evolution(repair_policy)`。固定预算实验里
+            `stage2_autonomous_controller=false`，于是 14790 那个降级
+            （`path_evolution_v1` → `non_mutating_v1`）**不触发** —— 它只在控制器
+            **开启**时降级。策略仍是 `path_evolution_v1` ⟹ 早退不走 ⟹ 收集逻辑
+            整个够不着，异常照旧从下面的主循环炸穿（真机 sweep2 A_20260916 窗口 4）。
+            """
+            indeterminate: List[Dict[str, Any]] = []
+            pending = None
+            first = first_error            # 已经被外层 except 接住的那一个
+            while True:
+                try:
+                    if first is not None:
+                        _e, first = first, None
+                        raise _e
+                    return call(pending), indeterminate
+                except _ie.IBSValidationBudgetIndeterminateError as _ind_err:
+                    _widx = getattr(_ind_err, "window_idx", None)
+                    if _widx is None:
+                        raise                      # 定位不到就不猜，fail closed
+                    _widx = int(_widx)
+                    if any(int(x["window_idx"]) == _widx for x in indeterminate):
+                        raise                      # 子集机制没推动它，别转圈
+                    indeterminate.append({
+                        "window_idx": _widx,
+                        "reason": "frozen_validation_budget_indeterminate",
+                        "detail": str(_ind_err)[:800],
+                        "diagnostics": getattr(_ind_err, "diagnostics", None),
+                    })
+                    _rest = [i for i in range(len(current_r))
+                             if i > _widx and (pending is None or i in pending)]
+                    self._log(
+                        f"  [固定预算] 窗口 {_widx} 冻结验证**无结论**"
+                        "（Δf−ΔF 从未求出）⟹ 记为 indeterminate，诊断已落盘；"
+                        "**不延长预算、不改 f_k、不动布局**，继续跑其余窗口 "
+                        f"{_rest or '（无）'}。"
+                    )
+                    if not _rest:
+                        return None, indeterminate
+                    pending = _rest
+
         def _finalize_with_indeterminate(result, indeterminate):
             """把 indeterminate 窗口**显式**挂进结果；有它就不产出 ΔG。
 
@@ -10680,47 +10726,13 @@ class ABFEPipeline:
             #      由下游报告按 `indeterminate_windows` 判，不在这里硬算差值。
             # ⚠️ 这里**不延长任何预算、不改 f_k、不动布局** —— 那是"自适应"，正是
             # 固定预算设计要关掉的东西。只做路由与状态收集。
-            _indeterminate: List[Dict[str, Any]] = []
-            _pending = None                      # None = 全部窗口
-            while True:
-                try:
-                    return _finalize_with_indeterminate(
-                        run_once(len(current_l), current_l, current_r,
-                                 **({} if _pending is None
-                                    else {"_only_window_indices": list(_pending)})),
-                        _indeterminate)
-                except _ie.IBSValidationBudgetIndeterminateError as _ind_err:
-                    if route_to_controller:
-                        break                    # 交给下面原有的路由分支
-                    _widx = getattr(_ind_err, "window_idx", None)
-                    if _widx is None:
-                        # 定位不到是哪个窗口就不猜、不吞 —— fail closed。
-                        raise
-                    _widx = int(_widx)
-                    if any(int(x["window_idx"]) == _widx for x in _indeterminate):
-                        # 同一个窗口第二次报无结论 ⟹ 子集机制没推动它，别转圈。
-                        raise
-                    _indeterminate.append({
-                        "window_idx": _widx,
-                        "reason": "frozen_validation_budget_indeterminate",
-                        "detail": str(_ind_err)[:800],
-                        "diagnostics": getattr(_ind_err, "diagnostics", None),
-                    })
-                    _rest = [i for i in range(len(current_r))
-                             if i > _widx
-                             and (_pending is None or i in _pending)]
-                    self._log(
-                        f"  [固定预算] 窗口 {_widx} 冻结验证**无结论**"
-                        "（Δf−ΔF 从未求出）⟹ 记为 indeterminate，诊断已落盘；"
-                        "**不延长预算、不改 f_k、不动布局**，继续跑其余窗口 "
-                        f"{_rest or '（无）'}。"
-                    )
-                    if not _rest:
-                        return _finalize_with_indeterminate(None, _indeterminate)
-                    _pending = _rest
-                    continue
-                except _ie.IBSWarmupConvergenceError:
-                    break                        # 交给下面原有的路由分支
+            if not route_to_controller:
+                _res, _ind = _collect_indeterminate(
+                    lambda pending: run_once(
+                        len(current_l), current_l, current_r,
+                        **({} if pending is None
+                           else {"_only_window_indices": list(pending)})))
+                return _finalize_with_indeterminate(_res, _ind)
             try:
                 return run_once(len(current_l), current_l, current_r)
             except (_ie.IBSValidationBudgetIndeterminateError,
@@ -10823,7 +10835,21 @@ class ABFEPipeline:
                 # 没有控制器就没人去延长那个窗口的验证预算，静默返回等于把一个
                 # 「没结论」伪装成一次执行完毕 —— 那时照旧抛。
                 if not route_to_controller:
-                    raise
+                    # 🔑🔑 [2026-09-17] **固定预算模式走的是这条路，不是早退那条。**
+                    # 见 `_collect_indeterminate` 的长注释：控制器关闭时
+                    # `path_evolution_v1` 不会被降级，所以早退分支够不着。
+                    # 语义与那边逐字相同：记 indeterminate + 继续其余窗口 +
+                    # 不产出 ΔG + 不延长任何预算。
+                    _res, _ind = _collect_indeterminate(
+                        lambda pending: run_once(
+                            len(current_l), current_l, current_r,
+                            _authoritative_window_ranges=(
+                                True if int(record["version"]) > 1 else None),
+                            **({"_only_window_indices": list(pending)}
+                               if pending is not None else {})),
+                        first_error=_cap_err)
+                    return (_finalize_with_indeterminate(_res, _ind),
+                            current_l, current_r)
                 return _routing_marker(_cap_err), current_l, current_r
             except _ie.IBSWarmupConvergenceError as err:
                 # 🔑 [2026-09-11] 拆窗的依据只有一个：**f_k 压不平**（这个窗口一个
@@ -10966,7 +10992,8 @@ class ABFEPipeline:
                 # 实例：window 4 [15:21] 六态测不出来 → 插 1 个 λ → 7 态 → 4+4。
                 # （`split_window_from_ibs_lse_failure` 允许两态子窗，那是设计精修档
                 # 的下限，生产压不齐，别拿它当依据。）
-                if str(partition_criterion).lower() == "metric_integral" and not pilot[2]:
+                if (str(partition_criterion).lower()
+                        in ("metric_integral", "state_count") and not pilot[2]):
                     self._log(
                         f"  [路径演化] 分窗判据是 metric_integral，但 "
                         f"{os.path.basename(preopt_file)} 里没有 metric_g，"
@@ -11479,6 +11506,28 @@ class ABFEPipeline:
                         "warmup_steps_left": x.get("warmup_steps_left"),
                         "lambda_span": x.get("lambda_span"),
                         "derailment_status": x.get("derailment_status"),
+                        # 🔑🔑 [2026-09-17，用户拍板 #3] **瓶颈态的 g / η 观测。**
+                        # 射程判据 `R_now × H` 假定 η 与 g 恒定，两个假设实测都
+                        # 朝不利方向走（g 实测 12.25→17.63）。要把实测增长纳进来，
+                        # 前提是先逐块记下 g 与 η —— 而这份台账原来只有步数、
+                        # 去相关帧数、ratio，**连 g 都没有**。
+                        # ⚠️ **本轮只记录，不改任何门。**
+                        # ⚠️ 三个量同 `k*`、同 frame set（见 `_bottleneck_observation`）。
+                        # ⚠️ 老产物缺键 ⟹ None（= UNKNOWN），**不填 0**。
+                        "bottleneck_state": x.get("bottleneck_state"),
+                        "bottleneck_g": x.get("bottleneck_g"),
+                        "bottleneck_n_eff": x.get("bottleneck_n_eff"),
+                        "bottleneck_eta": x.get("bottleneck_eta"),
+                        "bottleneck_ratio": x.get("bottleneck_ratio"),
+                        "bottleneck_n_eff_input_n_frames":
+                            x.get("bottleneck_n_eff_input_n_frames"),
+                        "n_eff_frame_set": x.get("n_eff_frame_set"),
+                        "n_eff_frame_set_n_frames_raw":
+                            x.get("n_eff_frame_set_n_frames_raw"),
+                        # 两个**不是** η 分母的量，一并落盘让人一眼看出差几倍
+                        # （实测 2–8 倍）——省得下一个人拿它们当分母。
+                        "self_n_frames_decorrelated":
+                            x.get("self_n_frames_decorrelated"),
                     }
                     for x in (view.get("windows") or [])
                 ],
@@ -11590,7 +11639,71 @@ class ABFEPipeline:
                             f"{_stale_for_escalation} 的证据被布局变更作废 ⟹ "
                             "重解类降级动作在构造上不可能成功", it)
                     break
-                if act not in _NO_ESCALATION and wins:
+                # 🔑🔑 [2026-09-17] **带 `unit_id` 的动作不许降级。**
+                #
+                # 子窗动作报的 `windows` 是 `[父窗]`（分支 1c：
+                # `windows=[_pw], unit_id=_u["unit_id"]`），而降级**只改 `act`、
+                # 不改 `wins`、也不看 `unit_id`** ⟹ 一个卡住的**子窗补帧**会被
+                # 改写成对**父窗**的 `PROBE_REANCHOR_EPOCH`：
+                # `_recalibrate_f_k_and_resample_segment(only_windows=[父窗], …)`
+                # 新开一个采样段、给父窗一整块 +250k。
+                #
+                # 而父窗已经被子系综取代、**整个不在求解覆盖里**（分支 1c 原话：
+                # 「对父窗口本身做任何动作都推不动结果」；`_is_routable_candidate`
+                # 对 `idx in replaced` 直接返回 False）⟹ 那一块帧一帧都进不了 ΔG，
+                # 纯烧 GPU，而且还占掉父窗的块账。
+                #
+                # 子窗卡住本来就有自己的出口（分支 1c-2 的 `D3_REWINDOW_DEPTH_EXHAUSTED`
+                # ——「有界重窗这条路到此为止」），不需要也不允许这条旁路替它决定。
+                # 🔑🔑 [2026-09-17] **降级必须过 `plan()` 已有的两道预算闸。**
+                #
+                # 降级直接改写 `act` 然后执行，而 `PROBE_REANCHOR_EPOCH` 同时落在
+                # `plan()` 的 `_EPOCH_ACTIONS`（换 Epoch 的最低验证额度）和
+                # `_PRODUCTION_CHARGED`（按一块收生产预算）两张表里 —— 走正常路径时
+                # 两道闸都要过，走这条旁路一道都不过。
+                # 后果正是那两道闸各自存在的理由：
+                #   · 验证额度闸：「不能启动动作之后才发现新 f_k 没预算验」——
+                #     win2 **连续三次**死在这（账本 555000/555000、剩 0，循环一次都没
+                #     进就被标成 f_k 不收敛）；
+                #   · 生产预算闸：剩 100k 也照发一个 250k 块 = 允许超支一整块。
+                # 两条都是「开一个跑不完的 Epoch，把预算烧光再半路死掉」——
+                # **跑不完**，而不是跑出个坏答案。
+                #
+                # 判据不在这里重写：调**同一个** `_epoch_validation_unaffordable()`
+                # 和**同一份** `view["production_budget"]`，与 `plan()` 逐字同源。
+                # 付不起就不降级，如实 `NO_FEASIBLE_ACTION` —— 那正是事实：
+                # 唯一的降级动作付不起，确实没有可行动作了。
+                _esc_broke = None
+                if act not in _NO_ESCALATION and wins and not plan.get("unit_id"):
+                    _esc_broke = ctl._epoch_validation_unaffordable(
+                        view, [int(x) for x in wins], new_epoch=False)
+                    if _esc_broke is None:
+                        _pb_esc = view.get("production_budget") or {}
+                        _left_esc = _pb_esc.get("stage_remaining_steps")
+                        _cost_esc = int(_pb_esc.get("production_block_steps") or 0)
+                        if (_pb_esc.get("cap_known") and _left_esc is not None
+                                and int(_left_esc) < _cost_esc):
+                            _esc_broke = {
+                                "reason": "production_budget_insufficient_for_one_block",
+                                "stage_remaining_steps": int(_left_esc),
+                                "production_block_steps": _cost_esc,
+                            }
+                    if _esc_broke is not None:
+                        self._log(
+                            f"  [自治] 想降级到 PROBE_REANCHOR_EPOCH，但窗口 {wins} "
+                            f"**付不起**（{_esc_broke}）⟹ 不降级。"
+                            "启动之后才发现没预算验，正是这两道闸要防的形状。"
+                            "NO_FEASIBLE_ACTION，退出。"
+                        )
+                        history[-1]["exit"] = "NO_FEASIBLE_ACTION"
+                        history[-1]["escalation_blocked_by"] = "budget"
+                        history[-1]["escalation_budget_detail"] = _esc_broke
+                        _finish("TERMINAL", "NO_FEASIBLE_ACTION", "loop",
+                                f"动作 {act}{wins} 推不动，而唯一的降级动作 "
+                                f"PROBE_REANCHOR_EPOCH 付不起预算：{_esc_broke}", it)
+                        break
+                if (act not in _NO_ESCALATION and wins
+                        and not plan.get("unit_id") and _esc_broke is None):
                     # **有界探针**，不是全路径重来：只针对卡住的那个窗口、
                     # 只给一个 +250k 块。先前降级到 RECALIBRATE_FK ——
                     # 它无差别重标定全部窗口并整段重采，把已经
@@ -11987,6 +12100,10 @@ class ABFEPipeline:
                             min_states_per_window=int(min_states_per_window),
                             max_states_per_window=int(max_states_per_window),
                             first_untrusted=ctl.first_untrusted_window(view),
+                            # 🔑 [2026-09-17] 原来这一处**没传**，于是吃默认
+                            # `arclength`，而另一个调用点传的是 `ctl.partition_criterion`
+                            # ⟹ 同一个合法化在两条路径上按两套判据分窗。
+                            partition_criterion=ctl.partition_criterion,
                         )
                         # 🔑🔑 [2026-09-15 审计 #3] **这里原来直接 `run_once(...)`
                         # 全路径重采，而 `plan()` 刚刚把这个动作判为"零生产成本"。**
@@ -12712,10 +12829,40 @@ class ABFEPipeline:
         # 读不到就是账不完整，fail-closed：不猜一个目标出来。
         _u_done = unit.get("production_steps")
         if _u_done is None:
-            raise RuntimeError(
-                f"采样单元 {unit.get('unit_id')!r} 读不到已采生产步数 ⟹ "
-                "无法算出续跑目标（未知不是零，猜 0 会少跑一整块）。fail-closed。"
+            # 🔑🔑 [2026-09-17] **「还没有产物」和「有产物却读不到步数」不是一回事，
+            # 先前一律 fail-closed ⟹ 一个可恢复的中断被变成了不可恢复的死局。**
+            #
+            # 链条（全部有源码依据，不是推测）：
+            #   1. rewindow 采样中途被 kill ⟹ 台账留 `SAMPLING_INTENT`；
+            #   2. `_reconcile_rewindow_intents` 用 `"SAMPLED" if produced else ...`
+            #      核销 —— `produced` 是**任一**子窗有 convergence 就非空 ⟹
+            #      「2 个子窗只完成了 1 个」被整条判成 `SAMPLED`；
+            #   3. 于是父窗进 `parents_done` ⟹ `_replaced_parents` 把它移出 earliest
+            #      排序、`_is_routable_candidate` 对它返 False —— 父窗再也修不了；
+            #   4. 没完成的那个子窗 `has_convergence=False` ⟹
+            #      `needs_frames=True` ⟹ 分支 1c 路由 `RUN_PRODUCTION`，
+            #      它的理由文本第一条就是「**还没有生产产物**」—— 决策层明确
+            #      预期并处理这个状态；
+            #   5. 而这里对同一个状态 `raise`，被循环末尾的
+            #      `except Exception as exec_err: … raise` 原样抛出 ⟹ **炸穿流水线**。
+            #   6. 盘面是确定性的 ⟹ 重跑逐字复现，人工不介入就出不来。
+            #
+            # 「未知不是零」这条规矩在这里仍然成立，只是**未知有两种**：
+            #   · 有 convergence 产物、却读不到步数 ⟹ 账确实不完整，保持 fail-closed；
+            #   · **一个产物都没有** ⟹ 这不是"读不到"，这是"它一步都还没跑过"，
+            #     目标就是它的第一块。猜 0 在这里不是猜，是盘面的事实。
+            if unit.get("has_convergence"):
+                raise RuntimeError(
+                    f"采样单元 {unit.get('unit_id')!r} 有生产产物却读不到已采步数 ⟹ "
+                    "账不完整，无法算出续跑目标（未知不是零，猜 0 会少跑一整块）。"
+                    "fail-closed。"
+                )
+            self._log(
+                f"  [自治] 子窗 {unit.get('unit_id')!r} 还没有任何生产产物"
+                "（上一跑的 rewindow 采样中途被打断）⟹ 这是它的**第一块**，"
+                "目标 = 0 + 一个预算块。"
             )
+            _u_done = 0
         target = int(_u_done) + int(base_unit)
         self._log(
             f"  [自治] 续跑子窗 {unit['unit_id']}（局部下标 {li}，λ 区间 "
@@ -13257,21 +13404,53 @@ class ABFEPipeline:
         # re-raise、整跑炸穿。默认 4/5 配置 + `K_tail == 6`（死区循环自己先插了一个）
         # 时可达；`first_untrusted > 失败窗口` 时必炸。
         # 窗口**下标**在 model B 下不变（非末窗 ranges 逐字冻结，有后置断言），
-        # 所以这里按 `first_untrusted` 的**下标**、用**当前** lam/ranges 现解数值。
-        # 语义与 `Stage2RepairController.tail_repartition_anchor` 逐字相同
-        # （含 `idx <= 0` 时没有共享态可用 ⟹ None）。
+        # 所以这里用**当前** lam/ranges 现解数值。
         # ⚠️ 原来的 `anchor_getter` 参数已于 2026-09-14 连同两个调用点一起摘除：
         # 留一个「还在签名里但永远不被调用」的钩子，正是审计 #29 那条死参数的形状。
-        anchor = None
-        if first_untrusted is not None and 0 < int(first_untrusted) < len(ranges):
-            _a_idx = int(ranges[int(first_untrusted)][0])
-            if _a_idx < len(lam):
-                anchor = float(lam[_a_idx])
-        if anchor is None:
+        #
+        # 🔑🔑 [2026-09-17，用户拍板] **合法化不再借用 `first_untrusted`。**
+        #
+        # 先前这里按 `first_untrusted` 的下标取 anchor，语义抄自
+        # `Stage2RepairController.tail_repartition_anchor`（含 `idx <= 0 ⟹ None`）。
+        # 那是**概念串线**：
+        #   · 「**修复**」要知道哪个窗口不可信 —— 从它起重分尾段，作用范围是诊断给的；
+        #   · 「**合法化**」只要把超出执行上限的末窗重新切合法 —— 与谁不可信**无关**，
+        #     只要末窗超了 hi 就**必须**做。
+        # 后果：`first_untrusted == 0`（本方法的必然坏窗口是解耦端点）或根本没有不可信
+        # 窗口时 anchor 恒为 None ⟹ 抛 RuntimeError，而那个**非法布局已经落盘**。
+        # 真机 cyclod_ligand3/rep1、rep3 就死在这里：lo=4/hi=8、末窗 K=9 ——
+        # 注意 K=9 **不在死区**（死区 `hi < K < 2lo−1` 即 `8 < K < 7` 是空集），
+        # 它落在可拆区间 `[2lo−1, 2hi−1] = [7, 15]` 里，**数学上完全拆得开**
+        # （9 → 5+5，两个都在 [4,8]），卡的只有"没人告诉它从哪下刀"。
+        #
+        # 正解：合法化用**自己的**切点 —— 末窗首态。它天然是前一窗末态与末窗首态的
+        # **共享节点**（相邻窗口共享边界态是布局的构造不变量），于是：
+        #   · 重分范围 = 恰好末窗那一段 ⟹ **前缀逐字不变**（下面有断言）；
+        #   · 不需要任何诊断输入 ⟹ 对 window 0、对"没有不可信窗口"一样成立。
+        # ⚠️ **不**去放宽 `tail_repartition_anchor()` 让 window 0 可用 —— 那会扩大
+        # `SPLIT_TAIL_WINDOW` 这个**修复**动作的语义，可能重分整条路径。两件事分开。
+        # `first_untrusted` 只作为事件元数据留给审计（`record_tail_repartition_version`）。
+        if len(ranges) < 2:
             raise RuntimeError(
-                f"末窗 K={tail_k} 超执行层上限 {hi} 但取不到 tail anchor ⟹ "
-                "无法拆。fail-closed：不带着非法布局继续。"
+                f"末窗 K={tail_k} 超执行层上限 {hi}，而整条路径只有 {len(ranges)} 个窗口 ⟹ "
+                "没有「末窗首态」这个共享节点可用（重分它等于重分整条路径，那是布点的事"
+                "不是合法化的事）。fail-closed：不带着非法布局继续。"
             )
+        _a_idx = int(ranges[-1][0])
+        if not (0 < _a_idx < len(lam)):
+            raise RuntimeError(
+                f"末窗首态下标 {_a_idx} 不在 λ 表范围（len={len(lam)}）⟹ 布局与 λ 表"
+                "对不上，合法化无从下刀。fail-closed。"
+            )
+        # 共享节点自检：末窗首态必须同时是前一窗的末态。布局构造上如此，
+        # 但它是这条修法的**前提**，所以显式验一次而不是假定。
+        if int(ranges[-2][1]) - 1 != _a_idx:
+            raise RuntimeError(
+                f"末窗首态 {_a_idx} 不是前一窗 {tuple(ranges[-2])} 的末态 ⟹ "
+                "相邻系综没有共享 λ 节点，自由能链在接缝上断开。fail-closed。"
+            )
+        anchor = float(lam[_a_idx])
+        _prefix_before = [tuple(int(i) for i in r) for r in ranges[:-1]]
         # 🔑 [2026-09-15] 分窗判据必须与生产一致（D）。这里**不传 `n_windows`**：
         # 合法化的目标是「每个窗口回到 [lo,hi]」，不是「更细」—— 传了就会把
         # `repartition_tail_from_anchor` 里那两条"必须更细"的硬断言也套上来，
@@ -13283,8 +13462,22 @@ class ABFEPipeline:
             metric_g=(pilot[2] if pilot else None),
             partition_criterion=str(partition_criterion).lower(),
         )
+        # 前缀逐字不变：anchor 就是末窗首态 ⟹ 重分范围恰好是末窗那一段。
+        # 这条断言是上面那句「合法化不动前缀」的执行侧对账，别删。
+        _prefix_after = [tuple(int(i) for i in r) for r in new_ranges[:len(_prefix_before)]]
+        if _prefix_after != _prefix_before:
+            raise RuntimeError(
+                f"合法化动了前缀：{_prefix_before} → {_prefix_after}。"
+                "anchor 是末窗首态时重分范围只该是末窗那一段。fail-closed。"
+            )
+        _illegal = [tuple(r) for r in new_ranges if not (lo <= r[1] - r[0] <= hi)]
+        if _illegal:
+            raise RuntimeError(
+                f"合法化之后仍有窗口不在 [{lo}, {hi}]：{_illegal}。fail-closed。"
+            )
         record_tail_repartition_version(
             checkpoint_dir, lam, new_ranges, tdiag,
+            # `first_untrusted` 不再参与合法化（见上面那段），只作为审计元数据。
             first_untrusted_window=first_untrusted,
         )
         self._log(
@@ -13319,7 +13512,7 @@ class ABFEPipeline:
         criterion = str(
             kwargs.get("stage2_window_partition", "arclength")
         ).lower()
-        if criterion == "metric_integral":
+        if criterion in ("metric_integral", "state_count"):
             diag = path_diagnostics or {}
             if not diag.get("pilot_lambdas") or not diag.get("metric_g"):
                 raise RuntimeError(
@@ -13341,6 +13534,7 @@ class ABFEPipeline:
                 max_states_per_window=int(
                     vanishing_range_kwargs.get("max_states_per_window", 8)
                 ),
+                objective=criterion,
                 n_windows=kwargs.get("stage2_n_windows"),
                 first_window_max_states=kwargs.get(
                     "stage2_first_window_max_states"
@@ -14786,11 +14980,47 @@ class ABFEPipeline:
         # `_NON_MUTATING_POLICY_CLASS`（`repair_policy_cache_class` 判的就是它），
         # 所以既有窗口缓存不失配。行为上 `_run_stage2_with_path_evolution` 退化成
         # 一次普通的 `run_once`，布局动作全部交给 `decide()` 的 9b / INSERT_LAMBDA。
+        #
+        # 🔑🔑 [2026-09-17] **那个 `and` 条件是有意的，别删。** 有人提过
+        # 「控制器关着时更该降级，所以条件多余」—— 论证看着成立，但前提是假的：
+        # **确实存在**「显式关控制器 + 显式用 path_evolution」的调用方，就在本文件
+        # `_finalize_with_indeterminate` 上面那段 [2026-09-17 真机] 注释里写着
+        # （固定预算实验，`stage2_autonomous_controller=false`，真机 sweep2
+        # A_20260916）。去掉条件会**静默改掉正在跑的实验**，而且会让
+        # `sampling_repair_policy="path_evolution_v1"` 变成一个**永远无法生效**的配置值。
+        #
+        # 真正的问题不是语义，是**不响**。而它值得响，是因为一个核实过的事实：
+        # **`abfe-benchmark/openmm_IBS/configs/*.json` 14/14 全都显式写着
+        # `"sampling_repair_policy": "path_evolution_v1"`**（2026-09-17 逐个核过）。
+        # ⟹ 「默认是 non_mutating_v1，普通用户碰不到」只对**主线默认**成立，
+        # 对**整个 benchmark 不成立**：任何人在 benchmark 上做 A/B 时想「关掉控制器
+        # 求稳」，就正好落进这个组合，而没有任何东西告诉他布局仍然会变。
+        # ⟹ 不改行为，改成**大声说出来**。
+        # ⚠️ 这里原本还引了一组「三条臂 λ 表漂成 21→24/21→23」的实测数字，
+        # **已删**：报数者事后核实那几次跑的控制器是**开着**的（⟹ 降级正常触发、
+        # 插 λ 的是控制器本身），那批数字不是这条耦合的证据。宁可只留核得住的事实。
         _path_evolution_silenced_for_autonomous = False
-        if (bool(kwargs.get("stage2_autonomous_controller", True))
+        _autonomous_for_policy = bool(kwargs.get("stage2_autonomous_controller", True))
+        if (_autonomous_for_policy
                 and _sampling_repair_policy == "path_evolution_v1"):
             _sampling_repair_policy = "non_mutating_v1"
             _path_evolution_silenced_for_autonomous = True
+        elif (not _autonomous_for_policy
+                and _sampling_repair_policy == "path_evolution_v1"):
+            self._log(
+                "  [WARN] ⚠️ `stage2_autonomous_controller=False` **且** "
+                "`sampling_repair_policy='path_evolution_v1'` —— 这**不是**"
+                "「冻结 λ 表」。自治控制器关掉只关掉了它自己；path_evolution "
+                "仍然会在跑中插 λ、改 window_ranges。"
+                "\n         关掉控制器**不会**连带关掉它（那个降级只在控制器**开着**"
+                "时发生，是为了「一个 stage 只许有一个控制器」，不是为了冻结布局）。"
+                "\n         要真正冻结布局：显式传 "
+                "`sampling_repair_policy='non_mutating_v1'`。"
+                "\n         ⚠️ 做 A/B 对照时尤其要注意：benchmark 的 configs "
+                "**全部**预置了 `path_evolution_v1`，所以「关掉控制器求稳」在那里"
+                "一定落进这个组合，各臂 λ 表会各自演化 ⟹ ΔG 的差分不出来自处理"
+                "还是来自布局。"
+            )
 
         _vanishing_range_kwargs = {}
         if kwargs.get("stage2_window_min_states") is not None:
@@ -16296,7 +16526,7 @@ class ABFEPipeline:
                     f"个窗口，尺寸={[b - a for a, b in expected_vanishing_ranges]}；"
                     "不使用等弧长自动分窗。"
                 )
-            elif _partition_criterion == "metric_integral":
+            elif _partition_criterion in ("metric_integral", "state_count"):
                 # 🔑 [2026-09-11] 按 ∫g dλ 均衡分窗（默认仍是等弧长）。
                 #
                 # 等**弧长**均衡的是相邻态之间的重叠；而 IBS 是一条轨迹重加权到
@@ -16347,6 +16577,7 @@ class ABFEPipeline:
                         pilot_mean_dU_dlambda=_pilot_mean_gradients_or_none(
                             _pd.get("pilot_points") or []
                         ),
+                        objective=_partition_criterion,
                     )
                 )
                 self._log(

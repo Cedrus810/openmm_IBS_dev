@@ -22,6 +22,8 @@ import abfe_preoptimizer as pre
 import ibs_engine as ie
 from abfe_pipeline import ABFEPipeline
 
+pytestmark = pytest.mark.cpu_only
+
 
 # ---------------------------------------------------------------- pilot 夹具
 def _pilot(n=201):

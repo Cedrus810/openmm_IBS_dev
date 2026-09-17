@@ -14,6 +14,9 @@ import ast
 import builtins
 import pathlib
 import symtable
+import pytest
+
+pytestmark = pytest.mark.cpu_only
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BUILTINS = set(dir(builtins)) | {"__file__", "__name__", "__doc__", "__package__"}

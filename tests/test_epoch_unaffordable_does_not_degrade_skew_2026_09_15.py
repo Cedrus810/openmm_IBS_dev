@@ -63,5 +63,15 @@ def test_the_attribution_reuses_the_shared_implementation():
     src = (inspect.getsource(Stage2RepairController.decide)
            + inspect.getsource(Stage2RepairController._decide_once))
     blk = src.split("_EPOCH_ACTIONS = (")[1].split("if action == \"RUN_PRODUCTION\":")[0]
-    assert "support_failure_is_skew(" in blk
+    # 🔑 [2026-09-17] 字面量从 `support_failure_is_skew(` 改成
+    # `support_failure_attribution(`：O1 改成了**三态**归因（用户拍板 A）——
+    # `is_skew` 只区分两态，于是 `UNKNOWN`（射程只说明「还没被证伪」）被算进了
+    # "样本量类"，一个乐观上界就足以把「f_k 不对，换 Epoch」静默改写成「补帧」。
+    # `support_failure_is_skew()` 现在就是 `attribution(...) == STRUCTURAL` 的薄包装，
+    # 所以**本条的意图一字未变**：O1 用的仍是那份共享实现，没有在这里另写一套。
+    assert "support_failure_attribution(" in blk
     assert "n_decorrelated=" in blk
+    # 反过来钉住：别在这块里出现自造的归因判据（那才是本条要防的）
+    for forbidden in ("top1pct", "HARD_INSUFFICIENT", "_SAMPLE_SIZE_VERDICT_SOURCES"):
+        assert forbidden not in blk, (
+            f"O1 里出现了自造的归因判据 `{forbidden}` —— 归因只许走共享实现")
