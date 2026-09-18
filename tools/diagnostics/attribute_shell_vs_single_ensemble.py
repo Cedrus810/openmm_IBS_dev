@@ -272,7 +272,7 @@ def main():
     #     python tools/diagnostics/probe_reference_box_density.py --lambda-subset 12
     #     ... --root /home/ruigengji/ABFE_IBS/4W53/reference_at_npt_box
     # 生产实际用的 V 可从产物反解：energies.npy - sampling_states.npy.T 是逐 λ 态常数
-    # = lrc_coeff[k]/V。详见 docs/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md。
+    # = lrc_coeff[k]/V。详见 docs/archive/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md。
     ligand_indices = json.load(open(ligf))["ligand_indices"]
 
     print(f"体系原子数 = {system.getNumParticles()}, 约束 = {system.getNumConstraints()}")

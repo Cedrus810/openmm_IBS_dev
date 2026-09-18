@@ -1593,6 +1593,7 @@ def partition_windows_by_metric_integral(
     # （split-tail 够得着）。代价是 +1 个系综；峰值 ∫g 三档都是 134.6，
     # 即"封 win0 在 ∫g 账本上一分钱不赚"——它买的是 K，不是 ∫g。
     first_window_max_states: Optional[int] = None,
+    last_window_max_states: Optional[int] = None,
     # 🔑 [2026-09-15] **仅报告，不是判据。** 给了 pilot 的 <dU/dλ> 就顺手算出
     # 每个窗口的预测 |ΔF| 跨度（总变差口径，与 `edge_free_energy_kJ_mol` 同一条
     # 积分）落进诊断。它是 f_k 跨度的保守代理，而 f_k 跨度正是 IBS 单系综重加权
@@ -1643,9 +1644,46 @@ def partition_windows_by_metric_integral(
             f"first_window_max_states={first_hi} 小于 min_states_per_window={lo}"
         )
     first_hi = min(first_hi, hi)
+    # 末窗上界：不给就等于 `hi`（逐位保持旧行为）。给了就必须能被拆回 [lo, hi]
+    # —— 见 `_cap` 上面那段推导：`last_hi ≤ 2*hi − 2`。超了 fail-closed，
+    # 因为那种布局一旦落盘就**永远合法化不了**（拆出来必有子窗 > hi）。
+    last_hi = hi if last_window_max_states is None else int(last_window_max_states)
+    if last_hi < lo:
+        raise ValueError(
+            f"last_window_max_states={last_hi} 小于 min_states_per_window={lo}")
+    if last_hi > 2 * hi - 2:
+        raise ValueError(
+            f"last_window_max_states={last_hi} 超过 2*max_states_per_window−2="
+            f"{2 * hi - 2}：末窗长到 {last_hi + 1} 时要拆成两个共享一个边界态的子窗"
+            f"（p+q−1={last_hi + 1}），而那样至少有一个子窗 > {hi} ⟹ 这个布局"
+            "在构造上合法化不了。")
     # 约束**进 DP 的候选枚举**，不是解完再过滤。两者不等价：先解再滤只会把
     # 整条布局丢掉（然后回退到窗口数更多的那条），拿不到"在该约束下的最优"。
-    _cap = lambda a: first_hi if a == 0 else hi
+    # 🔑🔑🔑 [2026-09-18] **三个上界，不是一个。**
+    #
+    #   · 首窗   `first_hi`   —— 解耦端点，本方法的必然坏窗口，单独收紧；
+    #   · 非末窗 `hi`         —— 真正要跑的窗口的上界；
+    #   · 末窗   `last_hi`    —— **溢出槽**。model B 插 λ 时非末窗 ranges 逐字冻结、
+    #     多出来的态一律落到末窗（`insert_lambda_in_failed_ibs_window` 的后置断言），
+    #     所以末窗天然会比别的窗口大。
+    #
+    # 先前这三件事**共用一个 `hi`**，后果是要给末窗留溢出空间就必须把 `hi` 抬高，
+    # 而那会把**每一个非末窗**一起抬上去。真机实测（45 个 run 的全部布局）里
+    # `[4,6,5,4,6]`、`[4,7,5,4,5]`、`[4,8,4,4,5]`、`[4,6,6,4,5]` 的第二/三窗
+    # 就是这么被抬到 6/7/8 的 —— 那些窗口并不需要溢出空间。
+    #
+    # `last_hi` 的上界是**算出来的，不是拍的**：末窗要拆成两个共享一个边界态的
+    # 子窗时 `p + q − 1 = K`，两个都 ≤ `hi` ⟹ 可拆的最大 K 是 `2*hi − 1`。
+    # 所以「长到 `last_hi`、超了就拆」要求 `last_hi + 1 ≤ 2*hi − 1`，即
+    # **`last_hi ≤ 2*hi − 2`**。lo=4/hi=5 ⟹ `last_hi ≤ 8`，而 9 正好拆成 5+5。
+    # 顺带消掉死区：死区是 `(hi, 2lo−1)`，而拆窗只在 K = last_hi+1 ≥ 2lo−1 时发生
+    # ⟹ 永远落在可拆区间里，不再需要"先补一个 λ 把末窗喂到可拆"。
+    # ⚠️ 末窗同时是首窗（单窗布局）时按**首窗**算：那是更紧的那个，保守优先。
+    # ⚠️ `w_target` 是 `_solve()` 的形参（每个候选窗口数各解一次），所以这里
+    # 必须把它当**入参**收进来，不能靠闭包 —— 闭包在定义点还没绑定，延迟求值
+    # 会在第一次调用时 NameError。
+    _cap = lambda a, w, w_target: (
+        first_hi if a == 0 else (last_hi if w == w_target - 1 else hi))
     if n < lo:
         raise ValueError(f"λ 表只有 {n} 个态，不足 min_states_per_window={lo}")
     gcum = metric_integral_cumulative(lam, pilot_lambdas, metric_g)
@@ -1694,7 +1732,7 @@ def partition_windows_by_metric_integral(
             for w in range(w_target):
                 if best[i][w] == INF:
                     continue
-                for size in range(lo, _cap(i) + 1):
+                for size in range(lo, _cap(i, w, w_target) + 1):
                     j = i + size - 1
                     if j > n - 1:
                         break
@@ -1715,7 +1753,7 @@ def partition_windows_by_metric_integral(
             for w in range(w_target):
                 if kbest[i][w] == INF:
                     continue
-                for size in range(lo, _cap(i) + 1):
+                for size in range(lo, _cap(i, w, w_target) + 1):
                     j = i + size - 1
                     if j > n - 1:
                         break
@@ -1737,7 +1775,7 @@ def partition_windows_by_metric_integral(
             for w in range(w_target):
                 if ss[i][w] == INF:
                     continue
-                for size in range(lo, _cap(i) + 1):
+                for size in range(lo, _cap(i, w, w_target) + 1):
                     j = i + size - 1
                     if j > n - 1:
                         break
@@ -2217,9 +2255,57 @@ def n_eff_over_g_reachable_by_frames(ratio, target, headroom):
     return bool(r * h >= t)
 
 
+def eta_lever_can_reach(n_eff_input_n_frames, g, target):
+    """**只改权重剖面**的动作（η 杠杆）有没有可能把 `N_eff/g` 推过门。
+
+    🔑🔑🔑 [2026-09-18] **这是一个上界，不是阈值；它由定义推出来，不需要标定。**
+
+    验收量（`ibs_engine.window_self_support_check`）::
+
+        R = N_eff/g,   N_eff = (Σw)² / Σw²   （Kish ESS，算在**未抽稀**帧上）
+
+    记 N = 真正进 N_eff 的帧数（`n_eff_input_n_frames_per_state`），
+    η = N_eff/N。则 ``R = η · N / g``，而 Cauchy–Schwarz 给
+
+        (Σw)² ≤ N · Σw²   ⟹   N_eff ≤ N   ⟹   **η ≤ 1**
+
+    （等号仅当所有权重相等，即"完美偏置"。）于是
+
+        **R ≤ N / g**
+
+    ⟹ `N/g < target` 时，**任何只改 η 的动作都不可能过门**：插 λ（缩跨度改重叠）、
+    重标定 / 重学 f_k（改采样混合）、有界重窗 —— 它们全部只动 η，而 η 已经被 1 封顶。
+    此时唯一还能动的是分母那一侧：把 **N** 加上去（同分布补帧），或者把 **g** 降下来
+    （换独立初态 / 处理慢模态）。
+
+    ⚠️ 与 `n_eff_over_g_reachable_by_frames()` 是**两个不同的问题**，别混：
+      · 那个问的是「**加帧**够不够得着」，判据 `R_now × headroom`（R_now 已含 η）；
+      · 这个问的是「**改 η** 够不够得着」，判据 `N/g`（把 η 拿掉、取它的上界 1）。
+    两个都可能为假 —— 那才是真的没路走，而不是"再试一个动作"。
+
+    ⚠️ **只在明确算出来时给答案。** `None` = 判不了（缺 N 或 g、非有限、g ≤ 0），
+    调用方按"未知不授权"处理 —— 与本模块别处的三态口径一致。
+
+    返回 `True`（η 杠杆**有可能**够到，不保证一定够到）/ `False`（**证明**够不到）
+    / `None`（判不了）。
+    """
+    if n_eff_input_n_frames is None or g is None or target is None:
+        return None
+    try:
+        n, gg, t = float(n_eff_input_n_frames), float(g), float(target)
+    except (TypeError, ValueError):
+        return None
+    if not (np.isfinite(n) and np.isfinite(gg) and np.isfinite(t)):
+        return None
+    if gg <= 0.0 or t <= 0.0 or n <= 0.0:
+        return None
+    return bool(n / gg >= t)
+
+
 def support_failure_is_skew(
     verdict, verdict_source, *, n_decorrelated=None, min_frames=None,
-    min_n_eff_over_g=None, n_eff_over_g_target=None, frames_headroom=None
+    min_n_eff_over_g=None, n_eff_over_g_target=None, frames_headroom=None,
+    n_eff_input_n_frames=None, bottleneck_g=None
 ) -> bool:
     """这次自检失败是**支撑/偏斜类**（加帧治不了）还是**样本量类**（加帧对症）。
 
@@ -2245,20 +2331,29 @@ def support_failure_is_skew(
         verdict, verdict_source, n_decorrelated=n_decorrelated,
         min_frames=min_frames, min_n_eff_over_g=min_n_eff_over_g,
         n_eff_over_g_target=n_eff_over_g_target,
-        frames_headroom=frames_headroom) == SUPPORT_FAILURE_STRUCTURAL
+        frames_headroom=frames_headroom,
+        n_eff_input_n_frames=n_eff_input_n_frames,
+        bottleneck_g=bottleneck_g) == SUPPORT_FAILURE_STRUCTURAL
 
 
-# 归因三态。⚠️ 第三态**不是**"两者之间"，它是「**还没判出来**」。
+# 归因四态。⚠️ `UNKNOWN` **不是**"两者之间"，它是「**还没判出来**」。
 SUPPORT_FAILURE_SAMPLE_SIZE = "SAMPLE_SIZE"   # 帧确实少 ⟹ 加帧对症
 SUPPORT_FAILURE_STRUCTURAL = "STRUCTURAL"     # 权重塌缩/跨度过大 ⟹ 加帧治不了
 SUPPORT_FAILURE_UNKNOWN = "UNKNOWN"           # 判不出来 ⟹ **不得**授权任何覆盖
+# 🔑🔑🔑 [2026-09-18] **第四态：瓶颈在 `N/g` 这个分母上，不在权重剖面上。**
+# 由 `eta_lever_can_reach()` 的 `R ≤ N/g`（η ≤ 1，Cauchy–Schwarz）判出来：
+# `N/g < 门` 时**任何只改 η 的动作都被证明够不到门** —— 插 λ、重标定/重学 f_k、
+# 有界重窗全在此列。它**不是** `STRUCTURAL`：那一档授权的正是缩跨度，而缩跨度
+# 在这里是被证伪的。剩下能动的只有 N（同分布补帧）与 g（换独立初态 / 治慢模态）。
+SUPPORT_FAILURE_N_OVER_G_BOUND = "N_OVER_G_BOUND"
 
 
 def support_failure_attribution(
     verdict, verdict_source, *, n_decorrelated=None, min_frames=None,
-    min_n_eff_over_g=None, n_eff_over_g_target=None, frames_headroom=None
+    min_n_eff_over_g=None, n_eff_over_g_target=None, frames_headroom=None,
+    n_eff_input_n_frames=None, bottleneck_g=None
 ) -> Optional[str]:
-    """支撑失败的归因，**三态**。非失败返回 `None`。
+    """支撑失败的归因，**四态**。非失败返回 `None`。
 
     🔑🔑 [2026-09-17，用户拍板 A] **「乐观上界说也许够得着」曾被升级成「这是样本量
     问题」，那是本条链的真错误。**
@@ -2295,6 +2390,20 @@ def support_failure_attribution(
         return None           # 通过的窗口同样带 verdict_source，不能只看来源
     if src in _SAMPLE_SIZE_VERDICT_SOURCES:
         return SUPPORT_FAILURE_SAMPLE_SIZE    # 样本量不够 ⟹ 加帧就是对症动作
+    # 🔑🔑🔑 [2026-09-18] **先判「改 η 到底够不够得着」，再谈是哪一类 η 失败。**
+    #
+    # `R = η·N/g` 且 `η ≤ 1`（Kish ESS 的 Cauchy–Schwarz，见
+    # `eta_lever_can_reach` 的推导）⟹ `R ≤ N/g`。所以 `N/g < 门` 时，**插 λ /
+    # 重标定 / 重学 f_k / 有界重窗这一整族（它们全都只动 η）被证明够不到门**。
+    # 把这种窗口判成 `STRUCTURAL` 是错的 —— 那一档授权的恰好是缩跨度。
+    #
+    # ⚠️ 排在 `top1pct_veto` **之前**：权重塌缩确实是 η 的直接证据，但"η 坏"
+    # 与"改 η 能不能救回来"是两个问题，后者由这个上界回答，与 verdict_source 无关。
+    # ⚠️ 只在**明确算出 False** 时才用（`None` = 缺 N 或 g ⟹ 照旧往下走），
+    # 与本函数别处"未知不授权"的口径一致。
+    if eta_lever_can_reach(
+            n_eff_input_n_frames, bottleneck_g, n_eff_over_g_target) is False:
+        return SUPPORT_FAILURE_N_OVER_G_BOUND
     if src == "min_n_eff_over_g":
         # 帧数本身就没到地板 ⟹ **硬证据**的样本量问题（先补帧，比值以后再说）。
         # 写侧的覆盖顺序保证这种情形会写成 `solver_eligibility`，这里只是不依赖它。
@@ -2911,7 +3020,7 @@ def classify_layout_evidence(segments, path) -> Dict[str, Any]:
 class Stage2RepairController:
     """Stage-2 的统一控制器：**看状态 → 选一个动作 → 交执行器 → 回来重新判断。**
 
-    设计依据：``docs/PLAN_PATH_REPAIR_2026-09-11.md``（定位、三类修补、判别、可行性、
+    设计依据：``docs/archive/PLAN_PATH_REPAIR_2026-09-11.md``（定位、三类修补、判别、可行性、
     停止标准）。放在 `abfe_preoptimizer` 里、而且是**一个类**，是刻意的：
 
       · **决策不许散开。** 现状是三层各用一种机制 —— `ibs_engine.run_all_windows`
@@ -3528,6 +3637,19 @@ class Stage2RepairController:
         "PROVISIONAL_PRODUCTION",
     )
 
+    # 🔑🔑 [2026-09-18] **记账面 ⊋ 准入面。** 两张表刻意不同，别合并：
+    #   · `_BLOCK_CHARGING_ACTIONS` 是**准入**用的（`plan()` 里问"这个动作批不批"）；
+    #   · 下面这张是**记账**用的（扫历史，数"这个窗口烧过几块"）。
+    # `IMMUTABLE_REWINDOW` 只进记账那张：它确实烧生产块（执行器给每个子窗采一个
+    # `base_unit`，`plan()` 的 `_PRODUCTION_CHARGED` 也按 `n_children ×
+    # new_ensemble_reserve_steps` 预留预算），所以资源账必须看得见它。
+    # 但**不进准入**：换不起 Epoch 时有界重窗正是唯一对症的那条路（见 `plan()` 里
+    # O1 那段），拿父窗已经吃满的块配额去否决它，等于掐掉唯一的出路 —— 与
+    # `_frames_admission` 的 `hard_cap_only` 是同一条理由，方向别搞反。
+    # ⚠️ 记进父窗名下不会误伤父窗自己的补帧：父窗一旦被子系综接管就进
+    # `parents_done`，`_is_routable_candidate` 对它直接返回 False，不会再收到补帧。
+    _BLOCK_LEDGER_ACTIONS = _BLOCK_CHARGING_ACTIONS + ("IMMUTABLE_REWINDOW",)
+
     def _production_blocks_scan(self, windows, path_version, *,
                                 same_segment_only, units=None):
         out: Dict[int, List[Any]] = {}
@@ -3546,7 +3668,20 @@ class Stage2RepairController:
             for it in (hist.get("iterations") or []):
                 if path_version is not None and it.get("path_version") != path_version:
                     continue
-                if it.get("action") not in self._BLOCK_CHARGING_ACTIONS:
+                # 🔑🔑🔑 [2026-09-18] **账要跟着「实际跑了什么」，不是「控制器发了什么」。**
+                #
+                # 主循环的停滞降级会把动作改写成 `PROBE_REANCHOR_EPOCH`（真开新段、
+                # 真烧一个 +250k 块），但**刻意保留** `action` 为控制器发的那个，
+                # 把实际动作另记成 `action_executed`。而 `action_executed` 在本仓
+                # **零个读者** —— 于是凡是降级前的动作不在这张表里的
+                # （`CONTINUE_WARMUP` / `INSERT_LAMBDA` / `SPLIT_TAIL_WINDOW` /
+                # `RELEARN_FK_EPOCH` / `IMMUTABLE_REWINDOW`），那一块帧**一格都不扣**，
+                # 块数硬上限直接漏掉。与 S2-N（写侧 4 个动作、读侧只认 1 个）同一个
+                # 形状，只是上移了一层。
+                # ⚠️ `structural_action_history()` 仍然只看 `action`，那是**故意**的：
+                # 它问的是「控制器试过几次」，不是「烧了几块 GPU」。两个量不同源。
+                if (it.get("action_executed") or it.get("action")) \
+                        not in self._BLOCK_LEDGER_ACTIONS:
                     continue
                 # 🔑🔑 [审计 #40①] **只给这一轮实际点名的窗口记账。**
                 # 先前给快照里**每个**窗口都记一行 —— 而快照是全窗的。于是一轮只补
@@ -4166,6 +4301,12 @@ class Stage2RepairController:
                     "bottleneck_g": _w.get("bottleneck_g"),
                     "bottleneck_eta": _w.get("bottleneck_eta"),
                     "bottleneck_ratio": _w.get("bottleneck_ratio"),
+                    # 🔑 [2026-09-18] η≤1 硬上界（`eta_lever_can_reach`）要的分子。
+                    # 少了它，`N/g` 判据对子窗恒 `None` ⟹ 第四态
+                    # `N_OVER_G_BOUND` 在子窗侧恒不成立 —— 与上面那四个键当初被
+                    # 补上的理由逐字相同，别再漏第五个。
+                    "bottleneck_n_eff_input_n_frames": _w.get(
+                        "bottleneck_n_eff_input_n_frames"),
                     "warmup_steps_left": _w.get("warmup_steps_left"),
                     "phase": _w.get("phase"),
                     "has_convergence": bool(_w.get("has_convergence")),
@@ -4588,10 +4729,17 @@ class Stage2RepairController:
                 min_n_eff_over_g=_u.get("min_n_eff_over_g"),
                 n_eff_over_g_target=_u.get("self_n_eff_over_g_eligible"),
                 frames_headroom=frames_growth_headroom(
-                    _hr_view, None, unit_id=str(_u.get("unit_id"))))
+                    _hr_view, None, unit_id=str(_u.get("unit_id"))),
+                # [2026-09-18] η≤1 硬上界（子窗与物理窗口同一判据）
+                n_eff_input_n_frames=_u.get("bottleneck_n_eff_input_n_frames"),
+                bottleneck_g=_u.get("bottleneck_g"))
             _u["support_attribution"] = _attr2
             _u["support_failed"] = bool(_attr2 == SUPPORT_FAILURE_STRUCTURAL)
             _u["attribution_unknown"] = bool(_attr2 == SUPPORT_FAILURE_UNKNOWN)
+            # [2026-09-18] 第四态：瓶颈在 N/g，缩跨度类被 η≤1 证伪 ⟹ 既不是
+            # `support_failed`（那一档授权缩跨度）也不是 `attribution_unknown`
+            # （它判得出来，只是判出的是"改 η 没用"）。单独标，别被压回三态。
+            _u["n_over_g_bound"] = bool(_attr2 == SUPPORT_FAILURE_N_OVER_G_BOUND)
             # ⚠️ **整式重算**，不是在旧值上 AND 掩码：三条独立理由与归因是**或**的
             # 关系，掩码会把它们一起抹掉。
             _u["needs_frames"] = bool(
@@ -4874,7 +5022,7 @@ class Stage2RepairController:
         # min_windows`（最少窗口数，即最宽的窗）⟹ **判据要更细、执行器给更宽**。
         # 纸面复现见 `repartition_tail_from_anchor` 的参数注释。
         # 这正是本仓库反复复发的那个形状：同一个不变量两份实现
-        # （`docs/STAGE2_CONTROLLER_DESIGN_2026-09-12.md` 把它记成最贵的 bug）。
+        # （`docs/archive/STAGE2_CONTROLLER_DESIGN_2026-09-12.md` 把它记成最贵的 bug）。
         #
         # 现在改成**直接把执行器跑一遍**：`_dry_run_tail_repartition` 是纯函数
         # （不落盘、不采样，微秒级），切得出来才叫可行。执行器落地时调**同一个**
@@ -5433,7 +5581,10 @@ class Stage2RepairController:
                             min_n_eff_over_g=w.get("min_n_eff_over_g"),
                             n_eff_over_g_target=w.get("self_n_eff_over_g_eligible"),
                             frames_headroom=frames_growth_headroom(
-                                view, int(w["window_idx"])))
+                                view, int(w["window_idx"])),
+                            n_eff_input_n_frames=w.get(
+                                "bottleneck_n_eff_input_n_frames"),
+                            bottleneck_g=w.get("bottleneck_g"))
                         for w in _ep_recs
                     }
                     _ep_skew = [i for i, a in _ep_attr.items()
@@ -5466,7 +5617,26 @@ class Stage2RepairController:
                             "不动 λ 表。原动作与理由：" + reason
                         )
                     elif _ep_skew or _ep_unknown:
-                        action, exit_ = "NO_ACTION", "HALT_BUDGET"
+                        # 🔑🔑🔑 [2026-09-18] **这里原来配的是 `HALT_BUDGET`，
+                        # 而它在 `EXIT_SPECS` 里 `terminal=False`（它本来就是路由信号）。**
+                        # `NO_ACTION` + 非终态出口 ⟹ `plan["terminal"]` 为 False ⟹
+                        # 主循环不 break ⟹ 分发段没有 `NO_ACTION` 的执行器 ⟹ 掉进
+                        # 「动作没有执行器，退出循环交人工」⟹
+                        # `outcome = {status: HALTED_NO_EXECUTOR, exit: None}`。
+                        # 而下游每一道门（`abfe_pipeline` 的放行判、收尾 ANALYZE 的
+                        # 判据、2026-09-18 那六条验收）**全部按 `exit` 分类** ——
+                        # 这一跑连出口码都没有，事后分不清它是怎么停的。
+                        # `tests/test_stage2_controller_vocabulary.py::
+                        # test_no_action_is_only_ever_paired_with_a_terminal_exit`
+                        # 钉的正是这条不变量，但它的 docstring 自己写明了盲区：
+                        # 「`plan()` 内部把 action 改写成 NO_ACTION 的那几道闸在这里
+                        # 一条都看不见」。五处内部改写里只有这一处配错，就是它漏的。
+                        # 语义本来就是终态：这个窗口换不起 Epoch、加帧治不了、
+                        # 有界重窗也不可行 —— 和下面那段理由说的「如实停下」一致。
+                        # `TARGET_LOCAL`：卡死的是**这个窗口**，别处照常可修
+                        # （`_retirable_window` 据此退役换窗）。
+                        action, exit_ = "NO_ACTION", "NO_FEASIBLE_ACTION"
+                        halt_scope = "TARGET_LOCAL"
                         reason = (
                             f"原动作 `{_orig}` 要换 Epoch，但窗口 {_ep_ws} **付不起新 "
                             f"Epoch 的最低验证额度**（{_ep_broke}）。"
@@ -5530,7 +5700,16 @@ class Stage2RepairController:
             # `decide()` 有 **16 个**发 `RUN_PRODUCTION` 的出口；逐个挂门必然漏 ——
             # 实测就漏了 15 个（其中两处的改动还因为同一个脚本里后面的 assert 抛错
             # 而整份写入被中止、悄悄丢掉）。这里一次挂住全部。
-            if action == "RUN_PRODUCTION":
+            # 🔑🔑🔑 [S2-N，2026-09-18 真机] **写侧记账的动作，读侧都要过这道闸。**
+            # 先前这里是 `if action == "RUN_PRODUCTION"`，而 `_BLOCK_CHARGING_ACTIONS`
+            # 有 4 个 ⟹ 另外三个扣配额却从不被拦（真机两例：`cmet_ligand2/rep3` w4
+            # 吃到 5 块、`cyclod_ligand3/rep3` w1 同形）。同一张表管两侧，别再分叉。
+            # ⚠️ 非 `RUN_PRODUCTION` 的三个只过**第一道**（块数硬上限），理由见
+            # `_frames_admission` 的 `hard_cap_only` 那段：拿"加帧没用"去否决重标定，
+            # 正好掐掉唯一对症的那条路。
+            if action in self._BLOCK_CHARGING_ACTIONS:
+                _is_topup = (action == "RUN_PRODUCTION")
+                _what = "补帧" if _is_topup else f"动作 `{action}`（它要花一个生产块）"
                 # 🔑🔑🔑 [S2-B，2026-09-17 真机 `cmet_ligand1/rep2`] **第一遍覆盖优先于重复补帧。**
                 #
                 # 盘面：布局 5 窗、产物 3 个 ⟹ `missing=[3,4]` **从没采过**；
@@ -5551,7 +5730,10 @@ class Stage2RepairController:
                 # ⚠️ 代价是"先采的下游窗口可能被之后的重锚作废"。那是**浪费**，
                 # 而现状是**整条路径缺窗**（缺窗口的和不是 ΔG，是另一个量）——
                 # 后者是硬约束，前者不是。
-                if (not unit_id and windows and view.get("missing_windows")):
+                # ⚠️ 这条只对**补帧**成立：它的论证是「同一份冻结 f_k、接着原段 ⟹
+                # 不重锚、作废不了任何下游」。重标定/换 Epoch **会**重锚，不适用。
+                if (_is_topup and not unit_id and windows
+                        and view.get("missing_windows")):
                     _tot_b = view.get("production_blocks_total_by_window") or {}
                     _repeat = [int(w) for w in windows
                                if len(_tot_b.get(int(w)) or []) >= 1]
@@ -5596,7 +5778,8 @@ class Stage2RepairController:
                         _tgt_ws = [int(_u_pw)]
                 elif windows:
                     _tgt_ws = [int(x) for x in windows]
-                _adm = {w: _frames_admission(w, unit_id=unit_id if unit_id else None)
+                _adm = {w: _frames_admission(w, unit_id=unit_id if unit_id else None,
+                                             hard_cap_only=not _is_topup)
                         for w in _tgt_ws}
                 _ok_ws = [w for w in _tgt_ws if _adm[w][0]]
                 if _tgt_ws and _ok_ws and len(_ok_ws) < len(_tgt_ws) and not unit_id:
@@ -5604,7 +5787,7 @@ class Stage2RepairController:
                     _dropped = [w for w in _tgt_ws if not _adm[w][0]]
                     windows = list(_ok_ws)
                     reason = (
-                        f"（窗口 {_dropped} 已达补帧准入上限、本轮剔除："
+                        f"（窗口 {_dropped} 已达块数准入上限、本轮剔除（{_what}）："
                         + "；".join(f"w{w}: {_adm[w][1]}" for w in _dropped)
                         + f"）仍然补 {_ok_ws}。原理由：" + reason
                     )
@@ -5634,15 +5817,16 @@ class Stage2RepairController:
                     if not _all_full:
                         halt_scope = "TARGET_LOCAL"
                     reason = (
-                        f"原动作是给 {_tgt_ws}{f'（子窗 {unit_id}）' if unit_id else ''}"
-                        f" 补帧，但**不再自动补**：{_adm_why}"
+                        f"原动作是对 {_tgt_ws}{f'（子窗 {unit_id}）' if unit_id else ''}"
+                        f" 做{_what}，但**不再自动发**：{_adm_why}"
                         "「又产生了帧」不等于「获得了有用证据」。"
                         + ("**所有**窗口的补帧块数配额都已用尽 ⟹ 没有可做的补帧动作了"
                            "（`HALT_FRAMES_ADMISSION_CAP`）。"
                            if _all_full else
                            "本轮点名的窗口一个都批不过（部分满额时上面已经剔掉满额的、"
                            "只补剩下的，走不到这里）。")
-                        + "要对这个窗口继续补帧必须显式提高它的块数上限，"
+                        + "要对这个窗口继续花生产块（补帧或重标定/换 Epoch）"
+                        "必须显式提高它的块数上限，"
                         "或改走布局动作。原动作与理由：" + reason
                     )
 
@@ -5810,6 +5994,29 @@ class Stage2RepairController:
                     f"默认 scope（{_spec.why}），发出点必须显式传 "
                     "`halt_scope=\"TARGET_LOCAL\"` 或 `\"STAGE_GLOBAL\"` 或 "
                     "`\"PATH_INVALID\"`。漏传不再静默停整跑。")
+            # 🔑🔑🔑 [2026-09-18] **`NO_ACTION` 必须配终态出口 —— 在唯一出口处强制。**
+            #
+            # 这条不变量本来只有 `tests/test_stage2_controller_vocabulary.py` 的 AST
+            # 扫描在钉，而它只看 `plan(...)` **调用点上字面写出来的** `action`/`exit_`；
+            # `plan()` **内部**把 action 改写成 `NO_ACTION` 的五道闸（换 Epoch 预检 /
+            # 会开新段的动作 / 补帧准入 / no-op 台账 / 生产预算）在它眼里一条都看不见
+            # —— 那个测试的 docstring 自己写着这个盲区。实测就漏掉了换 Epoch 预检
+            # 那一处（配了非终态的 `HALT_BUDGET`，真机表现是 `outcome.exit=None` +
+            # `HALTED_NO_EXECUTOR`）。
+            #
+            # 检查放这里而不是再补一条 AST 规则：这是**运行期的唯一出口**，五道闸
+            # 改完 action 都要经过它，往后再加第六道也躲不掉。主循环按 `terminal`
+            # **先于**执行器分发 break，这正是执行器不需要认识 `NO_ACTION` 的前提；
+            # 前提破了就该响，不该让执行器收到一个不认识的词再以 `exit=None` 收场。
+            if action == "NO_ACTION" and not (_spec is not None and _spec.terminal):
+                raise ValueError(
+                    f"`NO_ACTION` 配了非终态出口 {exit_!r} ⟹ 主循环不会 break，"
+                    "执行器会收到一个它不认识的动作，整跑以 "
+                    "`status=HALTED_NO_EXECUTOR` / `exit=None` 收场（下游每一道门都按 "
+                    "`exit` 分类，拿不到出口码就分不清这一跑是怎么停的）。"
+                    "`NO_ACTION` 的语义是「没有动作」，它**必须**终止 —— 请改配 "
+                    "`EXIT_SPECS` 里 terminal=True 的出口，可用："
+                    f"{sorted(k for k, v in EXIT_SPECS.items() if v.terminal)}。")
             return {
                 "protocol_version": STAGE2_CONTROLLER_PROTOCOL_VERSION,
                 "action": action,
@@ -6026,7 +6233,7 @@ class Stage2RepairController:
                     "DONE",
                     _common + "且 `precision_status = MEETS_CROSS_REPEAT_TARGET`"
                     "（跨重复精度已达标）⟹ 完成。"
-                    "⚠️ 这仍不等于答案正确 —— STAGE2_ROOT_CAUSE_2026-08-28.md §2"
+                    "⚠️ 这仍不等于答案正确 —— docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md §2"
                     "「所有收敛门对该失效模式失明」仍然有效。",
                     exit_="DONE_UNTRUSTED" if self.allow_untrusted else "DONE",
                 )
@@ -6202,10 +6409,25 @@ class Stage2RepairController:
         _blocks_total_u = view.get("production_blocks_total_by_unit") or _blocks_u
         _max_blocks = int(view.get("max_production_blocks_per_window") or 4)
 
-        def _frames_admission(w_idx, unit_id=None):
+        def _frames_admission(w_idx, unit_id=None, *, hard_cap_only=False):
             """能不能再批一块帧。返回 `(True, None)` 或 `(False, 原因)`。
 
             带 `unit_id` ⟹ 查**子窗那本账**（父窗的账描述的不是它）。
+
+            🔑🔑🔑 [S2-N，2026-09-18 真机] **`hard_cap_only` 给「非补帧」的花块动作用。**
+
+            块账的写侧（`_BLOCK_CHARGING_ACTIONS`）有 4 个动作，而这道闸先前只挂在
+            `RUN_PRODUCTION` 上 ⟹ 重标定 / 探针 / 临时生产**扣配额却从不过闸**。
+            真机 `cmet_ligand2/rep3` w4：2 块补帧 + 3 块 `RECALIBRATE_FK` = **5 块**（上限 4）；
+            `cyclod_ligand3/rep3` w1 同形。它们吃掉的正是那个窗口稍后重采要用的配额。
+
+            但**三道闸不能整套套给它们**，只有第一道（块数硬上限）适用：
+              · 第二道「上一块补帧没带来增益」与第三道「剩余配额够不着门」问的都是
+                **同分布加帧还有没有用**；而 `RECALIBRATE_FK` 恰恰是「加帧没用」时的
+                **对症动作** —— 拿"加帧没用"去否决它，正好把唯一对症的那条路掐掉，
+                方向完全反了。
+              · 块数硬上限是**资源账**（烧掉的 GPU 不会回来），与动作是什么无关 ⟹
+                四个动作一视同仁。
             """
             if unit_id:
                 _who = f"子窗 `{unit_id}`"
@@ -6224,6 +6446,9 @@ class Stage2RepairController:
                     f"逐块判据量（{_dim}, 求解器去相关帧数）="
                     f"{[(r.get('segment'), r.get('solver_n_decorrelated')) for r in rows_all]}。"
                 )
+            if hard_cap_only:
+                # 非补帧的花块动作：只受资源账约束，不受"加帧还有没有用"那两道约束。
+                return True, None
             # [审计 #47] 边际增益刹车改用共享的 `marginal_gain_stalled()`：
             # 至少 3 个点、基准取前面各点的中位数、只有明显低于基准才算被证伪。
             # 旧判据 `max(fin[1:]) <= fin[0]` 把 `solver_n_decorrelated` 当成随采样
@@ -6569,9 +6794,14 @@ class Stage2RepairController:
         #     绝不回头动父窗（子窗局部下标 0/1 与父窗索引同名不同义）。
         # 🔑 [CTL-02] **只有"缺帧"才走补帧这条分支。** 支撑/偏斜类失败的子窗
         # 由下面的 1c-2 单独处理 —— 拿加帧顶替它正是要修的那个错。
+        # [2026-09-18] 父窗已退役的子窗本轮不再路由（理由同 1c-2 / 1c-3）：
+        # 本分支发的 `RUN_PRODUCTION` 会被 `plan()` 的补帧准入闸改写成终态，
+        # 而它不看 `retired` ⟹ 退役之后原样再触发、再交出同一个终态，
+        # 退役循环空转一圈就收摊。
         _pending_units = sorted(
             [u for u in (view.get("sampling_units") or [])
-             if u.get("needs_frames")],
+             if u.get("needs_frames")
+             and int(_pw_or_last(u)) not in _retired],
             # [2026-09-17] 父窗未知 ⟹ 排到**最后**（大数），不冒充 window 0。
             # 先前 `or 0` 让它插到队首、并被当成 window 0 的子窗路由。
             key=lambda u: (_pw_or_last(u), int(u.get("local_index") or 0)),
@@ -6601,6 +6831,15 @@ class Stage2RepairController:
                     "对父窗口本身做任何动作都推不动结果 —— 它整个不在求解覆盖里。",
                     windows=[_pw], unit_id=_u["unit_id"],
                     blocked=blocked, earliest=earliest,
+                    # 🔑🔑 [2026-09-18] **动作虽然是 `RUN_PRODUCTION`，也必须点名。**
+                    # 它会被 `plan()` 的补帧准入闸 / no-op 台账改写成
+                    # `NO_ACTION` + 终态（`TARGET_LOCAL`）—— 到那时 `blocking_window`
+                    # 兜底成 `earliest`，而卡死的是**这个子窗的父窗**。
+                    # 本分支的守卫只要求 `_pw <= earliest`：`_pw < earliest` 时退役
+                    # 会退掉无辜窗口；`earliest is None` 时它是 `None`，
+                    # `_retirable_window()` 第一行就返回 ⟹ 连「别处还有没有活干」
+                    # 都不问。与 1c-2 / 1c-3 同一形状的第三处。
+                    blocking_window=int(_pw),
                 )
 
         # 1d) 🔑🔑 [2026-09-14 真机] **被求解器跳掉的窗口只能加帧，不能重解。**
@@ -6648,10 +6887,16 @@ class Stage2RepairController:
         # 🔑 [2026-09-17 P0] `support_failed` 现在**只**由 `STRUCTURAL` 置位
         # （见 `read()` 的第二遍归因）。`UNKNOWN` 不进这个选择器 —— D3 停机是
         # 「有界重窗这条路用尽」的结论，归因判不出来时说不出这句话。
+        # 🔑🔑 [2026-09-18] **父窗已退役 ⟹ 它的子窗本轮也不再路由。**
+        # 退役的语义就是「对这个目标已经没有任何可行动作，别让它把还能修的
+        # 窗口一起拖死」。不在这里排除的话，本分支不看 `retired` ⟹ 退役之后
+        # `_decide_once` 重跑时它原样再触发、再交出同一个终态，退役等于只在
+        # `retired_windows` 里留了条记录，**下游该跑的窗口仍然一步没跑**。
         _skew_units = sorted(
             [u for u in (view.get("sampling_units") or [])
              if u.get("support_attribution") == SUPPORT_FAILURE_STRUCTURAL
-             and not u.get("needs_frames")],
+             and not u.get("needs_frames")
+             and int(_pw_or_last(u)) not in _retired],
             key=lambda u: (_pw_or_last(u), int(u.get("local_index") or 0)),
         )
         if _skew_units:
@@ -6713,6 +6958,17 @@ class Stage2RepairController:
                     "先拿**至少三个独立 seed** 稳定复现这条终态、并证明二次切分优于停机。",
                     exit_="D3_REWINDOW_DEPTH_EXHAUSTED", windows=[_spw],
                     unit_id=_su["unit_id"], blocked=blocked, earliest=earliest,
+                    # 🔑🔑 [2026-09-18] **必须显式点名卡死的是谁。**
+                    # 不传时 `plan()` 拿 `earliest` 兜底，而本分支的触发条件只要求
+                    # `_spw <= earliest` —— `_spw < earliest` 时 `blocking_window`
+                    # 就指向一个**与 D3 无关**的窗口。出口的 scope 是 `TARGET_LOCAL`
+                    # ⟹ `decide()` 的退役循环照着它退役 `earliest`；而 `_skew_units`
+                    # 不随 `retired` 变化 ⟹ 下一轮同一条分支再触发、再退役下一个，
+                    # 直到全窗退役。返回的 plan 于是声称那些窗口「已无任何可行动作」
+                    # —— 它们一次都没被判过。
+                    # 正确的退役目标就是 `_spw`：它的子系综这条路已经用尽，绕过它
+                    # 继续调度别处，正是这条出口的语义（用户规格「不能让它停掉整跑」）。
+                    blocking_window=int(_spw),
                     extra={"rewindow_depth_exhausted": _d3},
                 )
 
@@ -6724,10 +6980,12 @@ class Stage2RepairController:
         # （可能只是数据缺口，改布局是拿"没测出来"当"测出来是坏的"）。
         # ⚠️ **但它不该停掉整跑**：别处还有活干就绕过它继续调度。所以这里只在
         # 「没有 earliest、也没有别的可做单元」时才发终态。
+        # [2026-09-18] 父窗已退役的子窗本轮不再路由（理由同 1c-2 那条）。
         _unk_units = [u for u in (view.get("sampling_units") or [])
                       if u.get("attribution_unknown")
                       and not u.get("needs_frames")
-                      and u.get("schedulable", True)]
+                      and u.get("schedulable", True)
+                      and int(_pw_or_last(u)) not in _retired]
         if _unk_units and earliest is None and not _pending_units:
             _uu = _unk_units[0]
             return plan(
@@ -6751,6 +7009,18 @@ class Stage2RepairController:
                 unit_id=str(_uu["unit_id"]),
                 missing=[f"子窗 {_uu['unit_id']} 的支撑失败归因输入"],
                 blocked=blocked, earliest=earliest,
+                # 🔑🔑 [2026-09-18] **不点名就等于不可退役。**
+                # 本分支的守卫是 `earliest is None` ⟹ `plan()` 的兜底把
+                # `blocking_window` 也算成 `None` ⟹ `_retirable_window()` 第一行
+                # （`e is None ⟹ return None`）直接返回，于是它下面那条 S2-G 兜底
+                # （「布局里有、产物里一个都没有的窗口 = 还有活干」）**永不执行**。
+                # 盘面：一个 UNKNOWN 子窗 + 一个从没采过的末窗 ⟹ 整跑判终态，
+                # 而收尾那次全路径 ANALYZE 又因 `missing_windows` 非空被跳过
+                # ⟹ 一份 stage 结果都拿不到。这正是 S2-G 写来修的崩溃形状，
+                # 换了个出口原样复发。
+                # 点名父窗之后，退役判定才能去问「别处还有没有活干」。
+                blocking_window=(int(_uu["parent_window"])
+                                 if _uu.get("parent_window") is not None else None),
             )
 
         # 1b) **救援已经跑过、仍有窗口被踢出 ⟹ 预算耗尽，不是"结果差一点"。**
@@ -7503,7 +7773,10 @@ class Stage2RepairController:
                 min_n_eff_over_g=w.get("min_n_eff_over_g"),
                 n_eff_over_g_target=w.get("self_n_eff_over_g_eligible"),
                 frames_headroom=frames_growth_headroom(
-                    view, int(w["window_idx"])))
+                    view, int(w["window_idx"])),
+                # [2026-09-18] η≤1 硬上界要的两个读数（写侧早就在落盘，此前无人判）
+                n_eff_input_n_frames=w.get("bottleneck_n_eff_input_n_frames"),
+                bottleneck_g=w.get("bottleneck_g"))
 
         def _is_skew(w):
             # 帧数一并传进去：判据自己再验一次，不押在写侧的覆盖顺序上。
@@ -7516,12 +7789,51 @@ class Stage2RepairController:
                 min_n_eff_over_g=w.get("min_n_eff_over_g"),
                 n_eff_over_g_target=w.get("self_n_eff_over_g_eligible"),
                 frames_headroom=frames_growth_headroom(
-                    view, int(w["window_idx"])))
+                    view, int(w["window_idx"])),
+                # [2026-09-18] η≤1 硬上界要的两个读数（写侧早就在落盘，此前无人判）
+                n_eff_input_n_frames=w.get("bottleneck_n_eff_input_n_frames"),
+                bottleneck_g=w.get("bottleneck_g"))
 
         _short_all = [w for w in W if w.get("self_sufficient") is False]
         _skew_sel = _pick([w for w in _short_all if _is_skew(w)])
         if _skew_sel:
             _sw = next(w for w in _short_all if int(w["window_idx"]) in _skew_sel)
+            # 🔑🔑🔑 [2026-09-18] **权重塌缩先换 f_k，再谈缩跨度。**
+            #
+            # `R = η·N/g`。走到这里说明 `N/g ≥ 门`（够不着的那档已被 5c 截走），
+            # 所以缺口确实在 **η** —— 权重剖面。而能动 η 的动作有两族：
+            #   · **换 f_k**（重学）：直接改采样混合，**不动布局**；
+            #   · **缩跨度**（插 λ / 拆窗）：改重叠也能改 η，但 model B 的后置断言
+            #     写死了 `new_ranges = ranges[:-1] + [(tail_lo, tail_hi + n)]`
+            #     ⟹ **末窗必须吸收全部溢出** ⟹ 失败窗口的 η 是从末窗身上借来的。
+            # 两个同类杠杆，一个无副作用、一个有 —— 没有理由先用有副作用那个。
+            #
+            # `top1pct_veto` 是权重塌缩的**直接证据**（单帧/少数帧支配整个权重和），
+            # 它正是"f_k 没把占据压平"的读数，所以对它 f_k 是对症的那一个。
+            # ⚠️ 用 `RELEARN_FK_EPOCH`（从头 LEARN）而不是 `RECALIBRATE_FK`
+            # （拿已有生产帧重解）：塌缩窗口的生产帧**就是**那批塌缩的帧，拿它们
+            # 重解等于用坏样本估新参考系。两者的语义差别是 `ACTIONS` 里写死的。
+            # ⚠️ 一个窗口只给一次（`relearn_epoch_used`），用过就落回下面的缩跨度；
+            # 付不付得起由 `plan()` 的换 Epoch 预检判，不在这里另写。
+            _sw_src = str(_sw.get("self_verdict_source") or "")
+            if _sw_src == "top1pct_veto" and not relearn_epoch_used(
+                    self.checkpoint_dir, int(view.get("path_version") or 0),
+                    int(_sw["window_idx"])):
+                return plan(
+                    "RELEARN_FK_EPOCH",
+                    f"窗口 {_skew_sel} 的自检失败来源是 **top1pct_veto**（权重塌缩："
+                    "少数帧支配整个权重和）—— 这是 **η**（权重剖面）坏了的直接证据，"
+                    f"而 `N/g` 这一侧够得着门（否则已被上一档 `N_OVER_G_BOUND` 截走）。"
+                    "能改 η 的有两族动作：**换 f_k** 与 **缩跨度**。"
+                    "缩跨度（插 λ）在 model B 下 **必然把溢出推给末窗**"
+                    "（后置断言：`new_ranges = ranges[:-1] + [(tail_lo, tail_hi+n)]`）"
+                    "⟹ 它是拿末窗的 η 去补这个窗口的 η。换 f_k 没有这个代价，"
+                    "而且 top1% 塌缩本来就是「f_k 没把占据压平」的读数 ⟹ **先换 f_k**。"
+                    "用 `RELEARN_FK_EPOCH` 而不是 `RECALIBRATE_FK`：塌缩窗口的生产帧"
+                    "**就是**那批塌缩的帧，拿它们重解等于用坏样本估新参考系。"
+                    "一个窗口只给一次；用过、或付不起验证额度，就落回缩跨度。",
+                    windows=list(_skew_sel), blocked=blocked, earliest=earliest,
+                )
             _can_split_skew = feas.get("split_tail_window") is None and (
                 int(_sw["window_idx"]) == max((int(x["window_idx"]) for x in W),
                                               default=-1))
@@ -7615,6 +7927,53 @@ class Stage2RepairController:
                 "它们的 checkpoint 此刻还热，补采不作废任何已有帧。",
                 windows=short_self,
                 blocked=blocked, earliest=earliest,
+            )
+
+        # 5c) 🔑🔑🔑 [2026-09-18] **瓶颈在 `N/g`：缩跨度那一整族被证明够不着。**
+        #
+        # `R = η·N/g` 且 `η ≤ 1`（Kish ESS 的 Cauchy–Schwarz）⟹ `R ≤ N/g`。
+        # `N/g < 门` 时，插 λ / 重标定 / 重学 f_k / 有界重窗 —— 它们**全部只动 η**
+        # —— 无论怎么改都过不了门。所以这种窗口**不该**进 `_skew_sel`（那一档
+        # 授权的正是缩跨度）；它有自己的一档 `N_OVER_G_BOUND`。
+        #
+        # 还能动的只有两个分母项：
+        #   · **N**：同分布补帧。`R ∝ N`（η、g 稳定时），所以它**在数学上是可行的**，
+        #     只是可能很贵 —— 贵不贵由 `plan()` 那道唯一的补帧准入闸判（块数硬上限 /
+        #     边际增益 / 射程），不在这里另写判据。
+        #   · **g**：换独立初态 / 处理慢模态。**本仓目前没有这个动作**（全仓没有
+        #     任何生成独立起始构型的执行器）。
+        #
+        # ⟹ 这里发补帧，让准入闸判。批得动就补；批不动时准入闸会把动作改写成终态
+        # 并附上它自己的拒绝理由 —— 那时「加帧够不着（射程闸）」与「改 η 也够不着
+        # （本档）」两条同时在案，结论就是**必须降 g**，而那个动作还不存在。
+        # 这比静默掉到兜底、报一句"归因不到任何一道具体的门"强：后者把一个**已经
+        # 算出来的结论**说成了没结论。
+        _nog_sel = _pick([w for w in _short_all
+                          if _attr_of(w) == SUPPORT_FAILURE_N_OVER_G_BOUND])
+        if _nog_sel:
+            _nw = next(w for w in _short_all
+                       if int(w["window_idx"]) in _nog_sel)
+            _nog_N = _nw.get("bottleneck_n_eff_input_n_frames")
+            _nog_g = _nw.get("bottleneck_g")
+            _nog_t = _nw.get("self_n_eff_over_g_eligible")
+            return plan(
+                "RUN_PRODUCTION",
+                f"窗口 {_nog_sel} 的瓶颈在 **N/g**，不在权重剖面上："
+                f"瓶颈态 k*={_nw.get('bottleneck_state')}，进 N_eff 的帧数 N={_nog_N}，"
+                f"g={_nog_g} ⟹ **N/g = "
+                + (f"{float(_nog_N) / float(_nog_g):.3g}"
+                   if (_nog_N and _nog_g) else "?")
+                + f"** < 门 {_nog_t}。"
+                "而 `R = N_eff/g = η·N/g` 且 **η ≤ 1**（Kish ESS 的 Cauchy–Schwarz，"
+                "等号仅当权重全等）⟹ **R ≤ N/g** ⟹ 插 λ / 重标定 / 重学 f_k / "
+                "有界重窗这一整族（它们只动 η）**被证明够不到门**，不是"
+                "「还没试过」。⟹ 不发缩跨度。"
+                "还能动的只有分母：**加 N**（同分布补帧，`R ∝ N`，数学上可行）"
+                "或**降 g**（换独立初态 / 治慢模态 —— **本仓目前没有这个动作**）。"
+                "这里先发补帧，够不够得着由补帧准入闸判；它若拒绝，那条拒绝理由"
+                "加上本档就同时钉住了两件事：加帧够不着、改 η 也够不着 ⟹ "
+                "剩下的唯一出路是降 g。",
+                windows=list(_nog_sel), blocked=blocked, earliest=earliest,
             )
 
         # 1c-4) 🔑🔑 [2026-09-17 P0] **物理窗口侧的 UNKNOWN 出口。**
@@ -7775,7 +8134,7 @@ class Stage2RepairController:
                     "DONE",
                     "分析的硬不变量全部通过，且跨重复精度已达标"
                     "（`precision_status = MEETS_CROSS_REPEAT_TARGET`）。"
-                    "⚠️ 这不等于答案正确 —— STAGE2_ROOT_CAUSE_2026-08-28.md §2"
+                    "⚠️ 这不等于答案正确 —— docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md §2"
                     "「所有收敛门对该失效模式失明」仍然有效（该节被其自身的超越"
                     "声明明确标为仍然有效）。",
                     exit_="DONE_UNTRUSTED" if self.allow_untrusted else "DONE",
@@ -9356,7 +9715,7 @@ def repartition_tail_from_anchor(
 ) -> Tuple[List[Tuple[int, int]], Dict[str, Any]]:
     """**只重分尾段**：anchor 之前的窗口逐字冻结，只有 anchor 起的重新分配。
 
-    设计依据：``docs/PLAN_PATH_REPAIR_2026-09-11.md``。老板的原话是
+    设计依据：``docs/archive/PLAN_PATH_REPAIR_2026-09-11.md``。老板的原话是
     「若当前实现要求全部从头重跑，那是路径版本/reuse 规则仍过粗，**不是物理上的
     必要代价**」。
 
@@ -9754,7 +10113,7 @@ def feasible_repair_actions(
 ) -> Dict[str, Optional[str]]:
     """哪些**结构性**修补动作在当前布局下可行。纯计算，零 GPU。
 
-    设计依据：``docs/PLAN_PATH_REPAIR_2026-09-11.md`` §2「可行性规则」。
+    设计依据：``docs/archive/PLAN_PATH_REPAIR_2026-09-11.md`` §2「可行性规则」。
 
     返回 ``{动作名: None 表示可行 | str 表示不可行的理由}``。
     调用方取可行集：``[k for k, v in d.items() if v is None]``。
@@ -9939,7 +10298,7 @@ def insert_lambda_in_failed_ibs_window(
 ) -> Tuple[List[float], List[Tuple[int, int]], Dict]:
     """在失败窗口内插 λ，**缩小该窗口的 λ 跨度**；多出来的态由**末窗**吸收。
 
-    ⚠️ 2026-09-11 重写。设计依据：``docs/PLAN_PATH_REPAIR_2026-09-11.md`` §2 更正
+    ⚠️ 2026-09-11 重写。设计依据：``docs/archive/PLAN_PATH_REPAIR_2026-09-11.md`` §2 更正
     与 §3ter。两条关键改动，改前先读那份文档。
 
     **记账口径 = model B：窗口的下标区间一律不动，只有末窗上界 += n。**
@@ -10077,7 +10436,7 @@ def insert_lambda_in_failed_ibs_window(
                 f"{[round(float(e), 4) for e in win_edges]}）—— **边级证据不支持插点**。"
                 "这个窗口的缺陷是窗口级的（跨度 / 混合 / f_k），插几个点必须由调用方"
                 "按窗口级判据给出 n_insert；本函数不替它猜，也不静默插 1 个。"
-                "见 docs/PLAN_PATH_REPAIR_2026-09-11.md §3ter.4。"
+                "见 docs/archive/PLAN_PATH_REPAIR_2026-09-11.md §3ter.4。"
             )
     else:
         n_needed = int(n_insert)
@@ -10142,7 +10501,7 @@ def insert_lambda_in_failed_ibs_window(
             "(b) 承认这是 HALT_LAMBDA_BUDGET_INSUFFICIENT —— 输入的 λ 总数从一开始"
             "就不够，退出进程、人工改输入文件的 λ 数目。**不要把 n 封顶到预算**，"
             "那会静默产出一个不满足触发它那份证据的布局；理由见 "
-            "docs/PLAN_PATH_REPAIR_2026-09-11.md §2。"
+            "docs/archive/PLAN_PATH_REPAIR_2026-09-11.md §2。"
         )
     new_ranges = list(ranges[:-1]) + [(ranges[-1][0], ranges[-1][1] + n_needed)]
     validate_single_shared_boundary_ranges(new_ranges, len(lambdas))

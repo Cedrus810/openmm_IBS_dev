@@ -1,6 +1,6 @@
 # 计划：prescribed ABFE path 的证据驱动最小修补
 
-**2026-09-11 · 计划稿** · 事实依据：`STAGE2_THREE_AXES_COUPLING_2026-09-11.md`
+**2026-09-11 · 计划稿** · 事实依据：`archive/STAGE2_THREE_AXES_COUPLING_2026-09-11.md`
 
 ## 0. 定位
 

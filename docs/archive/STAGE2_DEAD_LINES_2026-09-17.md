@@ -6,7 +6,7 @@
 >
 > | 本文的哪一段 | 结论去了哪 |
 > |---|---|
-> | §2 一次开四条：接 `IMMUTABLE_REWINDOW` | ✅ 当天落地 = `REWIND-01`，整段在 [TODO_closed_2026-09-17.md](TODO_closed_2026-09-17.md) |
+> | §2 一次开四条：接 `IMMUTABLE_REWINDOW` | ✅ 当天落地 = `REWIND-01`，整段在 [TODO_closed.md](TODO_closed.md) |
 > | §3.1 加帧刹车永不触发 | ✅ 当天修（**没走本节建议的拟斜率**，走的是同一个前向判据问剩余配额），见 [CHANGELOG](../CHANGELOG.md) 09-17 |
 > | §3.2 `plan()` 把换 f_k 静默改写成补帧 | ⚖️ **改写本身仍在**（O1 已收紧成只认 `SAMPLE_SIZE`）；它与 §3.1 的**共同根因**——射程判据高估——同日补上第三道准入 |
 > | §1 D1 / D8 | ✅ 报告侧改进当天落地（`terminal_window_failures` 恒常输出、`_attribution_blind_spots()` 区分 corrupt/absent），见 [CHANGELOG](../CHANGELOG.md) 09-17 |

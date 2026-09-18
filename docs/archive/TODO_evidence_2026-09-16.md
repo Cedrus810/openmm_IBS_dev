@@ -1,6 +1,6 @@
 # TODO 取证存档：Stage-2 控制器 / 预算 / benchmark（截至 2026-09-16）
 
-[文档导航](../README.md) · [在推的待办](../TODO.md) · [已关闭条目](TODO_closed_2026-09-16.md)
+[文档导航](../README.md) · [在推的待办](../TODO.md) · [已关闭条目](TODO_closed.md)
 
 > **2026-09-16 归档，不是待办。** 这些整段来自 `docs/TODO.md` 09-16 之前的正文：
 > 已关闭条目留下的结论、以及**本仓唯一一次成规模的离线取证**
@@ -8,7 +8,7 @@
 >
 > 留下来是因为那几张表还有引用价值；**表里的数字都带日期，都不是当前值** ——
 > 判当前行为要重新重放，别照抄。逐条关闭证据在
-> [TODO_closed_2026-09-16.md](TODO_closed_2026-09-16.md)。
+> [TODO_closed.md](TODO_closed.md)。
 
 ---
 
@@ -17,20 +17,20 @@
 ### 剩余缺口（源：控制器 design §7）
 
 > `S2-D`（代码收拢）**2026-09-12 已关闭**，整段进
-> [archive/TODO_closed_2026-09-12.md](TODO_closed_2026-09-12.md)。
+> [archive/TODO_closed.md](TODO_closed.md)。
 > 一句话结论：不是"都塞进一个文件"，是**决策同源的进 `abfe_preoptimizer`、
 > 写盘的留 `abfe_pipeline`**。逐符号现状见
-> [设计文档 §9.4](../STAGE2_CONTROLLER_DESIGN_2026-09-12.md)。
+> [设计文档 §9.4](STAGE2_CONTROLLER_DESIGN_2026-09-12.md)。
 
 > `S2-B`（完整性要求随预算膨胀）**2026-09-13 已修**，整段进
-> [archive/TODO_closed_2026-09-13.md](TODO_closed_2026-09-13.md)。
+> [archive/TODO_closed.md](TODO_closed.md)。
 > 一句话结论：**原条目的后果描述是错的** —— 「可达性判据第 2 档因此失效」从没
 > 发生过，那个量在本仓自第一个 commit 起就只进报告、不当门。真实危害是它会骗
 > 读它的人（可达性的 T 一度就被错取成它，gcrit 算小 20 倍）。修法仍按原定正解：
 > 去掉预算那一支。
 
 > `S2-F`（10 条旧断言对齐新语义）**2026-09-13 已关闭**，整段进
-> [archive/TODO_closed_2026-09-13.md](TODO_closed_2026-09-13.md)。
+> [archive/TODO_closed.md](TODO_closed.md)。
 > 一句话结论：**10 条里只有 3 条真的是断言旧了，另外 7 条是 fixture 旧了** ——
 > 造的 run 目录缺自检产物/缺预算台账，于是 fail-closed 的前置门把请求兜住，
 > 测试想钉的分支一条都走不到。**照着实际输出改断言会让 7 条退化成同一个测试。**
@@ -64,12 +64,12 @@
 
 > `DECORR-01` 的 `- [ ]` **2026-09-16 摘除**：同一条在它上面已经有两段「已裁决 /
 > 已接线」的结论，条目本身是规则 2 说的那种"`[x]` 尸体"。整段进
-> [archive/TODO_closed_2026-09-16.md](TODO_closed_2026-09-16.md)。**裁决与禁令一字未变**（权威是求解器；两侧数字不许互相看齐）。
+> [archive/TODO_closed.md](TODO_closed.md)。**裁决与禁令一字未变**（权威是求解器；两侧数字不许互相看齐）。
 
 > `AUDIT-S2-01`（`decide()` 从不发 `SPLIT_TAIL_WINDOW`）**2026-09-16 前提证伪**：
 > `abfe_preoptimizer.py:5814`（`_feas_split`）与 `5955`（`_can_split_skew`）两处都发得出，
 > 且本文 09-14 自己的重放表里 `cyclod_ligand2/rep1` 拿到的就是 `SPLIT_TAIL_WINDOW[5]`。
-> 整段进 [archive/TODO_closed_2026-09-16.md](TODO_closed_2026-09-16.md)。
+> 整段进 [archive/TODO_closed.md](TODO_closed.md)。
 > ⚠️ 真正该盯的不是「发不发得出」而是**发出来做的是不是同一件事** —— 见审计 #24
 > （可行性问的是「末窗能否一分为二」，执行器做的是「从 `first_untrusted_window` 起全部重分」）。
 
@@ -99,7 +99,7 @@
 > 但 `decide()` 的重放是当前代码，可以。下面分开标注。
 >
 > ⚠️ **下表备注里的 `CTL-11` / `CTL-12` / `CTL-15` 现在都在
-> [archive/TODO_closed_2026-09-16.md](TODO_closed_2026-09-16.md) 里（2026-09-16 已关闭）。**
+> [archive/TODO_closed.md](TODO_closed.md) 里（2026-09-16 已关闭）。**
 > 表本身是 **09-14 那天**的重放快照，**别当成当前行为** —— 修完之后的重放见
 > 本节末尾 09-14 收尾表，以及 `BM-B`。
 >
@@ -130,9 +130,9 @@
 > 这七条 + 四条当时是**只读查出、一条未修**地写进来的，后来在 09-14/09-15 的修复批次里
 > 陆续修掉了，**但没人回来打勾** —— 于是它们以 `- [ ]` 的样子在这里挂了两天，
 > 让整个预算系统看起来还没接上。**2026-09-16 逐条回源码核实，缺陷都已不在**，
-> 整段（含逐条证据行号）进 [archive/TODO_closed_2026-09-16.md](TODO_closed_2026-09-16.md)。
+> 整段（含逐条证据行号）进 [archive/TODO_closed.md](TODO_closed.md)。
 >
-> 同一天连带纠正了 [CONTROLLER_BUDGET_AUDIT_2026-09-14.md](../CONTROLLER_BUDGET_AUDIT_2026-09-14.md)
+> 同一天连带纠正了 [CONTROLLER_BUDGET_AUDIT_2026-09-14.md](CONTROLLER_BUDGET_AUDIT_2026-09-14.md)
 > 的状态列：那份文档 65 条里有 20 条还标着 `OPEN`，实测 **65 条全部落地**。
 >
 > **留下的规矩**：「某条缺陷修没修」这个事实**只有一份权威，是源码**。
@@ -144,7 +144,7 @@
 
 
 > `CTL-15` ~ `CTL-19` **2026-09-14 当天已关闭**（`CTL-15` 是**原判断错误**被作废，
-> 其余四条已修），整段进 [archive/TODO_closed_2026-09-16.md](TODO_closed_2026-09-16.md)。
+> 其余四条已修），整段进 [archive/TODO_closed.md](TODO_closed.md)。
 > 留下一条规矩：**`lo/hi` 是逐 run 从 `run_provenance.json` 读的**，
 > 跨 run 引用可拆区间前必须先看那个 run 自己的 `lo/hi`，别拿手边那个体系的数去套 ——
 > `CTL-15` 的错判正是拿 cyclod 的 `4/5` 去套 brd4 的 `8`。
@@ -263,7 +263,7 @@
 > 错的永远是"在这个中间态里去载它不需要的窗口"。
 
 > `BM-01` / `BM-02` / `BM-03` / `BM-05` **2026-09-16 已修**，整段进
-> [archive/TODO_closed_2026-09-16.md](TODO_closed_2026-09-16.md)（含逐条位置、判据测试名、回归差分）。
+> [archive/TODO_closed.md](TODO_closed.md)（含逐条位置、判据测试名、回归差分）。
 > 留下三条规矩，**别重新论证**：
 > 1. **局部动作只许载它要动的窗口** —— loader 的 fail-closed 布局校验是对的，
 >    错的永远是「在插 λ 的合法中间态里去载它不需要的窗口」；
@@ -272,7 +272,7 @@
 >    只判一侧就会把非法布局写进版本链，`DATA-02` 那两个 run 就是这么卡死的。
 >
 > ⚠️ `BM-04`（window 0 死局）**没有**被这四条解决 —— 它已于 2026-09-16 由维护者拍板关闭，
-> 结论与理由见本节末尾的拍板块与 [archive/TODO_closed_2026-09-16.md](TODO_closed_2026-09-16.md)。
+> 结论与理由见本节末尾的拍板块与 [archive/TODO_closed.md](TODO_closed.md)。
 
 ---
 
@@ -282,13 +282,13 @@
 
 > `DATA-01`（`cyclod_ligand2/rep3` win4 的 production manifest 与 f_k 对不上）
 > **已消解**（维护者清空三个 run 的 stage-2 产物重跑），整段进
-> [archive/TODO_closed_2026-09-16.md](TODO_closed_2026-09-16.md)。**判据没变**：分析 loader 仍然对「manifest 与两份 f_k 都对不上」
+> [archive/TODO_closed.md](TODO_closed.md)。**判据没变**：分析 loader 仍然对「manifest 与两份 f_k 都对不上」
 > fail-closed，下次再出现照样拦。
 
 > ### ✅ 2026-09-16 维护者拍板：`BM-04` / `DATA-02` / `DATA-03` 三条同日关闭
 >
 > 覆盖 benchmark 里 **7 个走不动的 run**。全文（含逐条理由、已核实的源码证据、
-> 验收判据、GPU 代价）进 [archive/TODO_closed_2026-09-16.md](TODO_closed_2026-09-16.md)。一句话结论：
+> 验收判据、GPU 代价）进 [archive/TODO_closed.md](TODO_closed.md)。一句话结论：
 > **4 个旧/非法 Stage-2 干净重建，3 个预算不足 run 用 `21/4` 有界续跑。**
 >
 > | 条目 | 结论 |

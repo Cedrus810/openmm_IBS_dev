@@ -20,13 +20,22 @@
 
 体系：`cyclod_ligand2/rep1`（环糊精主客体，可溶）。
 
+## 0. 核心设计指标（老板定案，唯一验收指标）
+
+> **一次启动，无人干预；遇到采样/收敛问题，自己读证据、诊断原因、选择动作、执行、复验，直到完整结果。**
+
+原件是 [`archive/AUTONOMOUS_STAGE2_LOOP_SPEC_2026-09-11.md`](AUTONOMOUS_STAGE2_LOOP_SPEC_2026-09-11.md)
+§0（2026-09-18 归档；那份的 §1/§4 已过期，§0 与 §2 没有）。**它是其它一切的上位项。**
+达成与否不由本文声明：见 §10 当前状态与
+[`STAGE2_BENCHMARK_CRASH_TRIAGE_2026-09-18.md`](STAGE2_BENCHMARK_CRASH_TRIAGE_2026-09-18.md)。
+
 **接手的人**：§9 代码在哪 · §10 当前状态与复现 · §11 别重新论证的事 ·
 §12 规矩。动手前先读 §6 的十条陷阱。
 
 前置文档（读这份之前先读）：
 - `PLAN_PATH_REPAIR_2026-09-11.md` —— 设计要求的来源，分支编号（5a/5b/6）出自这里
-- `STAGE2_THREE_AXES_COUPLING_2026-09-11.md` —— 三轴耦合
-- `STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md` —— 逐个 bug 的修复流水账
+- `archive/STAGE2_THREE_AXES_COUPLING_2026-09-11.md` —— 三轴耦合
+- `archive/STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md` —— 逐个 bug 的修复流水账
 
 ---
 
@@ -301,7 +310,7 @@ win4 在 vanishing_5:  1.62 ❌ 15:51（废弃 Epoch）
    （按源码 AST 断言右侧不得引用任何预算量，已用旧公式变异验证会红）。
 3. **边际增长判据需要至少两段历史**，只有一段的窗口用不上。
 4. ~~**代码仍散在三个文件**~~ —— **2026-09-12 已关闭**（`S2-D`，整段进
-   [archive/TODO_closed_2026-09-12.md](archive/TODO_closed_2026-09-12.md)）。
+   [archive/TODO_closed.md](TODO_closed.md)）。
    ⚠️ 原文写的「设计要求是**包在一起**」**是被否掉的口径**：收拢的判据不是
    "都塞进一个文件"，而是**决策同源的进 `abfe_preoptimizer`、写盘的留
    `abfe_pipeline`**（"执行器"= 写盘，由 `test_controller_never_writes_anything`

@@ -32,19 +32,20 @@
 > 2026-09-16 那次对账：§1 里 16 条未打勾的条目，**13 条描述的缺陷已经不在代码里了**
 > —— 09-14/09-15 修掉的，没人回来打勾。危害不是漏修，是**重复排查**。
 > ⟹ **关掉一条的动作是「回源码看缺陷在不在」，不是「看上次谁写了什么」**；
-> 对账用的 `grep` 命令逐条写在 [archive/TODO_closed_2026-09-16.md](archive/TODO_closed_2026-09-16.md)。
+> 对账用的 `grep` 命令逐条写在 [archive/TODO_closed.md](archive/TODO_closed.md)。
 >
-> ⚠️ 对账只证明缺陷不在了，**不证明修得对**。这批改动仍然**真机零验证**（`AUDIT-S2-03`）。
+> ⚠️ 对账只证明缺陷不在了，**不证明修得对**。这批改动的真机覆盖仍然只有 2 个 run
+> （`AUDIT-S2-03`；「真机零验证」那个旧说法 09-16 已更正，别再照抄）。
 
 > **已关闭的条目不留在这里**，整段移进 `archive/`：
 >
 > | 归档 | 内容 |
 > |---|---|
-> | [archive/TODO_closed_2026-09-09.md](archive/TODO_closed_2026-09-09.md) | `MIGRATE-01` / `PBC-01` / `XFAIL-01` / `XFAIL-02` / `CACHE-01` / `CFG-01` 六条已关闭缺陷的完整记录 |
-> | [archive/TODO_closed_2026-09-12.md](archive/TODO_closed_2026-09-12.md) | `BOR-01`（Boresch 几何 minimum-image 口径）与 `S2-D`（控制器代码收拢）两条已关闭条目的完整记录 + 关闭验收。留下的规矩：**同一个不变量只能有一份实现**；**收拢的判据是“写盘的留 pipeline”，不是“塞进一个文件”** |
-> | [archive/TODO_closed_2026-09-13.md](archive/TODO_closed_2026-09-13.md) | `LR-01`（残差开关进 stage 指纹的作用域）一条已关闭条目 + 只读核实证据。留下的规矩：**一个开关有几条进指纹的路径就得收窄几条**；且**顶层 run 指纹与 stage 指纹口径不同**，顶层无条件进是对的，别跟着"统一" |
-> | [archive/TODO_closed_2026-09-16.md](archive/TODO_closed_2026-09-16.md) | **一次对账，不是一次修复**：`DECORR-01` / `AUDIT-S2-01` / `BUD-01`~`05` / `BUD-07` / `CTL-11`~`19` / `BM-01`~`03`+`05` / `DATA-01` 共 20 余条 —— 其中 13 条是**挂在本文里、但缺陷早已不在代码里**的。含逐条证据行号与对账用的 `grep`。留下的规矩：**「某条缺陷修没修」的权威是源码，`- [ ]` 和状态列都是会过期的缓存** |
-> | [archive/TODO_closed_2026-09-17.md](archive/TODO_closed_2026-09-17.md) | **当天真做掉的 6 条**（与 09-16 那次「对账」不同）：`REWIND-01`（P1）+ `TEST-01`/`LR-03`/`LR-04`/`REL-08`/`REL-09`（P2）。留下的规矩：**死动作要接在各自兜底之前、不是在链尾加一条分支**；**一个父窗只切一层**（不设深度上限就是新的无限循环，且不许放宽）；**测试选择口径的判据是收集数不是 grep 文件** |
+> | [archive/TODO_closed.md](archive/TODO_closed.md) | `MIGRATE-01` / `PBC-01` / `XFAIL-01` / `XFAIL-02` / `CACHE-01` / `CFG-01` 六条已关闭缺陷的完整记录 |
+> | [archive/TODO_closed.md](archive/TODO_closed.md) | `BOR-01`（Boresch 几何 minimum-image 口径）与 `S2-D`（控制器代码收拢）两条已关闭条目的完整记录 + 关闭验收。留下的规矩：**同一个不变量只能有一份实现**；**收拢的判据是“写盘的留 pipeline”，不是“塞进一个文件”** |
+> | [archive/TODO_closed.md](archive/TODO_closed.md) | `LR-01`（残差开关进 stage 指纹的作用域）一条已关闭条目 + 只读核实证据。留下的规矩：**一个开关有几条进指纹的路径就得收窄几条**；且**顶层 run 指纹与 stage 指纹口径不同**，顶层无条件进是对的，别跟着"统一" |
+> | [archive/TODO_closed.md](archive/TODO_closed.md) | **一次对账，不是一次修复**：`DECORR-01` / `AUDIT-S2-01` / `BUD-01`~`05` / `BUD-07` / `CTL-11`~`19` / `BM-01`~`03`+`05` / `DATA-01` 共 20 余条 —— 其中 13 条是**挂在本文里、但缺陷早已不在代码里**的。含逐条证据行号与对账用的 `grep`。留下的规矩：**「某条缺陷修没修」的权威是源码，`- [ ]` 和状态列都是会过期的缓存** |
+> | [archive/TODO_closed.md](archive/TODO_closed.md) | **当天真做掉的 6 条**（与 09-16 那次「对账」不同）：`REWIND-01`（P1）+ `TEST-01`/`LR-03`/`LR-04`/`REL-08`/`REL-09`（P2）。留下的规矩：**死动作要接在各自兜底之前、不是在链尾加一条分支**；**一个父窗只切一层**（不设深度上限就是新的无限循环，且不许放宽）；**测试选择口径的判据是收集数不是 grep 文件** |
 > | [archive/TODO_2026-08-06_unreconciled.md](archive/TODO_2026-08-06_unreconciled.md) | 2026-08-06 的主表（1350 行，`ATT-xx`/`MEM-xx`/`P0-9~13` 编号）。**那里面的 `- [ ]` 只表示"当时未完成"**，要人逐条对账才能重新变成待办 |
 >
 > ⚠️ 不要按编号跨文档机械对账：`P1-19` 在 08-29 那份交接里是"v4 charging 接缝内静电失配"（已修），
@@ -61,155 +62,29 @@
 > ΔG_bind = **−3.48 ± 0.47 kcal/mol** vs 实验 −4.04，差 **1.19σ**。
 >
 > **设计、实证与十条陷阱全部在
-> [STAGE2_CONTROLLER_DESIGN_2026-09-12.md](STAGE2_CONTROLLER_DESIGN_2026-09-12.md)
+> [STAGE2_CONTROLLER_DESIGN_2026-09-12.md](archive/STAGE2_CONTROLLER_DESIGN_2026-09-12.md)
 > —— 接手先读那份，别重推。** 本节只登记它 §7 列的缺口。
 >
 > ⚠️ 一次跑通 ≠ 通用。这是**单体系单 run**，没有独立重复。
 
-- [x] **S2-L [P1] 补帧的块数硬上限被「换布局」重置 ⟹ 补帧实际没有有效上限（2026-09-17 真机）**
+> ### ✅ 已关闭的 8 条整段移进 `archive/`（2026-09-18 搬）
+> 
+> | 条目 | 一句话 | 去处 |
+> |---|---|---|
+> | `S2-N` | 块账写侧 4 个动作、读侧只拦 1 个 ⟹ 重标定/探针/临时生产扣配额却从不过闸 | [archive/TODO_closed.md](archive/TODO_closed.md) |
+> | `S2-O` | 退出前的全路径 ANALYZE 在有 stale 证据时被整个跳过 ⟹ 整跑零产出 + 自锁 | [archive/TODO_closed.md](archive/TODO_closed.md) |
+> | `S2-L` | 补帧的块数硬上限被「换布局」重置 ⟹ 补帧实际没有有效上限 | [archive/TODO_closed.md](archive/TODO_closed.md) |
+> | `S2-M` | 「布局过期 + 冻结验证批次打满」= 死锁 ⟹ 整跑终止 | [archive/TODO_closed.md](archive/TODO_closed.md) |
+> | `S2-K` | `ANALYZE` 在有过期证据的盘面上炸穿流水线 —— 判据侧知道、执行器侧不看 | [archive/TODO_closed.md](archive/TODO_closed.md) |
+> | `S2-J` | model B 的收尾动作「末窗一分为二」在自治控制器下整个不存在 | [archive/TODO_closed.md](archive/TODO_closed.md) |
+> | `S2-H` | 「总是改变盘面」的动作对停滞保护与 no-op 台账结构性免疫 | [archive/TODO_closed.md](archive/TODO_closed.md) |
+> | `S2-G` | 退役判定看不见「从没采过的窗口」⟹ 整跑崩溃 | [archive/TODO_closed.md](archive/TODO_closed.md) |
+> 
+> ⚠️ **`S2-N`/`S2-O` 真机零复验** —— 修复落盘 09-18 08:30–08:36，`cyclod_ligand1_outer`
+> rep2/rep3 是 09-17 起的吃不到；看 09-18 16:11 之后起的 `p38_ligand1` 那批。
 
-  `_production_blocks_total_by_window()`（**硬上限**那本账）和
-  `_production_blocks_ledger()`（**边际增益**那本）都按 `path_version` 过滤
-  ⟹ **插一次 λ / 拆一次窗，配额就清零、重新发满 4 块**。
-  这跟 `BUD-03` 是**同一个 bug 换了一个维度**（那次是"换段退钱"），
-  而本函数的定义白纸黑字写着「硬上限 = **资源账**」—— 烧掉的 GPU 不会因为布局变了就回来。
-
-  真机实测（修复后才看得见真实消耗）：
-
-      cmet_ligand1/rep1  w4：旧口径 2 块 → 真实 9 块（上限 4）
-      cmet_ligand2/rep1  w5：旧口径 4 块 → 真实 5 块
-      brd4_ligand1/rep2  w3：累计 1,250,000 步 = 5 块
-
-  叠加 `S2-A`（边际增益刹车全程没有输入、恒不触发）⟹ 在布局反复演化的 run 上
-  **补帧没有任何有效上限**。这正是跨 run 统计里最准那条判据的机制：
-  「至少一个窗口累计 ≥500k 步」覆盖 **9/9** 失败（maxK≥6 只覆盖 7/9）。
-
-  **已修**：硬上限那本**不按 `path_version` 过滤**；边际增益那本**仍然要过滤**
-  （跨布局比 `min N_eff/g` 没有意义，窗口几何都变了）——两本账的过滤维度本来就不同，
-  这正是 BUD-03 把它们拆成两个函数的理由。
-  测试：`tests/test_structural_action_budget_2026_09_17.py::test_the_hard_cap_counts_blocks_across_layout_changes`
-  ⚠️ 该测试的 fixture 必须用**单调递增**的 `production_steps`：块账按步数去重，
-  每个布局都从 250k 重来会被折叠掉，测不到要测的东西。
-
-- [x] **S2-M [P1] 「布局过期 + 冻结验证批次打满」= 死锁 ⟹ 整跑终止（2026-09-17 真机）**
-
-  分支 1d-0（过期 ⟹ 只能重采）排在 1e（进不进得去）**之前**，且无条件发
-  `RUN_PRODUCTION`。于是：重采要**重新进入**窗口 → 预热门看到 15/15 批打满 →
-  抛 `LOCAL_VALIDATION_CAP` 弹回，盘面未变 → no-op 还记不下（stale 窗口
-  `production_steps` 读不到 ⟹ 指纹没有可比身份）→ 连发 3 次 → 停滞保护 →
-  降级又被 `_stale_for_escalation` 挡住 → `NO_FEASIBLE_ACTION`，整跑终止。
-
-  而对「验证批次打满」控制器**有**答案 —— 分支 3a 的 `PROVISIONAL_PRODUCTION`，
-  只是排在 1d-0 后面够不着。它产出的是**新布局下**的帧，一并解决了证据过期；
-  普通 `RUN_PRODUCTION` 则在预热门上被弹回、一帧都产不出来。
-
-  **已修**：1d-0 分流 —— 过期**且**正卡在验证批次上限 ⟹ 发 `PROVISIONAL_PRODUCTION`
-  （语义/额度/证据口径全照 3a，判据复用**同一份** `local_validation_cap_hits()`）。
-
-- [x] **S2-K [P1] `ANALYZE` 在有过期证据的盘面上炸穿流水线 —— 判据侧知道、执行器侧不看（2026-09-17 真机）**
-
-      [自治] 执行 ANALYZE 失败：ValueError('窗口 4 lambda 内容与当前路径不匹配')
-      _solve_merged_segments_if_any → _load_ibs_window_outputs_merged
-        → ibs_engine.load_ibs_window_outputs_from_dir:664 → raise ValueError → 炸穿主循环
-
-  控制器**对补帧类动作有这道闸**（分支 1d-0：过期窗口只能重采；停滞降级另有
-  `_stale_for_escalation`），理由原文：「拿已有帧重解的动作在构造上都会维度不符，
-  真机实测是直接 `ValueError` 炸出流水线」。**但 `ANALYZE` 没有这道闸** ——
-  而它恰恰是**跨全部段、拿已有帧重解**的那个动作。
-
-  **判据侧其实完全知道**：`classify_layout_evidence()` 逐 (段, 窗口) 比 λ 身份，
-  `read_aggregated()` 把过期的排除出 `merged` 并记进 `stale_layout_evidence`。
-  而 `_solve_merged_segments_if_any` 是执行器侧，从盘上**无过滤**加载所有段。
-  ⟹ **同一个不变量两份实现**，这次的形态是"判据侧过滤了、执行器侧没过滤"。
-
-  判据：发 `ANALYZE` 之前要么确认没有过期证据、要么让合并求解**按同一份判据跳过**
-  过期的 (段, 窗口)；不得让它抛到主循环。
-  完整记录 → [STAGE2_CONTROLLER_WAVE_2026-09-17.md](STAGE2_CONTROLLER_WAVE_2026-09-17.md) §3.K
-
-- [x] **S2-J [P1] model B 的收尾动作「末窗一分为二」在自治控制器下**整个不存在**（E 与 I 的共同根因）**
-
-  原始设计写在 `abfe_preoptimizer.py:9556`（`feasible_repair_actions` 内）：
-  「这一条问的是**溢出槽长到能一分为二了没有**，是 model B 插点的**收尾条件**；
-  继续插 λ 让末窗长大即可到达；拆窗只是末窗溢出压不住时的收尾动作。」
-  即：插 λ 把末窗养大，到 `K ≥ 2·lo−1`（lo=4 时 K=7）就**一分为二**。
-
-  | | 状态 |
-  |---|---|
-  | 判据 `split_last_window_in_two` | ✅ 每轮都算，两个真机盘面都答**可拆** |
-  | 执行器 `split_window_from_ibs_lse_failure` | ✅ 存在（`abfe_preoptimizer.py:1497`） |
-  | **调用者** | ❌ 全仓只有 `abfe_pipeline.py:10933`，在 **path_evolution 的异常处理**里 |
-
-  而自治控制器**显式关闭**那条路径（每份日志都印着「关闭 … path_evolution 的插 λ
-  修复分支」），并有断言钉死（`abfe_pipeline.py:17169`）。
-  ⟹ **判据活着、执行器活着、动作不存在。**
-
-  控制器自己的 `SPLIT_TAIL_WINDOW` 是**另一个更重的动作**
-  （`repartition_tail_from_anchor`：从 anchor 起重分**整个尾段**，要 tail anchor），
-  不是「末窗一分为二」。审计 #24 把两个问题分开时判据留在了
-  `split_last_window_in_two`，**但没给控制器补上对应的动作**。
-
-  **⟹ `S2-E` 与 `S2-I` 是它的两个症状**：
-  `末窗失败 → 插 λ(跨度不变) → 变宽 → 能量+f_k 全废 → 重采重学 → 再插 → 撞 hi 卡死`。
-  中间本该有一步「K≥7 就一分为二」。
-
-  ⚠️ 修它**不是**重新打开 `path_evolution`（那条被关是有理由的：同一个决定不许两套
-  机制各判一次）。要做的是把「末窗一分为二」作为**控制器的一个动作**补进动作表 +
-  执行器分发，判据直接用现成的 `split_last_window_in_two`。**这条一补，E 和 I 自动消解。**
-
-  完整记录 → [STAGE2_CONTROLLER_WAVE_2026-09-17.md](STAGE2_CONTROLLER_WAVE_2026-09-17.md) §3.J
-
-- [x] **S2-H [P1] 「总是改变盘面」的动作对停滞保护与 no-op 台账结构性免疫（2026-09-17 真机 `cmet_ligand1/rep1`）**
-
-  停滞保护判的是「同一个动作 + **盘面未变**」（`seen[key] >= 3`）。而 `RECALIBRATE_FK`
-  `probe_only=False`、**开新采样段** ⟹ `_disk_signature()` 里的 `segment` /
-  `aggregated_segments` 必变 ⟹ `seen[key]` 每轮重置成 1 ⟹ **永远到不了 3**。
-  `action_noop_fingerprint()` 含段维度，同理永不匹配。
-  ⟹ **这一族动作对唯一的通用刹车免疫**，叠加 `S2-F`（无事后有效性检查）即可无限重标定。
-
-  **真机（31/40 轮里 17 轮花在窗口 4）**：
-
-      20 RECALIBRATE_FK  seg=vanishing    steps=750000  ratio=9.645  ← 离门 10 差 0.355
-      21 RECALIBRATE_FK  seg=vanishing_4  steps=250000  ratio=4.182  ← 新段，750k 步作废
-      22 RECALIBRATE_FK  seg=vanishing_5  steps=250000  ratio=0.837
-      23 RECALIBRATE_FK  seg=vanishing_6  steps=250000  ratio=7.017
-
-  它在第 20 轮再补一块几乎必过；三次重标定把它推到 0.837，全程无人察觉。
-  盘上留下 7 个采样段。**定 P1 的理由**：17/31 轮花在一个窗口上，
-  这样的烧法会把 40 轮预算耗尽 ⟹ `ITERATION_CAP_NOT_CONVERGED`，拿不到结果。
-
-  ⚠️ **别用「把 `RECALIBRATE_FK` 加进 `_NOOP_GUARDED`」来补**：no-op 判据问的是
-  "盘面变没变"，而它**真的变了**（新段是真实产物）。要判的是"变好还是变坏"——
-  那是 `S2-F` 的判据。两条必须一起修：只修 F，控制器仍可每轮换新段绕过重复计数；
-  只修 H，第 3 次会被拦，前两次仍白烧。
-
-  完整记录 → [STAGE2_CONTROLLER_WAVE_2026-09-17.md](STAGE2_CONTROLLER_WAVE_2026-09-17.md) §3.H
-
-- [x] **S2-G [P1] 退役判定看不见「从没采过的窗口」⟹ 整跑崩溃（2026-09-17 真机 `cmet_ligand2`）**
-
-  `Stage2RepairController._retirable_window()` 第一行就取错了源：
-
-      recs = {int(w["window_idx"]): w for w in (view.get("windows") or [])}
-
-  `view["windows"]` 只收**盘上有产物**的窗口；从没采过的窗口在
-  `view["missing_windows"]`，**不在这张表里**。而"别处还有没有活干"就是遍历 `recs`
-  ⟹ 对一个**整窗未采、块配额分文未动**的窗口**恒答否** ⟹ 不退役 ⟹ 交出终态。
-
-  **真机崩溃链条**：w4 跨全部段已批 4 块（上限 4）→ `plan()` 补帧准入拒 →
-  `NO_ACTION` + `NO_FEASIBLE_ACTION`（`halt_scope=TARGET_LOCAL`，可退役）→
-  `_retirable_window` 找不到候选（w5 未采、不在 `recs`）→ 不退役 → 终态 →
-  退出前 ANALYZE 也跳过（`missing_window_5`）→ `_assert_stage_result_sane` 抛
-  `RuntimeError`，整跑失败。**w5 一步都没跑过。**
-
-  分支 6b（缺窗 → 补采）在结构上就在下游，`plan()` 里的准入闸先一步把整轮变成终态，
-  根本落不到它。
-
-  ⚠️ **这条不是分支顺序问题** —— 只是一个集合取错了源，修它不碰 `_decide_once` 的
-  任何分支、不改任何优先级。与 `AUDIT-S2-02` 那批（`S2-A/B/E/F`）性质不同，可单独做。
-
-  判据：布局里有、产物里没有的窗口必须算作"别处还有的活"。
-  完整记录 → [STAGE2_CONTROLLER_WAVE_2026-09-17.md](STAGE2_CONTROLLER_WAVE_2026-09-17.md) §3.G
-
-- [ ] **AUDIT-S2-03 [P1] 控制器已有真机，但**没有一次以 `DONE` 收口** —— 验收口径仍未达成。**
+- [ ] **AUDIT-S2-03 [P1] 控制器已有真机，但**旧验收判据（`DONE`）单跑结构性不可达，
+  2026-09-18 已换判据**；新判据下的闭环仍未在修复后的代码上拿到。**
   📌 **2026-09-16 更正：本条原文「控制器真机零验证」已不成立。** 全量 benchmark
   （13 体系 ×3 = 39 rep）真上过 GPU，9 个跑出 `final_binding_results.json`。
   但**其中只有 2 个跑的是修复后的代码**（`p38_ligand1/rep2` 启动 09-16 06:29:45、
@@ -218,9 +93,60 @@
   不是 `DONE`。**（两者都在 `TERMINAL_EXITS` 里，是**合法终态、不是 bug** ——
   但设计 §7 要的验收是「六窗全部 `ANALYSIS_ELIGIBLE` → `DONE`」，那个还没在修复后的代码上出现过。）
   ⚠️ 2026-09-14 那约 **30 处**修复 + 09-16 的 `BM-01`~`03`/`05`，真机覆盖仍然只有上面这 2 个 run。
-  **在拿到一次修复后代码的 `DONE` 闭环之前**：不得声称「Stage-2 自治闭环可用」；
+
+  📌📌 **2026-09-18 再次更正：旧判据（`decide()` 给 `DONE` 且 `execution_status=COMPLETE`）
+  在单跑里结构性不可达，已作废。** 逐条核实（与 `abfe-benchmark-cf` 会话对过 36 份台账）：
+  · `DONE` ⟸ `precision_status == MEETS_CROSS_REPEAT_TARGET`
+    （`abfe_preoptimizer.py:6038` / `:7805`），而 `MIN_INDEPENDENT_REPEATS = 3`
+    （`abfe_core.py:2672`）。
+  · Stage-2 IBS **真正计算**该字段的三条生产路径全传空列表
+    （`ibs_engine.py:23632` / `:23789` / `:24158` 的 `cross_repeat_precision([])`），
+    且仓内**没有跨-run 聚合器**回写它 ⟹ 单跑恒 `UNMEASURED`。
+    ⚠️ **「全仓只有三个产出点」的说法不准确，别照抄** —— `"precision_status"` 全仓
+    有 22 处（`grep -n '"precision_status"' *.py`），但它们分三类，没有一类能产出
+    `MEETS`：① **计算**的就上面三处，全传空列表；② **硬写 `UNMEASURED`** 四处
+    （`abfe_pipeline.py:2537` / `:6969` / `:10680` / `:10755`，外加
+    `ibs_engine.py:23788` / `:24157`）；③ 其余是**转抄/汇总**
+    （`abfe_pipeline.py:6658` / `:7830` / `:7858` / `:14885`、
+    `abfe_preoptimizer.py:3388` / `:4450`、`runabfe.py:7125` / `:7137` / `:8804`、
+    `ibs_engine.py:14505` / `:23700`），只搬不算，且 `runabfe.py:7125` 的两腿合并
+    对缺失值兜底成 `"UNMEASURED"`。⟹ 结论不变，而且比原说法更强。
+  · `execution_status=COMPLETE` 不是第二道条件，只是 `action == "DONE"` 的派生值
+    （`abfe_preoptimizer.py:5853`）。
+  · `--allow-untrusted-stage-results` 救不了 —— 它换出口的那两行写在
+    **precision 已达标的 then 分支里面**（`:6045` / `:7813`）。
+  · 单跑的合法终态本来就存在：`action=NO_ACTION` + `exit=ANALYSIS_COMPLETE_PRECISION_UNMEASURED`
+    （`:6047` / `:7816`，`EXIT_SPECS` 里 `terminal=True`，见 `:2782`）。
+  · 管线侧 2026-09-15 已经换过判据：非 `DONE` 出口**不再** raise，只记日志
+    （`abfe_pipeline.py:8599`）；真正拦的是分析不完整 / 窗口子集 / λ 覆盖不全 / 非有限结果。
+  · 「能不能当已验收结果发布」另有专门闸 `publishable_as_accepted_result`
+    （`abfe_pipeline.py:7870`），`MEETS` 的要求在**那里**，控制器层不必再要一遍。
+  ⚠️ 真机 36 份台账：`NO_FEASIBLE_ACTION` 20 / `ANALYSIS_COMPLETE_PRECISION_UNMEASURED` 16 /
+  **`DONE` 0**；`precision_status=UNMEASURED` 25/25；**没有任何 run 出不来**（全部有
+  `outcome.exit`）。上层语义也是接对的：未验收走 WARNING + 零退出码 + 产物齐全。
+  ⚠️ 即使凑够 3 个独立重复也大概率拿不到 `MEETS`：按臂实测跨 rep 散布是报出 σ 的
+  **3.7× 中位**（10 个臂无一小于 1；三个 n=3 的臂 3.3/3.0/1.9×），而门槛是
+  `CROSS_REPEAT_MAX_STDDEV_KCAL_PER_MOL = 1.0`（`abfe_core.py:2671`）。
+  把判据改写成「拿到 `MEETS`」只是把一个不可能事件换成另一个。
+
+  **新判据（2026-09-18）—— 任一体系在当前代码上跑出：**
+  1. `analysis_status = ANALYSIS_COMPLETE`（两条腿都要）；
+  2. `action = NO_ACTION`；
+  3. `autonomous_outcome.exit = ANALYSIS_COMPLETE_PRECISION_UNMEASURED`；
+  4. `missing_windows` / `skipped_windows` / `skipped_sampling_units` /
+     `out_of_range_windows` **全空**；
+  5. 不带 `stage_scope = window_subset_no_stage_verdict`，也不带
+     `subset_partial_sum_not_delta_G = true`；
+  6. `coverage_diagnostics` 覆盖**全部** λ 态且 `dropped_window_indices` 为空。
+
+  `DONE` 需要 ≥3 个独立重复，属 **BM 跨-run 验收**，不属控制器单跑验收 ⟹ 归 `BM-B`。
+  **在拿到一次满足上面六条的闭环之前**：不得声称「Stage-2 自治闭环可用」；
   不得删除任何旧修复路径（`S2-E`）；控制器产出的任何 ΔG 都不是可引用结果。
-  判据：任一体系在当前代码上跑出 `decide()` 给 `DONE` 且 `execution_status=COMPLETE`。
+
+  ⚠️ 本条上面那句「设计 §7 要的验收是『六窗全部 `ANALYSIS_ELIGIBLE` → `DONE`』」
+  指的是 2026-09-12 那次真机 —— 那是 **09-15 收紧 `DONE` 判据之前**的事，不能拿它
+  当现在的验收口径。设计文档 `STAGE2_CONTROLLER_DESIGN_2026-09-12.md:237` 那句
+  「`DONE` 在结构上不可达」说的是**另一件事**（中间结果不落盘的死锁，已修），别混。
 
 - [ ] **BM-B [P1] 全量 benchmark（13 体系 ×3 = 39 rep）：30 个未完成 run 里，最后启动在修复之后的是 0 个。**
   **先取证，再重跑 —— 但有 6 个不能直接重跑，见下。**
@@ -300,7 +226,7 @@
 
   1. **`输出目录已被另一次运行独占（目录锁）` 历史出现 4 次，全部出自 `cyclod_ligand1`** ——
      `REL-09` 第一次拿到真机证据，已记到那条下面（该条 09-17 关闭，整段进
-     [archive/TODO_closed_2026-09-17.md](archive/TODO_closed_2026-09-17.md)）。
+     [archive/TODO_closed.md](archive/TODO_closed.md)）。
   2. **`thrombin_ligand2` 连 run 目录都没有**（同为 +1 e 配体）。**输入是齐的**
      （`systems.csv`：`status=ok`、`q_lig_e=+1.000`、43764 原子）—— 就是**一次都没启动过**。
 
@@ -391,18 +317,18 @@
   production rescue / rescue 后重标定，**等自治这条再跑通几次再删**。这不是待办，
   是一条禁令：解除它的条件写在 `AUDIT-S2-03` 的判据里。
 
-- [STAGE2_CONTROLLER_DESIGN_2026-09-12.md](STAGE2_CONTROLLER_DESIGN_2026-09-12.md)
+- [STAGE2_CONTROLLER_DESIGN_2026-09-12.md](archive/STAGE2_CONTROLLER_DESIGN_2026-09-12.md)
   —— **权威**：设计 + 实证 + 十条真机咬过的陷阱。最贵的一条是
   **「同一个不变量的 N 份实现」**（λ 身份有四份）。
-- [AUTONOMOUS_STAGE2_LOOP_SPEC_2026-09-11.md](AUTONOMOUS_STAGE2_LOOP_SPEC_2026-09-11.md)
+- [AUTONOMOUS_STAGE2_LOOP_SPEC_2026-09-11.md](archive/AUTONOMOUS_STAGE2_LOOP_SPEC_2026-09-11.md)
   —— 老板定的核心设计指标（唯一验收指标）。
-- [STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md](STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md)
+- [STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md](archive/STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md)
   —— 逐个 bug 的修复流水账（历史，不是待办）。
-- [PLAN_PATH_REPAIR_2026-09-11.md](PLAN_PATH_REPAIR_2026-09-11.md) —— 设计要求的来源，
+- [PLAN_PATH_REPAIR_2026-09-11.md](archive/PLAN_PATH_REPAIR_2026-09-11.md) —— 设计要求的来源，
   分支编号（5a/5b/6）出自这里；代码里 10 余处引它作设计依据。
-- [STAGE2_THREE_AXES_COUPLING_2026-09-11.md](STAGE2_THREE_AXES_COUPLING_2026-09-11.md)
+- [STAGE2_THREE_AXES_COUPLING_2026-09-11.md](archive/STAGE2_THREE_AXES_COUPLING_2026-09-11.md)
   —— 分窗口/分 λ/分采样量三轴当前怎么耦合的。
-- [STAGE2_ROOT_CAUSE_2026-08-28.md](STAGE2_ROOT_CAUSE_2026-08-28.md) —— **所有收敛门
+- [STAGE2_ROOT_CAUSE_2026-08-28.md](archive/STAGE2_ROOT_CAUSE_2026-08-28.md) —— **所有收敛门
   对单轨迹重加权这个失效模式是瞎的**：实测门全绿时 ΔG 错 42 kJ/mol。别拿质量门当验收。
 
 ---
@@ -417,15 +343,19 @@
 > 优先级只看方括号 `[P1]`。
 
 背景：`B_φ` **不是配体的物理模型**，是提高 λ 态混合的**采样增强项**；按体系在线学的只有 `f_k`。
-方案见 [EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md](EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md)，
-P1 落地见 [EXP-033_P1_LANDED_2026-09-12.md](EXP-033_P1_LANDED_2026-09-12.md)。
+方案见 [EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md](archive/EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md)，
+P1 落地见 [EXP-033_P1_LANDED_2026-09-12.md](archive/EXP-033_P1_LANDED_2026-09-12.md)。
 **`LR-01`（残差开关的指纹作用域）2026-09-13 核实已修，整段进
-[archive/TODO_closed_2026-09-13.md](archive/TODO_closed_2026-09-13.md)，别再列。**
+[archive/TODO_closed.md](archive/TODO_closed.md)，别再列。**
 **P3（跨配体通用权重）已于 2026-09-12 由用户拍板划掉，前提没了，别重新提。**
 
 - [ ] **LR-06 [P1] 预热鬼影期 × 插件 0.1 Å 硬门 ⟹ outer 臂在窗口 0 必死。**
   **🟢 2026-09-16：方案 A 已落地并真机验证。2026-09-17：第 6 步真机通过。**
-  **⏸️ 剩下的第 5、7 步 2026-09-17 由维护者判为「不着急，等控制器修完再动」** —— 第 7 步换体系复跑会把控制器当前那批未收口的改动一起卷进去，跑了也说明不了插件；第 5 步删脚手架要在有真机复跑兜底时才敢动。**别再把 LR-06 当「现在最能推的一条」。**
+  **⏸️ 剩下的第 5、7 步 2026-09-17 由维护者判为「不着急，等控制器修完再动」** —— 第 7 步换体系复跑会把控制器当前那批未收口的改动一起卷进去，跑了也说明不了插件；第 5 步删脚手架要在有真机复跑兜底时才敢动。
+
+  🔺 **2026-09-18 更新：第 5 步的押后条件（「有真机复跑兜底」）已经满足。**
+  `cyclod_ligand1_outer` rep2/rep3 **带着那两个猴子补丁跑完全程**（详见第 6 步）。
+  第 7 步（换体系）**仍然没做** —— rep2/rep3 是同一个体系，不是换体系。
 
   ### 已做完（代码 + 真机）
 
@@ -436,9 +366,9 @@ P1 落地见 [EXP-033_P1_LANDED_2026-09-12.md](EXP-033_P1_LANDED_2026-09-12.md)�
   | 2. 重编 | ✅ `g0_build.sh` 三个 `.so` 全通过 |
   | 3. 回归 | ✅ `exp028_run_regression_suite.sh` **ALL TESTS PASS**（5 个原生 harness）。⚠️ **G1/G2/G3 三个一致性 harness 没跑** —— 它们要 `yyjson`，本机 `$CONDA_PREFIX/include/yyjson.h` 缺失，套件按设计跳过。**改动最需要它们，这是本次验证的已知缺口**，下面用真机 A/B 代偿 |
   | 4. 同步两处 sha256 | ✅ `local_residual/openmm_plugin.py::KNOWN_PLUGIN_SOURCE_SHA256` + `resources/…/manifest.json` 的 `plugin.source_sha256` → `5c74365dffaa…` |
-  | 5. 删临时脚手架 | ⏸️ 押后（见上：等控制器）。`local_residual/em_no_residual.py::install()` 里 `patched_set_parameter` / `patched_get_state` 两个 `Context` 级补丁**仍在**（2026-09-17 核实） |
-  | 6. `cyclod_ligand1_outer` 复跑 | ✅ **2026-09-17 真机通过**。同一份 `runs/cyclod_ligand1_outer/rep1/launch.log` 里两次启动直接对照（判版本用**启动横幅**不用 mtime，`BM-B` 取证①）：**09-16 02:46（夹取前）** 行 303–357 窗口 0 热化 `fail-closed … pair distance below 0.1 A`，步长降到 0.008 fs 仍炸 → `RuntimeError`；**09-17 01:22（夹取后）** 行 358–1251 `fail-closed` **0 次**，窗口 0–4 全部跑出能量，走到 `[自治 15/40]`，02:29 终止于**人为 SIGTERM**（`TerminationRequested`），不是插件。⟹ 「outer 臂在窗口 0 必死」这个失效模式已消除 |
-  | 7. 换疏水口袋体系再跑 | ⏸️ 押后（见上：等控制器）。`runs/` 下目前只有 `cyclod_ligand1_outer` 一个 outer 目录，jnk1/p38/brd4 一个都没跑过 |
+  | 5. 删临时脚手架 | 🔓 **2026-09-18 解除押后**（押后理由是「要有真机复跑兜底」，第 6 步已给出两个完整 run）。两个 `Context` 级补丁**仍在**，但代码里那条「这套东西还没经过大规模验证」（`em_no_residual.py:138`）的注释已经**过期**。⚠️ 两半代价不同，别当一件事做：`patched_set_parameter` 的 9 处调用点全在 `ibs_engine.py`、全是 `context.setParameter(f"{self.prefix}_bias_scale", X)` 同一形状（6786 / 15912 / 15934 / 15953 / 15968 / 16115 / 16152 / 16196 / 19897）⟹ 一个 helper 收掉，顺带消掉「同一不变量 9 份实现」的形状；`patched_get_state` **故意是全局的** —— 它拦的是鬼影期内进程里**任何**不带 `groups` 的 `getState`，不只是 `step_guard.py:104/186` 那两处，改成逐点显式传参就是补丁注释自己写的「逐个去包必然漏」⟹ **建议保留，并把「为什么不合并」写进注释** |
+  | 6. `cyclod_ligand1_outer` 复跑 | ✅ **2026-09-17 真机通过**。同一份 `runs/cyclod_ligand1_outer/rep1/launch.log` 里两次启动直接对照（判版本用**启动横幅**不用 mtime，`BM-B` 取证①）：**09-16 02:46（夹取前）** 行 303–357 窗口 0 热化 `fail-closed … pair distance below 0.1 A`，步长降到 0.008 fs 仍炸 → `RuntimeError`；**09-17 01:22（夹取后）** 行 358–1251 `fail-closed` **0 次**，窗口 0–4 全部跑出能量，走到 `[自治 15/40]`，02:29 终止于**人为 SIGTERM**（`TerminationRequested`），不是插件。⟹ 「outer 臂在窗口 0 必死」这个失效模式已消除。<br><br>🔺 **2026-09-18 追加（同僚会话 `abfe-benchmark-cf` 取证）：不只是「不死了」，是跑完了。** `rep2`/`rep3` **全程带着第 5 步那两个猴子补丁**，跑出完整结果：<br>· `rep2` ΔG_bind **-6.28 ± 0.48** kcal/mol，`untrusted=False`（complex 71.20 / solvent 44.94 / Boresch -37.02 kJ/mol），控制器 19 轮，末轮 `NO_ACTION`<br>· `rep3` ΔG_bind **-2.00 ± 0.52** kcal/mol，`untrusted=False`（complex 56.94 / solvent 48.57 / Boresch -32.24 kJ/mol），控制器 14 轮，末轮 `NO_ACTION`<br>· 两 rep 的 complex/solvent **两条腿 `analysis_status` 均为 `ANALYSIS_COMPLETE`**，`precision_status` 均为 `UNMEASURED`，`outcome.exit` 均为 `ANALYSIS_COMPLETE_PRECISION_UNMEASURED`<br>· 版本（按启动横幅，`BM-B` 取证①）：**2026-09-17 14:43:12-04:00** / **15:54:47-04:00**，`abfe_ibs_commit=9a18ded`，RTX 5080 ⟹ 落在「09-17 那批控制器改动之后、09-18 的 `S2-N`/`S2-O` 之前」<br>· `rep1` 无结果，崩在 `ExistingEnsembleRequiresRescueAudit`（IBS state score identity mismatch）—— **这是闸在正常工作，别放宽**：逐 rep 闭式重训 ⟹ `sampling_score_sha256` 逐 rep 不同 ⟹ 拒绝复用别的 rep 的 ensemble；要跑得给它自己的干净 checkpoint 目录<br><br>⚠️⚠️ **`runs/cyclod_ligand1_outer` 与 `runs/cyclod_ligand1` 两臂不能做 A/B。** 两个 config 逐键只差两行（`output` 与 `outer_lambda_local_residual_ibs`），但冻结 manifest 只覆盖 Atenolol、本配体 27 原子对不上指纹 ⟹ 走 EXP-033 P1 的**自动闭式重训**，**三个 rep 各自拟合各自的 B_φ**。所以 outer 均值 -4.14 vs 基线均值 -5.36 这个差**不构成 outer 臂的效果证据**。真要 A/B 得按 `docs/RETRAIN_LOCAL_RESIDUAL.md` 手工冻结一份权重给两臂共用 |
+  | 7. 换疏水口袋体系再跑 | ⏸️ **仍然押后，2026-09-18 复核后不变**。`runs/` 下仍然只有 `cyclod_ligand1_outer` 一个 outer 目录，jnk1/p38/brd4 一个都没跑过。第 6 步新增的 rep2/rep3 **是同一个体系**，补的是「补丁能跑完」，不是「换了体系也成立」⟹ 这一步的缺口原样还在 |
 
   ### 真机 A/B（RTX 2080 Ti，mixed precision，改动前后两份独立编译的 `.so`、两个独立进程）
 

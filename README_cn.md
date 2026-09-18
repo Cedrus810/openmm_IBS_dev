@@ -1,6 +1,6 @@
 # ABFE-IBS：绝对结合自由能工作流
 
-[English](README_en.md) · [简明入口](README.md) · [完整文档](docs/README.md)
+🌐 [**English (项目首页) →**](README.md)　·　[文档导航](docs/README.md)　·　[目录结构](PROJECT_LAYOUT.md)
 
 ABFE-IBS 是一个基于 OpenMM 的绝对结合自由能（ABFE）工作流。它读取 GROMACS
 `.gro/.top` 体系，分别计算配体在蛋白复合物和体相溶剂中的去耦自由能，并用 IBS
@@ -10,15 +10,21 @@ ABFE-IBS 是一个基于 OpenMM 的绝对结合自由能（ABFE）工作流。�
 Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS
 ```
 
-方法学依据与逐项文献见 [docs/METHODS.md](docs/METHODS.md)。
-
 管线覆盖 GROMACS→OpenMM 建系、complex/solvent 两腿、dual-lambda 解耦、
 IBS 预热与固定偏置 production、MBAR/TMBAR 估计、Boresch attachment/release 记账、
 LJ 长程修正、缓存、续跑和 fail-closed 质量门。
+每一步实现的是哪篇文献的方法见 [docs/METHODS.md](docs/METHODS.md)。
 
-> **当前科学状态见 [docs/STATUS.md](docs/STATUS.md)。** 本仓库目前**没有**可以作为
-> 最终结论引用的结果；主线体系、结果登记、协议版本和开放问题全部登记在那一份，
-> 引用任何数字前先读它。
+仓库里还有一条 **RBFE（相对结合自由能）** 线，入口是 `runrbfe.py`，独立于 ABFE 主线。
+
+> ## ⚠️ 引用任何数字之前
+>
+> **本仓库目前没有可以作为最终结论引用的结果。** 主线体系（4W53 / T4 lysozyme
+> L99A + toluene）、结果登记表、协议版本、开放问题和有效性判据**全部**登记在
+> [docs/STATUS.md](docs/STATUS.md) —— 那是本仓库唯一声明科学状态的文档，
+> 本文和其它任何地方都不再复制它的表。
+>
+> **文件名里有 `final` 不代表结果可以引用。** 判据在同一份里。
 
 ## 1. 环境
 
@@ -53,7 +59,7 @@ python runabfe.py config-template --out my_system.json
 | `--output` | 独立的**新**输出目录 |
 
 `abfe_config.json` 是参考配置，含机器相关的 `gmx_path` 和针对历史运行冻结的选项。
-不要未经审阅就当成新体系模板——用 `config-template` 生成，或读
+不要未经审阅就当成新体系模板 —— 用 `config-template` 生成，或读
 [迁移教程](docs/MIGRATING_TO_A_NEW_SYSTEM.md)。
 
 **不要把任何体系的 checkpoint 复用到另一个体系。**
@@ -73,15 +79,10 @@ python runabfe.py \
   --boresch --boresch-source simple
 ```
 
-续跑：
+续跑 / 只分析已有能量和 checkpoint（不跑动力学）：
 
 ```bash
 python runabfe.py --config abfe_config.json --ligand MOL --resume
-```
-
-只分析已有能量和 checkpoint（不跑动力学）：
-
-```bash
 python runabfe.py --config abfe_config.json --ligand MOL --analyze-only
 ```
 
@@ -93,78 +94,57 @@ python runabfe.py --config abfe_config.json --ligand MOL --analyze-only
 结果落在 `--output` 目录：`final_binding_results.json` 是汇总，
 `run_provenance.json` 记录协议身份和输入指纹，`checkpoints/` 是续跑依据。
 符号约定、每一项的口径和续跑语义见
-[OUTPUTS_AND_RESUME.md](docs/OUTPUTS_AND_RESUME.md)。
-
-**文件名里有 `final` 不代表结果可以引用。** 判据在
-[docs/STATUS.md](docs/STATUS.md)。
+[OUTPUTS_AND_RESUME.md](docs/OUTPUTS_AND_RESUME.md)；能不能引用见上面那条。
 
 ## 5. 改代码后的最低验证
 
 ```bash
-./tests/run_offline_tests.sh                                # 全部（排除 needs_gpu）
+./tests/run_offline_tests.sh                                       # 全部（排除 needs_gpu）
 ./tests/run_offline_tests.sh tests/test_core_physics_numerics.py   # 单个文件
 ```
 
 测试通过证明**软件契约**成立，不自动证明新的**科学结果**已验证。
-维护规则见 [MAINTAINING.md](docs/MAINTAINING.md) 和 [PROJECT_LAYOUT.md](PROJECT_LAYOUT.md)。
+完整的三档验证与「改完该更新哪份文档」见 [MAINTAINING.md](docs/MAINTAINING.md)。
 
-## 6. 仓库地图
+## 6. 从哪里开始读代码
 
-```text
-runabfe.py                  ABFE 主命令入口（含 doctor / validate-config / config-template）
-runrbfe.py                  RBFE 命令入口（相对结合自由能，独立于 ABFE 主线）
-abfe_core.py                体系构建与底层物理组件
-abfe_pipeline.py            阶段编排、质量门、resume 和结果落盘
-abfe_preoptimizer.py        lambda 路径与窗口预优化；Stage-2 分窗与修补控制器
-ibs_engine.py               IBS、MBAR/TMBAR、Boresch、LRC 核心
-free_energy_engine.py       ABFE / RBFE 共用的自由能采样引擎
-abfe_diagnostics.py         doctor / validate-config / config-template 的实现（只读）
-rbfe_core.py                RBFE 数据契约、输入验证、ΔΔG 汇总
-rbfe_pipeline.py            RBFE 编排层
-step_guard.py               OpenMM 步进的统一异常出口（模块级 import，缺了整条链起不来）
-lambda_path_versions.py     Stage-2 λ 路径的版本记录
-multi_segment_analysis.py   多采样段分析适配层（同窗口多段相加而非替换）
-apbs_correction.py          Rocklin 有限尺寸静电修正（膜路线用，当前不在主线）
-outer_lambda_neural_basis.py  外层 λ 神经基势（local_residual 加载器的依赖）
-local_residual/             local-residual 路径势
-resources/                  冻结的 R1 模型资源（2026-09-12 起随仓库分发）
-abfe_scripts/               离线脚本：local-residual 训练 / 导出 / manifest
-exp012_xed/                 EXP-012 独立研究代码（local_residual 的二阶依赖）
-tests/                      回归与协议测试
-tools/                      诊断、显式修复和绘图（非生产入口）
-plugins/                    原生 OpenMM 插件源码
-docs/                       唯一文档集
-```
+- `runabfe.py` —— ABFE 主命令入口（`doctor` / `validate-config` / `config-template` 也在这）
+- `runrbfe.py` —— RBFE 命令入口
+- `abfe_config.json` —— 参考配置，**不是新体系模板**
 
-逐条说明见 [PROJECT_LAYOUT.md](PROJECT_LAYOUT.md)。
+逐个模块干什么、哪些是"缺一个 clone 就跑不起来"的支撑模块、文件往哪放，
+**全在 [PROJECT_LAYOUT.md](PROJECT_LAYOUT.md)** —— 那是仓库结构的唯一出处，
+本文不再复制一份目录树。
 
 ## 7. 文档
 
+**[docs/README.md](docs/README.md) 是完整文档地图。** 最常用的四个入口：
+
 | 目标 | 入口 |
 |---|---|
-| 当前科学状态、结果登记、协议版本 | [docs/STATUS.md](docs/STATUS.md) |
-| 方法学依据与文献引用 | [docs/METHODS.md](docs/METHODS.md) |
-| 安装、输入与命令 | [GETTING_STARTED.md](docs/GETTING_STARTED.md) |
-| 输出结构、符号、续跑 | [OUTPUTS_AND_RESUME.md](docs/OUTPUTS_AND_RESUME.md) |
+| 当前科学状态、结果能不能引用、协议版本 | [docs/STATUS.md](docs/STATUS.md) |
+| 安装、输入与首次运行 | [GETTING_STARTED.md](docs/GETTING_STARTED.md) |
+| 还欠什么活（带 `[P1]`/`[P2]`/`[P3]` 等级） | [docs/TODO.md](docs/TODO.md) |
 | 排障 | [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) |
-| 迁移到其他体系 | [MIGRATING_TO_A_NEW_SYSTEM.md](docs/MIGRATING_TO_A_NEW_SYSTEM.md) |
-| 改代码和验证 | [MAINTAINING.md](docs/MAINTAINING.md) |
-| 还欠什么活（唯一待办清单） | [docs/TODO.md](docs/TODO.md) |
-| 历史材料索引 | [docs/HISTORY_LOG.md](docs/HISTORY_LOG.md) |
-| 完整文档地图 | [docs/README.md](docs/README.md) |
 
-本仓库是 ABFE-IBS 的**工程区分支**：只有工作流源码、生产回归测试、诊断工具和使用
-文档。参考体系的 `output*` / 轨迹 / checkpoint、失败实验记录和逐条决策历史都在
-`Atenolol-rank11` 工作区，本仓库只保留[历史材料索引](docs/HISTORY_LOG.md)。
+## 8. 这个仓库是什么
+
+**工程区分支**：只有工作流源码、生产回归测试、诊断工具和使用文档。参考体系的
+`output*` / 轨迹 / checkpoint、失败实验记录和逐条决策历史都在 `Atenolol-rank11`
+工作区，本仓库只保留[历史材料索引](docs/HISTORY_LOG.md)。
 
 **发布定位是 clone-and-run**：`git clone` 之后直接 `python runabfe.py …`，不打包。
-`pyproject.toml` 只承担 linter 配置。判据是 `pytest tests/test_fresh_clone_imports.py`。
-冻结的 R1 资源与预编译插件 `.so` 都随仓库分发，clone 下来不用编、不用另取。
+冻结的 R1 资源与预编译插件 `.so` 都随仓库分发，不用编、不用另取。判据是
+`pytest tests/test_fresh_clone_imports.py`。细节见 [PROJECT_LAYOUT.md](PROJECT_LAYOUT.md)。
+
+**`docs/` 下的教程以中文为准** —— 为开发速度做的既定选择，不是疏漏。
+仓库首页 [README.md](README.md) 是英文版，覆盖同样的完整流程；
+两份**不做逐字对等**（见 [docs/TODO_P3.md](docs/TODO_P3.md)）。
 
 ## 许可
 
 [MIT License](LICENSE)，Copyright (c) 2026 Ruigeng Ji。
 
-第三方组件署名与合规依据见 [NOTICE](NOTICE)——注意 **OpenMM 是双授权的**：
+第三方组件署名与合规依据见 [NOTICE](NOTICE) —— 注意 **OpenMM 是双授权的**：
 public API / reference / CPU platform / application layer 是 MIT，
 CUDA、HIP、OpenCL platform 是 LGPL。本仓库不 vendor 第三方源码，也不分发第三方二进制。

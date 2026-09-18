@@ -97,12 +97,33 @@ def test_failed_window_gets_one_lambda_inserted_not_split(tmp_path):
     assert len(LAMBDAS) < len(lam) <= len(LAMBDAS) + 3
     assert set(_q(LAMBDAS)) < set(_q(lam)), "已有 λ 一个都不能动"
 
-    inserted = (set(_q(lam)) - set(_q(LAMBDAS))).pop()
-    assert LAMBDAS[6] < inserted < LAMBDAS[3], "插点必须落在失败窗口内部"
+    # 🔑 [2026-09-18] **插点必须从 v2 那条事件里取，不能对"新增 λ 集合"做 `.pop()`。**
+    # 末窗合法化（见下）自己也会插点，于是新增 λ 通常有两个，`.pop()` 取到哪个
+    # 靠集合序 —— 这个断言先前是**靠运气**过的。
+    v2 = lpv.load_version(str(tmp_path), 2)
+    assert v2["event"]["kind"] == "insert_lambda"
+    assert v2["event"]["detail"]["failed_global_state_range"] == [3, 7]
+    for inserted in _q(v2["event"]["detail"]["inserted_lambda_vdw"]):
+        assert LAMBDAS[6] < inserted < LAMBDAS[3], "插点必须落在失败窗口内部"
 
+    # 🔑🔑 [2026-09-18] **插完必须已经合法化，重试拿到的布局不许有越界窗口。**
+    # 先前本测试钉的是 `load_current()["version"] == 2` —— 也就是「插完就停，
+    # 直接拿去跑」。那正是要修的 bug：插 λ 让末窗吸收溢出（这里 K 5→6 > hi=5），
+    # 而 `_run_stage2_with_path_evolution` 排在自治循环**之前**、当时不做任何
+    # 合法化，于是越界末窗被原样送进 `run_once`（真机 hi=6 的 run 里末窗跑到
+    # 7 态、预热+生产全程无声）。现在插完就地拆：
+    #   v2 insert_lambda（修复） → v3 insert_lambda（死区补 1，K 6→7）
+    #   → v4 tail_repartition（7 → 4+4）
+    lo, hi = 4, 5          # `_run` 用的是 `_run_stage2_with_path_evolution` 的默认值
+    retried_ranges = seen[1][1]
+    assert all(lo <= b - a <= hi for a, b in retried_ranges), (
+        f"重试时拿到的布局含越界窗口：{retried_ranges}"
+    )
+    assert [tuple(r) for r in rng] == retried_ranges, "返回的布局要和真跑的那份一致"
     record = lpv.load_current(str(tmp_path))
-    assert record["version"] == 2 and record["event"]["kind"] == "insert_lambda"
-    assert record["event"]["detail"]["failed_global_state_range"] == [3, 7]
+    assert record["event"]["kind"] == "tail_repartition", (
+        "末窗吸收溢出之后必须以一次拆窗收尾，否则盘上留的是越界布局"
+    )
 
 
 def test_every_window_always_keeps_at_least_four_states(tmp_path):
@@ -141,7 +162,21 @@ def test_exhausting_the_budget_reraises_and_keeps_progress(tmp_path):
     with pytest.raises(ie.IBSWarmupConvergenceError):
         _run(tmp_path, run_once, max_insertions=2)
     # 撞上限时路径与进度必须保留，供加预算后从这里继续。
-    assert lpv.load_current(str(tmp_path))["version"] == 3
+    # 🔑 [2026-09-18] 版本号不再是 3：每轮修复插点之后多了一次就地合法化
+    # （死区补点 + 拆末窗），所以链上是
+    #   v1 init / v2 insert(修复) / v3 insert(死区) / v4 tail_repartition / v5 insert(修复)
+    # 钉**语义**而不是那个数字：预算内的修复轮次恰好用满、进度留在盘上、
+    # 而且留下的是一份**合法**布局（撞上限不是把非法中间态留给下一跑的理由）。
+    hist = lpv.history(str(tmp_path))
+    repairs = [h for h in hist
+               if (h.get("event") or {}).get("reason")
+               == "ibs_warmup_f_k_not_converged"]
+    assert len(repairs) == 2, f"max_insertions=2 应恰好用满两轮修复，实得 {len(repairs)}"
+    cur = lpv.load_current(str(tmp_path))
+    assert cur["version"] == max(h["version"] for h in hist) > 1
+    assert all(4 <= b - a <= 5 for a, b in cur["window_ranges"]), (
+        f"撞上限之后盘上留的是越界布局：{cur['window_ranges']}"
+    )
 
 
 def test_undiagnosable_failure_is_reraised_without_touching_the_path(tmp_path):

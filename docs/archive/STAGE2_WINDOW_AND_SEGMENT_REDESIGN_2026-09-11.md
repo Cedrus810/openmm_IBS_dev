@@ -3,7 +3,7 @@
 > **已归档（2026-09-12）。** 文中八个 bug 全部已修并进主线（CHANGELOG 09-11 那条）。
 > 保留原文是因为它是这几处当前行为的**唯一出处**（分窗判据为什么用 ∫g dλ 而不是等弧长、
 > f_k 为什么必须在加帧前重标定）。**不是待办。**
-> Stage-2 现在开着的活见 [STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md](../STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md)。
+> Stage-2 现在开着的活见 [STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md](STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md)。
 
 ---
 

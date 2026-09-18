@@ -6,7 +6,7 @@
 > 其中 §1 / §2 / §2.7 / §3 含**已撤回**的中间结论（原处均有横幅），只当推导记录看。
 >
 > **壳退役之后剩下的误差不在本文** —— 见
-> [../STAGE2_SOLVENT_LEG_ERROR_BUDGET.md](../STAGE2_SOLVENT_LEG_ERROR_BUDGET.md)。
+> [STAGE2_SOLVENT_LEG_ERROR_BUDGET.md](STAGE2_SOLVENT_LEG_ERROR_BUDGET.md)。
 >
 > ⚠️ 本文仍被源码注释引用（`WCA_SHIELD_RETIRED` 为什么是 True、
 > `build_ibs_dual_system` 里那段为什么是死代码、三处断言方向为什么是反的
@@ -43,7 +43,7 @@
 
 **阅读顺序**：结论看本节 → 定罪证据看 §2.10 → §1/§2/§2.7/§3 有已撤回的
 中间结论（原处已加横幅），只当推导记录看。
-**壳退役之后的残差归因不在本文**，见 [../STAGE2_SOLVENT_LEG_ERROR_BUDGET.md](../STAGE2_SOLVENT_LEG_ERROR_BUDGET.md)。
+**壳退役之后的残差归因不在本文**，见 [STAGE2_SOLVENT_LEG_ERROR_BUDGET.md](STAGE2_SOLVENT_LEG_ERROR_BUDGET.md)。
 
 **代码改动**：`WCA_SHIELD_RETIRED = True`（构造整段留在永久为假的分支，
 翻常量即复活）、三处硬断言方向反转（生产去壳 ⟹ bias 校准探针也必须去壳）、
@@ -57,7 +57,7 @@
 数据源：`4W53/output_v3_seed20260908/solvent_leg/`（甲苯，15 原子 = 7C+8H；
 6 个窗口全部 `ligand_com_restraint_protocol_version = 2`，即 Group5 修复**之后**；
 落盘 2026-09-01 17:21–17:46）。参考真值口径见
-`docs/STAGE2_ROOT_CAUSE_2026-08-28.md` §9.1。
+`docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md` §9.1。
 
 ---
 

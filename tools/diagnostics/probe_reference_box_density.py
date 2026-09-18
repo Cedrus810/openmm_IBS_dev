@@ -4,7 +4,7 @@
 
 ## 背景（一句话）
 
-`docs/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md` 把溶剂腿 −4.32 kJ/mol 残差里的
+`docs/archive/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md` 把溶剂腿 −4.32 kJ/mol 残差里的
 **−0.86（20%）** 归给"生产与真值不在同一密度"。那条归因立在一个**未直接检验过的
 前提**上：43.950 nm³ 的**建系盒**才是偏离平衡的那个，42.63~42.75 的生产盒是对的。
 

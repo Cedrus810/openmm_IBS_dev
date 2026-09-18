@@ -1,6 +1,6 @@
 """EXP-033 §5 P1：把「换配体重训 B_φ」压成一次闭式求解。
 
-`docs/EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md` §5 P1 的五条，逐条落在这里：
+`docs/archive/EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md` §5 P1 的五条，逐条落在这里：
 
 1. 闭式拟合。目标函数就是现有的 `bidirectional_gap_variance_loss`——它对 `B` 二次，
    而线性 `B` 对参数二次 ⟹ `θ* = −(M + λΩ)⁻¹ b`。正则是 **r 方向的二阶平滑先验**，
@@ -8,7 +8,7 @@
    互相抵消。λ 用**内层** CV 选，不看测试折。不 import torch、不跑 SGD。
 2. 口径对账。标签**不读** `energies.npy`，用逐态软核 probe 现算 —— 于是 §2.2 那个
    「LRC 算没算进去、单位是 kJ/mol 还是 reduced」的风险根本不存在（前科见
-   `docs/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md`）。
+   `docs/archive/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md`）。
 3. 容量常量按配体尺寸推导（`_derived_capacities`），并与**实测**用量取大，
    替掉 `softlift.py` 里按 41 原子写死的 320/2048/80。
 4. 词表从 teacher z-table ∩ 体系推（给了 teacher 才有交集，否则退回体系元素并在
@@ -470,7 +470,7 @@ def _probe_reduced_energies(
     EXP-033 §5 P1 item 2 要求对账 `energies.npy` 的 LRC 与单位。这里干脆不读它：
     自己按 `(lam_coul, lam_vdw)` 逐态求 `U^sc_k`，单位与 LRC 口径都由本函数一手定义，
     于是那类"同类不对齐骗过 5.5σ"的风险在这条路上不存在
-    （`docs/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md`）。
+    （`docs/archive/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md`）。
 
     也不走 `TraditionalMBARAnalyzer.compute_u_kn`：它是传统 REMD 腿的重加权入口，
     会给目标能量补 Beutler 软核缺的 1/V LRC 尾项，因此带一道"轨迹必须固定盒"的门，
@@ -844,7 +844,7 @@ def write_refit_payload(
         },
         "closed_form_refit": {
             "chain": "local_residual.refit",
-            "reference": "docs/EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md §5 P1",
+            "reference": "docs/archive/EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md §5 P1",
             "trajectory_path": result["trajectory_path"],
             "n_frames": result["n_frames"],
             "ridge_selected": result["fit_report"]["ridge_selected"],

@@ -281,6 +281,9 @@ def _production_shaped(**overrides):
         # 咬到了"加了派生键却没更新夹具"。
         "stage2_window_partition": "metric_integral",
         "stage2_first_window_max_states": 4,
+        # 🔑 [2026-09-18] 末窗上界（溢出槽）同期进派生身份 —— 它决定末窗长到多大
+        # 才拆，也就是决定布局。夹具跟着长，理由与上面那两个键逐字相同。
+        "stage2_last_window_max_states": 8,
         "stage2_n_windows": 6,
         "stage2_refine_extra_points_per_segment": 4,
     }

@@ -1,7 +1,7 @@
 """只读用户诊断：`runabfe.py doctor` / `validate-config` / `config-template`。
 
 [CLI-01, 2026-09-02] 这两个命令是发布准备度评估里"用户可读的配置与运行诊断"
-那一条（见 `docs/RELEASE_READINESS_2026-08-31.md`《发布前应补齐的交付项》）。
+那一条（见 `docs/archive/RELEASE_READINESS_2026-08-31.md`《发布前应补齐的交付项》）。
 
 设计约束，改这个文件前先读：
 

@@ -1,6 +1,24 @@
 # EXP-031 IBS 偏置力 GPU 优化 —— 主线接入现状（2026-09-09）
 
-**取代 [EXP-031_GPU_OPTIMIZATION_2026-09-04.md](archive/EXP-031_GPU_OPTIMIZATION_2026-09-04.md)。
+> ## 🗂 2026-09-18 归档 —— **不是待办**
+>
+> 本文是一份**迁移操作手册，已经执行完**：路线 A + B 已并入主线（协议 v33），
+> 融合 CUDA kernel 判 `STOP`（慢 16%）。§1「不要整份拷贝」讲的是那次迁移，
+> 迁移已完成 ⟹ 历史。
+>
+> **仍然有效**（三处源码注释引本文）：
+>
+> | 引用点 | 引的是什么 |
+> |---|---|
+> | `abfe_core.py` | 头条数字**不能引用**这条口径 —— 端到端只有 **1.09×**，不是 1.39× |
+> | `tests/test_exclusion_order_is_ascending.py` | 排除表顺序税：`sync_all_exclusions` 用 `set` 序灌排除表白烧 ~1.1 ms/step（整步 30%），`sorted(missing)` 一行得 1.45×、能量逐比特不变 |
+> | `tests/test_shadow_coul_ibs_builder.py` | shadow-coulomb builder 的设计依据（原始 PROPOSAL §2 在 CUDA 沙箱） |
+>
+> 正文、脚本与全部证据在沙箱 `ABFE_IBS_CUDA/experiments/EXP-031_ibs_bias_fusion/`，
+> 不在本仓。它取代的 09-04 那份见
+> [EXP-031_GPU_OPTIMIZATION_2026-09-04.md](EXP-031_GPU_OPTIMIZATION_2026-09-04.md)。
+
+**取代 [EXP-031_GPU_OPTIMIZATION_2026-09-04.md](EXP-031_GPU_OPTIMIZATION_2026-09-04.md)。
 那份的三条结论有两条已被推翻，头条数字也不能引用 —— 见 §4。**
 
 正文、脚本与全部证据仍在沙箱，不在主线：

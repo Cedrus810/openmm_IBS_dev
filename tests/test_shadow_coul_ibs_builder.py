@@ -4,7 +4,7 @@
 
 这个 builder 与它唯一的调用者 `IBSWindowManagerShadowCoul`（`ibs_engine.py`）在
 整个 `tests/` 里**零提及** —— EXP-031 独立核查时点出来的（见
-`docs/EXP-031_GPU_OPTIMIZATION_2026-09-09.md`；原始 PLAN §11.2 在 CUDA 沙箱，不在本仓）。
+`docs/archive/EXP-031_GPU_OPTIMIZATION_2026-09-09.md`；原始 PLAN §11.2 在 CUDA 沙箱，不在本仓）。
 它与 `build_ibs_dual_system` 共用同一套 `IBSBiasForce` 多态 log-sum-exp 框架，
 只是把 CV 从软核 VdW 换成短程"影子"库仑，所以**任何动到 Group-1 形态的改动都会
 同时落到它头上，而此前没有任何东西会发现**。
@@ -168,7 +168,7 @@ def test_shadow_coul_cv_exclusion_lists_are_ascending(omit):
         assert got == sorted(got), (
             f"CV {force.getCollectiveVariableName(i)} 的排除表不是升序（前 8 条 {got[:8]}）；"
             "乱序会让该力每步白烧时间而能量逐比特不变，见 "
-            "docs/EXP-031_GPU_OPTIMIZATION_2026-09-09.md（原始 PROPOSAL §2 在 CUDA 沙箱）"
+            "docs/archive/EXP-031_GPU_OPTIMIZATION_2026-09-09.md（原始 PROPOSAL §2 在 CUDA 沙箱）"
         )
         checked += 1
     assert checked > 0, "没有检查到任何 CustomNonbondedForce CV —— 测例形态变了"

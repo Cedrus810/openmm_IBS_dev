@@ -1362,7 +1362,7 @@
   2. 若一致 → 记为"无影响"，关闭本条；
   3. 若不一致 → 说明现有基线的预平衡起点本身受此影响，需要决定是否重跑基线。
 
-- [~] **`pymbar-core` 已固定为 4.2.0，待目标环境/CI 验收后关闭。** GitHub [#76](https://github.com/Cedrus810/openmm_IBS_dev/issues/76)。生产与 CPU-CI 环境使用同一精确版本；默认 `None -> svd-ew` 语义见 `docs/PYMBAR_UNCERTAINTY_PROTOCOL.md`，不得借此改变 #78/#87 的生产统计口径。
+- [~] **`pymbar-core` 已固定为 4.2.0，待目标环境/CI 验收后关闭。** GitHub [#76](https://github.com/Cedrus810/openmm_IBS_dev/issues/76)。生产与 CPU-CI 环境使用同一精确版本；默认 `None -> svd-ew` 语义见 `docs/METHODS.md`《PyMBAR uncertainty protocol》，不得借此改变 #78/#87 的生产统计口径。
 
 ## 长期研究项
 

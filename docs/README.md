@@ -1,202 +1,180 @@
 # ABFE-IBS 文档
 
-[项目入口](../README.md) · [中文完整说明](../README_cn.md) · [English](../README_en.md)
+[项目入口 (English)](../README.md) · [中文完整说明](../README_cn.md)
 
-本目录是本仓库**唯一**的文档集。2026-08-31 的发布整理把原来并存的两套文档
-（`docs/` 与 `curated_project/` 整理版知识库，两边有 46 份逐字重复件）合并成这一份，
-并把开发期的过程材料（实验记录、交接单、审计快照、阶段性结论）压缩成
-[历史材料 log](HISTORY_LOG.md)。
+本目录是本仓库**唯一**的文档集。本仓库是 ABFE-IBS 的**工程区分支**：只保留发布所需的
+生产代码、生产回归测试和使用文档；开发期的过程材料压缩成
+[历史材料 log](HISTORY_LOG.md)，原文在 `Atenolol-rank11` 工作区。
 
-**原文全部保存在 `Atenolol-rank11` 工作区。** 本仓库是 ABFE-IBS 的**工程区分支**：
-只保留发布所需的生产代码、生产回归测试和使用文档。
+> **每份文档自己的页首才是权威。** 本页只是路牌 —— 状态、口径、「还剩什么有效」
+> 都写在各文档页首，不在这张表里复制一遍。
 
-## 按任务阅读
+## 手册（稳定用法）
 
 | 任务 | 文档 |
 |---|---|
-| 查当前科学状态、结果能不能引用、协议版本 | [STATUS.md](STATUS.md) |
-| 查某天改了什么、协议版本为什么跳、破不破缓存 | [CHANGELOG.md](CHANGELOG.md)（全程缩略时间线） |
-| 查某一步实现的是哪篇文献的方法、怎么引用 | [METHODS.md](METHODS.md) |
-| 安装依赖、准备输入、首次运行 | [GETTING_STARTED.md](GETTING_STARTED.md) |
-| CUDA 插件：**随仓库分发**，按 `environment.yml` 建环境开箱可用；只有换了 OpenMM 版本或改了插件源码才要重编（秒级） | [GETTING_STARTED.md](GETTING_STARTED.md)《CUDA 插件》 |
+| 安装依赖、准备输入、首次运行、CUDA 插件 | [GETTING_STARTED.md](GETTING_STARTED.md) |
 | 理解输出、符号、缓存和续跑 | [OUTPUTS_AND_RESUME.md](OUTPUTS_AND_RESUME.md) |
 | 定位常见错误 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) |
 | 迁移到新蛋白–配体体系 | [MIGRATING_TO_A_NEW_SYSTEM.md](MIGRATING_TO_A_NEW_SYSTEM.md) |
-| 修改源码、运行最低验证 | [MAINTAINING.md](MAINTAINING.md) |
-| **今天有什么挡路的**（P1） | [TODO.md](TODO.md) —— 2026-09-16 按**优先级**拆成四份，这是唯一入口；优先级写在编号后：`grep -rn '[P1]' docs/` |
-| P2 —— 该做但不挡路（重构立项 / 待拍板 / EXP-033 / 发布工程门） | [TODO_P2.md](TODO_P2.md) |
-| P3 —— **现在明确不做**（判定不改 / 不是 bug / 暂停 / 押后）—— 想重新论证某条前先查这里 | [TODO_P3.md](TODO_P3.md) |
-| TODO 里那些实测表与重放证据（已关闭条目的取证） | [archive/TODO_evidence_2026-09-16.md](archive/TODO_evidence_2026-09-16.md) |
-| 判断能不能发布、还缺什么 | [RELEASE_READINESS_2026-08-31.md](RELEASE_READINESS_2026-08-31.md) |
-| 不确定度口径 | [PYMBAR_UNCERTAINTY_PROTOCOL.md](PYMBAR_UNCERTAINTY_PROTOCOL.md) |
-| 查某份历史材料写过什么 | [HISTORY_LOG.md](HISTORY_LOG.md) |
-| 看当前流程全貌（一张图） | [current-pipeline.svg](current-pipeline.svg) |
-| stage2 溶剂腿那 5.5σ 去哪了（**已关闭 2026-09-10**：参照臂的盒错了） | [STAGE2_SOLVENT_LEG_ERROR_BUDGET.md](STAGE2_SOLVENT_LEG_ERROR_BUDGET.md) |
-| 查 stage2 的失效机制（仍是活的参考） | [STAGE2_ROOT_CAUSE_2026-08-28.md](STAGE2_ROOT_CAUSE_2026-08-28.md) |
-| 重新设计 stage2 控制流前先读（分窗口/分 λ/分采样量 三轴当前怎么耦合的） | [STAGE2_THREE_AXES_COUPLING_2026-09-11.md](STAGE2_THREE_AXES_COUPLING_2026-09-11.md) |
-| 路径最小修补：Type I/II/III + 修补顺序（**部分已实现**，代码里 10 余处引它作设计依据；缺口见 [TODO.md](TODO.md) §1） | [PLAN_PATH_REPAIR_2026-09-11.md](PLAN_PATH_REPAIR_2026-09-11.md) |
-| 🔴🔴 **stage2 控制器：2026-09-17 整波真机缺口（11 条，10 条已修）**（**碰控制器前先读这份**：它是**生产跑实测**出来的，不是静态审计。含 A–M 逐条的盘面证据、哪几条必须**配对修**（H↔F、E↔I）、以及**三处我做错又改正的**——尤其「别再试图靠挪 `ANALYZE` 的位置补 `S2-A`」（连打红 25→11 条）与「别再往控制器加『末窗一分为二』动作」（`_legalize_tail_window` 早就实现了，那是同一不变量的第二份实现）） | [STAGE2_CONTROLLER_WAVE_2026-09-17.md](STAGE2_CONTROLLER_WAVE_2026-09-17.md) |
-| 🔴 **stage2 控制器 + 预算：63+2 条缺陷的全面审计与修复状态**（**改控制器/预算前先读这份**；含三条贯穿性根因、逐条状态列、两条「别再犯」的规矩：#18「零调用点 ≠ 忘了接」、#65「改名/改值不通知消费者」） | [CONTROLLER_BUDGET_AUDIT_2026-09-14.md](CONTROLLER_BUDGET_AUDIT_2026-09-14.md) |
-| 🔑 **stage2 自治控制器：设计 + 实证 + 陷阱清单**（**接手先读这份**；含首次跑通的实证与 10 条真机咬过的坑） | [STAGE2_CONTROLLER_DESIGN_2026-09-12.md](STAGE2_CONTROLLER_DESIGN_2026-09-12.md) |
-| **stage2 自治控制器：设计 + 实证 + 十条真机陷阱 + 交接**（碰 stage2 先读这份，**别重推**；含代码位置图、当前状态与复现、8 条别重新论证的事、给下一个人的规矩） | [STAGE2_CONTROLLER_DESIGN_2026-09-12.md](STAGE2_CONTROLLER_DESIGN_2026-09-12.md) |
-| **stage2 后分析：单跑演化报告 / 两跑 A/B 对比**（baseline vs outer-λ 增强采样，只读纯聚合，不重算自由能）<br>`python stage2_ab_report.py <run_dir>`｜`--ab <baseline> <cand>`｜`--json` | 脚本 [`stage2_ab_report.py`](../stage2_ab_report.py)；清单由 `abfe_preoptimizer.Stage2RepairController.comparison_manifest()` 生成，落在 `<run>/checkpoints/controller_comparison_manifest.json`（**2026-09-14 改名**，旧名 `stage2_comparison_manifest.json` 会被 `_read_stage_result()` 的兜底 glob `stage2_*.json` 吃掉；脚本两级回退兼容旧产物，见审计 **#65**） |
-| stage2 自治循环逐个 bug 的修复流水账（历史，不是待办） | [STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md](STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md) |
-| stage2 自治闭环的**验收指标**（老板定案，唯一指标） | [AUTONOMOUS_STAGE2_LOOP_SPEC_2026-09-11.md](AUTONOMOUS_STAGE2_LOOP_SPEC_2026-09-11.md) |
-| stage2 分窗与多采样段：09-10/11 那八个 bug 改了什么（**已全部落地，09-12 归档**；仍是这几处当前行为的唯一出处） | [archive/STAGE2_WINDOW_AND_SEGMENT_REDESIGN_2026-09-11.md](archive/STAGE2_WINDOW_AND_SEGMENT_REDESIGN_2026-09-11.md) |
-| 2026-09-09 全仓审计原始记录（**不是待办**，09-12 归档；7 条不修已进 [TODO_P3.md](TODO_P3.md) §1，52 处待 GPU 复验进 [TODO_P2.md](TODO_P2.md) `REL-04`） | [archive/AUDIT_2026-09-09_full_repo.md](archive/AUDIT_2026-09-09_full_repo.md) |
-| 给新配体重训 local-residual R1 权重（操作手册） | [RETRAIN_LOCAL_RESIDUAL.md](RETRAIN_LOCAL_RESIDUAL.md) |
-| local-residual 换体系**别再踩的坑**（接线部分已被 EXP-033 P1 取代，09-12 归档；§6 仍全部有效） | [archive/HANDOFF_LOCAL_RESIDUAL_2026-09-11.md](archive/HANDOFF_LOCAL_RESIDUAL_2026-09-11.md) |
-| 查 λ-WCA 壳为什么退役（已结案，历史） | [archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md](archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md) |
+| 改源码前先跑什么、改完该更新哪份文档 | [MAINTAINING.md](MAINTAINING.md) |
+| 每一步实现的是哪篇文献的方法、怎么引用 | [METHODS.md](METHODS.md) |
+| 不确定度口径 | [METHODS.md](METHODS.md)《PyMBAR uncertainty protocol》 |
+| 给新配体重训 local-residual R1 权重 | [RETRAIN_LOCAL_RESIDUAL.md](RETRAIN_LOCAL_RESIDUAL.md) |
+| 当前流程全貌（一张图） | [current-pipeline.svg](current-pipeline.svg) |
+
+## 状态与待办
+
+| 要查什么 | 文档 |
+|---|---|
+| 当前科学状态、结果能不能引用、协议版本 —— **唯一出处** | [STATUS.md](STATUS.md) |
+| 某天改了什么、协议版本为什么跳、破不破缓存 | [CHANGELOG.md](CHANGELOG.md) |
+| **今天有什么挡路的**（P1） | [TODO.md](TODO.md) |
+| 该做但不挡路（P2） | [TODO_P2.md](TODO_P2.md) |
+| **现在明确不做**（P3）—— 想重新论证某条前先查这里 | [TODO_P3.md](TODO_P3.md) |
+| 能不能发布、还缺什么 | [RELEASE_READINESS_2026-08-31.md](archive/RELEASE_READINESS_2026-08-31.md) |
+| 某份历史材料写过什么（原文在 `Atenolol-rank11`） | [HISTORY_LOG.md](HISTORY_LOG.md) |
 | 拿独立参照真值对生产结果 | [reference_data/README.md](reference_data/README.md) |
-| 查 GPU 性能优化做过什么、结论是什么 | [EXP-031_GPU_OPTIMIZATION_2026-09-09.md](EXP-031_GPU_OPTIMIZATION_2026-09-09.md)（**取代 [09-04 那份](archive/EXP-031_GPU_OPTIMIZATION_2026-09-04.md)，那份三条结论有两条已被推翻、09-12 归档**；正文与脚本在沙箱 `ABFE_IBS_CUDA`） |
-| 换配体要重训 local-residual 模型：方案与证据（**P1 闭式重训已接主线 09-12，真机未跑**） | [EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md](EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md) |
-| **闭式重训到底落成什么样**（代码已落地、离线全绿、真机一次没跑） | [EXP-033_P1_LANDED_2026-09-12.md](EXP-033_P1_LANDED_2026-09-12.md) |
 
-## 结果与有效性
+待办按优先级分三份，`TODO.md` 是唯一入口。
 
-**全部登记在 [STATUS.md](STATUS.md)。** 那是本仓库唯一声明"当前科学结论"的文档：
-主线体系、结果登记表、协议版本、开放问题、状态词和证据保全目录都在那一份。
+> ### 📌 每一条待办都必须带重要等级
+>
+> **等级写在编号后面的方括号里**，跟着条目走，不靠它在哪个文件里推断：
+>
+> ```
+> - [ ] **S2-N [P1] 块账写侧记 4 个动作、读侧只拦 1 个。** …
+> - [ ] **AUDIT-S2-02 [P2] 判断函数已经 1795 行 / 63 个 return。** …
+> ```
+>
+> | 等级 | 含义 | 落在哪 |
+> |---|---|---|
+> | `[P1]` | **挡住在推的工作** | [TODO.md](TODO.md) |
+> | `[P2]` | 该做，但不挡路 | [TODO_P2.md](TODO_P2.md) |
+> | `[P3]` | **现在明确不做**（判定不改 / 不是 bug / 暂停 / 押后），每条都要写「理由别重新论证」 | [TODO_P3.md](TODO_P3.md) |
+>
+> 等级和文件是**两份记录同一件事**，所以：**改优先级 = 同时移动条目和改方括号**，
+> 只改一处就会出现「躺在 `TODO_P2.md` 里标着 `[P1]`」这种查不出来的条目。
+> 清点用等级、不用文件：`grep -rn '\[P1\]' docs/`。
+>
+> 新条目除了等级，还**必须带位置（`文件:行号`）和判据**（怎样算做完）。
 
-2026-09-05 之前，同样三张表在 `README.md` / `README_cn.md` / `README_en.md` /
-本文件各存了一份，热力学路径版本已经在其中三份里烂成了旧值。**不要再复制过来。**
+已关闭的条目整段移进 `archive/TODO_closed_<日期>.md`，取证在
+[archive/TODO_evidence_2026-09-16.md](archive/TODO_evidence_2026-09-16.md)。
 
-## 设计与协议
+## stage-2 控制器（当前主战场）
 
-- [design/README.md](design/README.md)：**设计文档状态索引**——哪份是仍在跑的合同、
-  哪份已实施、哪份一步没动，逐份对过源码（复核日期 2026-09-02）。读 `design/` 先读这份；
-- `design/`：当前合同和候选设计——**提案不等于已实现**；
-- [current-pipeline.svg](current-pipeline.svg)：当前 softcore ABFE dual-lambda
-  生产流程图（从配置与建系到汇总）；
-- `archive/`：只读存档，两类内容——
-  - `removed_*.md`：2026-07-27 移除的那几块不可达代码的逐字存档。它们不是历史资料，
-    是**防回归凭证**：`tests/test_att27_dead_code_removed.py` 断言这些文件存在且
-    不可执行，防止有人把已判定不可达的路线重新引进代码。删掉会让那条防线失效。
-  - `LAMBDA_SCHEDULE_CONTRACT.md`：2026-08-31 归档的旧 λ 调度合同——描述的 23 态路径
-    当前体系不走。**当前 λ 布点没有现行合同文档，只有代码。**
-  - `PROPOSAL_*.md`：2026-08-31 从 `design/` 移入的设计提案——**已实施且已被后续决策覆盖**，
-    保留原文只为追溯决策依据，不是待办。每份页首有归档标记，状态见
-    [design/README.md](design/README.md)。
-  - `TODO_2026-08-06_unreconciled.md`：`TODO.md` 截至 2026-08-06 的主表（1350 行），
-    2026-08-31 整段归档，内容一字未改。里面的 `- [ ]` 只表示"当时未完成"，
-    需要人逐条对账后才能重新变成待办。
-  - `TECH_REPORT_0831issue_P2_2026-09-01.md` / `RUNTIME_ISSUES_2026-09-02.md`：
-    2026-09-02 从已撤销的 `docs/status/` 移入。主题都已关闭、结论都已归位到正式文档，
-    两份页首的告示写明「哪一节是别处没有的」。**都不是待办。**
-  - **2026-09-12 归档的五份**——主题都已结案，每份页首有归档告示写明「结论去了哪、
-    还剩什么已抄进 [TODO.md](TODO.md)」。**都不是待办：**
+**按这个顺序读**，前三份是活的，第四份是今天的盘面：
 
-    | 文件 | 为什么归档 | 仍然有效的部分 |
-    |---|---|---|
-    | `TODO_closed_2026-09-09.md` | `MIGRATE-01`/`PBC-01`/`XFAIL-01`/`XFAIL-02`/`CACHE-01`/`CFG-01` 六条已关闭 | 每条留下的那句规矩 |
-    | `AUDIT_2026-09-09_full_repo.md` | 62 条候选已收口（52 修 + 7 不修） | §4 的 GPU 复跑命令（→ TODO `REL-04`） |
-    | `STAGE2_WINDOW_AND_SEGMENT_REDESIGN_2026-09-11.md` | 八个 bug 全部落地 | 分窗判据用 `∫g dλ`、f_k 加帧前必须重标定的**唯一出处** |
-    | `HANDOFF_LOCAL_RESIDUAL_2026-09-11.md` | 接线部分被 EXP-033 P1 取代 | §6《别再踩的坑》全部有效；§4 的 3 条未修已进 TODO `LR-02`~`LR-04` |
-    | `EXP-031_GPU_OPTIMIZATION_2026-09-04.md` | 三条结论有两条被 09-09 那份推翻 | 仅追溯用 |
+1. [STAGE2_CONTROLLER_DESIGN_2026-09-12.md](archive/STAGE2_CONTROLLER_DESIGN_2026-09-12.md)
+   —— 🔑 **接手先读这份**。核心验收指标、设计、实证、十条真机陷阱、别重新论证的事。
+2. [PLAN_PATH_REPAIR_2026-09-11.md](archive/PLAN_PATH_REPAIR_2026-09-11.md)
+   —— 设计要求的来源（Type I/II/III + 修补顺序）。**部分已实现**，缺口见 `TODO.md` §1。
+3. [STAGE2_ROOT_CAUSE_2026-08-28.md](archive/STAGE2_ROOT_CAUSE_2026-08-28.md)
+   —— stage-2 的失效机制。**live 参考**，多处源码注释引它。
+4. [STAGE2_BENCHMARK_CRASH_TRIAGE_2026-09-18.md](archive/STAGE2_BENCHMARK_CRASH_TRIAGE_2026-09-18.md)
+   —— 🔴 09-18 benchmark 7 次崩溃分诊（只分诊未动手）+
+   [STAGE2_OFFLINE_FORENSICS_2026-09-18.md](archive/STAGE2_OFFLINE_FORENSICS_2026-09-18.md)（24 run 误差棒取证）。
 
-  - **2026-09-16 归档的四份**——主题都已结案或已被测试钉住，每份页首有归档告示。
-    前两份原来躺在**仓库根目录**（根目录只留三份 README 加 `PROJECT_LAYOUT.md`）：
+历史批次都在 `archive/`，页首各自写清「还剩什么有效」：09-17 整波（`STAGE2_CONTROLLER_WAVE`）、
+09-14 六路审计（`CONTROLLER_BUDGET_AUDIT`）、09-11 三轴快照与修复流水账、
+09-11 验收规格原件。**别当待办读。**
 
-    | 文件 | 为什么归档 | 仍然有效的部分 |
-    |---|---|---|
-    | `改进计划_2026-09-14.md` | 09-14 一次性只读审视，未做项已归 `TODO.md` | §6 撤回的 7 条（口径追溯） |
-    | `采样问题_2026-09-15.md` | 那条链的落点已被 `tests/test_epoch_unaffordable_does_not_degrade_skew_2026_09_15.py` 钉住 | §5.1 的实测数字 |
-    | `AUDIT_STAGE2_CONTROL_FLOW_2026-09-15.md` | 三条 P1 全落在 `5d6d24b` | 设计依据；真机验收 → TODO `AUDIT-S2-03` |
-    | `PME_DECHARGE_V5_CHANGE_RECORD_2026-09-14.md` | v5 已落地，逐行改动记录 | 文末「未验证」清单 |
+## 其它活文档
 
-  - **2026-09-17 归档的四份**——当天做掉的一批，每份页首有归档告示。
-    三份审查/抽取文档是**同一批次**（`tools/audit/` 是它们的脚本），**都不是待办**：
+| 主题 | 文档 |
+|---|---|
+| 溶剂腿那 5.5σ 去哪了（主题 09-10 已关闭，文档是 **live 靶子**） | [STAGE2_SOLVENT_LEG_ERROR_BUDGET.md](archive/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md) |
+| 换配体重训 local-residual：方案与证据 | [EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md](archive/EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md) |
+| 闭式重训落成什么样（P1 已落地，`EXP-033-P2` 仍开着） | [EXP-033_P1_LANDED_2026-09-12.md](archive/EXP-033_P1_LANDED_2026-09-12.md) |
+| stage-2 后分析：单跑演化报告 / 两跑 A/B 对比 | 脚本 [`stage2_ab_report.py`](../stage2_ab_report.py)（`<run_dir>`｜`--ab <baseline> <cand>`｜`--json`），清单落在 `<run>/checkpoints/controller_comparison_manifest.json` |
 
-    | 文件 | 为什么归档 | 仍然有效的部分 |
-    |---|---|---|
-    | `TODO_closed_2026-09-17.md` | 当天真做掉的 6 条（`REWIND-01` + `TEST-01`/`LR-03`/`LR-04`/`REL-08`/`REL-09`）整段移出待办 | 每条留下的那句规矩；`REL-09` 那条「真机证据指向反面」 |
-    | `STAGE2_DEAD_LINES_2026-09-17.md` | 八条死线：§2 当天落地（`REWIND-01`）、§3.1 当天修、D1/D8 报告侧当天改 | §1 D3「子窗失败」第一次可达，默认**不递归**；开头那条「判据噪声 34×」的警告 |
-    | `STAGE2_CONTROLLER_FLOW_2026-09-17.md` | `_decide_once` 的**当日快照**（分支编号当天就被 `REWIND-01` 改了，别当现值） | §3 D4/D5/D6 + §4 结论 → TODO_P2 `AUDIT-S2-02`；要现值重跑 `tools/audit/static_controller_2026-09-17.py` |
-    | `AUDIT_GATES_AND_CRITERIA_2026-09-17.md` | 一次性只读数据审查，结论已各自归位；**含 §4.3 一处自我撤回** | §0.1/§4.2 噪声 34×（被 `abfe_pipeline.py` 和 TODO 引作现行口径）；§3.3「阈值一个都没标定」= 质量门只作报告不驱动动作的依据 |
+## 三个子目录
 
-    ⚠️ 这批里 `AUDIT_GATES_AND_CRITERIA_2026-09-17.md` **被 `abfe_pipeline.py` 与两个测试的注释引用**
-    （已在归档同一次改动里改成 `docs/archive/…`）—— 下次再移它要照上面「归档前必查」那条走。
+- **`design/`** —— 当前合同和候选设计。**提案不等于已实现**：先读
+  [design/README.md](design/README.md) 的状态索引（哪份在跑、哪份已实施、哪份一步没动，
+  逐份对过源码）。
+- **`reference_data/`** —— 带 provenance 的**外部**参照真值，独立于本管线算出来的靶子。
+  「生产算对了没有」只能拿这里的数比，不能拿生产自己的数互相比。
+- **`archive/`** —— 只读存档。**一份都不是待办**，每份页首都写了「为什么归档 / 结论去了哪 /
+  还剩什么有效」；`ls docs/archive/` 就是目录。其中四类不要按"过期资料"处理：
+
+  | 文件 | 性质 |
+  |---|---|
+  | `removed_*.md` | **防回归凭证，不能删** —— `tests/test_att27_dead_code_removed.py` 断言它们存在且不可执行，防止已判定不可达的路线被重新引进代码 |
+  | `LAMBDA_SCHEDULE_CONTRACT.md` | 旧 λ 调度合同，描述的 23 态路径当前体系不走。**当前 λ 布点没有现行合同文档，只有代码** |
+  | `TODO_2026-08-06_unreconciled.md` | `TODO.md` 截至 2026-08-06 的主表（1350 行），一字未改。里面的 `- [ ]` 只表示"当时未完成"，需逐条对账后才能重新变成待办 |
+  | 被源码注释引用的几份 | 见下面「归档前必查」 |
+
+> ## 🛑 归档前必查：被**源码注释**引用的文档
+>
+> 「结案了就进 `archive/`」有例外 —— 有些文档是源码注释和测试的靶子，
+> 移动它们**必须在同一次改动里把引用一起改**。**权威是这条命令，不是名单：**
+>
+> ```bash
+> grep -rn "docs/[^\"' ]*\.md" *.py tests/*.py tools/*/*.py local_residual/*.py
+> ```
+>
+> 当前仍在 `docs/` 顶层、且被源码引用的：[STAGE2_ROOT_CAUSE_2026-08-28.md](archive/STAGE2_ROOT_CAUSE_2026-08-28.md)、
+> [STAGE2_SOLVENT_LEG_ERROR_BUDGET.md](archive/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md)、
+> [PLAN_PATH_REPAIR_2026-09-11.md](archive/PLAN_PATH_REPAIR_2026-09-11.md)、
+> [reference_data/](reference_data/)（`attribute_stage2_solvent_leg_gap.py` 直接读它）。
+> 已在 `archive/` 而仍被引用的：`BUG_LOCATION_…`（`WCA_SHIELD_RETIRED` 为什么是 True 的唯一出处）、
+> `AUDIT_GATES_AND_CRITERIA_2026-09-17.md`、`EXP-031_GPU_OPTIMIZATION_2026-09-09.md`、
+> `STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md`、`CONTROLLER_BUDGET_AUDIT_2026-09-14.md`。
+>
+> **这条约定已经按规矩执行过三次**（09-09 `BUG_LOCATION_…` 32 处引用、09-17 四份、
+> 09-18 六份），每次都在同一改动里改完引用并跑链接校验。
+>
+> ⚠️ 反面教材：`.py` 里现存 **28 处**指向 `docs/status/` / `docs/experiments/` /
+> `docs/handoffs/` 的引用（2026-09-09 实测），**那些路径在本分支已不存在**，
+> 原文在 `Atenolol-rank11`。那批当时刻意没改，成了永久的债 —— 这就是为什么
+> 现在移动文档要当场改引用。
+>
+> `docs/` **内部**链接由
+> `tests/test_doc_staleness_contract.py::test_docs_internal_links_resolve` 钉住；
+> 上面那 28 处是**代码注释里的路径**，不在该测试范围内。
 
 ## 运行期发现往哪写
 
-**没有 `docs/status/` 这个目录了。** 它 2026-09-02 被撤掉——它本身就是维护规则
-第 1 条不许有的「平行当前状态文档」，两份内容已按下面的分工归位、原文归档：
+**没有 `docs/status/` 这个目录了。** 它 2026-09-02 被撤掉 —— 它本身就是维护规则
+第 1 条不许有的「平行当前状态文档」。
 
 | 发现的性质 | 写进哪 |
 |---|---|
 | 用户会遇到的症状 + 完整因果链 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) |
-| 已定位但没修的缺陷 | 按优先级：`[P1]` 进 [TODO.md](TODO.md)、`[P2]` 进 [TODO_P2.md](TODO_P2.md)、`[P3]` 进 [TODO_P3.md](TODO_P3.md) —— 归到对应的编号段（`S2-` / `LR-` / `REL-` / `AUDIT-`），**必须带位置和判据** |
-| 发布阻塞判断 | [RELEASE_READINESS_2026-08-31.md](RELEASE_READINESS_2026-08-31.md) |
+| 已定位但没修的缺陷 | **先定重要等级**：`[P1]` → [TODO.md](TODO.md)、`[P2]` → [TODO_P2.md](TODO_P2.md)、`[P3]` → [TODO_P3.md](TODO_P3.md)，归到对应编号段（`S2-` / `LR-` / `REL-` / `AUDIT-`）。**等级写进方括号、位置写 `文件:行号`、判据写怎样算做完，三样缺一不可** |
+| 新的科学结论、数值 | [STATUS.md](STATUS.md)（唯一一份），必须附来源、单位、符号、协议身份、有效性、是否可引用 |
+| 发布阻塞判断 | [RELEASE_READINESS_2026-08-31.md](archive/RELEASE_READINESS_2026-08-31.md) |
 | 一次性运行的原始记录（不分析） | 直接进 `archive/`，页首写清结论去了哪 |
 
-> ## 🛑 归档前必查：这两份被**代码注释**引用
->
-> 「结案了就进 `archive/`」有例外——下面这些是源码注释的靶子，
-> 移动它们**必须在同一次改动里把引用一起改**。
->
-> | 文档 | 状态 | 为什么不能随手移 |
-> |---|---|---|
-> | [reference_data/](reference_data/) | **live** | 真值数据本身；`attribute_stage2_solvent_leg_gap.py` 直接读它 |
-> | [STAGE2_SOLVENT_LEG_ERROR_BUDGET.md](STAGE2_SOLVENT_LEG_ERROR_BUDGET.md) | **live**（主题 09-10 已关闭，文档仍是 live 靶子） | 溶剂腿当前口径的唯一出处 |
-> | [STAGE2_ROOT_CAUSE_2026-08-28.md](STAGE2_ROOT_CAUSE_2026-08-28.md) | **live 参考** | §3.2/§3.3/§4/§8.2 被多处注释当作现行行为的依据 |
-> | [archive/BUG_LOCATION_…](archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md) | 已归档 | §2.9/§2.10 是「`WCA_SHIELD_RETIRED` 为什么是 True」「那段为什么是死代码」「三处断言方向为什么是反的」的**唯一**出处 |
->
-> 复核命令：
->
-> ```bash
-> grep -rn "BUG_LOCATION_stage2\|STAGE2_ROOT_CAUSE\|STAGE2_SOLVENT_LEG\|reference_data" \
->   *.py local_residual/*.py tools/*/*.py
-> ```
->
-> **2026-09-09 已按这条约定做过一次**：`BUG_LOCATION_…` 移进 `archive/`，
-> 同一次改完全部 32 处引用（其中 6 处改指新的 live 文档），
-> `docs/` 内 143 条链接校验 0 坏链。
->
-> ⚠️ 反面教材：`.py` 里现存 **28 处**指向 `docs/status/` / `docs/experiments/` /
-> `docs/handoffs/` 的引用（2026-09-09 实测，此前本节写的 14 是漏数），
-> **那些路径在本工程区分支已不存在**，原文在 `Atenolol-rank11`
-> （见 [HISTORY_LOG.md](HISTORY_LOG.md)）。那批当时刻意没改，成了永久的债 ——
-> 这就是为什么现在移动文档要当场改引用。
->
-> `docs/` **内部**链接由 `tests/test_doc_staleness_contract.py::test_docs_internal_links_resolve`
-> 钉住（当前 147 条、0 坏链）；上面那 28 处是**代码注释里的路径**，不在该测试范围内。
+## 看着像断链、其实不是
 
-## 还有一个子目录
+三类：
 
-- `reference_data/`：**带 provenance 的外部参照真值**——独立于本管线算出来的靶子。
-  「生产算对了没有」只能拿这里的数比，不能拿生产自己的数互相比。
-  见 [reference_data/README.md](reference_data/README.md)。
-
-## 引用约定：`Atenolol-rank11` 里的材料
-
-本目录的正文里会出现一些**本仓库找不到的路径**，例如 `0831issue.md`、
-`docs/status/memtodolist.md`、`BUGFIX_HANDOFF_2026-08-29.md`、
-`RESULT_REGISTRY.csv`、`4W53/toluene_hydration_reference.py`。
-它们不是断链——**原文在 `Atenolol-rank11` 工作区**，2026-08-31 发布整理时
-刻意没有搬进工程区分支，逐份登记在 [HISTORY_LOG.md](HISTORY_LOG.md)。
-
-这类引用尽量都带 `（在 Atenolol-rank11，不在本仓）` 后缀标记。**最容易踩的一个**：
-正文里的 `docs/status/xxx.md`（`memtodolist*.md`、`AUDIT_STATUS.md`、
-`BUGFIX_HANDOFF_*.md`）全部指 rank11 里的路径。本仓库的 `docs/status/` 已于
-2026-09-02 撤销，**不要在本仓里找**。
-
-另外还有两类看着像断链、其实不是的：
-
-- **运行期产物**（`output/final_binding_results.json`、`run_provenance.json`、
-  `checkpoints/*.json`、`*.npy`）—— 跑起来才生成，不在版本控制里；
-- **计划中还没写的文件**（`design/` 里提到的 `remd_backends.py`、
-  `edge_manifest.json` 等）—— 提案不等于已实现，见
-  [design/README.md](design/README.md)。
+- **`Atenolol-rank11` 里的材料** —— `0831issue.md`、`docs/status/memtodolist.md`、
+  `BUGFIX_HANDOFF_2026-08-29.md`、`RESULT_REGISTRY.csv` 等，2026-08-31 发布整理时
+  刻意没搬进本分支，逐份登记在 [HISTORY_LOG.md](HISTORY_LOG.md)。
+  **最容易踩的一个**：正文里的 `docs/status/xxx.md` 全部指 rank11 的路径。
+- **运行期产物** —— `output/final_binding_results.json`、`run_provenance.json`、
+  `checkpoints/*.json`、`*.npy`，跑起来才生成，不在版本控制里。
+- **计划中还没写的文件** —— `design/` 里提到的 `remd_backends.py`、`edge_manifest.json` 等，
+  提案不等于已实现，见 [design/README.md](design/README.md)。
 
 ## 文档维护规则
 
 0. 改了代码或协议，往 [CHANGELOG.md](CHANGELOG.md) 加**一行**（规则见该文件末尾）；
-1. 稳定用法写入教程；当前科学结论**只**写 [STATUS.md](STATUS.md)（唯一一份，
-   别在 README 或别处复制它的表）；体系、日期和实验相关的过程材料写入
-   [HISTORY_LOG.md](HISTORY_LOG.md) 或留在 `Atenolol-rank11`。
-2. 计划、代码实现、测试通过和科学验证是四种不同状态，不要混为"成功"。
-3. 旧状态文档不原地重写为当前版；用替代关系保留历史。
-4. 新数字必须附来源、单位、符号、协议身份、有效性和是否可引用。
-5. 文档整理不移动或改写 `output*`、轨迹、checkpoint、日志和诊断 artifact。
-6. [STATUS.md](STATUS.md) 的日期戳由 `tools/diagnostics/check_doc_staleness.py`
-   盯着，协议版本表由同一份契约测试 `tests/test_doc_staleness_contract.py`
-   对着源码常量钉住。三份 README 不再声明科学状态，因此不再进追踪表。
+1. 稳定用法写入教程；当前科学结论**只**写 [STATUS.md](STATUS.md)（别在 README 或别处
+   复制它的表）；体系、日期和实验相关的过程材料写入 [HISTORY_LOG.md](HISTORY_LOG.md)
+   或留在 `Atenolol-rank11`。**不要新开平行的「当前状态」文档。**
+2. **每条待办带重要等级** `[P1]`/`[P2]`/`[P3]`（见上面《每一条待办都必须带重要等级》），
+   加条目和改优先级都要同时动方括号和文件，别只改一处。
+3. 计划、代码实现、测试通过和科学验证是四种不同状态，不要混为"成功"。
+4. 旧状态文档不原地重写为当前版；用替代关系保留历史。
+5. 新数字必须附来源、单位、符号、协议身份、有效性和是否可引用。
+6. 文档整理不移动或改写 `output*`、轨迹、checkpoint、日志和诊断 artifact。
+7. 结案了就进 `archive/`，页首写清「为什么归档 / 结论去了哪 / 还剩什么有效」 ——
+   **本页不再逐批复制那张表**，各文档页首才是权威。移动前先过「归档前必查」。
+8. [STATUS.md](STATUS.md) 的日期戳由 `tools/diagnostics/check_doc_staleness.py` 盯着，
+   协议版本表由 `tests/test_doc_staleness_contract.py` 对着源码常量钉住。
+   **改了任何 `*_PROTOCOL_VERSION` 常量，同一次改动里要把 STATUS.md 的表改掉。**

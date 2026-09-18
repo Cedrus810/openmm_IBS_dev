@@ -223,4 +223,4 @@ utility + ΔG 一致性。赢了就把「重训」永久变成流水线里一次
 * `docs/RETRAIN_LOCAL_RESIDUAL.md` —— 现行四步重训链（P1 会取代它的 ①②）
 * `PLAN_EXP-027_online_utility.md` §16 —— 验收口径与 U3/U4 状态（在 rank11）
 * `DiffLift.MD` §1 / §14 / §15 / §E.2 / §E.6 —— R1 的设计契约与能力边界（在 rank11）
-* `docs/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md` —— LRC 口径不对齐的前科
+* `docs/archive/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md` —— LRC 口径不对齐的前科

@@ -1116,7 +1116,34 @@ def _truncate_production_history(sampler, keep: int) -> int:
     return current - keep
 
 
-class IBSIncompleteStageCoverageError(RuntimeError):
+class IBSControlPlaneError(RuntimeError):
+    """引擎抛出的**决定**，不是崩溃。所有这类异常必须继承它。
+
+    🔑🔑🔑 [2026-09-18] **「引擎抛的可路由异常」先前是一张手写白名单，漏一个就是
+    整跑以 traceback 收场。**
+
+    实测：`ExistingEnsembleRequiresRescueAudit` 的消息自己写着 `route it to
+    rescue/provenance audit`，而 `abfe_pipeline` 的两处 handler
+    （自治循环、`_run_stage2_with_path_evolution._guarded_once`）都只列了
+    `IBSValidationBudgetIndeterminateError` + `IBSWarmupConvergenceError`
+    ⟹ 它落进 `except Exception` ⟹ 一个**已知、可分类**的控制器结局被伪装成
+    执行器崩溃。而它的四个 `non_mutating_v1` 守卫恰好是自治模式的常态策略。
+
+    为什么要一个基类而不是只加一个 dict：dict 里**没有**的条目照旧静默落进
+    `except Exception`，"下一个不会漏"这句话就不成立。有了基类，
+    `IBSControlPlaneError.__subclasses__()` 是一个**可枚举的唯一集合**，
+    `abfe_pipeline` 在 import 时拿它跟注册表对账，缺一项立刻抛。
+
+    ⚠️ **「刻意不路由」也必须显式登记**（注册表里有 `NOT_ROUTED` 档）。
+    靠缺席表达"决定不路由"读不出来 —— 它和"忘了"长得一模一样。这与
+    `EXIT_SPECS` 里 `NO_FEASIBLE_ACTION` 的 `default_scope=None` 是同一个手法。
+
+    ⚠️ 它**仍然是 `RuntimeError` 子类**：插在中间不改变任何既有 `except
+    RuntimeError` / `except <具体类>` 的行为，纯增量。
+    """
+
+
+class IBSIncompleteStageCoverageError(IBSControlPlaneError):
     """一个 stage 的预期窗口没有全部加载成功，拒绝在缺口上求解自由能。"""
 
 
@@ -4415,7 +4442,7 @@ LIGAND_COM_RESTRAINT_PROTOCOL_VERSION = 2
 # **-3.57 kJ/mol**（放大 3.6 倍），而且它就是壳退役后剩下的**全部**残差
 # （生产 -10.898 vs 逐态独立 -7.324 / 真值 -6.581，即 -3.57 ~ -4.32，5.5σ）。
 # ⟹ 「只移除壳」这一步是对的且已完成，但**不能**据此认为独立采样没有价值。
-# 逐项消元证据见 docs/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md。
+# 逐项消元证据见 docs/archive/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md。
 #
 # 退役方式是**死代码而非删除**：`build_ibs_dual_system` 里构造壳的整段留在一个
 # 永久为假的分支里；`_estimate_wca_shield_parameters` 等函数体一字未改、仍可导入。
@@ -8402,7 +8429,7 @@ def _resolve_frozen_validation_is_final_rung(
     return bool(int(effective_frozen_validation_budget) >= schedule[-1])
 
 
-class IBSWarmupConvergenceError(RuntimeError):
+class IBSWarmupConvergenceError(IBSControlPlaneError):
     """Structured signal that a window lacks adequate sampled-state coverage."""
 
     def __init__(self, message: str, diagnostics: Dict):
@@ -8595,7 +8622,7 @@ def assert_candidate_not_sealed(
         )
 
 
-class IBSValidationBudgetIndeterminateError(RuntimeError):
+class IBSValidationBudgetIndeterminateError(IBSControlPlaneError):
     """冻结验证预算耗尽，但一直**样本不足**——Δf−ΔF 从来没被求出来过。
 
     与 ``IBSWarmupConvergenceError`` 的区别是决定性的，别合并：那个是"测出来了、
@@ -8624,7 +8651,7 @@ class IBSValidationBudgetIndeterminateError(RuntimeError):
         self.window_idx = None if window_idx is None else int(window_idx)
 
 
-class ExistingEnsembleRequiresRescueAudit(RuntimeError):
+class ExistingEnsembleRequiresRescueAudit(IBSControlPlaneError):
     """On-disk data for this window was produced under a DIFFERENT sampling
     repair policy (e.g. the deprecated mutating path that could rewrite f_k in
     place). Under non_mutating_v1 we refuse to reuse it AND refuse to overwrite
@@ -8695,7 +8722,7 @@ def should_run_legacy_repair(repair_policy: str) -> bool:
     )
 
 
-class IBSFrozenCalibrationValidationError(RuntimeError):
+class IBSFrozenCalibrationValidationError(IBSControlPlaneError):
     """一份已经用 fixed-H overlap 探针 + bias 校准探针证明过物理正确的冻结 f_k，
     在（当前这次或累计）冻结验证预算内仍未通过独立验证——跟
     IBSWarmupConvergenceError（从未获得过一份校准 f_k 的普通未收敛，真正需要
@@ -12631,7 +12658,7 @@ def probe_adjacent_bias_calibration_bank(
 # ============================================================================
 # [INDEPENDENT_ENDPOINT_PROTOCOL_VERSION=1] 端点态独立固定-λ 生产采样
 #
-# 机制见 STAGE2_ROOT_CAUSE_2026-08-28.md。IBS 的 stage2 每个窗口只跑**一条**
+# 机制见 docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md。IBS 的 stage2 每个窗口只跑**一条**
 # 轨迹，窗口内所有 λ 态都从这一条轨迹重加权出来。那条轨迹里配体（哪怕软核）
 # 几乎总占着体积，"水填满配体空腔"的构型概率 ≈ 0——**重加权造不出没采到的
 # 构型，再多帧也造不出来**。
@@ -12660,7 +12687,7 @@ def probe_adjacent_bias_calibration_bank(
 #     **剩下 80% 就是本模块描述的这个机制**：残差全在 λ<0.578 的下降支（空腔塌缩区），
 #     win4 一个窗口占 50%。
 # 所以保留这条独立端点采样路径的理由不只是"机制成立"，
-# 而是**它针对的正是壳退役后剩下误差的主体**。见 docs/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md。
+# 而是**它针对的正是壳退役后剩下误差的主体**。见 docs/archive/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md。
 #
 # 决定性的一点：window 2 的相邻 <ΔU> 只有 0.4~0.6 kT，**任何基于能量的重叠
 # 判据都会说"完美"**。所以这不是"窗口太宽/重叠不足/统计噪声"，加窗、插 λ、
@@ -12792,14 +12819,14 @@ _INDEPENDENT_ENDPOINT_WALKER_STRIDE = 1_009
 # 再多采样、再换种子都修不了 —— 那是观测量的问题，不是采样量的问题。
 #
 # ⚠️ **保留的是独立端点采样本身**（每个 λ 各自跑独立轨迹），那是
-# STAGE2_ROOT_CAUSE_2026-08-28.md §8.2 提出的采样设计层修法，与干/湿无关。
+# docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md §8.2 提出的采样设计层修法，与干/湿无关。
 # ⚠️ [2026-09-02 归因更正] 原文写"针对 **+32 kJ/mol 根因**的修复"——**错了**。
 # 那 +32 的 98% 是 λ-WCA 防护壳，已于 2026-09-02 退役定案（见
 # docs/archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md）。独立端点采样
 # 针对的是单系综重加权这个**机制**。
 # ⚠️ [2026-09-09 更正] 上一版这里写"只对残余 ≈4% 负责"——**作废**（那个 4% 带
 # LRC 口径错误且是带壳测的）。壳退役后该机制对应 **-2.7 ~ -3.5 kJ/mol，
-# 即残差的约 80%**（另 20% 是生产/参考的盒体积差 2.81%，实测 -0.86 ± 0.13）。见 docs/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md。
+# 即残差的约 80%**（另 20% 是生产/参考的盒体积差 2.81%，实测 -0.86 ± 0.13）。见 docs/archive/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md。
 # 去掉的只是"从湿构型再起一组"这个诊断装置。
 # 要恢复双起点，先把探针锚点从配体换成蛋白腔壁参考原子，让它重新成为状态函数；
 # 在那之前恢复它只会再烧一轮 GPU 得到同样无判别力的结果。
@@ -13793,7 +13820,7 @@ def _reduced_energies_for_record(
 # [ENDPOINT_CAVITY_SAMPLING_GATE_PROTOCOL_VERSION=1] 独立端点段的"慢坐标到底被
 # 采到了没有"硬门
 # ----------------------------------------------------------------------------
-# 本模块存在的全部理由（STAGE2_ROOT_CAUSE_2026-08-28.md §3.3）是：IBS 每窗口单轨迹
+# 本模块存在的全部理由（docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md §3.3）是：IBS 每窗口单轨迹
 # 重加权造不出"水塌进空腔"这个构型，所以端点态改成每个 λ 各自独立采样。
 # 那么"这条独立轨迹到底有没有采到空腔的湿/干转换"就是该段结果可信度的**前提**，
 # 而不是一项可选诊断。
@@ -13831,7 +13858,7 @@ def _decorrelate_independent_record(
 
     候选一是这个态自己的约化势能；候选二是逐帧空腔水数。这不是可有可无的
     保险：本模块要采的慢模态是**结构性**的（水进出配体空腔），而
-    STAGE2_ROOT_CAUSE_2026-08-28.md §3.2 已经实测出这个模态在能量上几乎不
+    docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md §3.2 已经实测出这个模态在能量上几乎不
     可见（window 2 相邻 <ΔU> 仅 0.4~0.6 kT）。⚠️ [2026-09-02] 原文这里还写着
     该窗口"贡献 ~21 kJ/mol 的 TΔS"——那个幅度是**壳还在时**推出来的，已随
     λ-WCA 壳退役作废（见 docs/archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md）。
@@ -13901,7 +13928,7 @@ def _decorrelate_independent_record(
     # 两者混起来会得到一个「对单相态假阳性、对能量估计过严」的门。
     # 它的正确用途只有一个：**慢模态覆盖度诊断** —— "这条记录最多提供 k+1 个关于
     # 空腔是否湿的独立观测"。空腔水的 TΔS 是单系综机制所依赖的量
-    # （STAGE2_ROOT_CAUSE_2026-08-28.md §3.2/§3.3）。
+    # （docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md §3.2/§3.3）。
     # ⚠️ [2026-09-02 归因更正] 原文写"正是 **+32 kJ/mol 根因**所依赖的量"——
     # 那 +32 的 98% 已定罪为 λ-WCA 防护壳（见
     # docs/archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md）。这个诊断量
@@ -14225,7 +14252,7 @@ def endpoint_wet_dry_hysteresis_gate(
           区间有重叠。若湿组全程 wet_fraction=1、干组全程 =0、两边转换次数
           都是 0，那就是两个互不连通的模态各自被采了一遍——此时 (1) 即使
           通过也毫无意义（两个都错、且错得一样，差值照样是 0）。这一条是
-          STAGE2_ROOT_CAUSE_2026-08-28.md §4 "所有门测的都是已采到的构型之间
+          docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md §4 "所有门测的都是已采到的构型之间
           的散布" 那个教训的直接产物：必须有一项直接证明"该采的构型采到了"。
     """
     # ------------------------------------------------------------------
@@ -16418,7 +16445,7 @@ class IBSWindowManagerDualLambda:
             # 它现在**只进报告、不当门**（本仓自第一个 commit 起就是如此），所以修它
             # 不改变任何判定；修的理由是这个数**会骗读它的人**：可达性预检的 T 一度
             # 就被错取成它，把 gcrit 算小 20 倍、把只差 26% 帧数的 win4 判成
-            # "差 7.5 倍不可达"（见 docs/STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md
+            # "差 7.5 倍不可达"（见 docs/archive/STAGE2_AUTONOMOUS_LOOP_STATUS_2026-09-11.md
             # §9）。一个随预算浮动的数还会让两次 run 的报告没法横向比。
             #
             # ⚠️ 与可达性预检的 T（`IBS_LOCAL_MBAR_GATE_MIN_FRAMES`=10，**去相关**
@@ -20316,7 +20343,7 @@ PROBE_MAX_LAMBDA_STATES = OPENMM_MAX_FORCE_GROUP - PROBE_FORCE_GROUP_BASE + 1  #
 # "这批被 Group-4 λ-WCA 防护壳偏置过、且整窗只有一条轨迹的采样，能不能重加权
 # 到没有防护壳的真实物理系综"——共模因子恰恰就是在那一步被除掉的。
 #
-# 4W53 实测（STAGE2_ROOT_CAUSE_2026-08-28.md）是这个盲点的直接证据：
+# 4W53 实测（docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md）是这个盲点的直接证据：
 #     溶剂腿  mixture min_overlap = 0.4684  → 判定通过
 #             raw     min_overlap = 0.0196  → 对真实物理目标几乎不能重加权
 #     converged=True，stage2 报 +35.61 kJ/mol，独立端点参考是 -6.29 kJ/mol。
@@ -20348,7 +20375,7 @@ PROBE_MAX_LAMBDA_STATES = OPENMM_MAX_FORCE_GROUP - PROBE_FORCE_GROUP_BASE + 1  #
 # 任一项不达标、或算不出来（证据不全）→ converged=False，
 # failure_reason = "insufficient_target_support"。
 #
-# ⚠️ 这道门只**拦得住**错值，治不了病。STAGE2_ROOT_CAUSE_2026-08-28.md §3.2 的
+# ⚠️ 这道门只**拦得住**错值，治不了病。docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md §3.2 的
 # window 2 是决定性反例：它相邻 <ΔU> 只有 0.4~0.6 kT，任何基于能量的重叠判据
 # 都会说"完美"，却错得最多——因为失效模式是结构性的（"该采的构型一次都没采到"），
 # 不是"采到的构型之间散布不够"。这个教训与幅度无关，仍然成立。
@@ -20660,7 +20687,7 @@ def window_self_support_check(
 ) -> Optional[Dict[str, Any]]:
     """窗口**自己**的支撑够不够 —— 在它刚跑完那一刻就判，不等全部窗口跑完。
 
-    设计依据：``docs/PLAN_PATH_REPAIR_2026-09-11.md`` P2-9c。
+    设计依据：``docs/archive/PLAN_PATH_REPAIR_2026-09-11.md`` P2-9c。
     老板原话：「每个窗口跑完就判一次，这不是更早判定吗」。
 
     **为什么值得做** —— 实测浪费（cyclod_ligand2/rep1 的 launch.log 顺序）::
@@ -21102,7 +21129,7 @@ def join_lambda_two_sided_support(
 ) -> Optional[Dict[str, Any]]:
     """相邻两个窗口对它们**共享的那一个 λ** 各自给出的重要性支撑。
 
-    设计依据：``docs/PLAN_PATH_REPAIR_2026-09-11.md`` §3bis（跨窗累加）+ P2-9a。
+    设计依据：``docs/archive/PLAN_PATH_REPAIR_2026-09-11.md`` §3bis（跨窗累加）+ P2-9a。
 
     **为什么需要它**：IBS 窗口的样本本来就能跨窗累加（每个窗口是一个已知的采样
     分布，MBAR 天生处理多个采样分布），所以"某个 λ 到底采够没有"这个问题**不该只问
@@ -23563,7 +23590,7 @@ class GlobalMBARAnalyzer:
             ),
             "not_sufficient_note": (
                 "通过这道门只说明目标态有起码的重要性采样支撑，**不**说明结果正确："
-                "STAGE2_ROOT_CAUSE_2026-08-28.md §3.2 的 window 2 相邻 <dU> 仅 0.4~0.6 kT、"
+                "docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md §3.2 的 window 2 相邻 <dU> 仅 0.4~0.6 kT、"
                 "任何能量重叠判据都判优，却错得最多，因为失效模式是结构性的"
                 "（'该采的构型一次都没采到'），不是'采到的构型之间散布不够'。"
                 "[2026-09-02] 该窗口原先标注的 +19.49 kJ/mol 是壳还在时测的幅度，"
@@ -23953,16 +23980,35 @@ def split_half_drift_diagnostics(
         int(s["window_index"]): float(s["uncertainty_kJ_mol"])
         for s in (full_result.get("covariance_chain_segments") or [])
     }
-    if set(seg_first) != set(seg_full) or set(seg_second) != set(seg_full):
+    # 🔑 [2026-09-18] 半程窗口集合与全量不一致时，原来**整段**返回 available=False。
+    # 实测后果（09-18 benchmark 24 run）：complex 腿 20 条里 12 条的漂移诊断完全是
+    # 暗的，溶剂腿 0/22 —— 而且失败的恰好是最弱窗口已经贴/破样本下限的那些
+    # （`min_decorrelated_samples` 中位 18.0 vs 可用组 26.5，12 条里 6 条在**全量**
+    # 数据上就已经低于门 20）。半程帧数砍半 ⟹ 那个边缘窗口被 solver `continue`
+    # 掉 ⟹ 集合不一致 ⟹ 整段关闭。**与"最需要漂移检验"反相关，而且是构造出来的
+    # fail-open。** 见 docs/archive/STAGE2_OFFLINE_FORENSICS_2026-09-18.md §9。
+    #
+    # 改法：逐窗比较取**交集**，缺的窗口如实记名。
+    # `sigma_inflated_from_split_half` 早就逐窗处理"这个窗口没有漂移证据"
+    # （`sigma_floor_unavailable`），所以交集结果可以直接喂给它，缺的窗口照旧
+    # 不膨胀、并在名单里可见 —— 数值语义不变，只是不再把**有证据的窗口**
+    # 一起丢掉。
+    #
+    # ⚠️ 总量那几项**不能**这么救：窗口集合不同 ⟹ 两个半程的 `total_delta_G`
+    # 积的不是同一段 λ，相减没有物理意义。集合不全时一律置 None（**不是 0**）。
+    common = sorted(set(seg_full) & set(seg_first) & set(seg_second))
+    missing_from_halves = sorted(set(seg_full) - set(common))
+    if not common:
         return {
             "split_half_gate_protocol_version": int(SPLIT_HALF_GATE_PROTOCOL_VERSION),
             "available": False,
-            "reason": "半程解出的窗口集合与全量不一致，无法逐窗比较",
+            "reason": "两个半程与全量没有任何共同窗口，无法逐窗比较",
+            "windows_missing_from_halves": [int(w) for w in sorted(set(seg_full))],
         }
 
     per_window = []
     max_z = 0.0
-    for w in sorted(seg_full):
+    for w in common:
         drift = seg_second[w] - seg_first[w]
         sigma = sigma_win.get(w, 0.0)
         # σ_win 为 0 时 z 无意义（不是"完美"），记 None 而不是 inf。
@@ -23980,8 +24026,17 @@ def split_half_drift_diagnostics(
         })
 
     total_sigma = float(full_result.get("total_error", 0.0) or 0.0)
-    total_drift = float(halves["second"].get("total_delta_G", 0.0)) - float(
-        halves["first"].get("total_delta_G", 0.0)
+    coverage_complete = not missing_from_halves
+    # 集合不全 ⟹ 两个半程积的不是同一段 λ，总量相减无物理意义，置 None。
+    total_first = (
+        float(halves["first"].get("total_delta_G", 0.0)) if coverage_complete else None
+    )
+    total_second = (
+        float(halves["second"].get("total_delta_G", 0.0)) if coverage_complete else None
+    )
+    total_drift = (
+        total_second - total_first
+        if (total_first is not None and total_second is not None) else None
     )
     return {
         "split_half_gate_protocol_version": int(SPLIT_HALF_GATE_PROTOCOL_VERSION),
@@ -23991,11 +24046,24 @@ def split_half_drift_diagnostics(
             "两个半程各自 SE≈√2·σ，其差的 SE≈2σ，所以判据分母是 2σ 而不是 σ。"
             "该诊断对帧的时间顺序敏感，是现有五道门都不具备的维度。"
         ),
-        "total_delta_G_first_half_kJ_mol": float(halves["first"].get("total_delta_G", 0.0)),
-        "total_delta_G_second_half_kJ_mol": float(halves["second"].get("total_delta_G", 0.0)),
+        # [2026-09-18] 逐窗结果取的是「全量 ∩ 前半 ∩ 后半」。缺的窗口在
+        # `windows_missing_from_halves` 里如实记名 —— 它们**没有**漂移证据，
+        # 不是"实测漂移为 0"；下游 `sigma_inflated_from_split_half` 会把它们标成
+        # `sigma_floor_unavailable` 并计入 `sigma_floor_coverage_complete`。
+        "windows_missing_from_halves": [int(w) for w in missing_from_halves],
+        "n_windows_compared": int(len(common)),
+        "coverage_complete": bool(coverage_complete),
+        "coverage_note": (
+            "" if coverage_complete else
+            "半程解出的窗口集合少于全量（帧数砍半后边缘窗口被求解器跳过）。"
+            "逐窗漂移只覆盖交集；总量项因两半积的 λ 段不同而置 None，**不是 0**。"
+        ),
+        "total_delta_G_first_half_kJ_mol": total_first,
+        "total_delta_G_second_half_kJ_mol": total_second,
         "total_drift_kJ_mol": total_drift,
         "total_drift_over_2sigma": (
-            abs(total_drift) / (2.0 * total_sigma) if total_sigma > 0.0 else None
+            abs(total_drift) / (2.0 * total_sigma)
+            if (total_drift is not None and total_sigma > 0.0) else None
         ),
         "max_window_drift_over_2sigma": max_z,
         "per_window": per_window,
@@ -24171,10 +24239,21 @@ def solve_stage_integrated(
             )
             # ⚠️ 触发判据**没变**，仍是逐窗 max_z（这一行只是把总量摆出来一起看）。
             print(
-                f"    ↳ [split-half 总量] 半程一 {drift.get('total_delta_G_first_half_kJ_mol'):+.3f} → "
-                f"半程二 {drift.get('total_delta_G_second_half_kJ_mol'):+.3f}，"
-                f"总漂移 {drift.get('total_drift_kJ_mol'):+.3f} kJ/mol"
-                + (f" = {_tot_z:.2f}×2σ" if _tot_z is not None else "（σ_total=0，z 无意义）")
+                # [2026-09-18] 窗口集合不全时总量项是 None（两半积的 λ 段不同，
+                # 相减无意义）。不能再无条件 `:+.3f`，否则诊断自己把主求解打断。
+                (
+                    f"    ↳ [split-half 总量] 半程一 "
+                    f"{drift.get('total_delta_G_first_half_kJ_mol'):+.3f} → "
+                    f"半程二 {drift.get('total_delta_G_second_half_kJ_mol'):+.3f}，"
+                    f"总漂移 {drift.get('total_drift_kJ_mol'):+.3f} kJ/mol"
+                    + (f" = {_tot_z:.2f}×2σ" if _tot_z is not None
+                       else "（σ_total=0，z 无意义）")
+                    if drift.get("total_drift_kJ_mol") is not None else
+                    f"    ↳ [split-half 总量] **不可比** —— 半程解出的窗口集合"
+                    f"少于全量（缺 {drift.get('windows_missing_from_halves')}），"
+                    f"两半积的 λ 段不同；逐窗漂移只覆盖交集"
+                    f"（{drift.get('n_windows_compared')} 个窗口）"
+                )
                 + "。**总量稳而逐窗大 ⟹ 多半是归属重排,不是漂移**："
                 "整条路径是一个拼接的全局 MBAR 解,窗口不是独立可分的单元,"
                 "帧砍一半会让 per-window 的 segment ΔG 重新分配。"

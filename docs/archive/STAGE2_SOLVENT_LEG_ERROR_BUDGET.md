@@ -1,6 +1,6 @@
 # Stage2 溶剂腿残差归因（**已关闭 2026-09-10**）
 
-[项目入口](../README.md) · [文档导航](README.md) · [当前科学状态](STATUS.md)
+[项目入口](../README.md) · [文档导航](../README.md) · [当前科学状态](../STATUS.md)
 
 > **状态：CLOSED。残差 100% 是参照臂的盒体积错了，生产没有错。**
 >
@@ -28,7 +28,7 @@
 数据源：`4W53/output_v3_seed20260908/solvent_leg/`（甲苯，15 原子 = 7C+8H；
 6 个窗口全部 `ligand_com_restraint_protocol_version = 2`；落盘 2026-09-01 17:21–17:46）。
 参考真值口径见 [STAGE2_ROOT_CAUSE_2026-08-28.md](STAGE2_ROOT_CAUSE_2026-08-28.md) §9.1
-与 [reference_data/README.md](reference_data/README.md)。
+与 [reference_data/README.md](../reference_data/README.md)。
 
 ---
 

@@ -383,7 +383,7 @@ slab（无蛋白）不能代替这里的真实 receptor–ligand complex；C4 �
   **等重构落地后重新出图再挂。**
 
 - [ ] **REL-10 [P3] 软件版本号与变更说明** ——
-  [RELEASE_READINESS:178](RELEASE_READINESS_2026-08-31.md)。LICENSE（MIT + NOTICE）已有，
+  [RELEASE_READINESS:178](archive/RELEASE_READINESS_2026-08-31.md)。LICENSE（MIT + NOTICE）已有，
   `CITATION` 已有意押后（见上方"明确不做"），**只欠版本号本身**：冻一个版本、写清支持范围。
   ⚠️ 与 `REL-05`/`REL-06` 同理，**方法定稿前不急**；登记在这里是为了不再从 RELEASE_READINESS
   里被重新"发现"一遍。

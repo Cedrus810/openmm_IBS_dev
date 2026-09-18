@@ -29,10 +29,10 @@ float64（24 KB）。
 > **P1 已落地（2026-09-12）：** 这条四步链的 ①② 现在有了自动替代 —— 开
 > `--outer-lambda-local-residual-ibs` 且配体不在冻结 manifest 覆盖范围内时，主线会在
 > 基线预平衡之后自己做一次闭式重训（帧源 `pre_equilibration.dcd`），③④ 不变。
-> 见 [EXP-033_P1_LANDED_2026-09-12.md](EXP-033_P1_LANDED_2026-09-12.md)。
+> 见 [EXP-033_P1_LANDED_2026-09-12.md](archive/EXP-033_P1_LANDED_2026-09-12.md)。
 > **做 A/B 仍然走本文这条手工链**（两臂必须共用同一份冻结权重）。
 > 原始方案登记在
-> [EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md](EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md)。
+> [EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md](archive/EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md)。
 
 ## 链条
 

@@ -261,7 +261,7 @@ RESOURCE_MISSING_HINT = (
     "resources/outer_lambda_local_residual/。\n"
     "走 runabfe 主线时通常**不该看到这条**：EXP-033 P1 落地后，manifest 缺失或覆盖"
     "不到当前配体会走自动闭式重训（基线预平衡之后，帧源 pre_equilibration.dcd），"
-    "见 docs/EXP-033_P1_LANDED_2026-09-12.md。看到这条说明 loader 被直接调用了，"
+    "见 docs/archive/EXP-033_P1_LANDED_2026-09-12.md。看到这条说明 loader 被直接调用了，"
     "或者那条自动重训本身失败了。\n"
     "要手工冻一份（做 A/B 时两臂必须共用同一份）：按 docs/RETRAIN_LOCAL_RESIDUAL.md "
     "重训，再用 abfe_scripts/write_local_residual_resource_manifest.py 生成 manifest。"

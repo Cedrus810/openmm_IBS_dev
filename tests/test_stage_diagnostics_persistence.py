@@ -200,7 +200,7 @@ def test_reusable_stage_cache_rehydrates_and_rechecks_every_gate():
 def test_reusable_vanishing_cache_without_target_support_gate_is_refused():
     """升级前写下的 stage2 缓存没有 target_support_gate，其 raw 重加权支撑度
     从未被判定过。它必须被拒绝复用，而不是因为"旧路径没这个字段"就放行——
-    4W53 溶剂腿（STAGE2_ROOT_CAUSE_2026-08-28.md）就是这样一份 converged=True
+    4W53 溶剂腿（docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md）就是这样一份 converged=True
     但错 +41.9 kJ/mol 的缓存。"""
     pipeline = _pipeline_without_init()
     cached = {
@@ -305,7 +305,7 @@ def test_a_failed_target_support_gate_is_reused_but_marked_untrusted():
       ③ 证据进 `stage_quality_failures`（failure_reason / failed_checks 原样可审计）。
 
     ⚠️ 少任何一项，这份 +41.9 kJ/mol 的缓存就会以"一次干净通过"的样子被复用 ——
-    那正是 STAGE2_ROOT_CAUSE_2026-08-28.md 记的那次事故。
+    那正是 docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md 记的那次事故。
     """
     pipeline = _pipeline_without_init()
     logged = []

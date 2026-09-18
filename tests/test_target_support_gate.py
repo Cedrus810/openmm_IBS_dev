@@ -1,6 +1,6 @@
 """TARGET_SUPPORT_GATE_PROTOCOL_VERSION=1 回归。
 
-背景：STAGE2_ROOT_CAUSE_2026-08-28.md。4W53（T4L99A + 甲苯）的 stage2 溶剂腿
+背景：docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md。4W53（T4L99A + 甲苯）的 stage2 溶剂腿
 报出 `+35.61 kJ/mol`，独立参考算例（不 import 仓库任何模块、同一份
 `system_solvent.xml`、同一条 λ 路径）给的是 `-6.29 ± 0.34`，差 **+41.9 kJ/mol**。
 而当时**所有五道收敛门全部通过**：

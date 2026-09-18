@@ -1,6 +1,6 @@
 """失败窗口插 λ 的契约（**model B**，2026-09-11 重写）。
 
-设计依据：`docs/PLAN_PATH_REPAIR_2026-09-11.md` §2 更正与 §3ter。
+设计依据：`docs/archive/PLAN_PATH_REPAIR_2026-09-11.md` §2 更正与 §3ter。
 
 两次真机事故塑造了这个契约，都要记住：
 

@@ -1,12 +1,25 @@
 # Stage-2 三轴耦合现状（分窗口 / 分 λ / 分采样量）
 
+> ## 🗂 2026-09-18 归档 —— **是快照，不是待办、也不是现值**
+>
+> 本文的用途写在它自己页首：给「重新设计一个总控制」做输入。**那件事已经做完了**
+> —— 控制器 09-12 设计并跑通，见
+> [STAGE2_CONTROLLER_DESIGN_2026-09-12.md](STAGE2_CONTROLLER_DESIGN_2026-09-12.md)。
+>
+> **仍然有效**：作为 [PLAN_PATH_REPAIR_2026-09-11.md](PLAN_PATH_REPAIR_2026-09-11.md)
+> 的事实依据（那份页首就引本文）。
+>
+> ⚠️ **三轴的现值此后改过**，别拿本文的数当现状：分窗目标
+> `metric_integral` → `state_count`（09-17）、`stage2_window_max_states` 8 → 5（09-17）。
+> 现状看源码与 [../STATUS.md](../STATUS.md)。
+
 **日期**：2026-09-11
 **性质**：**现状快照，不是提案。** 为"重新设计一个总控制"做输入用。
 只记可核对的事实与出处；凡是推断都显式标成「推断」。
 
 相关但不重复的文档：
 - `docs/STAGE2_WINDOW_AND_SEGMENT_REDESIGN_2026-09-11.md` —— 分窗+多采样段重构的落地记录。
-- `docs/STAGE2_ROOT_CAUSE_2026-08-28.md` —— 单系综重加权的根因。
+- `docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md` —— 单系综重加权的根因。
 - `abfe_config.json` 里 `_comment_stage2_*` 四条 —— 当前各值的实测依据，**别重新论证**。
 
 ---

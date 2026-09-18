@@ -27,7 +27,7 @@
 >
 > 差 **−4.896**，把对生产的判读从「差 5.5σ」翻成「差 0.72σ」。
 > 全部证据与复现命令见
-> [../STAGE2_SOLVENT_LEG_ERROR_BUDGET.md](../STAGE2_SOLVENT_LEG_ERROR_BUDGET.md)。
+> [../archive/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md](../archive/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md)。
 >
 > 新的可用数值在
 > `4W53/reference_at_npt_box/hydration_reference/hydration_reference_vdwonly_prodlambda_results.json`
@@ -36,7 +36,7 @@
 **这是目前唯一带 provenance 的 stage2（λ_vdw 解耦段）真值。** 在此之前，全仓
 只有三处**转述**"独立参考真值 ΔG_LJ = −6.26 kJ/mol"（`runabfe.py:3832`、
 `abfe_pipeline.py:7144/7171`），不写方向、不写 LRC 口径、不写软核指数 —— 那三处
-已经害人两次（见 `docs/STAGE2_ROOT_CAUSE_2026-08-28.md` §9.1）。
+已经害人两次（见 `docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md` §9.1）。
 
 ### 怎么产生的
 
@@ -127,7 +127,7 @@ power_lj: [2,2], alpha_convention: dimensionless_sigma_scaled_v2}`。
 
 而且 `single_mixture` 是**带壳**测的。壳退役后同一个量是 **−3.57**（放大 3.6 倍）
 ⟹ 结论「单系综抓不到空腔重组、只占 4%」**不成立**。逐条见
-[../STAGE2_SOLVENT_LEG_ERROR_BUDGET.md](../STAGE2_SOLVENT_LEG_ERROR_BUDGET.md)。
+[../archive/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md](../archive/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md)。
 
 **JSON 本身未改**（它是带 provenance 的实验数据）——更正只记在这里。
 

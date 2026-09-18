@@ -14,7 +14,7 @@
 尾巴**。它的产地本身是 `sorted()` 的，但有序前缀 + 乱序尾巴仍然是乱序 —— 所以
 **在各产地加 `sorted()` 挡不住这个问题**，必须在追加处修，也必须在这里断言。
 
-完整调查见 `docs/EXP-031_GPU_OPTIMIZATION_2026-09-09.md`（原始记录在 CUDA 沙箱的
+完整调查见 `docs/archive/EXP-031_GPU_OPTIMIZATION_2026-09-09.md`（原始记录在 CUDA 沙箱的
 `experiments/EXP-031_ibs_bias_fusion/PROPOSAL_mainline_integration.md` §2/§5.1，不在本仓）。
 
 ## 这条断言盯的是什么

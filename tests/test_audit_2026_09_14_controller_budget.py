@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""`docs/CONTROLLER_BUDGET_AUDIT_2026-09-14.md` 的 63 条缺陷的**回归钉子**。
+"""`docs/archive/CONTROLLER_BUDGET_AUDIT_2026-09-14.md` 的 63 条缺陷的**回归钉子**。
 
 本文件只钉**行为不变量**（"给这样一份盘面，`decide()` 必须 / 不得给出某个动作"），
 不钉内部实现：审计里的修复正在并行落地，函数签名随时会变，按签名写的测试会在
@@ -227,6 +227,12 @@ def test_an_unknown_production_remainder_does_not_reject_a_bounded_rewindow(tmp_
     c = Stage2RepairController(run, "vanishing")
     pb = c.read()["production_budget"]
     assert pb["stage_remaining_steps"] is None, pb        # 未知
+    # 🔑 [2026-09-18] 这个盘面的失败来源是 `top1pct_veto`，它现在**先**走一次性的
+    # `RELEARN_FK_EPOCH`（换 f_k 与缩跨度同属 η 杠杆，但不把溢出推给末窗）。
+    # 本用例钉的是它之后那一步：余量未知不得把有界重窗挡掉。先把额度用掉。
+    import abfe_preoptimizer as _pre
+    assert c.decide()["action"] == "RELEARN_FK_EPOCH"
+    _pre.mark_relearn_epoch_consumed(c.checkpoint_dir, 1, 1, detail={})
     plan = c.decide()
     assert plan["action"] == "IMMUTABLE_REWINDOW", (
         f"余量未知把有界重窗挡掉了：{plan['action']}／{plan['exit']}｜{plan['reason']}")
@@ -608,8 +614,24 @@ def all_plans(tmp_path_factory):
     boards["rewindow_children"] = _rewindow_board(td("l"))
     boards["empty"] = _mkrun(td("m"), windows={}, ranges=R4, n_states=13)
 
-    return [(k, Stage2RepairController(v, "vanishing").decide())
-            for k, v in boards.items()]
+    plans = [(k, Stage2RepairController(v, "vanishing").decide())
+             for k, v in boards.items()]
+
+    # 🔑🔑 [2026-09-18] **一次性 `RELEARN_FK_EPOCH` 用掉之后的盘面也要进 sweep。**
+    #
+    # `top1pct_veto` 现在先走换 f_k（与缩跨度同属 η 杠杆，但不把溢出推给末窗），
+    # 于是上面那两个原本产出布局动作的盘面都停在 RELEARN 上 ⟹
+    # `test_a_layout_action_is_only_ever_issued_when_it_is_feasible` **一条布局
+    # 动作都扫不到**，那条安全断言会静默失去覆盖（它自己有一句 `assert seen` 在
+    # 兜底，正是为了不让这种事静默发生）。
+    # 所以这里显式把那一次额度用掉，再决策一次 —— 覆盖的是**落回缩跨度**那一步。
+    import abfe_preoptimizer as _pre
+    for _label, _win in (("tail_support_failure", 2),
+                         ("fixed_lambda_rewindow", 1)):
+        _ctl = Stage2RepairController(boards[_label], "vanishing")
+        _pre.mark_relearn_epoch_consumed(_ctl.checkpoint_dir, 1, _win, detail={})
+        plans.append((f"{_label}_after_relearn", _ctl.decide()))
+    return plans
 
 
 # =============================================================== 段号识别（#2/#3）

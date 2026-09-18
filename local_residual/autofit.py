@@ -1017,7 +1017,7 @@ def startup_element_gate(
 #
 # 3. **最要命的一层：拿来重训的帧本身就缺构型。** stage2 每个窗口只跑一条轨迹、窗内
 #    所有 λ 态靠重加权覆盖，配体消失时空腔塌缩+水灌入这个结构性慢模态根本没被采到
-#    （docs/STAGE2_ROOT_CAUSE_2026-08-28.md）。用这批帧拟 B_φ 等于把缺掉的那个构象态
+#    （docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md）。用这批帧拟 B_φ 等于把缺掉的那个构象态
 #    焊进模型：模型学会在已采到的区域上把混合做得更漂亮，没采到的态连梯度都拿不到。
 #    然后 ESS / overlap / split-half / MBAR-BAR-TI 三方一致**全都会更绿**——它们只问
 #    "这批样本内部自洽吗"。实测参照：门全绿（mixture overlap 0.4684、converged=True）
