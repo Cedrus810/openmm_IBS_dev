@@ -49,7 +49,7 @@
 > 要放开得先复验 8.6 那些 bug，并连带重编 `plugins/LocalManyBodyResidual/*.so`（见下节）。
 
 > ⚠️ **`pymbar-core` 的版本是钉死的，不是"建议"。** 理由见
-> [PYMBAR_UNCERTAINTY_PROTOCOL.md](PYMBAR_UNCERTAINTY_PROTOCOL.md)：报告出去的 ABFE
+> [METHODS.md](METHODS.md)《PyMBAR uncertainty protocol》：报告出去的 ABFE
 > 不确定度不能因为换了个 environment 就静默改变。换版本要走那份文档里的完整流程。
 >
 > 本节早期版本写的是「`output/run_provenance.json` 记录 …… PyMBAR 4.0.3」——

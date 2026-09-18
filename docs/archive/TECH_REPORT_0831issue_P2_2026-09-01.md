@@ -2,7 +2,7 @@
 >
 > 主题（0831issue 的 P2 backlog + RELEASE_READINESS 的 R1/R2）**已关闭**，
 > 逐条处置结果已并入
-> [RELEASE_READINESS_2026-08-31.md](../RELEASE_READINESS_2026-08-31.md)
+> [RELEASE_READINESS_2026-08-31.md](RELEASE_READINESS_2026-08-31.md)
 > 的《第九轮审查 backlog》与《P2：本轮处置结果》两节。
 >
 > **但本文有两节是那边没有的，要查只能来这里**：
@@ -32,7 +32,7 @@
 两件事合成一件：
 
 1. 把 `Atenolol-rank11/0831issue.md`（第九轮 7 路分片审查清单，位于**旧工地目录**、不在主线库里）的
-   **剩余项整体并入** `docs/RELEASE_READINESS_2026-08-31.md`，作为发布验收的统一入口。
+   **剩余项整体并入** `docs/archive/RELEASE_READINESS_2026-08-31.md`，作为发布验收的统一入口。
 2. 把其中「能修的」修掉，包括 RELEASE_READINESS 自己列的 R1、R2 两条。
 
 结果：**P1 13 条全部收口**，**P2 37 条中 30 已修 / 4 加标注 / 3 明确暂缓**，**R1 + R2 已修**。
@@ -233,5 +233,5 @@ wheel 安装验证与端到端 CLI 测试同样仍未做。**CPU 全套通过不
 
 ## 10. 相关文档
 
-- `docs/RELEASE_READINESS_2026-08-31.md` —— backlog 已并入，R1/R2 各自的「处置」小节
+- `docs/archive/RELEASE_READINESS_2026-08-31.md` —— backlog 已并入，R1/R2 各自的「处置」小节
 - `Atenolol-rank11/0831issue.md` —— P1 两个回填小节（逐条依据与数值复核），P2 正文位置

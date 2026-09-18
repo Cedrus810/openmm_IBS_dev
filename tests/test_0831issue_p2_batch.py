@@ -1,7 +1,7 @@
 """0831issue.md P2 批次回归（2026-09-01）。
 
 只覆盖**行为有变**的那些条目；纯注释/文档类的不在这里钉。
-分组与 `docs/RELEASE_READINESS_2026-08-31.md` 的「第九轮审查 backlog」一致。
+分组与 `docs/archive/RELEASE_READINESS_2026-08-31.md` 的「第九轮审查 backlog」一致。
 """
 
 from __future__ import annotations

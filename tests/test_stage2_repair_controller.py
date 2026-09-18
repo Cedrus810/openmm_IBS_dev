@@ -26,6 +26,7 @@ import pytest
 
 pytestmark = pytest.mark.cpu_only
 
+import abfe_preoptimizer as pre
 from abfe_preoptimizer import Stage2RepairController
 
 
@@ -73,7 +74,7 @@ def _mkrun(tmp_path, *, windows, ranges, n_states, config=None, stage_result=Non
         # 把请求吞掉，于是缺窗/短生产/DONE/skipped 四条分支一条都走不到，
         # 六个测试会退化成同一个"没有自检产物就 ANALYZE"。
         # 默认给 ANALYSIS_ELIGIBLE（= 这个窗口自己没问题），要测别的态就传
-        # `self_verdict=...`，语义见 docs/STAGE2_CONTROLLER_DESIGN_2026-09-12.md §3/§4。
+        # `self_verdict=...`，语义见 docs/archive/STAGE2_CONTROLLER_DESIGN_2026-09-12.md §3/§4。
         # ⚠️ **还在预热/验证的窗口不落这份产物** —— 它是生产跑完那一刻才写的
         # （`ibs_engine.window_self_support_check`）。给预热中的窗口伪造一份
         # `ANALYSIS_ELIGIBLE` 会让 `_window_state` 的 `self_verdict` 判据盖过
@@ -434,10 +435,21 @@ def test_stage_gate_failure_routes_by_the_gate_that_actually_failed(tmp_path):
               # 归因分支排在 f_k 探针之后 ⟹ 不给这份证据，控制器会先去要它
               "cumulative_fk_residual_production": _fk}
 
-    def act(bad_window):
+    def act(bad_window, relearn_used_for=None):
+        """`relearn_used_for`：先把那个窗口一次性的全新 Epoch 用掉再决策。
+
+        🔑 [2026-09-18] `top1pct_veto` 现在**先**走 `RELEARN_FK_EPOCH`（换 f_k 与
+        缩跨度同属 η 杠杆，但不把溢出推给末窗）。本用例钉的是「按**失败的那道门**
+        路由」，也就是它之后那一步，所以偏斜那一支要先把一次性额度用掉。
+        """
         with tempfile.TemporaryDirectory() as td:
-            _, p = _plan(_pl.Path(td), windows={**FULL, 3: bad_window},
-                         ranges=R4, n_states=13, stage_result=_stage)
+            ctl, p = _plan(_pl.Path(td), windows={**FULL, 3: bad_window},
+                           ranges=R4, n_states=13, stage_result=_stage)
+            if relearn_used_for is not None:
+                assert p["action"] == "RELEARN_FK_EPOCH", p["reason"]
+                pre.mark_relearn_epoch_consumed(
+                    ctl.checkpoint_dir, 1, int(relearn_used_for), detail={})
+                p = ctl.decide()
             return p
 
     # 支撑/偏斜类 ⟹ 布局动作，落在自检点名的那个窗口上
@@ -447,7 +459,8 @@ def test_stage_gate_failure_routes_by_the_gate_that_actually_failed(tmp_path):
     # min_n_eff_over_g / solver_eligibility）。`top1pct_raw_weight`
     # 是**阶段门的指标名**，写侧从不把它写进 verdict_source ——
     # 用它等于造了一个真机不存在的盘面，归因必然落到"来源读不出来"那支。
-    "self_verdict_source": "top1pct_veto", "min_n_eff_over_g": 1.1})
+    "self_verdict_source": "top1pct_veto", "min_n_eff_over_g": 1.1},
+            relearn_used_for=3)
     assert p["action"] in ("SPLIT_TAIL_WINDOW", "INSERT_LAMBDA"), p["reason"]
     assert "加帧治不了" in p["reason"]
     assert p["windows"] == [3], p["reason"]
@@ -903,7 +916,10 @@ def test_fixed_lambda_table_middle_window_falls_back_to_bounded_rewindow(tmp_pat
     """λ 表上的两个动作都不可行 ⟹ 固定 λ 表上的**有界**重窗，而不是终止。"""
     # 末窗已经顶到**溢出槽上限** 2*hi−1=9 ⟹ 插 λ 不可行（λ 表不能再动）；
     # 失败的是中间窗 ⟹ 拆末窗不对症（它修的不是这个窗口）。
-    _, plan = _plan(
+    # 🔑 [2026-09-18] `top1pct_veto` 现在**先**走一次性的 `RELEARN_FK_EPOCH`
+    # （换 f_k 与缩跨度同属 η 杠杆，但不把溢出推给末窗）。本用例钉的是它之后的
+    # 那一步：λ 表上两个动作都不可行 ⟹ 落回有界重窗。所以先把那一次用掉。
+    ctl, plan = _plan(
         tmp_path,
         windows={0: {"K": 4}, 1: dict(SUPPORT_FAIL_WINDOW), 2: {"K": 9}},
         ranges=[(0, 4), (3, 8), (7, 16)], n_states=16,
@@ -911,6 +927,9 @@ def test_fixed_lambda_table_middle_window_falls_back_to_bounded_rewindow(tmp_pat
                 "max_path_insertions": 3},
         stage_result=_stage_support_failure(worst_window=1),
     )
+    assert plan["action"] == "RELEARN_FK_EPOCH", plan["reason"]
+    pre.mark_relearn_epoch_consumed(ctl.checkpoint_dir, 1, 1, detail={})
+    plan = ctl.decide()
     assert plan["action"] == "IMMUTABLE_REWINDOW", plan["reason"]
     assert plan["windows"] == [1]
     assert not plan["terminal"], "有界动作不是终态"

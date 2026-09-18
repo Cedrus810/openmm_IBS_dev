@@ -1,7 +1,7 @@
 # 交接：outer / local-residual 换体系接线（2026-09-11）
 
 > **已归档（2026-09-12）。** 接线部分已被 EXP-033 P1 闭式重训取代
-> （[EXP-033_P1_LANDED_2026-09-12.md](../EXP-033_P1_LANDED_2026-09-12.md)）。
+> （[EXP-033_P1_LANDED_2026-09-12.md](EXP-033_P1_LANDED_2026-09-12.md)）。
 > **§4 的第 2/3/4 条仍未修**，已抄进 [TODO.md](../TODO.md)《local-residual 未修项》；
 > §6《别再踩的坑》仍然全部有效，换体系前照读。
 
@@ -96,7 +96,7 @@ physical target 永远不含残差（`ibs_engine.py:8549`）。
   overlap / split-half / 三方一致全都会更绿——它们只问"这批样本内部自洽吗"。
 - **别拿质量门当验收。** 单轨迹重加权采不到空腔重组慢模态，所有收敛门对这个失效模式
   是瞎的：实测门全绿（mixture overlap 0.4684、`converged=True`）时 ΔG 错 42 kJ/mol
-  （raw overlap 只有 0.0196）。见 [STAGE2_ROOT_CAUSE_2026-08-28.md](../STAGE2_ROOT_CAUSE_2026-08-28.md)。
+  （raw overlap 只有 0.0196）。见 [STAGE2_ROOT_CAUSE_2026-08-28.md](STAGE2_ROOT_CAUSE_2026-08-28.md)。
 - **LORO held-out gap-variance 是用错层的判据。** 它只能证明"B_φ 在给它的那批帧上泛化
   得动"，不能证明"那批帧代表真实系综"。只配当过拟合的内部诊断。
 - **探针系综必须是窗口形状的。** 横跨整条 λ 梯子采样再互相重加权，会把深度解耦端的鬼影

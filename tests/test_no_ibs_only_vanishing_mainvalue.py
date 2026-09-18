@@ -61,7 +61,7 @@ def test_endpoint_segment_is_opt_in_and_still_fails_closed_when_requested():
     # 2) 显式请求了、但窗口数不够 → 仍然 fail-closed，不许静默降级
     assert "显式请求了独立端点段" in src
     # 3) 关闭它的代价必须显式告知，不能只是跳过
-    assert "STAGE2_ROOT_CAUSE_2026-08-28.md §3.3" in src
+    assert "docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md §3.3" in src
 
 
 def test_bridge_rescue_cannot_overwrite_the_stitched_result():

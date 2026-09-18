@@ -3,7 +3,7 @@
 [返回项目首页](../README.md) · [目录约定](../PROJECT_LAYOUT.md) ·
 [测试说明](../tests/README.md) · [文档导航](README.md)
 
-更新日期：**2026-09-12**
+更新日期：**2026-09-18**
 
 ## 改完代码先跑什么
 
@@ -28,7 +28,7 @@ python -m py_compile abfe_core.py abfe_pipeline.py abfe_preoptimizer.py ibs_engi
 python runabfe.py self-test
 ```
 
-`self-test`（`runabfe.py:3275` `run_self_tests`）会在缺依赖时逐项 `SKIP` 而不是
+`self-test`（`runabfe.py:4069` `run_self_tests`）会在缺依赖时逐项 `SKIP` 而不是
 报错——**看到 PASS 之前先确认没有一片 SKIP**，否则它什么也没验证。
 
 **4. 发布前：clone 下来 import 得动吗（秒级，CPU）**
@@ -67,9 +67,9 @@ CI 跑的是哪些门见 [`.github/workflows/cpu-ci.yml`](../.github/workflows/c
 | 改了什么 | 更新哪里 |
 |---|---|
 | **任何代码或协议改动** | [CHANGELOG.md](CHANGELOG.md) 加一行（规则见该文件末尾） |
-| 协议版本号、fail-closed 判据、物理口径 | 改动点的代码注释 + [TODO.md](TODO.md) 的《未关闭的代码缺陷》 |
+| 协议版本号、fail-closed 判据、物理口径 | 改动点的代码注释 + 对应优先级的待办：[TODO.md](TODO.md)`[P1]` / [TODO_P2.md](TODO_P2.md)`[P2]` / [TODO_P3.md](TODO_P3.md)`[P3]`（2026-09-16 起按优先级拆成三份，原来的《未关闭的代码缺陷》一节已不存在） |
 | 设计合同 / 提案的实施状态 | [design/README.md](design/README.md) 的状态表（**必须同步复核日期**） |
-| 发布阻塞项 | [RELEASE_READINESS_2026-08-31.md](RELEASE_READINESS_2026-08-31.md) |
+| 发布阻塞项 | [RELEASE_READINESS_2026-08-31.md](archive/RELEASE_READINESS_2026-08-31.md) |
 | 稳定用法 | [GETTING_STARTED.md](GETTING_STARTED.md) / [OUTPUTS_AND_RESUME.md](OUTPUTS_AND_RESUME.md) |
 | 新的科学结论、数值 | [STATUS.md](STATUS.md)：必须附来源、单位、符号、协议身份、有效性、是否可引用 |
 
@@ -98,10 +98,15 @@ CI 跑的是哪些门见 [`.github/workflows/cpu-ci.yml`](../.github/workflows/c
 
 1. 新的自动化测试**只**放 `tests/`。
 2. 一次性诊断 → `tools/diagnostics/`；验证 → `tools/validation/`。
-   **事故结案 = 它的诊断脚本也结案**：结论写进 `docs/`，脚本移到
-   `Atenolol-rank11/archive/from_mainline_<日期>/`，别留在主线烂掉。
+   **事故结案 = 它的诊断脚本也结案**：结论写进 `docs/`，脚本移到本仓库的
+   `archive/<名字>_removed_<日期>.py`，别留在主线烂掉。
+   （2026-09-18 更正：原文写的是往 `Atenolol-rank11/archive/from_mainline_<日期>/`
+   扔——那是**已退役的旧工地**，不是本仓库的归档位。实际在用的就是仓库根的
+   `archive/`，09-17 删 EXP-010/011 CLI 与 RunDirectoryLock 都放在那儿。）
 3. **新建的模块当场 `git add`。** 不是洁癖——`tests/test_fresh_clone_imports.py`
    的硬门会红，而且漏了它 clone 下来直接 import 不动（见上面第 4 档）。
-4. **旧源码副本、`*_bak`、`*_pre_patch` 一律不进本分支**，留在 `Atenolol-rank11`。
+4. **旧源码副本、`*_bak`、`*_pre_patch` 一律不进本分支。**
+   要留证据就按第 2 条进 `archive/`，别往旧工地 `Atenolol-rank11` 扔——那边已退役，
+   扔过去等于丢了。
    `docs/archive/` 只放文档，且其中 `removed_*.md` 是防回归凭证
    （`tests/test_att27_dead_code_removed.py` 断言它们存在），**不能删**。

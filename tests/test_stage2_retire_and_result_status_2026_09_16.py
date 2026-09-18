@@ -162,7 +162,7 @@ def test_sample_size_sources_are_untouched():
 def test_the_threshold_travels_with_the_artifact():
     """门槛由写侧落盘、读侧从产物里读，不许两边各抄一份常量。
 
-    （本仓 `docs/STAGE2_CONTROLLER_DESIGN_2026-09-12.md` 把「同一不变量两份实现」
+    （本仓 `docs/archive/STAGE2_CONTROLLER_DESIGN_2026-09-12.md` 把「同一不变量两份实现」
     记成最贵的 bug —— 控制器要算"加帧的射程"就必须知道门在哪。）
     """
     root = pathlib.Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

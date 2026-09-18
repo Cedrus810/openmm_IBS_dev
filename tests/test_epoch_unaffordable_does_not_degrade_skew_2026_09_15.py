@@ -62,7 +62,15 @@ def test_the_attribution_reuses_the_shared_implementation():
 # 源码探针指着 `decide` 会一无所获 —— 断言"存在"的当场红，断言"不存在"的**静默变成假绿**。
     src = (inspect.getsource(Stage2RepairController.decide)
            + inspect.getsource(Stage2RepairController._decide_once))
-    blk = src.split("_EPOCH_ACTIONS = (")[1].split("if action == \"RUN_PRODUCTION\":")[0]
+    # 🔑 [S2-N，2026-09-18] 结束锚点从 `if action == "RUN_PRODUCTION":` 改成
+    # `if action in self._BLOCK_CHARGING_ACTIONS:` —— 本测试拿「补帧准入闸的开头」
+    # 当 O1 块的下界，而那道闸的条件当天从「只拦 RUN_PRODUCTION」放宽成「拦全部
+    # 记账动作」（写侧 4 个动作、读侧只拦 1 个 ⟹ 重标定/探针/临时生产扣配额却从不过闸）。
+    # **本条的意图一字未变**：仍然是「O1 块里不许自造归因判据」。
+    # ⚠️ 锚点必须跟着源码走，否则 split 拿不到分隔符会**返回整个函数体** ——
+    # 后面每条分支里的 `top1pct` 都会被算进 O1 块，测试红得莫名其妙（这次就是）。
+    blk = src.split("_EPOCH_ACTIONS = (")[1].split(
+        "if action in self._BLOCK_CHARGING_ACTIONS:")[0]
     # 🔑 [2026-09-17] 字面量从 `support_failure_is_skew(` 改成
     # `support_failure_attribution(`：O1 改成了**三态**归因（用户拍板 A）——
     # `is_skew` 只区分两态，于是 `UNKNOWN`（射程只说明「还没被证伪」）被算进了

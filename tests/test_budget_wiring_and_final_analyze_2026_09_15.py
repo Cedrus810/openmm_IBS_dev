@@ -72,8 +72,13 @@ def test_final_analyze_is_skipped_when_it_would_sample():
     """控制器停手后，收尾的全路径 ANALYZE 不得在缺产物时启动采样。"""
     src = open("abfe_pipeline.py", encoding="utf-8").read()
     body = src.split("def _run_stage2_autonomous(")[1].split("\n    def ")[0]
-    tail = body.split("退出前跑一次")[0][-2500:]
-    assert "_blockers" in tail and "missing_windows" in tail, \
+    # 🔑 [2026-09-18] 这里原来取的是 marker 前**固定 2500 字符**的窗口。那个数字
+    # 不表达任何不变量 —— 在判据和 marker 之间插一段（本例：给
+    # `ExistingEnsembleRequiresRescueAudit` 加了一条 blocker）就会把判据挤出窗口，
+    # 行为一个 bit 没变、测试却红。钉的东西不变（判据必须出现在收尾 ANALYZE
+    # **之前**），只是不再用一个魔法字符数去表达"之前"。
+    head = body.split("退出前跑一次")[0]
+    assert "_blockers" in head and "missing_windows" in head, \
         "收尾 ANALYZE 前没有'会不会采样'的判据"
     # 真正的调用必须挂在 blockers 为空的那一支上
     assert "elif outcome.get(\"exit\") not in (" in body.split("_final = run_once(")[0][-800:], \

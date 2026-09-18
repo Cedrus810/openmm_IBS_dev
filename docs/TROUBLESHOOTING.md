@@ -18,44 +18,13 @@ python -c "import openmm; print(openmm.__version__)"
 
 ### `--openmm-cache-only` 下仍然警告「GROMACS 力场 include 目录找不到」
 
-**已修（2026-09-02，CACHE-01）。** 修法就是下面那句"要把调用挪进 else 分支"：
-`find_gmx_include_dir(config.gmx_path)` 现在只在**非** cache-only 分支里调用，
-cache-only 路径把 `include_dir` 留成 `None`。cache-only 下不再打这条警告。
+**已修（2026-09-02，`CACHE-01`）** —— `find_gmx_include_dir()` 现在只在**非** cache-only
+分支里调用。逐条核实「cache-only 确实用不到 `include_dir`」的原始记录在
+[archive/RUNTIME_ISSUES_2026-09-02.md](archive/RUNTIME_ISSUES_2026-09-02.md)。
 
-历史原因与"为什么这么改是安全的"的核对留在下面——它同时也是
-"cache-only 路径确实用不到 include_dir"这个结论的证据。
-
-原来的现象：`find_gmx_include_dir(config.gmx_path)` 在
-`if args.openmm_cache_only:` 分支**之前**就无条件执行了，所以即使这一路根本不需要
-include 树，警告也照样打。2026-09-02 实测（原始记录见
-[archive/RUNTIME_ISSUES_2026-09-02.md](archive/RUNTIME_ISSUES_2026-09-02.md)）。
-
-它确实用不到——三条路径逐个查过：
-
-| 用到 `include_dir` 的地方 | cache-only 下会不会真用 |
-|---|---|
-| `main_cache_identity`（`:6055`） | ❌ 不会，身份取自 `validate_openmm_cache_only` 的审计结果 |
-| `system_cache_exists(...)`（`:6061`） | ❌ 不会，`or` 短路，`openmm_cache_only=True` 时整个调用不执行 |
-| `load_native_system(gmx_include_dir=...)`（`:6071`） | ❌ 不会，见下 |
-
-`load_native_system` 里只有两处会用它，cache-only 下都到不了：
-`:2260` 的 `.top` 重建要求 `require_bonded_topology`，而 cache-only 在 `:6037`
-就明确拒绝膜体系；`:2265` 的 `.top` 降级只在 `topology is None`（mmCIF 缓存损坏）
-时触发，而 `validate_openmm_cache_only`（`:1077`）已经先把 mmCIF 的存在性和哈希
-验过并 fail-closed。
-
-⟹ **在审计通过的缓存上，`include_dir` 一次都不会被解引用。**
-
-> 想彻底消掉这条警告，要把那次调用挪进 `else` 分支。对 cache-only
-> 路径行为中立。**2026-09-02 已按此修复**（`runabfe.py` 里搜 `[CACHE-01`）；
-> `system_cache_exists(...)` 那处的 `or` 短路顺序未变，仍然在
-> `openmm_cache_only=True` 时整个不执行。
-
-顺带一个**独立**的坑：本仓 `abfe_config.json` 的 `gmx_path` 自 2026-09-07 起
-**留空**（它是机器本地路径，写死谁的都是错的）。留空时会回退到
-`GMXLIB`/`GMXDATA`/`PATH` 自动探测。要跑非 cache-only 的路径就自己填上本机的
-GROMACS 安装前缀（前缀和 `share/gromacs/top` 两种写法都能吃，见下面
-《GROMACS include 文件找不到》）。
+⚠️ 另一个**独立**的坑：本仓 `abfe_config.json` 的 `gmx_path` 自 2026-09-07 起**留空**
+（机器本地路径，写死谁的都是错的），留空时回退到 `GMXLIB`/`GMXDATA`/`PATH` 自动探测。
+跑非 cache-only 就自己填本机 GROMACS 安装前缀（见下节）。
 
 ### GROMACS include 文件找不到
 

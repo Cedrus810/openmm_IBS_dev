@@ -2,8 +2,13 @@
 
 [项目入口](../README.md) · [文档导航](README.md)
 
-> **本页整理截至 2026-09-14**（协议版本一栏 09-12 逐个对过源码常量，六个值与 09-09 相同；
-> 09-13/14 的改动**没有动任何协议版本号**，也不破缓存）。
+> **本页整理截至 2026-09-18**（协议版本一栏最后一次逐条核对是 09-12，六个值与 09-09 相同；
+> 09-13 至 09-18 的改动**没有动任何协议版本号**）。
+> ⚠️ 09-15 至 09-18 破过缓存的是**配置**不是协议：`stage2_window_partition`
+> （`metric_integral`→`state_count`）与 `stage2_window_max_states`（8→5）
+> 都在 `_PREOPT_DERIVED_PATH_KEYS` 里，作废窗口缓存、不作废 pilot。
+> **本次更新只改「控制器真机验证状态」一节**（那节的标题原来写着"真机零验证"，
+> 已经不成立了），结果登记表与物理结论**一行未动**。
 > 逐日变更看 [CHANGELOG.md](CHANGELOG.md)。
 >
 > 这是本仓库**唯一**声明"当前科学结论"的文档。三份 README 只对外讲用法，
@@ -11,11 +16,7 @@
 > `README_cn.md`、`README_en.md`、`docs/README.md` 各存了一份，
 > 热力学路径版本已经在其中三份里烂成了旧值。别再复制。
 
-## 主线体系
-
-**4W53（T4 lysozyme L99A + toluene）**，不再是 Atenolol。
-
-符号约定：
+## 符号约定
 
 ```text
 Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS
@@ -40,144 +41,30 @@ Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS
 登记表（`RESULT_REGISTRY.csv`）在 `Atenolol-rank11` 工作区，不在本分支；
 4W53 那一行的证据在本 `docs/` 里。
 
-## ⚠️ decharging 湮灭配体分子内库仑（2026-09-14 定位并修复，**所有已有 ΔG 作废**）
+## decharging 湮灭配体分子内库仑 —— **2026-09-14 已修复（v5 已落地）**
 
-> **改了哪些文件哪些符号，逐行记录在**
-> [PME_DECHARGE_V5_CHANGE_RECORD_2026-09-14.md](archive/PME_DECHARGE_V5_CHANGE_RECORD_2026-09-14.md)。
-> 那份文档同时列出**未验证 / 未解决**的六条，包括一条已退化为空转的旧测试。
+> 影响：该日之前的所有 ΔG 作废。症状 / 根因 / 为什么一直没暴露 / 修法 / 连带作废
+> 的完整原文在 [archive/PME_DECHARGE_V5_CHANGE_RECORD_2026-09-14.md](archive/PME_DECHARGE_V5_CHANGE_RECORD_2026-09-14.md)。
 
-`PME_DECHARGE_MODEL_VERSION` v4 → **v5**（`..._intramolecular_coulomb_decoupled_20260914`）。
-**破缓存**：所有 decharging 采样与 u_kn 必须重跑。
+## Stage-2 自治控制器：真机已跑过三批，**仍未有一次以 `DONE` 收口**（2026-09-18）
 
-### 症状
-
-abfe-benchmark `cyclod_ligand2`（CypD，实验 **−4.04 kcal/mol**）：
-
-| rep | complex | solvent | ΔG_bind |
-|---|---|---|---|
-| rep2 | 632.30 | 527.35 | **−25.08 kcal/mol** |
-| rep3 | 635.48 | (527.33) | −25.85 kcal/mol |
-
-系统性过度结合 **21 kcal/mol**，且 rep2/rep3 互相吻合 —— 是可复现的偏差，不是噪声。
-
-### 根因
-
-误差 **100% 在 stage 1（decharging）**，不在 vanishing：
-
-| | complex | solvent | 差 |
-|---|---|---|---|
-| stage1 | 623.94 | 532.29 | **−91.65** |
-| stage2 | +44.09 | −4.94 | −49.03 |
-| Boresch | −35.73 | 0 | +35.73 |
-
-stage2 + Boresch 单独 = −13.30 kJ/mol = **−3.18 kcal/mol**，与实验相符。
-
-v4 把配体内部的普通 ≥1-5 L–L 对连同配体–环境对一起按 λ² 缩放（annihilation），
-于是 stage 1 里夹了一个 ~500 kJ/mol 的分子内库仑项。
-
-**先把定性说准**（这一段 2026-09-14 晚更正过，原先写得会让人读成「v4 形式上就错了」）：
-
-* v4 的热力学循环**形式上是闭合的** —— 两腿的终态都是「内部库仑被湮灭的配体」，
-  是同一个参考态。完美采样极限下 v4 与 v5 给同一个 ΔG_bind。
-* 但 v4 注释里那句「湮灭项在 ΔG_bind 里**严格相消**」仍然是**假的**：它不是恒等抵消。
-  哈密顿量相同不等于自由能相同 —— 自由能是系综平均，而结合态（Boresch 约束在口袋里）
-  与自由态（体相水）的配体构象系综不同，这一项的两腿之差是**真实的构象重组功**，
-  必须靠采样得到。写成「严格相消」等于宣称它不需要被采样，这是 v4 放行的根据。
-* 真正的失效是**条件数**：把一个 ~90 kJ/mol 的物理量做成两个 ~500 kJ/mol 项之差，
-  而结合态配体在 500 ps × 8 个 λ 态里完不成构象弛豫 ⟹ 滞后，估计器报的是**未弛豫的
-  平均能差**（下面 1:1 的吻合正是这个特征：零补偿、纯线性响应）。
-* **v5 不是删掉物理**：该项变成 λ 无关 ⟹ 对两腿 ΔG 各贡献 0，重组功改走配体–环境
-  那条条件良好的路。顺带参考态从「内部静电被删掉的虚构分子」变回**真实分子在真空中**。
-
-实测（400 帧/腿，直接从 DCD + System XML 算）：
-
-```
-<U_intra> complex = -539.91 ± 1.32 kJ/mol   Rg 0.457 nm（伸展）
-<U_intra> solvent = -451.25 ± 1.04 kJ/mol   Rg 0.364 nm（塌缩）
-               差 = -88.66 kJ/mol
-ΔG_bind 对实验的误差 = -88.05 kJ/mol      <- 1:1 吻合到 0.7%
-```
-
-拆开 stage 1：ligand–environment 那一半两腿只差 **+2.99 kJ/mol**（正常），
-配体内部那一半差 88.66（全部误差）。扣掉后 ΔG_bind ≈ **−3.89 kcal/mol**（一阶估计）。
-
-### 为什么一直没暴露
-
-**4W53/toluene —— 本仓库唯一验过实验值的体系 —— 对这个失效模式免疫**：
-Σq² = 0.499 e²、刚性，stage1 两腿只差 **+1.56 kJ/mol**。
-cyclod_ligand2 是 Σq² = 3.21 e²、柔性多极性。
-⚠️ **别再拿「4W53 对上实验」当作 stage 1 正确的证据。**
-
-质量门也看不见：88 kJ/mol 是两条**独立腿之间**的差，没有任何一道门跨腿。
-单腿内 overlap / ESS / split-half / target_support 全绿，rep2 报的 total_error 是 1.83 kJ/mol。
-
-### 修法
-
-`_freeze_ligand_internal_coulomb`（`ibs_engine.py`）给去电荷系统挂一个 (1-λ²) 前缀的
-`CustomBondForce`（`abfe_core.create_ligand_internal_coulomb_force`），逐对展开、不带
-cutoff：主 NB 力给出 λ²·U_intra，补偿项给出 (1-λ²)·U_intra，合计逐 λ 恒定。
-λ=1 时补偿项恒为 0，物理端点仍逐位等于原 System（P0-01 不变量不受影响）。
-vanishing 腿同一份对表、前缀取 1，Stage-1/Stage-2 接缝按构造恒等。
-
-**残留（PME 下无法消除）**：配体与自己周期镜像的相互作用同样按 λ² 走，逐对补偿
-只覆盖主镜像。GROMACS 的 `couple-intramol=no` 同样留着这一项。
-
-真实体系实测（`cyclod_ligand2/rep2` 的 decharging 首帧，环境电荷清零后
-E(λ=0)−E(λ=1)，**带未补偿对照**）：
-
-| | 未补偿（v4） | 补偿后（v5） | 盒 |
-|---|---|---|---|
-| complex | +617.80 | **+0.0013** | 6.75 nm |
-| solvent | +479.18 | **+0.0436** | 4.11 nm |
-| 两腿之差 | | **−0.0423 kJ/mol** | |
-
-即 0.01 kcal/mol，比它取代的 −88.66 小 2000 倍，远在误差棒之下。
-⚠️ 最小 fixture 上这个残差是 0.2–5 kJ/mol，**比真实体系大 1–2 个量级** —— 那是人为
-拉直的 8 原子链、偶极远大于真实配体（实测 μ = 2.55 / 4.83 D，Rg 0.41–0.46 nm）。
-**别拿 fixture 的残差量级去推断生产体系。**
-
-验证：`tests/test_intramolecular_coulomb_is_lambda_independent.py`（自校准对照，
-已做还原变异验证）。
-
-### 连带作废
-
-- 4W53 那一行 `−21.36 ± 0.93 kJ/mol` 与实验 1.83σ 的吻合：stage1 影响只有 1.56 kJ/mol，
-  **结论方向不变**，但数字需在 v5 下重跑后才能再引用。
-- `docs/STAGE2_CONTROLLER_DESIGN_2026-09-12.md` 的头条 **−3.48 ± 0.47 kcal/mol（1.19σ）
-  已作废**：它是 `cyclod_ligand2/rep1`，而该 run 的 vanishing 是只覆盖 λ 17→23 的部分和。
-  它"对上实验"是**两个 ~90 kJ/mol 的错误反号抵消**（部分和 +92 / 分子内湮灭 −88.7）。
-  用它自己的全路径重算 → **−25.49 kcal/mol**，与 rep2/rep3 一致。
-
-## Stage-2 自治控制器：代码已收口，**真机零验证**（2026-09-14）
-
-2026-09-14 一天之内，控制器经历了**两轮静态复核 + 五次真机日志驱动的修复**：
-
-| 批次 | 内容 | 状态 |
-|---|---|---|
-| 真机 bug | 路由信号炸管线、拼接失败炸管线、分析用错 f_k 字段、四起 no-op 死循环 | 已修 |
-| 复核第一轮 | 子窗可调度、生产预算独立成账、S2-A 逐段门、DECORR 同输入对照 | 已修 |
-| 复核第二轮 | `CTL-01`~`CTL-10`（读旧结果 / 过期预算账 / 调度状态≠归因 / 身份隔离 / 预算准入 …） | 已修 |
-| 六路并行全面审计 | **63 条**缺陷（三条贯穿性根因：路由在知道窗口缺什么之前就锁定 / 「未知」四处四套语义 / 子窗是二等公民） | **44 条已修，18 条仍 `OPEN`**，逐条状态列见 [CONTROLLER_BUDGET_AUDIT_2026-09-14.md](CONTROLLER_BUDGET_AUDIT_2026-09-14.md) |
-| 审计后新增 | **#64** win0 空转（补帧目标每涨一次就把 EM + dt 测试 + Boresch 爬坡 + 冻结 burn-in + 只读复验整条前置链白跑一遍再被 checkpoint 逐字覆盖）、**#65** manifest 改名而消费者没跟 ⟹ A/B 报告全空且不报错 | 均已修（#64 的 P3 判定不做）|
-
-`./tests/run_offline_tests.sh` **2383 passed / 3 skipped / 0 failed**；每一条都做过
-**还原变异验证**（把改动退回旧行为，确认测试真的变红）。
-
-> ⚠️ **但这些全部是离线验证。** 控制器修好之后**一次完整的真机 run 都没跑过** ——
-> 三个 benchmark run 的 stage-2 产物已于当天清空重跑，那次 resume 将是它的
-> **第一次上机**。在拿到一次完整闭环之前：
+> 🔴 **[2026-09-18 更新]** 下面那节标题原来是「代码已收口，**真机零验证**（2026-09-14）」——
+> **「零验证」已经不成立**：09-16 / 09-17 / 09-18 三批 benchmark 都上了真机。
+> 但**验收口径仍未达成**：本批 20 完成 / 9 真崩（另有 4 条是 09-11 与 09-16 的历史归档目录
+> 被扫进来的误报）/ 1 在跑，`publishable_as_accepted_result` **0/20**，
+> `precision_status` 全 `UNMEASURED`（后者是设计内的：单次 run 无法自证精度）。
 >
-> * 不得声称「Stage-2 自治闭环可用」；
-> * 不得删除任何旧修复路径（`S2-E` 明确等这次闭环）；
-> * 控制器产出的任何 ΔG 都不是可引用结果。
+> **所以下面那三条禁令一条都没解除**（不得声称闭环可用 / 不得删旧修复路径 /
+> 控制器产出的 ΔG 不是可引用结果）。
+>
+> 真机暴露的缺口逐条在
+> [STAGE2_CONTROLLER_WAVE_2026-09-17.md](archive/STAGE2_CONTROLLER_WAVE_2026-09-17.md)（11 条，10 条已修）
+> 与 [STAGE2_BENCHMARK_CRASH_TRIAGE_2026-09-18.md](archive/STAGE2_BENCHMARK_CRASH_TRIAGE_2026-09-18.md)
+> （`S2-N`/`S2-O`，09-18 已修，**尚未上机复验**）。
+> ⚠️ ΔG 系统性偏负是**已定论的采样故障**，不是控制器缺陷，别混着查。
 
-> 🔴 **2026-09-14 追加：上表「已修」是逐条回源码核实过的，但那份审计仍有 18 条 `OPEN`** ——
-> 其中 `#11`（`HALT_FK_REFUTED` 不在 `TERMINAL_EXITS` 里 ⟹ 统计驳回以未捕获 traceback
-> 结束整跑）、`#12`（`_legalize_tail_window` 用插点**之前**的 `view` 解 anchor ⟹ `ValueError`
-> 炸穿）、`#13`（5a-2 的 `INSERT_LAMBDA` 完全不查可行性）三条**会炸整跑**，
-> `#2`（rewindow 目录被当采样段合并 ⟹ 静默错 ΔG）、`#4`（λ 表 fail-open 回退未量化内存值）
-> 两条**会静默产出错误结果**。**在这五条关掉之前，别把真机闭环的失败当成物理问题去查。**
-> 逐条见 [CONTROLLER_BUDGET_AUDIT_2026-09-14.md](CONTROLLER_BUDGET_AUDIT_2026-09-14.md)。
+> 📌 2026-09-14 当天那份修复快照（两轮静态复核 + 五次真机修复、65 条审计对账、
+> 2383 passed 的离线验证）已移进 [HISTORY_LOG.md](HISTORY_LOG.md) 第六节 —— 那是当天的快照，不是当前状态。
 
 ## 仍开放（不阻塞，但必须随数字一起说）
 
@@ -188,7 +75,7 @@ E(λ=0)−E(λ=1)，**带未补偿对照**）：
   ⚠️ 09-09 写的「密度 20% + 单混合重加权 80%」**两半都作废**——
   单混合效应同盒重测后为零。
   ⚠️ 比较前仍**必须先对齐 LRC**，否则得 −1.49（1.9σ）的假象。
-  证据与复现见 [STAGE2_SOLVENT_LEG_ERROR_BUDGET.md](STAGE2_SOLVENT_LEG_ERROR_BUDGET.md)。
+  证据与复现见 [STAGE2_SOLVENT_LEG_ERROR_BUDGET.md](archive/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md)。
 - 独立重复、随机种子账本、时间相关不确定度**仍未闭合**。
 
 ## 协议身份
@@ -209,7 +96,7 @@ E(λ=0)−E(λ=1)，**带未补偿对照**）：
 那个数字从 +12.75 变成 −21.36 的原因）。
 
 > **2026-09-09：`IBS_BIAS_PROTOCOL_VERSION` 32 → 33**（EXP-031 路线 A+B 并入主线，
-> 详见 [EXP-031_GPU_OPTIMIZATION_2026-09-09.md](EXP-031_GPU_OPTIMIZATION_2026-09-09.md)；
+> 详见 [EXP-031_GPU_OPTIMIZATION_2026-09-09.md](archive/EXP-031_GPU_OPTIMIZATION_2026-09-09.md)；
 > 融合内核本轮不接）。兼容集合已收窄成 `frozenset((33,))`。
 >
 > ⚠️ `system_xml_sha256` 随之改变 ⟹ **既有 `dual_window_*` / `ibs_state_*` /

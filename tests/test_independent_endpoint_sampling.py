@@ -1,6 +1,6 @@
 """INDEPENDENT_ENDPOINT_PROTOCOL_VERSION=1 回归。
 
-背景 STAGE2_ROOT_CAUSE_2026-08-28.md：IBS stage2 每个窗口只跑一条轨迹、窗口内
+背景 docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md：IBS stage2 每个窗口只跑一条轨迹、窗口内
 所有 λ 态靠重加权得到，采不到"水塌进配体空腔"这个构型；window 2 的相邻
 ⟨ΔU⟩ 只有 0.4~0.6 kT（任何能量重叠判据都判优）却错 +19.49 kJ/mol。
 

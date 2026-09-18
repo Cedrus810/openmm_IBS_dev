@@ -753,6 +753,35 @@ def find_gmx_include_dir(user_path: Optional[str] = None) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # 状态检测函数
 # ---------------------------------------------------------------------------
+def charge_transfer_admission_error(charge_protocol, *, diagnostics_mode=False):
+    """charge-transfer 能不能开跑。返回 `None`（放行）或该抛的错误信息。
+
+    🔑 [2026-09-18] carrier reservoir / C4-C5 closure 仍未验证 ⟹ **默认拒绝**：
+    一个有限的两腿数会被当成闭合的 ABFE 结果。这道闸在建任何 Context 之前判死。
+
+    `diagnostics_mode`（`--run-unclosed-charge-transfer-diagnostics`）只解除"不许开跑"
+    这一条，**不改变任何被算出来的数**：`closes_thermodynamic_cycle` 仍是
+    `False`，provenance 仍然带 `must_not_report_delta_g_bind=True`（那段逻辑
+    只看 `closes_thermodynamic_cycle`，本开关碰不到它）⟹ 放行出来的 ΔG_bind
+    依旧**不得发布**。它不是把 fail-closed 降级成放行，是把"启动即拒"换成
+    "跑完但全程标记未验收"。
+    """
+    if (str(charge_protocol.get("charge_treatment"))
+            != CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER):
+        return None
+    if charge_protocol.get("closes_thermodynamic_cycle") is True:
+        return None
+    if diagnostics_mode:
+        return None
+    return (
+        "charge-transfer 当前未通过 carrier reservoir/C4-C5 closure 验证，"
+        "禁止运行并报告 ΔG_bind。请完成双腿 restraint/盒缩放 closure 后再启用；"
+        "本实现仅保留底层 Hamiltonian 作为实验诊断。"
+        "（确知这一点、只要诊断数值 ⟹ 加 `--run-unclosed-charge-transfer-diagnostics`；"
+        "产物仍带 must_not_report_delta_g_bind=True，不得发布。）"
+    )
+
+
 def _recompute_cached_builder_identity(
     *,
     xml_path: str,
@@ -1415,6 +1444,51 @@ def _resolve_mdtraj_topology_input(output_dir: str, gro_file: Optional[str], top
         return top_file
     raise FileNotFoundError(
         "无法为轨迹加载解析拓扑：未找到 topology.cif 缓存，也未提供有效的 --gro/--top。"
+    )
+
+
+RESERVED_COION_DERIVED_DIRNAME = "coion_reserved"
+RESERVED_COION_REPORT_BASENAME = "coion_reserved.json"
+
+
+def runtime_gromacs_top(output_dir, config_top):
+    """与**运行时 System** 对得上的那份 `.top`。
+
+    🔑🔑🔑 [2026-09-18 真机 `thrombin_ligand1/rep1`] **带电配体的复合物腿里，
+    `config.top` 不再描述正在跑的体系。**
+
+    净电荷 ≠ 0 时复合物腿会派生一份带 reserved co-ion dummy 的 `.gro`/`.top`
+    （删掉 N 个水分子、在 `[molecules]` 末尾追加 N 个离子），随后
+    `system` / `topology` / `ligand_indices` **全部**从派生件重建，原始输入只读。
+    真机数字：原始 43761 原子 → 派生 43759（−3 水 +1 Na）。此后任何再拿
+    `config.top` 去读拓扑的地方，原子数和配体索引都对不上 —— Boresch 锚点估算
+    就是这么死的（`GROMACS 与轨迹拓扑原子数/配体索引不匹配`）。
+
+    ⚠️ **不能直接改 `config.top`**：它是**缓存身份**的一部分
+    （`system_cache_manifest.json` 的 `identity.gro/top.sha256` 记的就是用户给的
+    那两份原始文件）。派生件是本次运行的产物，不是用户输入 —— 把自产产物写进
+    身份是这个仓库反复复发的同一类 bug。所以身份留给原始件，**只有读拓扑的人**
+    改读派生件。
+
+    中性配体没有派生件 ⟹ 原样返回 `config_top`，行为逐字节不变。
+    """
+    report = os.path.join(output_dir, RESERVED_COION_DERIVED_DIRNAME,
+                          RESERVED_COION_REPORT_BASENAME)
+    if not os.path.isfile(report):
+        return config_top
+    try:
+        with open(report, "r", encoding="utf-8") as fh:
+            derived = json.load(fh).get("derived_top")
+    except (OSError, ValueError, json.JSONDecodeError):
+        derived = None
+    if derived and os.path.isfile(derived):
+        return derived
+    # 报告在但派生件不在 = 产物被删/搬过。**不静默退回原始件**：那会拿一份
+    # 对不上的拓扑继续跑，正是本次要修掉的失效模式。
+    raise FileNotFoundError(
+        f"本次运行派生过带 reserved co-ion 的 GROMACS 拓扑（见 {report}），"
+        f"但 derived_top={derived!r} 不存在 ⟹ 无法取得与运行时 System 一致的拓扑。"
+        "原始 --top 的原子数与之不同，拿它继续会静默算错，拒绝回退。"
     )
 
 
@@ -2181,7 +2255,7 @@ def _derive_gromacs_inputs_with_reserved_coions(
                 len(new_lines) + 1, pos_nm[ox],
             )
         )
-    derived_dir = os.path.join(output_dir, "coion_reserved")
+    derived_dir = os.path.join(output_dir, RESERVED_COION_DERIVED_DIRNAME)
     os.makedirs(derived_dir, exist_ok=True)
     out_gro = os.path.join(derived_dir, os.path.basename(gro_file))
     with open(out_gro, "w", encoding="utf-8") as fh:
@@ -2246,7 +2320,7 @@ def _derive_gromacs_inputs_with_reserved_coions(
         "derived_gro": os.path.abspath(out_gro),
         "derived_top": os.path.abspath(out_top),
     }
-    with open(os.path.join(derived_dir, "coion_reserved.json"), "w",
+    with open(os.path.join(derived_dir, RESERVED_COION_REPORT_BASENAME), "w",
               encoding="utf-8") as fh:
         json.dump(report, fh, indent=2, sort_keys=True)
     return out_gro, out_top, report
@@ -3333,6 +3407,16 @@ class RunConfig:
                 preset[k] = v
             log.info("已合并配置文件: %s", args.config)
 
+        # 🔑 [2026-09-18] **诊断模式只认命令行，且无条件覆盖配置文件。**
+        # 这里是唯一一处**不带 `if _flag_present`** 的赋值，故意的：它要把配置
+        # 文件里可能写着的同名键**擦掉**。理由是这个开关放行的是一条物理上
+        # 未闭合的路线（`--run-unclosed-charge-transfer-diagnostics`），
+        # 一旦它能沉进 config 就会被 resume/复制配置带着到处跑，而产物只是
+        # "带标记"不是"被拦住"。要求每次运行显式指定，代价只有多打一个参数。
+        preset["run_unclosed_charge_transfer_diagnostics"] = _flag_present(
+            "--run-unclosed-charge-transfer-diagnostics"
+        )
+
         # 3. 仅当命令行显式提供参数时才覆盖配置文件，避免 parser 默认值反向污染配置。
         if _flag_present("--resume"):
             preset["resume"] = bool(args.resume)
@@ -4262,7 +4346,8 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
     if not os.path.exists(traj_file):
         raise RuntimeError("预平衡轨迹不存在，无法估算 Boresch 参数")
     traj_top = _boresch_mdtraj_topology(
-        pipeline, config.top, getattr(config, "gmx_include_dir", None) or find_gmx_include_dir(getattr(config, "gmx_path", None))
+        pipeline, runtime_gromacs_top(output_dir, config.top),
+        getattr(config, "gmx_include_dir", None) or find_gmx_include_dir(getattr(config, "gmx_path", None))
     )
 
     # 根据来源调用不同估算器
@@ -4683,6 +4768,21 @@ def build_parser() -> argparse.ArgumentParser:
             "docs/reference_data/README.md —— 与生产逐窗口可比的是 m2n2 的 "
             "−6.581±0.256 kJ/mol，且为 no-LRC，别直接相减）。"
             "默认关闭 = fail-closed。"
+        ),
+    )
+
+    parser.add_argument(
+        "--run-unclosed-charge-transfer-diagnostics",
+        action="store_true",
+        help=(
+            "**诊断专用执行模式**：解除「charge-transfer 未通过 carrier "
+            "reservoir/C4-C5 closure 验证 ⟹ 启动即拒」这一条，只为拿诊断数值。"
+            "不改变任何被算出来的数；逐腿 final_results.json 与 "
+            "final_binding_results.json 都会带 must_not_report_delta_g_bind=true / "
+            "production_qualified=false / closes_thermodynamic_cycle=false ⟹ "
+            "放行出来的 ΔG_bind **不得**发布或进任何汇总。默认关闭 = fail-closed。"
+            "⚠️ **只认命令行**：写进配置文件不生效（每次运行必须显式指定，"
+            "防止它沉进生产默认配置）。"
         ),
     )
 
@@ -5427,10 +5527,22 @@ def run_post_analysis(args):
         == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER
         for value in _treatment_values
     )
+    # 🔑🔑 [2026-09-18] 未闭合 charge-transfer 的**第四道**闸：`--analyze-only`
+    # 重新分析既有产物。诊断模式下同样要放行，否则一个诊断 run 跑完之后连
+    # 重新分析都做不了。代价与汇总那道一致 —— reservoir 项按 0 计。
+    _reservoir_omitted = False
     if _is_charge_transfer and _reservoir_payload is None:
-        raise RuntimeError(
-            "analyze-only 的 charge-transfer 结果缺少已验证的双腿 reservoir correction；"
-            "拒绝把 tethered-carrier endpoint 当作闭合 ABFE"
+        if not bool(args.get("run_unclosed_charge_transfer_diagnostics", False)):
+            raise RuntimeError(
+                "analyze-only 的 charge-transfer 结果缺少已验证的双腿 reservoir correction；"
+                "拒绝把 tethered-carrier endpoint 当作闭合 ABFE"
+                "（只要诊断数值 ⟹ `--run-unclosed-charge-transfer-diagnostics`；"
+                "届时 reservoir 项按 0 计、产物标记不得发布。）"
+            )
+        _reservoir_omitted = True
+        log.warning(
+            "[WARN] [诊断模式] analyze-only 缺少 carrier reservoir correction，"
+            "该项**按 0 计** ⟹ ΔG_bind 少了一整项，不得发布。"
         )
     _reservoir_delta = (
         float(_reservoir_payload["delta_G_bind_correction_kJ_mol"])
@@ -5485,6 +5597,9 @@ def run_post_analysis(args):
         ),
         "constraint_identity": complex_leg.get("constraint_identity"),
         "charge_transfer_reservoir_correction": _reservoir_payload,
+        # 诊断模式下 reservoir 项按 0 计 ⟹ 这个 ΔG_bind 少了一整项（同汇总处）。
+        **({"charge_transfer_reservoir_correction_omitted": True,
+            "must_not_report_delta_g_bind": True} if _reservoir_omitted else {}),
         "boresch_correction_already_included_in_complex_delta_G": bool(boresch_included_in_complex_dg),
         "boresch_correction_note": (
             "boresch_correction_kJ_mol 已经烘焙进 complex_leg_delta_G_kJ_mol，"
@@ -5590,7 +5705,8 @@ def run_prepare_command(args):
     # 6. Boresch 估算（默认 fluctuation 模式）
     if args.save_boresch:
         import mdtraj as md
-        traj = md.load(traj_file, top=_boresch_mdtraj_topology(pipeline, args.top, include_dir))
+        traj = md.load(traj_file, top=_boresch_mdtraj_topology(
+            pipeline, runtime_gromacs_top(output_dir, args.top), include_dir))
         estimator = GeometricRestraintEstimator(
             temperature=args.temperature, allow_geometric_bond_fallback=False
         )
@@ -6797,6 +6913,12 @@ def _path_evolution_kwargs(config) -> dict:
     first_cap = config.get("stage2_first_window_max_states")
     if first_cap is not None:
         out["stage2_first_window_max_states"] = int(first_cap)
+    # 🔑 [2026-09-18] 末窗上界（溢出槽）。与 `stage2_window_max_states`（非末窗）
+    # 是**两个数**：末窗是 model B 插 λ 的溢出落点，天然更大；共用一个数的话，
+    # 要给末窗留空间就得把每个非末窗一起抬上去。
+    last_cap = config.get("stage2_last_window_max_states")
+    if last_cap is not None:
+        out["stage2_last_window_max_states"] = int(last_cap)
     # 🔑 [2026-09-15] 固定节奏重锚 f_k 的节奏（步）。缺省 500k = 1 ns @2fs。
     # **不进指纹**（它只改控制器什么时候重锚，不改布局/协议）。
     cadence = config.get("stage2_f_k_reanchor_cadence_steps")
@@ -6931,6 +7053,21 @@ _LEG_STATUS_KEYS = (
     "stage_quality_failures",
     "publishable_as_accepted_result",
     "publishable_rejection_reason",
+    # [2026-09-18] 未闭合的 charge-transfer 禁报标记（中性配体这三个键根本不存在
+    # ⟹ `if k in leg` 过滤掉，既有产物逐字节不变）。
+    "must_not_report_delta_g_bind",
+    "must_not_report_delta_g_bind_reason",
+    "production_qualified",
+    "closes_thermodynamic_cycle",
+)
+
+# 汇总文件顶层要复刻的禁报键。少一个都会让"只读 final_binding_results.json"的人
+# 看不出这份 ΔG_bind 不得引用 —— 这正是 2026-09-16 那次修的同一类漏。
+_MUST_NOT_REPORT_KEYS = (
+    "must_not_report_delta_g_bind",
+    "must_not_report_delta_g_bind_reason",
+    "production_qualified",
+    "closes_thermodynamic_cycle",
 )
 
 
@@ -7016,11 +7153,24 @@ def _binding_result_status(complex_results, solv_results) -> Dict[str, Any]:
         ),
         "stage_quality_failures": failures,
         "per_leg": per_leg,
+        # [2026-09-18] 任一腿声明禁报 ⟹ 合成结果禁报（两条腿共用同一份电荷协议，
+        # 所以这里是"原样上浮"而不是重新判一次）。中性配体两腿都没有这些键 ⟹
+        # 这块是空 dict，既有 final_binding_results.json 逐字节不变。
+        **_merged_must_not_report(legs),
         "note": (
             "本块是两条腿自报状态的合并，不改判任何一条腿的结论。"
             "`results_untrusted=true` 的 ΔG_bind **不得**作为可发布结果引用。"
         ),
     }
+
+
+def _merged_must_not_report(legs) -> Dict[str, Any]:
+    """两条腿的禁报标记上浮到汇总层。没有腿声明 ⟹ 返回 `{}`。"""
+    declaring = [leg for leg in legs.values()
+                 if leg.get("must_not_report_delta_g_bind") is True]
+    if not declaring:
+        return {}
+    return {k: declaring[0][k] for k in _MUST_NOT_REPORT_KEYS if k in declaring[0]}
 
 
 def main():
@@ -7482,19 +7632,28 @@ def main():
                 "[WARN] charge_treatment=co_annihilation_experimental 是**实验对照专用**，"
                 "其数值不得进入任何 ΔG_bind 汇总（memtodolist MEM-00a-2）。"
             )
+        # The charging builder exists, but the tethered carrier's
+        # reservoir/standard-state correction has not been validated.
+        # Refuse before creating any Context; a finite two-leg number would
+        # otherwise be mistaken for a closed ABFE result.
+        _ct_err = charge_transfer_admission_error(
+            _charge_protocol,
+            diagnostics_mode=bool(
+                config.get("run_unclosed_charge_transfer_diagnostics", False)
+            ),
+        )
+        if _ct_err:
+            raise RuntimeError(_ct_err)
         if (
             _charge_protocol["charge_treatment"]
             == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER
             and _charge_protocol.get("closes_thermodynamic_cycle") is not True
         ):
-            # The charging builder exists, but the tethered carrier's
-            # reservoir/standard-state correction has not been validated.
-            # Refuse before creating any Context; a finite two-leg number would
-            # otherwise be mistaken for a closed ABFE result.
-            raise RuntimeError(
-                "charge-transfer 当前未通过 carrier reservoir/C4-C5 closure 验证，"
-                "禁止运行并报告 ΔG_bind。请完成双腿 restraint/盒缩放 closure 后再启用；"
-                "本实现仅保留底层 Hamiltonian 作为实验诊断。"
+            log.warning(
+                "[WARN] --run-unclosed-charge-transfer-diagnostics 已放行一条**未验收**的 "
+                "charge-transfer 运行：carrier reservoir/C4-C5 closure 未验证 ⟹ "
+                "本跑的 ΔG_bind **不得发布**（provenance 已带 "
+                "closes_thermodynamic_cycle=False / must_not_report_delta_g_bind=True）。"
             )
 
     # 力场族与 LJ/色散路线（memtodolist §1.1 / §1.3，B6）。同样在建 Context 之前判死。
@@ -7815,6 +7974,11 @@ def main():
         charge_transfer_reservoir_correction=_charge_protocol.get(
             "charge_transfer_reservoir_correction"
         ),
+        # 只读：让这条腿的 final_results.json 带上禁报标记（中性配体是 no-op）。
+        charge_protocol=_charge_protocol,
+        unclosed_charge_transfer_diagnostics=bool(
+            config.get("run_unclosed_charge_transfer_diagnostics", False)
+        ),
         # §9 质量门需要的显式输入，从膜输入声明里取（可溶体系为空 dict，不进该分支）。
         membrane_quality_inputs=(
             {
@@ -8058,7 +8222,7 @@ def main():
             raise RuntimeError(
                 f"{OUTER_LAMBDA_RESIDUAL_FEATURE_NAME} 开关是开的，但到开始采样时运行时"
                 "仍然没有绑上。这不该发生：冻结 manifest 覆盖不到当前配体时应该走自动"
-                "闭式重训（docs/EXP-033_P1_LANDED_2026-09-12.md）。"
+                "闭式重训（docs/archive/EXP-033_P1_LANDED_2026-09-12.md）。"
                 "拒绝静默按 baseline 跑完 —— 那会产出一份看起来一切正常、而残差从未生效的结果。"
             )
 
@@ -8067,6 +8231,14 @@ def main():
             # 不传的话 _last_run_config 里就是 False，行为与之前完全一致（fail-closed）。
             allow_untrusted_stage_results=bool(
                 config.get("allow_untrusted_stage_results", False)
+            ),
+            # 🔑 [2026-09-18] split-half σ 下界是否采用（默认 True）。
+            # ⚠️ 必须在这里显式透传：本函数是**逐键枚举**往 run_full_pipeline 传参，
+            # 没枚举的键永远进不了 `kwargs` —— `stage2_autonomous_controller` 就栽过
+            # 同一个坑（见本文件下方注释：「配置里写了也没用」）。漏了这一行的后果
+            # 不是默认值失效，而是**关不掉**：做 σ 口径 A/B 时没有对照臂。
+            inflate_sigma_from_split_half=bool(
+                config.get("inflate_sigma_from_split_half", True)
             ),
             decoupling_scheme=config.decoupling,
             potential_type=config.potential,
@@ -8238,6 +8410,11 @@ def main():
         charge_transfer_reservoir_correction=_charge_protocol.get(
             "charge_transfer_reservoir_correction"
         ),
+        # 只读：让这条腿的 final_results.json 带上禁报标记（中性配体是 no-op）。
+        charge_protocol=_charge_protocol,
+        unclosed_charge_transfer_diagnostics=bool(
+            config.get("run_unclosed_charge_transfer_diagnostics", False)
+        ),
         repeat_seed=_repeat_seed,
         leg_name="solvent",
         residual_sampling_enabled=outer_lambda_runtime_solv is not None,
@@ -8322,6 +8499,11 @@ def main():
         )
 
     solv_results = pipeline_solv.run_full_pipeline(
+        # 🔑 [2026-09-18] 与复合物腿同一个开关，两腿必须同口径 ——
+        # 一腿放大一腿不放大，ΔG_bind 的误差合成就是混口径的。
+        inflate_sigma_from_split_half=bool(
+            config.get("inflate_sigma_from_split_half", True)
+        ),
         decoupling_scheme=config.decoupling,
         potential_type=config.potential,
         dexp_params=dexp_params,
@@ -8486,12 +8668,34 @@ def main():
     _reservoir_payload = _charge_protocol.get(
         "charge_transfer_reservoir_correction"
     )
+    # 🔑🔑 [2026-09-18] 未闭合 charge-transfer 的**第三道**闸（前两道：runabfe 建
+    # Context 之前、abfe_pipeline.run_full_pipeline 入口）。三道必须一起解，否则
+    # 诊断模式只是把死点挪到两条腿都烧完之后。
+    # ⚠️ 这一道解除的代价跟前两道**不同**：`_reservoir_delta` 会取 0.0 ⟹ carrier
+    # reservoir / 标准态那一项不是"未验证"，是**整项被省掉**。所以除了三个禁报
+    # 标记之外，还要显式落 `charge_transfer_reservoir_correction_omitted`，
+    # 免得下游看到一个有限数就以为循环是齐的。
+    _reservoir_omitted = False
     if _charge_protocol["charge_treatment"] == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
         if not isinstance(_reservoir_payload, dict):
-            raise RuntimeError(
-                "charge-transfer 已通过预检但缺少已验证的双腿 reservoir correction；"
-                "拒绝汇总"
+            if not bool(config.get(
+                    "run_unclosed_charge_transfer_diagnostics", False)):
+                raise RuntimeError(
+                    "charge-transfer 已通过预检但缺少已验证的双腿 reservoir correction；"
+                    "拒绝汇总"
+                    "（只要诊断数值 ⟹ `--run-unclosed-charge-transfer-diagnostics`；"
+                    "届时 reservoir 项按 0 计、产物标记不得发布。）"
+                )
+            _reservoir_omitted = True
+            log.warning(
+                "[WARN] [诊断模式] 缺少 carrier reservoir correction，汇总时该项**按 0 计**"
+                "⟹ ΔG_bind 少了一整项：这不是「未验证」，是「不完整」。"
+                "产物带 charge_transfer_reservoir_correction_omitted=true + "
+                "must_not_report_delta_g_bind=true，**不得**发布或进任何汇总表。"
             )
+    if (_charge_protocol["charge_treatment"]
+            == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER
+            and not _reservoir_omitted):
         _reservoir_canonical = json.dumps(
             _reservoir_payload, sort_keys=True, separators=(",", ":")
         )
@@ -8607,12 +8811,23 @@ def main():
         "publishable_as_accepted_result": _result_status[
             "publishable_as_accepted_result"],
         "stage_quality_failures": _result_status["stage_quality_failures"],
+        # [2026-09-18] 禁报标记与 ΔG_bind 同级：只读顶层的人也必须看得见。
+        **{k: _result_status[k] for k in _MUST_NOT_REPORT_KEYS
+           if k in _result_status},
         "complex_delta_G_kJ_mol": float(dg_complex),
         "solvent_delta_G_kJ_mol": float(dg_solvent),
         "boresch_correction_kJ_mol": float(dg_boresch),
         "boresch_attachment": attachment_result,
         "constraint_identity": _constraint_identity,
         "charge_transfer_reservoir_correction": _reservoir_payload,
+        # [2026-09-18] 诊断模式下 reservoir 项按 0 计 ⟹ 这个 ΔG_bind **少了一整项**。
+        # 只在真的省掉时才写这个键（正常 run 一个字节都不变）。
+        **({"charge_transfer_reservoir_correction_omitted": True,
+            "charge_transfer_reservoir_correction_omitted_reason": (
+                "run_unclosed_charge_transfer_diagnostics: carrier reservoir/"
+                "standard-state correction 缺失，汇总时按 0 计；ΔG_bind 不完整，"
+                "不得发布或进任何汇总表"
+            )} if _reservoir_omitted else {}),
         # ✅ complex_delta_G_kJ_mol 来自 total_delta_G_complex_kJ_mol，已经在
         # abfe_pipeline.py 里把 Boresch 释放修正烘焙进去 (total_dg = dg_phys +
         # cons_correction + dg_boresch)；下面 delta_g_bind_uncorrected 没有再单独

@@ -34,7 +34,7 @@ import sys
 import math
 import atexit
 from datetime import datetime
-from typing import Any, Dict, List, Sequence, Tuple, Optional
+from typing import Any, Dict, List, NamedTuple, Sequence, Tuple, Optional
 
 # 项目内部模块依赖
 from abfe_preoptimizer import (
@@ -109,6 +109,7 @@ from ibs_engine import (
     PRODUCTION_SEGMENT_PROTOCOL_VERSION,
     _load_validated_joint_score_ledgers,
     _assert_expected_windows_all_loaded,
+    IBSControlPlaneError,
     IBSIncompleteStageCoverageError,
     _compute_ligand_net_charge,
     ibs_lj_tail_lrc_is_applicable,
@@ -200,6 +201,7 @@ from abfe_core import (
     ensure_owned_system,
     CHARGE_TRANSFER_VANISHING_HANDOFF_PROTOCOL_VERSION,
     charge_treatment_qualification_payload,
+    charge_transfer_result_markers,
     validate_charge_transfer_reservoir_correction,
 )
 import warnings
@@ -248,6 +250,94 @@ GEODESIC_PATH_PROTOCOL_VERSION = 1
 # offsets/restraint plus PME in the pilot energy group).  Keep this version
 # separate so neutral Atenolol preopt/geodesic caches remain reusable.
 COION_PREOPT_HAMILTONIAN_PROTOCOL_VERSION = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 引擎控制面异常 → 控制器语义。**唯一注册表**（`EXIT_SPECS` 的对侧）
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 🔑🔑🔑 [2026-09-18] **先前这是两处手写的 `except (A, B)` 元组，而引擎有 5 个
+# 控制面异常。**
+#
+# 漏掉的那个是 `ExistingEnsembleRequiresRescueAudit` —— 它的消息自己写着
+# `route it to rescue/provenance audit`，七个抛出点全部 fail-closed
+# （`ibs_engine` 的 `load_ibs_state` 四处 + `run_all_windows` 三处），而且四条
+# `non_mutating_v1` 守卫恰好是**自治模式的常态策略**。它落进 `except Exception`
+# ⟹ `_finish("FAILED") + raise` ⟹ 一个**已知、可分类**的控制器结局被伪装成
+# 执行器崩溃、整跑 traceback 收场。
+#
+# ⚠️ 补一个 dict **不足以**保证"下一个不会漏"：没登记的新异常照旧落进
+# `except Exception`。所以配套在 `ibs_engine` 立了 `IBSControlPlaneError` 基类，
+# 下面那道 import 期对账拿 `__subclasses__()` 跟本表逐项比 —— 缺一项立刻抛。
+#
+# ⚠️ **「刻意不路由」也必须登记**（`NOT_ROUTED`）。靠缺席表达"决定不路由"与
+# "忘了登记"在代码里长得一模一样。同 `EXIT_SPECS` 里 `NO_FEASIBLE_ACTION` 的
+# `default_scope=None`：强迫发出点做一次显式决定。
+class EngineSignalSpec(NamedTuple):
+    handler: str          # REDECIDE / SEAL_REFUTED_CANDIDATE / HALT / NOT_ROUTED
+    signal: Optional[str]  # 记进 history 的 routing_signal
+    exit_: Optional[str]   # HALT 档才有：控制器出口码（必须在 EXIT_SPECS 里）
+    why: str
+
+
+ENGINE_SIGNAL_SPECS: Dict[str, EngineSignalSpec] = {
+    "IBSValidationBudgetIndeterminateError": EngineSignalSpec(
+        "REDECIDE", "LOCAL_VALIDATION_CAP", None,
+        "单周期验证批次打满、对这份 f_k 无结论 ⟹ 「没测出来」≠「f_k 错了」"
+        "≠「该停」。回顶层重判，控制器有对症动作（PROVISIONAL_PRODUCTION）。"),
+    "IBSWarmupConvergenceError": EngineSignalSpec(
+        "REDECIDE", "WARMUP_F_K_NOT_CONVERGED", None,
+        "一个 bias 压不平这个跨度 ⟹ 回顶层重判，证据类型→动作的映射由 "
+        "`decide()` 负责，不在 handler 里发明。"),
+    "IBSFrozenCalibrationValidationError": EngineSignalSpec(
+        "SEAL_REFUTED_CANDIDATE", "FK_CANDIDATE_REFUTED", None,
+        "有统计功效的否决 ⟹ 只终止**这份候选**，不终止整个 Stage-2："
+        "封存候选与指纹、永不续验，然后回顶层重判。"),
+    "ExistingEnsembleRequiresRescueAudit": EngineSignalSpec(
+        "HALT", "EXISTING_ENSEMBLE_REQUIRES_RESCUE_AUDIT", "HALT_INVALID_INPUT",
+        "盘上的 ensemble 与当前采样身份/协议不相容：不能复用、也不能原地覆盖，"
+        "必须整份留给 rescue/provenance audit。"
+        "⚠️ **不走 `REDECIDE`**：它不是「这一轮没测出来」，是「这条路径依赖的"
+        "ensemble 身份已经不成立」。继续下一轮产不出新证据 —— 控制器会再发同一个"
+        "动作、再撞同一个异常，盘面一字节不变 ⟹ no-op 台账把它挡掉 ⟹ 最后以 "
+        "`NO_FEASIBLE_ACTION` 收场。**不是死循环，是把「身份无效」歪曲成「动作"
+        "推不动」**，而那是人工接手时最需要分清的一件事。"
+        "出口 `HALT_INVALID_INPUT` 的默认 scope 就是 `PATH_INVALID`"
+        "（见 `EXIT_SPECS`：绕过去采下游无意义），所以也不会被退役换窗绕开。"),
+    "IBSIncompleteStageCoverageError": EngineSignalSpec(
+        "NOT_ROUTED", None, None,
+        "**刻意不路由。** 缺窗在控制器侧有专门分支（缺窗 ⟹ RUN_PRODUCTION），"
+        "而这个异常来自加载器：合并求解已经按段显式传 `excluded_local_windows` "
+        "把「部分段」这个常态摘掉了，剩下真能触发它的情形就是「全体覆盖度不成立」"
+        "—— 那必须炸，不许在缺口上求解一条截断的 ΔG。"
+        "登记在这里是为了让「决定不路由」和「忘了登记」在代码里长得不一样。"),
+}
+
+
+def _assert_engine_signal_registry_complete() -> None:
+    """引擎声明的控制面异常必须**逐个**在本表里有处置。缺一项立刻抛。
+
+    这是 `EXIT_SPECS` 那套「漏项立即暴露」在异常这一侧的对应物。放在 import 期：
+    它只可能因为**改代码**而失败（加了新异常没登记），不会因为盘面/数据失败。
+    """
+    declared = {c.__name__ for c in IBSControlPlaneError.__subclasses__()}
+    registered = set(ENGINE_SIGNAL_SPECS)
+    missing = sorted(declared - registered)
+    stale = sorted(registered - declared)
+    if missing or stale:
+        raise RuntimeError(
+            "引擎控制面异常的路由注册表与 `ibs_engine.IBSControlPlaneError` 的子类"
+            f"集合不一致：未登记 {missing}、表里多余 {stale}。"
+            "未登记的异常会静默落进 `except Exception`，被当成执行器崩溃 —— "
+            "而它们表达的是**控制器的一个结局**。请在 `ENGINE_SIGNAL_SPECS` 里"
+            "补一条（确实不该路由就登记 `NOT_ROUTED`，别靠缺席表达）。"
+        )
+    for _name, _spec in ENGINE_SIGNAL_SPECS.items():
+        if _spec.handler == "HALT" and not _spec.exit_:
+            raise RuntimeError(f"{_name} 是 HALT 档但没给 `exit_`")
+
+
+_assert_engine_signal_registry_complete()
 
 
 def _stage_lambda_endpoint_diagnostics(
@@ -3030,6 +3120,11 @@ _PREOPT_DERIVED_PATH_KEYS = (
     # 🔑🔑 [2026-09-15] 见 `derived_path_params` 处的注释：这两个键同样决定布局。
     "stage2_window_partition",
     "stage2_first_window_max_states",
+    # 🔑 [2026-09-18] 末窗上界同样**决定布局**（它决定末窗长到多大才拆）⟹ 必须
+    # 进派生路径身份。漏了它的后果是改了这个数**不作废旧窗口缓存**，resume 直接
+    # 拿到一份按另一个上界分出来的布局 —— 这正是 09-11 `max_bias_warmup_steps`
+    # 那次的形状。
+    "stage2_last_window_max_states",
     "stage2_n_windows",
     "stage2_free_energy_densify_points",
 )
@@ -3152,6 +3247,15 @@ class ABFEPipeline:
         membrane_quality_gate_mode: Optional[str] = None,
         charge_treatment: Optional[str] = None,
         charge_transfer_reservoir_correction: Optional[Dict[str, Any]] = None,
+        # [2026-09-18] `resolve_charge_treatment()` 解析好的整份 payload，**只读**：
+        # 唯一用途是让这条腿的 `final_results.json` 带上禁报标记
+        # （见 `abfe_core.charge_transfer_result_markers`）。本层不解析、不改判。
+        charge_protocol: Optional[Dict[str, Any]] = None,
+        # [2026-09-18] `--run-unclosed-charge-transfer-diagnostics`。**执行策略，
+        # 不是身份**：不进 run_config、不进任何指纹（同 allow_untrusted_stage_results
+        # 的理由）。做成 ctor 参数而不是 run_full_pipeline 的 kwarg，正是为了不碰
+        # 那条 kwargs→指纹的路。默认 False ⟹ 直接 API 调用方照旧 fail-closed。
+        unclosed_charge_transfer_diagnostics: bool = False,
         repeat_seed: Optional[int] = None,
         leg_name: Optional[str] = None,
         # EXP-030: optional residual sampling Hamiltonian.  All arguments are
@@ -3252,6 +3356,10 @@ class ABFEPipeline:
         # 但 run_full_pipeline 会对带电配体 fail closed，要求上游先解析并记录
         # charge-transfer / Rocklin / 实验对照路线，不能静默退回旧默认值。
         self.charge_treatment = charge_treatment
+        self.charge_protocol = dict(charge_protocol) if charge_protocol else None
+        self.unclosed_charge_transfer_diagnostics = bool(
+            unclosed_charge_transfer_diagnostics
+        )
         if charge_transfer_reservoir_correction is not None:
             if str(charge_treatment or "").strip().lower() != CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER:
                 raise ValueError(
@@ -5682,6 +5790,7 @@ class ABFEPipeline:
         # None 时透传 vanishing_subdomain_ranges_from_lambdas 自己的默认值。
         vanishing_min_states_per_window: Optional[int] = None,
         vanishing_max_states_per_window: Optional[int] = None,
+        vanishing_last_window_max_states: Optional[int] = None,
         **kwargs,
     ) -> Dict:
         """
@@ -6052,6 +6161,10 @@ class ABFEPipeline:
                 _stage_range_kwargs["max_states_per_window"] = int(
                     vanishing_max_states_per_window
                 )
+            if vanishing_last_window_max_states is not None:
+                _stage_range_kwargs["last_window_max_states"] = int(
+                    vanishing_last_window_max_states
+                )
             expected_subdomain_ranges = vanishing_subdomain_ranges_from_lambdas(
                 lambdas_var,
                 first_ensemble_target_intervals=VANISHING_FIRST_ENSEMBLE_TARGET_INTERVALS,
@@ -6074,30 +6187,92 @@ class ABFEPipeline:
                 )
                 _lo = int(_stage_range_kwargs.get("min_states_per_window", 4))
                 _hi = int(_stage_range_kwargs.get("max_states_per_window", 6))
-                # 🔑 [2026-09-12] **末窗不套 `_hi`。**
-                # 末窗是**溢出槽**：model B 插 λ 时索引区间固定、多出来的态一律
-                # 落到它身上，所以它天然会比别的窗口大。既定口径是「末窗不加最大
-                # 设置 —— 太大了该加 λ 而不是拆开」。
-                # 这个报错自己的理由也只管**下界**（"内部只剩 K-2 个自由态，
-                # K<lo 压不平占据"），上界从来没有过论证。
-                # 先前一刀切套 `_hi`，于是合法的溢出布局（末窗 K=6）被拒，
-                # 而且拒在**执行时**、离写入点十万八千里 —— 真机就是这么把
-                # v3 写进版本链、然后每次启动都崩在同一个地方。
+                # 🔑🔑🔑 [2026-09-18 真机] **末窗在这里不再豁免 `_hi`。**
                 #
-                # 末窗真正的上界是「可拆上限」`2*_hi − 1`：超过它之后两个子窗
-                # 不可能都落在 [lo, hi]（p+q−1=K），溢出槽从此是死胡同。
-                _tail_cap = 2 * _hi - 1
-                _last = len(normalized_ranges) - 1
+                # 先前是 `_tail_cap = 2*_hi − 1`（2026-09-12 加的），理由是「末窗是
+                # 溢出槽、天然更大」。那句话对**路径版本层**成立，对**执行层**不成立
+                # —— 两个上界是两个数，被写成了同一个：
+                #   · `2*_hi − 1` = **可拆上限**：插 λ 时末窗允许涨到这里，因为它
+                #     之后**必须**被拆回去（`_legalize_tail_window` 的 docstring
+                #     原话：「stage 的权威 window_ranges 校验对所有窗口一律要求
+                #     [lo, hi]，所以跑之前必须合法化」）；
+                #   · `_hi` = **可跑上限**：真正拿去 `run_all_windows` 的布局。
+                # 而「跑之前必须 ≤ hi」这条**只活在 `_legalize_tail_window` 里**，
+                # 那个函数全仓只有两个调用点，都在 `_run_stage2_autonomous` 中 ——
+                # `_run_stage2_with_path_evolution` 排在自治循环**之前**
+                # （`:17085` vs `:17134`），它插完 λ 只是 `current_r = new_r` 然后
+                # `continue` 回到 `run_once`，中间没有任何合法化。
+                # ⟹ 这道门是那条路径上**唯一**的执行层校验，而它自己在放行。
+                #
+                # 真机（abfe-ibs-a5 逐行核过）：`stage2_window_max_states=6`，
+                # 窗口 5 索引 `[17:24]`、**状态数 7**，`cache n_states=4` ——
+                # 4 态窗口被 path evolution 喂到 7 态后直接开预热+生产，
+                # f_k 已冻结、`max|F|` 安全检查全过，**一路无声跑到底**。
+                # K=7 ≤ 2*6−1=11 ⟹ 这道门当时判它合法。
+                #
+                # ⚠️ 溢出槽语义**没有被削弱**：插点侧的 fail-closed 上限仍然是
+                # `2*hi−1`（`insert_lambda_in_failed_ibs_window`），末窗照旧吸收
+                # 溢出。变的只有一件事：**溢出中间态不许被拿去跑**，必须先合法化。
+                # 配套改动在 `:11148` 之后（path evolution 插完立刻合法化）——
+                # 少一处都不行：只收紧这里，是把静默跑错换成必崩。
+                # ⚠️ **不要拿 `stage2_window_max_states` 的值当修复手段。** 它在
+                # `_PREOPT_DERIVED_PATH_KEYS` 里，改它作废全部窗口缓存；而且
+                # 09-17 才从 8 改到 5，理由是死区算术，不是调参。
+                _split_cap = 2 * _hi - 1
+                # 🔑🔑🔑 [2026-09-18 第二轮] **两个上界，不是一个，也不是 `2*hi−1`。**
+                #
+                # 今天早些时候这里被收成「**所有**窗口一律 `[lo, hi]`」。那修掉了
+                # 真正的洞（末窗带着溢出**无声跑完**），但对末窗过严了：末窗是
+                # **溢出槽**（model B 插 λ 时非末窗 ranges 逐字冻结、多出来的态一律
+                # 落到它身上），一律按 `hi` 判等于它一超就得拆，当不成槽。
+                #
+                # 正确的形状是两个数：
+                #   · 非末窗 `_hi`      —— 要跑的窗口的上界（配置 5）；
+                #   · 末窗   `_tail_hi` —— 溢出容量（配置 8）。
+                # 先前它们共用一个 `hi`，所以「给末窗留空间」只能靠把 `hi` 抬高，
+                # 而那把**每个非末窗**一起抬了上去 —— 真机 45 个 run 的布局里
+                # `[4,8,8,4]` / `[4,7,7,5,4]` / `[4,7,7,7,4]` 就是这么来的
+                # （`metric_integral` 目标 + hi=8），那些窗口并不需要溢出空间。
+                #
+                # `_tail_hi` 的上界是**推出来的**：末窗拆成两个共享一个边界态的子窗
+                # 时 `p+q−1=K`，两个都要 ≤ `hi` ⟹ 可拆的最大 K 是 `2*hi−1`。
+                # 「长到 `_tail_hi`、超了就拆」于是要求 `_tail_hi + 1 ≤ 2*hi−1`，
+                # 即 **`_tail_hi ≤ 2*hi − 2`**。hi=5 ⟹ 8，而 9 正好拆成 5+5。
+                # 不给这个键时 `_tail_hi = _hi`（逐位保持今天早些时候那版行为）。
+                # ⚠️ 仍然**不是** `2*hi−1`：那是"可拆上限"，是插点侧的 fail-closed
+                # 边界，不是"可以照跑的上限"。两者差 1，而那 1 正是「必须先拆」。
+                _tail_hi = int(_stage_range_kwargs.get(
+                    "last_window_max_states", _hi))
+                _tail_hi = max(_lo, min(_tail_hi, 2 * _hi - 2)) if _hi >= 2 else _hi
+                _last_i = len(normalized_ranges) - 1
                 _bad = [
                     (a, b) for i, (a, b) in enumerate(normalized_ranges)
-                    if not (_lo <= b - a <= (_tail_cap if i == _last else _hi))
+                    if not (_lo <= b - a <= (_tail_hi if i == _last_i else _hi))
                 ]
                 if _bad:
+                    # 存量布局的迁移代价写进报错：末窗 K ∈ (hi, 2hi−1] 是**插 λ 的
+                    # 溢出中间态**，跑一次合法化拆开就行，**不需要重跑**。
+                    _tail_mid = [
+                        (a, b) for (a, b) in _bad
+                        if (a, b) == normalized_ranges[-1]
+                        and _tail_hi < b - a <= _split_cap
+                    ]
                     raise RuntimeError(
                         f"权威 window_ranges 含越界窗口 {_bad}；非末窗态数必须落在 "
-                        f"[{_lo}, {_hi}]，末窗（溢出槽）放宽到 [{_lo}, {_tail_cap}]"
+                        f"[{_lo}, {_hi}]，末窗（溢出槽）到 [{_lo}, {_tail_hi}]"
                         f"（两端各有一个与邻窗共享的边界态，内部只剩 K-2 个自由态，"
-                        f"K<{_lo} 压不平占据；末窗 K>{_tail_cap} 则永远拆不开）。"
+                        f"K<{_lo} 压不平占据）。"
+                        + (
+                            f" ⚠️ 末窗 {_tail_mid} 落在 ({_tail_hi}, {_split_cap}] —— 这是插 λ 的"
+                            "**溢出中间态**，不是坏数据：末窗是溢出槽，插点允许它先涨到"
+                            f"可拆上限 {_split_cap}，但**跑之前必须拆回 [{_lo}, {_tail_hi}]**。"
+                            "处置是跑一次末窗合法化（`_legalize_tail_window`，"
+                            f"{_tail_mid[0][1] - _tail_mid[0][0]} → 两个共享边界态的子窗），"
+                            "**已采的帧一帧都不作废、不需要重跑**。"
+                            "这个中间态之所以会留在盘上，是因为 2026-09-18 之前这道门"
+                            f"对末窗放宽到 {_split_cap}、把它放跑了。"
+                            if _tail_mid else ""
+                        )
                     )
                 window_ranges = normalized_ranges
             else:
@@ -6318,7 +6493,7 @@ class ABFEPipeline:
         # ------------------------------------------------------------------
         # [INDEPENDENT_ENDPOINT_PROTOCOL_VERSION=1] λ_vdw→0 那一段改由独立固定-λ
         # 轨迹求解，不再由 IBS 窗口重加权得到。见
-        # STAGE2_ROOT_CAUSE_2026-08-28.md §3.3：那条窗口轨迹里配体（哪怕软核）
+        # docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md §3.3：那条窗口轨迹里配体（哪怕软核）
         # 几乎总占着体积，"水填满空腔"的构型概率≈0，重加权造不出没采到的构型。
         # 末窗口的 IBS 采样**照常跑**（数据留在盘上作为对照证据），只是不参与
         # 最终拼接——两条路线对同一段 λ 给出的数字可以直接对比。
@@ -6344,7 +6519,7 @@ class ABFEPipeline:
         # 同分布下单段干驻留 ≥500 帧的概率 ≈ 1e-141）。
         #
         # ⚠️ 代价必须写明：末窗口因此回到 IBS 单轨迹重加权。
-        # `STAGE2_ROOT_CAUSE_2026-08-28.md §3.3` 在**溶剂腿**上论证过那条路径采不到
+        # `docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md §3.3` 在**溶剂腿**上论证过那条路径采不到
         # 「水塌进配体空腔」的构型。所以关掉它不是「那个问题不存在了」，
         # 而是「这个装置在复合物腿上解决不了它、却在持续烧时间」。
         #
@@ -6358,7 +6533,7 @@ class ABFEPipeline:
         # （尾项 +2.823 减在生产侧）生产 -10.898 vs 真值 -6.581 ⟹ 残差
         # **-4.318 kJ/mol，5.5σ**。拆分：生产/参考的盒体积差 2.81%（生产用 NPT
         # 预平衡末帧冻结盒 42.747，参考用建系盒 43.950）实测占 -0.86 ± 0.13（20%）；
-        # 其余十一项候选逐条实测排除后，**单系综重加权是剩下 80% 的解释**。见 docs/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md。
+        # 其余十一项候选逐条实测排除后，**单系综重加权是剩下 80% 的解释**。见 docs/archive/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md。
         # 要重新启用：`stage2_independent_endpoint=True`。真正的修法是把探针锚点
         # 从配体换成蛋白腔壁参考原子，让观测量重新成为状态函数。
         _endpoint_requested = bool(kwargs.get("stage2_independent_endpoint", False))
@@ -6373,7 +6548,7 @@ class ABFEPipeline:
             self._log(
                 "  [独立端点段] **未启用**（默认关闭）。末窗口沿用 IBS 单轨迹重加权。"
                 "[WARN] 该路径在溶剂腿上被论证为采不到「水塌进配体空腔」的构型"
-                "（STAGE2_ROOT_CAUSE_2026-08-28.md §3.3）——关闭它是"
+                "（docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md §3.3）——关闭它是"
                 "「这个装置解决不了该问题且在持续烧时间」，不是「该问题已消失」。"
                 "[2026-09-02] 该文档原先把 stage2 的整个误差归因于此，实测 98% 是"
                 " λ-WCA 防护壳（已退役）；[2026-09-09] 壳退役后剩下的残差"
@@ -6450,6 +6625,22 @@ class ABFEPipeline:
             ),
             final_max_top1pct_raw_weight=kwargs.get(
                 "final_max_top1pct_raw_weight", TARGET_SUPPORT_MAX_TOP1PCT_WEIGHT
+            ),
+            # 🔑 [2026-09-18] 采用 split-half 给出的 σ 下界（σ_eff = max(σ_MBAR,
+            # |逐窗漂移|/2)）。默认值必须与 _final_gate_thresholds 里那份**逐字一致**。
+            #
+            # 为什么默认开：这个量是**下界**不是猜测——两个半程之差的 SD 就是 2σ，
+            # 观测到漂移就蕴含 σ ≥ |漂移|/2。关着等于明知报的是下界还照报。
+            # 实测（09-18，33 条腿）中位 ×1.22、最高 ×2.59。
+            # 吃掉它的那道 `max_endpoint_uncertainty_kJ_mol` 门是**仅诊断、不拒绝、
+            # 不触发补帧**，所以打开不会硬失败任何 run。
+            #
+            # ⚠️ 已知的过估方向（保留在此以免被当成新发现）：逐窗漂移在"总量稳、
+            # 只是窗口间归属重排"时会系统性偏大。solve_stage_integrated 会把总量
+            # 漂移与逐窗漂移**一起**打印，就是为了当场区分这两种。要关掉传
+            # `inflate_sigma_from_split_half=False`。
+            inflate_sigma_from_split_half=bool(
+                kwargs.get("inflate_sigma_from_split_half", True)
             ),
         )
         if stage_result.get("error"):
@@ -7604,23 +7795,36 @@ class ABFEPipeline:
         ):
             reservoir = getattr(self, "charge_transfer_reservoir_correction", None)
             if reservoir is None:
-                raise RuntimeError(
-                    "charge-transfer pipeline 缺少已验证的双腿 reservoir correction；"
-                    "compute_final_results 不允许把未闭合 endpoint 写成最终结果"
+                # 🔑🔑 [2026-09-18] 未闭合 charge-transfer 的**第五道**闸：逐腿
+                # 最终结果落盘。诊断模式要一起解，否则两条腿都采完了却写不出
+                # final_results.json —— 前四道全放行也没用。
+                if not getattr(self, "unclosed_charge_transfer_diagnostics", False):
+                    raise RuntimeError(
+                        "charge-transfer pipeline 缺少已验证的双腿 reservoir correction；"
+                        "compute_final_results 不允许把未闭合 endpoint 写成最终结果"
+                        "（只要诊断数值 ⟹ `--run-unclosed-charge-transfer-diagnostics`；"
+                        "产物仍标记不得发布。）"
+                    )
+                self._log(
+                    "  [诊断模式] 本腿最终结果在**缺 carrier reservoir correction** 的"
+                    "情况下落盘：已带 must_not_report_delta_g_bind=true，不得发布。"
                 )
             # Re-validate at the final-result boundary as well as construction
             # time.  This protects callers that instantiate a lightweight
             # pipeline object or mutate its protocol between sampling and
             # aggregation.
-            self.charge_transfer_reservoir_correction = (
-                validate_charge_transfer_reservoir_correction(
-                    reservoir,
-                    temperature_k=self.temperature.value_in_unit(unit.kelvin)
-                    if hasattr(self, "temperature")
-                    and hasattr(self.temperature, "value_in_unit")
-                    else None,
+            # ⚠️ 诊断模式下 `reservoir` 就是 None（上面刚放行），没有东西可校验 ——
+            # 不能把 None 喂进校验器。
+            if reservoir is not None:
+                self.charge_transfer_reservoir_correction = (
+                    validate_charge_transfer_reservoir_correction(
+                        reservoir,
+                        temperature_k=self.temperature.value_in_unit(unit.kelvin)
+                        if hasattr(self, "temperature")
+                        and hasattr(self.temperature, "value_in_unit")
+                        else None,
+                    )
                 )
-            )
         # Constraints are present in both endpoint Hamiltonians and therefore
         # cancel in the alchemical free-energy difference. A mass-based
         # mu/mu_ref term is not a valid correction for this protocol and used
@@ -7827,6 +8031,9 @@ class ABFEPipeline:
             "publishable_as_accepted_result": _publishable_reason is None,
             "publishable_rejection_reason": _publishable_reason,
             "stage_quality_failures": _quality_failures,
+            # [2026-09-18] 未闭合/未验收的 charge-transfer ⟹ 禁报标记跟着这条腿的
+            # 产物走。中性配体返回 `{}` ⟹ 既有 final_results.json 逐字节不变。
+            **charge_transfer_result_markers(getattr(self, "charge_protocol", None)),
             # [P1-19] 供 UnitFormatter.format_results_human 选人类可读标题用，
             # 也供审计时确认这份 final_results.json 到底是哪条腿产出的。
             "system_type": _system_type,
@@ -8073,17 +8280,33 @@ class ABFEPipeline:
                 expected_correction = getattr(
                     self, "charge_transfer_reservoir_correction", None
                 )
+                # 🔑🔑 [2026-09-18] 未闭合 charge-transfer 的**第六道**闸：这条
+                # 内建双腿路径自己的汇总一致性检查。诊断模式下没有 correction 可对，
+                # 整段跨腿一致性检查按定义不成立 ⟹ 跳过，而不是拿 None 去比。
                 if expected_correction is None:
-                    raise RuntimeError(
-                        "charge-transfer 循环缺少已验证的 reservoir correction；"
-                        "拒绝汇总两条腿"
+                    if not getattr(
+                            self, "unclosed_charge_transfer_diagnostics", False):
+                        raise RuntimeError(
+                            "charge-transfer 循环缺少已验证的 reservoir correction；"
+                            "拒绝汇总两条腿"
+                            "（只要诊断数值 ⟹ `--run-unclosed-charge-transfer-diagnostics`；"
+                            "产物仍标记不得发布。）"
+                        )
+                    self._log(
+                        "  [诊断模式] 缺 carrier reservoir correction ⟹ 跳过跨腿一致性"
+                        "核对，reservoir 项按 0 计；合成 ΔG_bind 少一整项，不得发布。"
                     )
-                expected_canonical = json.dumps(
-                    expected_correction, sort_keys=True, separators=(",", ":")
+                    expected_canonical = None
+                else:
+                    expected_canonical = json.dumps(
+                        expected_correction, sort_keys=True, separators=(",", ":")
+                    )
+                # 没有 correction 可对 ⟹ 空序列，整段跨腿核对不执行。
+                _cross_leg_pairs = (
+                    (("complex", complex_res), ("solvent", solvent_res))
+                    if expected_canonical is not None else ()
                 )
-                for leg_name, leg_result in (
-                    ("complex", complex_res), ("solvent", solvent_res)
-                ):
+                for leg_name, leg_result in _cross_leg_pairs:
                     candidate = (
                         leg_result.get("charge_transfer_reservoir_correction")
                         if isinstance(leg_result, dict)
@@ -8461,7 +8684,7 @@ class ABFEPipeline:
         # 下面 min_overlap 那道门用的是 mixture 覆盖度——**共模因子已经被除掉**，
         # 它证明的是"已采到的帧在窗口内各 λ 态之间分得开"，不是"这批被 Group-4
         # λ-WCA 防护壳偏置过、整窗只有一条轨迹的采样能重加权到真实物理系综"。
-        # 4W53 实测（STAGE2_ROOT_CAUSE_2026-08-28.md）：溶剂腿 mixture 0.4684 判优、
+        # 4W53 实测（docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md）：溶剂腿 mixture 0.4684 判优、
         # raw 0.0196，converged=True，stage2 报 +35.61 而独立参考是 -6.29 kJ/mol。
         # ⚠️ [2026-09-02] 上面这组数字是**壳退役前**的。这道门的因果性在 09-02
         # 得到正面验证：壳一去掉（`WCA_SHIELD_RETIRED = True`），溶剂腿 stage2 的
@@ -9715,7 +9938,7 @@ class ABFEPipeline:
         """[INDEPENDENT_ENDPOINT_PROTOCOL_VERSION=1] 为 λ_vdw→0 那一段建立真正独立的
         固定-λ 生产轨迹，并解出这一段的自由能。
 
-        见 STAGE2_ROOT_CAUSE_2026-08-28.md：IBS 每个窗口只跑一条轨迹，窗口内所有
+        见 docs/archive/STAGE2_ROOT_CAUSE_2026-08-28.md：IBS 每个窗口只跑一条轨迹，窗口内所有
         λ 态靠重加权得到，采不到"水塌进配体空腔"这个构型。
 
         ⚠️ [2026-09-02 归因更正] 原文这句结尾是"**而它正是 ΔG 的主要来源**"。
@@ -9725,7 +9948,7 @@ class ABFEPipeline:
         （≈4%）负责"——**作废**（那个区间是 LRC 口径没对齐造成的）。口径对齐后
         残差是 **-4.318 kJ/mol（5.5σ）**：其中约 20% 是生产/参考的盒体积差 2.81%
         （实测 -0.86 ± 0.13），其余十一项候选逐条实测排除后
-        ⟹ 壳退役之后，这个构型采样问题是剩下 **80%** 的误差来源。见 docs/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md。
+        ⟹ 壳退役之后，这个构型采样问题是剩下 **80%** 的误差来源。见 docs/archive/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md。
         这里对 [endpoint_join_index, n_states) 这一段的每个 λ 态各建独立 Context、
         各自平衡、各自采样，并**不含 Group-4 WCA**——防护壳的全部作用就是把水挡在
         空腔外，留着它等于继续采不到那个构型。
@@ -10575,6 +10798,7 @@ class ABFEPipeline:
         max_insertions: int = 3,
         min_states_per_window: int = 4,
         max_states_per_window: int = 5,
+        last_window_max_states: Optional[int] = None,
         explicit_window_ranges_pinned: bool = False,
         partition_criterion: str = "arclength",
         route_to_controller: bool = False,
@@ -10751,6 +10975,46 @@ class ABFEPipeline:
                 if not route_to_controller:
                     raise
                 return _routing_marker(_route_err)
+            except _ie.ExistingEnsembleRequiresRescueAudit as _ens_err:
+                # 🔑🔑🔑 [2026-09-18] **这一侧只能「分类」，不能「路由」。**
+                #
+                # 本函数排在自治循环**之前**（`run_full_pipeline` 里先 path
+                # evolution、后 `_run_stage2_autonomous`），此刻还没有控制器可以交回
+                # 去重判 —— 而且这个异常的语义本来就是终态（ensemble 身份不成立，
+                # 换个动作也没用）。所以这里**照旧上抛**，不返回 routing marker：
+                # 把它压成 marker 等于让下游拿一个身份不成立的 ensemble 继续跑。
+                #
+                # 缺的那一半是**分类**：先前它直接穿出 `run_full_pipeline`，只留一条
+                # 裸 traceback，既没说"这属于哪一类结局"，也没留下**该审哪个文件**。
+                # 而它的七个抛出点里有四条守卫是 `non_mutating_v1` —— 正是自治模式的
+                # 常态策略，所以这条路一点也不偏。
+                # 处置与自治循环那一侧共用同一条注册表记录，措辞不另写。
+                _spec_ens = ENGINE_SIGNAL_SPECS[
+                    "ExistingEnsembleRequiresRescueAudit"]
+                self._log(
+                    "  [路径演化] **ensemble 身份不成立**："
+                    f"{str(_ens_err)[:200]} ⟹ {_spec_ens.exit_}。"
+                    "这不是执行器崩溃，是一个可分类的终局；原文件全部保留，"
+                    "交 rescue/provenance audit。诊断落盘后原样上抛。"
+                )
+                try:
+                    _atomic_write_json(
+                        os.path.join(checkpoint_dir, "stage2_engine_halt.json"),
+                        {
+                            "exit": _spec_ens.exit_,
+                            "signal": _spec_ens.signal,
+                            "exception": type(_ens_err).__name__,
+                            "requires_rescue_audit": True,
+                            "raised_by": "path_evolution",
+                            "message": str(_ens_err)[:2000],
+                            "diagnostics": json.loads(json.dumps(
+                                getattr(_ens_err, "diagnostics", None) or {},
+                                default=str)),
+                        },
+                    )
+                except Exception:  # noqa: BLE001 —— 落盘失败不改变结局
+                    pass
+                raise
 
         if not _ie.should_run_path_evolution(repair_policy):
             return _guarded_once(), current_l, current_r
@@ -11001,6 +11265,9 @@ class ABFEPipeline:
                     )
                     raise
                 try:
+                    # 插点**之前**的布局：下面合法化要靠它把失败窗口的**下标**
+                    # 找出来（插完那个区间的边界可能已经变了，见那里的注释）。
+                    _ranges_before_insert = [tuple(r) for r in current_r]
                     new_l, new_r, step_diag = insert_lambda_in_failed_ibs_window(
                         list(current_l), list(current_r), tuple(failed_range),
                         pilot[0], pilot[1],
@@ -11085,6 +11352,56 @@ class ABFEPipeline:
                 record = new_record
                 current_l = [float(x) for x in new_l]
                 current_r = [tuple(int(i) for i in r) for r in new_r]
+                # 🔑🔑🔑 [2026-09-18 真机] **插完必须就地合法化，不能直接 `continue`。**
+                #
+                # 下一行 `continue` 回到 `:10864` 的 `run_once(..., current_r,
+                # _authoritative_window_ranges=True)` —— 也就是**立刻拿这份布局去跑**。
+                # 而插 λ 的语义是「末窗吸收溢出、豁免 max_states」，所以这里的末窗
+                # 完全可能是 K ∈ (hi, 2hi−1] 的**溢出中间态**。
+                #
+                # 「跑之前必须拆回 [lo, hi]」这条规则此前只挂在 `_run_stage2_autonomous`
+                # 的两个调用点上（`:11501` 启动校验、`:12159` 自治插 λ 执行器），而本函数
+                # 排在自治循环**之前**（`:17085` vs `:17134`）⟹ 本条路径上一次都不合法化。
+                # 真机后果：`stage2_window_max_states=6` 的 run 里窗口 5 从 4 态被喂到
+                # 7 态，然后直接开预热+生产，f_k 冻结、`max|F|` 全过，无声跑到底
+                # （缓存那边只留下一句 `缓存能量形状 (4,500) 与期望 (7,N) 不符`）。
+                #
+                # 与 `:6103` 那道执行层门是**一对**：那边把末窗上界从 `2*hi−1` 收回
+                # `hi`（不再放跑中间态），这边保证插点之后**确实**有人把它拆回去。
+                # 只做一边：只收紧门 = 必崩；只加合法化 = 别的入口照样漏。
+                # ⚠️ 末窗没超 `hi` 时 `_legalize_tail_window` 第一行就 return，零成本。
+                # ⚠️ 它内部所有失败路径都是 `raise`（不会原样返回非法布局），
+                #    所以这里**不加 try** —— 拆不开就该响，别把它吞成"跑一个非法布局"。
+                # ⚠️ **传插点之后的失败窗口区间，不是 `failed_range` 本身。**
+                # 合法化的死区分支会拿它再调 `insert_lambda_in_failed_ibs_window`，
+                # 而那个函数要求区间**存在于当前窗口列表里**（否则
+                # `RuntimeError: 失败窗口 … 不在当前窗口列表 … 中`）。失败窗口
+                # 就是末窗时它刚刚吸收完溢出、边界已经变了 —— 实测 failed=(6,11)
+                # 插完变成 (6,12)，拿旧元组去查必炸。
+                # 窗口**下标**在 model B 下不变（非末窗 ranges 逐字冻结、窗口数不变，
+                # `insert_lambda_in_failed_ibs_window` 有后置断言），所以按下标取。
+                _fw_i = next(
+                    (i for i, r in enumerate(_ranges_before_insert)
+                     if tuple(r) == tuple(failed_range)), None)
+                _fr_now = (tuple(current_r[_fw_i])
+                           if _fw_i is not None and _fw_i < len(current_r)
+                           else None)
+                current_l, current_r = self._legalize_tail_window(
+                    current_l, current_r,
+                    failed_range=_fr_now, pilot=pilot,
+                    checkpoint_dir=checkpoint_dir,
+                    min_states_per_window=int(min_states_per_window),
+                    max_states_per_window=int(max_states_per_window),
+                    last_window_max_states=last_window_max_states,
+                    # 合法化用的是**末窗首态**这个共享节点，与"谁不可信"无关
+                    # （2026-09-17 改动）；这个参数现在只作审计元数据。
+                    first_untrusted=None,
+                    partition_criterion=partition_criterion,
+                )
+                current_r = [tuple(int(i) for i in r) for r in current_r]
+                # 合法化可能又推了版本链（死区补点 / tail_repartition）⟹ `record`
+                # 会过期，而下一圈 `run_once` 要按它判 `_authoritative_window_ranges`。
+                record = _lpv.load_current(checkpoint_dir) or record
                 rounds_done += 1
                 local_attempts += 1
             except _ie.IBSFrozenCalibrationValidationError as _fk_err:
@@ -11219,6 +11536,7 @@ class ABFEPipeline:
         n_steps_per_window: int,
         min_states_per_window: int,
         max_states_per_window: int,
+        last_window_max_states: Optional[int] = None,
         max_iterations: int = 40,
         allow_untrusted_stage_results: bool = False,
         f_k_reanchor_cadence_steps: int = 500_000,
@@ -11426,14 +11744,20 @@ class ABFEPipeline:
             # 判据是**执行层上限** `hi`，不是可拆上限 `2hi−1`：后者是 path-version
             # 层允许插 λ 溢出到的位置，不是"可以照跑的上限"（见 `_legalize_tail_window`）。
             _tk = ranges[-1][1] - ranges[-1][0]
-            if _tk > int(max_states_per_window):
+            # [2026-09-18] 判据是**末窗上界**（溢出槽），不是非末窗的 `max_states`。
+            _tail_hi_start = (int(max_states_per_window)
+                              if last_window_max_states is None
+                              else max(int(min_states_per_window),
+                                       min(int(last_window_max_states),
+                                           2 * int(max_states_per_window) - 2)))
+            if _tk > _tail_hi_start:
                 # 插哪个窗口：**接着上次没做完的那次修复**。当前路径版本事件里
                 # 记着 `failed_global_state_range`，那就是上次插 λ 的目标窗口。
                 _ev = (_lpv.load_current(checkpoint_dir) or {}).get("event") or {}
                 _fr = (_ev.get("detail") or {}).get("failed_global_state_range")
                 self._log(
                     f"  [自治] 启动布局校验：末窗 K={_tk} > "
-                    f"{max_states_per_window} ⟹ 先合法化再决策"
+                    f"{_tail_hi_start} ⟹ 先合法化再决策"
                     f"（续上次针对窗口 {_fr} 的插 λ）。"
                 )
                 lam, ranges = self._legalize_tail_window(
@@ -11444,6 +11768,7 @@ class ABFEPipeline:
                     checkpoint_dir=checkpoint_dir,
                     min_states_per_window=int(min_states_per_window),
                     max_states_per_window=int(max_states_per_window),
+                    last_window_max_states=last_window_max_states,
                     first_untrusted=ctl.first_untrusted_window(view),
                     partition_criterion=ctl.partition_criterion,
                 )
@@ -12094,11 +12419,21 @@ class ABFEPipeline:
                         # 态数 ∈ [lo, hi]。所以超了就必须**先拆末窗再跑** ——
                         # 真机 15:59 连插两次把末窗顶到 (17,23)=6 > 5，
                         # 然后被下游验证器打死。
+                        # ⚠️ [2026-09-18] **`_rng` 是插点**之前**捕获的区间，这里
+                        # `ranges` 已经是插点之后的了。** 合法化的死区分支会拿它再调
+                        # `insert_lambda_in_failed_ibs_window`，而那个函数要求区间
+                        # **存在于当前窗口列表里**；失败窗口恰好是末窗时它刚吸收完
+                        # 溢出、边界已变 ⟹ `RuntimeError: 失败窗口 … 不在当前窗口
+                        # 列表 … 中`。窗口**下标**在 model B 下不变，按下标现取。
+                        _rng_now = (tuple(ranges[int(wins[0])])
+                                    if wins and 0 <= int(wins[0]) < len(ranges)
+                                    else None)
                         lam, ranges = self._legalize_tail_window(
-                            lam, ranges, failed_range=_rng, pilot=_pilot,
+                            lam, ranges, failed_range=_rng_now, pilot=_pilot,
                             checkpoint_dir=checkpoint_dir,
                             min_states_per_window=int(min_states_per_window),
                             max_states_per_window=int(max_states_per_window),
+                            last_window_max_states=last_window_max_states,
                             first_untrusted=ctl.first_untrusted_window(view),
                             # 🔑 [2026-09-17] 原来这一处**没传**，于是吃默认
                             # `arclength`，而另一个调用点传的是 `ctl.partition_criterion`
@@ -12538,6 +12873,51 @@ class ABFEPipeline:
                     break
                 _write_history()
                 continue
+            except _ie_exc.ExistingEnsembleRequiresRescueAudit as _ens_err:
+                # 🔑🔑🔑 [2026-09-18] **`HALT` 档：这是控制器的一个结局，不是崩溃。**
+                # 语义、为什么不走 `REDECIDE`、为什么配 `HALT_INVALID_INPUT`，
+                # 全部在模块级 `ENGINE_SIGNAL_SPECS` 那一条里，这里不复述。
+                # ⚠️ **必须排在下面那个 `except Exception` 之前**，否则被它吃掉。
+                _spec_ens = ENGINE_SIGNAL_SPECS[
+                    "ExistingEnsembleRequiresRescueAudit"]
+                _ens_diag = getattr(_ens_err, "diagnostics", None) or {}
+                self._log(
+                    f"  [自治] {act}{wins} 撞上**ensemble 身份不成立**："
+                    f"{str(_ens_err)[:200]} ⟹ 出口 {_spec_ens.exit_}（"
+                    "盘上的结论属于另一个系综，绕过去采下游无意义）。"
+                    "原文件全部保留，交 rescue/provenance audit。"
+                )
+                history[-1]["routing_signal"] = _spec_ens.signal
+                history[-1]["detail"] = str(_ens_err)[:400]
+                history[-1]["exit"] = _spec_ens.exit_
+                # 🔑 诊断必须落盘：这条终态的全部价值是告诉人**去审哪个文件**。
+                # 同 `stage2_fk_refuted.json` 的先例 —— 只报"身份不成立"而不给
+                # `state_file` / `window_index`，人接手时还得自己去翻盘面。
+                try:
+                    _atomic_write_json(
+                        os.path.join(checkpoint_dir,
+                                     "stage2_engine_halt.json"),
+                        {
+                            "exit": _spec_ens.exit_,
+                            "signal": _spec_ens.signal,
+                            "exception": type(_ens_err).__name__,
+                            "requires_rescue_audit": True,
+                            "raised_by": "autonomous_loop",
+                            "action": act,
+                            "windows": wins,
+                            "unit_id": plan.get("unit_id"),
+                            "iteration": it,
+                            "message": str(_ens_err)[:2000],
+                            "diagnostics": json.loads(
+                                json.dumps(_ens_diag, default=str)),
+                        },
+                    )
+                except Exception:  # noqa: BLE001 —— 落盘失败不改变终态
+                    pass
+                _finish("TERMINAL", _spec_ens.exit_, "loop",
+                        f"{type(_ens_err).__name__}: {str(_ens_err)[:300]}", it)
+                _write_history()
+                break
             except Exception as exec_err:  # noqa: BLE001
                 # 执行失败**不静默吞掉**：记进历史、退出，让上层看到真实异常。
                 # 历史必须**先落盘再 raise** —— 否则决策轨迹正好在最需要它的
@@ -12606,6 +12986,16 @@ class ABFEPipeline:
                     + [f"stale_layout_window_{int(i)}"
                        for i in (_fresh.get("stale_layout_evidence") or {})]
                 )
+            # 🔑🔑🔑 [2026-09-18] **ensemble 身份不成立时，这次收尾调用只会再炸一次。**
+            # 上面那两个判据（缺产物 / 产物对不上当前布局）都可能是空的 ——
+            # `ExistingEnsembleRequiresRescueAudit` 判的是**另一维**：产物在、
+            # 布局也对，但它属于另一个采样身份/协议。`run_once` 会重新加载同一个
+            # ensemble、原样再抛一次。异常会被下面吞掉（终态已经定了），
+            # 于是净结果是白跑一次加载 + 一条与根因无关的误导日志。
+            if outcome.get("exit") == ENGINE_SIGNAL_SPECS[
+                    "ExistingEnsembleRequiresRescueAudit"].exit_:
+                _blockers = list(_blockers) + [
+                    "existing_ensemble_requires_rescue_audit"]
         else:
             _blockers = []
         if outcome.get("exit") not in ("DONE", "DONE_UNTRUSTED") and _blockers:
@@ -12615,6 +13005,38 @@ class ABFEPipeline:
                 f"{outcome.get('exit')} 决定停手。诊断缺失是预期结果，不是失败。"
             )
             outcome["final_analyze_skipped"] = _blockers
+            # 🔑🔑🔑 [S2-O，2026-09-18 真机] **跳过收尾 ANALYZE 不等于什么都不留。**
+            #
+            # 真机五个 run（`cmet_ligand2/rep1`+`rep3`、`brd4_ligand1/rep1`、
+            # `cmet_ligand1/rep2`、`cyclod_ligand3/rep3`）全部走到这一条，结果是
+            # **整跑零产出**：没有任何 stage 级产物落盘，人工接手时连"哪个窗口坏在哪"
+            # 都要重新去翻各窗口的散文件。`cyclod_ligand3/rep3` 更极端 —— 16 轮里
+            # 一次 `ANALYZE` 都没发过，所以连中间结果都没有。
+            #
+            # 上面那个跳过的决定**本身是对的**（跑 `run_once` 就是重新采样，会绕过
+            # 控制器刚做的停止决定），不推翻。缺的只是：**跳过之后要留下一份
+            # 不花 GPU 的诊断**。
+            #
+            # 用已有的 `comparison_manifest()` —— 它的 docstring 写明「纯聚合，不新算
+            # 任何东西」，逐窗验收量 / ΔF±σ / 块账 / 动作序列全在里面，一步采样都不花。
+            # 文件名 `controller_comparison_manifest.json` **刻意不以 `stage2_` 开头**
+            # （见 `write_comparison_manifest` 的 [审计 #63]），不会被
+            # `_read_stage_result()` 的兜底 glob 误当成 stage 结果。
+            #
+            # ⚠️ 这**不解决** `S2-A`：`solver_n_frames_decorrelated` 只存在于 stage
+            # 求解结果里，而这里按定义跑不了求解。那条仍然开着（`AUDIT-S2-02`）。
+            # ⚠️ 也**不阻止** `_assert_stage_result_sane` 抛错 —— 路径确实不完整，
+            # 那道 fail-closed 是对的（缺窗口的和不是 ΔG），不许在这里放宽。
+            try:
+                _mf_path = _make_ctl().write_comparison_manifest()
+                outcome["final_diagnostic_manifest"] = _mf_path
+                self._log(
+                    f"  [自治] 已落一份**零采样**的诊断清单：{os.path.basename(_mf_path)}"
+                    "（逐窗验收量 / 块账 / 动作序列；纯聚合，不跑求解）。"
+                )
+            except Exception as _mf_err:  # noqa: BLE001 —— 诊断落盘失败不改终态
+                outcome["final_diagnostic_manifest_error"] = repr(_mf_err)[:300]
+                self._log(f"  [自治] 诊断清单落盘失败：{_mf_err!r}（不改终态）")
             _write_history()   # 上一次写盘在这个决定之前，不补写就看不见它
         elif outcome.get("exit") not in ("DONE", "DONE_UNTRUSTED"):
             try:
@@ -13343,12 +13765,26 @@ class ABFEPipeline:
         self, lam, ranges, *, failed_range, pilot, checkpoint_dir,
         min_states_per_window, max_states_per_window,
         first_untrusted, partition_criterion: str = "arclength",
+        last_window_max_states: Optional[int] = None,
     ):
         """把末窗弄回**执行层**合法（每个窗口态数 ∈ [lo, hi]）。返回 (lam, ranges)。
 
         末窗豁免只活在 path-version 层：插 λ 允许它涨到「可拆上限」2*hi−1，因为它是
         溢出槽。但 stage 的权威 window_ranges 校验对**所有**窗口一律要求 [lo, hi]，
         所以跑之前必须合法化。
+
+        🔑🔑🔑 [2026-09-18] **上面这句话在 2026-09-18 之前是假的，别照着旧代码读。**
+        权威校验（`_run_dual_lambda_stage` 里 `authoritative_window_ranges` 那段）
+        当时对末窗放宽到 `2*hi−1`，也就是说它**不要求**末窗 ≤ hi ——「跑之前必须
+        合法化」只是本函数自己的约定，执行层从没兑现。于是 K ∈ (hi, 2hi−1] 的末窗
+        被放跑（真机 hi=6、末窗 K=7 无声跑完预热+生产）。
+        这句话现在成立了，落点有两处，改动时**两处一起看**：
+          · 执行层硬门：`_run_dual_lambda_stage`，搜 `_split_cap = 2 * _hi - 1`
+            那段（现在对所有窗口一律 `[lo, hi]`，`2*hi−1` 只用来写迁移提示）；
+          · path evolution 插完就地合法化：`_run_stage2_with_path_evolution` 的
+            `while True` 里，`current_r = new_r` 之后、`continue` 之前。
+        本函数的另外两个调用点仍在 `_run_stage2_autonomous`（启动布局校验 / 自治插 λ
+        执行器）。**全仓共四个调用点**，加第五个之前先想清楚是不是又一份实现。
 
         死区：K ∈ (hi, 2*lo−1) 既不能当单窗（超 hi）又拆不开（可拆区间
         [2*lo−1, 2*hi−1]）。4/5 配置下死区只有 K=6 ⟹ 补 1 到 K=7 ⟹ 唯一拆法 4+4
@@ -13389,10 +13825,19 @@ class ABFEPipeline:
         # 实测 `repartition_tail_from_anchor` 对 K=7 和 K=12 都能拆成全部 ∈[lo,hi]
         # （7 → 4+4，12 → 4+5+5），机器本来就够用，卡的只是这道门。
         lo, hi = int(min_states_per_window), int(max_states_per_window)
+        # 🔑🔑🔑 [2026-09-18 第二轮] **触发点是末窗上界 `tail_hi`，不是非末窗的 `hi`。**
+        # 末窗是溢出槽：它被允许长到 `tail_hi`（配置 8）才拆，拆出来的两个子窗
+        # 必须都 ≤ `hi`（配置 5）—— 下面 `_illegal` 那道断言钉的就是后者。
+        # `tail_hi ≤ 2*hi − 2` 保证 `tail_hi + 1 ≤ 2*hi − 1`，即**触发拆窗的那个 K
+        # 永远落在可拆区间里**，所以下面那个死区循环（`hi < K < 2lo−1`）在给了
+        # `last_window_max_states` 时**进不去** —— 留着是 fail-closed，不是死码：
+        # 不给这个键时它照旧是唯一能把 K=hi+1 喂到可拆的路。
+        tail_hi = hi if last_window_max_states is None else int(last_window_max_states)
+        tail_hi = max(lo, min(tail_hi, 2 * hi - 2)) if hi >= 2 else hi
         split_lo = 2 * lo - 1
         ranges = [tuple(int(i) for i in r) for r in ranges]
         tail_k = ranges[-1][1] - ranges[-1][0]
-        if tail_k <= hi:
+        if tail_k <= tail_hi:
             return [float(x) for x in lam], ranges
 
         while hi < tail_k < split_lo:
@@ -13469,7 +13914,7 @@ class ABFEPipeline:
         # `first_untrusted` 只作为事件元数据留给审计（`record_tail_repartition_version`）。
         if len(ranges) < 2:
             raise RuntimeError(
-                f"末窗 K={tail_k} 超执行层上限 {hi}，而整条路径只有 {len(ranges)} 个窗口 ⟹ "
+                f"末窗 K={tail_k} 超末窗上限 {tail_hi}，而整条路径只有 {len(ranges)} 个窗口 ⟹ "
                 "没有「末窗首态」这个共享节点可用（重分它等于重分整条路径，那是布点的事"
                 "不是合法化的事）。fail-closed：不带着非法布局继续。"
             )
@@ -13518,7 +13963,7 @@ class ABFEPipeline:
             first_untrusted_window=first_untrusted,
         )
         self._log(
-            f"  [自治] 末窗 K={tail_k} 超执行层上限 {hi} ⟹ 拆："
+            f"  [自治] 末窗 K={tail_k} 超末窗上限 {tail_hi} ⟹ 拆："
             f"{tdiag['old_ranges']} → {tdiag['new_ranges']}。"
         )
         return ([float(x) for x in lam],
@@ -13575,6 +14020,9 @@ class ABFEPipeline:
                 n_windows=kwargs.get("stage2_n_windows"),
                 first_window_max_states=kwargs.get(
                     "stage2_first_window_max_states"
+                ),
+                last_window_max_states=vanishing_range_kwargs.get(
+                    "last_window_max_states"
                 ),
                 pilot_mean_dU_dlambda=_pilot_mean_gradients_or_none(
                     diag.get("pilot_points") or []
@@ -14937,9 +15385,22 @@ class ABFEPipeline:
             == CHARGE_TREATMENT_CO_ALCHEMICAL_CHARGE_TRANSFER
             and getattr(self, "charge_transfer_reservoir_correction", None) is None
         ):
-            raise RuntimeError(
-                "charge-transfer pipeline 缺少已验证的双腿 carrier reservoir correction；"
-                "不得把 tethered-carrier 的 restrained endpoint 当作闭合 ABFE。"
+            # 🔑🔑 [2026-09-18] 这是「未闭合 charge-transfer」的**第二道**闸
+            # （第一道在 runabfe 建 Context 之前、第三道在汇总时）。诊断模式
+            # `--run-unclosed-charge-transfer-diagnostics` 三道要一起解，否则
+            # 只是把同一条路的死点往后挪一格、白烧一条腿的 GPU。
+            # 解除的只是"不许跑"，产物照旧带 must_not_report_delta_g_bind=true。
+            if not getattr(self, "unclosed_charge_transfer_diagnostics", False):
+                raise RuntimeError(
+                    "charge-transfer pipeline 缺少已验证的双腿 carrier reservoir correction；"
+                    "不得把 tethered-carrier 的 restrained endpoint 当作闭合 ABFE。"
+                    "（只要诊断数值 ⟹ `--run-unclosed-charge-transfer-diagnostics`；"
+                    "产物仍标记不得发布。）"
+                )
+            self._log(
+                "  [诊断模式] 未闭合 charge-transfer 放行开跑（缺 carrier reservoir "
+                "correction）：本腿结果**不得**作为 ΔG_bind 发布，产物已带 "
+                "must_not_report_delta_g_bind=true。"
             )
         if getattr(self, "residual_sampling_enabled", False) and decoupling_scheme != "dual_lambda":
             raise RuntimeError(
@@ -15314,6 +15775,15 @@ class ABFEPipeline:
                 ),
                 "target_support_gate_protocol_version": int(
                     TARGET_SUPPORT_GATE_PROTOCOL_VERSION
+                ),
+                # 🔑 [2026-09-18] split-half σ 下界是否**采用**（不只是算出来）。
+                # 它改的是报出的 `total_error` 与逐段 σ，所以必须进 stage 协议指纹：
+                # 不进指纹 ⟹ 开关翻了而旧 stage 结果被静默复用、带着未放大的 σ，
+                # 那正是本仓库反复栽过的形状。
+                # 进的是 final_gate_thresholds ⟹ `_stage_window_sampling_identity`
+                # 会把它 pop 掉 ⟹ **stage 结果重算、窗口轨迹照常复用**（不重跑 MD）。
+                "inflate_sigma_from_split_half": bool(
+                    kwargs.get("inflate_sigma_from_split_half", True)
                 ),
             }
             _stage1_protocol_key = self._stage_protocol_key(
@@ -16880,6 +17350,9 @@ class ABFEPipeline:
                         vanishing_max_states_per_window=kwargs.get(
                             "stage2_window_max_states"
                         ),
+                        vanishing_last_window_max_states=kwargs.get(
+                            "stage2_last_window_max_states"
+                        ),
                         fixed_lam_coul=0.0,
                         fixed_lam_vdw=1.0,
                         potential_type=potential_type,
@@ -16983,6 +17456,8 @@ class ABFEPipeline:
                     max_states_per_window=int(
                         kwargs.get("stage2_window_max_states", 5)
                     ),
+                    last_window_max_states=kwargs.get(
+                        "stage2_last_window_max_states"),
                     partition_criterion=_partition_criterion,
                     # 路由信号只有在下游真有控制器接管时才允许被咽下去。
                     route_to_controller=bool(
@@ -17080,6 +17555,8 @@ class ABFEPipeline:
                             max_states_per_window=int(
                                 kwargs.get("stage2_window_max_states", 5)
                             ),
+                            last_window_max_states=kwargs.get(
+                                "stage2_last_window_max_states"),
                             max_iterations=int(
                                 kwargs.get("stage2_autonomous_max_iterations", 40)
                             ),

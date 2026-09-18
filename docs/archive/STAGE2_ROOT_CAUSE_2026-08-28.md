@@ -12,7 +12,7 @@
 >
 > 本文把 4W53 的 **+32.31 kJ/mol** 误差整体归因于「每窗口单轨迹重加权抓不到
 > 空腔重组熵」。2026-09-02 结案的
-> [archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md](archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md)
+> [archive/BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md](BUG_LOCATION_stage2_ibs_window0_shell_2026-09-01.md)
 > 把该误差的 **98%** 定罪为 **λ-WCA 防护壳（Group 4）**：壳退役后 ΔG_bind 从
 > **+12.75 → −21.36 ± 0.93**，与实验 −23.10 差 1.83σ。
 >
@@ -28,7 +28,7 @@
 > **唯一例外**是 `ibs_engine.py:11257` 的措辞「针对 +32 kJ/mol 根因的修复」：
 > 那个**幅度归因**已经不对了，机制本身还在。
 >
-> 按 [README.md](README.md) 维护规则第 3 条，本文正文**一字未改**，用替代关系
+> 按 [README.md](../README.md) 维护规则第 3 条，本文正文**一字未改**，用替代关系
 > 保留历史。不要原地把结论改写成当前版。
 
 ## 1. 结论

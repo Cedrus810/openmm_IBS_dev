@@ -229,7 +229,7 @@ def _assignments_of(module: str, target: str):
 
     按**源码 AST** 断言而不是跑一遍：这个量活在 `run_ibs_bias_warmup` 内部，
     真要跑到它得起 OpenMM + 完整预热循环。同类源码断言的先例见
-    `docs/STAGE2_CONTROLLER_DESIGN_2026-09-12.md` §9.5。
+    `docs/archive/STAGE2_CONTROLLER_DESIGN_2026-09-12.md` §9.5。
     """
     out = []
     for node in ast.walk(ast.parse((_SRC / module).read_text())):

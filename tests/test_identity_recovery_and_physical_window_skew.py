@@ -84,8 +84,14 @@ def test_a_skewed_physical_window_is_not_answered_with_more_frames(tmp_path):
     run = _run_with_self_failure(tmp_path, source="top1pct_veto")
     plan = Stage2RepairController(run, "vanishing").decide()
     assert plan["action"] != "RUN_PRODUCTION", plan["reason"]
-    assert plan["action"] in ("INSERT_LAMBDA", "SPLIT_TAIL_WINDOW", "NO_ACTION")
-    assert "加帧治不了偏斜" in plan["reason"] or "不拿加帧顶替" in plan["reason"]
+    # 🔑 [2026-09-18] `RELEARN_FK_EPOCH` 进这张表：本用例钉的是「**不拿加帧顶替
+    # 偏斜**」，而换 f_k 同样不是加帧。`top1pct_veto` 现在先走它 —— 它和缩跨度
+    # 同属 η 杠杆，但不像插 λ 那样必然把溢出推给末窗（model B 后置断言）。
+    assert plan["action"] in (
+        "RELEARN_FK_EPOCH", "INSERT_LAMBDA", "SPLIT_TAIL_WINDOW", "NO_ACTION")
+    assert ("加帧治不了偏斜" in plan["reason"]
+            or "不拿加帧顶替" in plan["reason"]
+            or "top1pct_veto" in plan["reason"])
 
 
 def test_a_sample_size_failure_still_gets_frames(tmp_path):

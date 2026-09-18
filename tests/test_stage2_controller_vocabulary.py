@@ -13,7 +13,7 @@
 
 所以这里按**源码 AST** 对账，不是按运行时行为：把 `decide()` 里每个
 `plan(..., exit_=...)` 的字符串字面量抽出来，与清单互相比。
-（同类源码断言的先例见 `docs/STAGE2_CONTROLLER_DESIGN_2026-09-12.md` §9.5。）
+（同类源码断言的先例见 `docs/archive/STAGE2_CONTROLLER_DESIGN_2026-09-12.md` §9.5。）
 """
 
 import ast

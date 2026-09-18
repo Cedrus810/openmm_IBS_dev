@@ -1081,6 +1081,43 @@ def charge_treatment_qualification_payload(charge_treatment: Optional[str]) -> D
     return {}
 
 
+def charge_transfer_result_markers(
+    charge_protocol: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """未闭合/未验收的 charge-transfer ⟹ 跟着**每份产物**走的禁报标记。
+
+    🔑 [2026-09-18] `--run-unclosed-charge-transfer-diagnostics` 让这类运行能起，
+    代价是它的数**一步都不能进 ΔG_bind 汇总**。先前这条信息只保证写进
+    `run_provenance.json`，逐腿 `final_results.json` 与 `final_binding_results.json`
+    只有 `production_qualified=false` —— 只读结果文件的人看不出"禁报"。
+    这里把三个键做成一份、由**已解析的协议 payload** 派生（不另判一次循环闭合，
+    那是 `resolve_charge_treatment` 的事），两边产物用同一个来源。
+
+    中性 / Rocklin ⟹ 返回 `{}`（`charge_treatment_qualification_payload` 对这两条
+    路线本来就返回空）⟹ 既有产物逐字节不变。
+    """
+    if not isinstance(charge_protocol, dict):
+        return {}
+    qualification = charge_treatment_qualification_payload(
+        charge_protocol.get("charge_treatment")
+    )
+    if not qualification:
+        return {}
+    closes = charge_protocol.get("closes_thermodynamic_cycle") is True
+    qualified = bool(qualification.get("production_qualified"))
+    if qualified and closes:
+        return {}
+    return {
+        "production_qualified": qualified,
+        "closes_thermodynamic_cycle": closes,
+        "must_not_report_delta_g_bind": True,
+        "must_not_report_delta_g_bind_reason": (
+            charge_protocol.get("incomplete_cycle_reason")
+            or qualification.get("production_qualification_reason")
+        ),
+    }
+
+
 def resolve_charge_treatment(
     charge_treatment: Optional[str],
     ligand_net_charge_e: float,
@@ -11997,7 +12034,7 @@ def sync_all_exclusions(system: openmm.System) -> int:
         #
         # 实测（EXP-031，abfe-ibs-cuda-d5）：真 Atenolol 膜体系 45354 原子、
         # 三次独立测量 **1.162×**。⚠️ 早期文档里的 **1.45× 是水盒工作点的数字，
-        # 不可引用**（见 docs/EXP-031_GPU_OPTIMIZATION_2026-09-09.md）。
+        # 不可引用**（见 docs/archive/EXP-031_GPU_OPTIMIZATION_2026-09-09.md）。
         # 排除对的集合与条数完全不变，能量逐比特不变；变的只有写入顺序 ——
         # 但那会改 System XML 里排除表的书写顺序 ⟹ `system_xml_sha256` 变，
         # 既有窗口产物/resume 失配。"能量不变"≠"缓存能用"。

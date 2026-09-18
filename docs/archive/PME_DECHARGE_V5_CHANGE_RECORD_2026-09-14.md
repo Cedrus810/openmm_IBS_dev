@@ -231,7 +231,7 @@ rep2/rep3 是 `[0..20]`、6 段、+44.09 / +40.97。
 所以 rep1 的 vanishing 是**只解了末窗一个窗口的部分和**，被当成完整 ΔG。
 rep1 自己的全路径中间结果是 **+43.00**（与 rep2 的 +44.09 差 1.1）。
 
-**连带**：`docs/STAGE2_CONTROLLER_DESIGN_2026-09-12.md` 的头条
+**连带**：`docs/archive/STAGE2_CONTROLLER_DESIGN_2026-09-12.md` 的头条
 ΔG_bind = −3.48 ± 0.47 kcal/mol（1.19σ）**就是 rep1**，已作废。
 它"对上实验"是两个 ~90 kJ/mol 的错误反号抵消：部分和 +92 / 分子内湮灭 −88.7。
 用 rep1 自己的全路径重算 → **−25.49 kcal/mol**，与 rep2/rep3 一致。
