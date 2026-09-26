@@ -1,0 +1,86 @@
+--- a/tests/test_boresch_anchor_and_pbc_fixes.py
++++ b/tests/test_boresch_anchor_and_pbc_fixes.py
+@@ -9,6 +9,12 @@
+ from types import SimpleNamespace
+ 
+ import pytest
++import inspect
++import textwrap
++import abfe_core
++import abfe_pipeline
++import ibs_engine
++import runabfe
+ 
+ pytestmark = pytest.mark.cpu_only
+ 
+@@ -103,7 +109,7 @@
+ 
+ def test_bond_source_is_recorded_for_audit():
+     """诊断里必须能看出用的是真实键还是几何近似。"""
+-    src = (REPO_ROOT / "abfe_core.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(abfe_core.GeometricRestraintEstimator.estimate_from_trajectory)))
+     assert '"bond_source": self.bond_source' in src, (
+         "锚点是靠成键关系枚举的，用了哪套判据必须落盘，否则事后无法复核"
+     )
+@@ -116,7 +122,7 @@
+       · 因配体缺键而整体退几何 → 白丢受体侧用真实键的收益；
+       · 因配体有零星键而整体用拓扑 → 配体侧枚举全灭（2026-07-27 生产崩溃）。
+     """
+-    src = (REPO_ROOT / "abfe_core.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(abfe_core)))
+     tree = ast.parse(src, filename="abfe_core.py")
+     fn = next(
+         n for n in ast.walk(tree)
+@@ -187,7 +193,7 @@
+ 
+ def test_backup_length_is_refreshed_wherever_the_position_backup_is():
+     """坐标备份与 history 长度必须成对更新，否则回退会截到错的分叉点。"""
+-    src = (REPO_ROOT / "ibs_engine.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(ibs_engine)))
+     lines = src.splitlines()
+     assign_pos = [
+         i for i, l in enumerate(lines)
+@@ -211,7 +217,7 @@
+ 
+ 
+ def test_both_rollback_sites_truncate():
+-    src = (REPO_ROOT / "ibs_engine.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(ibs_engine)))
+     assert src.count("_truncate_production_history(") >= 3, (
+         "两处灾难回退（主循环 + 余数补齐）都必须调用截断，加上定义共 ≥3 次出现"
+     )
+@@ -224,7 +230,7 @@
+ 
+ def test_repair_runs_before_pre_equilibration():
+     """`repair_pbc_molecule_integrity` 必须在 pre_equilibrate 体内、且在建 Context 前。"""
+-    src = (REPO_ROOT / "abfe_pipeline.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(abfe_pipeline)))
+     tree = ast.parse(src, filename="abfe_pipeline.py")
+     fn = next(
+         n for n in ast.walk(tree)
+@@ -242,7 +248,7 @@
+ 
+ def test_repair_fails_closed_instead_of_degrading_to_a_com_shift():
+     """失败必须 raise，不能回退到 _wrap_ligand_to_box（那只是质心平移）。"""
+-    src = (REPO_ROOT / "abfe_pipeline.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(abfe_pipeline)))
+     tree = ast.parse(src, filename="abfe_pipeline.py")
+     fn = next(
+         n for n in ast.walk(tree)
+@@ -270,7 +276,7 @@
+     用 AST 只看真正被打印出去的字符串字面量，不做裸子串匹配：源码注释里解释
+     "原来这行写的是……" 是应该允许的，被匹配到就成了误报。
+     """
+-    src = (REPO_ROOT / "runabfe.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(runabfe)))
+     tree = ast.parse(src, filename="runabfe.py")
+ 
+     offenders = []
+@@ -413,6 +419,6 @@
+ 
+ def test_diagnostics_records_both_sides_and_coverage():
+     """诊断落盘必须能事后判断每一侧用了什么判据、覆盖度多少。"""
+-    src = (REPO_ROOT / "abfe_core.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(abfe_core)))
+     for key in ("bond_source_receptor", "bond_source_ligand", "bond_coverage"):
+         assert f'"{key}"' in src, f"diagnostics 里缺 {key}"

@@ -1,0 +1,50 @@
+--- a/tests/test_routing_signal_not_terminal.py
++++ b/tests/test_routing_signal_not_terminal.py
+@@ -22,6 +22,9 @@
+ 
+ import ibs_engine as _ie  # noqa: E402
+ from abfe_pipeline import ABFEPipeline, ANALYSIS_INCOMPLETE  # noqa: E402
++import inspect
++import textwrap
++import abfe_pipeline
+ 
+ 
+ def _call(tmp_path, *, route_to_controller, repair_policy="path_evolution_v1"):
+@@ -83,7 +86,7 @@
+     root = pathlib.Path(__file__).resolve().parents[1]
+     emitted = {
+         node.args[0].value
+-        for node in ast.walk(ast.parse((root / "ibs_engine.py").read_text("utf-8")))
++        for node in ast.walk(ast.parse((textwrap.dedent(inspect.getsource(_ie)))))
+         if isinstance(node, ast.Call)
+         and isinstance(node.func, ast.Attribute)
+         and node.func.attr in ("_fallback", "_incomplete_path_fallback")
+@@ -108,9 +111,7 @@
+                     "total_delta_G": 0.0, "total_error": 999.9}
+     assert stage_result["error"] in STAGE_SOLVE_ROUTING_ERRORS
+ 
+-    src = (
+-        __import__("pathlib").Path(__file__).resolve().parents[1] / "abfe_pipeline.py"
+-    ).read_text("utf-8")
++    src = (textwrap.dedent(inspect.getsource(abfe_pipeline)))
+     assert "STAGE_SOLVE_ROUTING_ERRORS" in src
+     # 绝不能顺手把它标成收敛/可发布。
+     # 🔑 [2026-09-16] 原探针钉的是 `stage_result["converged"] = True`，而
+@@ -149,7 +150,7 @@
+ 
+     root = pathlib.Path(__file__).resolve().parents[1]
+     fn = next(
+-        n for n in ast.walk(ast.parse((root / "ibs_engine.py").read_text("utf-8")))
++        n for n in ast.walk(ast.parse((textwrap.dedent(inspect.getsource(_ie)))))
+         if isinstance(n, ast.FunctionDef) and n.name == "solve_stage_integrated"
+     )
+     bare = {
+@@ -185,7 +186,7 @@
+     import ast
+     import pathlib
+ 
+-    src = (pathlib.Path(__file__).resolve().parents[1] / "abfe_pipeline.py").read_text("utf-8")
++    src = (textwrap.dedent(inspect.getsource(abfe_pipeline.ABFEPipeline.run_full_pipeline)))
+     tree = ast.parse(src)
+     fn = next(n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == "run_full_pipeline")

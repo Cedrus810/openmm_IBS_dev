@@ -1,6 +1,6 @@
 """C2：`tools/validation/validate_charge_transfer_lipid_slab.py` 的 CPU 契约测试。
 
-覆盖用户 code-review 里列的 11 条（见对话记录 / `docs/status/memtodolist.md` C2 一节）：
+覆盖用户 code-review 里列的 11 条（见对话记录 / `Atenolol-rank11/memtodolist.md` C2 一节）：
 
   1. Na build 后 TP3 -3 / Na+ +2 / Cl- +1（`_edit_top_molecules_block` 纯文本层）。
   2. dummy 清零后基础总电荷严格为 0。

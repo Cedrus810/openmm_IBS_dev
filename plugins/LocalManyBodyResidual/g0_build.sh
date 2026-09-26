@@ -16,7 +16,7 @@
 
 # EXP-025 G0 build script.
 #
-# Deliberately NOT CMake yet (see docs/experiments/PLAN_EXP-025_local_manybody_cuda.md section
+# Deliberately NOT CMake yet (see Atenolol-rank11/PLAN_EXP-025_local_manybody_cuda.md section
 # 4.1 for the eventual CMakeLists.txt layout). This is a manual g++ build
 # against the already-installed OpenMM 8.5.2 (git_revision 36a30cb) conda
 # package's public API headers, private Reference-platform headers, and

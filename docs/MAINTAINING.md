@@ -67,7 +67,7 @@ CI 跑的是哪些门见 [`.github/workflows/cpu-ci.yml`](../.github/workflows/c
 | 改了什么 | 更新哪里 |
 |---|---|
 | **任何代码或协议改动** | [CHANGELOG.md](CHANGELOG.md) 加一行（规则见该文件末尾） |
-| 协议版本号、fail-closed 判据、物理口径 | 改动点的代码注释 + 对应优先级的待办：[TODO.md](TODO.md)`[P1]` / [TODO_P2.md](TODO_P2.md)`[P2]` / [TODO_P3.md](TODO_P3.md)`[P3]`（2026-09-16 起按优先级拆成三份，原来的《未关闭的代码缺陷》一节已不存在） |
+| 协议版本号、fail-closed 判据、物理口径 | 改动点的代码注释 + 对应优先级的待办：[TODO.md](TODO.md) 的对应等级节（`[P1]`/`[P2]`/`[P3]`；09-16 曾拆成三份，2026-09-24 又合并回一份） |
 | 设计合同 / 提案的实施状态 | [design/README.md](design/README.md) 的状态表（**必须同步复核日期**） |
 | 发布阻塞项 | [RELEASE_READINESS_2026-08-31.md](archive/RELEASE_READINESS_2026-08-31.md) |
 | 稳定用法 | [GETTING_STARTED.md](GETTING_STARTED.md) / [OUTPUTS_AND_RESUME.md](OUTPUTS_AND_RESUME.md) |

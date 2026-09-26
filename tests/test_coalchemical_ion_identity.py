@@ -1,6 +1,6 @@
 """MEM-00c：co-ion 身份必须选一次、冻结、之后处处只读核对。
 
-对应 `docs/status/memtodolist.md` §0.5.1 MEM-00c、§3.4、§14 R3，以及 `docs/TODO.md` 的 MEM-00c 条目。
+对应 `Atenolol-rank11/memtodolist.md` §0.5.1 MEM-00c、§3.4、§14 R3，以及 `docs/archive/TODO_2026-08-06_unreconciled.md` 的 MEM-00c 条目。
 
 ## 缺陷是什么（已修，本文件现在是契约测试）
 
@@ -553,6 +553,6 @@ def test_pipeline_freezes_once_persists_and_reverifies_on_resume():
         "消费点数量变了：3 处 REMDManager + 3 处 compute_u_kn + 1 处 "
         "[Stage2 handoff，2026-08-11] `_run_dual_lambda_stage` 的 vanishing 分支"
         "（charge-transfer 配体：先独立配置一份 charging，再烘焙成 λ_coul=0 端点，"
-        "见 docs/experiments/STAGE2_CHARGE_TRANSFER_HANDOFF_PROPOSAL.md）。"
+        "见 Atenolol-rank11/STAGE2_CHARGE_TRANSFER_HANDOFF_PROPOSAL.md）。"
         "新增消费点必须同样走 resolve_co_alchemical_ion_spec()"
     )

@@ -18,10 +18,11 @@ IBS warmup and frozen-bias production, MBAR/TMBAR estimation, Boresch
 attachment/release accounting, LJ long-range correction, caching, resume, and
 fail-closed quality gates.
 
-> **Current scientific status lives in [docs/STATUS.md](docs/STATUS.md).** This repository
-> currently has **no** result that may be cited as a final conclusion. The production
-> system, result registry, protocol versions, and open items are all recorded there --
-> read it before quoting any number.
+> **Current scientific status lives in [docs/STATUS.md](docs/STATUS.md).** The repository
+> has real-hardware results (a multi-system benchmark is producing numbers), but whether a
+> given number may be cited, and under which caveats, is decided **only** there. The
+> production system, result registry, protocol versions, and open items are all recorded
+> there -- read it before quoting any number.
 
 ## 1. Environment
 
@@ -154,7 +155,7 @@ repository -- a clone needs no compilation step and no separate download. The cr
 development speed, not an oversight: Chinese is the authoritative version there, and its
 commands, paths, and status markers are directly usable as-is. This English README covers
 the full workflow; [README_cn.md](README_cn.md) is its Chinese counterpart. The two are
-**not** kept at word-for-word parity (see [docs/TODO_P3.md](docs/TODO_P3.md)).
+**not** kept at word-for-word parity (see [docs/TODO.md](docs/TODO.md) §3.4).
 
 ## License
 

@@ -388,6 +388,7 @@ VANISHING_TARGET_INTERVALS_PER_ENSEMBLE = 3
 VANISHING_MIN_INTERVALS_PER_ENSEMBLE = 2
 # OpenMM CustomCVForce supports at most 32 CVs.  build_ibs_dual_system currently
 # adds two CVs per lambda state (interaction + zero restraint bookkeeping).
+# （2026-09-24 更正：`ibs_engine.IBS_BIAS_OMIT_ZERO_REST_CVS=True` 起每态只占 1 个 CV。）
 VANISHING_MAX_STATES_PER_IBS_ENSEMBLE = 16
 
 
@@ -934,7 +935,7 @@ def vanishing_subdomain_ranges_from_lambdas(
 
     真正按 ∫g 均衡的分窗是 ``partition_windows_by_metric_integral``。
     **[2026-09-14 用户拍板] 它现在是生产默认**：``abfe_config.json`` 里
-    ``stage2_window_partition = "metric_integral"``、``stage2_window_max_states = 8``
+    ``stage2_window_partition = "metric_integral"``、``stage2_window_max_states = 8``（2026-09-24 更正：现配置为 ``"state_count"``（仍由该函数以 objective 实现）、max=5）
     （max 是卡住均衡的那一项：max=5 会强制 [5,5,5,5,5]，等于退化回等边数）。
 
     ⟹ **本函数只在显式设 ``stage2_window_partition="arclength"`` 时才会被生产
@@ -1103,6 +1104,11 @@ def recompute_vanishing_path_from_cached_pilot(
     partition_criterion: str = "arclength",
     n_windows: Optional[int] = None,
     first_window_max_states: Optional[int] = None,
+    # 🔑🔑 [2026-09-20] 末窗上界同样必须收进来。它也在 `_PREOPT_DERIVED_PATH_KEYS`
+    # 里、也**决定布局**，签名不收 ⟹ 调用方想传也传不进来 ⟹ 重算出的末窗按 `hi`
+    # 切，而调用方随后拿**带 cap** 的权威分窗去逐字比对 ⟹ 结构性失配、整份缓存被拒、
+    # 重烧 pilot。恰好在「需要末窗 cap」这个该用它的场景上自毁。
+    last_window_max_states: Optional[int] = None,
 ) -> Dict:
     """从**已落盘的 pilot 测量**离线重算 λ 路径与窗口布局。**不跑任何 MD。**
 
@@ -1188,6 +1194,10 @@ def recompute_vanishing_path_from_cached_pilot(
             first_window_max_states=(
                 int(first_window_max_states)
                 if first_window_max_states is not None else None
+            ),
+            last_window_max_states=(
+                int(last_window_max_states)
+                if last_window_max_states is not None else None
             ),
             pilot_mean_dU_dlambda=_pilot_mean_gradients_or_none(
                 path_diagnostics["pilot_points"]
@@ -1607,7 +1617,7 @@ def partition_windows_by_metric_integral(
     # 因为它是既有 run 的协议指纹的一部分，不做同名改义。
     objective: str = "metric_integral",
 ) -> Tuple[List[Tuple[int, int]], Dict[str, Any]]:
-    """按 ``∫g dλ`` 均衡划分 IBS 窗口（**尚未接入生产,独立函数**）。
+    """按 ``∫g dλ`` 均衡划分 IBS 窗口（2026-09-24 更正：已接入生产，见 abfe_pipeline 的分窗入口）。
 
     相邻窗口共享且只共享一个边界态。先用 DP 最小化"最大窗 ∫g"，再在所有取得该
     最小值的布局里最小化 ∫g 的平方和，得到确定性的、尽量均匀的结果。
@@ -2170,7 +2180,7 @@ MARGINAL_GAIN_STALL_RATIO = 0.9
 # 写侧自己的注释就是「帧数不够 ≠ 支撑不够」，读侧必须同口径。
 # 🔑🔑 [2026-09-15 真机 brd4_ligand1/rep2] **`min_n_eff_over_g` 从这张表里拿掉。**
 #
-# 上面第 2099 行原来写「`min_n_eff_over_g` 支撑比值偏低 ⟹ 样本量问题，加帧对症」。
+# 上面那张表里原来写「`min_n_eff_over_g` 支撑比值偏低 ⟹ 样本量问题，加帧对症」。
 # 反例就在同一个 run 里：
 #     win1  n_decorr = 888（地板 10 的 **88 倍**）、min N_eff/g = 8.68
 # **帧一点都不缺**，缺的是权重压不到目标态上。同分布再加一块，只会得到权重剖面
@@ -2552,7 +2562,7 @@ def marginal_gain_stalled(series) -> Tuple[bool, Dict[str, Any]]:
         # 换一个替代判据（比如改用自检侧的 `min_n_eff_over_g`）是另一回事：
         # 那个量单次读数噪声 34×，拿它当**停止**判据会误杀 ——
         # 而误杀的代价今天已经实测过（两次生产跑连崩）。
-        # 真正的修法是 `AUDIT-S2-02` 的重构，见 docs/TODO_P2.md `S2-A`。
+        # 真正的修法是 `AUDIT-S2-02` 的重构，见 docs/archive/TODO_closed.md `S2-A`（09-23 随控制器关闭判为已被取代）。
         _present = sum(1 for x in _raw if x is not None)
         return False, {
             "verdict": ("NO_CRITERION_INPUT_AT_ALL" if (_raw and _present == 0)
@@ -2566,7 +2576,7 @@ def marginal_gain_stalled(series) -> Tuple[bool, Dict[str, Any]]:
                 "`solver_n_frames_decorrelated` 来自 stage 结果的 "
                 "`window_overlap_diagnostics`，而 stage 结果只在 `ANALYZE` 执行时落盘，"
                 "`ANALYZE` 又排在补帧那一族之后 ⟹ 整个采样阶段读不到。"
-                "见 docs/TODO_P2.md `S2-A`。"}
+                "见 docs/archive/TODO_closed.md `S2-A`。"}
                if (_raw and _present == 0) else {}),
         }
     head = sorted(vals[:-1])
@@ -3025,7 +3035,7 @@ class Stage2RepairController:
 
       · **决策不许散开。** 现状是三层各用一种机制 —— `ibs_engine.run_all_windows`
         尾部 4200 行函数里的 if/else（窗口内 f_k）、`abfe_pipeline` 的异常展开
-        （插 λ）、`abfe_pipeline:13027` 的 while 循环（补采）；状态写点 25 处、
+        （插 λ）、`abfe_pipeline:13027` 的 while 循环（补采；2026-09-24 注：该行号已漂移）；状态写点 25 处、
         分三个区，其中 resume 那一段是**第二套**从盘上推状态的规则。本类把这些
         判断收到一处。
       · 修补的判据（`insert_lambda_in_failed_ibs_window`、`feasible_repair_actions`）
@@ -3109,7 +3119,7 @@ class Stage2RepairController:
     #         action   = decide(evidence, feasible_actions, global_budget)
     #         execute(action)
     #
-    # ⟹ 出口要分成两类。**只有这三种允许真正终止**，其余一律是**路由信号**
+    # ⟹ 出口要分成两类。**只有这三种允许真正终止**（2026-09-24 更正：不止三种了，现以 `EXIT_SPECS` 里 terminal=True 的为准），其余一律是**路由信号**
     #    （被主循环消费、换个动作继续跑）：
     # 🔑🔑 [2026-09-17，用户拍板] **两张表都从 `EXIT_SPECS` 派生，不再手写。**
     # 手写两张表的代价已经实证四次（漏项、互相矛盾的注释、静默停整跑）——
@@ -3125,7 +3135,7 @@ class Stage2RepairController:
     # 两者全仓（含 docs/）零引用，删除是纯清理。由
     # `tests/test_stage2_controller_vocabulary.py` 钉住不再漂移。
 
-    # `bias_status` 六个值混了"还在流程中"（前三）与"已有裁决"（后三）。
+    # `bias_status` 六个值（2026-09-24 更正：加了 `provisional_production` 后是七个）混了"还在流程中"（前三）与"已有裁决"（后三）。
     # 拆开才知道是"在跑"还是"有结论了"。
     _PHASE = {
         "unconverged": "WARMUP_LEARN",
@@ -3173,7 +3183,7 @@ class Stage2RepairController:
         #
         # 🔑🔑 [2026-09-15 审计 #1] **但"run 自己记了"这件事只对复合物腿成立。**
         # `_write_run_provenance` 只往**总**输出目录写一份 `run_provenance.json`，
-        # 而溶剂腿的 run_dir 是 `output_dir/solvent_leg`（`runabfe.py` 约 7515），
+        # 而溶剂腿的 run_dir 是 `output_dir/solvent_leg`（`runabfe.py` 约 8614），
         # 那底下没有这个文件 ⟹ `_cfg` 为空 ⟹ 分窗判据、插点上限、块数上限、
         # 生产预算**全部退回默认值**，与复合物腿不是同一套。真机实测两腿读出：
         #     分窗判据 metric_integral vs arclength
@@ -3234,6 +3244,16 @@ class Stage2RepairController:
             max_path_insertions if max_path_insertions is not None
             else _cfg.get("max_path_insertions", 3)
         )
+        # 🔑 [2026-09-22] 复现模式（`stage2_uniform_lambda_states` 打开时由
+        # `abfe_pipeline._freeze_stage2_path_for_repro` 置位）：**布局冻结 + 固定
+        # 长度采样**。控制器仍然全程在跑——它是 f_k 重标定唯一的执行者——但
+        #   · 三个改布局的动作（INSERT_LAMBDA / SPLIT_TAIL_WINDOW /
+        #     IMMUTABLE_REWINDOW）一律判不可行；
+        #   · 同一份 f_k 下**不再补帧**（RUN_PRODUCTION 的 top-up），
+        #     救窗口只许换 f_k。
+        # 三处实现分别在 `feasible()` / `rewindow_feasible()` / `_frames_admission`
+        # ——都是各自动作的**唯一**判据入口，不是三份拷贝。
+        self.repro_frozen_path = bool(_cfg.get("stage2_frozen_layout", False))
         # 🔑 [2026-09-15] 尾段重分必须用**与生产同一个**分窗判据；从 run 自己记的
         # config 读，缺省与 `_run_dual_lambda_stage` 那侧的缺省一致。
         self.partition_criterion = str(
@@ -3274,7 +3294,7 @@ class Stage2RepairController:
         self.new_ensemble_reserve_steps = int(self.production_block_steps)
         self.stage_dir = os.path.join(self.run_dir, self.stage_name)
         # 🔑 **多采样段有自己的 checkpoint 命名空间。** 约定见
-        # `abfe_pipeline._recalibrate_fk_and_resample_segment`：
+        # `abfe_pipeline._recalibrate_f_k_and_resample_segment`：
         #   段输出目录 = f"{stage_dir}_{segment_index}"       → `vanishing_2`
         #   段 checkpoint = checkpoints/f"segment_{index}"     → `checkpoints/segment_2`
         # 读错子目录的后果很具体：段 2 会读到段 1 的 ibs_state，把段 1 的
@@ -3991,7 +4011,7 @@ class Stage2RepairController:
             "self_sufficient": selfchk.get("sufficient"),
             "self_verdict": selfchk.get("verdict"),
             # 为什么是这个 verdict：solver_eligibility / min_n_eff_over_g /
-            # top1pct_veto。三者补救方向都是加采样，但归因不同，对账时要分得开。
+            # top1pct_veto。三者补救方向都是加采样，但归因不同，对账时要分得开。（2026-09-24 更正：现只有 solver_eligibility 按样本量处理；top1pct_veto 判 STRUCTURAL（加帧治不了），min_n_eff_over_g 见 support_failure_attribution。）
             "self_verdict_source": selfchk.get("verdict_source"),
             "self_frames_short_by": selfchk.get("frames_short_by"),
             # 验收量：N_eff,k / g_k（未抽稀帧上逐目标态 support ÷ 时间自相关）。
@@ -4937,6 +4957,12 @@ class Stage2RepairController:
         （可拆区间 `[2lo−1, 2hi−1]`、溢出槽上界）必须与
         `insert_lambda_in_failed_ibs_window` 里的守卫**同一份**，不许各写一遍。
         """
+        if getattr(self, "repro_frozen_path", False):
+            _frozen = (
+                "复现模式（stage2_uniform_lambda_states）：λ 表与分窗已钉死，"
+                "改布局的动作一律不可行。救窗口只许换 f_k。"
+            )
+            return {"insert_lambda": _frozen, "split_tail_window": _frozen}
         view = view or self.read()
         ranges = view["path"]["window_ranges"]
         n_states = view["path"]["n_states"]
@@ -5070,6 +5096,13 @@ class Stage2RepairController:
           · **这个父窗还没建过子系综**：一个父窗只切**一层**。子窗再失败不再递归 ——
             不设深度上限就是一个新的无限循环，而子窗的失败另有出口（见死线 D3）。
         """
+        if getattr(self, "repro_frozen_path", False):
+            # 有界重窗不动 λ 表，但它**建新的子系综、改采样布局** ⟹ 两条腿/两个
+            # rep 的窗口不再逐字相同，正是复现模式要排除的那个变量。
+            return (
+                "复现模式（stage2_uniform_lambda_states）：分窗已钉死，"
+                "有界重窗会建出布局不同的子系综 ⟹ 不可行。救窗口只许换 f_k。"
+            )
         if window_idx is None:
             return "没有目标窗口"
         _i = int(window_idx)
@@ -5488,10 +5521,10 @@ class Stage2RepairController:
         #
         # 后果不是"少了一行诊断"：`decide()` 的**退役换窗**（2026-09-16 那条，专治
         # 「末窗全程躺在 `blocked_by_upstream` 里一次没被看过」）靠
-        # `plan["earliest_unresolved_window"]` 找退役目标，`None` 就直接 `return None`
+        # `plan["blocking_window"]`（缺省取 earliest）找退役目标，`None` 就直接 `return None`
         # ⟹ 这六条路径上退役**永不触发**。而它们恰恰都通向 `plan()` 内部的两道改写闸
         # （换 Epoch 付不起 → `RUN_PRODUCTION` → 补帧准入 → `NO_FEASIBLE_ACTION` /
-        # `HALT_FRAMES_ADMISSION_CAP`），也就是 `_RETIRABLE_EXITS` 的**全部**两个值。
+        # `HALT_FRAMES_ADMISSION_CAP`），也就是 `_RETIRABLE_EXITS` 的**全部**两个值（该名单已于 2026-09-17 删除，现按 `halt_scope` 判）。
         #
         # 用一个**字典**而不是裸闭包：分支 0 / 0a 在它被填之前 return，`.get()` 返回
         # `None`，行为与先前逐字相同 —— NameError 那条理由被保住，重复那 44 遍被删掉。
@@ -5880,10 +5913,10 @@ class Stage2RepairController:
             # 🔑🔑 [2026-09-15 审计②③] **终态不许和自己的证据打架。**
             #
             # 两条 DONE 分支各自判一遍前提，而 `evidence_status` 在**下面**才算：
-            #   · 0a（4331）查了 `_layout_trustworthy` / `stale` / `coverage`，
+            #   · 0a（现约 6200 行）查了 `_layout_trustworthy` / `stale` / `coverage`，
             #     但**没查逐窗 `STATISTICALLY_REJECTED` / `phase == TERMINAL`**
             #     ⟹ 一份 f_k 已被统计驳回的窗口仍可被宣布 DONE；
-            #   · 分支 7（5603）**一道都没查** —— 而 0a 的注释写着「两条都不满足
+            #   · 分支 7（现约 8169 行）**一道都没查** —— 而 0a 的注释写着「两条都不满足
             #     就往下走路由，由分支 7 兜底（那条路径上保护仍然成立）」，
             #     **那句话是假的**。真机形状：path v2 + stage 缓存不盖 path_version
             #     ⟹ 0a 跳过 ⟹ 分支 7 直接 DONE，发布一个描述**另一条布局**的 ΔG。
@@ -6081,7 +6114,7 @@ class Stage2RepairController:
                      "window_idx": int(_iw),
                      "diagnosis": _idiag,
                      "why": "补帧的边际增益刹车在这个窗口上没有输入 ⟹ 本轮没有带电。"
-                            "见 docs/TODO_P2.md `S2-A`。"}
+                            "见 docs/archive/TODO_closed.md `S2-A`。"}
                     for _iw, _irows in sorted(
                         (view.get("production_blocks_total_by_window") or {}).items())
                     for _idiag in [marginal_gain_stalled(
@@ -6357,7 +6390,7 @@ class Stage2RepairController:
         #
         # `IMMUTABLE_REWINDOW` 恰好绕开全部四个封锁条件（见 `rewindow_feasible`），
         # 成本表 / 执行器 / 子窗调度 / no-op 台账早就齐了，唯独缺这一个发出点
-        # （`docs/TODO.md` 的 REWIND-01：13 个声明动作里唯一发不出的那个）。
+        # （`docs/archive/TODO_closed.md` 的 REWIND-01，09-17 已关闭：13 个声明动作里唯一发不出的那个）。
         # ⚠️ 接在**每条死线各自的兜底之前**，不是在链尾加第 33 条分支 ——
         # 否则又是「按书写顺序决定语义」。
         def _bounded_rewindow(win, why):
@@ -6445,6 +6478,16 @@ class Stage2RepairController:
                     f"（上限 {_max_blocks}；换段/换 Epoch 不重置配额）⟹ **不再自动补**。"
                     f"逐块判据量（{_dim}, 求解器去相关帧数）="
                     f"{[(r.get('segment'), r.get('solver_n_decorrelated')) for r in rows_all]}。"
+                )
+            if getattr(self, "repro_frozen_path", False) and not hard_cap_only and rows:
+                # 🔑 [2026-09-22] 复现模式 = **固定长度采样**：每份 f_k 只跑
+                # `n_steps_per_window`，不靠同分布加帧去够门（加帧让偏斜更糟是
+                # 已经实测过的：N 涨 g 也涨，比值不动甚至倒退）。
+                # `hard_cap_only=True` 的动作（RECALIBRATE_FK / 探针 / 临时生产）
+                # **不受这条限制** —— 换 f_k 正是这个模式留下的唯一出路。
+                return False, (
+                    f"{_who}：复现模式（固定长度采样）⟹ 同一份 f_k 下不再补帧"
+                    f"（本段已批 {len(rows)} 块）。要救这个窗口只能换 f_k。"
                 )
             if hard_cap_only:
                 # 非补帧的花块动作：只受资源账约束，不受"加帧还有没有用"那两道约束。
@@ -7052,6 +7095,9 @@ class Stage2RepairController:
                 # 所以这里无法判定补帧可不可行 —— 唯一能判的地方是主循环的停滞
                 # 保护（"补了一轮，盘上没变"），`GLOBAL_BUDGET_EXHAUSTED` 已改由
                 # 它发出。造一个真正的双层预算是 PLAN 第 5 步 F，尚未实现。
+                # （2026-09-24 更正：上面几句已过时 —— 09-14「裁决 2」已新增
+                # `view["production_budget"]`；`GLOBAL_BUDGET_EXHAUSTED` 现只由 `plan()`
+                # 内那道统一生产预算闸发出，停滞保护不再推断预算、一律 NO_FEASIBLE_ACTION。）
                 exit_="HALT_BUDGET",
                 windows=_sel,
                 blocked=blocked, earliest=earliest,
@@ -7192,7 +7238,7 @@ class Stage2RepairController:
         # 发这个动作 —— 它的处置改由块后的 N_eff/g 判据接手（达到 10 则继续；
         # 边际停滞/下降或 far-end support 塌陷 ⟹ 关 Epoch 走 tail rewindow；
         # top1% 灾难性集中 ⟹ 停止同分布加帧），那些分支在下面本来就有。
-        # ⚠️ 再发一次 = 「反复试到偶然通过」，正是 4818 那段明令禁止的。
+        # ⚠️ 再发一次 = 「反复试到偶然通过」，正是上面 3a 那段（「只给一个 +250k 诊断块」）明令禁止的（2026-09-24 更正：原写「4818 那段」，行号已漂移）。
         _cap_hit = [
             w for w in _cap_hit
             if str(w.get("bias_status") or "") != "provisional_production"
@@ -7587,7 +7633,7 @@ class Stage2RepairController:
                 # 这里先前只问「拆末窗在结构上可不可行」，不问「失败的是不是末窗」——
                 # 与 9b 已经修过的是同一个毛病，这一处漏了：中间窗的 f_k 被 held-out
                 # 驳回，却换来一次**与它无关**的尾段重分（烧 GPU、改布局、作废下游
-                # 证据，元凶窗口一个字节没动）。判据与 9b 同一份。
+                # 证据，元凶窗口一个字节没动）。判据与 9b 同一份（2026-09-24 更正：分支 9b 已于 09-15 删除，见分支 9 注释）。
                 _tail_i = max((int(w["window_idx"]) for w in W), default=None)
                 _is_tail = (_tail_i is not None and int(earliest) == int(_tail_i))
                 _feas_split = feas.get("split_tail_window") is None and _is_tail
@@ -7988,7 +8034,7 @@ class Stage2RepairController:
         # ⚠️ 与子窗那条（1c-3）同一形状、同一出口。`UNKNOWN` 两边都不授权：
         # 补帧可能越加越差（若其实是结构性），改布局是拿「没测出来」当「测出来是
         # 坏的」（若其实只是数据缺口）。
-        # ⚠️ 出口进了 `_RETIRABLE_EXITS`：别处还有活干时退役换窗继续调度，
+        # ⚠️ 出口的 `halt_scope` 是 `TARGET_LOCAL`（2026-09-24 更正：原写「进了 `_RETIRABLE_EXITS`」，那张表已于 09-17 删除，可退役性改由 `EXIT_SPECS` 的 halt_scope 决定）：别处还有活干时退役换窗继续调度，
         # 不因为一个判不出归因的窗口停掉整跑（用户规格原话）。
         # ⚠️⚠️ **只在「没有其他独立硬证据」时才拦。**（用户规格原话）
         # 被求解器跳掉 / 还没有产物 —— 这两类是**独立于归因的硬证据**，它们各自
@@ -8980,7 +9026,7 @@ class Stage2RepairController:
             # 量在 `_epoch_validation_unaffordable` 里是 fail-closed、在 `decide()`
             # 分支 1e 里是 `left is not None and <=0`（未知 = 有钱）。同一个未知，
             # 三套语义。实测 cyclod_ligand1/rep3 win4 的 ledger 确实读不到，
-            # 在这里被显示成 0。规矩（TODO §1）：**未知不是零，两个方向都不是。**
+            # 在这里被显示成 0。规矩（`docs/archive/TODO_closed.md` CTL-01~10 那组「留下四条规矩」第 3 条）：**未知不是零，两个方向都不是。**
             "per_window_budget_remaining": {
                 int(w["window_idx"]): (
                     None if w.get("warmup_steps_left") is None
@@ -9352,8 +9398,8 @@ class Stage2RepairController:
                     f"{('w%d' % j.get('upstream_window', -1)):>5} "
                     # 🔑 [2026-09-14] **列名是 `g`，就必须读 g 那个键。**
                     # `join_lambda_two_sided_support` 现在落 `statistical_inefficiency_g`
-                    # = g；`tau_int` 保留为别名但**值已改成真正的 τ_int=(g−1)/2**
-                    # ⟹ 照旧读它会静默打印出**一半**的数字，表头却还写着 g。
+                    # = g；`tau_int` 已**不再写**（2026-09-24 更正：原写「保留为别名但值已改成 τ_int=(g−1)/2」，见 ibs_engine 审计 #54）
+                    # ⟹ 照旧只读它在新产物上会拿到 None，表头却还写着 g。
                     # 旧产物没有新键时才回退到 `tau_int`（那时它还是 g）。
                     f"{f2(u.get('raw_ess'), 9)} "
                     f"{f2(u.get('statistical_inefficiency_g', u.get('tau_int')), 7, 2)} "
@@ -9701,8 +9747,8 @@ def repartition_tail_from_anchor(
     #     三个 5 态窗变成两个 7 态窗。可行性说"可以拆细"，执行器交付"合并了"。
     #     ⟹ `n_windows` 现在是**必须显式给**的目标窗口数（调用方传 m0+1）。
     #
-    # (2) **判据被换掉了。** 生产分窗是 `stage2_window_partition=metric_integral`
-    #     （按 ∫g dλ 均衡），而尾段重分调的是等状态数贪心、**根本不读 metric_g**。
+    # (2) **判据被换掉了。** 生产分窗当时是 `stage2_window_partition=metric_integral`
+    #     （按 ∫g dλ 均衡；2026-09-24 更正：09-17 起 abfe_config.json 为 `state_count`，同样走 `partition_windows_by_metric_integral`、缺数据同样 fail-closed），而尾段重分调的是等状态数贪心、**根本不读 metric_g**。
     #     于是重分之后：冻结前缀按 ∫g 切、新尾段按边数切，同一条路径上两套判据。
     #     ⟹ 给了 `pilot_lambdas`/`metric_g` 就用 `partition_windows_by_metric_integral`，
     #     与生产同一个分窗器；`partition_criterion="metric_integral"` 而数据缺失时
@@ -9880,7 +9926,7 @@ def repartition_tail_from_anchor(
             "`n_windows = min_windows`），方向与可行性判据相反。"
             "调用方必须显式给 `n_windows`（= 原尾段窗口数 + 1）。"
         )
-    # 跨度的口径**跟分窗器的目标函数同一个**：metric_integral 时比 ∫g，
+    # 跨度的口径**跟分窗器的目标函数同一个**：走 `partition_windows_by_metric_integral`（metric_integral / state_count）时比 ∫g，
     # 否则比态数。比"失败窗口重分后的 span"是不成立的 —— 边界整体移动之后，
     # 原来那个窗口的下标已经不指向同一段 λ 了。
     _tail_old = [(a, b) for a, b in ranges if a >= a_idx]
@@ -10141,7 +10187,7 @@ def feasible_repair_actions(
     ``max_states_per_window``**（仅路径版本层）。拆过之后两个孩子都受约束，溢出槽消失 ——
     此后插点无处可去，唯一出口是报「输入 λ 数目不够」并退出进程（控制器
     **不得**自行加总态数重跑 preopt：总态数是输入，属于 prescribed path 的定义）。
-    调用方应从路径版本链里数 ``split_tail_window`` 事件来决定这个标志。
+    调用方应从路径版本链里数 ``split_tail_window`` 与 ``tail_repartition`` 两种拆窗事件来决定这个标志（见 `tail_overflow_exemption_active`）。
 
     只覆盖**结构性**动作。"延长采样 / 重标定 f_k"不改结构、永远可行，不在此列。
     """
@@ -10654,7 +10700,7 @@ def split_window_from_warmup_failure(
     existing lambda state, which is sufficient to stitch their free energies.
 
     The initial pilot layout intentionally uses a wide cumulative-overlap
-    budget (``pilot_overlap_thermodynamic_length``), so neighboring windows
+    budget (``pilot_overlap_thermodynamic_length``；2026-09-24 更正：该符号已不在仓库代码中), so neighboring windows
     can legitimately share several states -- e.g. a 6-state parent sharing 3
     states with its next neighbor. That is by design, not a bug. But once this
     parent SPLITS, only ``start`` is preserved on the left child and only
@@ -10940,7 +10986,7 @@ def canonicalize_window_ranges(
 
 
 # #[P1 FIX] 抽取共享方差归一化逻辑，消除重复代码
-# abfe_preoptimizer.py 顶部 (约第 15 行)
+# abfe_preoptimizer.py 模块级函数（2026-09-24 更正：原写「顶部 (约第 15 行)」，现已不在文件顶部）
 def _normalize_variance_weights(std_dev_clipped, max_ratio=0.15):
     """共享方差归一化函数，消除代码重复"""
     density_weight = np.log1p(std_dev_clipped) + 0.1
@@ -11055,6 +11101,8 @@ def _pilot_ti_cumulative_f(lam_sorted: np.ndarray, grad_sorted: np.ndarray) -> n
     only needs real |Delta F| magnitudes, no sign/gauge convention) -- kept
     as one function so both stay derived from the same integration, not two
     independently-maintained copies of the same trapezoidal rule.
+    （2026-09-24 更正：当前唯一调用方是 ``estimate_f_k_from_pilot_ti``；
+    ``redistribute_vanishing_lambda_subdomains`` 的自由能加密走 ``_free_energy_arclength``，没有复用本函数。）
     """
     seg = 0.5 * (grad_sorted[:-1] + grad_sorted[1:]) * np.diff(lam_sorted)
     return np.concatenate(([0.0], np.cumsum(seg)))
@@ -11705,7 +11753,7 @@ class ABFEPreOptimizer:
         print(f"\n→ 正在执行能量景观分析 ({n_steps_per_state} 步/状态)... ")
 
         # === 【修复 4】安全检查参数是否存在 ===
-        # abfe_preoptimizer.py -> analyze_gradient_and_optimize_path 方法 (约第 120 行)
+        # abfe_preoptimizer.py -> analyze_gradient_and_optimize_path 方法（2026-09-24 更正：原写「约第 120 行」，现在约第 11722 行）
 
         # === 【修复】安全参数设置：先检查后设置 ===
         initial_lam = float(self.lambdas[0])
@@ -11844,7 +11892,7 @@ class ABFEPreOptimizer:
     ) -> List[float]:
         """
         [步骤 2 备选] Lambda 路径预设（如果不用 Pathfinding）
-        【修复】添加此方法以兼容 openmm_abfe_pipeline.py
+        【修复】添加此方法以兼容 openmm_abfe_pipeline.py（2026-09-24 更正：该文件已不在仓库中）
         """
         total_states = n_windows * states_per_window
 
@@ -12150,7 +12198,7 @@ class ABFEPreOptimizer:
 # 背景（详见 abfe_pipeline.py 里 "vanishing" 分支调用 _run_dual_lambda_
 # optimization 处 2026-07-19 的原地注释）：那次真实 GPU 回归发现 10000 步的
 # 短 pilot 会系统性低估 λ≈1 端点由稀有/发作性事件主导的
-# beta^2*Var[dU/dlambda]，才把预算拉长到当前生产用的 30000。任何缩短 pilot
+# beta^2*Var[dU/dlambda]，才把预算拉长到当时生产用的 30000（2026-09-24 更正：09-04 起 abfe_config.json 为 15000）。任何缩短 pilot
 # 预算的方案都必须先证明不会重新踩这个坑——这组函数只是用来在真机上收集
 # "如果提前停会怎样"的影子数据供之后离线验证，本身不做任何提前停的决定。
 

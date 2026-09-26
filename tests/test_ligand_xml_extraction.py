@@ -1,6 +1,6 @@
 """P0-13：从 GROMACS .top 抽配体参数时，**不许对同类型力做单例假设**。
 
-对应 `docs/TODO.md` 的 P0-13，以及它引起的 P0-12（溶剂腿构象塌缩）。
+对应 `docs/archive/TODO_2026-08-06_unreconciled.md` 的 P0-13，以及它引起的 P0-12（溶剂腿构象塌缩）。
 
 ## 缺陷是什么（2026-08-04 实测事故）
 
@@ -64,8 +64,10 @@ def test_membrane_ligand_angles_survive_the_extraction(tmp_path):
     )
     # 其余项一并钉住，防止"修了角、漏了别的"。
     assert xml.count("<Bond ") == 82          # 41 个成键项 + 41 个 Residue 连接
-    assert xml.count("<Proper ") == 96
-    assert xml.count("<Improper ") == 8
+    # [2026-09-23] 扭转不再写进 XML（无编号属性曾被 ForceField 静默读成 0 项），
+    # 改由 `_overwrite_solvent_leg_terms_from_top` 建系后从 top 逐项拷入。
+    assert xml.count("<Proper ") == 0
+    assert xml.count("<Improper ") == 0
 
 
 @pytest.mark.skipif(not MEMTEST_TOP.is_file(), reason="需要 memtest/topol.top")
@@ -166,9 +168,11 @@ def test_extraction_reconciles_written_terms_against_the_source_system():
     assert "配体 XML 抽取对账失败（P0-13）" in src
     assert "n_written != expected" in src
     # 三类力都必须聚合（列表），不能再出现单例假设。
-    for name in ("bond_forces", "angle_forces", "torsion_forces"):
+    for name in ("bond_forces", "angle_forces"):
         assert f"{name} = _forces_of(" in src, f"{name} 没有走聚合"
     assert "angle_force = next(" not in src, "单例假设又回来了（P0-13）"
+    # 扭转走建系后覆盖（2026-09-23），不走 XML。
+    assert "_overwrite_solvent_leg_terms_from_top(" in src
 
 
 def test_nonbonded_force_multiplicity_is_rejected_rather_than_guessed():

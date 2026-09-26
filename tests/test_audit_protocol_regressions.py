@@ -188,7 +188,7 @@ class SourceContractTests(unittest.TestCase):
         self.assertIn("bias_update_count += 1", self.engine)
 
     def test_production_entry_self_correction_stays_before_production_sampling(self):
-        """docs/experiments/EXP-030_FROZEN_SNAPSHOT_TIMING_BUG_2026-08-26.md's fix (in
+        """Atenolol-rank11/EXP-030_FROZEN_SNAPSHOT_TIMING_BUG_2026-08-26.md's fix (in
         scripts/exp030_window_state_machine.py) is safe only as long as the
         one-time damped+pairwise-capped f_k self-correction on production
         entry stays structurally confined to the warmup/validation
@@ -568,7 +568,7 @@ class SourceContractTests(unittest.TestCase):
         # "缓存有效"（P0-12）。升版本号让所有旧盒缓存重建，这是刻意的。
         # 5 → 6（2026-08-05，B4）：manifest 加入 reserved co-ion 字段，旧缓存不含
         # dummy 粒子，必须重建。
-        self.assertIn("SOLVENT_CACHE_PROTOCOL_VERSION = 7", self.runabfe)
+        self.assertIn("SOLVENT_CACHE_PROTOCOL_VERSION = 8", self.runabfe)
         self.assertIn('"ligand_start_conformer"', self.runabfe)
         self.assertIn("DEFAULT_SOLVENT_IONIC_STRENGTH_MOLAR = 0.15", self.runabfe)
         self.assertIn('positiveIon="Na+"', self.runabfe)
@@ -916,7 +916,10 @@ class SourceContractTests(unittest.TestCase):
 
     def test_analyze_only_fallback_fails_closed_on_unconverged_solve(self):
         self.assertIn("validator._assert_stage_result_sane(name, cached)", self.runabfe)
-        self.assertIn("_assert_sampling_result_converged(cached, context=name)", self.runabfe)
+        # [2026-09-22] IBS stage 结果**不得**再叠 traditional 腿那个 `converged` 门：
+        # 该键 2026-09-15 已从 solve_stage_integrated 删除，叠上去等于让 --analyze
+        # 对任何 vdW 腿恒抛。硬不变量由 analysis_status（上一行）判，没有放松。
+        self.assertNotIn("_assert_sampling_result_converged(cached, context=name)", self.runabfe)
 
     def test_preopt_cache_requires_full_protocol_match_not_just_state_count(self):
         # todolist.md P1: Stage1/Stage2 preopt-cache (lambda path + window

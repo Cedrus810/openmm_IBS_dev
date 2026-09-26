@@ -1,6 +1,6 @@
 """C3-1：`tools/validation/compare_charge_transfer_endpoints.py` 的 CPU 契约测试。
 
-对应 `docs/status/memtodolist.md` §「C3：真实体系 λ=1/λ=0 端点能量和力」的 C3-1 清单：
+对应 `Atenolol-rank11/memtodolist.md` §「C3：真实体系 λ=1/λ=0 端点能量和力」的 C3-1 清单：
 
     正/负 ligand 电荷
     单/多 co-ion
@@ -15,12 +15,12 @@
 
 这里只用小型合成体系（Reference 平台），不碰真实 C1/C2 数据——那是 C3-2
 （wiring smoke）与 C3-3/C3-4（真实数值门）的事，需要 GPU 双精度权威跑，
-留给用户计算节点执行（见 docs/status/memtodolist.md §9）。
+留给用户计算节点执行（见 Atenolol-rank11/memtodolist.md §9）。
 
 ## 这个文件不覆盖什么（诚实标注，不要悄悄假装做了）
 
 - C（vanishing λ_vdw=1 seam）的比较用的是两条**都是生产代码**的路径互相对照，
-  不是独立 reference——这是 docs/status/memtodolist.md 表里本来的设计（"两阶段接缝完全
+  不是独立 reference——这是 Atenolol-rank11/memtodolist.md 表里本来的设计（"两阶段接缝完全
   一致"），不是本文件偷懒。
 - 没有测试"缺失真实 DCD 帧/box/hash"这个 I/O 层面的 fail-closed（那需要真实
   轨迹文件），这里只测 `evaluate()`/`compare_endpoint()` 对非有限值和形状不
@@ -488,7 +488,7 @@ def test_vanishing_lambda_one_seam_matches_charging_lambda_zero():
 # offsets` + `abfe_core.bake_global_parameter_into_fixed_nonbonded_force`，
 # `lambda_name="lambda_coul"`，与 `abfe_pipeline.py` 里
 # `ABFEPipeline._run_dual_lambda_stage` 的 vanishing 分支逐字一致），不是临时
-# 诊断脚本——这是 docs/experiments/STAGE2_CHARGE_TRANSFER_HANDOFF_PROPOSAL.md 落地后补的永久
+# 诊断脚本——这是 Atenolol-rank11/STAGE2_CHARGE_TRANSFER_HANDOFF_PROPOSAL.md 落地后补的永久
 # 契约测试。C 用**伸展几何**（真实键长键角，见下面 helper）：2026-08-11 实测
 # 确认原来那个紧凑几何（配体 4 原子挤在 <0.2nm 内）会带出一个小的、与几何
 # 基本无关的绝对残差（~0.0005 kJ/mol），让相对差刚好卡在 1e-5 门外——不是

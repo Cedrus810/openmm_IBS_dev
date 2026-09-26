@@ -1,6 +1,6 @@
 """pytest 共享配置。
 
-只做一件事：把仓库根目录放进 `sys.path`。
+做两件事：把仓库根目录放进 `sys.path`；把数值库默认线程数压到 1（见下）。
 
 在此之前，`import ibs_engine` / `import abfe_pipeline` 能成功纯粹是因为
 "pytest 恰好从仓库根目录启动"（rootdir 被隐式加进 sys.path）。从别处调用
@@ -14,8 +14,15 @@ CI 时换了工作目录）就会 ImportError。显式加进来把这个隐式�
     测试进程和 xdist worker 都必经的地方，不该在这里引入任何设备初始化副作用。
 """
 
+import os
 import sys
 from pathlib import Path
+
+# 2026-09-24：BLAS/OpenMP/torch 默认按核数（本机 80）开线程。测试里的张量都很小，
+# 80 线程反而更慢（exp012 训练那条 18 s → 9 s），xdist 多 worker 时还会互相超订。
+# 只 setdefault：调用方显式设了就尊重。必须在任何测试模块 import numpy/torch 之前。
+for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 

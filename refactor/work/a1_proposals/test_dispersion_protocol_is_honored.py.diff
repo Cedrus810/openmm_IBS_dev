@@ -1,0 +1,40 @@
+--- a/tests/test_dispersion_protocol_is_honored.py
++++ b/tests/test_dispersion_protocol_is_honored.py
+@@ -32,6 +32,8 @@
+ 
+ import abfe_core as core
+ import ibs_engine as ie
++import textwrap
++import abfe_pipeline
+ 
+ ROOT = Path(__file__).absolute().parents[1]
+ 
+@@ -203,8 +205,8 @@
+     两处都必须把 `dispersion_protocol` 传进去，否则一处认为"已应用"另一处认为
+     "没应用"，`final_results.json` 就会说谎。
+     """
+-    engine_src = (ROOT / "ibs_engine.py").read_text(encoding="utf-8")
+-    pipeline_src = (ROOT / "abfe_pipeline.py").read_text(encoding="utf-8")
++    engine_src = (textwrap.dedent(inspect.getsource(ie)))
++    pipeline_src = (textwrap.dedent(inspect.getsource(abfe_pipeline)))
+ 
+     assert (
+         "ibs_lj_tail_lrc_is_applicable(\n        potential_type, dispersion_protocol, environment_type\n    )"
+@@ -272,7 +274,7 @@
+     """`ABFEPipeline` 必须走 `resolve_dispersion_protocol`，这样 membrane 的
+     fail-closed（未声明 / legacy）在 pipeline 层也自动生效，不需要第二套判据。
+     """
+-    pipeline_src = (ROOT / "abfe_pipeline.py").read_text(encoding="utf-8")
++    pipeline_src = (textwrap.dedent(inspect.getsource(abfe_pipeline)))
+     assert "self.dispersion_protocol_info = resolve_dispersion_protocol(" in pipeline_src
+     assert (
+         'self.dispersion_protocol = self.dispersion_protocol_info["dispersion_protocol"]'
+@@ -291,7 +293,7 @@
+     换了色散路线后 u_kn 口径变了，旧的 "completed" stage 缓存不能再被复用；
+     但 legacy 时必须**不写这个键**，否则现有生产 stage 缓存会全部失效（§7.7）。
+     """
+-    pipeline_src = (ROOT / "abfe_pipeline.py").read_text(encoding="utf-8")
++    pipeline_src = (textwrap.dedent(inspect.getsource(abfe_pipeline)))
+     block = pipeline_src.split('"kind": "dual_lambda_stage"')[1].split(
+         "def _preopt_protocol_key"
+     )[0]

@@ -59,6 +59,10 @@ def _compile_pipeline_method(name: str):
         # OpenMMException 必须带上下文）。这里给真货而不是桩，免得替身把真实
         # 行为遮掉 —— guarded_step 只需要对象有 .step()，桩体也照样能跑。
         "guarded_step": guarded_step,
+        # 2026-09-22：run_full_pipeline 在开跑前调它冻结 stage-2 布局（等分 λ +
+        # 钉死分窗）。这里给「未开复现模式」的桩，保持本文件只做源码级编译的口径；
+        # 真货的契约在 tests/test_stage2_repro_frozen_path_2026_09_22.py 逐条判。
+        "_freeze_stage2_path_for_repro": lambda kwargs, log: None,
     }
     exec(compile(module, str(PIPELINE_PATH), "exec"), namespace)
     return namespace[name]
@@ -278,6 +282,8 @@ def test_checkpoint_load_failure_runs_the_complete_fresh_initialization(tmp_path
     pipeline.repair_pbc_molecule_integrity = lambda **kwargs: None
     pipeline._seed_for = lambda *args: 7
     pipeline._update_stage_status = lambda *args, **kwargs: None
+    # [2026-09-23] 末态落盘/均值盒缩放单独成方法（有真 OpenMM 测试），这里的假 State 不支持。
+    pipeline._commit_pre_equilibrated_final_state = lambda *args, **kwargs: None
 
     # Compile the method with production names plus the test fakes.
     method.__globals__.update(namespace)
@@ -371,6 +377,8 @@ def test_successful_checkpoint_resume_starts_a_new_segment_without_appending_old
     pipeline.repair_pbc_molecule_integrity = lambda **kwargs: None
     pipeline._seed_for = lambda *args: None
     pipeline._update_stage_status = lambda *args, **kwargs: None
+    # [2026-09-23] 末态落盘/均值盒缩放单独成方法（有真 OpenMM 测试），这里的假 State 不支持。
+    pipeline._commit_pre_equilibrated_final_state = lambda *args, **kwargs: None
 
     result = method(
         pipeline,

@@ -1,6 +1,6 @@
 """B4：溶剂腿 reserved co-ion dummy 插入。
 
-对应 `docs/status/memtodolist.md` §4.1/§4.4，MEM 会话 2026-08-05。
+对应 `Atenolol-rank11/memtodolist.md` §4.1/§4.4，MEM 会话 2026-08-05。
 
 ## 缺陷是什么（已修，本文件现在是契约测试）
 

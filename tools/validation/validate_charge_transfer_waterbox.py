@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""C1：带电配体小水盒 charge-transfer 验证（docs/status/memtodolist.md §17.0 步骤⑤）。
+"""C1：带电配体小水盒 charge-transfer 验证（Atenolol-rank11/memtodolist.md §17.0 步骤⑤）。
 
-## 与 docs/status/memtodolist.md 原始 C1 草案的一处刻意偏离（2026-08-06 拍定）
+## 与 Atenolol-rank11/memtodolist.md 原始 C1 草案的一处刻意偏离（2026-08-06 拍定）
 
 原稿要求"至少一个 q_L=+1 和一个 q_L=-1 的可追溯小分子输入"，示例给的是质子化
 Atenolol / acetate，需要 Gaussian + Sobtop 重新做 RESP/GAFF 参数化。

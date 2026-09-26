@@ -6,7 +6,8 @@
 （对同一个异常有路由分支）就在它返回之后接管 —— 信号在控制器拿到方向盘之前
 把整条管线打死了。
 
-约定见 docs/TODO.md「不许回退的约定」：只有三个真终态，
+约定见 docs/TODO.md「不许回退的约定」：真终态只看 `abfe_preoptimizer` 里 `EXIT_SPECS` 的 `terminal=True`
+（不是原来写的三个；个数以代码为准），
 `LOCAL_VALIDATION_CAP` / `INSUFFICIENT_DATA` / `CUMULATIVE_FK_MISALIGNMENT` /
 `SKIPPED_WINDOW` 全是路由。
 """

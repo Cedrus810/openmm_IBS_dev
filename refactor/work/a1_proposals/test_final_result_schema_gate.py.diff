@@ -1,0 +1,34 @@
+--- a/tests/test_final_result_schema_gate.py
++++ b/tests/test_final_result_schema_gate.py
+@@ -41,6 +41,9 @@
+ )
+ 
+ import runabfe  # noqa: E402  （只验证其源码里确实接了 gate，不在此执行 main）
++import inspect
++import textwrap
++import abfe_pipeline
+ 
+ VALID_DUAL_LEG = {
+     "total_delta_G_complex_kJ_mol": -12.5,
+@@ -121,9 +124,7 @@
+     import ast
+     from pathlib import Path
+ 
+-    src = (Path(__file__).resolve().parents[1] / "abfe_pipeline.py").read_text(
+-        encoding="utf-8"
+-    )
++    src = (textwrap.dedent(inspect.getsource(abfe_pipeline)))
+     tree = ast.parse(src)
+     pipeline_class = next(
+         n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ABFEPipeline"
+@@ -176,9 +177,7 @@
+     """两腿汇总不再用 .get(..., 0.0) 静默补零（静态守护）。"""
+     from pathlib import Path
+ 
+-    src = (Path(__file__).resolve().parents[1] / "runabfe.py").read_text(
+-        encoding="utf-8"
+-    )
++    src = (textwrap.dedent(inspect.getsource(runabfe)))
+     assert 'complex_results.get("total_delta_G_complex_kJ_mol", complex_results.get(' not in src, (
+         "complex 腿汇总仍在把缺字段静默补成 0.0（P1-12）"
+     )

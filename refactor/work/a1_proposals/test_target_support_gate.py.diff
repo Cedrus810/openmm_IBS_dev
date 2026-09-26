@@ -1,0 +1,23 @@
+--- a/tests/test_target_support_gate.py
++++ b/tests/test_target_support_gate.py
+@@ -31,6 +31,9 @@
+     TARGET_SUPPORT_MIN_ABSOLUTE_ESS,
+     solve_stage_integrated,
+ )
++import inspect
++import textwrap
++import abfe_pipeline
+ 
+ 
+ pytestmark = pytest.mark.cpu_only
+@@ -214,9 +217,7 @@
+     import re
+     from pathlib import Path
+ 
+-    source = (Path(__file__).resolve().parents[1] / "abfe_pipeline.py").read_text(
+-        encoding="utf-8"
+-    )
++    source = (textwrap.dedent(inspect.getsource(abfe_pipeline)))
+     block = re.search(r"_final_gate_thresholds = \{(.*?)\n            \}", source, re.S)
+     assert block is not None, "找不到 _final_gate_thresholds 的构造"
+     body = block.group(1)

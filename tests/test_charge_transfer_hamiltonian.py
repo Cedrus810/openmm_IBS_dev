@@ -1,6 +1,6 @@
 """B3：PME co-alchemical **charge-transfer** charging Hamiltonian + MEM-00d restraint。
 
-对应 `docs/status/memtodolist.md` §2.1（λ 定义）、§2.2（co-ion 粒子模型）、§2.3 + MEM-00d
+对应 `Atenolol-rank11/memtodolist.md` §2.1（λ 定义）、§2.2（co-ion 粒子模型）、§2.3 + MEM-00d
 （restraint 形式）、§2.4（charging Hamiltonian）、§7.2（电荷守恒）、§7.3（co-ion 物理）、
 §13.1（几何阈值）、§13.2（端点容差），以及 §11 Phase B3。
 

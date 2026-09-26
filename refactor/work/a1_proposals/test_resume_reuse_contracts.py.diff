@@ -1,0 +1,32 @@
+--- a/tests/test_resume_reuse_contracts.py
++++ b/tests/test_resume_reuse_contracts.py
+@@ -30,6 +30,9 @@
+ 
+ import abfe_pipeline as ap
+ import ibs_engine as ie
++import inspect
++import textwrap
++import runabfe
+ 
+ 
+ # ============================================================================
+@@ -68,9 +71,7 @@
+ 
+ 
+ def test_traditional_cli_disables_resume_under_reset():
+-    source = (Path(__file__).resolve().parents[1] / "runabfe.py").read_text(
+-        encoding="utf-8"
+-    )
++    source = (textwrap.dedent(inspect.getsource(runabfe)))
+     start = source.index("def run_traditional_mode(")
+     end = source.index("\ndef _load_frozen_stage_result(", start)
+     traditional_body = source[start:end]
+@@ -987,7 +988,7 @@
+     若 `lambdas_match` 哪天不再是 `usable` 的 AND 项，路径形状键必须放回
+     `_stage_window_sampling_identity`，否则 λ 变了的窗口会被静默复用。
+     """
+-    src = Path(ie.__file__).read_text(encoding="utf-8")
++    src = textwrap.dedent(inspect.getsource(ie))
+     start = src.index("def _resume_cached_window_gate_status(")
+     body = src[start:src.index("\ndef ", start + 1)]
+     usable = body[body.index("usable = bool("):]

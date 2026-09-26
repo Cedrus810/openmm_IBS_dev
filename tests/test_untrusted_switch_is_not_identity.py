@@ -45,6 +45,8 @@ def _run_config_after_identity_scrub(raw_config, stage_name="decharging"):
             "isinstance": isinstance,
             "RESIDUAL_SAMPLING_STAGES": ap.RESIDUAL_SAMPLING_STAGES,
             "_strip_non_identity_kwargs": ap._strip_non_identity_kwargs,
+            # [2026-09-25] stage2 轮次控制器开关只进 vanishing 指纹（同一段真实代码里调用）。
+            "_scope_stage2_lcr_switch": ap._scope_stage2_lcr_switch,
         },
         scope,
     )

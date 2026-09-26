@@ -1,6 +1,6 @@
 """`abfe_core.bake_global_parameter_into_fixed_nonbonded_force` 契约测试。
 
-对应 `docs/experiments/STAGE2_CHARGE_TRANSFER_HANDOFF_PROPOSAL.md`：这个函数是 charging→
+对应 `Atenolol-rank11/STAGE2_CHARGE_TRANSFER_HANDOFF_PROPOSAL.md`：这个函数是 charging→
 vanishing handoff 提案里那条"结构性删除危险活参数"的核心工具，2026-08-11
 用户审阅后钉死了六条契约（见函数 docstring），本文件逐条对着测：
 

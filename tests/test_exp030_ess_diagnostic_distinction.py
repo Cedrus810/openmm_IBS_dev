@@ -19,7 +19,7 @@ f_k-based reconstruction, not what the overlap actually was. The literal,
 measured-data quantity is `raw_ess`/`raw_ess_ratio` (also computed in the
 same function, and independently again elsewhere via
 `mbar.compute_effective_sample_number()` on the augmented matrix as
-`raw_min_ess_ratio` -- see docs/experiments/EXP-030_FINAL_STATUS_2026-08-27.md section 5g),
+`raw_min_ess_ratio` -- see Atenolol-rank11/EXP-030_FINAL_STATUS_2026-08-27.md section 5g),
 which DOES use the measured `bias_kj`:
 
     log_w_raw = (bias_kj - u_kj_raw) / kt

@@ -8,6 +8,7 @@
 """
 import ast
 import pathlib
+import subprocess
 
 import pytest
 
@@ -43,10 +44,27 @@ def _argparse_default_offenders(tree, path):
     return offenders
 
 
+def _python_files():
+    """只扫**入库**的 .py——守的是随仓库发出去的代码。
+
+    2026-09-24：原来是 `REPO.rglob("*.py")`，会一路走进 `refactor/`（683 个未入库
+    .py）、`output/`、`tmp/` 这些工作区产物目录（NFS），单条 26 s，是全量最慢的一条。
+    没有 git 时退回 rglob。
+    """
+    try:
+        listed = subprocess.run(
+            ["git", "ls-files", "-z", "--", "*.py"],
+            cwd=REPO, capture_output=True, check=True, timeout=60,
+        ).stdout.decode("utf-8").split("\0")
+        return [REPO / rel for rel in listed if rel]
+    except (OSError, subprocess.SubprocessError):
+        return list(REPO.rglob("*.py"))
+
+
 def test_no_argparse_default_points_at_a_personal_absolute_path():
     offenders = []
-    for path in REPO.rglob("*.py"):
-        if any(part in SKIP_DIRS for part in path.parts):
+    for path in _python_files():
+        if any(part in SKIP_DIRS for part in path.relative_to(REPO).parts) or not path.is_file():
             continue
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"))

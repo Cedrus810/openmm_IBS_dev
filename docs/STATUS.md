@@ -61,7 +61,8 @@ Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS
 > [STAGE2_CONTROLLER_WAVE_2026-09-17.md](archive/STAGE2_CONTROLLER_WAVE_2026-09-17.md)（11 条，10 条已修）
 > 与 [STAGE2_BENCHMARK_CRASH_TRIAGE_2026-09-18.md](archive/STAGE2_BENCHMARK_CRASH_TRIAGE_2026-09-18.md)
 > （`S2-N`/`S2-O`，09-18 已修，**尚未上机复验**）。
-> ⚠️ ΔG 系统性偏负是**已定论的采样故障**，不是控制器缺陷，别混着查。
+> ⚠️ ΔG 系统性偏负**重新是开放问题**（09-23：旧口径「已定论的采样故障」作废 —— 采样器已修、复现路线是固定采样）。
+> 头号线索是生产盒 bug（复合物腿在输入盒 +5% 上采样），待 `BOX-01` 重跑判定；仍不是控制器缺陷，别混着查。
 
 > 📌 2026-09-14 当天那份修复快照（两轮静态复核 + 五次真机修复、65 条审计对账、
 > 2383 passed 的离线验证）已移进 [HISTORY_LOG.md](HISTORY_LOG.md) 第六节 —— 那是当天的快照，不是当前状态。

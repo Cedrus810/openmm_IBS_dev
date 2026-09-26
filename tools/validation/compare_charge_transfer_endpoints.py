@@ -1,6 +1,6 @@
 """C3：真实体系 λ=1/λ=0 端点能量与力恒等式验证。
 
-对应 `docs/status/memtodolist.md` §「C3：真实体系 λ=1/λ=0 端点能量和力」。C3 不跑新的
+对应 `Atenolol-rank11/memtodolist.md` §「C3：真实体系 λ=1/λ=0 端点能量和力」。C3 不跑新的
 自由能、不重新采样——它是一套 Hamiltonian 端点恒等式测试：
 
 ## Protocol v2（2026-08-11，用户审阅批准；取代 v1 的单层力门）
@@ -117,7 +117,7 @@ switch，归一化是 no-op，A/B/C1-C/D 的既有干净结果不受影响；只
 
     生产 builder 构造出的端点   vs   完全独立、直接改粒子参数构造的 reference 端点
 
-详见 docs/status/memtodolist.md 的表：
+详见 Atenolol-rank11/memtodolist.md 的表：
 
     A：charging λ_coul=1        vs 原始物理体系（配体满电、co-ion 中性 dummy）
     B：charging λ_coul=0        vs 直接把配体电荷置零、co-ion 充满
@@ -152,7 +152,7 @@ positions/box。**禁止调用**（见 `FORBIDDEN_REFERENCE_CALLABLES`）：
     ibs_engine.build_ibs_dual_system
 
 `forbidden_calls_disabled()` 把这些函数换成"调用即抛异常"，供测试证明 reference
-builder 真正独立（docs/status/memtodolist.md §10 的建议）。`verify_co_alchemical_ion_identity`
+builder 真正独立（Atenolol-rank11/memtodolist.md §10 的建议）。`verify_co_alchemical_ion_identity`
 不在禁止列表里——它是只读核对，不产生任何电荷/restraint 副作用（已核实：函数体内
 没有任何 `setParticleParameters`/`addForce`/`addParameterOffset` 调用）。
 
@@ -162,14 +162,14 @@ builder 真正独立（docs/status/memtodolist.md §10 的建议）。`verify_co
 系列函数都是薄封装：clone 一份 System，然后调用真实的 `ibs_engine`/`abfe_core`
 入口。
 
-## 数值门（与 docs/status/memtodolist.md 完全一致，直接复用 `abfe_core` 里已冻结的常量）
+## 数值门（与 Atenolol-rank11/memtodolist.md 完全一致，直接复用 `abfe_core` 里已冻结的常量）
 
     energy relative difference = abs(Eprod-Eref) / max(1 kJ/mol, abs(Eref)) ≤ 1e-5
     max |ΔF_atom_component| ≤ 1e-3 kJ/mol/nm
     vanishing λ=0 额外要求：|E_ligand-environment| ≤ 1e-6 kJ/mol，
         max|F_ligand-environment| ≤ 1e-3 kJ/mol/nm，LRC coefficient = 0
 
-## 求值纪律（docs/status/memtodolist.md §9）
+## 求值纪律（Atenolol-rank11/memtodolist.md §9）
 
 每次求值都是：`setPeriodicBoxVectors()` → `setPositions()` →
 （若有 virtual site）`computeVirtualSites()` → 显式设置所有 global parameter →
@@ -201,7 +201,7 @@ import abfe_core as core  # noqa: E402
 import ibs_engine as ie  # noqa: E402
 
 # ---------------------------------------------------------------------------
-# 协议版本与容差（与 docs/status/memtodolist.md §C3-0 逐字一致，全部直接复用
+# 协议版本与容差（与 Atenolol-rank11/memtodolist.md §C3-0 逐字一致，全部直接复用
 # abfe_core 里已经冻结的常量——不重新定义一份，写歪了会自己对上自己）。
 # ---------------------------------------------------------------------------
 
@@ -213,7 +213,7 @@ FORCE_ABS_TOLERANCE_KJ_MOL_NM = core.ENDPOINT_FORCE_MAX_ABS_TOLERANCE_KJ_PER_MOL
 DECOUPLED_ABS_TOLERANCE_KJ_MOL = core.DECOUPLED_ENDPOINT_ENERGY_ABS_TOLERANCE_KJ_PER_MOL
 
 # MEM-00h 生产 baseline（C3 硬验收基线，与 C2 专用的窄 switching 不是一回事——
-# 见 docs/status/memtodolist.md §7）。
+# 见 Atenolol-rank11/memtodolist.md §7）。
 MEM00H_CUTOFF_NM = 1.0
 MEM00H_SWITCHING_ENABLED = False
 
@@ -580,7 +580,7 @@ def production_vanishing_fixed_hamiltonian_systems(
     lambdas_vdw: Sequence[float],
     box_vectors_nm: np.ndarray,
 ) -> List[openmm.System]:
-    """构造固定物理 Hamiltonian `U_common + CV(λ_vdw=k)`（docs/status/memtodolist.md §4）。
+    """构造固定物理 Hamiltonian `U_common + CV(λ_vdw=k)`（Atenolol-rank11/memtodolist.md §4）。
 
     `raw_system` 必须是**原始物理 System**，配体粒子在其中的电荷是**真实物理
     电荷**——不是 charging 配置完之后 base=0 的那份。
@@ -650,7 +650,7 @@ def production_vanishing_fixed_hamiltonian_systems(
 
 
 # ---------------------------------------------------------------------------
-# 求值纪律（docs/status/memtodolist.md §9）：box → positions → virtual sites →
+# 求值纪律（Atenolol-rank11/memtodolist.md §9）：box → positions → virtual sites →
 # 显式 global parameters → 零步取 energy/forces。
 # ---------------------------------------------------------------------------
 
@@ -941,7 +941,7 @@ def compare_vanishing_zero_endpoint(
     force_abs_tol: Optional[float] = None,
 ) -> Dict[str, Any]:
     """D 专用的额外硬门：单独隔离出配体–环境分量，要求严格零
-    （`|E|≤1e-6 kJ/mol`），不是"很小"（docs/status/memtodolist.md §8）。
+    （`|E|≤1e-6 kJ/mol`），不是"很小"（Atenolol-rank11/memtodolist.md §8）。
 
     没有 `reference_system` 参数：D 的参照在这个隔离出来的 force group 里就是
     解析意义上严格的 0（结构性删除，不是"数值上很小"），不需要另建一个 System
@@ -987,7 +987,7 @@ def compare_vanishing_zero_endpoint(
 
 
 # ---------------------------------------------------------------------------
-# 静态 fail-closed 检查（docs/status/memtodolist.md §10）。
+# 静态 fail-closed 检查（Atenolol-rank11/memtodolist.md §10）。
 # ---------------------------------------------------------------------------
 
 
@@ -1118,7 +1118,7 @@ def assert_mem00h_switching_convention(system: openmm.System, *, context: str) -
 #
 # 只做"逐 force-group 账目对不对、生产/参照两侧能不能求出同一个数"这件事，
 # 不是 C3-3/C3-4 的权威数值门——那要求 CUDA + double precision + 完整
-# 100 帧矩阵（docs/status/memtodolist.md §9），留给用户在计算节点上跑。这里默认用 CPU
+# 100 帧矩阵（Atenolol-rank11/memtodolist.md §9），留给用户在计算节点上跑。这里默认用 CPU
 # 平台，能覆盖"两个 System 的构造是不是接对了"，覆盖不了"GPU mixed
 # precision 下数值门还过不过"。
 # ---------------------------------------------------------------------------
@@ -1174,7 +1174,7 @@ def read_dcd_frame(
     frame_index: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """读一帧的坐标 + **这一帧自己的**完整周期盒矢量（不是初始
-    `box_vectors_nm.npy`），不做 `image_molecules`（docs/status/memtodolist.md §9 禁止在
+    `box_vectors_nm.npy`），不做 `image_molecules`（Atenolol-rank11/memtodolist.md §9 禁止在
     求值前修改坐标）。返回 `(positions_nm, box_vectors_nm)`，均是裸 ndarray。
     """
     import mdtraj as md
@@ -1208,7 +1208,7 @@ def wiring_smoke_report(
 
     `dynamics_dir` 用于 C2：raw 输入在 `validation/c2_lipid_slab_v11/<case>/`，
     真实轨迹在**另一个目录** `validation/c2_lipid_slab_v11_full11/<case>/dynamics/`
-    （`c2_lipid_slab_v11/<case>/dynamics/` 只是占位，是空的——docs/status/memtodolist.md §6）。
+    （`c2_lipid_slab_v11/<case>/dynamics/` 只是占位，是空的——Atenolol-rank11/memtodolist.md §6）。
     不传时默认 `case_dir/dynamics`（C1 的布局）。
     """
     inputs = load_case_raw_inputs(case_dir)
@@ -1275,11 +1275,11 @@ def wiring_smoke_report(
 
 
 # ---------------------------------------------------------------------------
-# 权威多帧 runner：固定帧索引表（docs/status/memtodolist.md §5），跑 A/B 全矩阵。
+# 权威多帧 runner：固定帧索引表（Atenolol-rank11/memtodolist.md §5），跑 A/B 全矩阵。
 #
 # C（seam）/D（严格零）目前没有接入真实 C1/C2 数据——2026-08-11 实测确认
 # vanishing 阶段的 charging→vanishing handoff 对带电 charge-transfer 配体尚未
-# 实现（见 docs/status/memtodolist.md C3-1 小节），这里先只跑 A/B；C/D 仍只在
+# 实现（见 Atenolol-rank11/memtodolist.md C3-1 小节），这里先只跑 A/B；C/D 仍只在
 # `tests/test_charge_transfer_real_endpoints.py` 的合成中性配体上做契约测试。
 # ---------------------------------------------------------------------------
 
@@ -1303,7 +1303,7 @@ def run_matrix(
     """A/B 端点在固定帧索引表上的权威判定——不是单帧 smoke。
 
     每一帧独立判定、独立记录；`passed` = 所有帧都过，`failed_frames` 显式列出
-    没过的帧，不用平均值掩盖任何一帧的失败（docs/status/memtodolist.md §8/§9）。生产/参照
+    没过的帧，不用平均值掩盖任何一帧的失败（Atenolol-rank11/memtodolist.md §8/§9）。生产/参照
     两个 System 只构造一次（不依赖帧），逐帧只换 positions/box——这与真实
     Stage2 的"System 结构固定、只有坐标随采样变化"一致，也避免重复构造的
     开销随帧数线性放大。
@@ -1857,7 +1857,7 @@ def _build_arg_parser() -> Any:
     matrix.add_argument(
         "--frame-set", choices=["c1", "c2"], required=True,
         help="c1：λ=1/λ=0 都用 [10,...,99]；c2：λ=1 用 [10,...,99]，"
-        "λ=0 用 [20,...,199]（docs/status/memtodolist.md §5）。",
+        "λ=0 用 [20,...,199]（Atenolol-rank11/memtodolist.md §5）。",
     )
 
     matrix_v2 = sub.add_parser(
@@ -1870,7 +1870,7 @@ def _build_arg_parser() -> Any:
     matrix_v2.add_argument(
         "--frame-set", choices=["c1", "c2"], required=True,
         help="c1：λ=1/λ=0 都用 [10,...,99]；c2：λ=1 用 [10,...,99]，"
-        "λ=0 用 [20,...,199]（docs/status/memtodolist.md §5）。",
+        "λ=0 用 [20,...,199]（Atenolol-rank11/memtodolist.md §5）。",
     )
     matrix_v2.add_argument("--lambda-name", default="lam_coul")
     matrix_v2.add_argument("--reference-platform", default="Reference")

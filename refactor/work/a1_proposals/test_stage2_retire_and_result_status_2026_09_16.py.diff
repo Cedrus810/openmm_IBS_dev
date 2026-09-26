@@ -1,0 +1,29 @@
+--- a/tests/test_stage2_retire_and_result_status_2026_09_16.py
++++ b/tests/test_stage2_retire_and_result_status_2026_09_16.py
+@@ -41,6 +41,9 @@
+ )
+ 
+ from test_stage2_repair_controller import _mkrun, R4  # noqa: E402
++import inspect
++import textwrap
++import ibs_engine
+ 
+ 
+ # --------------------------------------------------------------------- ②
+@@ -166,13 +169,14 @@
+     记成最贵的 bug —— 控制器要算"加帧的射程"就必须知道门在哪。）
+     """
+     root = pathlib.Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+-    engine = (root / "ibs_engine.py").read_text(encoding="utf-8")
++    engine = (textwrap.dedent(inspect.getsource(ibs_engine)))
+     # 写侧：档位是常量，且随产物一起交出去
+     assert "elif _ratio < 10.0:" not in engine       # 判读处不再有字面量
+     assert "WINDOW_SELF_SUPPORT_N_EFF_OVER_G_ELIGIBLE" in engine
+     assert '"n_eff_over_g_eligible_threshold"' in engine
+     # 读侧：从窗口记录里取，不硬编码
+-    pre = (root / "abfe_preoptimizer.py").read_text(encoding="utf-8")
++    import abfe_preoptimizer as _a1_pre
++    pre = textwrap.dedent(inspect.getsource(_a1_pre))
+     assert 'selfchk.get(\n                "n_eff_over_g_eligible_threshold")' in pre
+     assert "n_eff_over_g_target=w.get(\"self_n_eff_over_g_eligible\")" in pre
+     assert WINDOW_SELF_SUPPORT_N_EFF_OVER_G_ELIGIBLE == 10.0

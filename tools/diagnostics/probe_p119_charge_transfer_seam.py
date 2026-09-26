@@ -65,7 +65,7 @@ charge-transfer 路径（配体 +1 e → 0、co-ion 0 → +1 e、flat-bottom 位
 ——**与 P1-19 那个内部库仑常数是不同的机制**。
 
 ⚠️ 这不是静默的生产 bug：`co_alchemical_charge_transfer` 本就
-`production_qualified=False`，PHY-03（P1）仍挂在 `docs/TODO.md`。属于已知未合格
+`production_qualified=False`，`PHY-03 [P3]` 仍挂在 `docs/TODO.md` §3.3。属于已知未合格
 路径上的已知未合格行为，只是被错标成了 P1-19。
 
 ## 谁修好的 P1-19：未知
@@ -75,7 +75,7 @@ charge-transfer 路径（配体 +1 e → 0、co-ion 0 → +1 e、flat-bottom 位
 的连带效果——那天第一次全套跑之前 seam 就已经是 XPASS 了。**"未知"就写成未知**，
 不要把它变成"大概是某次改动的连带效果"这种会被后人当结论的猜测。
 
-处置建议见 `docs/TODO.md`《未关闭的代码缺陷》的 `XFAIL-01` / `XFAIL-02`。
+处置见 `XFAIL-01` / `XFAIL-02`（已关闭，原文在 `docs/archive/TODO_closed.md`）。
 
 用法（openmm_dev 环境，只读，几秒）：
 
@@ -238,7 +238,7 @@ def main() -> int:
     print("    2026-09-02 实测两条一致：")
     print("      'failing': ['D:gate1_reference_identity,gate3_mixed_production_vs_reference']")
     print("    整个输出里 failing 一次都没出现 'C:' ⟹ seam 在那两条里也是通过的。")
-    print("    处置建议见 docs/TODO.md 的 XFAIL-01 / XFAIL-02。")
+    print("    处置见 XFAIL-01 / XFAIL-02（已关闭，docs/archive/TODO_closed.md）。")
     return 0
 
 

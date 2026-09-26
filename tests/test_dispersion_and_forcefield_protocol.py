@@ -1,6 +1,6 @@
 """B6 + §1.1 + §13：色散路线、力场族识别、验收阈值常量。
 
-对应 docs/status/memtodolist.md：
+对应 Atenolol-rank11/memtodolist.md：
   §1.1  力场族按输入自动识别（amber 首选，charmm 因 OpenMM 无 force-switch 默认卡住），
         识别不出 fail closed，允许显式覆盖但必须留记录。
   §1.3  `dispersion_protocol` 显式配置；membrane 未选已验证路线 → fail closed；

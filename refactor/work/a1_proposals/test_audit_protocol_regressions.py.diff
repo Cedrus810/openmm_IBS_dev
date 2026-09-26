@@ -1,0 +1,42 @@
+--- a/tests/test_audit_protocol_regressions.py
++++ b/tests/test_audit_protocol_regressions.py
+@@ -9,6 +9,13 @@
+ import numpy as np
+ 
+ import pytest
++import inspect
++import textwrap
++import abfe_core
++import abfe_pipeline
++import abfe_preoptimizer
++import ibs_engine
++import runabfe
+ 
+ pytestmark = pytest.mark.cpu_only
+ 
+@@ -54,11 +61,11 @@
+ 
+     @classmethod
+     def setUpClass(cls):
+-        cls.engine = (ROOT / "ibs_engine.py").read_text(encoding="utf-8")
+-        cls.pipeline = (ROOT / "abfe_pipeline.py").read_text(encoding="utf-8")
+-        cls.preoptimizer = (ROOT / "abfe_preoptimizer.py").read_text(encoding="utf-8")
+-        cls.runabfe = (ROOT / "runabfe.py").read_text(encoding="utf-8")
+-        cls.core = (ROOT / "abfe_core.py").read_text(encoding="utf-8")
++        cls.engine = (textwrap.dedent(inspect.getsource(ibs_engine)))
++        cls.pipeline = (textwrap.dedent(inspect.getsource(abfe_pipeline)))
++        cls.preoptimizer = (textwrap.dedent(inspect.getsource(abfe_preoptimizer)))
++        cls.runabfe = (textwrap.dedent(inspect.getsource(runabfe)))
++        cls.core = (textwrap.dedent(inspect.getsource(abfe_core)))
+ 
+     def _extracted_resume_gate_source(self):
+         """Source text of `_resume_cached_window_gate_status`'s body only.
+@@ -836,7 +843,7 @@
+             self.assertIn("getForces", requested, "首次 e_base 失败没有立刻查受力")
+ 
+     def test_owned_system_early_return_validates_swig_object(self):
+-        core = (ROOT / "abfe_core.py").read_text(encoding="utf-8")
++        core = (textwrap.dedent(inspect.getsource(abfe_core)))
+         start = core.index("def ensure_owned_system(")
+         end = core.index("def sync_all_exclusions(", start)
+         block = core[start:end]

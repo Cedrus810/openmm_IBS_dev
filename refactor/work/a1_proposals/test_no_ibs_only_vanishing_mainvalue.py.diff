@@ -1,0 +1,57 @@
+--- a/tests/test_no_ibs_only_vanishing_mainvalue.py
++++ b/tests/test_no_ibs_only_vanishing_mainvalue.py
+@@ -17,6 +17,10 @@
+ from pathlib import Path
+ 
+ import pytest
++import inspect
++import textwrap
++import abfe_pipeline
++import ibs_engine
+ 
+ 
+ pytestmark = pytest.mark.cpu_only
+@@ -26,7 +30,7 @@
+ 
+ def test_vanishing_forces_the_independent_endpoint_route():
+     """独立端点段对 vanishing 必须是默认且强制，不是可选开关。"""
+-    src = (REPO / "abfe_pipeline.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(abfe_pipeline)))
+     i = src.index("_independent_endpoint_enabled = bool(")
+     block = src[i:i + 500]
+     assert 'kwargs.get("stage2_independent_endpoint_states"' not in block, (
+@@ -37,7 +41,7 @@
+ 
+ def test_the_retired_switch_is_rejected_loudly():
+     """还传旧开关的调用方必须收到明确报错，而不是被静默忽略。"""
+-    src = (REPO / "abfe_pipeline.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(abfe_pipeline)))
+     assert 'if "stage2_independent_endpoint_states" in kwargs:' in src
+     i = src.index('if "stage2_independent_endpoint_states" in kwargs:')
+     assert "已废弃" in src[i:i + 400]
+@@ -55,7 +59,7 @@
+     关掉它的代价必须留在代码里、不能静默：末窗口回到 IBS 单轨迹重加权，而那条
+     路径在**溶剂腿**上被证明采不到「水塌进配体空腔」的构型。
+     """
+-    src = (REPO / "abfe_pipeline.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(abfe_pipeline)))
+     # 1) 默认关闭，必须显式开关才启用
+     assert 'kwargs.get("stage2_independent_endpoint", False)' in src
+     # 2) 显式请求了、但窗口数不够 → 仍然 fail-closed，不许静默降级
+@@ -74,7 +78,7 @@
+     判据已前移到进入 bridge rescue 分支的第一件事，所以本契约反过来要求：
+     判据必须出现在 `_run_dual_lambda_stage("vanishing_rescue"` **之前**。
+     """
+-    src = (REPO / "abfe_pipeline.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(abfe_pipeline)))
+ 
+     gate = src.index('"independent_endpoint_diagnostics"\n                    ) is not None')
+     sampling = src.index('self._run_dual_lambda_stage(\n                            "vanishing_rescue"')
+@@ -99,6 +103,6 @@
+ def test_target_state_nk_is_zero_is_documented_where_it_happens():
+     """求解器里那句『其余物理态样本数均为 0』是这个失效模式的直接证据，
+     必须留在代码里，不能被后人当成无关注释删掉。"""
+-    src = (REPO / "ibs_engine.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(ibs_engine)))
+     assert "n_k_local[sampled_row] = n_frames" in src
+     assert "其余物理态" in src and "样本数均为 0" in src

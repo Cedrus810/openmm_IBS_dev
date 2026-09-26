@@ -1,4 +1,4 @@
-"""B2：`charge_treatment` 与 §1.2 的 fail-closed 矩阵（docs/status/memtodolist.md §1.2 / §2.2 / §7.1）。
+"""B2：`charge_treatment` 与 §1.2 的 fail-closed 矩阵（Atenolol-rank11/memtodolist.md §1.2 / §2.2 / §7.1）。
 
 覆盖 §7.1 的配置与 fail-closed 组合，外加 §1.2 那 5 条"必须 fail closed"：
 

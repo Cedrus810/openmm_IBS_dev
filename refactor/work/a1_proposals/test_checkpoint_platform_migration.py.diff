@@ -1,0 +1,36 @@
+--- a/tests/test_checkpoint_platform_migration.py
++++ b/tests/test_checkpoint_platform_migration.py
+@@ -14,6 +14,9 @@
+ import pytest
+ 
+ import abfe_pipeline as ap
++import inspect
++import textwrap
++import ibs_engine
+ 
+ pytestmark = pytest.mark.cpu_only
+ 
+@@ -158,10 +161,10 @@
+     import pathlib
+ 
+     repo = pathlib.Path(__file__).resolve().parent.parent
+-    engine = (repo / "ibs_engine.py").read_text(encoding="utf-8")
++    engine = (textwrap.dedent(inspect.getsource(ibs_engine)))
+     assert "load_checkpoint_with_platform_migration" not in engine
+ 
+-    pipeline = (repo / "abfe_pipeline.py").read_text(encoding="utf-8")
++    pipeline = (textwrap.dedent(inspect.getsource(ap)))
+     # 只允许出现在：1 处定义 + `_is_checkpoint_valid` 的校验 + 预平衡 resume +
+     # 再平衡 resume。这三处消费的都是"已完成片段的末态"。多出任何一处都要先回答
+     # "那条路径是不是把积分器状态当契约"。
+@@ -172,9 +175,7 @@
+     """搬不走的东西必须写在代码里，不能只活在某个人的脑子里。"""
+     import pathlib
+ 
+-    src = (
+-        pathlib.Path(__file__).resolve().parent.parent / "abfe_pipeline.py"
+-    ).read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(ap)))
+     i = src.index("def load_checkpoint_with_platform_migration")
+     head = src[max(0, i - 3000) : i]
+     assert "随机数流" in head          # Langevin RNG

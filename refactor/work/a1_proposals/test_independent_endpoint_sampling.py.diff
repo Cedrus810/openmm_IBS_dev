@@ -1,0 +1,88 @@
+--- a/tests/test_independent_endpoint_sampling.py
++++ b/tests/test_independent_endpoint_sampling.py
+@@ -24,6 +24,10 @@
+     endpoint_wet_dry_hysteresis_gate,
+     solve_independent_endpoint_states,
+ )
++import inspect
++import textwrap
++import abfe_pipeline
++import ibs_engine
+ 
+ 
+ pytestmark = pytest.mark.cpu_only
+@@ -366,7 +370,7 @@
+     """
+     from pathlib import Path
+ 
+-    src = (Path(__file__).resolve().parents[1] / "ibs_engine.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(ibs_engine)))
+     i = src.index("def run_independent_endpoint_states(")
+     j = src.index("def _reduced_energies_for_record(")
+     body = src[i:j]
+@@ -566,9 +570,7 @@
+     import re
+     from pathlib import Path
+ 
+-    source = (Path(__file__).resolve().parents[1] / "abfe_pipeline.py").read_text(
+-        encoding="utf-8"
+-    )
++    source = (textwrap.dedent(inspect.getsource(abfe_pipeline)))
+     block = re.search(
+         r'if stage_name == "vanishing":\n            payload\["vdw_nonbonded_protocol_version"\].*?\n        # ',
+         source, re.S,
+@@ -581,9 +583,7 @@
+     """开关打开时，末窗口的 IBS 数据不得参与拼接（否则那段被算两遍）。"""
+     from pathlib import Path
+ 
+-    source = (Path(__file__).resolve().parents[1] / "abfe_pipeline.py").read_text(
+-        encoding="utf-8"
+-    )
++    source = (textwrap.dedent(inspect.getsource(abfe_pipeline)))
+     assert "_independent_endpoint_enabled" in source
+     # 排除集现在是累加的（末窗口 + "本段没采的窗口"），不再是单元素字面量。
+     assert "_excluded_for_analysis.add(int(_endpoint_window_index))" in source
+@@ -621,9 +621,7 @@
+     """
+     from pathlib import Path
+ 
+-    source = (Path(__file__).resolve().parents[1] / "ibs_engine.py").read_text(
+-        encoding="utf-8"
+-    )
++    source = (textwrap.dedent(inspect.getsource(ibs_engine)))
+     i = source.index("def run_independent_endpoint_states(")
+     j = source.index("def _reduced_energies_for_record(")
+     body = source[i:j]
+@@ -646,9 +644,7 @@
+     """
+     from pathlib import Path
+ 
+-    source = (Path(__file__).resolve().parents[1] / "ibs_engine.py").read_text(
+-        encoding="utf-8"
+-    )
++    source = (textwrap.dedent(inspect.getsource(ibs_engine)))
+     i = source.index("def run_independent_endpoint_states(")
+     j = source.index("def _reduced_energies_for_record(")
+     body = source[i:j]
+@@ -679,9 +675,7 @@
+     """不给 λ 值时退回仓库约定：state_indices 升序 == λ_vdw 降序，倒序即最解耦优先。"""
+     from pathlib import Path
+ 
+-    source = (Path(__file__).resolve().parents[1] / "ibs_engine.py").read_text(
+-        encoding="utf-8"
+-    )
++    source = (textwrap.dedent(inspect.getsource(ibs_engine)))
+     i = source.index("def run_independent_endpoint_states(")
+     j = source.index("def _reduced_energies_for_record(")
+     body = source[i:j]
+@@ -1042,9 +1036,7 @@
+     """
+     from pathlib import Path
+ 
+-    source = (Path(__file__).resolve().parents[1] / "ibs_engine.py").read_text(
+-        encoding="utf-8"
+-    )
++    source = (textwrap.dedent(inspect.getsource(ibs_engine)))
+     i = source.index("def run_independent_endpoint_states(")
+     j = source.index("def _reduced_energies_for_record(")
+     lines = source[i:j].split("\n")

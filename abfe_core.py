@@ -218,7 +218,7 @@ DEXP_LEGACY_FIT_KEYS = frozenset(
 
 
 # ============================================================================
-# 膜体系协议：system_type + 膜恒压器（docs/status/memtodolist.md §3.1 / §3.2；MEM-00i）
+# 膜体系协议：system_type + 膜恒压器（Atenolol-rank11/memtodolist.md §3.1 / §3.2；MEM-00i）
 #
 # 这一节只负责"声明与校验"，不做任何采样决策。设计约束逐条对应清单：
 #   §3.1 不根据残基名自动猜 system_type，用户必须显式声明；脂质残基检测只做交叉
@@ -301,7 +301,7 @@ DEFAULT_MEMBRANE_PROTOCOL: Dict[str, Any] = {
     "barostat_frequency": 25,
 }
 
-# 改动前唯一存在的 barostat 协议：各向同性、频率 25（abfe_pipeline.py:1382）。
+# 改动前唯一存在的 barostat 协议：各向同性、频率 25（当时的 abfe_pipeline.py:1382；现由本文件 `ensure_barostat_for_protocol` 添加）。
 # fingerprint 对它保持沉默，以保证 §7.7 的"不声明 system_type 时逐位一致"。
 LEGACY_SOLUBLE_BAROSTAT_FREQUENCY = 25
 
@@ -490,8 +490,17 @@ def resolve_membrane_protocol(
     if not math.isfinite(surface_tension):
         raise ValueError("membrane.surface_tension_bar_nm 必须有限")
 
+    # 🔑 [2026-09-20] `int()` 对浮点是**静默截断**（int(25.7)==25），而报错文案写的是
+    # "不是整数" —— 挡不住它自己声称要挡的那件事。恒压器频率是协议字段，静默改数
+    # 等于在指纹里记一个用户没写过的值。
+    _raw_frequency = protocol["barostat_frequency"]
+    if isinstance(_raw_frequency, float) and not float(_raw_frequency).is_integer():
+        raise ValueError(
+            f"membrane.barostat_frequency={_raw_frequency!r} 不是整数"
+            "（浮点会被静默截断成一个你没写过的值，所以这里拒绝）"
+        )
     try:
-        frequency = int(protocol["barostat_frequency"])
+        frequency = int(_raw_frequency)
     except (TypeError, ValueError) as exc:
         raise ValueError(
             f"membrane.barostat_frequency={protocol['barostat_frequency']!r} 不是整数"
@@ -715,7 +724,7 @@ def barostat_fingerprint_payload(protocol: Optional[Dict[str, Any]]) -> Optional
 
 
 # ============================================================================
-# 净电荷处理协议：charge_treatment（docs/status/memtodolist.md §1.2 / §2 / §7.1；B2）
+# 净电荷处理协议：charge_treatment（Atenolol-rank11/memtodolist.md §1.2 / §2 / §7.1；B2）
 #
 # 这一节是**纯校验层**：把"配体净电荷 / co-ion / APBS / 环境类型"这四个量的合法
 # 组合一次性判死，在创建任何 Context 之前（§6.1）。它不构建任何 Hamiltonian——
@@ -997,7 +1006,7 @@ def validate_charge_transfer_reservoir_correction(
 # 配置固化到 λ_coul=0 端点（配体 0 电荷、co-ion 满电、配体内部 exception
 # 保留物理 chargeProd），再喂给 `build_ibs_dual_system`——不是直接把原始
 # `self.system` 传过去（那样带净电配体会被 `build_ibs_dual_system` 自己的
-# 电中性防御拒绝）。见 `docs/experiments/STAGE2_CHARGE_TRANSFER_HANDOFF_PROPOSAL.md`。
+# 电中性防御拒绝）。见 `Atenolol-rank11/STAGE2_CHARGE_TRANSFER_HANDOFF_PROPOSAL.md`。
 #
 # 这个协议版本号只在 `ABFEPipeline._charge_transfer_vanishing_handoff_active()`
 # 返回 True（即 charge_treatment 是 charge-transfer 且配体净电荷非零）时才
@@ -1710,7 +1719,7 @@ def co_alchemical_ion_anchor_atom_index(
     两条腿用同一条规则，规则本身与坐标无关（只有"哪一个最近"这一步看坐标），
     结果连同 minimum-image 位移一起冻结进 spec，此后只读核对。
 
-    返回 dict：`anchor_atom_index` / `anchor_position_nm` / `ligand_extent_nm`
+    返回 dict：`anchor_atom_index` / `anchor_position_nm` / `ligand_extent_from_anchor_nm`
     （配体任一原子到锚点的最大 minimum-image 距离，供 §13.1 的几何余量判据用）。
     """
     indices = [int(i) for i in ligand_indices]
@@ -2982,8 +2991,14 @@ def _iter_topology_lines(top_path: str, gmx_include_dir: Optional[str] = None):
                 elif line.startswith("#endif"):
                     if if_stack:
                         if_stack.pop()
-                if line.startswith("#include"):
-                    parts = line.split('"')
+                # 🔑 [2026-09-20] 用与 `gromacs_topology_files` 同一个正则：
+                # `# include "x.itp"`（# 和 include 之间有空格）是合法 GROMACS 写法，
+                # 而 `startswith("#include")` 不认 ⟹ 权威解析器直接把它当普通正文行，
+                # 那个 itp 里的 `[ moleculetype ]` 全部看不见 ⟹ 下游报"分子未定义"。
+                # 方向是 fail-closed（误杀合法拓扑），不出错数，但排查起来完全看不出。
+                _inc = _GROMACS_INCLUDE_RE.match(line)
+                if _inc:
+                    parts = ["", _inc.group(1)]
                     if len(parts) >= 2:
                         try:
                             resolved = resolve_gromacs_include(
@@ -3273,7 +3288,7 @@ def preflight_physical_inputs(
 
     # 🔑 [2026-09-10] `--ligand` 是**残基名**，不是 [ moleculetype ] 名。
     #
-    # 本仓其余全部消费点都按残基名取（runabfe 的 7 处都是
+    # 本仓其余全部消费点都按残基名取（runabfe 的 9 处都是
     # `atom.residue.name == ligand_resname`），而出厂 abfe_config.json 与所有
     # 文档示例写的是 `MOL`。真实体系里这两个名字经常不同：memtest 那套的
     # [ moleculetype ] 叫 `Atenolol-rank11`，[ atoms ] 第 4 列的 resname 才是 `MOL`。
@@ -3554,13 +3569,18 @@ def classify_system_composition(
 GROMACS_PAIRS_FUNCT2_CONVERSION_VERSION = 1
 
 
+# `#include "x.itp"` / `# include "x.itp"` —— GROMACS 允许 # 与指令之间有空白。
+# 两个解析器共用这一份，别再各写各的（09-20 核实：权威解析器此前用 startswith）。
+_GROMACS_INCLUDE_RE = re.compile(r'^\s*#\s*include\s+"([^"]+)"')
+
+
 def gromacs_topology_files(
     top_path: str,
     gmx_include_dir: Optional[str] = None,
 ) -> List[str]:
     """按 include 展开顺序返回拓扑树里全部文件的真实路径（去重、深度优先）。"""
     seen: List[str] = []
-    include_re = re.compile(r'^\s*#\s*include\s+"([^"]+)"')
+    include_re = _GROMACS_INCLUDE_RE
 
     def _walk(path: str):
         real = os.path.realpath(path)
@@ -4508,7 +4528,7 @@ def resolve_leg_dispersion_implementation(
 
 
 # ============================================================================
-# §3.3 膜输入核对 + §9 膜质量门（docs/status/memtodolist.md §3.3 / §9 / §13.3）
+# §3.3 膜输入核对 + §9 膜质量门（Atenolol-rank11/memtodolist.md §3.3 / §9 / §13.3）
 #
 # 这两节的共同前提，清单说得很直接：
 #   §3.3 输入必须是**已经完成膜构建和主要平衡**的体系，
@@ -4959,7 +4979,7 @@ def evaluate_membrane_quality_gate(
     #    会出现"体系没问题、方法波动把它挡住"的假阴性。
     #
     # 与本仓库把 ESS `min_occupancy_normalized` 退役为 diagnostics-only 是同一先例
-    # （`docs/TODO.md` TEST-GATE-01）。
+    # （`docs/archive/TODO_2026-08-06_unreconciled.md` TEST-GATE-01）。
     #
     # 🚫 **降级不等于不记录**：下面照样把 τ、比值、与纯 POPC 文献 D 的对照全部落盘，
     #    "永不弛豫的膜"会在这里以极大的 τ 与 < 1 的比值被如实报出（有专门测试钉住）。
@@ -5184,7 +5204,7 @@ def run_membrane_quality_gate(
 # ============================================================================
 
 # 流式处理的分块预算：按 16 GB 机器给 1 GiB，一次只把这么多字节拉进内存。
-# 三处共用（DCD 校验读、回卷后复查、LJ 尾项外积），不要在调用点各搓一套。
+# 三处共用（DCD 校验读、回卷后复查、LJ 尾项外积），不要在调用点各搓一套。（2026-09-24 更正：现只剩前两处——abfe_pipeline.py:2193 与 abfe_core.py:5465；LJ 尾项自 2026-09-09 起在 ibs_engine 里逐 ligand 行累加，不再调用 frames_per_chunk）
 STREAMING_CHUNK_BUDGET_BYTES = 1 << 30
 
 
@@ -5711,11 +5731,39 @@ def _topology_residues(topology):
     return list(attr() if callable(attr) else attr)
 
 
+def cluster_periodic_coordinate(values, box_length: float):
+    """把一维周期坐标按**最大空弧**切开，落到同一个镜像上；保持坐标原点不变。
+
+    折回主盒的坐标里，一层横跨周期边界（一半在 z≈0、另一半在 z≈L）时，直接取算术
+    均值会把这一层劈开：中面落在膜中间以外，上下叶划分随之全错。切在最大空隙处就
+    把"环上的一团"变成"线上的一团"。
+
+    🔑 [2026-09-20] 抽成函数是因为同一件事此前只在膜质量门那条路径里做了，
+    `assign_lipid_leaflets` 对**完全相同**的情形直接取了 raw 均值。
+    """
+    z = np.asarray(values, dtype=float).ravel()
+    L = float(box_length)
+    if z.size == 0 or not np.all(np.isfinite(z)) or not np.isfinite(L) or L <= 0.0:
+        raise ValueError("周期坐标或盒长非法")
+    z_mod = np.mod(z, L)
+    sorted_z = z_mod[np.argsort(z_mod)]
+    gaps = np.diff(np.concatenate([sorted_z, sorted_z[:1] + L]))
+    cut = float(sorted_z[(int(np.argmax(gaps)) + 1) % sorted_z.size])
+    out = z_mod - cut
+    out[out < 0.0] += L
+    # 还原坐标原点：只允许给这批原子整体加整数个盒镜像，不改它们与其他组分的相对口径。
+    return out + cut
+
+
 def assign_lipid_leaflets(
     topology,
     positions,
     normal_axis: str = "z",
     lipid_molecules: Optional[List[Dict[str, Any]]] = None,
+    # 🔑 [2026-09-20] 给了盒矢量就先把头基坐标按最大空弧聚到同一个镜像再取中面。
+    # 不给时**逐位保持旧行为**（直接对 raw 坐标取均值）—— 拿不到盒长就无从判断
+    # 这批坐标是不是横跨了周期边界，猜一个盒长比不解缠更糟。
+    box_vectors=None,
 ) -> Dict[str, Any]:
     """按头基参考原子相对膜中面的位置把脂质分到上/下叶（§3.3 / §9）。
 
@@ -5792,6 +5840,14 @@ def assign_lipid_leaflets(
         )
 
     coords = np.asarray([h[2] for h in heads], dtype=float)
+    if box_vectors is not None:
+        _box = np.asarray(
+            box_vectors.value_in_unit(unit.nanometer)
+            if hasattr(box_vectors, "value_in_unit") else box_vectors,
+            dtype=float,
+        )
+        coords = cluster_periodic_coordinate(coords, float(_box[axis][axis]))
+        heads = [(i, n, float(c)) for (i, n, _old), c in zip(heads, coords)]
     midplane = float(np.mean(coords))
     upper: Dict[str, int] = {}
     lower: Dict[str, int] = {}
@@ -6049,6 +6105,8 @@ def validate_membrane_input(
         topology,
         positions,
         normal_axis=normal_axis,
+        # 盒矢量在本函数里刚校验过（正交性/形状），传下去让中面用解缠后的坐标算。
+        box_vectors=box_vectors,
         lipid_molecules=(
             (composition or {}).get("molecules_by_role", {}).get("lipid")
         ),
@@ -6374,16 +6432,7 @@ def membrane_observables_from_trajectory(
         or first_box_length <= 0.0
     ):
         raise ValueError("脂质头基首帧法向坐标或盒长非法")
-    z_mod = np.mod(head_z_wrapped, first_box_length)
-    order = np.argsort(z_mod)
-    sorted_z = z_mod[order]
-    gaps = np.diff(np.concatenate([sorted_z, sorted_z[:1] + first_box_length]))
-    cut = float(sorted_z[(int(np.argmax(gaps)) + 1) % sorted_z.size])
-    head_z_cluster = z_mod - cut
-    head_z_cluster[head_z_cluster < 0.0] += first_box_length
-    # Restore the coordinate origin: only integer box-image shifts may be
-    # applied to heads alone. Water/ions/protein retain the trajectory origin.
-    head_z_cluster += cut
+    head_z_cluster = cluster_periodic_coordinate(head_z_wrapped, first_box_length)
     head_coords_frame0 = head_z_cluster
     midplane0 = float(np.mean(head_coords_frame0))
     upper_mask = head_coords_frame0 > midplane0
@@ -7825,6 +7874,9 @@ def get_optimal_device_settings():
 # OpenMM 的 `props["DeviceIndex"]` 表达、从不设 `CUDA_VISIBLE_DEVICES`，所以双 GPU
 # 并行时**两个**子进程都会在 device 0 上建 torch context，然后才各自去用被分配的
 # OpenMM 设备。
+# （2026-09-24 更正：`--parallel-stages` 的 spawn stage worker 已于 2026-07-27 删除，见
+#  docs/archive/removed_parallel_stages.md；现存 spawn 只剩 ibs_engine 的 u_kn MBAR worker 池，
+#  abfe_pipeline.py 里已无 spawn。）
 #
 # 注意：OpenMM 侧本来就没有 import 期副作用——abfe_core/ibs_engine/abfe_pipeline 里
 # 所有 `Platform.getPlatformByName` / `Context(...)` 都在函数内。要消除的只有 torch
@@ -7889,9 +7941,174 @@ class NumpyEncoder(json.JSONEncoder):
 # ============================================================================
 # 1. ACES 软核势 & DEXP 替身势 & Orb 拟合器
 # ============================================================================
+# 🔑 [2026-09-22] 软核指数的全局口径开关（None = 生产默认 DEFAULT_SOFTCORE_POWER_LJ）。
+# 由 `abfe_pipeline.run_full_pipeline` 在开跑前按 config 的 `softcore_power_lj`
+# 设一次；不设就是 None ⟹ 行为与本改动前逐字相同。
+# 它会通过 `optimize_alpha()` 的返回值进 `aces_softcore_params` ⟹ 自动进 stage
+# 协议指纹，所以换指数一定作废旧缓存、不会出现"新指数配旧帧"。
+SOFTCORE_POWER_LJ_OVERRIDE = None
+# 🔑 [2026-09-24] 生产默认从 (2, 2) 改回 (1, 1)（openfe/openmmtools 口径，
+# Pham & Shirts, JCP 135, 034114 (2011) 的 1-1-6）。(2, 2) 当初是为绕另一个 bug 调的，
+# 出处已查不到；09-23 benchmark 实测 [1,1] 与 [2,2] 的 pilot 热力学长度在 rep 散布内
+# 一致、λ≈0.2 的 dU/dλ 尖峰也还在 ⟹ 换它不改路径难度，只换口径。
+# 构造默认、optimize_alpha 默认、from_dict 回退三处都读这一份，别再各写各的字面量。
+DEFAULT_SOFTCORE_POWER_LJ = (1, 1)
+
+# openfe/BFE 的固定 Boresch 力常数（restraint_utils/settings.py）。
+# 两个估算器（OrbBoreschEstimator / GeometricRestraintEstimator）共用这一份，
+# 不各写各的。
+OPENFE_FIXED_KR_KJ_PER_MOL_NM2 = 4184.0       # 10 kcal/mol/Å²
+OPENFE_FIXED_KANGLE_KJ_PER_MOL_RAD2 = 334.72  # 80 kcal/mol/rad²
+
+# 🔑 [2026-09-24] Boresch 两个口径开关的生产默认改成 openfe 路线（原为 "fitted" / "orb"）。
+# 拟合档的力常数一直贴着裁剪边界（kr 每次恰好 2000、kphiB 常压在地板 10），
+# 老锚点路线（第 0 帧 ≤0.5 nm 接触对）与 openfe 的 0.5–1.5 nm 壳层几乎不重叠。
+# 旧两档代码保留（config 显式写 "fitted" / "orb" 仍可用），只是不再是默认。
+# 所有读这两个键的地方都用这两个常量做回退，别再各写各的字面量。
+DEFAULT_BORESCH_FORCE_CONSTANT_MODE = "openfe_fixed"
+DEFAULT_BORESCH_ANCHOR_MODE = "openfe"
+
+# openfe 的锚点接受判据阈值（boresch/host.py）。同样只此一份。
+OPENFE_MAX_ABS_DIHEDRAL_RAD = 2.618      # 150°：远离 ±π 缠绕边界
+OPENFE_MAX_ANGLE_CIRCSTD_RAD = 1.745     # 100°
+OPENFE_MAX_DIHEDRAL_CIRCSTD_RAD = 5.236  # 300°
+
+
+def circular_std_rad(values_rad, axis=0):
+    """圆标准差 sqrt(-2 ln R)，弧度；绕 ±π 边界安全。"""
+    a = np.asarray(values_rad, dtype=float)
+    if a.size == 0:
+        return float("inf")
+    r = np.abs(np.mean(np.exp(1j * a), axis=axis))
+    return np.sqrt(np.maximum(0.0, -2.0 * np.log(np.clip(r, 1e-12, 1.0))))
+
+
+# openfe 的锚点搜索参数（restraint_utils/settings.py BoreschRestraintSettings 默认值 +
+# geometry/utils.py is_collinear 的阈值）。只给 GeometricRestraintEstimator 的 openfe 档用。
+OPENFE_RMSF_CUTOFF_NM = 0.1
+OPENFE_HOST_MIN_DISTANCE_NM = 0.5
+OPENFE_HOST_MAX_DISTANCE_NM = 1.5
+OPENFE_COLLINEAR_ABS_COS = 0.9
+
+
+def local_rmsf_nm(traj, atom_indices):
+    """这组原子**先叠到自己第 0 帧**再算的 RMSF（openfe get_local_rmsf 同义），nm。"""
+    idx = [int(i) for i in atom_indices]
+    if len(idx) == 0 or traj.n_frames < 2:
+        return np.zeros(len(idx))
+    sub = traj.atom_slice(idx)   # 副本；mdtraj.rmsf 内部会 superpose，别动调用方的 traj
+    return np.asarray(mdtraj.rmsf(sub, sub, 0), dtype=float)
+
+
+def openfe_angle_not_flat(angles_rad, k_angle, temperature_k):
+    """逐元素：½K·θ² 和 ½K·(θ−π)² 都 ≥ 10 kT（openfe check_angle_not_flat）。"""
+    a = np.asarray(angles_rad, dtype=float)
+    kt = 0.008314462618 * float(temperature_k)
+    return (0.5 * k_angle * a ** 2 >= 10.0 * kt) & (0.5 * k_angle * (a - np.pi) ** 2 >= 10.0 * kt)
+
+
+def _scipy_circvar(a, low, high, axis=0):
+    """scipy.stats.circvar（≥1.8 口径，1−R），openfe 的排序量用的就是它。"""
+    ang = (np.asarray(a, dtype=float) - low) * 2.0 * np.pi / (high - low)
+    return 1.0 - np.abs(np.mean(np.exp(1j * ang), axis=axis))
+
+
+def openfe_ligand_anchor_pool(top, traj, ligand_resname, rmsf_cutoff_nm=0.15):
+    """配体侧锚点池：优先**芳香环**上的重原子（openfe 的做法）。
+
+    芳香性交给 RDKit 判，不用几何代理：从配体的元素 + 三维坐标建分子，
+    `rdDetermineBonds.DetermineBonds` 按几何推键级，sanitize 之后读
+    `GetIsAromatic()`。.gro/.top 没有键级，所以必须从坐标推，而不是拿
+    "环大小 + 平面性" 猜——五元非芳香环、扭船式六元环都会被那种代理误判。
+
+    再按 openfe 的口径过 RMSF：**整个环**的 max RMSF 低于 cutoff 才要这个环
+    （环上原子刚性最好、天然不共线，正是 Boresch 六自由度最怕缺的两点）。
+    芳香环不够用（或 RDKit 判不动）时先退到 RMSF 过 cutoff 的重原子（openfe 第二档），
+    再不够才退回全部重原子。RMSF 是局部的（配体先叠到自己身上）。
+
+    返回 ``(pool_indices, note)``。
+    """
+    heavy = [int(i) for i in top.select(f"resname {ligand_resname} and not element H")]
+    if len(heavy) < 3:
+        return [int(i) for i in top.select(f"resname {ligand_resname}")], "配体重原子不足，用全部原子"
+    lig_all = [int(i) for i in top.select(f"resname {ligand_resname}")]
+
+    xyz = np.asarray(traj.xyz, dtype=float)
+    mean_xyz = xyz.mean(axis=0)
+    # 🔑 [2026-09-24] 局部 RMSF（配体先叠到自己身上），openfe get_local_rmsf 同义。
+    # 原来直接对原始坐标算，配体在口袋里的整体平动/转动全算成"涨落"：09-23 复现批
+    # brd4/jnk1/cyclod 的芳香环一个都没过 cutoff，全退回了重原子。
+    rmsf = np.zeros(xyz.shape[1])
+    rmsf[lig_all] = local_rmsf_nm(traj, lig_all)
+    cutoff = float(rmsf_cutoff_nm)
+
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import rdDetermineBonds
+
+        mol = Chem.RWMol()
+        local_of_global = {}
+        for local, g in enumerate(lig_all):
+            sym = (getattr(top.atom(g).element, "symbol", "C") or "C")
+            mol.AddAtom(Chem.Atom(str(sym)))
+            local_of_global[g] = local
+        # 连接性直接用拓扑自己的键（它是可信输入），**不从坐标猜** ——
+        # 坐标推连接性对平衡态轨迹的平均构型不稳（氢位置一抖就判错）。
+        # 键级交给 RDKit：DetermineBondOrders 只需要连接性 + 元素。
+        lig_set = set(lig_all)
+        for b in top.bonds:
+            a1, a2 = int(b[0].index), int(b[1].index)
+            if a1 in lig_set and a2 in lig_set:
+                mol.AddBond(local_of_global[a1], local_of_global[a2],
+                            Chem.BondType.SINGLE)
+        # DetermineBondOrders 需要一个构象（它按几何辅助定阶），给平均构型。
+        conf = Chem.Conformer(len(lig_all))
+        for g, local in local_of_global.items():
+            x, y, z = mean_xyz[g] * 10.0          # nm → Å
+            conf.SetAtomPosition(local, (float(x), float(y), float(z)))
+        mol.AddConformer(conf)
+        probe = mol.GetMol()
+        # charge=0 是这条线的前提（净电荷必须为 0，见净电荷那道门）。
+        rdDetermineBonds.DetermineBondOrders(probe, charge=0)
+        Chem.SanitizeMol(probe)
+        ring_info = probe.GetRingInfo()
+        aromatic_rings = [
+            ring for ring in ring_info.AtomRings()
+            if all(probe.GetAtomWithIdx(int(a)).GetIsAromatic() for a in ring)
+        ]
+    except Exception as exc:  # noqa: BLE001 —— 判不动就退回重原子，不阻断
+        aromatic_rings, rdkit_error = [], exc
+    else:
+        rdkit_error = None
+
+    global_of_local = {v: k for k, v in local_of_global.items()}
+    pool, kept = set(), 0
+    for ring in aromatic_rings:
+        g_ring = [global_of_local[int(a)] for a in ring]
+        g_heavy = [g for g in g_ring
+                   if (getattr(top.atom(g).element, "symbol", "") or "").upper() != "H"]
+        if len(g_heavy) < 3:
+            continue
+        if float(np.max(rmsf[g_ring])) >= cutoff:     # 整环过 RMSF，不是逐原子
+            continue
+        pool.update(g_heavy)
+        kept += 1
+
+    if len(pool) < 3:
+        why = (f"RDKit 芳香性判定失败（{rdkit_error!r}）" if rdkit_error is not None
+               else f"芳香环不够用（RDKit 判出 {len(aromatic_rings)} 个、过 RMSF 的 {kept} 个）")
+        # openfe 的第二档：RMSF 过 cutoff 的重原子；再不够才退回全部重原子。
+        rigid = [g for g in heavy if rmsf[g] < cutoff]
+        if len(rigid) >= 3:
+            return rigid, f"{why}，退回 RMSF < {cutoff} nm 的重原子（{len(rigid)}/{len(heavy)} 个）"
+        return heavy, f"{why}，刚性重原子也不足 3 个，退回全部重原子"
+    return sorted(pool), (f"用芳香环上的重原子：{kept}/{len(aromatic_rings)} 个环通过"
+                          f"（整环 max RMSF < {cutoff} nm），池子 {len(pool)} 个原子")
+
+
 class ACESoftcorePotential:
     def __init__(
-        self, alpha_lj=0.5, alpha_coul=0.2, power_lj=(2, 2), power_coul=(1, 1)
+        self, alpha_lj=0.5, alpha_coul=0.2, power_lj=DEFAULT_SOFTCORE_POWER_LJ, power_coul=(1, 1)
     ):
         self.alpha_lj, self.alpha_coul = float(alpha_lj), float(alpha_coul)
         self.m_lj, self.n_lj = power_lj
@@ -7951,7 +8168,7 @@ class ACESoftcorePotential:
         return float(alpha_lj), float(alpha_coul)
 
     @staticmethod
-    def optimize_alpha(n, alpha_coul_nm2=None):
+    def optimize_alpha(n, alpha_coul_nm2=None, power_lj=None):
         """返回无量纲 Beutler 软核系数。
 
         ⚠️ 历史教训：这里曾写着「OpenMM 软核 alpha 标准单位即为 nm⁶/nm²，文献值 0.5
@@ -7975,10 +8192,30 @@ class ACESoftcorePotential:
         if not (0.05 < alpha_coul < 1.0):
             raise ValueError(f"alpha_coul 超出安全范围: {alpha_coul} (无量纲，预期 0.05~1.0)")
 
+        # 🔑 [2026-09-22] 软核指数 (a, b) = (前因子 λ^a, 软核偏移 (1−λ)^b)。
+        # 默认 DEFAULT_SOFTCORE_POWER_LJ = [1, 1]（2026-09-24 起；此前是 [2, 2]），
+        # 与 openfe / openmmtools 一致（softcore_a=1, softcore_b=1）。
+        # 两端完全一样（λ=1 精确 LJ、λ=0 恒为 0），差别全在路径上。
+        # ⚠️ 09-22 曾以为 b=2 把热力学长度堆到中段、造成 λ_vdw≈0.24 的 +222 kJ/mol
+        # 尖峰；09-24 对照 benchmark 两批 pilot 否掉了：[1,1] 下总热力学长度与 [2,2]
+        # 在 rep 散布内一致，dU/dλ 的 std 峰仍在 λ≈0.19–0.29。选 [1,1] 是为了口径，
+        # 不是为了摊平那个峰。
+        # ⚠️ 换指数 = 换哈密顿量 ⟹ 全部窗口缓存作废；ΔA 与路径无关，换它不改答案，
+        # 只改这条路好不好走。
+        # 调用点有近十处（pipeline / ibs_engine / preoptimizer 各自都要构造同一份
+        # 软核参数），所以口径走**一个模块级开关**而不是逐处加形参——逐处加一定漏，
+        # 漏掉的那一处就会用另一套指数建力，同一个 run 里两种哈密顿量。
+        if power_lj is None:
+            power_lj = SOFTCORE_POWER_LJ_OVERRIDE
+        _power_lj = list(DEFAULT_SOFTCORE_POWER_LJ) if power_lj is None else [int(x) for x in power_lj]
+        if len(_power_lj) != 2 or not all(1 <= x <= 4 for x in _power_lj):
+            raise ValueError(
+                f"power_lj 必须是两个 1~4 的整数 (a, b)，得到 {power_lj!r}"
+            )
         return {
             "alpha_lj": alpha_lj,        # 无量纲，表达式内乘 sigma_ij^6
             "alpha_coul": alpha_coul,    # 无量纲，表达式内乘 sigma_ij^2
-            "power_lj": [2, 2],
+            "power_lj": _power_lj,
             "power_coul": [1, 1],
             "alpha_convention": ACESoftcorePotential.ALPHA_CONVENTION,
         }
@@ -8014,7 +8251,7 @@ class ACESoftcorePotential:
         return cls(
             alpha_lj,
             alpha_coul,
-            tuple(p.get("power_lj", [2, 2])),
+            tuple(p.get("power_lj", DEFAULT_SOFTCORE_POWER_LJ)),
             tuple(p.get("power_coul", [1, 1])),
         )
 
@@ -8112,7 +8349,7 @@ class DEXPSurrogatePotential:
     一阶导(=0)；r->0 时能量和力都有限，天然没有 LJ 的 r^-12 奇点。
 
     默认 alpha_vdw=14, beta_vdw=5（不是标准 LJ 的 12/6）——这是在本项目结合态局部
-    anchor-relative 扰动云（--perturb-scan + --perturb-fit，20 anchor x 74 扰动/anchor，
+    anchor-relative 扰动云（--perturb-scan + --perturb-fit〔2026-09-24 更正：本仓库当前没有这两个 CLI 开关〕，20 anchor x 74 扰动/anchor，
     按扰动档等权 + leave-one-anchor-out 交叉验证）上验证过的经验值：19/20 折独立选中同一
     点，held-out 加权 RMSE 比 12/6 改善约 13%。**但要注意**：数据主要约束的是
     alpha+beta≈19 这个组合(2D score surface 在 (alpha,beta) 里是沿此方向的对角谷，
@@ -8565,9 +8802,25 @@ class FinalResultValidationError(RuntimeError):
     """腿级最终结果未通过统一 schema/sanity gate（P1-12）。"""
 
 
-def validate_boresch_attachment_result(payload: Any) -> Tuple[float, float]:
-    """Require a converged, finite A′→A contribution before cache/cycle use."""
-    if not isinstance(payload, dict) or payload.get("converged") is not True:
+def validate_boresch_attachment_result(payload: Any,
+                                       require_converged: Optional[bool] = None
+                                       ) -> Tuple[float, float]:
+    """Require a converged, finite A′→A contribution before cache/cycle use.
+
+    🔑 [2026-09-22] `require_converged=False` 只给**已经显式关掉 attachment 收敛门**
+    的那条路用（debug/复现模式）。不给这个口子的话，形状会变成"门放你过去、
+    `converged` 如实记成 False、下一个函数看见 False 直接抛" —— 放开等于没放开
+    （真机 cyclod_ligand1/rep1 22:32 实证）。
+    ⚠️ 放宽的**只有** converged 这一项：ΔG/σ 必须有限、σ ≥ 0 照常硬判，
+    那两条不是"门太严"，是"这个数根本不成立"。
+    🔑 [2026-09-23] 不传 ⟹ 读 payload 自带的 `convergence_gates_enforced`（缺席=True）。
+    原来只有两个调用点显式放宽，腿求和 / 最终汇总 / runabfe 重算照样硬判。
+    """
+    if not isinstance(payload, dict):
+        raise FinalResultValidationError("Boresch attachment stage0 必须带 converged=true")
+    if require_converged is None:
+        require_converged = bool(payload.get("convergence_gates_enforced", True))
+    if require_converged and payload.get("converged") is not True:
         raise FinalResultValidationError("Boresch attachment stage0 必须带 converged=true")
     values = []
     for field in ("attachment_delta_G_kJ_mol", "attachment_error_kJ_mol"):
@@ -8711,6 +8964,8 @@ def validate_final_leg_result(
     if attachment_summary.get("present"):
         validate_boresch_attachment_result({
             "converged": attachment_summary.get("converged"),
+            "convergence_gates_enforced": attachment_summary.get(
+                "convergence_gates_enforced", True),
             "attachment_delta_G_kJ_mol": attachment_summary.get("delta_G_kJ_mol"),
             "attachment_error_kJ_mol": attachment_summary.get("error_kJ_mol"),
         })
@@ -9207,6 +9462,25 @@ class OrbBoreschEstimator:
         "corr_threshold_keep": -0.1,
         "corr_threshold_good": -0.5,
         "use_fluctuation_fallback": True,
+        # 🔑 [2026-09-22] Boresch 力常数的口径。默认 "fitted" = 从轨迹拟合
+        # （kT/var 或 −cov/var，再 clip），**行为与本改动前逐字相同**。
+        # "openfe_fixed" = 借 openfe/BFE 的做法：力常数是**设置项**不从轨迹来，
+        #   kr        = 4184   kJ/mol/nm²  (=10 kcal/mol/Å²)
+        #   k_角/二面角 = 334.72 kJ/mol/rad² (=80 kcal/mol/rad²)
+        # 为什么值得有这一档：我们拟合出来的角力常数被 clip 在 [10, 100]
+        # kJ/mol/rad²，**上限比 openfe 的固定值还低 3.3 倍**。K=10 时
+        # σ_θ = sqrt(kT/K) ≈ 0.5 rad ≈ 29°，在 r0≈0.5 nm 上就是 ~0.25 nm 的横向摆动
+        # ——鬼影配体因此能在 λ_vdw 中段撞上腔壁（2026-09-22 cyclod 实测：预平衡
+        # 位姿漂移 0.5–0.73 nm，pilot dU/dλ 在 λ∈[0.24,0.43] 出现 std=84 的重尾）。
+        # 强约束还有第二个好处：角分布窄 ⟹ 谐波近似极好 ⟹ Boresch 解析释放项的
+        # 模型误差项（cosine 力 vs 谐波公式）本来就小。
+        # ⚠️ 换档会改变**束缚态定义** ⟹ ΔG 变、stage0 与下游全部缓存作废。
+        "boresch_force_constant_mode": DEFAULT_BORESCH_FORCE_CONSTANT_MODE,
+        # 🔑 [2026-09-22] 锚点选择口径（09-24 起默认 "openfe"）。"orb" = 老路：frame 0 上做几何校验 +
+        # RMSF/距离/序列分散度的加权评分。
+        # "openfe" = 借 openfe：判据必须**每一帧**都成立（二面角 |φ|≤150°、角不平、
+        # 圆标准差上限），再按**涨落最小**排序。前者一帧合法就收，后者整条轨迹合法才收。
+        "boresch_anchor_mode": DEFAULT_BORESCH_ANCHOR_MODE,
         "short_sidechain_res": ["GLY", "ALA", "SER", "VAL", "THR", "CYS"],
         "long_sidechain_res": [
             "TRP",
@@ -9477,11 +9751,13 @@ class OrbBoreschEstimator:
         rmsf_traj = traj[:: max(1, len(traj) // 100)]
         if len(rmsf_traj) > 1:
             rmsf_traj.superpose(rmsf_traj, 0, atom_indices=rec_ca_p)
+            # 🔑 [2026-09-20] 参考结构取**平均结构**，不是第 0 帧。同文件另一条锚点
+            # 路径早就把这一点判为错误并改掉了（"第 0 帧只是一个样本，它偏离平均
+            # 构象时算出的涨落系统性偏大 ⟹ rigid_mask 偏保守地把够刚性的 Cα 判掉、
+            # 漏掉本可用的锚点候选"），这条漏了同步。
+            _ca_xyz = rmsf_traj.xyz[:, rec_ca_p]
             rmsf = np.sqrt(
-                np.mean(
-                    (rmsf_traj.xyz[:, rec_ca_p] - rmsf_traj.xyz[0, rec_ca_p]) ** 2,
-                    axis=(0, 2),
-                )
+                np.mean((_ca_xyz - _ca_xyz.mean(axis=0)[None, :, :]) ** 2, axis=(0, 2))
             )
         else:
             rmsf = np.zeros(len(rec_ca_p))
@@ -9621,8 +9897,12 @@ class OrbBoreschEstimator:
         if len(traj) < 10:
             return None
         n_frames = len(traj)
-        q_data = np.zeros((n_frames, 6))
-        Fq_data = np.zeros((n_frames, 6))
+        # 🔑 [2026-09-20] 用 NaN 而不是 0 预填：下面遇到 NaN 锚点/几何量会 `continue`,
+        # 把这一帧**留在原样**。填 0 的后果是那些帧变成"位移 0、力 0"的**合法样本**
+        # 混进协方差 —— 下游的有效性掩码只筛 NaN，筛不掉 0。方差被掺了一堆零，
+        # k_fluc = kBT/var 与 k_reg = -cov/var 都被系统性往 0 拉。
+        q_data = np.full((n_frames, 6), np.nan)
+        Fq_data = np.full((n_frames, 6), np.nan)
         for f in range(n_frames):
             pos = traj.xyz[f, selection]
             forces = context.calculate_forces(pos)
@@ -9727,9 +10007,20 @@ class OrbBoreschEstimator:
                     ) / (2 * eps)
         return q, grads
 
+    OPENFE_FIXED_KR_KJ_PER_MOL_NM2 = OPENFE_FIXED_KR_KJ_PER_MOL_NM2
+    OPENFE_FIXED_KANGLE_KJ_PER_MOL_RAD2 = OPENFE_FIXED_KANGLE_KJ_PER_MOL_RAD2
+
     def _apply_hybrid_filter(self, q, Fq):
-        kB_T = self.gas_constant_kj_per_mol_k * self.T
         names = ["kr", "kthetaA", "kthetaB", "kphiA", "kphiB", "kphiC"]
+        if str(self.config.get("boresch_force_constant_mode", DEFAULT_BORESCH_FORCE_CONSTANT_MODE)) == "openfe_fixed":
+            # 力常数是设置项，不从轨迹来：挑锚点去适配固定的 K，而不是拟合 K 去
+            # 适配挑中的锚点。见该配置键处的说明。
+            return {
+                n: float(self.OPENFE_FIXED_KR_KJ_PER_MOL_NM2 if n == "kr"
+                         else self.OPENFE_FIXED_KANGLE_KJ_PER_MOL_RAD2)
+                for n in names
+            }
+        kB_T = self.gas_constant_kj_per_mol_k * self.T
         ks = {}
         for i in range(6):
             valid = ~(np.isnan(q[:, i]) | np.isnan(Fq[:, i]))
@@ -9769,8 +10060,12 @@ class OrbBoreschEstimator:
         self, traj, context, selection, local_anchors, cap_h_coords=None
     ):
         n_frames = len(traj)
-        q_data = np.zeros((n_frames, 6))
-        Fq_data = np.zeros((n_frames, 6))
+        # 🔑 [2026-09-20] 用 NaN 而不是 0 预填：下面遇到 NaN 锚点/几何量会 `continue`,
+        # 把这一帧**留在原样**。填 0 的后果是那些帧变成"位移 0、力 0"的**合法样本**
+        # 混进协方差 —— 下游的有效性掩码只筛 NaN，筛不掉 0。方差被掺了一堆零，
+        # k_fluc = kBT/var 与 k_reg = -cov/var 都被系统性往 0 拉。
+        q_data = np.full((n_frames, 6), np.nan)
+        Fq_data = np.full((n_frames, 6), np.nan)
         for f in range(n_frames):
             pos = traj.xyz[f, selection]
             forces = context.calculate_forces(pos)
@@ -9891,6 +10186,107 @@ class OrbBoreschEstimator:
         }
         return {**cand, "ks": ks, "eq": eq}
 
+    # ── openfe 口径的锚点接受判据（borrowed 2026-09-22）─────────────────────
+    # 来源：openfe restraint_utils/openmm/omm_restraints.py + boresch/host.py。
+    # 与我们原有判据的**本质差别**：
+    #   · 我们在 **frame 0 一帧**上做几何校验 + RMSF/距离打分；
+    #   · openfe 要求判据在**每一帧**都成立，再按**涨落**排序（最小者胜）。
+    # 一帧合法不代表整条轨迹合法 —— 二面角在 frame 0 是 170°、后面绕过 ±π 的
+    # 候选，我们会选中然后在事后 wrap 收拾（见 runabfe 那条"旧缓存可能含末帧
+    # 二面角反号"），openfe 在入口就把它排掉。
+    OPENFE_MAX_ABS_DIHEDRAL_RAD = OPENFE_MAX_ABS_DIHEDRAL_RAD
+    OPENFE_MAX_ANGLE_CIRCSTD_RAD = OPENFE_MAX_ANGLE_CIRCSTD_RAD
+    OPENFE_MAX_DIHEDRAL_CIRCSTD_RAD = OPENFE_MAX_DIHEDRAL_CIRCSTD_RAD
+    OPENFE_MIN_ANGLE_FROM_FLAT_RAD = 0.0     # 见 _openfe_angle_not_flat
+
+    @staticmethod
+    def _circular_std_rad(values_rad):
+        """圆标准差 sqrt(-2 ln R)，弧度。R 是合矢量长度，与 openfe 的 width 同量纲。"""
+        a = np.asarray(values_rad, dtype=float)
+        if a.size == 0:
+            return float("inf")
+        r = float(np.hypot(np.mean(np.cos(a)), np.mean(np.sin(a))))
+        if r <= 1e-12:
+            return float("inf")
+        return float(np.sqrt(max(0.0, -2.0 * np.log(min(1.0, r)))))
+
+    def _openfe_angle_not_flat(self, angles_rad, k_angle, temperature_k):
+        """角不能平到分布撞上 [0, π] 边界（openfe check_angle_not_flat 同义）。
+
+        判据：在给定力常数与温度下，谐波分布的宽度 σ=sqrt(kT/K)，要求
+        平衡角距离 0 和 π 都至少 `n_sigma` 个 σ —— 平角 ⟹ sinθ→0 ⟹ Boresch
+        解析释放项的 sinθ 因子发散，正是我们那道"拒绝以 0.0 kJ/mol 修正继续"
+        的门。openfe 把它前移到**选锚点**，所以永远不会选出需要那道门的候选。
+        """
+        a = np.asarray(angles_rad, dtype=float)
+        if a.size == 0 or not k_angle or k_angle <= 0:
+            return False
+        kt = self.gas_constant_kj_per_mol_k * float(temperature_k)
+        sigma = float(np.sqrt(kt / float(k_angle)))
+        n_sigma = 2.0
+        mean_angle = float(np.mean(a))
+        return bool(mean_angle - n_sigma * sigma > 0.0
+                    and mean_angle + n_sigma * sigma < np.pi)
+
+    def openfe_anchor_metrics(self, rec_anchors, lig_anchors, traj,
+                              k_angle=None, temperature_k=None):
+        """整条轨迹上的 Boresch 六自由度统计 + openfe 接受判据 + 涨落评分。
+
+        返回 ``(accepted: bool, reason: str, score: float, detail: dict)``；
+        ``score`` = Σ(三个二面角圆标准差 + 两个角圆标准差) + 键长方差，**越小越好**
+        （openfe boresch/host.py 的排序量）。
+        """
+        H0, H1, H2 = [int(x) for x in rec_anchors]
+        G0, G1, G2 = [int(x) for x in lig_anchors]
+        xyz = np.asarray(traj.xyz, dtype=float)
+
+        def ang(a, b, c):
+            ba, bc = xyz[:, a] - xyz[:, b], xyz[:, c] - xyz[:, b]
+            cosv = np.sum(ba * bc, axis=1) / (
+                np.linalg.norm(ba, axis=1) * np.linalg.norm(bc, axis=1) + 1e-12)
+            return np.arccos(np.clip(cosv, -1.0, 1.0))
+
+        def dih(a, b, c, d):
+            return np.array([
+                boresch_dihedral_rad(xyz[f, a], xyz[f, b], xyz[f, c], xyz[f, d])
+                for f in range(xyz.shape[0])
+            ], dtype=float)
+
+        r = np.linalg.norm(xyz[:, H0] - xyz[:, G0], axis=1)
+        thA, thB = ang(H1, H0, G0), ang(H0, G0, G1)
+        phiA, phiB, phiC = dih(H2, H1, H0, G0), dih(H1, H0, G0, G1), dih(H0, G0, G1, G2)
+
+        circ_ang = [self._circular_std_rad(x) for x in (thA, thB)]
+        circ_dih = [self._circular_std_rad(x) for x in (phiA, phiB, phiC)]
+        detail = {
+            "r_mean_nm": float(np.mean(r)), "r_var_nm2": float(np.var(r)),
+            "theta_circstd_rad": circ_ang, "phi_circstd_rad": circ_dih,
+            "max_abs_phi_rad": float(max(np.max(np.abs(p)) for p in (phiA, phiB, phiC))),
+        }
+        score = float(sum(circ_dih) + sum(circ_ang) + np.var(r))
+        detail["score"] = score
+
+        if detail["r_mean_nm"] <= float(self.config.get("dist_reject_nm", 0.40)):
+            return False, "r0 低于下限", score, detail
+        # 逐帧一票否决：任何一帧的二面角进到 ±150° 以外就不要这个候选
+        if detail["max_abs_phi_rad"] > self.OPENFE_MAX_ABS_DIHEDRAL_RAD:
+            return False, "有帧的二面角超出 ±150°（靠近 ±π 缠绕边界）", score, detail
+        if max(circ_ang) >= self.OPENFE_MAX_ANGLE_CIRCSTD_RAD:
+            return False, "角的圆标准差 ≥ 100°", score, detail
+        if max(circ_dih) >= self.OPENFE_MAX_DIHEDRAL_CIRCSTD_RAD:
+            return False, "二面角的圆标准差 ≥ 300°", score, detail
+        if k_angle is not None and temperature_k is not None:
+            for name, arr in (("thetaA", thA), ("thetaB", thB)):
+                if not self._openfe_angle_not_flat(arr, k_angle, temperature_k):
+                    return False, f"{name} 平到撞 [0, π] 边界（sinθ 奇点）", score, detail
+        return True, "", score, detail
+
+    def openfe_ligand_anchor_pool(self, top, traj, ligand_resname):
+        """见模块级 `openfe_ligand_anchor_pool`（两个估算器共用同一份实现）。"""
+        return openfe_ligand_anchor_pool(
+            top, traj, ligand_resname,
+            rmsf_cutoff_nm=float(self.config.get("rmsf_cutoff_nm", 0.15)))
+
     def _score_candidate_comprehensive(self, rec_anchors, lig_anchors, rmsf_vals,
                                         r0_nm, thA_rad, thB_rad, kr_raw, traj, top):
         """综合评分函数：稳定性 + 几何 + 力常数 + 序列分散度"""
@@ -9969,6 +10365,12 @@ class OrbBoreschEstimator:
         max_kr: float = 2000.0,
         min_residue_gap: int = 3,
         use_last_ns: float = 5.0,  # ✅ 强制参数：只分析最后 N ns
+        # 🔑🔑 [2026-09-20] 时间轴显式重建，不吃 `traj.time`。生产调用传的是
+        # `pre_equilibration.dcd`，而 mdtraj 读 DCD 给的 `time` 是**帧号**
+        # （本文件 §膜分析里已经把这件事判成错误并 fail-closed）。默认值就是
+        # 生产设置（reporter 间隔 × 步长），与 `pre_equilibration_frame_interval_ps`
+        # 同源；传别的轨迹请显式给它。
+        frame_interval_ps: Optional[float] = None,
     ) -> List[Dict]:
         """
         确定性枚举 v6.5 (最终修复版)
@@ -9986,23 +10388,33 @@ class OrbBoreschEstimator:
         # ✅ 0. 强制切片最后 5ns (物理需求：切除预平衡前期不稳定部分)
         # ========================================================================
         original_len = len(traj)
-        if hasattr(traj, "time") and len(traj.time) > 0:
-            t_max = traj.time[-1]  # ps
-            t_cut = t_max - (use_last_ns * 1000.0)  # ns -> ps
-            mask = traj.time >= t_cut
-            n_keep = mask.sum()
-
-            if n_keep > 0:
-                traj = traj[mask]
-                print(
-                    f"轨迹切片: 仅使用最后 {use_last_ns} ns ({n_keep} 帧 / 原始 {original_len} 帧)"
-                )
-            else:
-                print(
-                    f"[WARN] 轨迹长度不足 {use_last_ns} ns，使用全轨迹 ({original_len} 帧)"
-                )
+        # 🔑🔑 [2026-09-20] **时间轴由 `frame_interval_ps` 重建，不读 `traj.time`。**
+        # 原实现把 `traj.time` 当 ps 用，而 mdtraj 读 DCD 给的是帧号（0,1,2,…）：
+        # `t_cut = (N-1) - 5000` 在 N ≤ 5001 帧时 ≤ 0 ⟹ 掩码保留**全部**帧，
+        # 而日志照样打印"仅使用最后 5 ns"。也就是说这道"强制切除前期不稳定部分"的
+        # 关键修正在生产上（5M 步 / 20 ps 每帧 = 251 帧）**一次都没生效过**，
+        # 锚点是拿含预平衡前期的全轨迹估的。同一口径的判据在膜分析里是 fail-closed 的。
+        interval_ps = (
+            pre_equilibration_frame_interval_ps()
+            if frame_interval_ps is None else float(frame_interval_ps)
+        )
+        if not np.isfinite(interval_ps) or interval_ps <= 0.0:
+            raise ValueError(f"frame_interval_ps 必须是正有限值，收到 {frame_interval_ps!r}")
+        times_ps = np.arange(original_len, dtype=float) * interval_ps
+        span_ns = float(times_ps[-1] - times_ps[0]) / 1000.0 if original_len else 0.0
+        mask = times_ps >= (times_ps[-1] - use_last_ns * 1000.0) if original_len else None
+        n_keep = int(mask.sum()) if mask is not None else 0
+        if n_keep > 0 and n_keep < original_len:
+            traj = traj[mask]
+            print(
+                f"轨迹切片: 仅使用最后 {use_last_ns} ns "
+                f"({n_keep} 帧 / 原始 {original_len} 帧，每帧 {interval_ps:g} ps)"
+            )
         else:
-            print(f"[WARN] 轨迹无时间信息，使用全轨迹 ({original_len} 帧)")
+            print(
+                f"[WARN] 轨迹总长 {span_ns:.2f} ns 不足 {use_last_ns} ns，"
+                f"使用全轨迹 ({original_len} 帧，每帧 {interval_ps:g} ps)"
+            )
 
         print(
             f"确定性枚举 v6.5 | 目标: {n_candidates} | r0≤{max_r0_angstrom}Å | kr≤{max_kr} | 残基间隔≥{min_residue_gap}"
@@ -10044,9 +10456,14 @@ class OrbBoreschEstimator:
             return []
 
         # 1. 生成配体锚点候选三元组 (基于质量+刚性排序)
-        lig_heavy = top.select(f"resname {ligand_resname} and not element H")
-        if len(lig_heavy) < 3:
-            lig_heavy = top.select(f"resname {ligand_resname}")
+        if str(self.config.get("boresch_anchor_mode", DEFAULT_BORESCH_ANCHOR_MODE)) == "openfe":
+            lig_heavy, _pool_note = self.openfe_ligand_anchor_pool(
+                top, traj, ligand_resname)
+            print(f"  → 配体锚点池（openfe 口径）：{_pool_note}")
+        else:
+            lig_heavy = top.select(f"resname {ligand_resname} and not element H")
+            if len(lig_heavy) < 3:
+                lig_heavy = top.select(f"resname {ligand_resname}")
         
         lig_combos = []
         for combo in combinations(lig_heavy, 3):
@@ -10099,6 +10516,31 @@ class OrbBoreschEstimator:
                     continue
                 seen_geo_keys.add(geo_key)
                 
+                # openfe 口径：判据逐帧全过 + 按涨落排序（见 openfe_anchor_metrics）
+                if str(self.config.get("boresch_anchor_mode", DEFAULT_BORESCH_ANCHOR_MODE)) == "openfe":
+                    _ok, _why, _score, _detail = self.openfe_anchor_metrics(
+                        [ca0, ca1, ca2], list(lig_combo), traj,
+                        k_angle=(self.OPENFE_FIXED_KANGLE_KJ_PER_MOL_RAD2
+                                 if str(self.config.get("boresch_force_constant_mode",
+                                                        DEFAULT_BORESCH_FORCE_CONSTANT_MODE)) == "openfe_fixed"
+                                 else None),
+                        temperature_k=self.T,
+                    )
+                    if not _ok:
+                        continue
+                    candidates.append({
+                        "rec_anchors": [ca0, ca1, ca2],
+                        "lig_anchors": list(lig_combo),
+                        "res_key": tuple(sorted([res0, res1, res2])),
+                        "r0_A": r0_A,
+                        # 涨落越小越好 ⟹ 取负，沿用下面那个 reverse=True 的排序
+                        "score": -_score,
+                        "openfe_metrics": _detail,
+                        "rmsf_avg": float(np.mean(
+                            [rmsf[pocket_ca.index(ca)] for ca in [ca0, ca1, ca2]])),
+                    })
+                    continue
+
                 # 综合评分
                 rmsf_vals = [rmsf[pocket_ca.index(ca)] for ca in [ca0, ca1, ca2]]
                 score_stab = sum((self.config["rmsf_cutoff_nm"] - rv) * 100 for rv in rmsf_vals)
@@ -10183,10 +10625,16 @@ class OrbBoreschEstimator:
             kr_val = final["ks"]["kr"]
             if r0_nm < 0.4 or r0_nm > 1.0:
                 continue
+            # ⚠️ [2026-09-20] `max_r0_angstrom > 10` 时这一条是**死配置**：上面
+            # `r0_nm > 1.0` 已经先 continue 掉了（硬几何边界 0.4~1.0 nm）。调小才有效。
             if r0_nm > max_r0_angstrom / 10.0:
+                final["_fallback_reason"] = (
+                    f"r0={r0_nm * 10:.2f}Å 超出 max_r0_angstrom={max_r0_angstrom}Å"
+                )
                 fallback_pool.append(final)
                 continue
             if kr_val > max_kr:
+                final["_fallback_reason"] = f"kr={kr_val:.1f} 超出上限 {max_kr}"
                 fallback_pool.append(final)
                 continue
 
@@ -10259,7 +10707,11 @@ class OrbBoreschEstimator:
                     "total_score": float(total_score_fb),
                     "score_breakdown": score_breakdown_fb,
                     "method": "finite_combo_v6.5_fallback",
-                    "warning": "kr 超出上限，已放行"
+                    # 文案此前写死"kr 超出上限"，而 r0 越界的候选也进同一个池子 ——
+                    # 报的理由跟实际触发的判据可以是两回事。按实际原因记。
+                    "warning": (
+                        final.get("_fallback_reason", "阈值超出上限") + "，已放行"
+                    )
                 })
                 log_cand(len(results), final["eq"]["r0"], final["ks"]["kr"], res_key, tag="回退")
 
@@ -10445,10 +10897,21 @@ class SurrogateSystemBuilder:
             reference_exclusions.append((int(p1), int(p2)))
 
         # 1) 先恢复 ligand-ligand 内部 nonbonded / 1-4，保留原始 MM 内部拓扑语义。
+        # 🔑🔑 [2026-09-20] **内部库仑从这个力里摘出来，单独逐对、无截断地加。**
+        # `create_ligand_internal_force` 是 `CutoffPeriodic` 的 CustomNonbondedForce，
+        # 截断 1.0 nm（`BEUTLER_SOFTCORE_CUTOFF_NM`）。把原始电荷塞进它的 `q` 参数，
+        # 跨度 > 1 nm 的内部对就被整对丢掉（本模块记录过 1.46 nm 的实例），而去电荷腿
+        # 那侧的 PME 是**不截断**的 ⟹ 两个 stage 的接缝上出现一个哈密顿量跳变。
+        # 生产 IBS 路径（`build_ibs_dual_system`）早就是"清零 q + 挂无截断补偿力"
+        # 这个写法，这里照搬同一套，不另发明。
+        _internal_params = list(original_params)
+        for _idx in sorted(lig_set):
+            _q, _sig, _eps = _internal_params[_idx]
+            _internal_params[_idx] = (0.0 * unit.elementary_charge, _sig, _eps)
         ll_force, ll_14_force = create_ligand_internal_force(
             nb_force=nb_force,
             perturbed_indices=sorted(lig_set),
-            particle_params=original_params,
+            particle_params=_internal_params,
             reference_exclusions=reference_exclusions,
             num_particles=new_system.getNumParticles(),
             system=new_system,
@@ -10458,6 +10921,25 @@ class SurrogateSystemBuilder:
         if ll_14_force is not None:
             ll_14_force.setForceGroup(force_group)
             new_system.addForce(ll_14_force)
+        # ≥1-5 的内部库仑：逐对展开、无截断、与上面那个力共用同一份排除表。
+        # `scale_expr="1"` —— 配体在 surrogate 里被整体从主 NB 力剥离，内部库仑
+        # 全部由这一项承载（与 vanishing 腿同口径）。
+        ll_coulomb_force = create_ligand_internal_coulomb_force(
+            nb_force,
+            sorted(lig_set),
+            {
+                int(i): original_params[int(i)][0].value_in_unit(
+                    unit.elementary_charge
+                )
+                for i in sorted(lig_set)
+            },
+            system=new_system,
+            reference_exclusions=reference_exclusions,
+            scale_expr="1",
+        )
+        if ll_coulomb_force is not None:
+            ll_coulomb_force.setForceGroup(force_group)
+            new_system.addForce(ll_coulomb_force)
 
         # 2) 主 NonbondedForce 中将 ligand 完全去耦，避免原始 MM L-E 项始终全开。
         for idx in sorted(lig_set):
@@ -10568,7 +11050,7 @@ class SurrogateSystemBuilder:
 
 
 # ============================================================================
-# 5. Orb 扫描器 & 混合工厂 & Surrogate 流水线
+# 5. Orb 扫描器 & 混合工厂 & Surrogate 流水线（2026-09-24 更正：Orb 扫描器与 Surrogate 流水线已删除，本节只剩 OrbMMHybridFactory）
 # ============================================================================
 
 class OrbMMHybridFactory:
@@ -11062,7 +11544,8 @@ def assess_boresch_harmonicity(traj, receptor_indices, ligand_indices) -> Dict:
     Runs unconditionally for every Boresch source (auto/orb_simple/simple/
     fluctuation). The retired ML scanner in
     `dexp_退役.py::OrbScanner.scan_boresch_1d_pes` only implements the
-    r-coordinate and was never called from a production pipeline. This uses
+    r-coordinate and was never called from a production pipeline (2026-09-24 correction: that
+    file is no longer in this repository). This uses
     the same distance/angle/dihedral convention as
     `calc_boresch_from_last_frame` (receptor_indices[0] nearest ligand) and
     reuses `GeometricRestraintEstimator._fluctuation_diagnostics` so the same
@@ -11842,7 +12325,7 @@ class UnitFormatter:
         唯一生产调用方 `abfe_pipeline.apply_boresch_correction` 正是"格式化后
         写回同一个 boresch_params.json"，所以只要 complex 腿走 autoload
         （`boresch_params=None` 且盘上已有该文件，默认允许），生产 Boresch
-        工件就会被静默清零；之后 `_boresch_analytic_release` 的
+        工件就会被静默清零；之后 `calculate_boresch_analytical_correction` 的
         `50 <= kr <= 5000` 断言才会崩，而文件已经毁了。
         修法是双向接受裸键与本函数自己的后缀键，并且缺键 fail-closed。
         """
@@ -12180,7 +12663,7 @@ def bake_global_parameter_into_fixed_nonbonded_force(
     记得把它设成这个值"这种纪律来保证安全，是让"忘了设"这条路径在结构上
     就不存在。
 
-    背景（`docs/experiments/STAGE2_CHARGE_TRANSFER_HANDOFF_PROPOSAL.md`）：C3-1 会话诊断
+    背景（`Atenolol-rank11/STAGE2_CHARGE_TRANSFER_HANDOFF_PROPOSAL.md`）：C3-1 会话诊断
     发现的真实 bug——`ibs_engine.build_ibs_dual_system` 会把 charging 配置
     完成后 System 上的 `lam_coul`（默认值 **1.0**）连同它的
     ParticleParameterOffset/ExceptionParameterOffset 原样克隆过去；后续
@@ -12606,7 +13089,7 @@ def create_ligand_internal_coulomb_force(
     本身就不做最小镜像**，它假定成键原子总在同一个周期像里。这不是断言，是可运行的
     判据，见 `tests/test_intramolecular_coulomb_is_lambda_independent.py::
     test_nonbonded_exceptions_ignore_minimum_image`（那里现场建体系、现场算，
-    不抄任何数字）。
+    不抄任何数字）。（2026-09-24 更正：该测试函数在当前仓库里已不存在，全仓 grep 零命中。）
 
     所以配体内部这一段的**唯一正确前提是"坐标到达时分子是完整的"**（靠平移补全，
     见 PBC-01）。在这个前提下最小镜像与直接距离逐位相同，加 PBC 不解决任何问题；
@@ -12701,7 +13184,14 @@ class GeometricRestraintEstimator:
                  # 真正描述了成键的拓扑接近 100%（实测受体 1404/1404）；只零星
                  # 知道几根残基间连接的接近 10%（实测配体 2/19）。0.5 把两者
                  # 分得很开，不是贴着数据挑的边界。
-                 bond_topology_min_coverage=0.5):
+                 bond_topology_min_coverage=0.5,
+                 # 🔑 [2026-09-22] 与 OrbBoreschEstimator 同名同义的两个口径开关。
+                 # 生产走的是 `source=simple` ⟹ **本类**，所以键必须接在这里；
+                 # 只加在 Orb 那个类上等于配置写了没人读（2026-09-22 真机踩过）。
+                 force_constant_mode=DEFAULT_BORESCH_FORCE_CONSTANT_MODE,
+                 anchor_mode=DEFAULT_BORESCH_ANCHOR_MODE):
+        self.force_constant_mode = str(force_constant_mode)
+        self.anchor_mode = str(anchor_mode)
         self.temperature = temperature
         self.gas_constant_kj_per_mol_k = 8.314e-3
         self.search_dist = search_dist
@@ -12998,9 +13488,210 @@ class GeometricRestraintEstimator:
         return unique
 
     # ----------------------------------------------------------------
+    # openfe 档：照 openfe `find_boresch_restraint`（bonded 策略）挑六原子
+    # ----------------------------------------------------------------
+    @staticmethod
+    def _openfe_stable_ss_residues(traj):
+        """openfe stable_secondary_structure_selection：末帧 DSSP 的 H/E 连续段
+        （≥6 残基、两头各去 2），每条链首尾各去 10 残基。返回残基 index 集合。"""
+        from itertools import groupby
+        ss = mdtraj.compute_dssp(traj[-1], simplified=True)[0]
+        keep = set()
+        for chain in traj.topology.chains:
+            res = [r for r in chain.residues if r.is_protein]
+            if len(res) < 10 + 10 + 6:
+                continue
+            for key, grp in groupby(res[10:-10], key=lambda r: ss[r.index]):
+                grp = list(grp)
+                if key in ("H", "E") and len(grp) >= 6:
+                    keep.update(r.index for r in grp[2:-2])
+        return keep
+
+    def _openfe_select_combo(self, traj, ligand_resname):
+        """返回 ((H2, H1, H0), (G0, G1, G2))，与 `_generate_anchor_combos` 同序。
+
+        和老路（≤0.5 nm 接触对 + θ∈[45°,135°]）的差别全在**候选从哪来**：
+          · H0 离 G0 **每帧都在 0.5–1.5 nm**。老路恰好只在 openfe 不要的那一段
+            （≤0.5 nm）里找，再叠 openfe 的淘汰判据，池子被筛空（jnk1 rep3）。
+          · 受体池 = backbone、局部 RMSF < 0.1 nm、DSSP 稳定 H/E（壳内不足 20 个就不筛）。
+            H1/H2 也必须在这个池里，经真实键 H0–H1–H2 连通。
+          · θ 用"不平"判据（½Kθ² ≥ 10kT，K=334.72）代替 [45°,135°]。
+          · 配体三元组按离分子图中心由近到远排；**第一个**能配上合法主机三元组的
+            就用，在它的合法主机三元组里取 Σcircvar(角/二面角)+Var(r/Å) 最小的。
+        """
+        top = traj.topology
+        T = float(self.temperature)
+        k_ang = float(OPENFE_FIXED_KANGLE_KJ_PER_MOL_RAD2)
+        max_phi = float(OPENFE_MAX_ABS_DIHEDRAL_RAD)
+        adjacency = self._build_bond_adjacency(top)
+
+        # ---- 配体侧 ----
+        lig_heavy = top.select(f"resname {ligand_resname} and not element H")
+        if len(lig_heavy) < 3:
+            raise RuntimeError(f"[锚点/openfe] 配体 {ligand_resname} 重原子不足 3 个")
+        lig_adj, self.bond_source_ligand, lig_deep, lig_n = (
+            self._resolve_side_adjacency("配体侧", adjacency, lig_heavy))
+        ref_xyz = traj.xyz[-1]
+        lig_nei = {int(i): self._find_bonded_neighbors(i, lig_heavy, ref_xyz, lig_adj)
+                   for i in lig_heavy}
+        # 分子图中心 = 最长最短路径的中点（openfe get_central_atom_idx；这里只用重原子）
+        longest = []
+        for s0 in lig_nei:
+            prev, order = {s0: None}, [s0]
+            for a in order:
+                for b in lig_nei[a]:
+                    if b not in prev:
+                        prev[b] = a
+                        order.append(b)
+            path = [order[-1]]
+            while prev[path[-1]] is not None:
+                path.append(prev[path[-1]])
+            if len(path) > len(longest):
+                longest = path
+        center = longest[len(longest) // 2]
+
+        ring_pool, pool_note = openfe_ligand_anchor_pool(
+            top, traj, ligand_resname, rmsf_cutoff_nm=OPENFE_RMSF_CUTOFF_NM)
+        print(f"  [锚点/openfe] 配体池：{pool_note}")
+        lig_rmsf = dict(zip(map(int, lig_heavy), local_rmsf_nm(traj, lig_heavy)))
+        rigid_pool = [i for i in map(int, lig_heavy) if lig_rmsf[i] < OPENFE_RMSF_CUTOFF_NM]
+
+        def guest_triples(pool):
+            pool = sorted(map(int, pool), key=lambda i: np.linalg.norm(ref_xyz[i] - ref_xyz[center]))
+            in_pool = set(pool)
+            out = []
+            for a in pool:
+                for b in pool:
+                    if b not in lig_nei[a]:
+                        continue
+                    for c in pool:
+                        if c != a and c in lig_nei[b]:
+                            out.append((a, b, c))
+            return out
+
+        # ponytail: openfe 在芳香档要求三元组落在同一个环里；这里只要求三个都在池里
+        # （差别只在稠环桥头 / 联苯键上的三元组，几何上同样刚性）。
+        # 芳香池配不上时再试刚性重原子池（openfe 在这里直接报错）。
+        triples = guest_triples(ring_pool)
+        triples += [t for t in guest_triples(rigid_pool) if t not in set(triples)]
+        if triples:
+            gang = mdtraj.compute_angles(traj[-1], np.asarray(triples))[0]
+            triples = [t for t, a in zip(triples, gang)
+                       if abs(np.cos(a)) <= OPENFE_COLLINEAR_ABS_COS]
+        if not triples:
+            raise RuntimeError("[锚点/openfe] 配体池里没有成键、不共线的 G0-G1-G2 三元组")
+
+        # ---- 受体侧 ----
+        backbone = top.select("protein and backbone")
+        if len(backbone) < 3:
+            raise RuntimeError("[锚点/openfe] 受体 backbone 原子不足 3 个")
+        # 键覆盖度按整条 backbone 判（拓扑质量问题），不是按 RMSF 筛后的子集
+        prot_adj, self.bond_source_receptor, prot_deep, prot_n = (
+            self._resolve_side_adjacency("受体锚点侧", adjacency, backbone))
+        self.bond_coverage = {
+            "receptor_two_deep_chain_starts": int(prot_deep),
+            "receptor_n_atoms": int(prot_n),
+            "ligand_two_deep_chain_starts": int(lig_deep),
+            "ligand_n_atoms": int(lig_n),
+        }
+        host = backbone[local_rmsf_nm(traj, backbone) < OPENFE_RMSF_CUTOFF_NM]
+        try:
+            ss_res = self._openfe_stable_ss_residues(traj)
+        except Exception as exc:  # noqa: BLE001 —— DSSP 只是筛子，算不动就不筛
+            print(f"  [锚点/openfe] DSSP 失败（{exc!r}），不做二级结构筛选")
+            ss_res = set()
+        host_ss = np.array([top.atom(int(h)).residue.index in ss_res for h in host], dtype=bool)
+        print(f"  [锚点/openfe] 受体池：backbone {len(backbone)} → RMSF<{OPENFE_RMSF_CUTOFF_NM} nm "
+              f"{len(host)}（其中 DSSP 稳定 H/E {int(host_ss.sum())}）")
+
+        def all_frames_collinear(*angle_arrays):
+            col = np.zeros_like(angle_arrays[0], dtype=bool)
+            for a in angle_arrays:
+                col |= np.abs(np.cos(a)) > OPENFE_COLLINEAR_ABS_COS
+            return col.all(axis=0)
+
+        shell_cache = {}
+        for n_tried, (g0, g1, g2) in enumerate(triples, 1):
+            if g0 not in shell_cache:
+                d = mdtraj.compute_distances(traj, np.column_stack([host, np.full(len(host), g0)]))
+                shell_cache[g0] = np.all((d > OPENFE_HOST_MIN_DISTANCE_NM)
+                                         & (d <= OPENFE_HOST_MAX_DISTANCE_NM), axis=0)
+            shell = shell_cache[g0]
+            cand = host[shell & host_ss] if int((shell & host_ss).sum()) >= 20 else host[shell]
+            if len(cand) == 0:
+                continue
+            # H0 预筛（openfe EvaluateHostAtoms1，参照 G0-G1-G2）
+            th = mdtraj.compute_angles(traj, np.column_stack(
+                [cand, np.full(len(cand), g0), np.full(len(cand), g1)]))
+            ph = mdtraj.compute_dihedrals(traj, np.column_stack(
+                [cand, np.full(len(cand), g0), np.full(len(cand), g1), np.full(len(cand), g2)]))
+            thg = mdtraj.compute_angles(traj, np.array([[g0, g1, g2]]))
+            ok0 = (openfe_angle_not_flat(th, k_ang, T).all(axis=0)
+                   & (np.abs(ph) <= max_phi).all(axis=0)
+                   & (circular_std_rad(th) < OPENFE_MAX_ANGLE_CIRCSTD_RAD)
+                   & (circular_std_rad(ph) < OPENFE_MAX_DIHEDRAL_CIRCSTD_RAD)
+                   & ~all_frames_collinear(th, np.broadcast_to(thg, th.shape)))
+            in_cand = set(map(int, cand))
+            props = []
+            for h0 in map(int, cand[ok0]):
+                for h1 in prot_adj.get(h0, ()) if prot_adj else self._find_bonded_neighbors(
+                        h0, cand, ref_xyz, None):
+                    if h1 not in in_cand:
+                        continue
+                    for h2 in prot_adj.get(h1, ()) if prot_adj else self._find_bonded_neighbors(
+                            h1, cand, ref_xyz, None):
+                        if h2 != h0 and h2 in in_cand:
+                            props.append((int(h2), int(h1), h0))
+            if not props:
+                continue
+            P = np.asarray(props)
+            G = np.tile([g0, g1, g2], (len(P), 1))
+            A = np.hstack([P, G])  # H2 H1 H0 G0 G1 G2
+            r = mdtraj.compute_distances(traj, A[:, [2, 3]])
+            thA = mdtraj.compute_angles(traj, A[:, [1, 2, 3]])
+            thB = mdtraj.compute_angles(traj, A[:, [2, 3, 4]])
+            thH = mdtraj.compute_angles(traj, A[:, [0, 1, 2]])
+            phis = [mdtraj.compute_dihedrals(traj, A[:, [i, i + 1, i + 2, i + 3]]) for i in range(3)]
+            ok = (openfe_angle_not_flat(thA, k_ang, T).all(axis=0)
+                  & openfe_angle_not_flat(thB, k_ang, T).all(axis=0)
+                  & (circular_std_rad(thA) < OPENFE_MAX_ANGLE_CIRCSTD_RAD)
+                  & (circular_std_rad(thB) < OPENFE_MAX_ANGLE_CIRCSTD_RAD)
+                  & ~all_frames_collinear(thH, thA, thB, np.broadcast_to(thg, thA.shape)))
+            for p in phis:
+                ok &= (np.abs(p) <= max_phi).all(axis=0)
+                ok &= circular_std_rad(p) < OPENFE_MAX_DIHEDRAL_CIRCSTD_RAD
+            if not ok.any():
+                continue
+            score = (sum(_scipy_circvar(p, -np.pi, np.pi) for p in phis)
+                     + _scipy_circvar(thA, 0.0, np.pi) + _scipy_circvar(thB, 0.0, np.pi)
+                     + np.var(r * 10.0, axis=0))
+            score[~ok] = np.inf
+            best = int(np.argmin(score))
+            print(f"  [锚点/openfe] 第 {n_tried}/{len(triples)} 个配体三元组 {(g0, g1, g2)} 配上："
+                  f"H0 候选 {int(ok0.sum())}/{len(cand)}，主机三元组 {int(ok.sum())}/{len(P)} 合法")
+            self.openfe_selection = {
+                "ligand_pool_note": pool_note,
+                "guest_triple_rank": int(n_tried),
+                "n_guest_triples": int(len(triples)),
+                "n_host_pool": int(len(host)),
+                "n_h0_valid": int(ok0.sum()),
+                "n_host_triples_valid": int(ok.sum()),
+                "score": float(score[best]),
+            }
+            return tuple(map(int, P[best])), (int(g0), int(g1), int(g2))
+
+        raise RuntimeError(
+            f"[锚点/openfe] {len(triples)} 个配体三元组都配不上合法的 H0-H1-H2"
+            f"（受体池 {len(host)} 个 backbone 原子，距 G0 {OPENFE_HOST_MIN_DISTANCE_NM}–"
+            f"{OPENFE_HOST_MAX_DISTANCE_NM} nm、|φ|≤150°、θ 不平）。配体池：{pool_note}")
+
+    # ----------------------------------------------------------------
     # 主估算函数
     # ----------------------------------------------------------------
-    def estimate_from_trajectory(self, traj, ligand_resname, output_path=None):
+    def estimate_from_trajectory(self, traj, ligand_resname, output_path=None,
+                                 anchor_traj=None):
+        """`anchor_traj`（仅 openfe 档）：只用它**选锚点原子**，平衡值仍取 `traj`。
+        复现模式传输入结构（所有 rep 同一帧）⟹ 各 rep 锚点原子逐位相同。"""
         top = traj.topology
 
         # 1. 受体锚点候选原子 (基于原子名)
@@ -13009,13 +13700,17 @@ class GeometricRestraintEstimator:
         if len(prot_indices) == 0:
             raise RuntimeError(f"没有找到锚点原子：{self.anchor_atom_names}")
 
-        # 2. 配体重原子
-        lig_heavy = top.select(f"resname {ligand_resname} and not element H")
-        if len(lig_heavy) == 0:
-            raise RuntimeError(f"未找到配体 {ligand_resname} 的重原子")
-
-        # 3. 化学连通组合枚举
-        combos = self._generate_anchor_combos(traj, prot_indices, lig_heavy)
+        # 2-3. 候选组合。openfe 档自己挑好唯一一组（见 `_openfe_select_combo`），
+        # 下面的几何/平衡值/力常数流程两档共用。
+        self.openfe_selection = None
+        if self.anchor_mode == "openfe":
+            combos = [self._openfe_select_combo(
+                traj if anchor_traj is None else anchor_traj, ligand_resname)]
+        else:
+            lig_heavy = top.select(f"resname {ligand_resname} and not element H")
+            if len(lig_heavy) == 0:
+                raise RuntimeError(f"未找到配体 {ligand_resname} 的重原子")
+            combos = self._generate_anchor_combos(traj, prot_indices, lig_heavy)
         print(f"  化学连通候选组合数: {len(combos)}")
         if len(combos) == 0:
             raise RuntimeError("没有符合条件的6原子组合")
@@ -13084,7 +13779,41 @@ class GeometricRestraintEstimator:
         avg_angB = np.mean(angles_b, axis=0)
         banned = (avg_angA < np.deg2rad(45)) | (avg_angA > np.deg2rad(135)) | \
                  (avg_angB < np.deg2rad(45)) | (avg_angB > np.deg2rad(135))
+        if self.anchor_mode == "openfe":
+            # openfe 档已用"θ 不平"（½Kθ² ≥ 10kT）逐帧选过，不再叠 [45°,135°]
+            banned[:] = False
         total_var[banned] = np.inf
+
+        if self.anchor_mode == "openfe":
+            # openfe 口径的三条额外禁选（我们原来只有 [45°,135°] 那一条）：
+            #   · 任一帧 |φ| > 150°  —— 别选贴着 ±π 缠绕边界的二面角。我们原来靠
+            #     periodic_unwrap 事后展开，展开能算对方差，但**选**的还是那个
+            #     一抖就翻号的候选（runabfe 那条"旧缓存含末帧二面角反号"）。
+            #   · 角/二面角的圆标准差上限 —— 方差评分是加权和，某一项特别散会被
+            #     其它项摊掉；这两条是逐项硬上限，摊不掉。
+            _wrapped = lambda a: np.angle(np.exp(1j * a))  # noqa: E731
+            max_abs_phi = np.max(np.abs(np.stack([
+                _wrapped(diheds_a), _wrapped(diheds_b), _wrapped(diheds_c)])),
+                axis=(0, 1))
+            ang_cs = np.maximum(circular_std_rad(angles_a), circular_std_rad(angles_b))
+            dih_cs = np.max(np.stack([
+                circular_std_rad(diheds_a), circular_std_rad(diheds_b),
+                circular_std_rad(diheds_c)]), axis=0)
+            openfe_banned = (
+                (max_abs_phi > OPENFE_MAX_ABS_DIHEDRAL_RAD)
+                | (ang_cs >= OPENFE_MAX_ANGLE_CIRCSTD_RAD)
+                | (dih_cs >= OPENFE_MAX_DIHEDRAL_CIRCSTD_RAD)
+            )
+            if anchor_traj is not None:
+                # 锚点已由 anchor_traj 钉死（复现模式）：本 rep 轨迹上不合 openfe
+                # 判据只报警，不换锚点、不中止 —— 换了就不再是同一个束缚态定义。
+                if bool(np.any(openfe_banned)):
+                    print("  [WARN][锚点/openfe] 钉死的锚点在本 rep 预平衡轨迹上"
+                          "越过 |φ|≤150° 或圆标准差上限（仅诊断，锚点不变）")
+            else:
+                total_var[openfe_banned] = np.inf
+                print(f"  [锚点/openfe] 额外禁选 {int(np.sum(openfe_banned))}/"
+                      f"{len(total_var)} 个候选（|φ|>150° 或圆标准差超限）")
 
         # 🔑 核心修复：拦截全 inf 灾难
         if np.all(np.isinf(total_var)):
@@ -13126,9 +13855,23 @@ class GeometricRestraintEstimator:
         }
         fc = {}
         clipped_flags = {}
-        for key, raw_value in raw_fc.items():
-            lower, upper = force_constant_ranges[key]
-            fc[key], clipped_flags[key] = self._clip_force_constant(raw_value, lower, upper)
+        if self.force_constant_mode == "openfe_fixed":
+            # 力常数是**设置项**，不从轨迹拟合（openfe restraint_utils/settings.py）：
+            # 挑锚点去适配固定的 K，而不是拟合 K 去适配挑中的锚点。
+            # 拟合档的角力常数被 clip 在 [10, 1000]，而实测经常压在下限 10
+            # （真机 2026-09-22 cyclod rep1：kphiB=10 正好贴地板）⟹
+            # σ_θ=√(kT/K)≈0.5 rad≈29°，鬼影配体因此摆得动、在 λ 中段撞腔壁。
+            fc = {
+                "kr": float(OPENFE_FIXED_KR_KJ_PER_MOL_NM2),
+                **{k: float(OPENFE_FIXED_KANGLE_KJ_PER_MOL_RAD2)
+                   for k in ("kthetaA", "kthetaB", "kphiA", "kphiB", "kphiC")},
+            }
+            clipped_flags = {k: False for k in fc}
+        else:
+            for key, raw_value in raw_fc.items():
+                lower, upper = force_constant_ranges[key]
+                fc[key], clipped_flags[key] = self._clip_force_constant(
+                    raw_value, lower, upper)
 
         fluctuation_diagnostics = [
             self._fluctuation_diagnostics(dists[:, best_idx], "r"),
@@ -13174,6 +13917,7 @@ class GeometricRestraintEstimator:
                     ) else None
                 ),
                 "n_angle_banned_candidates": int(np.sum(banned)),
+                "openfe_selection": self.openfe_selection,
                 "best_total_variance_score": float(total_var[best_idx]),
                 "fluctuation_distribution": fluctuation_diagnostics,
                 "n_non_gaussian_or_under_sampled_terms": int(n_bad_diag),
@@ -13206,7 +13950,7 @@ class GeometricRestraintEstimator:
 
 
 # ============================================================================
-# 8. Orbv3 → DEXP 拟合流水线 (从 DEXP_class.py 合并)
+# 8. Orbv3 → DEXP 拟合流水线 (从 DEXP_class.py 合并)（2026-09-24 更正：该流水线已从本分支删除，本节为空）
 # ============================================================================
 
 

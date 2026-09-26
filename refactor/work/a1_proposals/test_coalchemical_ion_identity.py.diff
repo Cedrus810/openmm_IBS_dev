@@ -1,0 +1,29 @@
+--- a/tests/test_coalchemical_ion_identity.py
++++ b/tests/test_coalchemical_ion_identity.py
+@@ -48,6 +48,8 @@
+ 
+ import abfe_core as core
+ import ibs_engine as ie
++import textwrap
++import abfe_pipeline
+ 
+ # 与 test_audit_protocol_regressions.py 同口径：这些网络文件系统上 Path.resolve()
+ # 可能抛错，只取词法绝对路径。
+@@ -169,7 +171,7 @@
+ 
+     多一个调用点就等于多一次"按当时坐标重新选"的机会，MEM-00c 就回来了。
+     """
+-    src = (ROOT / "ibs_engine.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(ie)))
+     # 定义 1 次 + 调用 1 次；docstring/注释里的提及不带左括号，不会被算进来。
+     assert src.count("_select_bulk_water_counterion(") == 2, (
+         "`_select_bulk_water_counterion(` 的出现次数变了。它必须只有"
+@@ -537,7 +539,7 @@
+ 
+ def test_pipeline_freezes_once_persists_and_reverifies_on_resume():
+     """`abfe_pipeline` 侧的三件事：只选一次、落盘、resume 只读核对。"""
+-    src = (ROOT / "abfe_pipeline.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(abfe_pipeline)))
+ 
+     # 唯一选择入口在 pipeline 里只被调用一次（在 resolve_co_alchemical_ion_spec 内部）。
+     # import 那行是 `    select_co_alchemical_ion_once,`，不带左括号，不计入。

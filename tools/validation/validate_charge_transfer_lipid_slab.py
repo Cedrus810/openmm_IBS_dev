@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""C2：无蛋白 lipid–water slab charge-transfer 验证（docs/status/memtodolist.md「C2」/
-docs/status/memtodolist_archive.md「C2. protein-free lipid slab 测试」）。
+"""C2：无蛋白 lipid–water slab charge-transfer 验证（Atenolol-rank11/memtodolist.md「C2」/
+Atenolol-rank11/memtodolist_archive.md「C2. protein-free lipid slab 测试」）。
 
 PROTOCOL_VERSION = 11（见下方常量）——每次升级都是 Hamiltonian 或电荷账目层面的
 硬 bug 修复，旧版本产物**必须作废重建**，不允许跳过版本检查继续用：

@@ -52,6 +52,7 @@ from abfe_core import (
     image_molecules_by_system,
     ACESoftcorePotential, UnitFormatter, calculate_boresch_analytical_correction,
     calc_boresch_from_last_frame, GeometricRestraintEstimator, OrbBoreschEstimator,
+    DEFAULT_BORESCH_FORCE_CONSTANT_MODE, DEFAULT_BORESCH_ANCHOR_MODE,
     DEXPSurrogatePotential, LambdaDependentBoreschForce, ensure_owned_system,
     NumpyEncoder, THERMODYNAMIC_CYCLE_DOC, assess_boresch_harmonicity,  # ✅ 统一从 abfe_core 导入
     # [P1-12] final-result 统一 schema/sanity gate（三处共用：pipeline cache
@@ -420,7 +421,10 @@ MAIN_SYSTEM_CACHE_PROTOCOL_VERSION = 3
 # 静默选错身份）。
 # ⚠️ 升版本会让**所有**已有溶剂腿盒缓存重建（盒构建只要几十秒；真正贵的 stage
 # 采样缓存由 `_stage_protocol_key` 单独把关，不受本版本号影响）。
-SOLVENT_CACHE_PROTOCOL_VERSION = 7
+# 7 → 8（2026-09-23）：溶剂腿配体扭转此前全为 0 项（ligand_only.xml 无编号属性被
+# ForceField 静默跳过）、离子是 amber14 而非 top 的参数；现在两者都从 top 拷入。
+# 旧盒缓存是另一个分子，必须重建（stage 缓存靠 system_xml_sha256 随之失效；2026-09-24 更正：`_system_xml_hash` 自 09-09 起恒返回 None，这个字段不会变，靠不住它让 stage 缓存失效；修复前的旧缓存已由维护者 09-24 手动清掉。以后再改溶剂建系，要么手动清缓存，要么给 stage 缓存另加失效手段）。
+SOLVENT_CACHE_PROTOCOL_VERSION = 8
 DEFAULT_SOLVENT_IONIC_STRENGTH_MOLAR = 0.15
 SOLVENT_PADDING_NM = 1.5
 
@@ -682,6 +686,19 @@ def find_gmx_include_dir(user_path: Optional[str] = None) -> Optional[str]:
     它现在会走到最后的 warning 分支并返回 None。这是**有意的 fail-loud**——
     好过继续依赖一条不在仓库控制范围内的机器本地路径。
     """
+    # 🔑🔑 [2026-09-20] 显式给了路径却不存在 ⟹ **当场报错**，不静默往下走。
+    # 原来这里只是条件不成立、继续去试 GMXLIB/GMXDATA/猜测路径：用户明明指定了
+    # 力场目录，实际却用了另一棵 include 树，而 include 树决定 GROMACS 解析出的
+    # 力场文件、进而决定 `system_xml_sha256`/`topology_sha256` —— 这是**静默换
+    # 力场版本**，不是"优雅降级"。本函数末尾那条 warning+None 是"哪都没找到"的
+    # fail-loud，同一个精神这里也该有。没给路径（None/空）照旧往下走，不受影响。
+    if user_path and not os.path.exists(user_path):
+        raise FileNotFoundError(
+            f"显式指定的 GROMACS 力场目录不存在：{user_path!r}。"
+            "拒绝静默回落到 GMXLIB/GMXDATA/猜测路径 —— 那会换掉整棵 include 树，"
+            "解析出的力场文件与拓扑哈希都会变，而日志上看不出来。"
+            "请修正 --gmx-path / config 的 gmx_path，或者干脆不指定它。"
+        )
     if user_path and os.path.exists(user_path):
         # 🔑 [2026-08-31] `gmx_path` 允许写 GROMACS **安装前缀**，不必一路写到
         # `share/gromacs/top`。
@@ -998,6 +1015,21 @@ def solvent_cache_exists(
 _TRAJ_STRICT_VALIDITY_CACHE: Dict[Tuple[str, int, float], bool] = {}
 
 
+def _adopt_pre_equilibrated_state_or_raise(pipeline: "ABFEPipeline", label: str) -> None:
+    """预平衡已判定完成而跳过重跑时，读回平衡末态；读不回就 fail closed。
+
+    equilibrium_is_done() 刚用真实 loadCheckpoint 确认过 pre_equil.chk 可用，
+    此时读不回说明盘上状态自相矛盾 —— 继续跑就是在输入坐标/输入盒上采样。
+    """
+    if not pipeline.adopt_pre_equilibrated_state():
+        raise RuntimeError(
+            f"{label}预平衡已判定完成，但读不回平衡末态（pre_equil_final_state.npz / "
+            "pre_equil.chk 缺失或身份不符）。拒绝在输入坐标/输入盒上继续；"
+            "请 --reset 重跑预平衡。"
+        )
+    log.info(f"{label}预平衡已完成，跳过重跑；已读回平衡末态（坐标 + NPT 均值盒）")
+
+
 def _checkpoint_probe_simulation(pipeline: "ABFEPipeline"):
     """为 checkpoint 校验建一个一次性目标 Simulation（P1-07）。
 
@@ -1010,7 +1042,7 @@ def _checkpoint_probe_simulation(pipeline: "ABFEPipeline"):
     ## 为什么不缓存（2026-09-09）
 
     这里原本把建好的 probe `setattr` 到 pipeline 上当缓存，为的是同一个 pipeline
-    被查两次（`runabfe` 里 3576 与 6931）时省一次构建。代价是：一整个 30710 原子的
+    被查两次（`runabfe` 里 3576 与 6931；2026-09-24 更正：这是当时的行号，已漂移，现以各处 `equilibrium_is_done(` 调用为准）时省一次构建。代价是：一整个 30710 原子的
     System + Context **从预平衡判定那一刻挂到整条腿跑完**，纯属白占。
     而它省下的只有几秒，在一条跑几小时的腿上没有意义。
 
@@ -1131,9 +1163,14 @@ def equilibrium_is_done(
     # 从零重跑）。由同仓另一会话复核指出，已于同日一并改为只告警。两侧现在一致。
     fp_file = os.path.join(output_dir, "pre_equilibration_fingerprint.json")
     if not os.path.isfile(fp_file):
+        # 🔑 [2026-09-20] 文案改过：这里确实不影响**指纹**那一层的判定，但同一个
+        # 文件在下面还要提供"目标步数"，读不到时整条 MEM-09 门保守判未完成、
+        # 直接 `return False`。原文案说"不影响判定"，排查的人会以为缺它无所谓，
+        # 而实际现象恰恰是旧 run 永远过不了完成门。
         log.info(
             "[INFO] 缺少 pre_equilibration_fingerprint.json（可能来自更早的运行）；"
-            "不影响判定，继续按 pipeline_state.json 的完成状态决定。"
+            "指纹这一层不作判定 —— 但下面读不到**目标步数**时会保守判为未完成"
+            "（加 --resume 可从 Checkpoint 续跑，不会白烧已完成的部分）。"
         )
     else:
         try:
@@ -1567,13 +1604,6 @@ def generate_ligand_xml_from_top(
     stable_names = _build_stable_ligand_atom_names(top, ligand_resname)
     global_to_local = {g: l for l, g in enumerate(lig_idx)}
     atoms = list(top.topology.atoms())
-    lig_set = set(lig_idx)
-    bond_neighbors: Dict[int, set] = {idx: set() for idx in lig_idx}
-    for bond in top.topology.bonds():
-        i, j = bond.atom1.index, bond.atom2.index
-        if i in lig_set and j in lig_set:
-            bond_neighbors[i].add(j)
-            bond_neighbors[j].add(i)
 
     # 不再依赖 GromacsTopFile 的私有字段；直接用 createSystem() 后的真实 OpenMM 力参数。
     extracted_system = top.createSystem(
@@ -1605,23 +1635,6 @@ def generate_ligand_xml_from_top(
     nb_force = nb_candidates[0]
     bond_forces = _forces_of(openmm.HarmonicBondForce)
     angle_forces = _forces_of(openmm.HarmonicAngleForce)
-    torsion_forces = _forces_of(openmm.PeriodicTorsionForce)
-
-    def classify_torsion(p1: int, p2: int, p3: int, p4: int) -> Tuple[str, Tuple[int, int, int, int]]:
-        atoms4 = (p1, p2, p3, p4)
-        if (
-            p2 in bond_neighbors.get(p1, ())
-            and p3 in bond_neighbors.get(p2, ())
-            and p4 in bond_neighbors.get(p3, ())
-        ):
-            return "Proper", atoms4
-
-        for center in atoms4:
-            outer = [x for x in atoms4 if x != center]
-            if all(x in bond_neighbors.get(center, ()) for x in outer):
-                return "Improper", (center, outer[0], outer[1], outer[2])
-
-        return "Proper", atoms4
 
     unique_names: Dict[int, str] = {int(i): stable_names[int(i)] for i in lig_idx}
 
@@ -1643,7 +1656,7 @@ def generate_ligand_xml_from_top(
             )
     xml_lines += ["    </Residue>", "  </Residues>"]
 
-    n_written = {"bond": 0, "angle": 0, "torsion": 0}
+    n_written = {"bond": 0, "angle": 0}
     xml_lines.append("  <HarmonicBondForce>")
     for bond_force in bond_forces:
         for bidx in range(bond_force.getNumBonds()):
@@ -1673,22 +1686,12 @@ def generate_ligand_xml_from_top(
                 )
     xml_lines.append("  </HarmonicAngleForce>")
 
-    xml_lines.append("  <PeriodicTorsionForce>")
-    for torsion_force in torsion_forces:
-        for tidx in range(torsion_force.getNumTorsions()):
-            p1, p2, p3, p4, periodicity, phase, k = torsion_force.getTorsionParameters(tidx)
-            p1, p2, p3, p4 = int(p1), int(p2), int(p3), int(p4)
-            if all(x in unique_names for x in (p1, p2, p3, p4)):
-                n_written["torsion"] += 1
-                torsion_tag, ordered = classify_torsion(p1, p2, p3, p4)
-                t1, t2, t3, t4 = ordered
-                xml_lines.append(
-                    f'    <{torsion_tag} class1="T{t1}" class2="T{t2}" class3="T{t3}" class4="T{t4}" '
-                    f'periodicity="{int(periodicity)}" '
-                    f'phase="{phase.value_in_unit(unit.radian):.8f}" '
-                    f'k="{k.value_in_unit(unit.kilojoule_per_mole):.8f}"/>'
-                )
-    xml_lines.append("  </PeriodicTorsionForce>")
+    # 🔑🔑 [2026-09-23] **扭转不走 XML。** 这里曾写 `periodicity=/phase=/k=`（无编号），
+    # 而 OpenMM ForceField 只认 `periodicity1/phase1/k1`（forcefield.py `'phase%d'`）
+    # ⟹ 每个模板静默 0 项，benchmark 13/13 个体系溶剂腿配体**没有任何扭转**，
+    # 而复合物腿（GromacsTopFile）有 ⟹ 两腿不是同一个分子。补编号也不够：同一四元组
+    # 多项时 ForceField 只匹配一条。扭转改由 `_overwrite_solvent_leg_terms_from_top`
+    # 在 createSystem 之后直接从 top 的 System 逐项拷入。
 
     xml_lines.append('  <NonbondedForce coulomb14scale="0.833333" lj14scale="0.5">')
     for i in lig_idx:
@@ -1718,12 +1721,6 @@ def generate_ligand_xml_from_top(
             for i in range(f.getNumAngles())
             if all(int(x) in unique_names for x in f.getAngleParameters(i)[:3])
         ),
-        "torsion": sum(
-            1
-            for f in torsion_forces
-            for i in range(f.getNumTorsions())
-            if all(int(x) in unique_names for x in f.getTorsionParameters(i)[:4])
-        ),
     }
     if n_written != expected:
         raise RuntimeError(
@@ -1742,8 +1739,8 @@ def generate_ligand_xml_from_top(
             "带着这样的参数跑，分子是软的（P0-13）。"
         )
     log.info(
-        "  [OK] [P0-13] 配体成键项对账通过: bond=%d angle=%d torsion=%d（源体系逐项相同）",
-        n_written["bond"], n_written["angle"], n_written["torsion"],
+        "  [OK] [P0-13] 配体成键项对账通过: bond=%d angle=%d（扭转在建系后从 top 拷入）",
+        n_written["bond"], n_written["angle"],
     )
 
     os.makedirs(output_dir, exist_ok=True)
@@ -1752,6 +1749,89 @@ def generate_ligand_xml_from_top(
         f.write("\n".join(xml_lines))
     log.info("[OK] 已生成配体 XML: %s", out_path)
     return out_path
+
+
+def _overwrite_solvent_leg_terms_from_top(
+    system: openmm.System,
+    solvent_topology: app.Topology,
+    top_system: openmm.System,
+    gmx_topology: app.Topology,
+    top_to_solvent: Dict[int, int],
+) -> Dict[str, int]:
+    """[2026-09-23] 让溶剂腿的配体扭转与离子 LJ **只有 top 一个来源**（与复合物腿同源）。
+
+    溶剂腿走 ForceField 重建，两处与复合物腿（GromacsTopFile）对不上：
+      1. 配体扭转：`ligand_only.xml` 的扭转被 ForceField 静默读成 0 项（见
+         `generate_ligand_xml_from_top`）；用户给的 ffxml 也未必与 top 相同。
+      2. 离子：amber14 给 Joung–Cheatham，复合物 top 给自己的离子参数。
+    这里把 System 里配体内部扭转全部置零，再按 top 逐项拷入；离子 σ/ε 按元素取 top 的值
+    （电荷不动：reserved co-ion dummy 随后会清零电荷）。
+    """
+    lig_top = set(top_to_solvent)
+    for f in top_system.getForces():
+        if isinstance(f, (openmm.RBTorsionForce, openmm.CustomTorsionForce)):
+            hits = sum(
+                all(int(a) in lig_top for a in f.getTorsionParameters(i)[:4])
+                for i in range(f.getNumTorsions())
+            )
+            if hits:
+                raise RuntimeError(
+                    f"top 里配体有 {hits} 项 {f.__class__.__name__}；溶剂腿只拷 "
+                    "PeriodicTorsionForce，拒绝静默丢项（先把这类项接进来）。"
+                )
+
+    solv_tors = [f for f in system.getForces() if isinstance(f, openmm.PeriodicTorsionForce)]
+    if not solv_tors:
+        solv_tors = [openmm.PeriodicTorsionForce()]
+        system.addForce(solv_tors[0])
+    lig_solv = set(top_to_solvent.values())
+    for f in solv_tors:
+        for i in range(f.getNumTorsions()):
+            p1, p2, p3, p4, per, phase, _k = f.getTorsionParameters(i)
+            if all(int(a) in lig_solv for a in (p1, p2, p3, p4)):
+                f.setTorsionParameters(i, p1, p2, p3, p4, per, phase, 0.0)
+    n_tors = 0
+    for f in top_system.getForces():
+        if not isinstance(f, openmm.PeriodicTorsionForce):
+            continue
+        for i in range(f.getNumTorsions()):
+            p1, p2, p3, p4, per, phase, k = f.getTorsionParameters(i)
+            quad = [int(a) for a in (p1, p2, p3, p4)]
+            if all(a in lig_top for a in quad):
+                solv_tors[0].addTorsion(*[top_to_solvent[a] for a in quad], per, phase, k)
+                n_tors += 1
+
+    def _single_atom_residue_elements(topology):
+        out = {}
+        for res in topology.residues():
+            atoms = list(res.atoms())
+            if len(atoms) == 1 and atoms[0].element is not None:
+                out.setdefault(atoms[0].element.symbol, []).append(atoms[0].index)
+        return out
+
+    top_nb = next(f for f in top_system.getForces() if isinstance(f, openmm.NonbondedForce))
+    solv_nb = next(f for f in system.getForces() if isinstance(f, openmm.NonbondedForce))
+    top_ions = _single_atom_residue_elements(gmx_topology)
+    n_ions = 0
+    for elem, idxs in _single_atom_residue_elements(solvent_topology).items():
+        if elem not in top_ions:
+            log.warning(
+                "  [WARN] 复合物 top 里没有 %s 离子，溶剂腿 %d 个 %s 保留 ForceField 参数",
+                elem, len(idxs), elem,
+            )
+            continue
+        params = {
+            (p[1].value_in_unit(unit.nanometer), p[2].value_in_unit(unit.kilojoule_per_mole))
+            for p in (top_nb.getParticleParameters(i) for i in top_ions[elem])
+        }
+        if len(params) != 1:
+            raise RuntimeError(f"复合物 top 里 {elem} 离子有 {len(params)} 套 LJ 参数，无法确定用哪套")
+        sigma, epsilon = params.pop()
+        for i in idxs:
+            q = solv_nb.getParticleParameters(i)[0]
+            solv_nb.setParticleParameters(i, q, sigma, epsilon)
+            n_ions += 1
+    return {"ligand_torsions": n_tors, "ions": n_ions}
 
 
 # ---------------------------------------------------------------------------
@@ -2521,6 +2601,8 @@ def build_and_cache_solvent_leg(
     离子集合里且电荷严格为 0"这个坐标无关的判据认出它（`_identify_reserved_neutral_co_ions`），
     `abfe_core.build_co_alchemical_ion_identity` 冻结成可落盘身份。复合物腿的输入
     拓扑靠建系脚本预先带上同一种粒子，两条腿殊途同归，不需要两套判据。
+    （2026-09-24 更正：09-16 起复合物腿输入里没有 dummy 时，由 `_ensure_complex_reserved_coions`
+    经 `_derive_gromacs_inputs_with_reserved_coions` 派生 .gro/.top 插入；手工预留的输入照旧可用。）
     """
     padding_nm = float(padding_nm)
     log.info("正在构建溶剂相 (配体腿) 系统并生成缓存...")
@@ -2583,7 +2665,7 @@ def build_and_cache_solvent_leg(
         atom.name = stable_names[int(top_idx)]
     log.info("  [OK] 配体原子名已按 .top 稳定映射重命名并对齐 XML")
 
-    # 4. 复用/生成配体 XML + TIP3P 水
+    # 4. 复用/生成配体 XML + 水模型（从复合物 .top 反推，不固定 TIP3P）
     ffxml_path = resolve_ligand_ffxml(output_dir, ligand_resname, explicit_path=ligand_ffxml)
     if ffxml_path is None:
         ffxml_path = generate_ligand_xml_from_top(
@@ -2712,6 +2794,25 @@ def build_and_cache_solvent_leg(
             nonbondedCutoff=SOLVENT_NONBONDED_CUTOFF_NM * unit.nanometer,
             constraints=app.HBonds,
             rigidWater=True,
+        )
+        # 扭转与离子 LJ 以 top 为唯一来源（见 _overwrite_solvent_leg_terms_from_top）。
+        solv_lig_atoms = [
+            a.index for a in modeller.topology.atoms() if a.residue.name == ligand_resname
+        ]
+        if len(solv_lig_atoms) != len(top_lig_indices):
+            raise RuntimeError(
+                f"溶剂腿配体原子数 {len(solv_lig_atoms)} ≠ top {len(top_lig_indices)}"
+            )
+        overwritten = _overwrite_solvent_leg_terms_from_top(
+            system,
+            modeller.topology,
+            gmx_top.createSystem(nonbondedMethod=app.NoCutoff, constraints=None),
+            gmx_top.topology,
+            dict(zip(top_lig_indices, solv_lig_atoms)),
+        )
+        log.info(
+            "  [OK] 从 top 拷入配体扭转 %d 项、离子 LJ %d 个",
+            overwritten["ligand_torsions"], overwritten["ions"],
         )
 
         if reserved_coion_indices:
@@ -3058,11 +3159,15 @@ def load_native_system(
     # 后面 6243/6466 处重算的指纹就与落盘的那份（用初始坐标算的）不符，
     # `pre_equilibrate()` 也会判自己的 checkpoint 失效 —— 结果是**每次 resume
     # 都从零重跑预平衡**，比现在什么都不做更糟。
+    # （2026-09-24 更正：09-09 起 `positions_sha256` 已从 `_pre_equilibration_fingerprint()` 移除，
+    # 坐标不再进预平衡身份，上面这段的前提已不成立；6243/6466 也是当时的行号。）
     #
     # 现状是自洽的：坐标始终取身份绑定的初始坐标，预平衡的复用完全交给
     # pipeline 侧那两处带 simulation 的严格判定。所以这里显式写死 False 并留下
     # 依据，既不改行为、也不再发误导性警告。真要复用平衡末帧，先另开一项把坐标
     # 从预平衡指纹里摘出去（那是协议变更，不是这里能顺手做的）。
+    # [2026-09-23] 末态读回已在 pipeline 侧落地（`adopt_pre_equilibrated_state`，
+    # 由 resolve_boresch_restraint / run_full_pipeline 调用）；这里仍只恢复输入坐标。
     # ------------------------------------------------------------------
     equil_cache_trusted = False
     if prefer_equilibrated and expected_pre_equilibration_fingerprint is None:
@@ -3313,6 +3418,31 @@ def _coerce_positive_seed(raw: Any, origin: str) -> int:
     if seed <= 0:
         raise SystemExit(f"{origin} 必须是正整数，收到 {raw!r}")
     return seed
+
+
+def _attachment_leg_seed(config) -> int:
+    """attachment 腿的 seed。有 `repeat_seed` 就按 EXP-019 台账派生，没有沿用旧常量。
+
+    🔑🔑 [2026-09-20] 这里原来是写死的 `config.get("attachment_seed", 20260728)`，
+    而 defaults 无条件播种了这个键 ⟹ `RunConfig.get` 永远命中 `self.data` ⟹ 无论
+    `--seed` / `ABFE_RANDOM_SEED` 解析出什么，traditional 模式两个 attachment 调用点
+    拿到的都是同一个常量：所有"独立重复"的 ΔG_attach **逐位相同**，跨重复 σ 被系统性
+    低估，而 `main()` 的日志白纸黑字写着"两腿/预平衡/attachment/采样统一使用该值"。
+    IBS 路径（`abfe_pipeline` 的 stage0 组装处）08-31 就改成按台账派生了，traditional
+    这条在那次修复面之外。
+
+    leg 固定 `"complex"`：attachment 腿永远长在复合物腿上，与 IBS 路径同一把钥匙
+    （同 phase/stage/window/stream 四元组 ⟹ 同一个 seed）。
+    """
+    repeat_seed = config.get("repeat_seed")
+    if repeat_seed is None:
+        return int(config.get("attachment_seed", 20260728))
+    from ibs_engine import Exp019SeedLedger
+    return int(
+        Exp019SeedLedger(int(repeat_seed), "complex").derive(
+            "attachment", "stage0", "global", "integrator"
+        )
+    )
 
 
 def _resolve_repeat_seed(
@@ -3829,9 +3959,11 @@ def _write_run_provenance(
         # Keep it only as an explicitly deprecated audit record so old readers
         # can see what was supplied, but never let resume/provenance consumers
         # treat it as the spec actually used by either leg.
+        # `RunConfig.get` 是 `if key in self.data: return self.data[key]`，而 defaults
+        # 无条件播种了 `"co_alchemical_ion": None` ⟹ 第二个参数**永远取不到**。
+        # 留着一个恒不触发的兜底只会让读代码的人以为它还有一条回落路径。
         provenance["deprecated_global_co_alchemical_ion_input"] = config.get(
-            "co_alchemical_ion",
-            charge_protocol.get("co_alchemical_ion"),
+            "co_alchemical_ion"
         )
         provenance["coion_identity"] = None
         provenance["coion_identity_deprecated"] = True
@@ -4085,7 +4217,7 @@ def run_self_tests() -> int:
 
     # ⚠️ 这只是纯数学工具函数 pme_self_correction_energy_kj 自身的符号单元测试，
     # 不代表生产路径会应用它：apply_pme_self_correction 在生产代码里永远是 False
-    # （见 ibs_engine.py 附近注释与 PHYSICS_DEFECTS.md #撤销 +C*lambda^2 修正），
+    # （见 ibs_engine.py 附近注释与 Atenolol-rank11/PHYSICS_DEFECTS.md #撤销 +C*lambda^2 修正），
     # OpenMM 的 NonbondedForce ParameterOffset 已经在每个 λ 态里正确算出完整
     # PME 自能，不需要也不应该再手动叠加这个修正。这两个函数只作为历史遗留
     # 工具保留，供未来若要做“已验证的带电荷体系协同炼金中和循环”时复用。
@@ -4275,14 +4407,11 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
         # checkpoint 以真实 loadCheckpoint 成功为准。
         simulation=_checkpoint_probe_simulation(pipeline),
     ):
-        # ⚠️ 措辞如实：这里**没有**把平衡末帧读回 pipeline.positions（坐标经
-        # positions_sha256 进 _pre_equilibration_fingerprint，读回会让指纹自相矛盾、
-        # 每次 resume 都重跑预平衡；见 load_native_system 里那段说明）。跳过的是
-        # 计算，用的仍是身份绑定的初始坐标 —— 真要复用平衡末帧属协议变更。
-        log.info(
-            "基线预平衡已完成，跳过重跑（注意：坐标仍为身份绑定的初始坐标，"
-            "未读回平衡末帧）"
-        )
+        # 🔑 [2026-09-23] 读回平衡末态（坐标 + NPT 均值盒）。原来这里刻意不读回、
+        # 坐标和盒退回输入值，再平衡从那里起跑并写进此后一直被信任的
+        # rebalance.chk ⟹ 复合物腿在输入盒上采样（cyclod_ligand1 大 4.9%）。
+        # 旧理由"读回会让预平衡指纹自相矛盾"自 09-09 坐标移出身份后已不成立。
+        _adopt_pre_equilibrated_state_or_raise(pipeline, "基线")
     else:
         log.info("▶️ 执行基线预平衡")
         pipeline.pre_equilibrate(
@@ -4292,7 +4421,7 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
             # 🔑 [2026-09-09] 原来不传这个参数，于是走 `pre_equilibrate` 的默认
             # `True`，`enable_equilibration_convergence_stop: false` 这个配置项
             # **完全无效**。`run_full_pipeline` 那条路径是转发的
-            # （abfe_pipeline.py:10149），但真正跑满 5M 步基线预平衡的是**这一条**
+            # （abfe_pipeline.py:10149；2026-09-24 更正：行号已漂移，现为 run_full_pipeline 里 `enable_convergence_stop=getattr(...)` 那处），但真正跑满 5M 步基线预平衡的是**这一条**
             # —— 到 run_full_pipeline 时 equilibrium_is_done 已经是 True、整段跳过。
             # 结果：用户明确关掉早停，运行仍然在 4.25M/5M 步收敛早停，
             # 而 `equilibrium_is_done` 又把它当"合法早停"接受，生产系综实际起自
@@ -4350,10 +4479,20 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
         getattr(config, "gmx_include_dir", None) or find_gmx_include_dir(getattr(config, "gmx_path", None))
     )
 
+    def _orb_estimator():
+        # 🔑 [2026-09-24 CODE_REVIEW #2] 两个口径开关同样要喂给 Orb 估算器
+        # （它的 __init__ 不收 config，self.config 只有 DEFAULT_CONFIG）。
+        # 两个 orb 调用点共用这一处，别再各写各的。
+        from abfe_core import OrbBoreschEstimator
+        est = OrbBoreschEstimator(temperature=config.temperature)
+        est.config["boresch_force_constant_mode"] = str(
+            config.get("boresch_force_constant_mode", DEFAULT_BORESCH_FORCE_CONSTANT_MODE))
+        est.config["boresch_anchor_mode"] = str(config.get("boresch_anchor_mode", DEFAULT_BORESCH_ANCHOR_MODE))
+        return est
+
     # 根据来源调用不同估算器
     if source == "auto":
-        from abfe_core import OrbBoreschEstimator
-        estimator = OrbBoreschEstimator(temperature=config.temperature)
+        estimator = _orb_estimator()
         import mdtraj as md
         traj = md.load(traj_file, top=traj_top)
         # 自动估算（默认使用最后 5ns）
@@ -4374,21 +4513,43 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
         # 🔁 原来的 "simple"：基于 ORB/MACE-OFF 口袋力投影的单候选估算，
         # 需要加载 MACE-OFF 模型 (受限许可证)。改名以避免跟下面纯几何的
         # "simple" 混淆——如果不想用 MACE，请用 "simple" 或 "fluctuation"。
-        from abfe_core import OrbBoreschEstimator
         import mdtraj as md
         traj = md.load(traj_file, top=traj_top)
-        estimator = OrbBoreschEstimator(temperature=config.temperature)
+        estimator = _orb_estimator()
         boresch = estimator.estimate_from_trajectory(traj, config.ligand, output_path=boresch_file)
 
     elif source in ("simple", "fluctuation"):
         # ✅ 传统方法：纯几何涨落估算 (mdtraj 距离/角度/二面角方差 + 等配分定理)，
         # 不加载任何力场/ML 势，不需要 MACE-OFF 许可证。"simple" 是 "fluctuation" 的别名。
+        # 🔑 [2026-09-22] 两个口径开关必须接在**这里** —— 生产走的就是这条
+        # (`source=simple`)。只加在 OrbBoreschEstimator 上等于 config 写了没人读
+        # （真机 cyclod_ligand1/rep1 22:01 那次：config 写了 openfe_fixed，
+        # 日志里照样是拟合出来的 kphiB=10，正好贴 clip 地板）。
         estimator = GeometricRestraintEstimator(
-            temperature=config.temperature, allow_geometric_bond_fallback=False
+            temperature=config.temperature, allow_geometric_bond_fallback=False,
+            force_constant_mode=str(
+                config.get("boresch_force_constant_mode", DEFAULT_BORESCH_FORCE_CONSTANT_MODE)),
+            anchor_mode=str(config.get("boresch_anchor_mode", DEFAULT_BORESCH_ANCHOR_MODE)),
         )
         import mdtraj as md
         traj = md.load(traj_file, top=traj_top)
-        boresch = estimator.estimate_from_trajectory(traj, config.ligand, output_path=boresch_file)
+        # 🔑 [2026-09-24] 复现模式：锚点原子从**输入结构**选（所有 rep、所有机器同一帧），
+        # 不从本 rep 的预平衡轨迹选 —— 否则每个 rep 选出不同原子 = 不同束缚态定义
+        # （09-23 复现批 cmet L1 三个 rep 两端锚点全不同）。平衡值仍取本 rep 轨迹。
+        anchor_traj = None
+        if config.get("stage2_uniform_lambda_states") and estimator.anchor_mode == "openfe":
+            gro = config.gro
+            report = os.path.join(output_dir, RESERVED_COION_DERIVED_DIRNAME,
+                                  RESERVED_COION_REPORT_BASENAME)
+            if os.path.isfile(report):
+                with open(report, "r", encoding="utf-8") as fh:
+                    gro = json.load(fh)["derived_gro"]
+            g = md.load(gro)
+            anchor_traj = md.Trajectory(g.xyz, traj_top, unitcell_lengths=g.unitcell_lengths,
+                                        unitcell_angles=g.unitcell_angles)
+            log.info("[复现模式] Boresch 锚点原子从输入结构选: %s", gro)
+        boresch = estimator.estimate_from_trajectory(
+            traj, config.ligand, output_path=boresch_file, anchor_traj=anchor_traj)
         boresch["geometry_convention_version"] = BORESCH_GEOMETRY_CONVENTION_VERSION
         boresch["real_bond_protocol_version"] = BORESCH_REAL_BOND_PROTOCOL_VERSION
     else:
@@ -4477,7 +4638,23 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
         boresch["diagnostics"]["boresch_harmonicity_check"] = {"ok": False, "reason": f"exception:{e}"}
 
     # 裁剪力常数到安全范围
-    if "force_constants" in boresch:
+    # 🔑🔑 [2026-09-22] **固定档不参与这次裁剪。**
+    # `boresch_force_constant_mode="openfe_fixed"` 下力常数是**设置项**（kr=4184、
+    # 角项 334.72），裁一个设定值没有意义 —— 而下面 kr 的上限正是 2000，会把
+    # 4184 悄悄裁成 2000。真机 cyclod_ligand1/rep1 22:17 实测：五个角项 334.7 都
+    # 对，唯独 kr=2000，就是被这里裁的。
+    # 顺带一条读数：拟合档下 kr **每次都恰好是 2000**（09-10 / 今天 18:35 / 22:05
+    # 三次都是），说明拟合值一直顶着这个上限 —— 那个上限在拟合档也值得重新看，
+    # 但那是另一件事，这里只让固定档绕过去。
+    _fixed_fc_mode = str(
+        config.get("boresch_force_constant_mode", DEFAULT_BORESCH_FORCE_CONSTANT_MODE)) == "openfe_fixed"
+    if _fixed_fc_mode and "force_constants" in boresch:
+        boresch.setdefault("diagnostics", {})["force_constant_post_clip_skipped"] = (
+            "openfe_fixed：力常数是设置项，不做最终裁剪（kr 上限 2000 会裁掉 4184）"
+        )
+        log.info("  Boresch 力常数走固定档（openfe_fixed），跳过最终裁剪：%s",
+                 {k: round(float(v), 2) for k, v in boresch["force_constants"].items()})
+    if "force_constants" in boresch and not _fixed_fc_mode:
         fc = boresch["force_constants"]
         # 🔑 这套范围必须跟 abfe_core.py 里另外两处对力常数的处理保持完全一致，
         # 否则同一个物理量在不同阶段被裁到不同的上限，等于悄悄改写了估计器
@@ -4680,7 +4857,7 @@ def build_parser() -> argparse.ArgumentParser:
     #     λ_coul≠0 会硬性拒绝（CustomNonbondedForce 不支持 PME，真实电荷放进
     #     去会被截断成 cutoff 库仑，物理不可信），所以去电荷阶段走的是
     #     NonbondedForce ParameterOffset + 传统 REMD/MBAR，保留完整 PME 长程
-    #     静电。这是本仓库当前推荐路线（见 README「当前推荐路线」）。
+    #     静电。这是本仓库当前推荐路线（见 docs/GETTING_STARTED.md「命令入口」的 `--decharge-method` 条目）。
     #   - "shadow_ibs"（实验性，尚未经独立物理验证，生产结果不要用它）：改走
     #     Shadow-Coulomb IBS——用 erfc(alpha*r)/r 短程"影子"库仑 CV（Ewald 实
     #     空间形式，可以合法塞进 CustomNonbondedForce）做真正的 IBS 多态偏置
@@ -5182,9 +5359,20 @@ def _analyze_dual_leg_artifacts(base_dir, temperature, *, expected_context=None)
                 current_coion_identity=expected_context.get("co_alchemical_ion_runtime_identity"),
                 current_stage_protocol_key=expected_key,
             )
+            # 🔑 [2026-09-22] 独立端点段**默认关闭**（abfe_pipeline.py 的
+            # `_independent_endpoint_enabled`，2026-09-02 决定）。这里以前无条件排掉
+            # 末窗、无条件去要 endpoint artifact，而默认 run 根本不产那个文件 ⟹
+            # **默认 run 的 --analyze 必然抛错**。两边现在读同一个开关（run_config
+            # 的 kwargs，就是 pipeline 那侧读的同一份），前提也逐字对齐：显式打开
+            # 且窗口数 >= 2。开着的时候一切照旧 fail-closed。
+            endpoint_enabled = (
+                kind == "vdw"
+                and bool(kwargs.get("stage2_independent_endpoint", False))
+                and len(ranges) >= 2
+            )
             # The production route replaces the final vdW window with a
             # separately sampled endpoint segment. Never invent its frames.
-            excluded = {len(ranges)-1} if kind == "vdw" else set()
+            excluded = {len(ranges)-1} if endpoint_enabled else set()
             windows = engine.load_ibs_window_outputs_from_dir(
                 stage_dir, ranges, lambdas if kind == "coul" else [0.0]*n_states,
                 [1.0]*n_states if kind == "coul" else lambdas,
@@ -5194,7 +5382,7 @@ def _analyze_dual_leg_artifacts(base_dir, temperature, *, expected_context=None)
                 current_sampling_score_sha256=((protocol.get("run_config") or {}).get("residual_sampling") or {}).get("sampling_score_sha256") if kind == "vdw" else None,
             )
             endpoint = None
-            if kind == "vdw":
+            if endpoint_enabled:
                 try:
                     endpoint = pipeline_module._endpoint_analysis_artifact(
                         checkpoint_dir, stage_protocol_key=expected_key,
@@ -5202,6 +5390,16 @@ def _analyze_dual_leg_artifacts(base_dir, temperature, *, expected_context=None)
                     )
                 except FileNotFoundError as exc:
                     raise RuntimeError("回退分析拒绝用纯 IBS 窗口产出 vanishing 主值；缺少已验证的独立端点拼接结果") from exc
+            elif kind == "vdw" and os.path.isfile(
+                os.path.join(checkpoint_dir, pipeline_module.ENDPOINT_ANALYSIS_FILENAME)
+            ):
+                # 反向也必须 fail-closed：盘上有端点段产物，说明那次 run 的末窗是由
+                # 逐态端点段出的；开关却是关的 ⟹ 两边不一致。此时按纯 IBS 末窗出值
+                # 会**静默**给出一个跟生产不同的数，比报错危险得多。
+                raise RuntimeError(
+                    "checkpoint 里存在独立端点分析产物，但 run_config 没有打开 "
+                    "stage2_independent_endpoint：开关与产物不一致，拒绝按纯 IBS 末窗出值"
+                )
             if cached is None:
                 if protocol.get("decharge_method") == "shadow_ibs":
                     raise RuntimeError("Shadow-IBS 回退缺少已验证的 bridge + IBS 阶段结果，不能只累计 IBS 段")
@@ -5220,8 +5418,15 @@ def _analyze_dual_leg_artifacts(base_dir, temperature, *, expected_context=None)
                     [1.0]*n_states if kind == "coul" else lambdas,
                 )
                 validator._populate_stage_diagnostics(cached)
+                # 🔑 [2026-09-22] 这里曾经在下一行再叠一道
+                # `pipeline_module._assert_sampling_result_converged(cached, ...)`。
+                # 那个门是 **traditional 腿专用**（见它的 docstring：判
+                # `result["converged"] is True`），而 `solve_stage_integrated` 的
+                # `converged` 键 2026-09-15 就删了 ⟹ 它对**任何** IBS stage 结果恒为
+                # `converged=None` ⟹ `--analyze` 复算 vdW 腿必然抛错，与数据好坏无关。
+                # IBS/stage 结果的硬不变量门是下面这行（判 `analysis_status`），
+                # fail-closed 一点没放松。
                 validator._assert_stage_result_sane(name, cached)
-                pipeline_module._assert_sampling_result_converged(cached, context=name)
         elif cached is None:
             raise RuntimeError("PME decharging 缺少协议验证后的 stage checkpoint；不能用 IBS 回退")
         stages[name] = cached
@@ -5386,7 +5591,7 @@ def run_post_analysis(args):
             err_solvent = float(solvent_leg["total_error_kJ_mol"])
             # ✅ 同下方 "else" 分支的既有约定：total_delta_G_complex_kJ_mol 已经把
             # Boresch 释放修正烘焙进去了（见 abfe_pipeline.py total_dg = dg_phys +
-            # cons_correction + dg_boresch），所以循环闭合时绝不能再减一次，
+            # dg_boresch；约束项不在式中），所以循环闭合时绝不能再减一次，
             # 否则同一个 Boresch 修正会被计入两遍。
             boresch_included_in_complex_dg = True
         else:
@@ -5875,10 +6080,7 @@ def run_traditional_mode(config: RunConfig):
         # [P1-07] checkpoint 以目标 Simulation 的真实 loadCheckpoint 成功为准。
         simulation=_checkpoint_probe_simulation(traditional_baseline),
     ):
-        log.info(
-            "traditional 基线预平衡已完成，跳过重跑（坐标仍为初始坐标，"
-            "未读回平衡末帧）"
-        )
+        _adopt_pre_equilibrated_state_or_raise(traditional_baseline, "traditional 基线")
     else:
         log.info("▶️ 执行 traditional 基线预平衡")
         traditional_baseline.pre_equilibrate(
@@ -5922,7 +6124,7 @@ def run_traditional_mode(config: RunConfig):
                 equil_steps_per_state=int(config.get("attachment_equil_steps_per_state", 50_000)),
                 steps_per_sample=int(config.get("attachment_steps_per_sample", 1_000)),
                 platform_name=config.platform,
-                seed=int(config.get("attachment_seed", 20260728)),
+                seed=_attachment_leg_seed(config),
                 n_seeds=int(config.get("attachment_n_seeds", 1)),
                 output_dir=os.path.join(output_dir, "traditional_attachment"),
                 log=log.info,
@@ -6000,10 +6202,7 @@ def run_traditional_mode(config: RunConfig):
         expected_fingerprint=_solv_equil_fingerprint,
         simulation=_checkpoint_probe_simulation(solvent_baseline),
     ):
-        log.info(
-            "traditional 溶剂腿基线预平衡已完成，跳过重跑（坐标仍为初始坐标，"
-            "未读回平衡末帧）"
-        )
+        _adopt_pre_equilibrated_state_or_raise(solvent_baseline, "traditional 溶剂腿基线")
     else:
         log.info("▶️ 执行 traditional 溶剂腿基线预平衡")
         solvent_baseline.pre_equilibrate(
@@ -6457,7 +6656,7 @@ def _run_boresch_attachment_only(
         equil_steps_per_state=int(config.get("attachment_equil_steps_per_state", 50_000)),
         steps_per_sample=int(config.get("attachment_steps_per_sample", 1_000)),
         platform_name=config.platform,
-        seed=int(config.get("attachment_seed", 20260728)),
+        seed=_attachment_leg_seed(config),
         n_seeds=int(config.get("attachment_n_seeds", 1)),
         output_dir=os.path.join(rerun_dir, "attachment"),
         log=log.info,
@@ -6902,14 +7101,56 @@ def _path_evolution_kwargs(config) -> dict:
     ranges = config.get("stage2_window_ranges")
     if ranges:
         out["stage2_window_ranges"] = [[int(a), int(b)] for a, b in ranges]
+    # 🔑 [2026-09-22] 复现模式：等分 λ 表的态数。设了才透传（同本函数 docstring
+    # 的理由：无条件塞键会让全部现有缓存失配）。abfe_pipeline 那侧会据此钉死
+    # λ 表，并强制关掉 path_evolution / 自治控制器 / 插 λ 预算；它还**要求**
+    # 同时给 stage2_window_ranges。
+    uniform_states = config.get("stage2_uniform_lambda_states")
+    if uniform_states is not None:
+        out["stage2_uniform_lambda_states"] = int(uniform_states)
+    # 🔑 [2026-09-23] 复现节奏轮数 + 逐轮倾斜（+1 左 / 0 中 / -1 右）。设了才透传；
+    # 两个键都在 abfe_pipeline._NON_IDENTITY_KWARGS 里，不进 stage 指纹。
+    _repro_cycles = config.get("stage2_repro_fk_cycles")
+    if _repro_cycles is not None:
+        out["stage2_repro_fk_cycles"] = int(_repro_cycles)
+    _repro_tilts = config.get("stage2_repro_fk_tilt_signs")
+    if _repro_tilts is not None:
+        out["stage2_repro_fk_tilt_signs"] = [int(x) for x in _repro_tilts]
+    # 🔑 [2026-09-25] stage2 轮次控制器（第一轮左/中/右、之后缺啥补啥）。
+    # 开关**只在为真时**透传（进 vanishing 指纹：换的是采样协议）；不设 / false ⟹ 老路径逐字不变。
+    # 其余是计划参数，设了才透传，全部在 abfe_pipeline._NON_IDENTITY_KWARGS 里、不进身份。
+    if bool(config.get("stage2_lcr_rounds", False)):
+        out["stage2_lcr_rounds"] = True
+    for _k, _cast in (
+        ("stage2_lcr_tilt_kT", float),
+        ("stage2_lcr_trust_floor_kT", float),
+        ("stage2_lcr_trust_min_ess", float),
+        ("stage2_lcr_sigma_tol_kJ", float),
+        ("stage2_lcr_max_rounds", int),
+        ("stage2_lcr_burn_in_steps", int),
+        ("stage2_lcr_zero_window_end_shift_kT", float),
+    ):
+        if config.get(_k) is not None:
+            out[_k] = _cast(config.get(_k))
+    # 🔑 [2026-09-22] attachment 腿两道**收敛**门（BAR/TI 一致 + split-half）要不要
+    # 阻断。不设时：复现模式下默认**不阻断**（只记录），其余情况默认阻断。
+    # 显式设了就以它为准，两种模式都能覆盖。
+    _attach_gates = config.get("attachment_enforce_convergence_gates")
+    if _attach_gates is not None:
+        out["attachment_enforce_convergence_gates"] = bool(_attach_gates)
+    # 🔑 [2026-09-22] 软核 LJ 指数 (a, b)。不设 = 生产默认 (1, 1)（09-24 起，
+    # = openfe/openmmtools 口径；此前默认 (2, 2)）。换它作废全部窗口缓存。
+    _power_lj = config.get("softcore_power_lj")
+    if _power_lj is not None:
+        out["softcore_power_lj"] = [int(x) for x in _power_lj]
     criterion = config.get("stage2_window_partition")
     if criterion is not None:
         out["stage2_window_partition"] = str(criterion)
     n_windows = config.get("stage2_n_windows")
     if n_windows is not None:
         out["stage2_n_windows"] = int(n_windows)
-    # 🔑 [2026-09-15] 耦合端（win0）专用的态数上限。理由与代价见 abfe_config.json
-    # 里同名键的 `_comment`；它进 `_PREOPT_DERIVED_PATH_KEYS`，改动作废全部窗口缓存。
+    # 🔑 [2026-09-15] 耦合端（win0）专用的态数上限。理由与代价见本文件 PRESET_CONFIGS
+    # production 预设里同名键的注释；它进 `_PREOPT_DERIVED_PATH_KEYS`，改动作废全部窗口缓存。
     first_cap = config.get("stage2_first_window_max_states")
     if first_cap is not None:
         out["stage2_first_window_max_states"] = int(first_cap)
@@ -7075,7 +7316,7 @@ def _leg_sampling_drift(leg_results) -> Dict[str, Any]:
     """这条腿 stage-2 的半程漂移与**未采用**的 σ 下界，压成一小块摘要。
 
     两个量都只是把 `stage_diagnostics.stage2` 里已经算好的数搬出来，不重算、
-    不改判：`sigma_inflation_applied` 原样带出，默认仍是 `False`（P1-19 的决定 ——
+    不改判：`sigma_inflation_applied` 原样带出（2026-09-24 更正：`inflate_sigma_from_split_half` 现默认 True，不再默认 `False`）（P1-19 的决定 ——
     要不要采用这个下界是使用者的事）。搬出来的唯一理由是**汇总文件里看得见**。
     """
     s2 = ((leg_results or {}).get("stage_diagnostics") or {}).get("stage2") or {}
@@ -7961,7 +8202,7 @@ def main():
         output_dir=output_dir,
         checkpoint_dir=os.path.join(output_dir, "checkpoints"),
         platform_name=config.platform,
-        # 膜体系只影响复合物腿（memtodolist §3.2 / docs/TODO.md 的膜受体前置条）。
+        # 膜体系只影响复合物腿（Atenolol-rank11/memtodolist.md §3.2 / docs/archive/MEMBRANE_LINE_PLAN_2026-08-11.md）。
         # 协议在这里解析，即在创建任何 Context 之前完成 fail-closed 检查（§6.1）。
         environment_type=config.get("system_type"),
         membrane=config.get("membrane"),
@@ -8240,6 +8481,11 @@ def main():
             inflate_sigma_from_split_half=bool(
                 config.get("inflate_sigma_from_split_half", True)
             ),
+            # 🔑 [2026-09-20] split-half 漂移门阈值（默认 None = 只诊断不阻断，
+            # 逐位不变）。同上：本函数逐键枚举往 run_full_pipeline 传参，不写这行
+            # 配置里写了也进不去 kwargs。判据是总量 z 与逐窗 z **都**超才算
+            # 前后半程不一致 —— 只看逐窗会把"窗口间归属重排"误判成漂移。
+            split_half_max_z=config.get("split_half_max_z"),
             decoupling_scheme=config.decoupling,
             potential_type=config.potential,
             dexp_params=dexp_params,
@@ -8504,6 +8750,8 @@ def main():
         inflate_sigma_from_split_half=bool(
             config.get("inflate_sigma_from_split_half", True)
         ),
+        # 🔑 [2026-09-20] 与复合物腿同一个阈值，两腿必须同口径。
+        split_half_max_z=config.get("split_half_max_z"),
         decoupling_scheme=config.decoupling,
         potential_type=config.potential,
         dexp_params=dexp_params,
@@ -8656,7 +8904,7 @@ def main():
     # 🔑 [ATT-09] 循环闭合统一走 abfe_core.combine_binding_free_energy，
     # 不再在这里手写公式。这里 dg_complex 取自 total_delta_G_complex_kJ_mol，
     # Boresch 释放项已经烘焙在里面（abfe_pipeline: total_dg = dg_phys +
-    # cons_correction + dg_boresch），所以 already_included=True，不再减第二次。
+    # dg_boresch；约束项不在式中），所以 already_included=True，不再减第二次。
     _constraint_identity = _assert_matching_ligand_constraint_identity(
         pipeline.system,
         pipeline.ligand_indices,
@@ -8830,7 +9078,7 @@ def main():
             )} if _reservoir_omitted else {}),
         # ✅ complex_delta_G_kJ_mol 来自 total_delta_G_complex_kJ_mol，已经在
         # abfe_pipeline.py 里把 Boresch 释放修正烘焙进去 (total_dg = dg_phys +
-        # cons_correction + dg_boresch)；下面 delta_g_bind_uncorrected 没有再单独
+        # dg_boresch；约束项不在式中)；下面 delta_g_bind_uncorrected 没有再单独
         # 减一次 dg_boresch。这里显式标记，避免下游看到 boresch_correction_kJ_mol
         # 和 complex_delta_G_kJ_mol 并列就误以为还需要再手动扣一次。
         "boresch_correction_already_included_in_complex_delta_G": True,

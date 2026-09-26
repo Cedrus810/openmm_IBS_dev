@@ -38,6 +38,8 @@ ABFE 主线：
 | `step_guard.py` | OpenMM 积分步进的统一异常出口 | **模块级** import ×3，缺了它四个入口模块全部 `ModuleNotFoundError` |
 | `lambda_path_versions.py` | Stage-2 λ 路径的版本记录（路径演化时不丢已完成的工作） | 惰性 ×6 |
 | `multi_segment_analysis.py` | 多采样段分析适配层：同一窗口的多段采样**相加**而不是替换 | 惰性 ×5 |
+| `stage2_rounds.py` | stage 2 轮次控制器的纯函数层（第一轮左/中/右、之后缺啥补啥；倾斜、信赖域、段间 jackknife、`plan_next_round`）。设计见 [docs/design/PROPOSAL_stage2_lcr_rounds_2026-09-24.md](docs/design/PROPOSAL_stage2_lcr_rounds_2026-09-24.md) | 惰性（`abfe_pipeline._run_stage2_rounds`）；开关 `stage2_lcr_rounds` 默认关 |
+| `stage2_rounds_evidence.py` | stage 2 轮次控制器的逐窗证据数值层（合并 MBAR 复用 `multi_segment_analysis`；ESS / top-1% / 留一段 / 第一轮各段 ESS / 相邻重叠） | 惰性（同上） |
 | `apbs_correction.py` | Rocklin 有限尺寸静电修正（膜 ABFE 用） | 惰性；当前不在主线路径上 |
 | `outer_lambda_neural_basis.py` | 外层 λ 神经基势 | `local_residual.openmm_plugin` 的依赖，属于生产启动路径 |
 

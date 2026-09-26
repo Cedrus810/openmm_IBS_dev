@@ -1,6 +1,6 @@
 """P0-12a/b：配体构象诊断 + 跨腿一致性门 + 起始构象进溶剂腿缓存身份。
 
-对应 `docs/status/memtodolist.md` §3.0 末条与 `docs/TODO.md` 的 P0-12。
+对应 `Atenolol-rank11/memtodolist.md` §3.0 末条与 `docs/archive/TODO_2026-08-06_unreconciled.md` 的 P0-12。
 
 ## 缺陷是什么
 
@@ -281,7 +281,7 @@ def test_solvent_cache_identity_includes_the_start_conformer():
     runabfe = pytest.importorskip("runabfe")
     # 5 → 6（2026-08-05，B4）：manifest 加了 reserved co-ion 字段，版本号继续往上走，
     # 但本测试关心的仍是"升过版本号"这件事本身，不是具体数值。
-    assert runabfe.SOLVENT_CACHE_PROTOCOL_VERSION == 7, (
+    assert runabfe.SOLVENT_CACHE_PROTOCOL_VERSION >= 7, (
         "身份口径变了必须升版本号，否则旧缓存会被静默复用"
     )
     src = (ROOT / "runabfe.py").read_text(encoding="utf-8")

@@ -161,9 +161,14 @@ def test_reconcile_leaves_sampled_and_legacy_entries_alone(tmp_path):
 # ③ 合并求解：只采信 SAMPLED，且 fail-closed 的 replaced 集合同口径
 # --------------------------------------------------------------------------
 def _wire_solver(pipe, monkeypatch, loaded):
-    import ibs_engine
+    # [2026-09-20] 补丁打在 **abfe_pipeline** 上，不是 ibs_engine 上。
+    # 以前能打在 ibs_engine 上，是因为被测函数体内有一句
+    # `from ibs_engine import solve_stage_integrated as _solve`（每次调用重新取属性）。
+    # 那种换名裸调已经被收掉了（所有 stage 求解走 `_solve_stage_with_config_gates`，
+    # 用的是模块顶层导入的名字），所以按 Python 的常规做法打在使用处。
+    import abfe_pipeline
     monkeypatch.setattr(
-        ibs_engine, "solve_stage_integrated",
+        abfe_pipeline, "solve_stage_integrated",
         lambda **k: {"converged": True, "n_outputs": len(k["window_outputs"])},
         raising=False,
     )

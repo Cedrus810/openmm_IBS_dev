@@ -388,7 +388,7 @@ REQUIRED_DIAGNOSTIC_KEYS = [
     "production_rescue_targets",
     # [P1-19] 真正的生产 split-half 审计此前算出来就被丢弃，final_results.json
     # 无处可查最终轨迹前后半程是否漂移；见
-    # docs/experiments/P1-19_ONLINE_SLIDING_WINDOW_SPLITHALF_MISMATCH.md。
+    # Atenolol-rank11/P1-19_ONLINE_SLIDING_WINDOW_SPLITHALF_MISMATCH.md。
     "split_half_diagnostics",
     "split_half_max_window_z",
     "split_half_max_z_threshold",
@@ -507,12 +507,44 @@ def test_every_direct_solver_call_site_populates_diagnostics():
 
 
 def test_the_two_known_call_sites_are_both_covered():
-    """钉住具体的两处，防止有人把 rescue 分支整个删了让上面那条空过。"""
+    """钉住具体的那几处，防止有人把某条分支整个删了让上面那条空过。
+
+    [2026-09-20] 结构变了：`solve_stage_integrated` 在 abfe_pipeline 里原本有 6 个
+    直接调用点（其中两个还是 `from ibs_engine import ... as _solve` 的**换名**调用，
+    按函数名的检查看不见它们，三样判据全漏）。现在全部收口到唯一入口
+    `_solve_stage_with_config_gates`，由它统一 solve + populate。
+
+    所以这条从"每个历史调用点自己 populate"升级成更强的两条：入口自己必须
+    solve+populate，且历史上那几个产出 stage 结果的函数都必须**经由入口**拿结果 ——
+    谁也不许绕回去自己调。
+    """
+    import ast as _ast
+
+    entry = "_solve_stage_with_config_gates"
     by_fn = _solve_and_populate_by_function()
-    for name in ("_run_dual_lambda_stage", "run_full_pipeline"):
-        assert name in by_fn, f"{name} 里不再有 solve_stage_integrated 调用？"
-        solves, populates = by_fn[name]
-        assert populates, f"{name} 缺 _populate_stage_diagnostics 调用"
+    assert set(by_fn) == {entry}, (
+        f"除 {entry} 以外还有人直接调 solve_stage_integrated：{sorted(set(by_fn) - {entry})}"
+    )
+    assert by_fn[entry][1], f"{entry} 自己必须调 _populate_stage_diagnostics"
+
+    tree = _ast.parse((REPO_ROOT / "abfe_pipeline.py").read_text(encoding="utf-8"))
+    routed = {
+        fn.name
+        for fn in _ast.walk(tree)
+        if isinstance(fn, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+        and any(
+            isinstance(n, _ast.Call)
+            and isinstance(n.func, _ast.Attribute)
+            and n.func.attr == entry
+            for n in _ast.walk(fn)
+        )
+    }
+    for name in ("_run_dual_lambda_stage", "run_full_pipeline",
+                 "_solve_merged_segments_if_any", "_solve_with_rewindow_children"):
+        assert name in routed, (
+            f"{name} 不再经由 {entry} 求解 —— 绕过它就等于自己维护一套判据阈值"
+            "与诊断填充，而漏了不报错（09-19 那三条 merged 腿就是这么来的）"
+        )
 
 
 def test_shadow_path_still_preserves_its_evidence_some_other_way():

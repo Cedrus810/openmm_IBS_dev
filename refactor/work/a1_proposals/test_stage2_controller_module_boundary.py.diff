@@ -1,0 +1,21 @@
+--- a/tests/test_stage2_controller_module_boundary.py
++++ b/tests/test_stage2_controller_module_boundary.py
+@@ -15,6 +15,9 @@
+ import pathlib
+ 
+ import pytest
++import inspect
++import textwrap
++import abfe_pipeline
+ 
+ pytestmark = pytest.mark.cpu_only
+ 
+@@ -66,7 +69,7 @@
+ def test_relearn_budget_helper_is_actually_callable_from_the_loop():
+     """迁移前这里是 bug：类级 `@staticmethod` 被当**裸名字**调
+     ⟹ `RELEARN_FK_EPOCH` 分支一走到就 `NameError`。"""
+-    src = (ROOT / "abfe_pipeline.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(abfe_pipeline)))
+     assert "_pre.relearn_epoch_required_steps(" in src
+     assert "_need = relearn_epoch_required_steps(" not in src
+     assert "_need = _relearn_epoch_required_steps(" not in src

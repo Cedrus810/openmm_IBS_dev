@@ -88,5 +88,24 @@ for module in ("openmm", "pymbar", "numpy", "scipy"):
         print(f"{module}: 未安装 ({exc})")
 PY
 
-echo "── pytest（排除 needs_gpu）──"
-exec python -m pytest -m "not needs_gpu" "$@"
+# 2026-09-24：默认用 pytest-xdist 并行（串行全量约 260 s，并行约 30–60 s）。
+# 已实测全套在 `--dist loadfile` 下无互踩（结果与串行逐条一致）。
+#   - 调用方自己给了 -n / -p no:xdist / --pdb / -s 就不插手（调试单条时要串行）；
+#   - 环境里没装 xdist 时退回串行，不报错。
+#   - worker 数用 PYTEST_WORKERS 覆盖（默认 16：每个 worker 都要各自 import 一遍
+#     openmm/torch，开太多只是把 CPU 花在重复 import 上）。
+XDIST_ARGS=()
+if python -c 'import xdist' 2>/dev/null; then
+    _serial=0
+    for _a in "$@"; do
+        case "${_a}" in
+            -n|-n*|--numprocesses*|no:xdist|--pdb|--trace|-s|--capture=no) _serial=1 ;;
+        esac
+    done
+    if [[ ${_serial} -eq 0 ]]; then
+        XDIST_ARGS=(-n "${PYTEST_WORKERS:-16}" --dist loadfile)
+    fi
+fi
+
+echo "── pytest（排除 needs_gpu；${XDIST_ARGS[*]:-串行}）──"
+exec python -m pytest -m "not needs_gpu" "${XDIST_ARGS[@]}" "$@"

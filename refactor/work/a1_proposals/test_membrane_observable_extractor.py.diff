@@ -1,0 +1,22 @@
+--- a/tests/test_membrane_observable_extractor.py
++++ b/tests/test_membrane_observable_extractor.py
+@@ -25,6 +25,9 @@
+ md = pytest.importorskip("mdtraj")
+ 
+ import abfe_core as core
++import inspect
++import textwrap
++import runabfe
+ 
+ 
+ N_PER_LEAFLET = 8
+@@ -1038,7 +1041,6 @@
+     # 帧数已不再是判据 ⇒ 上游也不该再算这个数喂进来。
+     from pathlib import Path
+ 
+-    runabfe_src = (Path(__file__).absolute().parents[1] / "runabfe.py").read_text(
+-        encoding="utf-8"
+-    )
++    import inspect as _a1_inspect
++    runabfe_src = textwrap.dedent(_a1_inspect.getsource(runabfe))
+     assert '"expected_pre_equilibration_frames":' not in runabfe_src

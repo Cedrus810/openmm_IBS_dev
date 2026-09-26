@@ -29,37 +29,35 @@
 |---|---|
 | 当前科学状态、结果能不能引用、协议版本 —— **唯一出处** | [STATUS.md](STATUS.md) |
 | 某天改了什么、协议版本为什么跳、破不破缓存 | [CHANGELOG.md](CHANGELOG.md) |
-| **今天有什么挡路的**（P1） | [TODO.md](TODO.md) |
-| 该做但不挡路（P2） | [TODO_P2.md](TODO_P2.md) |
-| **现在明确不做**（P3）—— 想重新论证某条前先查这里 | [TODO_P3.md](TODO_P3.md) |
+| 待办：挡路的（P1）/ 该做不挡路（P2）/ **现在明确不做**（P3，想重新论证某条前先查这里） | [TODO.md](TODO.md)（2026-09-24 起合并成一份，按等级分节） |
 | 能不能发布、还缺什么 | [RELEASE_READINESS_2026-08-31.md](archive/RELEASE_READINESS_2026-08-31.md) |
 | 某份历史材料写过什么（原文在 `Atenolol-rank11`） | [HISTORY_LOG.md](HISTORY_LOG.md) |
 | 拿独立参照真值对生产结果 | [reference_data/README.md](reference_data/README.md) |
 
-待办按优先级分三份，`TODO.md` 是唯一入口。
+待办只有 `TODO.md` 一份（2026-09-24 起 P1/P2/P3 合并，按等级分 §1/§2/§3）。
 
 > ### 📌 每一条待办都必须带重要等级
 >
-> **等级写在编号后面的方括号里**，跟着条目走，不靠它在哪个文件里推断：
+> **等级写在编号后面的方括号里**，跟着条目走，不靠它在哪一节推断：
 >
 > ```
 > - [ ] **S2-N [P1] 块账写侧记 4 个动作、读侧只拦 1 个。** …
 > - [ ] **AUDIT-S2-02 [P2] 判断函数已经 1795 行 / 63 个 return。** …
 > ```
 >
-> | 等级 | 含义 | 落在哪 |
+> | 等级 | 含义 | 落在 `TODO.md` 哪节 |
 > |---|---|---|
-> | `[P1]` | **挡住在推的工作** | [TODO.md](TODO.md) |
-> | `[P2]` | 该做，但不挡路 | [TODO_P2.md](TODO_P2.md) |
-> | `[P3]` | **现在明确不做**（判定不改 / 不是 bug / 暂停 / 押后），每条都要写「理由别重新论证」 | [TODO_P3.md](TODO_P3.md) |
+> | `[P1]` | **挡住在推的工作** | §1 |
+> | `[P2]` | 该做，但不挡路 | §2 |
+> | `[P3]` | **现在明确不做**（判定不改 / 不是 bug / 暂停 / 押后），每条都要写「理由别重新论证」 | §3 |
 >
-> 等级和文件是**两份记录同一件事**，所以：**改优先级 = 同时移动条目和改方括号**，
-> 只改一处就会出现「躺在 `TODO_P2.md` 里标着 `[P1]`」这种查不出来的条目。
-> 清点用等级、不用文件：`grep -rn '\[P1\]' docs/`。
+> 等级和所在节是**两份记录同一件事**，所以：**改优先级 = 同时挪条目和改方括号**，
+> 只改一处就会出现「躺在 §2 里标着 `[P1]`」这种查不出来的条目。
+> 清点用等级、不用节：`grep -n '\[P[123]\]' docs/TODO.md`。
 >
 > 新条目除了等级，还**必须带位置（`文件:行号`）和判据**（怎样算做完）。
 
-已关闭的条目整段移进 `archive/TODO_closed_<日期>.md`，取证在
+已关闭的条目整段移进 [archive/TODO_closed.md](archive/TODO_closed.md)（09-18 起合并成一份，按日期倒序），取证在
 [archive/TODO_evidence_2026-09-16.md](archive/TODO_evidence_2026-09-16.md)。
 
 ## stage-2 控制器（当前主战场）
@@ -85,6 +83,7 @@
 | 主题 | 文档 |
 |---|---|
 | 溶剂腿那 5.5σ 去哪了（主题 09-10 已关闭，文档是 **live 靶子**） | [STAGE2_SOLVENT_LEG_ERROR_BUDGET.md](archive/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md) |
+| 复现（debug）路线：等分 λ、钉死分窗、f_k 固定节奏、从 openfe 借的三件；**全部开关默认关** | [DEBUG_REPRO_MODE_2026-09-22.md](DEBUG_REPRO_MODE_2026-09-22.md) |
 | 换配体重训 local-residual：方案与证据 | [EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md](archive/EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md) |
 | 闭式重训落成什么样（P1 已落地，`EXP-033-P2` 仍开着） | [EXP-033_P1_LANDED_2026-09-12.md](archive/EXP-033_P1_LANDED_2026-09-12.md) |
 | stage-2 后分析：单跑演化报告 / 两跑 A/B 对比 | 脚本 [`stage2_ab_report.py`](../stage2_ab_report.py)（`<run_dir>`｜`--ab <baseline> <cand>`｜`--json`），清单落在 `<run>/checkpoints/controller_comparison_manifest.json` |
@@ -115,7 +114,7 @@
 > grep -rn "docs/[^\"' ]*\.md" *.py tests/*.py tools/*/*.py local_residual/*.py
 > ```
 >
-> 当前仍在 `docs/` 顶层、且被源码引用的：[STAGE2_ROOT_CAUSE_2026-08-28.md](archive/STAGE2_ROOT_CAUSE_2026-08-28.md)、
+> 被源码引用、09-18 起已在 `archive/` 的：[STAGE2_ROOT_CAUSE_2026-08-28.md](archive/STAGE2_ROOT_CAUSE_2026-08-28.md)、
 > [STAGE2_SOLVENT_LEG_ERROR_BUDGET.md](archive/STAGE2_SOLVENT_LEG_ERROR_BUDGET.md)、
 > [PLAN_PATH_REPAIR_2026-09-11.md](archive/PLAN_PATH_REPAIR_2026-09-11.md)、
 > [reference_data/](reference_data/)（`attribute_stage2_solvent_leg_gap.py` 直接读它）。
@@ -126,10 +125,9 @@
 > **这条约定已经按规矩执行过三次**（09-09 `BUG_LOCATION_…` 32 处引用、09-17 四份、
 > 09-18 六份），每次都在同一改动里改完引用并跑链接校验。
 >
-> ⚠️ 反面教材：`.py` 里现存 **28 处**指向 `docs/status/` / `docs/experiments/` /
-> `docs/handoffs/` 的引用（2026-09-09 实测），**那些路径在本分支已不存在**，
-> 原文在 `Atenolol-rank11`。那批当时刻意没改，成了永久的债 —— 这就是为什么
-> 现在移动文档要当场改引用。
+> 📌 2026-09-24 清偿了一笔旧债：`.py` 注释里 62 处指向 `docs/status/` / `docs/experiments/` 的路径（本分支从来没有这两个目录），
+> 全部改成了 `Atenolol-rank11/<文件名>`（那几份原文在 rank11 根目录）；另外 12 处指向已归档 TODO 条目的也改到了 `archive/`。
+> 复查命令：对 `git ls-files '*.py'` 抽出所有 `docs/…\.md` 路径，逐个 `test -e`，应为 0 条坏引用。
 >
 > `docs/` **内部**链接由
 > `tests/test_doc_staleness_contract.py::test_docs_internal_links_resolve` 钉住；
@@ -143,7 +141,7 @@
 | 发现的性质 | 写进哪 |
 |---|---|
 | 用户会遇到的症状 + 完整因果链 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) |
-| 已定位但没修的缺陷 | **先定重要等级**：`[P1]` → [TODO.md](TODO.md)、`[P2]` → [TODO_P2.md](TODO_P2.md)、`[P3]` → [TODO_P3.md](TODO_P3.md)，归到对应编号段（`S2-` / `LR-` / `REL-` / `AUDIT-`）。**等级写进方括号、位置写 `文件:行号`、判据写怎样算做完，三样缺一不可** |
+| 已定位但没修的缺陷 | **先定重要等级**，写进 [TODO.md](TODO.md) 对应的节（`[P1]` §1 / `[P2]` §2 / `[P3]` §3），归到对应编号段（`S2-` / `LR-` / `REL-` / `AUDIT-`）。**等级写进方括号、位置写 `文件:行号`、判据写怎样算做完，三样缺一不可** |
 | 新的科学结论、数值 | [STATUS.md](STATUS.md)（唯一一份），必须附来源、单位、符号、协议身份、有效性、是否可引用 |
 | 发布阻塞判断 | [RELEASE_READINESS_2026-08-31.md](archive/RELEASE_READINESS_2026-08-31.md) |
 | 一次性运行的原始记录（不分析） | 直接进 `archive/`，页首写清结论去了哪 |

@@ -3,7 +3,7 @@
 
 背景：C3-3/C3-4 在真实生产 CUDA `Precision=mixed` 上跑出的力差大量集中在
 co-ion 及其近邻原子，且呈现"同一份拓扑换一个 co-ion 空间位置就从全通过变成
-大量失败"的位置相关模式（见 `docs/status/memtodolist.md` §C3-3/C3-4）。这个脚本只回答
+大量失败"的位置相关模式（见 `Atenolol-rank11/memtodolist.md` §C3-3/C3-4）。这个脚本只回答
 一个问题：**这个差异出在哪一层**，不做任何 gate 调整、不重跑 MD、不关闭 C3。
 
 对每一帧构造三个数学上"应该"给出同一个物理端点的 System：

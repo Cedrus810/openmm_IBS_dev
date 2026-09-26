@@ -1,0 +1,40 @@
+--- a/tests/test_platform_routing_regressions.py
++++ b/tests/test_platform_routing_regressions.py
+@@ -11,6 +11,9 @@
+ 
+ 
+ import pytest
++import inspect
++import textwrap
++import runabfe
+ 
+ pytestmark = pytest.mark.cpu_only
+ 
+@@ -235,7 +238,7 @@
+     行为。现在只看**真正被发出去的**字符串字面量（logger/print 的实参），
+     与 test_boresch_anchor_and_pbc_fixes.py 里那条同类断言用同一手法。
+     """
+-    runabfe_src = (ROOT / "runabfe.py").read_text(encoding="utf-8")
++    runabfe_src = (textwrap.dedent(inspect.getsource(runabfe)))
+     tree = ast.parse(runabfe_src, filename="runabfe.py")
+     fn = next(
+         (n for n in ast.walk(tree)
+@@ -404,7 +407,7 @@
+     我们改代码/按设计改坐标而翻脸 —— 这是这条覆盖的正确归属。
+     本测试防的是"坐标从身份里删掉了，而接手覆盖的那一层后来也被顺手删掉"。
+     """
+-    runabfe_src = (ROOT / "runabfe.py").read_text(encoding="utf-8")
++    runabfe_src = (textwrap.dedent(inspect.getsource(runabfe)))
+     tree = ast.parse(runabfe_src, filename="runabfe.py")
+ 
+     fn = next(
+@@ -467,7 +470,8 @@
+ 
+ def test_both_sides_go_through_the_same_entry_point():
+     """runabfe 与 pre_equilibrate 必须调同一个入口，否则时序不同 ⇒ 永远不匹配。"""
+-    runabfe = (ROOT / "runabfe.py").read_text(encoding="utf-8")
++    import runabfe as _a1_runabfe
++    runabfe = textwrap.dedent(inspect.getsource(_a1_runabfe))
+     live = [
+         l for l in runabfe.split("\n")
+         if "_pre_equilibration_fingerprint(" in l

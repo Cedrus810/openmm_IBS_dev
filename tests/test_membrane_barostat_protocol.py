@@ -1,4 +1,4 @@
-"""B1：`system_type=membrane` + 膜恒压器（docs/status/memtodolist.md §3.1 / §3.2 / §7.4 / §7.7）。
+"""B1：`system_type=membrane` + 膜恒压器（Atenolol-rank11/memtodolist.md §3.1 / §3.2 / §7.4 / §7.7）。
 
 对应清单条目：MEM-00i（"没有任何 MonteCarloMembraneBarostat"）、§3.1 膜体系识别、
 §3.2 膜恒压器、§7.4 barostat 测试组、§7.7 原有体系回归。

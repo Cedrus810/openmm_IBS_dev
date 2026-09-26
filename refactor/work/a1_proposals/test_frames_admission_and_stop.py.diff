@@ -1,0 +1,32 @@
+--- a/tests/test_frames_admission_and_stop.py
++++ b/tests/test_frames_admission_and_stop.py
+@@ -24,6 +24,9 @@
+ from abfe_preoptimizer import Stage2RepairController  # noqa: E402
+ 
+ from test_stage2_repair_controller import _mkrun, R4, FULL  # noqa: E402
++import inspect
++import textwrap
++import abfe_preoptimizer
+ 
+ 
+ def _run(tmp_path, *, blocks, cap=None, prod=250000):
+@@ -126,8 +129,7 @@
+     import ast
+     import pathlib
+ 
+-    src = (pathlib.Path(__file__).resolve().parents[1]
+-           / "abfe_preoptimizer.py").read_text("utf-8")
++    src = (textwrap.dedent(inspect.getsource(abfe_preoptimizer)))
+     tree = ast.parse(src)
+ # 🔑 [2026-09] `decide()` 现在只是 23 行的外壳（"退役一个窗口再判一次"），判断体是 `_decide_once`（1831 行）。
+ # 源码探针指着 `decide` 会一无所获 —— 断言"存在"的当场红，断言"不存在"的**静默变成假绿**。
+@@ -170,8 +172,7 @@
+     import ast
+     import pathlib
+ 
+-    src = (pathlib.Path(__file__).resolve().parents[1]
+-           / "abfe_preoptimizer.py").read_text("utf-8")
++    src = (textwrap.dedent(inspect.getsource(abfe_preoptimizer)))
+ # 🔑 [2026-09] `decide()` 现在只是 23 行的外壳（"退役一个窗口再判一次"），判断体是 `_decide_once`（1831 行）。
+ # 源码探针指着 `decide` 会一无所获 —— 断言"存在"的当场红，断言"不存在"的**静默变成假绿**。
+     from abfe_preoptimizer import Stage2RepairController

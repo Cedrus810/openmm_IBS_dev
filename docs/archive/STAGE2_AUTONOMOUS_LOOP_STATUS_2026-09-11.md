@@ -5,7 +5,7 @@
 > 09-11 那批 bug 的修复流水账，**那批活全部做完**。接手 stage-2 现在读
 > [STAGE2_CONTROLLER_DESIGN_2026-09-12.md](STAGE2_CONTROLLER_DESIGN_2026-09-12.md)
 > （控制器 09-12 首次独立走完六窗），当前开着的缺口在
-> [../TODO.md](../TODO.md) / [../TODO_P2.md](../TODO_P2.md) 的 `S2-*`。
+> [../TODO.md](../TODO.md) / [../TODO_P2.md](../TODO.md) 的 `S2-*`。
 >
 > | 本文的哪一段 | 状态 |
 > |---|---|

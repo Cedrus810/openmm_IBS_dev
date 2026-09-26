@@ -163,9 +163,10 @@ def test_window_level_production_resume_is_deliberately_excluded():
 
     pipeline = (repo / "abfe_pipeline.py").read_text(encoding="utf-8")
     # 只允许出现在：1 处定义 + `_is_checkpoint_valid` 的校验 + 预平衡 resume +
-    # 再平衡 resume。这三处消费的都是"已完成片段的末态"。多出任何一处都要先回答
+    # 再平衡 resume + 预平衡末态读回（adopt_pre_equilibrated_state，2026-09-23，
+    # 只取坐标/盒）。这几处消费的都是"已完成片段的末态"。多出任何一处都要先回答
     # "那条路径是不是把积分器状态当契约"。
-    assert pipeline.count("load_checkpoint_with_platform_migration(") == 4
+    assert pipeline.count("load_checkpoint_with_platform_migration(") == 5
 
 
 def test_migration_documents_what_it_cannot_carry():

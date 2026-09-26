@@ -1,0 +1,94 @@
+--- a/tests/test_validation_indeterminate_routing.py
++++ b/tests/test_validation_indeterminate_routing.py
+@@ -10,6 +10,10 @@
+ from pathlib import Path
+ 
+ import pytest
++import inspect
++import textwrap
++import abfe_pipeline
++import ibs_engine
+ 
+ pytestmark = pytest.mark.cpu_only
+ 
+@@ -69,7 +73,7 @@
+       3. ``feasible_repair_actions`` 判它可拆（K_tail ∈ [2·lo−1, 2·hi−1]）。
+     非末窗一律不拆（插点能缩它的跨度）。
+     """
+-    src = (ROOT / "abfe_pipeline.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(abfe_pipeline)))
+     tree = ast.parse(src)
+     fn = next(
+         node
+@@ -172,7 +176,7 @@
+     整份 load_ibs_state 需要真实 OpenMM Context，所以这里静态校验三件事：
+     落盘写了批数、load 有对应分支、resume 分支会把批次接回来。
+     """
+-    src = (ROOT / "ibs_engine.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(ibs_engine)))
+     assert '"frozen_validation_batches_done": int(' in src, "save_ibs_state 没落盘批数"
+ 
+     tree = ast.parse(src)
+@@ -228,7 +232,7 @@
+ 
+ 
+ def test_evolution_loop_budget_reads_the_version_chain():
+-    src = (ROOT / "abfe_pipeline.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(abfe_pipeline.ABFEPipeline._run_stage2_with_path_evolution)))
+     assert 'rounds_done = _lpv.count_events(checkpoint_dir, "insert_lambda")' in src
+     assert "if rounds_done >= int(max_insertions):" in src
+     # 窗口复用只看本次调用内部的重试次数，跟跨 resume 的预算是两回事
+@@ -310,7 +314,7 @@
+ 
+ 
+ def test_resume_action_and_fk_evidence_are_separate_concepts():
+-    src = (ROOT / "ibs_engine.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(ibs_engine)))
+     # 动作：恢复冻结验证（两种状态共用）
+     assert "resume_frozen_validation = bool(" in src
+     # 语义：证据状态（无法判定绝不等于已校准）
+@@ -332,7 +336,7 @@
+     import ibs_engine as ie
+ 
+     assert not hasattr(ie, "local_mbar_gate_batches_needed")
+-    src = (ROOT / "ibs_engine.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(ibs_engine)))
+     assert "_hopeless" not in src
+     # 只有攒到上限才判无法判定
+     assert "if _n_now >= IBS_LOCAL_MBAR_GATE_MAX_BATCHES:" in src
+@@ -340,7 +344,7 @@
+ 
+ def test_already_converged_window_is_not_demoted_by_an_unmeasurable_recheck():
+     """resume 复验测不出来时，绝不能把已通过验证的窗口降级或中止整个 run。"""
+-    src = (ROOT / "ibs_engine.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(ibs_engine)))
+     idx = src.index("if _n_now >= IBS_LOCAL_MBAR_GATE_MAX_BATCHES:")
+     tail = src[idx:idx + 2000]
+     # 已收敛窗口的分支必须**先于** validation_indeterminate_diag 出现
+@@ -355,7 +359,7 @@
+     """改 config 抬高预算上限必须生效（显式动作）；调小不追溯缩水。"""
+     import ibs_engine as ie
+ 
+-    src = (ROOT / "ibs_engine.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(ibs_engine.IBSWindowManagerDualLambda.run_all_windows)))
+     assert "elif _default_cap_steps > _stored_cap:" in src, "config 升档必须生效"
+     assert "[预算升档]" in src, "升档要留可审计的日志"
+     # 语义自检：只升不降
+@@ -373,7 +377,7 @@
+     却被标成 f_not_converged —— 那是"测出来了 f_k 不对"的语义。
+     这既不是不收敛，也不是"测了没测出来"，是**根本没开始**。
+     """
+-    src = (ROOT / "ibs_engine.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(ibs_engine.IBSWindowManagerDualLambda.run_all_windows)))
+     assert "_no_budget_at_all = bool(" in src
+     # 三个条件缺一不可
+     i = src.index("_no_budget_at_all = bool(")
+@@ -393,7 +397,7 @@
+     `bias_converged=True` 照样粘过去 ⟹ 窗口跳过 learning 只做"只读复验"，
+     复验的却是**另一个系综**的旧结论。
+     """
+-    src = (ROOT / "ibs_engine.py").read_text(encoding="utf-8")
++    src = (textwrap.dedent(inspect.getsource(ibs_engine)))
+     # 身份要落盘
+     assert '"stage_protocol_key": getattr(self, "stage_protocol_key", None),' in src
+     # skip_warmup_entirely 必须三条同时成立

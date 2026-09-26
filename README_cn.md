@@ -19,8 +19,9 @@ LJ 长程修正、缓存、续跑和 fail-closed 质量门。
 
 > ## ⚠️ 引用任何数字之前
 >
-> **本仓库目前没有可以作为最终结论引用的结果。** 主线体系（4W53 / T4 lysozyme
-> L99A + toluene）、结果登记表、协议版本、开放问题和有效性判据**全部**登记在
+> **本仓库已有真机结果（多体系 benchmark 正在出数），但每个数字能不能引用、按什么口径引用，
+> 只以 STATUS.md 为准。** 主线体系（4W53 / T4 lysozyme L99A + toluene）、结果登记表、
+> 协议版本、开放问题和有效性判据**全部**登记在
 > [docs/STATUS.md](docs/STATUS.md) —— 那是本仓库唯一声明科学状态的文档，
 > 本文和其它任何地方都不再复制它的表。
 >
@@ -139,7 +140,7 @@ python runabfe.py --config abfe_config.json --ligand MOL --analyze-only
 
 **`docs/` 下的教程以中文为准** —— 为开发速度做的既定选择，不是疏漏。
 仓库首页 [README.md](README.md) 是英文版，覆盖同样的完整流程；
-两份**不做逐字对等**（见 [docs/TODO_P3.md](docs/TODO_P3.md)）。
+两份**不做逐字对等**（见 [docs/TODO.md](docs/TODO.md) §3.4）。
 
 ## 许可
 

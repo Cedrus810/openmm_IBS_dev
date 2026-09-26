@@ -1,0 +1,29 @@
+--- a/tests/test_rbfe_pipeline_framework.py
++++ b/tests/test_rbfe_pipeline_framework.py
+@@ -13,6 +13,8 @@
+ 
+ import rbfe_core as rc
+ import rbfe_pipeline as rp
++import inspect
++import textwrap
+ 
+ 
+ pytestmark = pytest.mark.cpu_only
+@@ -250,7 +252,7 @@
+     """§4：编排层不自行构建相互作用公式。ΔΔG 只能来自 rbfe_core。"""
+     from pathlib import Path
+ 
+-    source = Path(rp.__file__).read_text(encoding="utf-8")
++    source = textwrap.dedent(inspect.getsource(rp))
+     assert "combine_rbfe" in source
+     assert "complex_result.delta_g -" not in source
+ 
+@@ -447,7 +449,7 @@
+     """ABFE 与 RBFE 是两条独立入口（计划 §1）。"""
+     from pathlib import Path
+ 
+-    source = Path(rp.__file__).read_text(encoding="utf-8")
++    source = textwrap.dedent(inspect.getsource(rp))
+     lines = [l.strip() for l in source.splitlines()
+              if l.lstrip().startswith(("import ", "from "))]
+     for banned in ("abfe_core", "abfe_pipeline", "ibs_engine", "runabfe"):

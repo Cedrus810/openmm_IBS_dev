@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """C3 正式关闭所需的两份汇总产物：`summary.json`/`mem00h_report.json`。
 
-对应 `docs/status/memtodolist.md` §C3 "要求" 清单（"MEM-00h protocol 字段一致"、
+对应 `Atenolol-rank11/memtodolist.md` §C3 "要求" 清单（"MEM-00h protocol 字段一致"、
 "`summary.json=PASS`"）与 "最终只有 C3 和 `mem00h_report.json` 同时 PASS，
 才能同时关闭 C3 与 MEM-00h" 这条硬约束。
 
@@ -71,7 +71,7 @@ CD_CASES: Dict[str, Path] = {
     "Na_thick_pos1": RESULT_DIR / "cd_c2_Na_thick_pos1_v2.json",
 }
 
-# case 名 -> raw case_dir（跟 docs/status/memtodolist.md/前面几轮 run-matrix-v2(-cd) 调用
+# case 名 -> raw case_dir（跟 Atenolol-rank11/memtodolist.md/前面几轮 run-matrix-v2(-cd) 调用
 # 用的是同一批目录），只用来做只读结构核验，不碰轨迹/坐标。
 CASE_RAW_DIRS: Dict[str, Path] = {
     "C1_Na_large": _FIXTURES / "c1_waterbox" / "Na_large",
