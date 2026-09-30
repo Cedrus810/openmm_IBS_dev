@@ -2,6 +2,9 @@
 
 日期：2026-09-18
 状态：🔴 **分支于 2026-09-18 暂停。** 设计已拍板；W-1/W0 实测完成，W1 探针完成，B 扫描未开始。
+> **2026-09-27 更新**：用户重新打开口袋水线。热力学环保留，采样器从 GCNCMC + B 阶梯换成总水数不变的搬水 MC，
+> 并补上 ABFE 期间的 N 约束 ⟹ 见 [PLAN_pocket_water_swap_sampler_2026-09-27.md](PLAN_pocket_water_swap_sampler_2026-09-27.md)。
+> 本文 §8 的沙箱代码已丢失；§8/§9 的数字仍可引用；§7 的 jnk1 基线早于 09-23 修复，不得再用。
 实验对象：**JNK1 与 P38**（用户选定）
 关联：[PROPOSAL_openfe_method_absorption.md](PROPOSAL_openfe_method_absorption.md)（同属「跑完了准不准」那条线）
 

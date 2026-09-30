@@ -22,6 +22,7 @@
 | [PLAN_stage2_controller_rewrite_2026-09-24.md](PLAN_stage2_controller_rewrite_2026-09-24.md) | 计划 | 🟡 **第一期进行中**（第 1 步 ✅）（2026-09-24） | stage 2 控制器重写的执行计划：已定决策一览、两期六+三步（先关后删）、每步判据、待拍板项。设计依据见下一行 |
 | [PROPOSAL_stage2_lcr_rounds_2026-09-24.md](PROPOSAL_stage2_lcr_rounds_2026-09-24.md) | 提案 | 🟡 **设计已定，落地中**（2026-09-24） | stage 2 改成「第一轮每窗左/中/右三段并行、不同起点，之后缺啥补啥」：LEARN 退出这条路，f_k = pilot 锚点 ± 信赖域，σ 加段间 jackknife，控制器只剩「补一段」一种动作 |
 | [PLAN_test_suite_pruning_2026-09-24.md](PLAN_test_suite_pruning_2026-09-24.md) | 计划 | 🟡 **提速已落地 / 压条数押后到重构**（2026-09-24） | 全量 263 s → 40 s 已做；2810 条 → ~1300 条的覆盖率判定法、规则和 09-24 分类快照，对应 [TODO.md](../TODO.md) `TEST-02` |
+| [PLAN_pocket_water_swap_sampler_2026-09-27.md](PLAN_pocket_water_swap_sampler_2026-09-27.md) | 计划 | 🟡 **S1 完成**（2026-09-28） | 口袋水补丁 v2：固定 N 的 ABFE + `kT ln P(N)` 不变，采样器换成 bulk↔口袋搬水 MTM + N 偏置（吸收 JCTC 2026 SwapMC，不用其 first-accept 与 RF 判据），ABFE 加区域墙把 N 真正固定。前身 [PLAN_pocket_water_gcmc_patch.md](PLAN_pocket_water_gcmc_patch.md)（09-18 暂停，GCNCMC 路线） |
 
 ## 待办前沿（2026-08-31 更新）
 

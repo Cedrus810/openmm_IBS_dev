@@ -196,4 +196,9 @@ def test_stage2_forwards_every_config_key_the_stage_reads():
         and n.func.attr == "_run_dual_lambda_stage"
     )
     forwarded = {k.arg for k in call.keywords}
-    assert (read & set_by_config) - forwarded == set()
+    # stage-1 专用键的豁免：`_run_dual_lambda_stage` 是两条腿共用的函数体，去电荷 REMD
+    # 分支读 `stage1_remd_equilibration_steps`（stage-1 调用点已显式转发），stage 2 故意
+    # 不转发——它只进 decharging 的采样指纹（`_scope_stage1_only_kwargs`），stage 2 的
+    # 执行与指纹都不该看到它（2026-09-30）。
+    stage1_only_keys = {"stage1_remd_equilibration_steps"}
+    assert (read & set_by_config) - forwarded - stage1_only_keys == set()

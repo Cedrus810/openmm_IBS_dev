@@ -242,6 +242,9 @@ def test_self_support_is_sufficient_for_a_healthy_window(tmp_path):
     assert r["frames_short_by"] is None
     assert r["remedy"] is None
     assert len(r["statistical_inefficiency_per_lambda"]) == 4, "逐态 g 剖面要给全"
+    # [2026-09-29 REVIEW-0929 M1] 返回 dict 里这个键曾写了两次，后一次的常量把条件表达式
+    # 覆盖掉 ⟹ 没有 production_segments 时帧集身份被错标。
+    assert r["n_eff_frame_set"] == "all_frames"
 
 
 def test_self_support_shortfall_is_insufficient_data_not_fail(tmp_path):
@@ -315,6 +318,7 @@ def test_self_support_honours_production_segments(tmp_path):
     r = ie.window_self_support_check(d, "vdw", 0, KT)
     assert r["n_segments"] == 2
     assert len(r["segment_diagnostics"]) == 2
+    assert r["n_eff_frame_set"] == "segments_kept_by_decorrelation"
 
 
 def test_self_support_returns_none_instead_of_raising(tmp_path):

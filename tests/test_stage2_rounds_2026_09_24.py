@@ -309,6 +309,21 @@ def test_small_sigma_jk_below_tol_does_not_trigger_even_if_above_2_sigma_mbar():
     assert sr.plan_next_round([ev], completed_round=1, used_seed_ids=[0, 1, 2]) == []
 
 
+def test_sigma_jk_above_tol_but_within_2_sigma_mbar_still_triggers():
+    """2026-09-29 REVIEW-0929 M2：σ_jk ∈ (σ_tol, 2σ_MBAR] 原先标 PROVISIONAL 却不补段。
+    补段门现在与标签门一致（σ_jk > σ_tol）；理由区分「段间不一致」与「精度没到」。"""
+    ev = _ev(sigma_mbar_kJ=2.0, loo_delta_f_kJ=[8.0, 10.0, 12.0])
+    assert 1.5 < ev.sigma_jk_kJ <= 2.0 * 2.0
+    label, why = sr.classify_window(ev)
+    assert label == sr.LABEL_PROVISIONAL and "sigma_jk_above_tol" in why
+    specs = sr.plan_next_round([ev], completed_round=1, used_seed_ids=[0, 1, 2])
+    assert len(specs) == 1 and specs[0].reason.startswith("sigma_jk_above_tol_")
+    # 超过 2σ_MBAR 的仍标「段间不一致」
+    ev2 = _ev(sigma_mbar_kJ=0.2, loo_delta_f_kJ=[5.0, 10.0, 15.0])
+    specs2 = sr.plan_next_round([ev2], completed_round=1, used_seed_ids=[0, 1, 2])
+    assert specs2[0].reason.startswith("segments_disagree_sigma_jk_")
+
+
 def test_round_cap():
     ev = _ev(state_ess=[1, 90, 90, 90, 90, 90])
     assert sr.plan_next_round([ev], completed_round=3, used_seed_ids=[0, 1, 2]) == []

@@ -21536,8 +21536,6 @@ def window_self_support_check(
         "n_eff_frame_set_n_frames_raw": _n_frames_frame_set,
         # 保留旧键名，老读侧不炸；新代码一律用 `_raw` 那个（语义写在名字里）。
         "n_eff_frame_set_n_frames": _n_frames_frame_set,
-        # 帧集身份：哪些 segment 被 decorrelation 判定为有效并保留下来。
-        "n_eff_frame_set": "segments_kept_by_decorrelation",
         # 🔑 逐态**实际进了 N_eff 的帧数**（已排除无效 segment、**未**按 sub_idx
         # 去相关稀疏、且对该态应用过 finite mask）。η 的唯一合法分母。
         "n_eff_input_n_frames_per_state": [

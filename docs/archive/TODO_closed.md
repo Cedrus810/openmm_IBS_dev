@@ -10,6 +10,23 @@
 
 ---
 
+# 2026-09-29（`REVIEW-0929` 的 M1、M2）
+> `REVIEW-0929` 本身没关，还欠 L8，条目在 [TODO.md](../TODO.md) §2.7。
+
+## **REVIEW-0929 · M2** LCR 补段门与标签门不一致 ⟹ σ_jk ∈ (σ_tol, 2σ_MBAR] 的窗口标 PROVISIONAL 却永远不补
+  **原文**：`stage2_rounds.py::classify_window` 用 `σ_jk > σ_tol` 判 PROVISIONAL，`plan_next_round` 用 `σ_jk > max(2σ_MBAR, σ_tol)` 决定补段；设计表 A1/A2/A5 没覆盖这个区间。来源 [CODE_REVIEW_2026-09-29.md](CODE_REVIEW_2026-09-29.md) §2.2。
+  **关闭（09-29，维护者拍板：补段门跟标签门走）**：补段门改成 `σ_jk > σ_tol`；理由字段区分两种情况：超过 2σ_MBAR 记 `segments_disagree_sigma_jk_*`，否则记 `sigma_jk_above_tol_*`。设计表补了一行 A5′（[PROPOSAL_stage2_lcr_rounds_2026-09-24.md](../design/PROPOSAL_stage2_lcr_rounds_2026-09-24.md)），计划表同步。新增 `tests/test_stage2_rounds_2026_09_24.py::test_sigma_jk_above_tol_but_within_2_sigma_mbar_still_triggers`。`STAGE2_ROUNDS_PROTOCOL_VERSION` 没接进任何缓存指纹 ⟹ 不作废现有缓存；已跑完的 run 不受影响，只有之后的补段决策会变（这类窗口会多补一段，最多到 `MAX_ROUNDS=3`）。
+
+## **REVIEW-0929 · M1** `window_self_support_check` 返回 dict 里 `"n_eff_frame_set"` 重复定义
+  **原文**：`ibs_engine.py::window_self_support_check` 的返回 dict 字面量里 `"n_eff_frame_set"` 写了两次，后一个常量
+  `"segments_kept_by_decorrelation"` 无条件覆盖前面的条件表达式 ⟹ 没有 `production_segments` 时帧集身份被错标（实际用的是 `all_frames`）。
+  只进账本、不影响数值。来源 [CODE_REVIEW_2026-09-29.md](CODE_REVIEW_2026-09-29.md) §2.2。
+  **关闭（09-29）**：删掉后一个键（连同它那行注释），条件表达式那个保留。
+  `tests/test_join_lambda_two_sided_support.py` 两条测试补了断言：不分段时读到 `all_frames`，分段时读到 `segments_kept_by_decorrelation`。
+  `ruff --select F601` 已无命中。
+
+---
+
 # 2026-09-24（未关闭条目的已完成部分：`LR-06` 第 1–4、6 步）
 > **`LR-06` 本身没关**，还欠第 5、7 步，条目在 [TODO.md](../TODO.md) §2.4。这里是 09-24 压缩 TODO 时挪过来的已完成部分：方案选择、根因、真机 A/B、`r_floor` 依据、排除项。原文一字未改。
 

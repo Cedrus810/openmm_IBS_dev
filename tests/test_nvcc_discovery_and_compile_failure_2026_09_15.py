@@ -84,6 +84,11 @@ def test_a_compile_error_raises_instead_of_silently_using_cpu(monkeypatch):
     import openmm
     monkeypatch.setattr(openmm, "Context", _ctx_factory_raising(
         "Error compiling program: default_program(325): error: expected a \";\""))
+    # CI 的 OpenMM 没编 CUDA platform：不 stub 的话 getPlatformByName("CUDA") 先抛
+    # ⟹ 判成资源类走 CPU 回退 ⟹ 测的就不是编译错误分支了（2026-09-29 CI-RED-01）。
+    real_platform = openmm.Platform.getPlatformByName
+    monkeypatch.setattr(openmm.Platform, "getPlatformByName",
+                        staticmethod(lambda n: real_platform("CPU")))
     with pytest.raises(RuntimeError, match="编译失败"):
         ap._create_context_with_local_cpu_fallback(
             object(), lambda: object(), "CUDA", log=lambda *a: None)

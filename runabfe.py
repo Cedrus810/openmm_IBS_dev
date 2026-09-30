@@ -278,6 +278,43 @@ def _assert_matching_ligand_constraint_identity(
     return complex_identity
 
 
+def _preflight_ligand_constraint_identity_against_solvent_cache(
+    output_dir: str,
+    complex_system,
+    complex_ligand_indices,
+    *,
+    context: str,
+) -> Dict:
+    """采样之前就用溶剂腿缓存做一遍 :func:`_assert_matching_ligand_constraint_identity`。
+
+    溶剂腿缓存在 main() 的「1.5 自动构建溶剂腿缓存」就已建好，而这道门原来只在
+    第 8 节（两条腿都跑完之后）查 ⟹ 身份不一致要先白烧两条腿的 GPU 才报错
+    （2026-09-28 fragment-opt HSP90_ligand-3：HMR 拓扑下溶剂腿配体氢质量取了元素表）。
+    第 8 节那道保留不动，防采样途中 System 被改。
+    """
+    xml_path = os.path.join(output_dir, "system_solvent.xml")
+    idx_path = os.path.join(output_dir, "ligand_indices_solvent.json")
+    with open(xml_path, encoding="utf-8") as handle:
+        solvent_system = XmlSerializer.deserialize(handle.read())
+    with open(idx_path, encoding="utf-8") as handle:
+        solvent_ligand_indices = json.load(handle)["ligand_indices"]
+    try:
+        return _assert_matching_ligand_constraint_identity(
+            complex_system,
+            complex_ligand_indices,
+            solvent_system,
+            solvent_ligand_indices,
+            context=context,
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"{exc}\n  → 采样之前拦下（两条腿都还没跑）。若溶剂腿缓存是 2026-09-28 修复前"
+            f"用 HMR 拓扑建的：删掉 {output_dir} 下的 system_solvent.xml / topology_solvent.cif / "
+            "ligand_indices_solvent.json / box_vectors_solvent.npy / solvent_cache_manifest.json，"
+            "以及 solvent_leg/ 目录（里面的 stage 缓存是按旧质量采的），再重跑。"
+        ) from exc
+
+
 def _assert_matching_result_constraint_identity(
     complex_result: Dict,
     solvent_result: Dict,
@@ -1641,7 +1678,12 @@ def generate_ligand_xml_from_top(
     xml_lines = ["<ForceField>", "  <AtomTypes>"]
     for i in lig_idx:
         elem = atoms[i].element
-        mass = elem.mass.value_in_unit(unit.dalton) if hasattr(elem, "mass") else 12.0
+        # 🔑 [2026-09-28] 质量取 top 里写的（createSystem 之后的真实粒子质量），不取元素表。
+        # HMR 拓扑（`#define HEAVY_H` + `ligand.hmr.itp`）把配体氢写成 4.032 amu；复合物腿走
+        # GromacsTopFile 拿到的是它，溶剂腿原来取 `elem.mass`（1.008）⟹ 两腿配体质量不同，
+        # 约束构型积分里的质量项在循环里消不掉，`_assert_matching_ligand_constraint_identity`
+        # 在两条腿都跑完后才拦下（fragment-opt HSP90_ligand-3）。非 HMR 拓扑下两者差 <1e-3 amu。
+        mass = extracted_system.getParticleMass(i).value_in_unit(unit.dalton)
         xml_lines.append(f'    <Type name="T{i}" class="T{i}" element="{elem.symbol}" mass="{mass:.6f}"/>')
     xml_lines += ["  </AtomTypes>", "  <Residues>", f'    <Residue name="{ligand_resname}">']
     for i in lig_idx:
@@ -4374,6 +4416,57 @@ BORESCH_GEOMETRY_CONVENTION_VERSION = 2
 BORESCH_REAL_BOND_PROTOCOL_VERSION = 1
 
 
+def _boresch_pose_guard_filter(traj, traj_top, config, output_dir):
+    """Drop pre-equilibration frames whose ligand pose has left the input pose.
+
+    🔑 [2026-09-30] 生产 Boresch（source=simple）的平衡值取无约束预平衡轨迹的
+    系综均值。弱结合配体可能在预平衡里漂离晶体姿态（HSP90 ligand-3 kang rep1：
+    离 Asp93 0.40→0.57 nm），均值就落在漂开的姿态上；角度力常数一加硬，整条
+    计算被钉死在非晶体姿态。
+
+    判据：配体重原子 × 输入结构里 0.6 nm 内的蛋白重原子，逐帧距离与输入结构的
+    RMS 差（dRMSD，无需叠合、周期边界安全）。只保留 ≤ 阈值的帧；合格帧不足
+    20% 直接报错。HSP90 ligand-3 九个预平衡：正常 run 全程 ≤0.118 nm，漂走的
+    那条中位数 0.179 ⟹ 推荐 0.14。
+
+    `boresch_pose_guard_drmsd_nm` 不设 = 不筛，老路径逐字不变。
+    """
+    thr = config.get("boresch_pose_guard_drmsd_nm")
+    if thr is None:
+        return traj
+    import mdtraj as md
+    thr = float(thr)
+    gro = config.gro
+    report = os.path.join(output_dir, RESERVED_COION_DERIVED_DIRNAME, RESERVED_COION_REPORT_BASENAME)
+    if os.path.isfile(report):
+        with open(report, "r", encoding="utf-8") as fh:
+            gro = json.load(fh)["derived_gro"]
+    g = md.load(gro)
+    ref = md.Trajectory(g.xyz, traj_top, unitcell_lengths=g.unitcell_lengths,
+                        unitcell_angles=g.unitcell_angles)
+    lig = traj_top.select(f"resname {config.ligand} and not element H")
+    prot = traj_top.select("protein and not element H")
+    pairs = np.array([[i, j] for i in lig for j in prot])
+    d_ref = md.compute_distances(ref, pairs)[0]
+    keep_pairs = d_ref < 0.6
+    if keep_pairs.sum() < 10:
+        raise RuntimeError(f"Boresch 姿态守卫：输入结构里配体 0.6 nm 内蛋白原子对只有 {int(keep_pairs.sum())} 个")
+    d = md.compute_distances(traj, pairs[keep_pairs])
+    drmsd = np.sqrt(((d - d_ref[keep_pairs]) ** 2).mean(1))
+    ok = drmsd <= thr
+    frac = float(ok.mean())
+    log.info("  Boresch 姿态守卫：dRMSD 中位数 %.3f / 最大 %.3f nm，阈值 %.3f，合格帧 %d/%d（%.0f%%）",
+             float(np.median(drmsd)), float(drmsd.max()), thr, int(ok.sum()), len(ok), 100 * frac)
+    if frac < 0.2:
+        raise RuntimeError(
+            f"Boresch 姿态守卫：预平衡轨迹只有 {100 * frac:.0f}% 的帧在输入姿态附近（dRMSD ≤ {thr} nm），"
+            "配体已离开输入结合姿态；拒绝用漂开的姿态定义 Boresch 限制。请检查输入/重跑预平衡。")
+    if ok.all():
+        return traj
+    log.warning("  [WARN] Boresch 姿态守卫：剔除 %d 帧偏离输入姿态的预平衡帧后再估算限制几何", int((~ok).sum()))
+    return traj[np.where(ok)[0]]
+
+
 def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Optional[Dict]:
     """统一获取 Boresch 参数。来源：
     - traditional/orb_ml: 加载外部参数文件
@@ -4533,6 +4626,7 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
         )
         import mdtraj as md
         traj = md.load(traj_file, top=traj_top)
+        traj = _boresch_pose_guard_filter(traj, traj_top, config, output_dir)
         # 🔑 [2026-09-24] 复现模式：锚点原子从**输入结构**选（所有 rep、所有机器同一帧），
         # 不从本 rep 的预平衡轨迹选 —— 否则每个 rep 选出不同原子 = 不同束缚态定义
         # （09-23 复现批 cmet L1 三个 rep 两端锚点全不同）。平衡值仍取本 rep 轨迹。
@@ -4649,6 +4743,22 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
     _fixed_fc_mode = str(
         config.get("boresch_force_constant_mode", DEFAULT_BORESCH_FORCE_CONSTANT_MODE)) == "openfe_fixed"
     if _fixed_fc_mode and "force_constants" in boresch:
+        # 🔑 [2026-09-29] 固定档的角/二面角力常数可由 config 覆盖（锚点仍按 334.72
+        # 选，只换施加的 K）。HSP90 ligand-3：去电荷后配体靠角度自由度外移 ~0.1 nm
+        # （代价 ≈1 kT），stage 2 每段随机落在深位/外移两个盆。循环对任意 K 精确
+        # 闭合（attach + release 同一套 K）。不设 = 老路径逐字不变。上限 1000 与
+        # calculate_boresch_analytical_correction 的 kθ 校验一致。
+        _k_ang = config.get("boresch_fixed_k_angle_kj_per_mol_rad2")
+        if _k_ang is not None:
+            _k_ang = float(_k_ang)
+            if not (10.0 <= _k_ang <= 1000.0):
+                raise ValueError(
+                    f"boresch_fixed_k_angle_kj_per_mol_rad2={_k_ang} 超出 [10, 1000] kJ/mol/rad²")
+            for _n in ("kthetaA", "kthetaB", "kphiA", "kphiB", "kphiC"):
+                if _n in boresch["force_constants"]:
+                    boresch["force_constants"][_n] = _k_ang
+            boresch.setdefault("diagnostics", {})["fixed_k_angle_override_kj_per_mol_rad2"] = _k_ang
+            log.info("  Boresch 固定档角/二面角力常数被 config 覆盖为 %.2f kJ/mol/rad²", _k_ang)
         boresch.setdefault("diagnostics", {})["force_constant_post_clip_skipped"] = (
             "openfe_fixed：力常数是设置项，不做最终裁剪（kr 上限 2000 会裁掉 4184）"
         )
@@ -7132,6 +7242,12 @@ def _path_evolution_kwargs(config) -> dict:
     ):
         if config.get(_k) is not None:
             out[_k] = _cast(config.get(_k))
+    # 🔑 [2026-09-30] 去电荷 REMD 生产前的平衡段步数（不进 MBAR）。设了才透传；
+    # 进 decharging 的采样指纹与 stage 指纹（只进 stage 1，见
+    # abfe_pipeline._scope_stage1_only_kwargs），不设 ⟹ 老路径逐字不变。
+    _s1_equil = config.get("stage1_remd_equilibration_steps")
+    if _s1_equil is not None and int(_s1_equil) > 0:
+        out["stage1_remd_equilibration_steps"] = int(_s1_equil)
     # 🔑 [2026-09-22] attachment 腿两道**收敛**门（BAR/TI 一致 + split-half）要不要
     # 阻断。不设时：复现模式下默认**不阻断**（只记录），其余情况默认阻断。
     # 显式设了就以它为准，两种模式都能覆盖。
@@ -8190,6 +8306,15 @@ def main():
                     sys.exit(1)
             else:
                 log.info("检测到已有溶剂腿缓存，跳过重建")
+        # 与第 8 节同一道配体约束/HMR 身份门，提前到任何采样之前（2026-09-28）。
+        # 只对会走到第 8 节的完整循环做；only-* 调试入口原来就不过这道门，行为不变。
+        if not (config.only_ligand_in_water or config.only_boresch_attachment):
+            _preflight_ligand_constraint_identity_against_solvent_cache(
+                output_dir,
+                system,
+                ligand_indices,
+                context="dual_lambda ABFE 热力学循环（采样前预检）",
+            )
 
     # ----- 2. 初始化 Pipeline -----
     pipeline = ABFEPipeline(

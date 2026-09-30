@@ -39,3 +39,9 @@ plugins/LocalManyBodyResidual/build_exp026_a2/tests/
 # 调试轨迹与重构重放数据不进 git（2026-09-27 维护者拍板）
 tmp/
 refactor/replay/
+
+# 论文工作区不进 git（2026-09-30 维护者拍板：AIBS_ 全都是论文稿件）
+AIBS_*.md
+docs/manuscript_data/
+# 第三方文献全文（JCTC 2026 SwapMC 的 markdown 转写），版权原因不入库
+acs.jctc.6c00178.md

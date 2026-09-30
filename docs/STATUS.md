@@ -2,7 +2,7 @@
 
 [项目入口](../README.md) · [文档导航](README.md)
 
-> **本页整理截至 2026-09-18**（协议版本一栏最后一次逐条核对是 09-12，六个值与 09-09 相同；
+> **本页整理截至 2026-09-28**（09-28 只新增「跨软件对照」一节，其余各节内容仍截至 09-18；协议版本一栏最后一次逐条核对是 09-12，六个值与 09-09 相同；
 > 09-13 至 09-18 的改动**没有动任何协议版本号**）。
 > ⚠️ 09-15 至 09-18 破过缓存的是**配置**不是协议：`stage2_window_partition`
 > （`metric_integral`→`state_count`）与 `stage2_window_max_states`（8→5）
@@ -10,6 +10,8 @@
 > **本次更新只改「控制器真机验证状态」一节**（那节的标题原来写着"真机零验证"，
 > 已经不成立了），结果登记表与物理结论**一行未动**。
 > 逐日变更看 [CHANGELOG.md](CHANGELOG.md)。
+>
+> **2026-09-28 补**：新增「跨软件对照：IBS vs OpenFE vs 实验」一节（只登记，不改其它节）。
 >
 > 这是本仓库**唯一**声明"当前科学结论"的文档。三份 README 只对外讲用法，
 > 不再复制这里的任何表格——2026-09-05 之前同样的三张表在 `README.md`、
@@ -40,6 +42,53 @@ Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS
 文件名包含 `final` 不代表结果可以引用。Atenolol 那三行的原始 artifact 和机器可读
 登记表（`RESULT_REGISTRY.csv`）在 `Atenolol-rank11` 工作区，不在本分支；
 4W53 那一行的证据在本 `docs/` 里。
+
+## 跨软件对照：IBS vs OpenFE vs 实验（2026-09-28，abfe-benchmark）
+
+> 数据由 abfe-benchmark 会话汇总，原表 `abfe-benchmark/openmm_IBS/crosscheck_openfe_20260928.csv`（UTF-8 BOM）。
+> **本节是登记，不是可引用的最终结论**：OpenFE 在 brd4_ligand1 / brd4_ligand2 / cyclod_ligand1 上 n=2，cmet 两个配体 n=1，IBS 各行来自不同批次。数据截至 09-28 21:31（19:41 后补了 brd4_ligand1、cyclod_ligand1 各一个 OpenFE rep2）。
+
+口径：两边同力场、同输入（amber99sbildn + TIP3P + openff-2.0.0、同一份 AM1-BCC 电荷、同结构、同晶体水）。
+实验值按「Kd 与 T 无关」换算到 IBS 的 300 K / OpenFE 的 298.15 K（下表列 300 K 值）；
+⚠️ brd4 的实验值是 ITC ΔG，可能是 288 K 测的，原文献没核。单位 kcal/mol。
+
+| 体系 | 实验 | OpenFE（均值 ± SD，n；未注明 = n=1） | IBS 均值 ± SD（批次，n） | OFE−实验 | IBS−实验 | IBS−OFE |
+|---|---|---|---|---|---|---|
+| brd4_ligand1 | −9.99 | −14.65 ± 1.42（n=2：−13.64 / −15.65） | −14.87 ± 0.75（09-27 lcr，3） | −4.72 | −4.88 | −0.22 |
+| brd4_ligand2 | −7.70 | −13.10 ± 0.11（n=2） | −13.29 ± 1.16（09-27 lcr，3） | −5.44 | −5.58 | −0.19 |
+| cmet_ligand1 | −12.36 | −21.83 | −21.52 ± 5.92（09-25 fixanchor，3） | −9.55 | −9.17 | +0.31 |
+| cmet_ligand2 | −7.39 | −15.97 | −15.69 ± 0.41（09-23，2） | −8.63 | −8.30 | +0.28 |
+| cyclod_ligand1 | −2.95 | −4.91 ± 0.11（n=2：−4.98 / −4.83） | −3.76 ± 1.22（09-27 lcr，3） | −1.98 | −0.81 | +1.15 |
+| **平均** | | | | **−6.06** | **−5.75** | **+0.26** |
+
+- cmet_ligand2 加上 09-24 resume 的 rep3（−17.82）⟹ −16.40 ± 1.26。
+- ΔΔG(L2−L1)：brd4 实验 +2.30 / IBS lcr +1.58 / OpenFE +1.54（rep1 单值时是 +0.54）；cmet 实验 +4.97 / OpenFE +5.86 / IBS +5.83。
+- **读法**：5 个体系上 IBS 与 OpenFE 平均只差 +0.26 kcal，两者相对实验**同样偏负**（约 −5.8 到 −6.1 kcal）。
+  OpenFE 自身的 repeat 间差：brd4_ligand1 2.0、brd4_ligand2 0.15、cyclod_ligand1 0.15 kcal ⟹ brd4_ligand1 上 IBS−OFE 的 −1.2 已落回 OpenFE 自己的散布之内。
+  ⟹ 偏负（见下文控制器一节的 ⚠️、`BOX-01`）的主要部分**两套软件共有**，更可能来自共同的力场 / 输入 / 口径，
+  而不是 IBS 特有的采样问题。⚠️ 这只是观察，不是归因：OpenFE cmet 两个配体仍是 n=1（cmet_ligand1 rep2、cmet_ligand2 rep3 在跑）、只有 5 个体系、cmet_ligand1 的 IBS rep 间 SD 5.9，
+  实验温度换算（尤其 brd4）未核。
+- 同一体系各 IBS 批次（decharging8 / 09-19 / 09-23 / 09-23 repro / 09-24 resume / 09-25 fixanchor / 09-26–27 lcr）
+  的均值散布见原表；repro 批在 cmet 两个配体上比同期 09-23 批负 6–11 kcal。
+
+**耗时与采样量（粗略，未控 GPU 型号与是否共享）**：
+
+| 体系 | IBS 全流程 | OpenFE 全流程 | 比 |
+|---|---|---|---|
+| brd4_ligand1 | 2:46–2:51（3090，lcr） | 13:56（4080S） | ≈5.0× |
+| brd4_ligand2 | 2:40–2:47（3090，lcr） | 13:29（4080S） | ≈5.0× |
+| cmet_ligand1 | 2:18–2:22（5090，fixanchor） | 16:06（5090） | ≈7.0×（**唯一同型号 GPU 的一对**） |
+| cmet_ligand2 | 4:10–4:18（3090，09-23） | 20:41（5080） | ≈4.9× |
+| cyclod_ligand1 | 1:29–1:31（5080，lcr） | 17:24（3090） | ≈11.6× |
+
+- OpenFE 总采样约 490 ns（4 fs + HMR，约 1.2×10⁸ 步）：复合物 30 replica × 11 ns、溶剂 14 × 11 ns、预平衡约 6.6 ns。
+- IBS（只数了 brd4_ligand1 lcr rep1）：stage 2 复合物 9000 帧 ≈ 4.5M 步、溶剂 ≈ 1.25M 步、平衡 2M 步（早停，请求 5M）；
+  stage 1 / attach / pilot / warmup 没数进去 ⟹ 总计估 15–20M 步，约为 OpenFE 的 1/6–1/8，与耗时比同量级。
+- 09-27 lcr 批：HEAD `e576a54`（工作树未提交改动没记录，`code_sha256` 为 null）；`run_provenance` 里 `stage2_n_states=22` 只给 pilot 用，
+  实际跑的是 26 态等分 vdW 格点（步长 0.04）、窗口 `[[0,6],[5,11],[10,16],[15,21],[20,26]]`。
+
+**OpenFE 侧现状（openfe 1.12.1.dev32，production，298.15 K）**：上表是各体系已跑完的 repeat（brd4_ligand2 = rep2 + rep3，rep3 09-28 19:38 出；其余单 repeat，报的不确定度 0.0 是因为只有一个 repeat；brd4_ligand2 rep1 launch.log 空、无结果）；数据截至 09-28 19:41；
+其余 repeat 在跑或待续跑（cmet_ligand1 rep2 09-28 14:25 被误杀，待用 `--resume` 续）。GROMACS FEP-suite（300 K）还没出 ΔG。
 
 ## decharging 湮灭配体分子内库仑 —— **2026-09-14 已修复（v5 已落地）**
 

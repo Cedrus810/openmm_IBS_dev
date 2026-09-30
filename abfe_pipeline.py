@@ -2751,6 +2751,9 @@ def _remd_sampling_fingerprint(
     # 旧 DCD/u_kn。repeat_seed 未启用时为 None（payload 里仍是显式 None，
     # 与"没记"有区别）。
     seed_contract: Optional[Dict] = None,
+    # 🔑 [2026-09-30] 生产前的 REMD 平衡段步数（不进 MBAR）。只在 >0 时进
+    # payload ⟹ 不设时指纹逐位不变、现有缓存不作废。
+    equilibration_steps: int = 0,
 ) -> Dict:
     """Fingerprint the distribution that produced a REMD trajectory set.
 
@@ -2784,6 +2787,8 @@ def _remd_sampling_fingerprint(
         "coion_identity": coion_identity,
         "seed_contract": seed_contract,
     }
+    if int(equilibration_steps or 0) > 0:
+        payload["equilibration_steps"] = int(equilibration_steps)
     return _protocol_fingerprint(payload)
 
 
@@ -3099,6 +3104,19 @@ def _finalize_stage_with_indeterminate(result, indeterminate):
     return out
 
 
+# 只影响 stage 1（去电荷 REMD）的采样协议键：进 decharging 的指纹，不进其它 stage
+# 的指纹（否则开了它会连带作废 stage 2 缓存）。
+_STAGE1_ONLY_KWARGS = ("stage1_remd_equilibration_steps",)
+
+
+def _scope_stage1_only_kwargs(run_config: Dict, stage_name: str) -> Dict:
+    kw = run_config.get("kwargs")
+    if stage_name != "decharging" and isinstance(kw, dict) and any(k in kw for k in _STAGE1_ONLY_KWARGS):
+        run_config = dict(run_config)
+        run_config["kwargs"] = {k: v for k, v in kw.items() if k not in _STAGE1_ONLY_KWARGS}
+    return run_config
+
+
 def _scope_stage2_lcr_switch(run_config: Dict, stage_name: str) -> Dict:
     """`stage2_lcr_rounds` 只进 vanishing 的指纹、且只在为真时进（不改入参）。
 
@@ -3112,7 +3130,8 @@ def _scope_stage2_lcr_switch(run_config: Dict, stage_name: str) -> Dict:
     ):
         run_config = dict(run_config)
         run_config["kwargs"] = {k: v for k, v in kw.items() if k != "stage2_lcr_rounds"}
-    return run_config
+    # 🔑 [2026-09-30] 同理，只作用于 stage 1 的采样协议键只进 decharging 的指纹。
+    return _scope_stage1_only_kwargs(run_config, stage_name)
 
 
 def _strip_non_identity_kwargs(run_config: Dict) -> Dict:
@@ -6420,6 +6439,10 @@ class ABFEPipeline:
             traj_files = _expected_remd_traj_files(stage_output_dir, stage_name, len(lambdas_coul))
             u_kn_path = os.path.join(stage_output_dir, f"{stage_name}_pme_u_kn.npy")
             n_k_path = u_kn_path + ".n_k.npy"
+            # 🔑 [2026-09-30] 去电荷 REMD 原来只有 5000 步轻预热就开始生产、全部帧
+            # 进 MBAR；HSP90 ligand-3 实测前 ~125 ps 均值偏高 ~5 kJ、rep 间散布最大。
+            # 设了就先跑这么多步平衡（同一套副本与交换，不落盘进分析），再生产。
+            _s1_equil_steps = int(kwargs.get("stage1_remd_equilibration_steps", 0) or 0)
             sampling_fingerprint = _remd_sampling_fingerprint(
                 stage_name=stage_name,
                 system=self.system,
@@ -6440,6 +6463,7 @@ class ABFEPipeline:
                 # 其身份必须进 sampling fingerprint：repeat_seed 一变，旧
                 # DCD/u_kn 缓存立即失效。
                 seed_contract=self.seed_contract_identity(),
+                equilibration_steps=_s1_equil_steps,
             )
             expected_frames = max(1, _expected_remd_frame_count(n_steps_per_window))
             sampling_cache_ok = bool(
@@ -6573,6 +6597,16 @@ class ABFEPipeline:
                     seed_stage=stage_name,
                     seed_leg=self.leg_name,
                 )
+                if _s1_equil_steps > 0:
+                    self._log(
+                        f"  [stage1 平衡段] REMD 先跑 {_s1_equil_steps} 步平衡（不进 MBAR），再开始生产"
+                    )
+                    remd.run(
+                        n_steps=_s1_equil_steps,
+                        exchange_interval=max(1, int(steps_per_update)),
+                        stage_name=f"{stage_name}_equil",
+                    )
+                    remd.begin_production_stage()
                 traj_files = remd.run(
                     n_steps=n_steps_per_window,
                     exchange_interval=max(1, int(steps_per_update)),
@@ -18406,6 +18440,7 @@ class ABFEPipeline:
                         shadow_bridge_lambdas=kwargs.get("shadow_bridge_lambdas"),
                         shadow_bridge_n_steps=kwargs.get("shadow_bridge_n_steps", 200000),
                         shadow_bridge_exchange_interval=kwargs.get("shadow_bridge_exchange_interval", 1000),
+                        stage1_remd_equilibration_steps=kwargs.get("stage1_remd_equilibration_steps", 0),
                     )
 
                 stage1, stage1_states, optimized_lambdas_1, window_ranges_1 = (

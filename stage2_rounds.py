@@ -344,7 +344,10 @@ def plan_next_round(
 
     每窗按序看，第一条命中的规则只决定**理由**：
       1. 缺帧：某态 ESS < ess_min（含某态一帧都没有）。
-      2. 段间不一致：单段依赖，或 σ_jk > max(2σ_MBAR, σ_tol)，或 top-1% > 上限。
+      2. 段间不一致：单段依赖，或 σ_jk > σ_tol，或 top-1% > 上限。
+         （09-29 起补段门与 `classify_window` 的 PROVISIONAL 门同为 σ_jk > σ_tol；原先是
+         max(2σ_MBAR, σ_tol) ⟹ σ_jk ∈ (σ_tol, 2σ_MBAR] 的窗口标 PROVISIONAL 却永远不补。
+         理由只用来区分两种情况：超过 2σ_MBAR = 段间不一致，否则 = 精度没到。）
       3. 都不命中 ⟹ 该窗完成。
     命中任一条，**动作都一样**（09-25 定，数据见设计 §11.3）：不倾斜、中心 = 合并 MBAR 的 F_k
     （证据弱且不含 λ=0 时投影回信赖域）、换一个没用过的种子 id。倾斜只在第一轮用。
@@ -373,8 +376,11 @@ def plan_next_round(
             sjk = ev.sigma_jk_kJ
             if sjk is None:
                 reason = "sigma_jk_unavailable"
-            elif sjk > max(2.0 * float(ev.sigma_mbar_kJ), float(sigma_tol_kJ)):
-                reason = f"segments_disagree_sigma_jk_{sjk:.2f}"
+            elif sjk > float(sigma_tol_kJ):
+                if sjk > 2.0 * float(ev.sigma_mbar_kJ):
+                    reason = f"segments_disagree_sigma_jk_{sjk:.2f}"
+                else:
+                    reason = f"sigma_jk_above_tol_{sjk:.2f}"
             elif not (ev.top1pct_weight <= top1pct_max):
                 reason = f"top1pct_weight_{ev.top1pct_weight:.2f}"
         if not reason:

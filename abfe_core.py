@@ -7972,6 +7972,19 @@ DEFAULT_BORESCH_ANCHOR_MODE = "openfe"
 OPENFE_MAX_ABS_DIHEDRAL_RAD = 2.618      # 150°：远离 ±π 缠绕边界
 OPENFE_MAX_ANGLE_CIRCSTD_RAD = 1.745     # 100°
 OPENFE_MAX_DIHEDRAL_CIRCSTD_RAD = 5.236  # 300°
+# 🔑 [2026-09-30] θA/θB 的**与 K 无关**的硬窗口（逐帧）。openfe 的「角不平」判据
+# ½Kθ² ≥ 10 kT 在 K=334.72 下最低放行到 ~22°，于是 brd4_ligand2 选出了
+# θA≈156–159°、θB≈25–27° 的近共线锚点：只因为 K 硬才勉强过关，φA/φB 在近共线时
+# 定义本身就病态，硬二面角约束反过来卡采样；K 一放软（41.84）共线代价只剩 1–2 kT。
+# 文献常用 30°–150° 硬拒（Boresch/restraint benchmark 2023）。两道判据都要过。
+OPENFE_ANCHOR_THETA_MIN_RAD = float(np.radians(30.0))
+OPENFE_ANCHOR_THETA_MAX_RAD = float(np.radians(150.0))
+
+
+def anchor_theta_in_window(angles_rad):
+    """逐元素：θ ∈ [30°, 150°]（与力常数无关的共线窗口）。"""
+    a = np.asarray(angles_rad, dtype=float)
+    return (a >= OPENFE_ANCHOR_THETA_MIN_RAD) & (a <= OPENFE_ANCHOR_THETA_MAX_RAD)
 
 
 def circular_std_rad(values_rad, axis=0):
@@ -10279,6 +10292,9 @@ class OrbBoreschEstimator:
             for name, arr in (("thetaA", thA), ("thetaB", thB)):
                 if not self._openfe_angle_not_flat(arr, k_angle, temperature_k):
                     return False, f"{name} 平到撞 [0, π] 边界（sinθ 奇点）", score, detail
+        for name, arr in (("thetaA", thA), ("thetaB", thB)):
+            if not anchor_theta_in_window(arr).all():
+                return False, f"{name} 有帧落在 [30°, 150°] 之外（近共线，与 K 无关的硬窗口）", score, detail
         return True, "", score, detail
 
     def openfe_ligand_anchor_pool(self, top, traj, ligand_resname):
@@ -13627,6 +13643,7 @@ class GeometricRestraintEstimator:
                 [cand, np.full(len(cand), g0), np.full(len(cand), g1), np.full(len(cand), g2)]))
             thg = mdtraj.compute_angles(traj, np.array([[g0, g1, g2]]))
             ok0 = (openfe_angle_not_flat(th, k_ang, T).all(axis=0)
+                   & anchor_theta_in_window(th).all(axis=0)
                    & (np.abs(ph) <= max_phi).all(axis=0)
                    & (circular_std_rad(th) < OPENFE_MAX_ANGLE_CIRCSTD_RAD)
                    & (circular_std_rad(ph) < OPENFE_MAX_DIHEDRAL_CIRCSTD_RAD)
@@ -13654,6 +13671,8 @@ class GeometricRestraintEstimator:
             phis = [mdtraj.compute_dihedrals(traj, A[:, [i, i + 1, i + 2, i + 3]]) for i in range(3)]
             ok = (openfe_angle_not_flat(thA, k_ang, T).all(axis=0)
                   & openfe_angle_not_flat(thB, k_ang, T).all(axis=0)
+                  & anchor_theta_in_window(thA).all(axis=0)
+                  & anchor_theta_in_window(thB).all(axis=0)
                   & (circular_std_rad(thA) < OPENFE_MAX_ANGLE_CIRCSTD_RAD)
                   & (circular_std_rad(thB) < OPENFE_MAX_ANGLE_CIRCSTD_RAD)
                   & ~all_frames_collinear(thH, thA, thB, np.broadcast_to(thg, thA.shape)))
@@ -13683,7 +13702,7 @@ class GeometricRestraintEstimator:
         raise RuntimeError(
             f"[锚点/openfe] {len(triples)} 个配体三元组都配不上合法的 H0-H1-H2"
             f"（受体池 {len(host)} 个 backbone 原子，距 G0 {OPENFE_HOST_MIN_DISTANCE_NM}–"
-            f"{OPENFE_HOST_MAX_DISTANCE_NM} nm、|φ|≤150°、θ 不平）。配体池：{pool_note}")
+            f"{OPENFE_HOST_MAX_DISTANCE_NM} nm、|φ|≤150°、θ 不平且 θ∈[30°,150°]）。配体池：{pool_note}")
 
     # ----------------------------------------------------------------
     # 主估算函数

@@ -27,16 +27,20 @@
 |---|---|---|
 | 1 | （空） | P1 |
 | 2.1 生产盒 / 偏负归因 | `BOX-01` | P2 |
-| 2.2 静态审核遗留 | `REVIEW-0924` | P2 |
+| 2.2 静态审核遗留 | `REVIEW-0924`、`REVIEW-0926` | P2 |
 | 2.3 待维护者拍板 | `IDENT-01` | P2 |
 | 2.4 local-residual / EXP-033 | `LR-06`、`EXP-033-P1-GPU`、`EXP-033-P2`、`LR-02`、`LR-05` | P2 |
 | 2.5 发布工程门 | `REL-03` | P2 |
+| 2.6 性能审查 0928（已核） | `BORESCH-AUTO-01`、`PERF-0928` | P2 |
+| 2.7 代码复查 0929（已核） | `CI-RED-01`、`REVIEW-0929`（剩 L8） | P2 |
 | 3.1 判定不改 | `AUDIT-01`~`07` | P3 |
 | 3.2 不是 bug | `BM-A` | P3 |
 | 3.3 膜线（暂停） | `MEM-LINE`、`PHY-03` | P3 |
 | 3.4 押后到方法定稿 | `REL-05` / `REL-06` / `REL-10` + 两条明确不做 | P3 |
 | 3.5 押后到独立端点段重新打开 | `COMBINE-01` | P3 |
 | 3.6 押后到重构 | `TEST-02` | P3 |
+| 3.7 性能审查 0928：非默认路径 / 驳回 | `PERF-0928-COND` + 4 条驳回 | P3 |
+| 3.8 代码复查 0929：降级 / 驳回 | `REVIEW-0929-COND` + 5 条驳回 | P3 |
 | 4 | 不许回退的约定 | — |
 
 ---
@@ -93,6 +97,16 @@
   先核凌晨份的两条"静默出错数"：#1 stage0 attachment 缓存 resume 用的是缓存里记下的 gate 标志、不是本次运行的；
   #4 `--analyze-only` 读窗口缓存的路径没接盒体积门。
   **判据**：每条都有结论（已修 / 不触发 / 有意为之 / 转成独立条目并带 `文件:行号`），写回两份审核的「处理结果」，本条关闭。
+
+- [ ] **REVIEW-0926 [P2] 09-26 静态审核（含 09-27 补充）还没对照代码核过。**
+  **位置**：[archive/CODE_REVIEW_2026-09-26.md](archive/CODE_REVIEW_2026-09-26.md)（行号是 HEAD `e576a54` 的）。规矩同 `REVIEW-0924`：量级是代理估的，不触发的潜伏项直接进 P3 或关掉。
+  **先核两条 P1**（09-28 性能审查说到 `e576a54` 仍未修，也没核过）：
+  #1 LCR 账本没绑定当前阶段协议，旧段可能混入新协议；#2 已完成的 final/stage 缓存能绕过生产盒校验。
+  **其余要核的**：#3 analyze-only 没接盒体积门（和 `REVIEW-0924` 凌晨份 #4 **是同一件事**，一起核）；#4 LCR 跳过边缘窗口后 jackknife σ 配错窗；
+  #5 非有限 MBAR σ 让补采条件失效；#6 固定 f_k burn-in 向上取整、超过配置步数；性能 `PERF-01`～`05`（09-28 的 `PERF-0928` 不重复这几条，实测时一起量）。
+  **不核**：RBFE 三条（A/B/C，RBFE 线叫停）；「结果质量与采样效率改进补充（09-27）」的 QUALITY-01～07 是改进建议、写不出判据，要做就去 `design/` 立方案。
+  线索：该审核的「已核实不应继续报」一节说 Stage0 attachment 缓存门已修，正对应 `REVIEW-0924` 凌晨份 #1，可以顺手核掉。
+  **判据**：每条有结论（已修 / 不触发 / 有意为之 / 转成独立条目并带 `文件:行号`），写回该审核文件的「处理结果」，本条关闭。
 
 ### 2.3 待维护者拍板（代理不要自行改）
 
@@ -152,6 +166,60 @@
   - ① residual 臂混合覆盖度门换口径后，EXP-030 candidate 臂的门读数（`ess_gate_mixture_gauge` 应为 `sampling_states`）——benchmark 没跑 candidate 臂；
   - ② 三个 decharging builder 的 `frozen_ll_pairs` 断言——39 rep 里没有一条报过它（真实体系上触发 ⟹ P0-01 前提不成立，是新发现不是回归）。
   **判据**：各有一条真机日志读到对应读数。
+
+### 2.6 性能静态审查（2026-09-28，已逐条对照源码核过）
+
+> 来源：[archive/PERF_REVIEW_2026-09-28.md](archive/PERF_REVIEW_2026-09-28.md)（26 条，HEAD `e576a54`）。09-28 逐条核过：行号基本都对，但**半数以上把「在不在默认路径」判错了，或优先级定高了**；
+> 以下只收核实后的版本（位置、机制按核实结果改写过，**不要回去照原文修**）。非默认路径的条目和驳回的条目在 §3.7。
+> ⚠️ 所有耗时/内存量级都是审查代理**推算**的，没有一条实测过。
+
+- [ ] **BORESCH-AUTO-01 [P2] 没写 `boresch_source` 的配置走 `auto`（Orb）链，在默认 `openfe_fixed` 下必然拒掉全部候选并抛错。**（原 A3，行为问题，不是性能问题）
+  **位置**：`abfe_core.py::OrbBoreschEstimator._apply_hybrid_filter`（`openfe_fixed` 时恒返回 kr=`OPENFE_FIXED_KR_KJ_PER_MOL_NM2`=4184）
+  vs `estimate_multiple_anchors_from_trajectory(max_kr=2000.0)` 的 `if ks["kr"] > max_kr: continue`（快速验证与 finalize 两处）；
+  `runabfe.py::resolve_boresch_restraint` 的 `source == "auto"` 分支不传 `max_kr` ⟹ `validated`/`fallback_pool` 全空 ⟹ `RuntimeError("自动 Boresch 估算失败…")`，
+  而且是付完整个枚举 + MACE 口袋力之后才抛。无测试覆盖。
+  **为什么没炸过**：自带 `abfe_config.json` 写了 `"boresch_source": "simple"`（走 `GeometricRestraintEstimator`），不是审查说的「有缓存」。
+  **为什么是 P2 不是 P3**：按 §4「`abfe_config.json` 只是样例、不是默认值」，**手写配置不写这个键 = 走 auto = 必炸**，是 clone-and-run 的坑；当前生产不受影响。
+  orb 档本身「留着别投入」，修法只求不炸，不优化这条链。
+  **判据**：`force_constant_mode == "openfe_fixed"` 时 kr 门跳过（力常数是设置项，不该拿拟合上限筛），或把未写 `boresch_source` 的默认改成 `simple`（二选一，需维护者拍板）；
+  补一条单测：`openfe_fixed` + 默认 `max_kr` 下 `estimate_multiple_anchors_from_trajectory` 返回非空。
+
+- [ ] **PERF-0928 [P2] 默认主线上核实成立的性能项：先实测占比，再决定改哪条。**
+  **先实测**：`ibs_engine.py` 的 `loop_timing_s`（integration/guard/cv_probe/ledger_io）已有入口，但**不覆盖** Context 构建、warmup 和分析期，A1/A2/A4 要另外计时。
+  | 原编号 | 位置 | 核实后的机制 |
+  |---|---|---|
+  | A1 | `abfe_pipeline.py::_run_stage2_autonomous` 的 ANALYZE 轮与非 DONE 退出收尾；`_solve_merged_segments_if_any` | 窗口输出无进程内缓存，全量重读重解；有合并段时先 `run_once` 再合并解，前一个结果被丢弃。**只在 ANALYZE 轮和非 DONE 退出时发生，不是每轮**。退出那次全路径解承担逐窗支撑/σ/overlap 落盘，重组时保留 |
+  | A2 | `ibs_engine.py::build_ibs_dual_system` 里的 `_common_system_xml = _serialize_ibs_common_system(...)` | 每窗无条件 clone + 序列化 U_common，常驻到窗口结束；`run_all_windows` 内部只在 `legacy_repair` 下消费。**另一个消费方** `abfe_pipeline.py::_run_independent_endpoint_segment` 也会读，改惰性时要保留 |
+  | A11 | `run_all_windows` 生产循环里每个 update 对 K 个 `_f_{k}` 做 `getParameter` 并与 `production_f_k_lock` 比对 | 没有节流，也不计入 loop_timing。只有这一处是防篡改轮询；审查列的另外三处是计算本身要读的值，不动 |
+  | A12 | 生产循环每 100 updates：`_enqueue_window_snapshot` 写完 npy 后，`_window_data_metadata` 又 `np.load` + `_sha256_file` 读回来 | 刚写的文件被读了两遍。修法**不能**用 `_array_content_fingerprint`（它哈希 `tobytes()`，和文件 sha256 不相等，而且注明只做诊断）；要在内存里对 npy 字节直接算 sha256 |
+  | A13 | `ibs_engine.py::_save_coords_sidecar` | 每次 flush 都对累计 list 做 `np.stack` 再全量覆盖写，累计 O(n²)；默认开（`STAGE2_COORDS_EVERY=5`）。单位换算已经是向量化的，可以忽略 |
+  | A4 | `run_all_windows` 开头的 `win_sys_xml = XmlSerializer.serialize(win_sys)` | 生产 checkpoint manifest 复用这一份，**进生产的窗口省不掉**。能省的只有两处：进生产前就退出的窗口；以及算完 sha256 后释放字符串 |
+  | A5 | `build_ibs_dual_system` 的 `cv_template` 与 K 态循环 | 每窗 K+1 次力构建，模板用完即弃；每态重建排除表 set 做比对。`value_in_unit` 是纯 Python，不是 SWIG。shadow-coul 那处不在默认路径 |
+  **判据**：每条有实测占比和处理结论（改 / 占比太小不改），改的那几条前后同体系同协议对照 ΔG 与账本逐字节一致。
+  ⚠️ 09-26 审查的 PERF-01～05 与本条是两批，登记在 §2.2 `REVIEW-0926`（未核）。
+
+### 2.7 代码复查（2026-09-29，已逐条对照源码核过）
+
+> 来源：[archive/CODE_REVIEW_2026-09-29.md](archive/CODE_REVIEW_2026-09-29.md)（H/M/L 共 14 条，基于未提交工作区）。09-29 逐条核过：
+> 描述大多属实，但 **H1、H2 两条「高」都是默认路径碰不到的潜伏项**，M3 的量级是推算且偏大一个数量级；
+> 以下只收核实后的版本，**不要回去照原文修**。降级 / 驳回的在 §3.8。原文 §3「确认干净」和 ruff 结论**没复核**。
+
+- [ ] **CI-RED-01 [P2] CPU CI 连续红，最近一次（09-26 run `36276233306`）是 `2 failed, 2840 passed, 6 xfailed`。两条都不是生产 bug。**
+  ① `tests/test_doc_staleness_contract.py::test_snapshot_docs_are_not_stale`：`docs/STATUS.md` 第 5 行声明日期仍是「截至 2026-09-18」，阈值 3 天。
+  ② `tests/test_nvcc_discovery_and_compile_failure_2026_09_15.py::test_a_compile_error_raises_instead_of_silently_using_cpu`：
+  CI 的 OpenMM 没有 CUDA platform ⟹ `abfe_pipeline.py` 里 `getPlatformByName(requested_base)` 先抛 ⟹ 被判为资源类故障 ⟹ 走 CPU 回退 ⟹ 回退路径的 `openmm.Context`
+  正好被测试 monkeypatch 成抛 `_Boom` ⟹ 逃出 `pytest.raises(RuntimeError)`。修的是测试，照同文件 resource 测试的写法把 `getPlatformByName` 也 stub 掉。
+  ⚠️ 复查原文说「近 8 次全红都是这两条」，**只核了最近一次**；更早的 run 在 STATUS 还没过期时就已经红了，原因多半不同。
+  🟢 **09-29 本地已修**：① STATUS.md 声明日期改成 09-28（09-28 那次只加了「跨软件对照」一节，头注写明了其余各节仍截至 09-18）；
+  ② 照同文件 resource 测试的写法 stub 掉 `getPlatformByName`。
+  同时把 `archive/CODE_REVIEW_2026-09-26.md`（未入库）里 84 处 `file.py:行号` 形式的链接改成 `file.py#L行号`：不改的话它一入库，`test_docs_internal_links_resolve` 就会红。
+  本地全量 `-m "not needs_gpu"`：`2854 passed, 8 skipped, 6 xfailed, 0 failed`。
+  **判据**：下一次推送的 CPU CI 为 0 failed（还没推，**未确认**）。
+
+- [ ] **REVIEW-0929 [P2] 默认路径上核实成立、还没修的一条**（M1、M2 09-29 已修，见 [archive/TODO_closed.md](archive/TODO_closed.md)）。
+  | 原编号 | 位置 | 核实后的机制 | 判据 |
+  |---|---|---|---|
+  | L8 | `tools/pocket_water/` 与 `tests/test_pocket_water_relocation_2026_09_28.py` | 只有 2 条测试（U0 差分对 OpenMM、stage-1 比值对独立重算），stage-2 延迟接受、`run_sampler` 的 apo ghost-ligand 路径、kabsch 跟踪都没有测试。口袋水线 09-27 已重新打开，S2 采样器开工前补 | stage-2 至少一条小体系测试：`min(1, exp(-β[ΔU−ΔU0]))` 与独立重算一致 |
 
 ---
 
@@ -250,6 +318,55 @@
   **触发**：重构。先重构再压——分类是按当前覆盖行算的，重构后要**重算**，现在删并会返工。
   ⚠️ 动手前先把 `tests/` 的未提交改动提交或打快照：大量日期文件未入库，删了找不回（09-24 权限分类器就是因此拦下的）。
   **判据**：全量绿、xfail/skip 数不变；收集数 ≤ 1500；压后生产行覆盖数不低于压前（重构后的新基线）。
+
+### 3.7 性能审查 0928 里不在默认路径 / 已驳回的条目（2026-09-28 核实）
+
+> 来源同 §2.6。**默认路径上成立的**在 §2.6 `PERF-0928`；这里的都**不修**，除非对应的触发条件出现。理由别重新论证。
+
+- [ ] **PERF-0928-COND [P3] 机制属实，但只在非默认分支上触发。触发时顺手改。**
+  | 原编号 | 触发条件 | 核实要点 |
+  |---|---|---|
+  | A7 | stage1 未完成就 resume（REMD 中途崩，或缓存失配） | `_is_traj_valid` 逐记录读到 EOF，abfe_pipeline 侧没有记忆化；真正读两遍的是「指纹匹配但 DCD 坏了」。审查写反了一处：runabfe 里有记忆化的是**预平衡 DCD**（`_TRAJ_STRICT_VALIDITY_CACHE`），checkpoint 是故意不缓存的。审查建议改成只看头部 + 文件大小，这和 docstring 里 fail-closed 的设计冲突，**要维护者拍板** |
+  | A9 | 控制器 RECALIBRATE_FK / PROBE_CANDIDATE_FK / PROBE_REANCHOR_EPOCH | 已按 `only_windows` 只解 decide() 点名的窗口，不是全窗；只是同输入重复解，没有记忆化 |
+  | A10 | `boresch_source=auto`（Orb 链） | 逐候选拷贝全轨迹 float64、逐帧 Python 二面角、MACE 口袋力逐候选重算；`openfe_fixed` 下 q/Fq 算完不被读。依附 `BORESCH-AUTO-01`，orb 档不投入 |
+  | A8 | `--mode traditional` | `run_traditional_mode` 复合物腿每次都 `build_system_from_gromacs`，没走 native cache |
+  | A14 | `TraditionalMBARAnalyzer` + 非 PME 腿（有 LRC） | `_compute_u_kn_chunk` 里盒体积放在 k 循环内，K 倍冗余 |
+  | B1 / C6 | `--outer-lambda-local-residual-ibs` | B1：残差值已经在首次 CV 数组里，却又调一次 `getCollectiveVariableValues`；C6：每窗重建一份逐字节相同的力 XML |
+  | C4 / C5 | 同上开关，**且**冻结 manifest 不覆盖当前配体（闭式重训，不是已摘线的 autofit） | C4：岭网格对与 ridge 无关的二次型重复计算；C5：约 251 帧 × 9 态串行 PME 单点能 |
+  | B2 | `stage2_independent_endpoint` + `--analyze` | 读侧对 bank 全量重算 sha256。只在 `--analyze` 时发生，不是每次 resume |
+  | B5 | legacy anchor 模式 | Python 双层循环做 unwrap；openfe 档只有 1 列，影响可以忽略 |
+  | C1 | 口袋水 S1 探针（离线工具） | 每个水、每帧都 `updateParametersInContext`；但同帧的试探能量评估有几万次，它未必是瓶颈，P1 没有依据。S2 采样器开工前实测再说 |
+  | C2 / C3 | APBS 修正（只服务膜线，膜线暂停） | DX 网格逐 token 正则解析；各快照串行跑子进程 |
+  **判据**：无单独判据，随各自工作线重新打开时一并处理。
+
+**驳回**（理由别重新论证）：
+- **A6**（warmup 续采每 250 步重写 ibs_state）：实际是攒满 40 帧（约 1 万步）才写一次，只在 resume 且 `calibrated_pending_validation` 时触发；历史长度有截断（`_TMBAR_SLIDING_WINDOW`、`max_bias_updates`），不是 O(累计)。
+- **B3**（`--only-complex-charging` 二次 MBAR）：raw 全帧 MBAR + 相邻 BAR 是另一种估计量，是**有意的交叉验收门**，不是重复计算。
+- **B4**（fixed-H 探针每边 fsync）：`_persist_fixed_h_probe_edge` / `_probe_vdw_window_fixed_overlap` 在活代码里**没有调用方**（测试甚至断言它不在），是死代码。
+- **C7**（mace_graph 逐原子 `.item()`）：`build_mace_graph` 在仓库里没有调用方，是死代码；审查说的「每图重算 SHA」也不对（`verify_sources` 默认 False）。
+- B4、C7 的死代码删除归 §3.6 重构一起做。
+
+### 3.8 代码复查 0929 里降级 / 驳回的条目（2026-09-29 核实）
+
+> 来源同 §2.7。这里的都**不修**，除非对应的触发条件出现。理由别重新论证。
+
+- [ ] **REVIEW-0929-COND [P3] 机制属实，但默认路径碰不到或收益可忽略。触发时顺手改。**
+  | 原编号 | 触发条件 | 核实要点 |
+  |---|---|---|
+  | H1 | 重新打开 `stage2_independent_endpoint` | **就是 §3.5 `COMBINE-01`**，不重复登记。复查原文说「`--analyze-only` 恢复 vanishing 腿今天是断的」、「发布前必修」，**不对**：开关 09-01 起默认关（`abfe_pipeline.py::_run_dual_lambda_stage` 里 `_endpoint_requested`），默认配置下不走拼接 |
+  | H2 | 留一法求解子集时抛 `MultiSegmentInputError` | `stage2_rounds_evidence.py` 留一法循环的 `except (…, ValueError)` 确实会连 `MultiSegmentInputError` 一起吞掉 ⟹ 写 nan ⟹ `single_segment_dependent` ⟹ 补段。但复查写的「输入账本损坏被静默降级」**碰不到**：完整求解 `solve_window` 在前面、没有包 try，账本坏了在那里就直接炸；留一法的输入是合法输入的子集，形状、有限性检查不会单独失败。和设计 A11（「解不出来 ⟹ fail-closed」）口径不一致，改的话把 `MultiSegmentInputError` 从捕获列表里剔掉即可 |
+  | M4 | GPU Context 构建失败、被判为资源类，并且 CPU Context 也失败 | `abfe_pipeline.py` CPU 回退路径的 `openmm.Context(...)` 不在 try 里，会裸抛、不带上下文。复查说它是 CI nvcc 测试失败的「共因」：实际修法在测试侧，见 `CI-RED-01` |
+  | L6 | outer-λ 生产路径再出 NaN、需要诊断现场时 | `step_guard.py` 的 `guarded_minimize` / `guarded_set_parameter` / `guarded_deserialize` 等在生产代码里没有调用点；裸 `.step()`：`outer_lambda_neural_basis.py` 3 处、`free_energy_engine.py` 2 处 |
+  | L1 | 壳体积 ≈ 0，或 bounding box 远大于壳 | `tools/pocket_water/relocation.py::uniform_in_shell` 的 while 没有迭代上限 |
+  | L7 | 别处开始假设 `seed_id` 全局唯一 | `stage2_rounds.py::first_round_specs` 每窗从 0 计（0/1/2 跨窗复用）；逐窗证据层不受影响，写进 docstring 即可 |
+  **判据**：无单独判据，随各自工作线重新打开时一并处理。
+
+**驳回**（理由别重新论证）：
+- **M3**（`RelocationMC` 的 V_R/V_S 用 MC 积分，误差进接受判据）：机制属实（常数比值偏了 ⟹ 进出方向的平稳分布整体平移 ≈ ε kT），但复查写的「1–2% 相对误差、0.02–0.04 kT」是推算且偏大：2M 样本、命中率约 0.3 时 ε ≈ 0.1%，约 1e-3 kT/水，可以忽略。
+- **L2**（`np.log(rng.random())` 取到 0 ⟹ -inf ⟹ 无条件接受）：概率约 2⁻⁵³，复查自己也判不值得。
+- **L4**（新预检遇到旧运行目录缺 `ligand_indices_solvent.json` 时裸抛 `FileNotFoundError`）：**碰不到**。1.5 步的溶剂腿缓存完整性检查已经把这个文件列为必需（`runabfe.py` 缓存路径表 + `missing` 列表），走到预检之前就会被拦下或重建。
+- **L5**（`_check_boresch_geometry_safe` 没查二面角 φ 的奇异性）：φA、φB 的奇异点就是 θA、θB 共线，已经被 sin 下限覆盖；只有 φC 用到的配体内部角 b1-b2-b3 不在运行时查，而那个角是选锚点时定的。
+- **L3**（`final_state.npz` 存 float32）：离线工具的续跑起点，精度够用，复查自己也判不值得。
 
 ---
 
