@@ -15163,6 +15163,12 @@ class IBSWindowManagerDualLambda:
         # 段标签：非 None 时并进 seed ledger 的流名，让同一窗口的不同段拿到不同的
         # 积分器 / 速度种子（起点坐标统一是预平衡末帧，段间只差种子）。
         segment_seed_tag: Optional[str] = None,
+        # 🔑 [2026-10-02 / stage2 接力] {window_idx: 坐标(nm, (N,3))}：给了的窗口从这份坐标
+        # 起跑（上一段该窗口的生产末态），不给的窗口照旧用 `positions`。None ⟹ 逐字不变。
+        window_start_positions: Optional[Dict[int, Any]] = None,
+        # True ⟹ 每个窗口生产结束时把全体系末态坐标与盒子写到
+        # {output_dir}/dual_window_{w}_{stage}_final_state.npz（接力的下一段从这里起跑）。
+        save_window_final_state: bool = False,
         production_step_overrides: Optional[Dict[int, int]] = None,
         enable_early_stop: bool = False,
         early_stop_min_steps: int = 100000,
@@ -15652,6 +15658,9 @@ class IBSWindowManagerDualLambda:
                         print(f"  [WARN] 窗口 {window_idx} 缓存能量加载失败 ({e})，将重新采样该窗口。")
 
             # ---------- 构建系统 ----------
+            # 接力起点只换 Context 的初始坐标；建体系仍用 `positions`（它作 reference_positions
+            # 进 build_ibs_dual_system，可能定义限制中心），保证接力不改哈密顿量。
+            _start_positions_w = (window_start_positions or {}).get(int(window_idx), positions)
             win_sys, ibs_wrap = self._build_window_system(lc_win, lv_win, resolved_box, positions)
             if debug_mode:
                 print_force_group_details(win_sys, prefix=f"窗口{window_idx}_系统构建后")
@@ -15728,7 +15737,7 @@ class IBSWindowManagerDualLambda:
             sim = app.Simulation(self.topology, win_sys, integrator, platform, props)
             if resolved_box is not None:
                 sim.context.setPeriodicBoxVectors(*resolved_box)
-            sim.context.setPositions(positions)
+            sim.context.setPositions(_start_positions_w)
             # lambda_shield 只存在于 VDW softcore 系统变体（build_ibs_dual_system）；
             # Shadow-Coulomb 变体（build_shadow_coul_ibs_system）里 VdW 全程满强度、
             # 不经过 λ-WCA 防护壳，不会注册这个 global parameter，需先判存在再设。
@@ -20043,6 +20052,20 @@ class IBSWindowManagerDualLambda:
                 sampling_states_arr,
             )
             _save_coords_sidecar(production_coords_path, sampler)
+            if save_window_final_state:
+                _fs = sim.context.getState(getPositions=True)
+                _fs_path = os.path.join(
+                    self.output_dir, f"dual_window_{window_idx}_{stage_type}_final_state.npz")
+                _fs_tmp = _fs_path + ".tmp.npz"
+                np.savez(
+                    _fs_tmp,
+                    positions_nm=np.asarray(
+                        _fs.getPositions(asNumpy=True).value_in_unit(unit.nanometer), dtype=np.float64),
+                    box_nm=np.asarray(
+                        _fs.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer),
+                        dtype=np.float64),
+                )
+                os.replace(_fs_tmp, _fs_path)
             _atomic_save_npy(
                 production_residual_basis_path,
                 np.asarray(sampler.residual_basis_history, dtype=np.float64),

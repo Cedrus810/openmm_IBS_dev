@@ -7231,6 +7231,10 @@ def _path_evolution_kwargs(config) -> dict:
     # 其余是计划参数，设了才透传，全部在 abfe_pipeline._NON_IDENTITY_KWARGS 里、不进身份。
     if bool(config.get("stage2_lcr_rounds", False)):
         out["stage2_lcr_rounds"] = True
+    # 🔑 [2026-10-02] stage2 接力（同窗下一段从上一段生产末态起跑）。只在为真时透传；
+    # 换的是采样起点 ⟹ 进 vanishing 指纹（abfe_pipeline._scope_stage2_lcr_switch），不设 ⟹ 逐字不变。
+    if bool(config.get("stage2_lcr_relay", False)):
+        out["stage2_lcr_relay"] = True
     for _k, _cast in (
         ("stage2_lcr_tilt_kT", float),
         ("stage2_lcr_trust_floor_kT", float),

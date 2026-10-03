@@ -3130,6 +3130,13 @@ def _scope_stage2_lcr_switch(run_config: Dict, stage_name: str) -> Dict:
     ):
         run_config = dict(run_config)
         run_config["kwargs"] = {k: v for k, v in kw.items() if k != "stage2_lcr_rounds"}
+    # 🔑 [2026-10-02] 接力开关同样只进 vanishing 的指纹、只在为真时进。
+    kw = run_config.get("kwargs")
+    if isinstance(kw, dict) and "stage2_lcr_relay" in kw and (
+        stage_name != "vanishing" or not kw.get("stage2_lcr_relay")
+    ):
+        run_config = dict(run_config)
+        run_config["kwargs"] = {k: v for k, v in kw.items() if k != "stage2_lcr_relay"}
     # 🔑 [2026-09-30] 同理，只作用于 stage 1 的采样协议键只进 decharging 的指纹。
     return _scope_stage1_only_kwargs(run_config, stage_name)
 
@@ -6300,6 +6307,9 @@ class ABFEPipeline:
         fixed_f_k_by_window: Optional[Dict[int, Any]] = None,
         segment_seed_tag: Optional[str] = None,
         fixed_f_k_burn_in_steps: int = 25000,
+        # [2026-10-02] stage2 接力：逐窗起跑坐标 + 是否落盘窗口末态（见 run_all_windows）。
+        window_start_positions: Optional[Dict[int, Any]] = None,
+        save_window_final_state: bool = False,
         only_window_indices: Optional[List[int]] = None,
         # 🔑 [路径演化] 调用方保证这份 window_ranges 是权威的（保前缀插点的产物，
         # 与全局分窗器重算的结果必然不同）。默认 False 时逐字保持原有严格判据。
@@ -7003,6 +7013,8 @@ class ABFEPipeline:
             # [2026-09-26] 10 ps 一块：块长 = 总长时只有 1 块，看不出漂移（LCR 真机实测）。
             fixed_f_k_burn_in_block_steps=5000,
             segment_seed_tag=segment_seed_tag,
+            window_start_positions=window_start_positions,
+            save_window_final_state=bool(save_window_final_state),
             # 🔑 [2026-09-11 实验开关，默认 False] 见 ibs_engine 里的参数注释。
             accept_recalibrated_f_k_without_gate=bool(
                 kwargs.get("stage2_accept_recalibrated_f_k_without_gate", False)
@@ -14815,6 +14827,11 @@ class ABFEPipeline:
                                   _sr.ZERO_WINDOW_END_SHIFT_KT_COMPLEX)) if is_complex else 0.0
         budget = kw.get("stage2_production_budget_steps")
         n_steps = int(n_steps_per_window)
+        # 🔑 [2026-10-02] 接力：同一窗口的下一段从上一段（该窗口最近一次采完的段）的生产末态起跑，
+        # 不再每段都回到预平衡末帧。HSP90 ligand-3：每段 0.5 ns 从耦合态独立重起 ⟹ 盖子螺旋相对
+        # Asp93 的两个构象每段随机落一个、段内不换（stage 2 rep 间 SD 11–13 kJ）。开关默认关。
+        # ⚠️ 接力后段与段不再独立，段间 jackknife σ 偏乐观。
+        relay = bool(kw.get("stage2_lcr_relay", False))
         # 09-25：溶剂腿第一轮每窗只跑中段、收敛标签只要 1 个种子（设计 §3.1.2 / §11.5）。
         min_seeds = (_sr.MIN_INDEPENDENT_SEEDS_COMPLEX if is_complex
                      else _sr.MIN_INDEPENDENT_SEEDS_SOLVENT)
@@ -14871,6 +14888,25 @@ class ABFEPipeline:
                 if os.path.isfile(spec_path):
                     with open(spec_path, "r", encoding="utf-8") as fh:
                         seg_spec = json.load(fh)
+                relay_start = None
+                if relay:
+                    prev = [(int(r["round"]), int(s2["segment"]))
+                            for r in ledger["rounds"] for s2 in r["specs"]
+                            if int(s2["window"]) == w and int(s2["segment"]) != seg
+                            and r["status"].get(f"{s2['segment']}:{w}", {}).get("state") == "SAMPLED"]
+                    spec["start_from"] = "pre_equilibration"
+                    if prev:
+                        _, pseg = max(prev)
+                        p_out, _ = self._stage2_segment_dirs(stage_dir, ckpt, pseg)
+                        fs = os.path.join(p_out, f"dual_window_{w}_vdw_final_state.npz")
+                        if os.path.isfile(fs):
+                            arr = np.load(fs)["positions_nm"]
+                            relay_start = [openmm.Vec3(*map(float, x)) for x in arr] * unit.nanometer
+                            spec["start_from"] = f"segment_{pseg}"
+                        else:
+                            spec["start_from"] = f"pre_equilibration (segment_{pseg} has no final_state)"
+                            self._log(f"  [stage2 接力] 段 {pseg} 窗口 {w} 没有末态文件 ⟹ 段 {seg} 退回预平衡末帧起跑。")
+                    self._log(f"  [stage2 接力] 段 {seg} 窗口 {w} 起点：{spec['start_from']}")
                 seg_spec.setdefault("segment", seg)
                 seg_spec.setdefault("windows", {})[str(w)] = spec
                 _atomic_write_json(spec_path, seg_spec)
@@ -14884,6 +14920,9 @@ class ABFEPipeline:
                         _resume_override=True,
                         _fixed_f_k_by_window={w: spec["sampling_f_k_kJ"]},
                         _segment_seed_tag=f"seg{seg}",
+                        # 接力关着时不传这两个参数 ⟹ 调用与老路径逐字相同。
+                        **({"_window_start_positions": ({w: relay_start} if relay_start is not None else None),
+                            "_save_window_final_state": True} if relay else {}),
                     )
                     rnd["status"][key] = {"state": "SAMPLED"}
                 except (RuntimeError, ArithmeticError, openmm.OpenMMException) as err:
@@ -18510,7 +18549,9 @@ class ABFEPipeline:
                                       _allow_partial_rescue=False,
                                       _repro_fk_tilt_sign=None,
                                       _fixed_f_k_by_window=None,
-                                      _segment_seed_tag=None):
+                                      _segment_seed_tag=None,
+                                      _window_start_positions=None,
+                                      _save_window_final_state=False):
                     # [2026-09-25] stage2 轮次控制器给的是**已倾斜好的固定 f_k**：
                     # 不再套复现节奏的默认倾斜（否则会倾斜两次）。
                     if _fixed_f_k_by_window is not None:
@@ -18598,6 +18639,8 @@ class ABFEPipeline:
                         repro_fk_tilt_sign=_repro_fk_tilt_sign,
                         fixed_f_k_by_window=_fixed_f_k_by_window,
                         segment_seed_tag=_segment_seed_tag,
+                        window_start_positions=_window_start_positions,
+                        save_window_final_state=_save_window_final_state,
                         fixed_f_k_burn_in_steps=int(
                             kwargs.get("stage2_lcr_burn_in_steps", 25000)),
                         production_step_overrides=_production_step_overrides,
