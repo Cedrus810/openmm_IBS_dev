@@ -10,6 +10,43 @@
 
 ---
 
+# 2026-10-03（`BOX-01`）
+
+## **BOX-01 [P2] 用修后代码重跑 `cyclod_ligand1/rep2`，判定生产盒 bug 是不是 ΔG 系统性偏负的主因。**
+
+  **缺陷（09-23 已修，CHANGELOG 同日条）**：resume 判「预平衡已完成」后坐标/盒退回输入值 ⟹ 复合物腿在输入盒上采样
+  （输入盒普遍比 NPT 平衡体积大 4–5%）；溶剂腿取 NPT 末帧单次快照。
+  **为什么是 P2**：新起/续跑的 run 自动用对的盒、旧缓存自动作废 ⟹ 不会再产生错数，只剩归因。
+  **触发**：溶剂腿扭转修复（09-23）之后**下一批新代码 benchmark 出数时顺带判定**，不单独排作业（单独跑会把两个修复的效果混在一起）。
+  ⚠️ 在那之前，盒子中招的旧结果（cmet 全部、cyclod_ligand1 rep2/rep3）**不得引用、不得拿来比**。
+
+  **benchmark 取证**（convergence json `lj_tail_lrc_box_volume_nm3` vs `pre_equilibration.dcd` 后半段体积均值；
+  ΔG 偏差 = 计算 − 实验，kcal/mol，09-23 复现批）：
+
+  | run | 复合物盒 | 溶剂盒 | ΔG 偏差 |
+  |---|---|---|---|
+  | cyclod_ligand3/rep1 | +0.32% | −0.18% | +2.14 |
+  | cyclod_ligand2/rep1 | −0.34% | −0.43% | −0.79 |
+  | cyclod_ligand1/rep3 | **+4.93%** | −0.14% | −3.06 |
+  | cyclod_ligand1/rep2 | **+4.89%** | +0.79% | −4.17 |
+  | cmet_ligand1/rep1 | **+5.37%** | **+3.50%** | −11.23 |
+  | cmet_ligand2/rep1 | **+5.42%** | **+3.08%** | −15.01 |
+  | cmet_ligand1/rep2 | **+5.40%** | −0.35% | −24.95 |
+
+  方向两处吻合：复合物盒正常的两个 cyclod 偏差小、偏大的全部显著偏负；cmet_ligand1 rep1/rep2 只差溶剂盒，rep1 溶剂盒也大 ⟹ 少负 13.7 kcal。
+  物理方向：盒大 ⟹ vanishing ΔG 更正（4W53 实测 ∂ΔA/∂V = 4.07 kJ/mol/nm³，见 [STATUS.md](../STATUS.md)）。
+  **不是证明**：n=7、与体系混杂；线性外推 15 nm³×4.07≈61 kJ 远超实测，已离开线性区。
+
+  **判据**：重跑后 cyclod_ligand1 偏差若缩到 cyclod_ligand2/3 的量级（−0.8 ~ +2 kcal）⟹ 盒子是主因，接着重跑全部 cmet；
+  缩得不多 ⟹ 盒子只是其中一项。预平衡可复用，其余会被新缓存门自动作废重跑，**不用手删产物**。
+  ⚠️ 「偏负 = 采样故障，已定论」这条旧口径 09-23 作废（采样器已修、复现路线是固定采样）。
+
+  📌 **10-03 注（只列事实，没判定）**：09-26 起的 lcr 批都是修后代码。cyclod_ligand1 lcr（n=3）偏差 −0.83，落进上面判据的区间；但同批 cyclod_ligand2 −4.63、cmet 两个 −11.7 ~ −11.9，且 OpenFE / FEP suite（加 LRC 后）同样偏负（[STATUS.md](../STATUS.md)「当前现状」）。10-02 起 abfe-benchmark 不再追 ⟹ 本条的触发条件（「下一批 benchmark 出数」）不会再自然出现。**关闭还是降 P3 由维护者定**。
+
+  **关闭（10-03，维护者拍板）**：不再追。abfe-benchmark 这套测试集本身有问题——cmet 等体系所有方法都跑不出来（IBS / OpenFE / FEP suite 加 LRC 后三家同样偏负，cmet 两个配体 −8.5 ~ −11.9 kcal，见 [STATUS.md](../STATUS.md)「当前现状」），拿它判不了生产盒是不是主因；10-02 起工作重心已换到 fragment-opt-abfe-benchmark（有同拓扑的论文逐 rep 参考）。生产盒的修复本身（09-23）照常生效，不回退。
+
+---
+
 # 2026-09-29（`REVIEW-0929` 的 M1、M2）
 > `REVIEW-0929` 本身没关，还欠 L8，条目在 [TODO.md](../TODO.md) §2.7。
 

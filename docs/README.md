@@ -60,9 +60,12 @@
 已关闭的条目整段移进 [archive/TODO_closed.md](archive/TODO_closed.md)（09-18 起合并成一份，按日期倒序），取证在
 [archive/TODO_evidence_2026-09-16.md](archive/TODO_evidence_2026-09-16.md)。
 
-## stage-2 控制器（当前主战场）
+## stage-2 控制器
 
-**按这个顺序读**，前三份是活的，第四份是今天的盘面：
+> 📌 **2026-10-03 现状**：主线 stage 2 走 **LCR 轮次控制器**（`stage2_lcr_rounds`，run config 里显式开），下面四份写的是**旧自治控制器**（已关）。
+> 现行文档：设计 [design/PROPOSAL_stage2_lcr_rounds_2026-09-24.md](design/PROPOSAL_stage2_lcr_rounds_2026-09-24.md)、计划 [design/PLAN_stage2_controller_rewrite_2026-09-24.md](design/PLAN_stage2_controller_rewrite_2026-09-24.md)、准确性缺口与下一版设计 [design/PROPOSAL_stage2_accuracy_2026-10-03.md](design/PROPOSAL_stage2_accuracy_2026-10-03.md)（未实施）；最近一次交接 [HANDOFF_2026-10-02_bias_precision_boresch.md](HANDOFF_2026-10-02_bias_precision_boresch.md)；当前数字看 [STATUS.md](STATUS.md)「当前现状」。
+
+**旧自治控制器**按这个顺序读，前三份是活的，第四份是 09-18 的盘面：
 
 1. [STAGE2_CONTROLLER_DESIGN_2026-09-12.md](archive/STAGE2_CONTROLLER_DESIGN_2026-09-12.md)
    —— 🔑 **接手先读这份**。核心验收指标、设计、实证、十条真机陷阱、别重新论证的事。

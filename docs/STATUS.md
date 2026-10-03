@@ -2,7 +2,11 @@
 
 [项目入口](../README.md) · [文档导航](README.md)
 
-> **本页整理截至 2026-09-28**（09-28 只新增「跨软件对照」一节，其余各节内容仍截至 09-18；协议版本一栏最后一次逐条核对是 09-12，六个值与 09-09 相同；
+> **本页整理截至 2026-10-03**（10-03 新增「当前现状」一节：主线、三方法偏负 7 体系对照、fragment-opt 登记；09-28 那节跨软件对照已被它取代但保留原文；
+> 「Stage-2 自治控制器」及以下各节内容仍截至 09-18；协议版本一栏最后一次逐条核对是 09-12，六个值与 09-09 相同；
+> 09-30 ~ 10-03 新增的键 `stage1_remd_equilibration_steps` / `stage1_n_steps_per_window` / `stage2_lcr_relay` / Boresch 两个覆盖键都**没动协议版本号**）。
+>
+> 以下为 09-28 版头注原文：（09-28 只新增「跨软件对照」一节，其余各节内容仍截至 09-18；协议版本一栏最后一次逐条核对是 09-12，六个值与 09-09 相同；
 > 09-13 至 09-18 的改动**没有动任何协议版本号**）。
 > ⚠️ 09-15 至 09-18 破过缓存的是**配置**不是协议：`stage2_window_partition`
 > （`metric_integral`→`state_count`）与 `stage2_window_max_states`（8→5）
@@ -43,8 +47,64 @@ Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS
 登记表（`RESULT_REGISTRY.csv`）在 `Atenolol-rank11` 工作区，不在本分支；
 4W53 那一行的证据在本 `docs/` 里。
 
+## 当前现状（2026-10-03）
+
+> **本节是登记，不是可引用的最终结论**：下面的数字都是 n=3 的 benchmark 批，`results_untrusted` 多数为 True，没有一条满足「新数字进这张表的条件」。
+> 逐条来源与坑见 [HANDOFF_2026-10-02_bias_precision_boresch.md](HANDOFF_2026-10-02_bias_precision_boresch.md)。
+
+**主线配置**：stage 2 走 LCR 轮次控制器（`stage2_lcr_rounds`，代码默认关，run config 里显式开；09-29 维护者确认）；
+旧自治控制器关闭。推荐另开 `stage1_remd_equilibration_steps: 125000`（去电荷 REMD 生产前 250 ps 平衡）。
+**`stage2_lcr_relay` 不要开**（HSP90 L27 上把复合物 stage 2 整体移了 −26 kJ，原因未查）。
+
+**方向（10-02 维护者拍板）**：abfe-benchmark 三套方法同样偏负，比不出工作流好坏 ⟹ **不再追偏负**；
+重心转 **fragment-opt-abfe-benchmark**（有同拓扑的论文 GROMACS 逐 rep 参考，`free_energy_data/abfe.csv`）。
+10-03 起 abfe-benchmark 主线只留 7 个体系（jnk1 / p38 / thrombin 各方法普遍都不准，不再做）。
+
+### 偏负：三方法 7 体系对照（abfe-benchmark，10-03 存档）
+
+来源 `abfe-benchmark/archive_20261003/`（`main_3methods_summary.csv` / `_stats.csv` / `README.md`）。kcal/mol，偏差 = 计算 − 实验。
+实验值取自该树 `experimental.csv`，与下面 09-28 那节的温度换算值略有不同（如 brd4_ligand1 −9.60 vs −9.99）。
+
+| 体系 | 实验 | IBS lcr（n=3） | OpenFE（n） | FEP suite 不含 LR（n=1） | IBS−实验 | OFE−实验 | FEP−实验 |
+|---|---|---|---|---|---|---|---|
+| brd4_ligand1 | −9.60 | −14.87 ± 0.75 | −14.56 ± 1.01（3） | −12.80 | −5.27 | −4.96 | −3.20 |
+| brd4_ligand2 | −7.40 | −13.29 ± 1.16 | −13.11 ± 0.11（2） | −11.10 | −5.89 | −5.71 | −3.70 |
+| cmet_ligand1 | −12.28 | −24.22 ± 0.86 | −21.83（1） | −18.88 | −11.94 | −9.55 | −6.60 |
+| cmet_ligand2 | −7.34 | −19.08 ± 1.90 | −15.79 ± 0.25（2） | −15.76 | −11.74 | −8.46 | −8.42 |
+| cyclod_ligand1 | −2.93 | −3.76 ± 1.22 | −5.06 ± 0.28（3） | −4.57 | −0.83 | −2.13 | −1.64 |
+| cyclod_ligand2 | −4.04 | −8.67 ± 1.62 | −7.85 ± 0.27（3） | −6.88 | −4.63 | −3.81 | −2.84 |
+| cyclod_ligand3 | −7.58 | −6.48 ± 2.07 | −11.96 ± 1.86（2） | −11.26 | +1.10 | −4.38 | −3.68 |
+| **MSE / MUE / RMSE** | | | | | −5.60 / 5.91 / 7.23 | −5.57 / 5.57 / 6.07 | −4.30 / 4.30 / 4.82 |
+| **Pearson r / Kendall τ** | | | | | 0.83 / 0.52 | 0.96 / 0.62 | 0.92 / 0.71 |
+
+- 21 个方法×体系均值里 20 个比实验负（唯一例外 IBS cyclod_ligand3）。IBS 21 个 rep 里 15 个 `results_untrusted=True`。
+- ⚠️ FEP suite 这一列**不含长程修正**（`total` 行的 LR 项是 10³–10¹⁰ 量级、不可用）；**维护者 10-02 确认：口径对齐加上 LRC 后与另两家一致**，它看起来离实验更近只是口径差，别当线索。
+- 已排除（证据在 HANDOFF §1）：口袋水（端点态与 λ 0.4→0）、Boresch 约束强度、锚点选择、起始结构、stage 1 起跑瞬态、解析 release 近似。
+  剩下的在力场 / 输入 / 实验参照这一层，不在工作流里——**这是排除法的推断，不是归因**。
+- brd4_ligand2 换锚点四组（09-30 ~ 10-01）均值都在 −11.9 ~ −13.3 之间，在 rep 散布内；软约束 kθ=41.84 + 旧锚点那组 3 个 rep 里 2 个在去电荷平衡段崩（近共线锚点，10-01 已修）。
+
+### 精度：fragment-opt 登记（我们 vs 论文 GROMACS）
+
+数据 `fragment-opt-abfe-benchmark/openmmIBS/runs_lcr*/`；论文为 5 rep、每 λ 态 20 ns、4 fs + HMR（我们 2 fs，stage 1 每态生产 0.5 ns、stage 2 每段 0.5 ns）。ΔG_bind kcal/mol。
+
+| 体系 / 批 | 我们（3 rep） | 论文 5 rep | 实验 | 散布最大的分项（rep 间 SD，kJ） |
+|---|---|---|---|---|
+| HSP90 L3，`runs_lcr` | 均值 −6.03，SD ≈ 2.2 | −5.21 ± 0.55 | −4.23 | 复合物 stage 2（w0–w2 每段随机落两盆）；stage 1 加平衡段后 8.4 → 2.6 |
+| HSP90 L27，`runs_lcr`（基线） | −11.17 ± 3.82 | −12.06 ± ~1.3 | −8.63 | 复合物 stage 2：13.3 |
+| HSP90 L27，`runs_lcr_s1eq`（+ stage 1 平衡段） | −13.03 ± 3.03 | 同上 | 同上 | 复合物 stage 2：12.6 |
+| HSP90 L27，`runs_lcr_relay`（+ 接力） | −6.52 ± 1.69 | 同上 | 同上 | **作废口径**：接力使复合物 stage 2 61.0 → 31.0 kJ |
+| PWWP1 L9，`runs_lcr`（+ stage 1 平衡段） | −7.93 ± 1.03（−6.92 / −8.98 / −7.89） | −6.80 ± 0.34 | −6.35 | **复合物 stage 1：4.9**；复合物 stage 2 1.8 |
+| PWWP1 L10，`runs_lcr`（+ stage 1 平衡段） | −6.87 ± 1.14（−5.60 / −7.79 / −7.23） | −6.12 ± 0.49 | −6.47 | **复合物 stage 1：3.4**；复合物 stage 2 1.0 |
+
+- **读法**：复合物 stage 2 的大散布（11–13 kJ）只在 HSP90 上出现，PWWP1 上只有 1–2 kJ ⟹ 更像 HSP90 自己的慢自由度（L3 上归因到盖子螺旋相对 Asp93 双稳、每段 0.5 ns 内不换盆）；
+  PWWP1 上散布最大的是复合物 stage 1（去电荷），和 HSP90 L3 加平衡段前的形状一样（口袋带电侧链各 rep 冻在不同态）。
+- PWWP1 两体系均值比论文负 0.75–1.1 kcal，n=3 下 t ≈ 1.2–1.8，**还不能说是系统差**；步长 2 fs vs 4 fs 的差别未控。
+- 在跑（10-03）：PWWP1 L9 `runs_lcr_s1long`（stage 1 平衡 0.5 ns + 生产 2 ns/态，新键 `stage1_n_steps_per_window`），判据 = 复合物 stage 1 SD 能否明显低于 4.9 kJ。
+
 ## 跨软件对照：IBS vs OpenFE vs 实验（2026-09-28，abfe-benchmark）
 
+> ⚠️ **10-03 起被上一节「三方法 7 体系对照」取代**（体系、批次、实验值来源都更新了）；本节原文保留作历史，数字别再引用。
+>
 > 数据由 abfe-benchmark 会话汇总，原表 `abfe-benchmark/openmm_IBS/crosscheck_openfe_20260928.csv`（UTF-8 BOM）。
 > **本节是登记，不是可引用的最终结论**：OpenFE 在 brd4_ligand1 / brd4_ligand2 / cyclod_ligand1 上 n=2，cmet 两个配体 n=1，IBS 各行来自不同批次。数据截至 09-28 21:31（19:41 后补了 brd4_ligand1、cyclod_ligand1 各一个 OpenFE rep2）。
 
@@ -96,6 +156,9 @@ Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS
 > 的完整原文在 [archive/PME_DECHARGE_V5_CHANGE_RECORD_2026-09-14.md](archive/PME_DECHARGE_V5_CHANGE_RECORD_2026-09-14.md)。
 
 ## Stage-2 自治控制器：真机已跑过三批，**仍未有一次以 `DONE` 收口**（2026-09-18）
+
+> 📌 **10-03 注**：这是**旧**自治控制器，已关闭；主线 stage 2 现走 LCR 轮次控制器（见上文「当前现状」）。
+> 本节以下内容截至 09-18 没再更新；其中「偏负的头号线索是生产盒」那句已被三方法对照取代（偏负三家共有），`BOX-01` 10-03 已关（abfe-benchmark 测试集本身有问题，见 [archive/TODO_closed.md](archive/TODO_closed.md)）。
 
 > 🔴 **[2026-09-18 更新]** 下面那节标题原来是「代码已收口，**真机零验证**（2026-09-14）」——
 > **「零验证」已经不成立**：09-16 / 09-17 / 09-18 三批 benchmark 都上了真机。

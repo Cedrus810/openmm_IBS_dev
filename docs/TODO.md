@@ -26,13 +26,15 @@
 | 节 | 条目 | 等级 |
 |---|---|---|
 | 1 | （空） | P1 |
-| 2.1 生产盒 / 偏负归因 | `BOX-01` | P2 |
 | 2.2 静态审核遗留 | `REVIEW-0924`、`REVIEW-0926` | P2 |
 | 2.3 待维护者拍板 | `IDENT-01` | P2 |
 | 2.4 local-residual / EXP-033 | `LR-06`、`EXP-033-P1-GPU`、`EXP-033-P2`、`LR-02`、`LR-05` | P2 |
 | 2.5 发布工程门 | `REL-03` | P2 |
 | 2.6 性能审查 0928（已核） | `BORESCH-AUTO-01`、`PERF-0928` | P2 |
 | 2.7 代码复查 0929（已核） | `CI-RED-01`、`REVIEW-0929`（剩 L8） | P2 |
+| 2.8 代码复查 0930（Opus，已对抗核实） | `REVIEW-0930` | P2 |
+| 2.9 准确性复查 1003（合成复现） | `ACCURACY-1003`、`COVERAGE-1003` | P2 |
+| 2.10 fragment-opt 精度线 | `FRAG-S1LONG-01`、`FRAG-BATCH-01` | P2 |
 | 3.1 判定不改 | `AUDIT-01`~`07` | P3 |
 | 3.2 不是 bug | `BM-A` | P3 |
 | 3.3 膜线（暂停） | `MEM-LINE`、`PHY-03` | P3 |
@@ -41,6 +43,9 @@
 | 3.6 押后到重构 | `TEST-02` | P3 |
 | 3.7 性能审查 0928：非默认路径 / 驳回 | `PERF-0928-COND` + 4 条驳回 | P3 |
 | 3.8 代码复查 0929：降级 / 驳回 | `REVIEW-0929-COND` + 5 条驳回 | P3 |
+| 3.9 代码复查 0930：旧控制器 / 实验路径 / 未核 | `REVIEW-0930-COND` | P3 |
+| 3.10 模块审计 0928：测试缺口 | `TEST-GAP-0928` | P3 |
+| 3.11 已关的实验开关 | `RELAY-01` | P3 |
 | 4 | 不许回退的约定 | — |
 
 ---
@@ -48,43 +53,13 @@
 ## 1. P1 · 挡住在推的工作
 
 **当前为空**（2026-09-23 清零）。最近一批的去向：`REPRO-01`/`REPRO-02` 关闭；控制器时代的 `AUDIT-S2-03`/`BM-B`
-判为已被取代（主线改走[复现路线](DEBUG_REPRO_MODE_2026-09-22.md)、控制器关闭）；`BOX-01`/`LR-06` 降 P2；
+判为已被取代（主线改走[复现路线](DEBUG_REPRO_MODE_2026-09-22.md)、控制器关闭）；`BOX-01`/`LR-06` 降 P2（`BOX-01` 10-03 已关）；
 `COMBINE-01` 降 P3。原文都在 [archive/TODO_closed.md](archive/TODO_closed.md)。
+> 📌 10-03 注：上面「主线改走复现路线、控制器关闭」指的是**旧**自治控制器；09-29 维护者确认主线 stage 2 走 LCR 轮次控制器（`stage2_lcr_rounds`）。
 
 ---
 
 ## 2. P2 · 该做，不挡路
-
-### 2.1 生产盒 / 偏负归因
-
-- [ ] **BOX-01 [P2] 用修后代码重跑 `cyclod_ligand1/rep2`，判定生产盒 bug 是不是 ΔG 系统性偏负的主因。**
-
-  **缺陷（09-23 已修，CHANGELOG 同日条）**：resume 判「预平衡已完成」后坐标/盒退回输入值 ⟹ 复合物腿在输入盒上采样
-  （输入盒普遍比 NPT 平衡体积大 4–5%）；溶剂腿取 NPT 末帧单次快照。
-  **为什么是 P2**：新起/续跑的 run 自动用对的盒、旧缓存自动作废 ⟹ 不会再产生错数，只剩归因。
-  **触发**：溶剂腿扭转修复（09-23）之后**下一批新代码 benchmark 出数时顺带判定**，不单独排作业（单独跑会把两个修复的效果混在一起）。
-  ⚠️ 在那之前，盒子中招的旧结果（cmet 全部、cyclod_ligand1 rep2/rep3）**不得引用、不得拿来比**。
-
-  **benchmark 取证**（convergence json `lj_tail_lrc_box_volume_nm3` vs `pre_equilibration.dcd` 后半段体积均值；
-  ΔG 偏差 = 计算 − 实验，kcal/mol，09-23 复现批）：
-
-  | run | 复合物盒 | 溶剂盒 | ΔG 偏差 |
-  |---|---|---|---|
-  | cyclod_ligand3/rep1 | +0.32% | −0.18% | +2.14 |
-  | cyclod_ligand2/rep1 | −0.34% | −0.43% | −0.79 |
-  | cyclod_ligand1/rep3 | **+4.93%** | −0.14% | −3.06 |
-  | cyclod_ligand1/rep2 | **+4.89%** | +0.79% | −4.17 |
-  | cmet_ligand1/rep1 | **+5.37%** | **+3.50%** | −11.23 |
-  | cmet_ligand2/rep1 | **+5.42%** | **+3.08%** | −15.01 |
-  | cmet_ligand1/rep2 | **+5.40%** | −0.35% | −24.95 |
-
-  方向两处吻合：复合物盒正常的两个 cyclod 偏差小、偏大的全部显著偏负；cmet_ligand1 rep1/rep2 只差溶剂盒，rep1 溶剂盒也大 ⟹ 少负 13.7 kcal。
-  物理方向：盒大 ⟹ vanishing ΔG 更正（4W53 实测 ∂ΔA/∂V = 4.07 kJ/mol/nm³，见 [STATUS.md](STATUS.md)）。
-  **不是证明**：n=7、与体系混杂；线性外推 15 nm³×4.07≈61 kJ 远超实测，已离开线性区。
-
-  **判据**：重跑后 cyclod_ligand1 偏差若缩到 cyclod_ligand2/3 的量级（−0.8 ~ +2 kcal）⟹ 盒子是主因，接着重跑全部 cmet；
-  缩得不多 ⟹ 盒子只是其中一项。预平衡可复用，其余会被新缓存门自动作废重跑，**不用手删产物**。
-  ⚠️ 「偏负 = 采样故障，已定论」这条旧口径 09-23 作废（采样器已修、复现路线是固定采样）。
 
 ### 2.2 静态审核遗留（2026-09-24）
 
@@ -107,6 +82,8 @@
   **不核**：RBFE 三条（A/B/C，RBFE 线叫停）；「结果质量与采样效率改进补充（09-27）」的 QUALITY-01～07 是改进建议、写不出判据，要做就去 `design/` 立方案。
   线索：该审核的「已核实不应继续报」一节说 Stage0 attachment 缓存门已修，正对应 `REVIEW-0924` 凌晨份 #1，可以顺手核掉。
   **判据**：每条有结论（已修 / 不触发 / 有意为之 / 转成独立条目并带 `文件:行号`），写回该审核文件的「处理结果」，本条关闭。
+
+  📌 **10-03 进展**：#1、#2、#3、#4、#6 已被 10-03 准确性复查用合成产物复现、确认仍在 ⟹ **转进 §2.9 `ACCURACY-1003`**（A1 / A5 / A7 / A3），这里不再重复核；#5（非有限 σ_MBAR 让补采失效）09-30 复查判定已被 09-29 补段门改成 `σ_jk > σ_tol` 解决（待写回原文）。**本条只剩 PERF-01～05**。
 
 ### 2.3 待维护者拍板（代理不要自行改）
 
@@ -220,6 +197,57 @@
   | 原编号 | 位置 | 核实后的机制 | 判据 |
   |---|---|---|---|
   | L8 | `tools/pocket_water/` 与 `tests/test_pocket_water_relocation_2026_09_28.py` | 只有 2 条测试（U0 差分对 OpenMM、stage-1 比值对独立重算），stage-2 延迟接受、`run_sampler` 的 apo ghost-ligand 路径、kabsch 跟踪都没有测试。口袋水线 09-27 已重新打开，S2 采样器开工前补 | stage-2 至少一条小体系测试：`min(1, exp(-β[ΔU−ΔU0]))` 与独立重算一致 |
+
+### 2.8 代码复查 0930（Opus，已对抗核实）
+
+> 来源：[archive/CODE_REVIEW_2026-09-30.md](archive/CODE_REVIEW_2026-09-30.md)（Opus 逐行全文重读 + 对全部 S2 做反方证伪，HEAD `e576a54` + 当时工作树）。**无 S1。**
+> LCR 主线上的 `LCR-GAUGE`、`BURNIN-1FS` 两条 10-03 准确性复查又复现了一遍，登记在 §2.9 `ACCURACY-1003`（A4 / A3），这里不重复。
+> 只影响旧控制器 / 实验路径的条目和 §2 未核 S3 在 §3.9。行号是审查当时的，**先按函数名重新定位**。
+
+- [ ] **REVIEW-0930 [P2] 默认 / LCR 路径上核实成立、还没修的小项。**
+  | 原编号 | 位置 | 核实后的机制 | 判据 |
+  |---|---|---|---|
+  | PME-RUNTIME-ID [S3] | `abfe_pipeline.py::_pme_u_kn_meta_payload`（写）与其兼容比较（只 pop 了 `code_sha256`） | meta 的 `runtime`（python / 内核 / openmm / pymbar 版本串）参与兼容比较 ⟹ 换节点必失配（`runs_lcr` 已见三种内核串）。只在 stage 1 结果缓存也未命中时走到，代价是 u_kn CPU 重算（~46 s），ΔG 不变、日志误报「模型版本不兼容」。又一处「非用户输入进身份」 | `runtime` 移出兼容比较（留在 meta 里作诊断），补一条换内核串仍命中的单测 |
+  | REFINE-EXTRA-LAYER [S3] | `stage2_refine_extra_points_per_segment` 在 `_PREOPT_DERIVED_PATH_KEYS`（`abfe_pipeline.py`）与 `abfe_preoptimizer.py` 对应处 | 被划进 preopt 派生层 ⟹ resume 改此键时离线重算用旧 pilot、新值不生效、却写回新指纹。119 份生产 config 无一设此键；LCR 下只影响 TI 种子与信赖域半径用的 pilot dU/dλ | 改键后 resume 新值生效或明确拒绝，二选一并补测试 |
+  | BORESCH-K-RESUME [S3, PLAUSIBLE] | `runabfe.py::resolve_boresch_restraint`：`boresch_{source}.json` 缓存命中先 return，`boresch_fixed_k_angle_kj_per_mol_rad2` 覆盖在其后 | `--resume` 命中缓存时新设 / 删掉的 K 覆盖都不生效，会原样返回旧 ΔG；非 `openfe_fixed` 档设此键被静默忽略。**现行使用约定：换 K 实验必须新开输出目录**（唯一真实用法 `kang1000` 就是这么做的） | 缓存命中时对比本次 K 与落盘 K，不一致 ⟹ 报错；非 `openfe_fixed` 档设了 ⟹ 报错 |
+
+### 2.9 准确性复查 1003（合成复现）
+
+> 来源：[archive/CODE_REVIEW_2026-10-03_accuracy.md](archive/CODE_REVIEW_2026-10-03_accuracy.md)（7 条；复现脚本 `tools/audit/core_accuracy_2026_10_03.py`，只在临时目录造合成产物）。
+> 与 09-24 / 09-26 / 09-30 几轮审查重叠的条目在这里**合并成一份**，原条目改指这里。复查本身没有发现默认路径上的符号 / 单位 / Boresch 公式 / MBAR 代数错误；
+> 也明确说了「不能由此推出剩下只能是力场」。修复方向的整体设计在 [design/PROPOSAL_stage2_accuracy_2026-10-03.md](design/PROPOSAL_stage2_accuracy_2026-10-03.md) §2（**未实施，动手前维护者拍板**）。
+
+- [ ] **ACCURACY-1003 [P2] LCR / stage 2 采样身份、时间与口径缺口（合成复现确认仍在）。**
+  | 编号 | 位置 | 机制 | 同一件事的旧登记 | 判据 |
+  |---|---|---|---|---|
+  | A1 账本不绑协议 | `abfe_pipeline.py::_stage2_rounds_ledger_load`（只比版本与 λ / 分窗布局）、`_run_stage2_rounds`（`SAMPLED` / `FAILED` 即跳过、已有 `evidence` 不重解）、`_load_ibs_window_outputs_merged`（不传 `expected_window_protocol`） | 复用输出目录、λ 布局不变但温度 / Boresch / softcore / 接力等身份变了 ⟹ 旧段原样复用（合成复现：换 kT 后新增引擎调用 0） | `REVIEW-0926` #1；09-30 `RESCUE-PROTO-NONE`（范围扩到所有走合并加载的路径） | 账本绑定阶段采样协议 + 已提交生产盒；读 SAMPLED 段与合并加载都校验；身份变了拒绝混用、**不许重贴当前指纹「升级」旧段**；补换协议后 resume 的测试 |
+  | A3 burn-in 实为 1 fs | `ibs_engine.py`：新窗口爬坡设 1 fs（`if not is_resumed_ibs:`）→ 固定 f_k burn-in 沿用 → 生产前才恢复 `original_dt`；分块 `max(1, ceil(total/block))` 每块跑满 | 默认 25000 步 = **25 ps**（设计 / 注释写 50 ps），5000 步一块 = 5 ps；resume 跳过爬坡的分支跑在 2 fs ⟹ 同 config 两种物理时长；7000 → 10000、0 → 5000 的取整 | 09-30 `BURNIN-1FS`；`REVIEW-0926` #6 | 步长契约写死并记录（requested / actual / dt）；新起与 resume 同一时长；最后一块按剩余步数、0 步跳过、负值报错 |
+  | A4 补段中心口径 | `stage2_rounds_evidence.py::solve_window`（用含 LJ 尾项的目标能量解 `merged_f_k_kJ`）→ `stage2_rounds.py::_next_center` 直接当下一轮固定 f_k | 每窗首末尾项差 1.2–1.3 kT ⟹ 每个补段等于带 ~1.3 kT 线性倾斜，占据末 / 首比多 3.3–3.7×；信赖域投影同样口径不一致。**ΔG 不受影响**，影响补段帧分配 | 09-30 `LCR-GAUGE` [S2] | 证据层另解 `sampling_f_k`（从 `sampling_states`）给调度用，`merged_f_k_kJ` 保留原含义作报告 |
+  | A5 生产盒校验缺口 | `runabfe.py` 离线分析回退构造的 `expected_window_protocol` 不带期望盒体积；`ibs_engine.py` 盒体积门 `current_box_volume_nm3 is None` 即放行；`abfe_pipeline.py` 完成结果早退绕过逐窗盒门 | 复用 / 重建同一输出目录且已提交生产盒与旧产物不同时，旧盒产物被当作当前盒结果 | `REVIEW-0926` #2 #3；`REVIEW-0924` 凌晨份 #4 | 期望盒从持久化的已提交状态取，聚合缓存与 raw-window fallback 两处都校验；拿不到 ⟹ 标未验证 |
+  | A7 不完整路径 σ 配错窗 | `abfe_pipeline.py` finalize 按局部 `window_index` 建表、按真实窗口号取值（`ibs_engine.py` 协方差链同时存 `window_index` / `source_window_index`） | 前面窗口去相关后被跳过时 σ 错位、后面窗口漏 jackknife 增量。只在已是 `ANALYSIS_INCOMPLETE` 时触发 | `REVIEW-0926` #4 | 改按 `source_window_index`（或 `_segment_physical_window`），补一条跳窗的单测 |
+
+- [ ] **COVERAGE-1003 [P2] 共同漏采的构象盆地可以带着 `CONVERGED` 标签通过（收敛证据的覆盖限制，不是 MBAR 错误）。**
+  **位置**：`stage2_rounds_evidence.py` 的逐窗证据 + `stage2_rounds.py` 的标签规则；执行层把贡献过帧的段数当 `n_independent_seeds`。
+  **机制**：标签只看 ESS、top-1%、留一段差异、种子数，看不到所有段共同没去过的构象区。精确双盆反例：三段全困在 A ⟹ `CONVERGED`、σ_jk=0、估计 0 vs 真值 −18.2 kJ（合成模型，**不是任何真实体系的误差估计**）。
+  真机上对应的形状：HSP90 w0–w2 每段 0.5 ns 内不换盆（[STATUS.md](STATUS.md)「当前现状」）。
+  ⚠️ **不许**靠调低 ESS 阈值、或从同一起点多跑短段来宣称解决。
+  **判据**：维护者对 [design/PROPOSAL_stage2_accuracy_2026-10-03.md](design/PROPOSAL_stage2_accuracy_2026-10-03.md) §3–§4（连续链 + 构象覆盖证据 `sampling_assessment`）拍板；
+  落地前，报告 / 文档里 `CONVERGED` 的解释限定为「现有观测数据通过所列判据」，构象覆盖记为未验证。
+
+### 2.10 fragment-opt 精度线（10-02 起的工作重心）
+
+> 背景与数字：[STATUS.md](STATUS.md)「当前现状」、[HANDOFF_2026-10-02_bias_precision_boresch.md](HANDOFF_2026-10-02_bias_precision_boresch.md) §4 / §6。
+> 数据目录 `fragment-opt-abfe-benchmark/openmmIBS/`，**当实验数据只读**，新跑的输出放新目录。
+
+- [ ] **FRAG-S1LONG-01 [P2] PWWP1 L9：加长去电荷能否压下复合物 stage 1 的 rep 间散布。**
+  **现状**：`runs_lcr/` 下 PWWP1 L9 / L10（开了 125000 步平衡段）复合物 stage 1 SD 4.9 / 3.4 kJ，是两体系最大的分项（stage 2 只有 1–2 kJ）。
+  10-03 起在跑 `runs_lcr_s1long/PWWP1_ligand-9/`（config `configs/PWWP1_ligand-9_lcr_s1long.json`：`stage1_remd_equilibration_steps: 250000` + `stage1_n_steps_per_window: 1000000` ⟹ 平衡 0.5 ns + 生产 2 ns/态，stage 2 不变，3 rep 串行，每 rep 约 3.5 h）。
+  **判据**：3 rep 跑完，复合物 stage 1 SD 与 4.9 kJ 对比给结论（明显降 ⟹ 整批把 stage 1 加长；不降 ⟹ 按残基归因，`tools/diagnostics/decharging_group_attribution.py`）。
+
+- [ ] **FRAG-BATCH-01 [P2] fragment-opt 整批：逐体系「我们 vs 论文」。**
+  **现状**：10-02 已给 59 份 `configs/*_lcr.json` 加了 `stage1_remd_equilibration_steps: 125000`（另有 `_comment_s1eq` 一行；直接改的 config，用 `make_configs.py` 重新生成会丢这个键）。跑过的：HSP90 L3 / L26 / L27 / L30、PWWP1 L9 / L10。整批命令在维护者手里（`run_<sys>_lcr.zsh`，config 路径写死）。
+  **不开接力**（`RELAY-01`）。`FRAG-S1LONG-01` 出结论后可能要再改 stage 1 时长。
+  **判据**：各体系 3 rep 跑完，按论文 `free_energy_data/abfe.csv` 的分项（`comp_vdw` / `comp_coul` / `lig_*`）逐段对照，回答「差是否系统性、出在哪一段」；注意论文 4 fs + HMR、我们 2 fs。
 
 ---
 
@@ -367,6 +395,40 @@
 - **L4**（新预检遇到旧运行目录缺 `ligand_indices_solvent.json` 时裸抛 `FileNotFoundError`）：**碰不到**。1.5 步的溶剂腿缓存完整性检查已经把这个文件列为必需（`runabfe.py` 缓存路径表 + `missing` 列表），走到预检之前就会被拦下或重建。
 - **L5**（`_check_boresch_geometry_safe` 没查二面角 φ 的奇异性）：φA、φB 的奇异点就是 θA、θB 共线，已经被 sin 下限覆盖；只有 φC 用到的配体内部角 b1-b2-b3 不在运行时查，而那个角是选锚点时定的。
 - **L3**（`final_state.npz` 存 float32）：离线工具的续跑起点，精度够用，复查自己也判不值得。
+
+### 3.9 代码复查 0930 里只影响旧控制器 / 实验路径的条目，以及未核的 S3（2026-10-03 登记）
+
+> 来源同 §2.8。旧自治控制器已关、LCR 开时这些路径不可达；**重新打开对应路线时再处理**。理由别重新论证。
+
+- [ ] **REVIEW-0930-COND [P3] 触发条件出现时顺手改。**
+  | 原编号 | 判定 | 触发条件 | 摘要 |
+  |---|---|---|---|
+  | FINAL-ANALYZE-REWINDOW | CONFIRMED · S2 | 重新打开旧自治控制器 | 收尾全路径 ANALYZE 不读 rewindow 台账 ⟹ 最终 `stage2_vanishing.json` 不含子系综、rewindow 修复被丢；父窗原本被跳过时整条腿 `ANALYSIS_INCOMPLETE` |
+  | PROVISIONAL-WASH | CONFIRMED · S2 | 同上 | 临时生产窗口经补帧或 resume 复验被洗成 `converged` / `verified`，`warmup_failure.json` 被删；ΔG 数值不变、证据标签失真。LCR 固定 f_k 不受影响 |
+  | RESCUE-PROTO-NONE | PLAUSIBLE · S3 | 同目录改哈密顿量键再 resume 且前一跑是旧控制器 | `"vanishing_rescue"` 取协议键得 None ⟹ 盒 / 协议门放行。合并加载那半并进 §2.9 A1 |
+  | RECAL-FK-GAUGE | CONFIRMED · S3 | 用到 `recalibrate_f_k_from_production` 的旧路径 | 与 `LCR-GAUGE` 同形状（energies 口径解 f_k）；口径问题，**不涉及符号** |
+  | INSERT-LAMBDA-ARGS | PLAUSIBLE · S3 | 非 LCR + 显式 `metric_integral` | 自治 INSERT_LAMBDA 漏传 `partition_criterion` / `pilot_metric_g` |
+  | SPLIT-TAIL-ASSERT | PLAUSIBLE · S3 | 旧控制器 SPLIT_TAIL_WINDOW | 缩跨度断言比尾段整体最大 ∫g，行内注释**明文选择**了这个口径 ⟹ 设计取舍，要维护者拍板，不是写错 |
+  | OUTER-SCORE-ID | PLAUSIBLE · S3 | 开 outer-λ local residual | `sampling_score_sha256` 含绝对路径与插件 `.so` sha256 ⟹ 自动重训后 HALT |
+  | PLATFORM-ID | PLAUSIBLE（潜伏） | 改 platform 名 / 设 `max_resident_contexts` | REMD 采样指纹与窗口身份含 platform（带设备号）与 `max_resident_contexts` ⟹ stage 1 与全部 stage 2 窗口一起失配 |
+  | SHADOW-BRIDGE-BORESCH | CONFIRMED · S3 | `--decharge-method shadow_ibs` | Shadow-Bridge REMD 副本从不设 `lambda_boresch_scale` ⟹ 复合物腿在 Boresch 关着时采样。其余所有生产 Context 都核过是对的 |
+  **未核的 S3**（原文 §2，约 35 条，含 LCR 段全 FAILED 后 resume 粘住、REMD 不作废旧 sampling meta、预平衡续跑剩 0 步退回末帧盒等）与死代码清单：**没对抗核实，不进待办**；做到相关代码时去原文查，按 §2.2 的规矩先核再修。
+
+### 3.10 模块审计 0928 的测试缺口（2026-10-03 登记）
+
+- [ ] **TEST-GAP-0928 [P3] [archive/MODULE_AUDIT_2026-09-28.md](archive/MODULE_AUDIT_2026-09-28.md) §3 的 TG-1～TG-8（顶层公共符号 → tests/ 零引用）。**
+  ⚠️ 09-30 复查的异议先看：**TG-1 前提错**（PME 自能修正生产硬编码 False、已因物理错误撤销，该支是死代码 ⟹ 该删 / 标死代码，不是补测试）；
+  TG-3 说 `delta_u_distribution_diagnostics`、`synthetic_mbar_u_kn` 零引用不对；§2.2「`_quantize_positions_for_identity` / `_q8` 口径一致」不能作已查干净的证据（零调用方）。
+  **为什么 P3**：测试缺口不是缺陷；TG-2（冻结 f_k 防篡改守卫）、TG-4（修正项与周期统计）随对应代码再动时补。
+  **判据**：无单独判据，随 §3.6 重构或对应模块下次改动时一并处理。
+
+### 3.11 已关的实验开关
+
+- **RELAY-01 [P3] `stage2_lcr_relay`（stage 2 同窗段间接力，10-02 落地）不要开。**
+  真机 HSP90_ligand-27 × 3（对照组只开 stage 1 平衡段）：复合物 stage 2 61.0 → 31.0 kJ，ΔG_bind 离论文更远；**原因没查**（维护者 10-02 说不分析漂移）。
+  另有统计问题：接力段仍按独立种子计数（`_run_stage2_rounds` 把段数传给 `n_independent_seeds`），段间 jackknife σ 偏乐观（10-03 准确性复查 #6）。
+  连续链的正确语义（恢复完整 checkpoint、不重新热化）在 [design/PROPOSAL_stage2_accuracy_2026-10-03.md](design/PROPOSAL_stage2_accuracy_2026-10-03.md) §3.1，**不是这个开关**。
+  **重新打开的前提**：先查清 26 kJ（HANDOFF_2026-10-02 §4.3 给了最便宜的查法），并把段计数改成按链。理由别重新论证。
 
 ---
 
