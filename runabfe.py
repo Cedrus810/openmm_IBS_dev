@@ -7252,6 +7252,11 @@ def _path_evolution_kwargs(config) -> dict:
     _s1_equil = config.get("stage1_remd_equilibration_steps")
     if _s1_equil is not None and int(_s1_equil) > 0:
         out["stage1_remd_equilibration_steps"] = int(_s1_equil)
+    # 🔑 [2026-10-03] 去电荷 REMD 生产段每态步数，单独于 n_steps_per_window（后者
+    # 同时是 stage 2 每段长度）。设了才透传、只进 decharging 指纹；不设 ⟹ 老路径不变。
+    _s1_steps = config.get("stage1_n_steps_per_window")
+    if _s1_steps is not None and int(_s1_steps) > 0:
+        out["stage1_n_steps_per_window"] = int(_s1_steps)
     # 🔑 [2026-09-22] attachment 腿两道**收敛**门（BAR/TI 一致 + split-half）要不要
     # 阻断。不设时：复现模式下默认**不阻断**（只记录），其余情况默认阻断。
     # 显式设了就以它为准，两种模式都能覆盖。

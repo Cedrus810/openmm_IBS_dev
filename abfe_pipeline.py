@@ -3106,7 +3106,14 @@ def _finalize_stage_with_indeterminate(result, indeterminate):
 
 # 只影响 stage 1（去电荷 REMD）的采样协议键：进 decharging 的指纹，不进其它 stage
 # 的指纹（否则开了它会连带作废 stage 2 缓存）。
-_STAGE1_ONLY_KWARGS = ("stage1_remd_equilibration_steps",)
+_STAGE1_ONLY_KWARGS = ("stage1_remd_equilibration_steps", "stage1_n_steps_per_window")
+
+
+def _stage1_n_steps_per_window(kwargs: Dict, default: int) -> int:
+    """去电荷 REMD 生产段每态步数：设了 `stage1_n_steps_per_window` 用它，否则沿用
+    `n_steps_per_window`（它同时是 stage 2 每段长度，2026-10-03 起可分开设）。"""
+    v = kwargs.get("stage1_n_steps_per_window")
+    return int(v) if v is not None and int(v) > 0 else int(default)
 
 
 def _scope_stage1_only_kwargs(run_config: Dict, stage_name: str) -> Dict:
@@ -18459,7 +18466,7 @@ class ABFEPipeline:
                         potential_type=potential_type,
                         dexp_params=dexp_params,
                         n_states=_n_states,
-                        n_steps_per_window=n_steps_per_window,
+                        n_steps_per_window=_stage1_n_steps_per_window(kwargs, n_steps_per_window),
                         steps_per_update=steps_per_update,
                         system_type=system_type,
                         resume=resume,
