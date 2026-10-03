@@ -62,3 +62,11 @@ def test_anchor_metrics_rejects_outside_window(theta_b, ok):
     assert accepted is ok, reason
     if not ok:
         assert "30°" in reason
+
+
+def test_single_frame_selection_uses_tighter_window():
+    # repro mode picks anchors from one input frame: 145.7° / 30.2° passed [30,150]
+    # but drifted to 157° / 23° in MD; a single frame must clear [45,135].
+    th = np.radians([30.2, 44.0, 45.0, 135.0, 136.0, 145.7])
+    assert ac.anchor_theta_in_window(th).tolist() == [True, True, True, True, True, True]
+    assert ac.anchor_theta_in_window(th, single_frame=True).tolist() == [False, False, True, True, False, False]

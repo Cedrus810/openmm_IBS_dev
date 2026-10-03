@@ -7981,9 +7981,19 @@ OPENFE_ANCHOR_THETA_MIN_RAD = float(np.radians(30.0))
 OPENFE_ANCHOR_THETA_MAX_RAD = float(np.radians(150.0))
 
 
-def anchor_theta_in_window(angles_rad):
-    """逐元素：θ ∈ [30°, 150°]（与力常数无关的共线窗口）。"""
+# 只拿**单帧**（复现模式的输入结构）选锚点时，一帧代表不了涨落：brd4_ligand2 输入帧
+# θA 145.7° / θB 30.2° 擦边过 [30°,150°]，预平衡里均值 157.5° / 23.3°、θB 最低到 2°。
+# 单帧收紧到 [45°,135°]，给 MD 涨落留 ~15°。
+OPENFE_ANCHOR_THETA_SINGLE_FRAME_MIN_RAD = float(np.radians(45.0))
+OPENFE_ANCHOR_THETA_SINGLE_FRAME_MAX_RAD = float(np.radians(135.0))
+
+
+def anchor_theta_in_window(angles_rad, single_frame=False):
+    """逐元素：θ ∈ [30°, 150°]（与力常数无关的共线窗口）；单帧选锚点时用 [45°, 135°]。"""
     a = np.asarray(angles_rad, dtype=float)
+    if single_frame:
+        return ((a >= OPENFE_ANCHOR_THETA_SINGLE_FRAME_MIN_RAD)
+                & (a <= OPENFE_ANCHOR_THETA_SINGLE_FRAME_MAX_RAD))
     return (a >= OPENFE_ANCHOR_THETA_MIN_RAD) & (a <= OPENFE_ANCHOR_THETA_MAX_RAD)
 
 
@@ -13539,6 +13549,7 @@ class GeometricRestraintEstimator:
         T = float(self.temperature)
         k_ang = float(OPENFE_FIXED_KANGLE_KJ_PER_MOL_RAD2)
         max_phi = float(OPENFE_MAX_ABS_DIHEDRAL_RAD)
+        single_frame = int(traj.n_frames) < 10
         adjacency = self._build_bond_adjacency(top)
 
         # ---- 配体侧 ----
@@ -13643,7 +13654,7 @@ class GeometricRestraintEstimator:
                 [cand, np.full(len(cand), g0), np.full(len(cand), g1), np.full(len(cand), g2)]))
             thg = mdtraj.compute_angles(traj, np.array([[g0, g1, g2]]))
             ok0 = (openfe_angle_not_flat(th, k_ang, T).all(axis=0)
-                   & anchor_theta_in_window(th).all(axis=0)
+                   & anchor_theta_in_window(th, single_frame).all(axis=0)
                    & (np.abs(ph) <= max_phi).all(axis=0)
                    & (circular_std_rad(th) < OPENFE_MAX_ANGLE_CIRCSTD_RAD)
                    & (circular_std_rad(ph) < OPENFE_MAX_DIHEDRAL_CIRCSTD_RAD)
@@ -13671,8 +13682,8 @@ class GeometricRestraintEstimator:
             phis = [mdtraj.compute_dihedrals(traj, A[:, [i, i + 1, i + 2, i + 3]]) for i in range(3)]
             ok = (openfe_angle_not_flat(thA, k_ang, T).all(axis=0)
                   & openfe_angle_not_flat(thB, k_ang, T).all(axis=0)
-                  & anchor_theta_in_window(thA).all(axis=0)
-                  & anchor_theta_in_window(thB).all(axis=0)
+                  & anchor_theta_in_window(thA, single_frame).all(axis=0)
+                  & anchor_theta_in_window(thB, single_frame).all(axis=0)
                   & (circular_std_rad(thA) < OPENFE_MAX_ANGLE_CIRCSTD_RAD)
                   & (circular_std_rad(thB) < OPENFE_MAX_ANGLE_CIRCSTD_RAD)
                   & ~all_frames_collinear(thH, thA, thB, np.broadcast_to(thg, thA.shape)))
@@ -13844,6 +13855,18 @@ class GeometricRestraintEstimator:
         # 9. 选择最优组合
         best_idx = np.argmin(total_var)
         best_combo = combos[best_idx]
+
+        # 🔑 [2026-09-30] 平衡值所在的 θ 必须在 [30°,150°]：复现模式锚点由输入结构单帧
+        # 钉死、本 rep 轨迹上只报警，近共线锚点会一路漏进生产（brd4_ligand2：θA0 157°、
+        # θB0 24°，软约束 K=41.84 下两个 rep 在去电荷平衡段 NaN）。这里 fail-closed。
+        if self.anchor_mode == "openfe":
+            _tA = float(np.mean(angles_a[:, best_idx]))
+            _tB = float(np.mean(angles_b[:, best_idx]))
+            if not (anchor_theta_in_window(_tA) and anchor_theta_in_window(_tB)):
+                raise RuntimeError(
+                    f"[锚点/openfe] 选中锚点在本 rep 轨迹上的平均 θA={np.degrees(_tA):.1f}° / "
+                    f"θB={np.degrees(_tB):.1f}° 落在 [30°,150°] 之外（近共线）。"
+                    "复现模式下锚点由输入结构单帧选定；该锚点在 MD 里漂到共线附近，拒绝使用。")
 
         # 10. 提取平衡值 (平均值) 和力常数
         eq = {
