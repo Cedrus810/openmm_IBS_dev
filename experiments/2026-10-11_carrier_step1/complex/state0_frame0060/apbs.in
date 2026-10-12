@@ -1,0 +1,107 @@
+read
+  mol pqr env.pqr
+  mol pqr xcav.pqr
+  mol pqr xbulk.pqr
+end
+
+elec name envpot
+  mg-auto
+  dime 129 129 129
+  cglen 171.498 69.132 78.522
+  fglen 24.000 24.000 24.000
+  cgcent 11.7423 71.4733 -2.0854
+  fgcent 29.9364 70.5526 22.1755
+  mol 1
+  lpbe
+  bcfl mdh
+  ion charge 1 conc 0.16770 radius 2.0
+  ion charge -1 conc 0.16770 radius 2.0
+  pdie 1.0
+  sdie 97.0
+  chgm spl4
+  srfm smol
+  srad 1.4
+  swin 0.3
+  sdens 10.0
+  temp 300.0
+  calcenergy no
+  calcforce no
+  write pot dx envpot
+end
+
+elec name envpot0
+  mg-auto
+  dime 129 129 129
+  cglen 171.498 69.132 78.522
+  fglen 24.000 24.000 24.000
+  cgcent 11.7423 71.4733 -2.0854
+  fgcent 29.9364 70.5526 22.1755
+  mol 1
+  lpbe
+  bcfl mdh
+  pdie 1.0
+  sdie 97.0
+  chgm spl4
+  srfm smol
+  srad 1.4
+  swin 0.3
+  sdens 10.0
+  temp 300.0
+  calcenergy no
+  calcforce no
+  write pot dx envpot0
+end
+
+elec name xcav
+  mg-auto
+  dime 129 129 129
+  cglen 171.498 69.132 78.522
+  fglen 24.000 24.000 24.000
+  cgcent 11.7423 71.4733 -2.0854
+  fgcent 29.9364 70.5526 22.1755
+  mol 2
+  lpbe
+  bcfl mdh
+  ion charge 1 conc 0.16770 radius 2.0
+  ion charge -1 conc 0.16770 radius 2.0
+  pdie 1.0
+  sdie 97.0
+  chgm spl4
+  srfm smol
+  srad 1.4
+  swin 0.3
+  sdens 10.0
+  temp 300.0
+  calcenergy total
+  calcforce no
+end
+
+elec name xbulk
+  mg-auto
+  dime 129 129 129
+  cglen 171.498 69.132 78.522
+  fglen 24.000 24.000 24.000
+  cgcent 11.7423 71.4733 -2.0854
+  fgcent 29.9364 70.5526 22.1755
+  mol 3
+  lpbe
+  bcfl mdh
+  ion charge 1 conc 0.16770 radius 2.0
+  ion charge -1 conc 0.16770 radius 2.0
+  pdie 1.0
+  sdie 97.0
+  chgm spl4
+  srfm smol
+  srad 1.4
+  swin 0.3
+  sdens 10.0
+  temp 300.0
+  calcenergy total
+  calcforce no
+end
+
+print elecEnergy xcav end
+
+print elecEnergy xbulk end
+
+quit

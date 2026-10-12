@@ -8036,7 +8036,8 @@ def _scipy_circvar(a, low, high, axis=0):
     return 1.0 - np.abs(np.mean(np.exp(1j * ang), axis=axis))
 
 
-def openfe_ligand_anchor_pool(top, traj, ligand_resname, rmsf_cutoff_nm=0.15):
+def openfe_ligand_anchor_pool(top, traj, ligand_resname, rmsf_cutoff_nm=0.15,
+                              ligand_net_charge=0):
     """配体侧锚点池：优先**芳香环**上的重原子（openfe 的做法）。
 
     芳香性交给 RDKit 判，不用几何代理：从配体的元素 + 三维坐标建分子，
@@ -8048,6 +8049,10 @@ def openfe_ligand_anchor_pool(top, traj, ligand_resname, rmsf_cutoff_nm=0.15):
     （环上原子刚性最好、天然不共线，正是 Boresch 六自由度最怕缺的两点）。
     芳香环不够用（或 RDKit 判不动）时先退到 RMSF 过 cutoff 的重原子（openfe 第二档），
     再不够才退回全部重原子。RMSF 是局部的（配体先叠到自己身上）。
+
+    ``ligand_net_charge``：配体净电荷（整数 e），交给 `DetermineBondOrders`。
+    键级是按"总电荷 = 这个数"去找的，带电配体传 0 必然找不到合法键级
+    （"Final molecular charge (0) does not match input (-1)"）。
 
     返回 ``(pool_indices, note)``。
     """
@@ -8091,8 +8096,10 @@ def openfe_ligand_anchor_pool(top, traj, ligand_resname, rmsf_cutoff_nm=0.15):
             conf.SetAtomPosition(local, (float(x), float(y), float(z)))
         mol.AddConformer(conf)
         probe = mol.GetMol()
-        # charge=0 是这条线的前提（净电荷必须为 0，见净电荷那道门）。
-        rdDetermineBonds.DetermineBondOrders(probe, charge=0)
+        # 🔑 [2026-10-10 真机 fragment-opt `MCL-1_ligand-1`，配体 −1 e] 原来写死
+        # charge=0（旧注释说"净电荷必须为 0"——带电配体走 reserved co-ion 之后
+        # 早已不成立），带电配体一律判不动、退回 RMSF 重原子。
+        rdDetermineBonds.DetermineBondOrders(probe, charge=int(ligand_net_charge))
         Chem.SanitizeMol(probe)
         ring_info = probe.GetRingInfo()
         aromatic_rings = [
@@ -10311,7 +10318,8 @@ class OrbBoreschEstimator:
         """见模块级 `openfe_ligand_anchor_pool`（两个估算器共用同一份实现）。"""
         return openfe_ligand_anchor_pool(
             top, traj, ligand_resname,
-            rmsf_cutoff_nm=float(self.config.get("rmsf_cutoff_nm", 0.15)))
+            rmsf_cutoff_nm=float(self.config.get("rmsf_cutoff_nm", 0.15)),
+            ligand_net_charge=int(self.config.get("ligand_net_charge", 0)))
 
     def _score_candidate_comprehensive(self, rec_anchors, lig_anchors, rmsf_vals,
                                         r0_nm, thA_rad, thB_rad, kr_raw, traj, top):
@@ -13215,9 +13223,12 @@ class GeometricRestraintEstimator:
                  # 生产走的是 `source=simple` ⟹ **本类**，所以键必须接在这里；
                  # 只加在 Orb 那个类上等于配置写了没人读（2026-09-22 真机踩过）。
                  force_constant_mode=DEFAULT_BORESCH_FORCE_CONSTANT_MODE,
-                 anchor_mode=DEFAULT_BORESCH_ANCHOR_MODE):
+                 anchor_mode=DEFAULT_BORESCH_ANCHOR_MODE,
+                 # [2026-10-10] 配体净电荷（整数 e），只给 openfe 锚点池的 RDKit 键级判定用。
+                 ligand_net_charge=0):
         self.force_constant_mode = str(force_constant_mode)
         self.anchor_mode = str(anchor_mode)
+        self.ligand_net_charge = int(ligand_net_charge)
         self.temperature = temperature
         self.gas_constant_kj_per_mol_k = 8.314e-3
         self.search_dist = search_dist
@@ -13578,7 +13589,8 @@ class GeometricRestraintEstimator:
         center = longest[len(longest) // 2]
 
         ring_pool, pool_note = openfe_ligand_anchor_pool(
-            top, traj, ligand_resname, rmsf_cutoff_nm=OPENFE_RMSF_CUTOFF_NM)
+            top, traj, ligand_resname, rmsf_cutoff_nm=OPENFE_RMSF_CUTOFF_NM,
+            ligand_net_charge=self.ligand_net_charge)
         print(f"  [锚点/openfe] 配体池：{pool_note}")
         lig_rmsf = dict(zip(map(int, lig_heavy), local_rmsf_nm(traj, lig_heavy)))
         rigid_pool = [i for i in map(int, lig_heavy) if lig_rmsf[i] < OPENFE_RMSF_CUTOFF_NM]

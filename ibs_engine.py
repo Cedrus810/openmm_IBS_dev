@@ -1444,20 +1444,24 @@ def pme_offset_charge_square_sum(
     nb_force: openmm.NonbondedForce,
     lambda_name: str = "lambda_coul",
 ) -> Tuple[float, List[Dict[str, float]]]:
-    """Return Σq² for particle charge offsets controlled by one lambda.
+    """Return ``(Σscale², rows)`` for particle charge offsets controlled by one lambda.
 
     OpenMM's reciprocal self term depends on the charge carried by the PME
     particle offsets.  For a co-alchemical counterion cycle this must include
     both the ligand atoms and the selected counterion, not ligand atoms alone.
 
-    🔑 [0831issue P2] 这里只累加 `scale²`，也就是隐含假设**每个带 offset 的粒子的
-    base 电荷为 0**：完整式子是
-    ``Σq(λ)² = Σq_base² + 2λ·Σ(q_base·scale) + λ²·Σscale²``。
-    当前三个 builder 都先 `setParticleParameters(idx, 0.0, ...)` 把 base 电荷清零、
-    再挂 offset，所以前提成立、只留 `λ²Σscale²` 一项是对的。但这个前提以前**没有
-    任何断言守护** —— 一旦有人改成分段去电荷（base 电荷不清零），离线 u_kn 的 PME
-    自能修正会残留一个假能量项，而且两条腿同错、循环闭合里不会互相抵消，是个静默
-    的自由能偏差。现在把前提就地断言掉。
+    完整式子是 ``Σq(λ)² = Σq_base² + 2λ·Σ(q_base·scale) + λ²·Σscale²``；返回值只是
+    λ² 系数，三项全量见 `pme_offset_charge_square_polynomial(rows)`。
+
+    🔑 [2026-10-10 真机 fragment-opt `MCL-1_ligand-1`] 原来（0831issue P2）在
+    base ≠ 0 时直接抛错，理由是"离线 u_kn 的 PME 自能修正会残留假能量项"。但：
+      · 这个修正在生产里**早已撤掉**（`apply_pme_self_correction` 恒 False，见
+        `compute_u_kn`），本函数的结果只进诊断 metadata，从不进 u_kn；
+      · charge-transfer 的 co-ion 本来就是 base = −q_lig、scale = +q_lig
+        （λ=1 中性 → λ=0 带电），base ≠ 0 是这条路线的正常形状。
+    于是这道断言把每个带电 charge-transfer 体系挡死在 stage 1 的 u_kn 上，挡的
+    却是一个诊断数字。改成照实记录三项，不再拦。若将来有人重新启用自能修正，
+    必须用完整多项式，不能只用这里返回的 λ² 系数。
     """
     qsq = 0.0
     rows: List[Dict[str, float]] = []
@@ -1467,14 +1471,6 @@ def pme_offset_charge_square_sum(
             continue
         q_base, _sigma_base, _eps_base = nb_force.getParticleParameters(int(particle_idx))
         q_base_e = _value_in_elementary_charge(q_base)
-        if abs(q_base_e) > 1.0e-9:
-            raise RuntimeError(
-                f"pme_offset_charge_square_sum 假设带 {lambda_name} 电荷 offset 的粒子 "
-                f"base 电荷为 0，但粒子 {int(particle_idx)} 的 base 电荷是 {q_base_e:.12g} e。"
-                "此时 Σq(λ)² 还有 Σq_base² 与 2λΣ(q_base·scale) 两项，只算 λ²Σscale² 会让"
-                "离线 u_kn 的 PME 自能修正残留假能量项（两条腿同错、循环里不抵消）。"
-                "请先把完整公式实现出来再放开这条路径。"
-            )
         q_val = _value_in_elementary_charge(charge_scale)
         qsq += q_val * q_val
         rows.append({
@@ -1484,6 +1480,14 @@ def pme_offset_charge_square_sum(
             "base_charge_e": float(q_base_e),
         })
     return float(qsq), rows
+
+
+def pme_offset_charge_square_polynomial(rows: List[Dict[str, float]]) -> Dict[str, float]:
+    """``Σq(λ)² = c0 + c1·λ + c2·λ²`` 的三个系数（e²），由 `pme_offset_charge_square_sum` 的 rows 算。"""
+    c0 = sum(float(r["base_charge_e"]) ** 2 for r in rows)
+    c1 = sum(2.0 * float(r["base_charge_e"]) * float(r["charge_offset_e"]) for r in rows)
+    c2 = sum(float(r["charge_offset_e"]) ** 2 for r in rows)
+    return {"c0_e2": float(c0), "c1_e2": float(c1), "c2_e2": float(c2)}
 
 
 def lambda_endpoint_diagnostics(
@@ -27453,6 +27457,9 @@ class TraditionalMBARAnalyzer:
                     "charge_square_sum_e2": float(offset_qsq),
                     "source": "particle_parameter_offsets_including_coalchemical_counterion",
                     "offset_particles": offset_rows,
+                    "charge_square_polynomial_in_lambda": (
+                        pme_offset_charge_square_polynomial(offset_rows)
+                    ),
                     "note": (
                         "diagnostic only: OpenMM's NonbondedForce particle-parameter-offset "
                         "charge scaling already reports the physically correct, λ-dependent "
@@ -27495,6 +27502,9 @@ class TraditionalMBARAnalyzer:
                     "charge_square_sum_e2": float(offset_qsq),
                     "source": "particle_parameter_offsets_including_coalchemical_counterion",
                     "offset_particles": offset_rows,
+                    "charge_square_polynomial_in_lambda": (
+                        pme_offset_charge_square_polynomial(offset_rows)
+                    ),
                     "note": (
                         "diagnostic only: OpenMM's NonbondedForce particle-parameter-offset "
                         "charge scaling already reports the physically correct, λ-dependent "

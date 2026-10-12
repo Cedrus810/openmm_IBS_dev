@@ -2,7 +2,7 @@
 
 复核日期：**2026-09-03**（逐份对当前源码核对过，不是转述）
 
-增量登记：**2026-10-03**，新增 Stage 2 准确性提案；本次没有重新复核其余历史条目。
+增量登记：**2026-10-03**，新增 Stage 2 准确性提案；**2026-10-11**，新增带电 charge-transfer 水体系 carrier 修正提案；两次都没有重新复核其余历史条目。
 
 > 08-31 那轮实现了 REMD 的 P0/P2′ 与 RBFE 的 R0；**09-03 这轮实现了 RBFE 的 R1a**
 > （原子映射）。见下方状态表与各计划的第 0 节。
@@ -14,6 +14,7 @@
 
 | 文件 | 类型 | 状态 | 一句话 |
 |---|---|---|---|
+| [PROPOSAL_charge_transfer_carrier_soluble_2026-10-11.md](PROPOSAL_charge_transfer_carrier_soluble_2026-10-11.md) | 提案 | 🟡 **第 0、1 步已做（只读诊断 + PB 后处理），代码未改**（2026-10-11） | 水体系带电配体：约束每个 λ 都在 ⟹ 体积/标准态项腿内相消，不需要"释放"项（现有 schema 只释放一端反而引入约 5 kJ/mol 伪项）；剩下的是 carrier 在约束位点 vs 无限远充电之差，先只读诊断、再 PB 后处理、再换位点采样验证；约束形式不改，已有 rep 可后处理补上。MCL-1 L1 rep1 实测修正 ≈ −0.07 kJ/mol（盐匹配 PB）。膜体系另写 |
 | [PROPOSAL_stage2_accuracy_2026-10-03.md](PROPOSAL_stage2_accuracy_2026-10-03.md) | 提案 | ⬜ **设计完成，未实施**（2026-10-03） | 先修采样身份、生产盒、burn-in 时长与 f_k 规范；再比较连续链并增加只读构象覆盖证据；增强采样仅列实验后备 |
 | [PLAN_openmm_8_6_remd_backend.md](PLAN_openmm_8_6_remd_backend.md) | 计划 | 🟡 **P0 完成 / P2′ 未接线** | `free_energy_engine.py`：选择器已接进 `--remd-backend`；采样契约已写好但三个 REMDManager 调用点仍走老路；P1 等 OpenMM 升级 |
 | [PLAN_rbfe_interface_and_implementation.md](PLAN_rbfe_interface_and_implementation.md) | 计划 | 🟢 **R0 + R1 完成** | R0 契约/验证/汇总 + R1a 原子映射 + **R1b 受限 hybrid builder**（`build_hybrid_system`，端点等价/有限差分力/逐 λ 电荷三项验收已过）；`rbfe_pipeline.py` 已于 09-01 建好（本表此前误记为「不存在」）；**R2 未开始，`prepare_edge` 卡在「可跑的配体 B」** |

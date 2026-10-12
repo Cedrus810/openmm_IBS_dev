@@ -13159,11 +13159,20 @@ def build_aces_probe_system_dual_lambda(
         # otherwise ligand/environment Coulomb would be counted twice.  The
         # native NonbondedForce still exposes the actual offsets for both the
         # ligand and co-ion, so endpoint charge audits inspect the real force.
-        for idx in range(nb.getNumGlobalParameters()):
-            if nb.getGlobalParameterName(idx) == "lam_coul":
-                default_lam = 1.0 if fixed_lam_coul is None else float(fixed_lam_coul)
-                nb.setGlobalParameterDefaultValue(idx, default_lam)
-                break
+        #
+        # 🔑 [2026-10-10 真机 fragment-opt `MCL-1_ligand-1`] B3 注册 lam_coul 的
+        # **不止** NonbondedForce：couple-intramol=no 的 (1-λ²) 配体内部库仑补偿项
+        # （`_freeze_ligand_internal_coulomb`）也注册了它，默认 1.0。原来只改 nb 的
+        # 默认值 ⟹ 两个 Force 默认值不一致，建 Context 直接抛
+        # "Two Forces define different default values for the parameter 'lam_coul'"。
+        # 所以对体系里**每个**注册了 lam_coul 的 Force 统一设默认值。
+        default_lam = 1.0 if fixed_lam_coul is None else float(fixed_lam_coul)
+        for force in new_sys.getForces():
+            if not hasattr(force, "getNumGlobalParameters"):
+                continue
+            for idx in range(force.getNumGlobalParameters()):
+                if force.getGlobalParameterName(idx) == "lam_coul":
+                    force.setGlobalParameterDefaultValue(idx, default_lam)
         # Dual-lambda pilot diagnostics difference the native PME/Nonbonded
         # Force only when the Coulomb lambda is the one being varied -- that is
         # where B3's ParameterOffset installs the real λ_coul dependence.
@@ -13178,8 +13187,18 @@ def build_aces_probe_system_dual_lambda(
         nb.setParticleParameters(idx, zero_q, zero_sig, zero_eps)
 
     # Group 2: 配体内部力
+    # [2026-10-10] 带电腿：B3 已挂上 (1-λ²) 的配体内部 ≥1-5 库仑补偿项
+    # （vanishing pilot 固定 λ_coul=0 ⟹ 取满）。ll_f 若再用原始电荷就把同一份
+    # 内部库仑算两遍。与生产 vanishing（ibs_engine 第 4 步）同口径：ll_f 用清零
+    # 电荷只管 LJ；1-4 由 ll_14_f 从 B3 冻结的 exception 读，不受影响。
+    group2_params = all_p
+    if charge_offsets_active:
+        group2_params = list(all_p)
+        for idx in perturbed_indices:
+            _q, sig, eps = group2_params[int(idx)]
+            group2_params[int(idx)] = (zero_q, sig, eps)
     ll_f, ll_14_f = create_ligand_internal_force(
-        nb, perturbed_indices, all_p, ref_excl, num_atoms, system=system
+        nb, perturbed_indices, group2_params, ref_excl, num_atoms, system=system
     )
     if ll_f:
         ll_f.setForceGroup(2)

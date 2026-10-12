@@ -1,0 +1,96 @@
+{
+ "leg": "complex",
+ "rep_dir": "/home/ruigengji/fragment-opt-abfe-benchmark/openmmIBS/runs_lcr_s1long15/MCL-1_ligand-1/rep1",
+ "salt_M": 0.1677044226719165,
+ "q_protein_e": 4.999999999999916,
+ "q_carrier_e": -1.0,
+ "pdie": 1.0,
+ "sdie": 97.0,
+ "r_cut_nm": 3.0,
+ "stride": 5,
+ "states": {
+  "state0": {
+   "E_int_kJ": {
+    "mean": -0.08245066394654064,
+    "sd": 0.08854841084729932,
+    "sem_naive": 0.016166654017433658,
+    "n": 30
+   },
+   "E_int_0M_kJ": {
+    "mean": -2.4116098165753623,
+    "sd": 0.7270849652525397,
+    "sem_naive": 0.13274694556389197,
+    "n": 30
+   },
+   "E_desolv_kJ": {
+    "mean": 0.0017039250999308327,
+    "sd": 0.002018109605144745,
+    "sem_naive": 0.0003684547180852069,
+    "n": 30
+   },
+   "dU_X_kJ": {
+    "mean": -0.08074673884660982,
+    "sd": 0.08685121777878291,
+    "sem_naive": 0.015856790374744377,
+    "n": 30
+   },
+   "dU_X_0M_kJ": {
+    "mean": -2.4099058914754314,
+    "sd": 0.7273513249238681,
+    "sem_naive": 0.13279557596402403,
+    "n": 30
+   },
+   "n_solute_copies": [
+    1,
+    2,
+    3
+   ]
+  },
+  "state11": {
+   "E_int_kJ": {
+    "mean": -0.06747882207753665,
+    "sd": 0.17015868741481505,
+    "sem_naive": 0.03106658381752154,
+    "n": 30
+   },
+   "E_int_0M_kJ": {
+    "mean": -2.891343826767046,
+    "sd": 0.7695428834759859,
+    "sem_naive": 0.140498665415789,
+    "n": 30
+   },
+   "E_desolv_kJ": {
+    "mean": 0.0022488373999294707,
+    "sd": 0.0025803442189225854,
+    "sem_naive": 0.0004711042449439829,
+    "n": 30
+   },
+   "dU_X_kJ": {
+    "mean": -0.06522998467760718,
+    "sd": 0.17077851555498852,
+    "sem_naive": 0.031179748435571367,
+    "n": 30
+   },
+   "dU_X_0M_kJ": {
+    "mean": -2.8890949893671163,
+    "sd": 0.7693499144176021,
+    "sem_naive": 0.14046343424706323,
+    "n": 30
+   },
+   "n_solute_copies": [
+    1,
+    2,
+    3,
+    4
+   ]
+  }
+ },
+ "delta_leg_kJ": 0.0729883617621085,
+ "delta_leg_sem_naive_kJ": 0.017490100868020324,
+ "delta_leg_0M_kJ": 2.649500440421274
+}
+dcdplugin) detected standard 32-bit DCD file of native endianness
+dcdplugin) CHARMM format DCD file (also NAMD 2.1 and later)
+dcdplugin) detected standard 32-bit DCD file of native endianness
+dcdplugin) CHARMM format DCD file (also NAMD 2.1 and later)
+complex exit 0

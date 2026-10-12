@@ -2985,13 +2985,29 @@ def _create_context_with_local_cpu_fallback(
                 "  · 真要用 CPU 就显式传 --platform CPU，让它成为一个决定而不是意外\n"
                 "  · 把上面那段编译错误连同 kernel 源码留档 —— 那才是根因所在"
             ) from exc
+        # [2026-10-10 真机 fragment-opt `MCL-1_ligand-1`] System 定义错误同样是确定性的、
+        # 与平台无关（"Two Forces define different default values ..." 被误判成资源类，
+        # 白白在 CPU 上再撞一次）。已知的这类消息直接抛；未列出的，CPU 也失败时
+        # 在报错里说清"两个平台都失败 ⟹ 不是资源问题"。
+        _is_system_def = ("define different default values" in _msg
+                          or "Unknown variable" in _msg)
+        if _is_system_def:
+            raise RuntimeError(
+                f"Context 初始化失败：System 定义错误（与平台无关，不回退 CPU）：{_msg}"
+            ) from exc
         log(
-            f"  [WARN] 平台 {platform_name!r} 的 Context 初始化失败（判为**资源类**，"
+            f"  [WARN] 平台 {platform_name!r} 的 Context 初始化失败（按**资源类**处理，"
             f"非编译错误）: {exc}，本阶段局部回退到 CPU"
         )
         integrator = integrator_factory()
         platform = openmm.Platform.getPlatformByName("CPU")
-        context = openmm.Context(system, integrator, platform, {})
+        try:
+            context = openmm.Context(system, integrator, platform, {})
+        except Exception as cpu_exc:
+            raise RuntimeError(
+                f"Context 在 {platform_name!r} 和 CPU 上都初始化失败 ⟹ 不是资源问题，"
+                f"多半是 System 定义错误。{platform_name}: {_msg} | CPU: {cpu_exc}"
+            ) from cpu_exc
         return context, integrator, "CPU", {}
 #============================================================================
 # 辅助类：NumpyEncoder (JSON 序列化支持)

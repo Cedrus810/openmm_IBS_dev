@@ -2428,7 +2428,31 @@ def _derive_gromacs_inputs_with_reserved_coions(
     with open(out_top, "w", encoding="utf-8") as fh:
         fh.write("\n".join(top_lines) + "\n")
 
+    # 🔑 [2026-10-10 真机 fragment-opt `MCL-1_ligand-1/rep1`] 派生 .top 的 `#include`
+    # 原样照抄，而 OpenMM/GROMACS 解析相对 include 时**先搜 .top 所在目录**。
+    # 派生件挪到 coion_reserved/ 以后，原目录里的 `ligand.itp` 之类就找不到了
+    # （"Could not locate #include file: ligand_atomtypes.hmr.itp"，启动 2 秒退出）。
+    # 把原 .top 目录里的每一项软链进派生目录 ⟹ 搜索顺序与原始件逐项一致
+    # （嵌套 include、同目录的 .ff 文件夹都照旧命中）。用 abspath 不用 realpath：
+    # 原目录里的条目本身可能是软链、也可能是同名真文件，必须指向"原目录里那一项"，
+    # 而不是它最终解析到的地方。我们自己写的 .gro/.top/报告不链。
+    src_dir = os.path.dirname(os.path.abspath(top_file))
+    own_names = {os.path.basename(out_gro), os.path.basename(out_top),
+                 RESERVED_COION_REPORT_BASENAME}
+    linked_entries = []
+    for name in sorted(os.listdir(src_dir)):
+        if name in own_names:
+            continue
+        link = os.path.join(derived_dir, name)
+        if os.path.islink(link) or os.path.isfile(link):
+            os.remove(link)
+        elif os.path.lexists(link):
+            continue
+        os.symlink(os.path.join(src_dir, name), link)
+        linked_entries.append(name)
+
     report = {
+        "linked_source_dir_entries": linked_entries,
         "species": species,
         "count": int(count),
         "cation": bool(cation),
@@ -4572,6 +4596,12 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
         getattr(config, "gmx_include_dir", None) or find_gmx_include_dir(getattr(config, "gmx_path", None))
     )
 
+    # [2026-10-10] 配体净电荷交给 openfe 锚点池的 RDKit 键级判定（带电配体原来
+    # 写死 0 ⟹ 芳香性判不动、退回 RMSF 重原子）。pipeline.system 是物理体系，
+    # 配体粒子电荷就是原始电荷。
+    ligand_net_charge = int(round(
+        _compute_ligand_net_charge(pipeline.system, pipeline.ligand_indices)))
+
     def _orb_estimator():
         # 🔑 [2026-09-24 CODE_REVIEW #2] 两个口径开关同样要喂给 Orb 估算器
         # （它的 __init__ 不收 config，self.config 只有 DEFAULT_CONFIG）。
@@ -4581,6 +4611,7 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
         est.config["boresch_force_constant_mode"] = str(
             config.get("boresch_force_constant_mode", DEFAULT_BORESCH_FORCE_CONSTANT_MODE))
         est.config["boresch_anchor_mode"] = str(config.get("boresch_anchor_mode", DEFAULT_BORESCH_ANCHOR_MODE))
+        est.config["ligand_net_charge"] = ligand_net_charge
         return est
 
     # 根据来源调用不同估算器
@@ -4623,6 +4654,7 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
             force_constant_mode=str(
                 config.get("boresch_force_constant_mode", DEFAULT_BORESCH_FORCE_CONSTANT_MODE)),
             anchor_mode=str(config.get("boresch_anchor_mode", DEFAULT_BORESCH_ANCHOR_MODE)),
+            ligand_net_charge=ligand_net_charge,
         )
         import mdtraj as md
         traj = md.load(traj_file, top=traj_top)

@@ -297,6 +297,18 @@
   膜体系生产盒目前 = NPT 末帧盒（没走均值缩放），要先处理。
 
 - [ ] **PHY-03 [P3] charge-transfer 的 tethered charge carrier 不能按当前论证严格跨腿抵消**（带电路线的条件性阻塞）。
+  **2026-10-11 水体系先行**（用户定：水的跑通再做膜）：推导与方案见
+  [design/PROPOSAL_charge_transfer_carrier_soluble_2026-10-11.md](design/PROPOSAL_charge_transfer_carrier_soluble_2026-10-11.md)。
+  要点：
+  - 约束每个 λ 都在、腿是固定盒 NVT ⟹ 体积/标准态项在腿内相消；
+  - 剩下的是 carrier 在约束位点充电与无限远充电之差（蛋白场 + 位置相关周期残余）；
+  - 下面 barostat 一条对水体系不成立：`ibs_engine._inject_co_alchemical_ion_restraints` 遇到 barostat 直接拒绝注入；
+  - 现有修正 schema（只在去耦端"释放"）要改成 v2。
+  **进度（10-11，MCL-1 L1 rep1，只此一个体系一个 rep）**：第 0 步（carrier 几何只读诊断）、第 1 步（APBS 盐匹配 PB 后处理）已做，
+  ΔG_bind 修正 ≈ −0.07 kJ/mol（δ_cplx = +0.073 ± 0.017，朴素 SEM；δ_solv ≈ 0；0 M 无屏蔽上界 2.65 kJ/mol），
+  脚本与结果在 `experiments/2026-10-11_carrier_step0/`、`experiments/2026-10-11_carrier_step1/`。
+  **未做**：提案 §5 的代码改动（schema v2、结果文件写入 δ_CT）、第 2 步换位点 / k–r0 扫描采样验证（GPU，需先报计划）。
+  下面原文保留，膜体系重启时再按膜的情况重核。
   **位置**：`abfe_core.py` 的 co-ion restraint 说明与表达式；`ibs_engine.py::_create_co_alchemical_ion_restraint`；
   `abfe_core.py::resolve_charge_treatment` 的 `closes_thermodynamic_cycle`。
   **触发**：带净电配体用 `co_alchemical_charge_transfer`。

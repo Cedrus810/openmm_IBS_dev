@@ -1,0 +1,106 @@
+{
+ "summary": {
+  "leg": "solvent",
+  "rep_dir": "/home/ruigengji/fragment-opt-abfe-benchmark/openmmIBS/runs_lcr_s1long15/MCL-1_ligand-1/rep1",
+  "salt_M": 0.15030467163168584,
+  "q_protein_e": 0.0,
+  "q_carrier_e": -1.0,
+  "pdie": 1.0,
+  "sdie": 97.0,
+  "r_cut_nm": 3.0,
+  "stride": 5,
+  "states": {
+   "state0": {
+    "E_int_kJ": {
+     "mean": 0.0,
+     "sd": null,
+     "sem_naive": null,
+     "n": 1
+    },
+    "E_int_0M_kJ": {
+     "mean": 0.0,
+     "sd": null,
+     "sem_naive": null,
+     "n": 1
+    },
+    "E_desolv_kJ": {
+     "mean": 0.00021982999987812946,
+     "sd": null,
+     "sem_naive": null,
+     "n": 1
+    },
+    "dU_X_kJ": {
+     "mean": 0.00021982999987812946,
+     "sd": null,
+     "sem_naive": null,
+     "n": 1
+    },
+    "dU_X_0M_kJ": {
+     "mean": 0.00021982999987812946,
+     "sd": null,
+     "sem_naive": null,
+     "n": 1
+    },
+    "n_solute_copies": [
+     4
+    ]
+   },
+   "state11": {
+    "E_int_kJ": {
+     "mean": 0.0,
+     "sd": null,
+     "sem_naive": null,
+     "n": 1
+    },
+    "E_int_0M_kJ": {
+     "mean": 0.0,
+     "sd": null,
+     "sem_naive": null,
+     "n": 1
+    },
+    "E_desolv_kJ": {
+     "mean": 0.00025075899975490756,
+     "sd": null,
+     "sem_naive": null,
+     "n": 1
+    },
+    "dU_X_kJ": {
+     "mean": 0.00025075899975490756,
+     "sd": null,
+     "sem_naive": null,
+     "n": 1
+    },
+    "dU_X_0M_kJ": {
+     "mean": 0.00025075899975490756,
+     "sd": null,
+     "sem_naive": null,
+     "n": 1
+    },
+    "n_solute_copies": [
+     4
+    ]
+   }
+  },
+  "delta_leg_kJ": -0.0002352944998165185,
+  "delta_leg_sem_naive_kJ": 0.0,
+  "delta_leg_0M_kJ": -0.0002352944998165185
+ },
+ "frames": [
+  {
+   "label": "state0_frame0000",
+   "n_solute_copies": 4,
+   "n_atoms": 69,
+   "E_desolv_kJ": 0.00021982999987812946,
+   "E_int_kJ": 0.0,
+   "E_int_0M_kJ": 0.0
+  },
+  {
+   "label": "state11_frame0000",
+   "n_solute_copies": 4,
+   "n_atoms": 69,
+   "E_desolv_kJ": 0.00025075899975490756,
+   "E_int_kJ": 0.0,
+   "E_int_0M_kJ": 0.0
+  }
+ ]
+}

@@ -182,12 +182,16 @@ def _numpy_cross_edges(
 
     raw = positions[environment][None, :, :] - positions[ligand][:, None, :]
     fractional = np.linalg.solve(box.T, raw.reshape((-1, 3)).T).T.reshape(raw.shape)
-    if np.any(np.isclose(np.abs(fractional), 0.5, atol=1e-12, rtol=0.0)):
-        raise SoftLiftDatasetError("half-box MIC tie detected")
     shift = -np.rint(fractional).astype(np.int64)
     displacement = np.matmul((fractional + shift).reshape((-1, 3)), box).reshape(raw.shape)
     distance = np.linalg.norm(displacement, axis=-1)
     retained = distance < cutoff
+    # Same rule as the CUDA plugin (exp025RoundWithTieCheckM) and softlift_deploy.py:
+    # a tie on a pair outside the cutoff cannot become an edge, and float32 frames
+    # do hit exact 0.5 on distant pairs (2026-10-08, SERT dodecahedron, 89.8 A pair).
+    tie = np.isclose(np.abs(fractional), 0.5, atol=1e-12, rtol=0.0).any(axis=-1)
+    if np.any(tie & retained):
+        raise SoftLiftDatasetError("half-box MIC tie detected")
     ligand_grid = np.broadcast_to(ligand[:, None], distance.shape)[retained]
     environment_grid = np.broadcast_to(environment[None, :], distance.shape)[retained]
     return ligand_grid.astype(np.int64), environment_grid.astype(np.int64), displacement[retained], distance[retained]
