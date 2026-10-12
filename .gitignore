@@ -45,3 +45,7 @@ AIBS_*.md
 docs/manuscript_data/
 # 第三方文献全文（JCTC 2026 SwapMC 的 markdown 转写），版权原因不入库
 acs.jctc.6c00178.md
+
+# analysis/ 是 fragment-opt-abfe-benchmark 工作区的产物（其 README 路径都指向那边），
+# 不进本仓（2026-10-12 拍板）
+analysis/
