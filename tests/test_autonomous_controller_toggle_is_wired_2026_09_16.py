@@ -28,9 +28,9 @@ def _run_full_pipeline_calls():
     tree = ast.parse(open(os.path.join(_ROOT, "runabfe.py"), encoding="utf-8").read())
     out = []
     for node in ast.walk(tree):
-        if (isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "run_full_pipeline"):
+        # 2026-10-21 起复合物腿经 `_run_complex_leg_pipeline(pipeline, ...)` 调 run_full_pipeline（在线 IBS 臂），
+        # 包装函数体里那句 `pipeline.run_full_pipeline(**kwargs)` 只转发、不是调用点。
+        if (isinstance(node, ast.Call) and ((isinstance(node.func, ast.Name) and node.func.id == "_run_complex_leg_pipeline") or (isinstance(node.func, ast.Attribute) and node.func.attr == "run_full_pipeline" and any(k.arg for k in node.keywords)))):
             out.append(node)
     return out
 

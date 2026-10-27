@@ -35,7 +35,8 @@ def test_uncovered_ligand_is_refused_before_any_sampling():
     check = source.index("if not _frozen_residual_manifest_covers_ligand(")
     refusal = source.index("tools/refit_outer_residual_from_stage2.py", check)
     assert check < refusal < source.index("resolve_boresch_restraint(config, pipeline)")
-    assert refusal < source.index("pipeline.run_full_pipeline(")
+    # 2026-10-21 起复合物腿经 `_run_complex_leg_pipeline(pipeline, …)` 调 run_full_pipeline（在线 IBS 臂）。
+    assert refusal < source.index("_run_complex_leg_pipeline(")
 
 
 def test_pre_equilibration_refit_path_is_gone():
@@ -73,7 +74,7 @@ def test_switch_on_without_a_bound_runtime_fails_instead_of_running_baseline():
     source = inspect.getsource(runabfe.main)
     assert "if config.outer_lambda_local_residual_ibs and outer_lambda_runtime is None:" in source
     assert source.index("and outer_lambda_runtime is None:") < source.index(
-        "complex_results = pipeline.run_full_pipeline(")
+        "complex_results = _run_complex_leg_pipeline(")
     assert "and outer_lambda_runtime_solv is None:" not in source
 
 
@@ -81,5 +82,5 @@ def test_only_modes_are_rejected_up_front_rather_than_silently_dropping_residual
     """`--only-charging` / `--only-attachment` 与残差互斥，且在入口就拒绝。"""
     source = inspect.getsource(runabfe.main)
     rejection = source.index("不能用于只跑 charging/attachment 的入口")
-    first_sampling = source.index("complex_results = pipeline.run_full_pipeline(")
+    first_sampling = source.index("complex_results = _run_complex_leg_pipeline(")
     assert rejection < first_sampling

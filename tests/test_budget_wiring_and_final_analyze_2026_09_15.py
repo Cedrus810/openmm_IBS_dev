@@ -28,7 +28,12 @@ def _kwarg_names(src, func_attr):
 
 def test_cli_passes_production_budget_to_both_legs():
     src = open("runabfe.py", encoding="utf-8").read()
-    calls = _kwarg_names(src, "run_full_pipeline")
+    # 2026-10-21 起复合物腿经 `_run_complex_leg_pipeline(pipeline, ...)` 调 run_full_pipeline（在线 IBS 臂），
+    # 包装函数体里那句 `pipeline.run_full_pipeline(**kwargs)` 只转发、不是调用点。
+    calls = _kwarg_names(src, "run_full_pipeline") + [
+        {kw.arg for kw in n.keywords if kw.arg} for n in ast.walk(ast.parse(src))
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        and n.func.id == "_run_complex_leg_pipeline"]
     legs = [c for c in calls if "system_type" in c]
     assert len(legs) == 2, f"预期复合物腿+溶剂腿两处，实到 {len(legs)}"
     for c in legs:

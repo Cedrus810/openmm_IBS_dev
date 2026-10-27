@@ -4626,8 +4626,7 @@ def resolve_boresch_restraint(config: RunConfig, pipeline: ABFEPipeline) -> Opti
     def _orb_estimator():
         # 🔑 [2026-09-24 CODE_REVIEW #2] 两个口径开关同样要喂给 Orb 估算器
         # （它的 __init__ 不收 config，self.config 只有 DEFAULT_CONFIG）。
-        # 两个 orb 调用点共用这一处，别再各写各的。
-        from abfe_core import OrbBoreschEstimator
+        # 两个 orb 调用点共用这一处，别再各写各的。（OrbBoreschEstimator 在文件顶部已从 abfe_core 导入）
         est = OrbBoreschEstimator(temperature=config.temperature)
         est.config["boresch_force_constant_mode"] = str(
             config.get("boresch_force_constant_mode", DEFAULT_BORESCH_FORCE_CONSTANT_MODE))

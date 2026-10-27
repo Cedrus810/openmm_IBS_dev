@@ -145,11 +145,9 @@ def test_runabfe_wires_the_config_into_both_legs():
     """复合物腿与溶剂腿的 run_full_pipeline 都必须把配置值传下去。"""
     src = (REPO_ROOT / "runabfe.py").read_text(encoding="utf-8")
     tree = ast.parse(src, filename="runabfe.py")
-    calls = [
-        n for n in ast.walk(tree)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-        and n.func.attr == "run_full_pipeline"
-    ]
+    # 2026-10-21 起复合物腿经 `_run_complex_leg_pipeline(pipeline, ...)` 调 run_full_pipeline（在线 IBS 臂），
+    # 包装函数体里那句 `pipeline.run_full_pipeline(**kwargs)` 只转发、不是调用点。
+    calls = [n for n in ast.walk(tree) if (isinstance(n, ast.Call) and ((isinstance(n.func, ast.Name) and n.func.id == "_run_complex_leg_pipeline") or (isinstance(n.func, ast.Attribute) and n.func.attr == "run_full_pipeline" and any(k.arg for k in n.keywords))))]
     assert len(calls) >= 2, f"只找到 {len(calls)} 个 run_full_pipeline 调用点"
     missing = [
         c.lineno for c in calls

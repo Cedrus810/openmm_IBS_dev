@@ -10,6 +10,7 @@ import ast
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -337,8 +338,12 @@ def test_second_leg_gets_its_own_clean_log_file(tmp_path):
 
 def test_walker_and_wet_seed_npz_writes_are_atomic():
     src = (REPO / "ibs_engine.py").read_text(encoding="utf-8")
-    # 只剩 _atomic_save_npz 内部那一处真正的 np.savez。
-    assert src.count("np.savez(handle, **arrays)") == 1
+    # 每一处 np.savez(handle, ...) 都必须是「写 .tmp 再 os.replace」（2026-10-27：stage 2 坐标旁车
+    # `_save_coords_sidecar` 也按这个模式写，原来的「只剩一处」文本计数就失配了）。
+    sites = [m.start() for m in re.finditer(r"np\.savez\(handle, \*\*arrays\)", src)]
+    assert sites
+    for i in sites:
+        assert ".tmp" in src[max(0, i - 300):i] and "os.replace(" in src[i:i + 120], src[i - 300:i + 120]
     assert "np.savez(\n        os.path.join(cache_dir" not in src
     assert "_atomic_save_npz(\n        os.path.join(cache_dir" in src
     # 读取侧要有损坏容错，别让截断 npz 卡死每次 resume。

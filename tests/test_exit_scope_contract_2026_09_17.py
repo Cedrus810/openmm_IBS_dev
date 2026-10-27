@@ -249,7 +249,6 @@ def test_a_never_sampled_window_gets_its_first_block_before_a_repeat_topup(tmp_p
     而 `missing=[3,4]` 一步都没跑过。挡住它们的「因果顺序」理由是「上游**重锚**会
     作废下游 lineage」—— 但补帧是同一份冻结 f_k、接着原段，**不重锚**。
     """
-    import abfe_preoptimizer as pre
     run = _board_with_a_never_sampled_window(tmp_path, blocks_on_w1=2)
     plan = pre.Stage2RepairController.for_physical_stage(
         run, "vanishing", "vdw").decide()
@@ -260,7 +259,6 @@ def test_a_never_sampled_window_gets_its_first_block_before_a_repeat_topup(tmp_p
 
 def test_the_first_block_itself_is_not_deferred(tmp_path):
     """反面：目标窗口自己还在**第一遍**（0 块）时不让路 —— 否则第一遍永远排不上。"""
-    import abfe_preoptimizer as pre
     run = _board_with_a_never_sampled_window(tmp_path, blocks_on_w1=0)
     plan = pre.Stage2RepairController.for_physical_stage(
         run, "vanishing", "vdw").decide()

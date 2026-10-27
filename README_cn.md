@@ -10,15 +10,61 @@ ABFE-IBS 是一个基于 OpenMM 的绝对结合自由能（ABFE）工作流。�
 Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS
 ```
 
-管线覆盖 GROMACS→OpenMM 建系、complex/solvent 两腿、dual-lambda 解耦、
-IBS 预热与固定偏置 production、MBAR/TMBAR 估计、Boresch attachment/release 记账、
-LJ 长程修正、缓存、续跑和 fail-closed 质量门。
+管线覆盖 GROMACS→OpenMM 建系、complex/solvent 两腿、dual-lambda 解耦（先去电荷、再去 vdW）、
+MBAR/TMBAR 估计、Boresch attachment/release 记账、LJ 长程修正、缓存、续跑和 fail-closed 质量门。
 每一步实现的是哪篇文献的方法、以及协议版本，见 [docs/METHODS.md](docs/METHODS.md)。
+
+## AIBS：vdW 阶段的自适应 integrated Boltzmann sampling
+
+integrated Boltzmann sampling（IBS）把相邻 λ 态合进一个混合势。AIBS 里相邻 λ 态分成
+**window**；能量偏移固定的混合势叫 **generator**，在它下面跑的一条轨迹叫一个 **segment**。
+每个 segment 期间 generator 不变，所以跑完的 segment 可以先互相比较，再决定要不要补采：
+
+- **第一轮**：复合物腿每个 window 跑三个 segment —— 一个中心 generator，加两个向窗口两端
+  各加小线性倾斜的 generator（溶剂腿每个 window 只跑中心一段）。
+- 每轮结束后对每个 window 做 **segment deletion**（逐个去掉 segment 重新求解）、pooled 逐态 ESS
+  和 top-1% 权重占比检查；不过的 window 下一轮补 segment。
+- segment 之间的分歧计入报告的不确定度。
+
+AIBS 作用于 `dual_lambda` 解耦的 vdW 阶段（stage 2），在运行配置里开启（**默认关闭**），
+并要求固定的 stage 2 布局：均匀 λ 格点（`stage2_uniform_lambda_states` = N 给出
+λ_i = 1 − i/(N−1)）和显式窗口（`stage2_window_ranges`，左闭右开的态下标区间，相邻窗口共用
+边界态）。论文中性 benchmark 用的 stage 2 设置：
+
+```json
+{
+  "decoupling": "dual_lambda",
+  "n_steps_per_window": 250000,
+  "stage2_uniform_lambda_states": 26,
+  "stage2_window_ranges": [[0, 6], [5, 11], [10, 16], [15, 21], [20, 26]],
+  "stage2_lcr_rounds": true
+}
+```
+
+`n_steps_per_window` 是一个 segment 的长度（250000 步 = 2 fs 下 0.5 ns）。只开
+`stage2_lcr_rounds` 而不给布局键，运行会直接报错退出。
+
+可选参数（默认值在 `stage2_rounds.py`）：
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `stage2_lcr_max_rounds` | 3 | 最多轮数（含第一轮） |
+| `stage2_lcr_sigma_tol_kJ` | 1.5 | segment deletion 灵敏度阈值（kJ/mol） |
+| `stage2_lcr_tilt_kT` | 2.0 | 第一轮左/右 generator 的首末总倾斜（kT） |
+| `stage2_lcr_trust_floor_kT` | 3.0 | 重定中心时信赖域半径下限（kT） |
+| `stage2_lcr_burn_in_steps` | 25000 | 每个 segment 开头丢弃的步数 |
+
+pooled ESS（20）和 top-1% 权重（0.35）两个阈值写死在代码里。
 
 ## 引用与数据
 
-<!-- TODO 发布前：论文引用与数据归档 DOI -->
-配套论文与所报告结果的数据/分析归档，发布后在此给出。
+<!-- TODO 发布前：作者、期刊信息、数据归档 DOI -->
+使用本代码请引用：
+
+> *Adaptive Integrated Boltzmann Sampling for the van der Waals Stage of Absolute
+> Binding Free-Energy Calculations*（稿件准备中，正式引用待补）。
+
+支撑论文的数据集与分析脚本将存入公开数据归档，DOI 届时在此给出。
 
 ## 1. 环境
 
@@ -100,6 +146,7 @@ python runabfe.py --config abfe_config.json --ligand MOL --analyze-only
 | 功能 | 状态 | 文档 |
 |---|---|---|
 | outer-λ 局部残差（`--outer-lambda-local-residual-ibs`） | 实验性，只用于复合物腿。仓库不带冻结权重：先不开它跑一次，从该次的 stage 2 帧重训，再带 `--outer-lambda-resource-manifest` 重跑。使用 `plugins/LocalManyBodyResidual/build/` 里预编译的 CUDA 插件 | [RETRAIN_LOCAL_RESIDUAL.md](docs/RETRAIN_LOCAL_RESIDUAL.md) |
+| reference IBS 对照臂（运行配置里 `stage2_online_ibs`，与 `stage2_lcr_rounds` 同开） | 只接管复合物腿 stage 2：偏移在生产中在线学习；复合物 stage 2 采完即结束，不写结合自由能。离线 TMBAR 分析脚本不在本仓库 | — |
 | RBFE（`runrbfe.py`） | 独立于 ABFE 主线；契约、原子映射、受限 hybrid builder 已有，端到端的边还没有 | — |
 | 口袋水采样器（`tools/pocket_water/`） | 实验性工具，未接入管线 | — |
 | 膜体系、charge-transfer、DEXP / MACE / ORB 路线 | 有代码，不在默认生产路径上 | — |
@@ -120,8 +167,8 @@ ABFE 主线：
 | `ibs_engine.py` | IBS、MBAR/TMBAR、Boresch、长程修正 |
 | `free_energy_engine.py` | ABFE / RBFE 共用的采样引擎 |
 | `abfe_diagnostics.py` | 只读诊断子命令的实现 |
-| `stage2_rounds.py`、`stage2_rounds_evidence.py` | stage 2 轮次控制器（纯函数）与逐窗证据 |
-| `stage2_online_ibs.py` | 在线权重 IBS 对照臂（不配置就不启用） |
+| `stage2_rounds.py`、`stage2_rounds_evidence.py` | AIBS 轮次控制器（纯函数）与逐窗证据（segment deletion、pooled ESS、top-1% 权重） |
+| `stage2_online_ibs.py` | reference IBS 对照臂：偏移在生产中在线学习、时间聚合 MBAR（不配置就不启用） |
 | `step_guard.py`、`lambda_path_versions.py`、`multi_segment_analysis.py` | 入口依赖的小支撑模块 |
 | `apbs_correction.py` | Rocklin 有限尺寸静电修正 |
 | `outer_lambda_neural_basis.py` | outer-λ 基势（`local_residual.openmm_plugin` 的依赖） |

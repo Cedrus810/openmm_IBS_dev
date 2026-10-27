@@ -107,5 +107,7 @@ def test_windows_gmx_executable_uses_shutil_which():
 
 def test_both_production_legs_forward_n_equil_steps():
     tree = ast.parse(RUNABFE.read_text(encoding="utf-8"), filename=str(RUNABFE))
-    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "run_full_pipeline"]
+    # 2026-10-21 起复合物腿经 `_run_complex_leg_pipeline(pipeline, ...)` 调 run_full_pipeline（在线 IBS 臂），
+    # 包装函数体里那句 `pipeline.run_full_pipeline(**kwargs)` 只转发、不是调用点。
+    calls = [n for n in ast.walk(tree) if (isinstance(n, ast.Call) and ((isinstance(n.func, ast.Name) and n.func.id == "_run_complex_leg_pipeline") or (isinstance(n.func, ast.Attribute) and n.func.attr == "run_full_pipeline" and any(k.arg for k in n.keywords))))]
     assert sum(any(k.arg == "n_equil_steps" for k in call.keywords) for call in calls) >= 2

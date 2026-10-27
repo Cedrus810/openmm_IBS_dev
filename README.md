@@ -13,16 +13,69 @@ Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS
 
 Per-step methodology, citations, and protocol versions: [docs/METHODS.md](docs/METHODS.md).
 
-The pipeline covers GROMACS-to-OpenMM construction, both legs, dual-lambda decoupling,
-IBS warmup and frozen-bias production, MBAR/TMBAR estimation, Boresch
+The pipeline covers GROMACS-to-OpenMM construction, both legs, dual-lambda decoupling
+(electrostatics removed before van der Waals), MBAR/TMBAR estimation, Boresch
 attachment/release accounting, LJ long-range correction, caching, resume, and
 fail-closed quality gates.
 
+## AIBS: adaptive integrated Boltzmann sampling for the van der Waals stage
+
+Integrated Boltzmann sampling (IBS) brings neighboring λ states into one mixture
+potential. In AIBS, neighboring λ states are grouped into **windows**; a mixture potential
+with fixed energy offsets is a **generator**, and one trajectory under it is a
+**segment**. The generator stays fixed during each segment, so completed segments can be
+compared before more sampling is requested:
+
+- **Round 1** samples each complex-leg window with three segments -- a center generator and
+  two with a small linear tilt toward either end of the window (one center segment per
+  solvent-leg window).
+- After each round, every window is checked by **segment deletion** (removing segments in
+  turn and re-solving), the pooled per-state ESS, and the top-1% weight fraction. Windows
+  that fail receive additional segments in the next round.
+- Segment disagreement is included in the reported uncertainty.
+
+AIBS applies to the van der Waals stage (stage 2) of `dual_lambda` decoupling. It is
+switched on in the run configuration (it is **off by default**) and requires a fixed
+stage-2 layout: a uniform λ grid (`stage2_uniform_lambda_states` = N gives
+λ_i = 1 − i/(N−1)) and explicit windows (`stage2_window_ranges`, half-open state-index
+ranges; neighboring windows share their boundary state). The stage-2 settings used for
+the manuscript's neutral benchmark:
+
+```json
+{
+  "decoupling": "dual_lambda",
+  "n_steps_per_window": 250000,
+  "stage2_uniform_lambda_states": 26,
+  "stage2_window_ranges": [[0, 6], [5, 11], [10, 16], [15, 21], [20, 26]],
+  "stage2_lcr_rounds": true
+}
+```
+
+`n_steps_per_window` is the length of one segment (250000 steps = 0.5 ns at 2 fs).
+Setting `stage2_lcr_rounds` without the layout keys stops the run with an error.
+
+Optional parameters (defaults in `stage2_rounds.py`):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `stage2_lcr_max_rounds` | 3 | Maximum number of rounds, including round 1 |
+| `stage2_lcr_sigma_tol_kJ` | 1.5 | Segment-deletion sensitivity threshold (kJ/mol) |
+| `stage2_lcr_tilt_kT` | 2.0 | End-to-end tilt of the round-1 left/right generators (kT) |
+| `stage2_lcr_trust_floor_kT` | 3.0 | Lower bound of the trust region for re-centered offsets (kT) |
+| `stage2_lcr_burn_in_steps` | 25000 | Steps discarded at the start of each segment |
+
+The pooled-ESS (20) and top-1% weight (0.35) thresholds are fixed in code.
+
 ## Citation and data
 
-<!-- TODO before release: manuscript citation and data-archive DOI -->
-The accompanying manuscript and the data/analysis archive for the reported results are
-referenced here once available.
+<!-- TODO before release: author list, journal reference, and data-archive DOI -->
+If you use this code, please cite:
+
+> *Adaptive Integrated Boltzmann Sampling for the van der Waals Stage of Absolute
+> Binding Free-Energy Calculations* (manuscript in preparation; reference to be added).
+
+The data sets and analysis scripts supporting the manuscript will be deposited in a
+public archive; the DOI will be listed here.
 
 ## 1. Environment
 
@@ -109,6 +162,7 @@ and repeat-to-repeat spread before quoting a number.
 | Feature | Status | Docs |
 |---|---|---|
 | Outer-λ local residual (`--outer-lambda-local-residual-ibs`) | Experimental, complex leg only. No frozen weights ship with the repository: run once without it, refit from that run's stage-2 frames, then rerun with `--outer-lambda-resource-manifest`. Uses the prebuilt CUDA plugin in `plugins/LocalManyBodyResidual/build/` | [RETRAIN_LOCAL_RESIDUAL.md](docs/RETRAIN_LOCAL_RESIDUAL.md) |
+| Reference-IBS comparison arm (`stage2_online_ibs` in the run config, together with `stage2_lcr_rounds`) | Complex-leg stage 2 only: offsets are learned during production; the run stops after complex stage-2 sampling and writes no binding result. The offline TMBAR analysis script is not part of this repository | -- |
 | RBFE (`runrbfe.py`) | Independent of the ABFE mainline; contracts, atom mapping and a restricted hybrid builder exist, end-to-end edges do not | -- |
 | Pocket-water sampler (`tools/pocket_water/`) | Experimental tool, not wired into the pipeline | -- |
 | Membrane systems, charge-transfer, DEXP / MACE / ORB paths | Code present, not on the default production path | -- |
@@ -130,8 +184,8 @@ ABFE mainline:
 | `ibs_engine.py` | IBS, MBAR/TMBAR, Boresch, long-range correction |
 | `free_energy_engine.py` | Sampling engine shared by ABFE and RBFE |
 | `abfe_diagnostics.py` | Implementation of the read-only diagnostic subcommands |
-| `stage2_rounds.py`, `stage2_rounds_evidence.py` | Stage-2 round controller (pure functions) and its per-window evidence |
-| `stage2_online_ibs.py` | Online-weight IBS comparison arm (off unless configured) |
+| `stage2_rounds.py`, `stage2_rounds_evidence.py` | AIBS round controller (pure functions) and its per-window evidence (segment deletion, pooled ESS, top-1% weight) |
+| `stage2_online_ibs.py` | Reference-IBS comparison arm: offsets learned online, time-aggregated MBAR (off unless configured) |
 | `step_guard.py`, `lambda_path_versions.py`, `multi_segment_analysis.py` | Small support modules required by the entry points |
 | `apbs_correction.py` | Rocklin finite-size electrostatic correction |
 | `outer_lambda_neural_basis.py` | Outer-λ basis potential (dependency of `local_residual.openmm_plugin`) |
