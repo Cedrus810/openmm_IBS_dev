@@ -351,6 +351,7 @@ extern "C" __global__ void exp025Readout(
         const real* __restrict__ q,
         const real* __restrict__ typedMlpFlat,
         real bMaxReduced,
+        real rawOffsetReduced,
         real* __restrict__ dBdq,
         real* __restrict__ energyScratch,
         int* __restrict__ deviceStatus) {
@@ -373,7 +374,7 @@ extern "C" __global__ void exp025Readout(
     __syncthreads();
 
     if (threadIdx.x == 0) {
-        real tanhVal = tanh(totalS / bMaxReduced);
+        real tanhVal = tanh((totalS - rawOffsetReduced) / bMaxReduced);
         real bReduced = bMaxReduced * tanhVal;
         sech2Shared = (real) 1 - tanhVal * tanhVal;
         if (!isfinite(bReduced) || !isfinite(sech2Shared))
@@ -539,30 +540,32 @@ __device__ inline void exp025EdgeQAndGrad(real r, int ligandType, int envType,
     *outDEdgeQDr = dc2 * g + c2 * dg;
 }
 
-// Folds an absolute (mixed-precision) position into the primary unit cell
-// via the same sequential z->y->x reduction as exp025WrapDeltaM above
-// (restricted triclinic: A=(Ax,0,0), B=(Bx,By,0), C=(Cx,Cy,Cz)), using
-// floor() to fold into [0, boxVec) rather than round() to wrap a delta into
-// [-half,half). Returns a cell index per axis in [0,nCellsAxis).
+// Cell index of an absolute (mixed-precision) position, computed in
+// FRACTIONAL coordinates s = H^-1 r (restricted triclinic: A=(Ax,0,0),
+// B=(Bx,By,0), C=(Cx,Cy,Cz)), each s folded into [0,1).
+//
+// Why fractional (2026-10-18): the previous version folded r into the
+// reduced Cartesian brick and took cx from px/Ax. In a triclinic box a
+// periodic shift by B or C also moves x by Bx/Cx, so the +-1 neighbour cells
+// of the 27-cell stencil (taken modulo n per axis) were NOT the geometric
+// neighbours across the y/z faces, and candidates there were silently missed
+// (SERT rhombic dodecahedron, ligand near a brick corner: B short by 1-7 kT).
+// In fractional space a lattice shift is an integer shift of s, so modulo-n
+// stencils are exact; and with n_i = floor(h_i / r_list) (h_i = face height,
+// host side) any pair within r_list has |ds_i| <= r_list / h_i <= 1 / n_i,
+// i.e. lies in an adjacent cell. Cubic boxes give the same cells as before.
 __device__ inline void exp025FoldToCellM(mixed px, mixed py, mixed pz,
         real4 boxVecX, real4 boxVecY, real4 boxVecZ,
         int nCellsX, int nCellsY, int nCellsZ, int* outCx, int* outCy, int* outCz) {
-    mixed nz = floor(pz / (mixed) boxVecZ.z);
-    px -= nz * (mixed) boxVecZ.x;
-    py -= nz * (mixed) boxVecZ.y;
-    pz -= nz * (mixed) boxVecZ.z;
-
-    mixed ny = floor(py / (mixed) boxVecY.y);
-    px -= ny * (mixed) boxVecY.x;
-    py -= ny * (mixed) boxVecY.y;
-
-    mixed nx = floor(px / (mixed) boxVecX.x);
-    px -= nx * (mixed) boxVecX.x;
-
-    mixed fx = px / (mixed) boxVecX.x, fy = py / (mixed) boxVecY.y, fz = pz / (mixed) boxVecZ.z;
-    int cx = (int) (fx * (mixed) nCellsX);
-    int cy = (int) (fy * (mixed) nCellsY);
-    int cz = (int) (fz * (mixed) nCellsZ);
+    mixed sz = pz / (mixed) boxVecZ.z;
+    mixed sy = (py - sz * (mixed) boxVecZ.y) / (mixed) boxVecY.y;
+    mixed sx = (px - sy * (mixed) boxVecY.x - sz * (mixed) boxVecZ.x) / (mixed) boxVecX.x;
+    sx -= floor(sx);
+    sy -= floor(sy);
+    sz -= floor(sz);
+    int cx = (int) (sx * (mixed) nCellsX);
+    int cy = (int) (sy * (mixed) nCellsY);
+    int cz = (int) (sz * (mixed) nCellsZ);
     if (cx >= nCellsX) cx = nCellsX - 1; if (cx < 0) cx = 0;
     if (cy >= nCellsY) cy = nCellsY - 1; if (cy < 0) cy = 0;
     if (cz >= nCellsZ) cz = nCellsZ - 1; if (cz < 0) cz = 0;
@@ -1053,6 +1056,7 @@ void CudaCalcLocalManyBodyResidualForceKernel::initialize(const System& system, 
     if (!(force.getInnerCutoffAngstrom() > 0.0 && force.getInnerCutoffAngstrom() < force.getOuterCutoffAngstrom()))
         throw OpenMMException("LocalManyBodyResidualForce (CUDA): cutoffs must satisfy 0 < inner < outer");
     if (!(force.getBMaxReduced() > 0.0)) throw OpenMMException("LocalManyBodyResidualForce (CUDA): b_max_reduced must be positive");
+    if (!std::isfinite(force.getRawOffsetReduced())) throw OpenMMException("LocalManyBodyResidualForce (CUDA): raw_offset_reduced must be finite");
     if (!(force.getTemperatureKelvin() > 0.0)) throw OpenMMException("LocalManyBodyResidualForce (CUDA): temperatureKelvin must be positive");
 
     int maxEdgesInt, maxNeighborsInt, maxEnvInt;
@@ -1083,6 +1087,7 @@ void CudaCalcLocalManyBodyResidualForceKernel::initialize(const System& system, 
     innerCutoffAngstrom = force.getInnerCutoffAngstrom();
     outerCutoffAngstrom = force.getOuterCutoffAngstrom();
     bMaxReduced = force.getBMaxReduced();
+    rawOffsetReduced = force.getRawOffsetReduced();
     radialWidthAngstrom = force.getRadialWidthAngstrom();
     maxEdges = maxEdgesInt;
     maxNeighborsPerLigand = maxNeighborsInt;
@@ -1574,9 +1579,10 @@ double CudaCalcLocalManyBodyResidualForceKernel::execute(ContextImpl& context, b
     addArrArg(readoutKernel, argsBoundReadout, 2, qDevice);
     addArrArg(readoutKernel, argsBoundReadout, 3, typedMlpFlatDevice);
     addRealArg(readoutKernel, argsBoundReadout, 4, useDouble, bMaxReduced);
-    addArrArg(readoutKernel, argsBoundReadout, 5, dBdqDevice);
-    addArrArg(readoutKernel, argsBoundReadout, 6, energyScratchDevice);
-    addArrArg(readoutKernel, argsBoundReadout, 7, deviceStatusDevice);
+    addRealArg(readoutKernel, argsBoundReadout, 5, useDouble, rawOffsetReduced);
+    addArrArg(readoutKernel, argsBoundReadout, 6, dBdqDevice);
+    addArrArg(readoutKernel, argsBoundReadout, 7, energyScratchDevice);
+    addArrArg(readoutKernel, argsBoundReadout, 8, deviceStatusDevice);
     readoutKernel->execute(numLigandAtoms, numLigandAtoms);
     argsBoundReadout = true;
 

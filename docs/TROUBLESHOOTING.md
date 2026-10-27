@@ -19,8 +19,7 @@ python -c "import openmm; print(openmm.__version__)"
 ### `--openmm-cache-only` 下仍然警告「GROMACS 力场 include 目录找不到」
 
 **已修（2026-09-02，`CACHE-01`）** —— `find_gmx_include_dir()` 现在只在**非** cache-only
-分支里调用。逐条核实「cache-only 确实用不到 `include_dir`」的原始记录在
-[archive/RUNTIME_ISSUES_2026-09-02.md](archive/RUNTIME_ISSUES_2026-09-02.md)。
+分支里调用：cache-only 从缓存的 System XML 建系，用不到 `include_dir`。
 
 ⚠️ 另一个**独立**的坑：本仓 `abfe_config.json` 的 `gmx_path` 自 2026-09-07 起**留空**
 （机器本地路径，写死谁的都是错的），留空时回退到 `GMXLIB`/`GMXDATA`/`PATH` 自动探测。
@@ -102,7 +101,3 @@ output/vanishing/dual_window_*_energies.npy
 旧版本。**不需要重新采样**：只要 `complex_results`/`solv_results` 能从缓存加载，
 重跑一次最终汇总即可刷新成当前约定。
 
-> 早期版本的本节曾让读者去查 `status/AUDIT_STATUS.md`、`PHYSICS_DEFECTS.md`、
-> `thermodynamic_cycle.md`。**这三份都不在本工程区分支**（原文在
-> `Atenolol-rank11`，登记在 [HISTORY_LOG.md](HISTORY_LOG.md)），且其中
-> `PHYSICS_DEFECTS.md` 当时就已被取代。上面三条口径已经把需要的结论直接写在这里。

@@ -24,7 +24,7 @@ set -uo pipefail
 : "${CONDA_PREFIX:?请先 conda activate 装有 OpenMM 的环境（本脚本对着它的头文件编译）}"
 CUDA_HOME="${CUDA_HOME:-/opt/cuda}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD="$HERE/build"
+BUILD="${LMBR_BUILD_DIR:-$HERE/build}"  # 和 g0_build.sh 同一个可选覆盖
 mkdir -p "$BUILD/tests"
 
 CXX=g++

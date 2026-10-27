@@ -64,6 +64,12 @@ _RHO_AFFINE_BIAS = 60.0
 _RHO_AFFINE_MAX_Q = 15.0
 _RHO_HIDDEN = 16
 
+# 边距离下限（Å）。插件在 computeQ 里把 r 钳到这个值再算 envelope 和径向基
+# （`plugins/LocalManyBodyResidual/r1_model_layout.h:135` `EXP025_R_FLOOR_ANGSTROM`，
+# 编译期常数），边照样计数。特征不钳，训练拟合的就不是运行时那个 B：低 λ 时蛋白原子
+# 钻进配体 1.5 Å 内，SERT 带水 trial 上两边差到约 1 kT（2026-10-18）。改插件常数时这里一起改。
+PLUGIN_R_FLOOR_ANGSTROM = 1.5
+
 
 def _log_to(log: Callable[[str], None] | None) -> Callable[[str], None]:
     return log if log is not None else (lambda _message: None)
@@ -148,6 +154,7 @@ def frame_basis_features(
 
     这一步就是把 R1 前向里 `pair_weight` 的**线性**部分提出来：ρ 被构造成恰好仿射
     （见 `_affine_rho_state`），斜率折进 `pair_weight`，所以 `raw` 对 θ 线性。
+    `r_e` 先钳到 `PLUGIN_R_FLOOR_ANGSTROM`，和插件一致。
     """
 
     import numpy as np
@@ -161,6 +168,7 @@ def frame_basis_features(
         environment_indices,
         outer_cutoff_angstrom,
     )
+    distance = np.maximum(distance, PLUGIN_R_FLOOR_ANGSTROM)
     features = np.zeros((n_types, n_types, len(radial_centers)), dtype=np.float64)
     realized = {"edges": int(distance.size), "environment_atoms": 0, "neighbors": 0}
     if distance.size:
@@ -836,6 +844,8 @@ def write_refit_payload(
             "inner_cutoff_angstrom": config.inner_cutoff_angstrom,
             "outer_cutoff_angstrom": config.outer_cutoff_angstrom,
             "b_max_reduced": config.b_max_reduced,
+            # 插件在 tanh 前减这个常数，部署的才是这里报告的 b_max·tanh(B_centered/b_max)
+            "raw_offset_reduced": float(result["raw_offset_reduced"]),
             "max_environment_atoms": config.max_environment_atoms,
             "max_edges": config.max_edges,
             "max_neighbors_per_ligand": config.max_neighbors_per_ligand,

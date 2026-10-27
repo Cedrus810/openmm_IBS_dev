@@ -146,6 +146,27 @@ logging.basicConfig(
 log = logging.getLogger("runabfe")
 
 
+# 🔑 [2026-10-21] 在线 IBS 对照臂（config `stage2_online_ibs`）：复合物 stage 2 采完由流水线抛
+# Stage2OnlineIBSSamplingComplete（正常结束信号），这里接住、记日志，主流程随即返回 ——
+# 不写 final_*、不跑溶剂腿，估计在 tools/audit/online_ibs_truncation_analysis.py 里离线做。
+# 设计：docs/design/DESIGN_online_ibs_vs_lcr_2026-10-21.md。不设该键时永远不会抛 ⟹ 逐字不变。
+_ONLINE_IBS_DONE = object()
+
+
+def _run_complex_leg_pipeline(pipeline, **kwargs):
+    from abfe_pipeline import Stage2OnlineIBSSamplingComplete
+    try:
+        return pipeline.run_full_pipeline(**kwargs)
+    except Stage2OnlineIBSSamplingComplete as done:
+        log.info(
+            "在线 IBS：复合物 stage 2 采样完成（账本 %s）；全长逐窗 ΔF 只作记录：%s。"
+            "流水线到此结束，未写 final_*、未跑溶剂腿；结果用 tools/audit/online_ibs_truncation_analysis.py。",
+            done.ledger_path,
+            {w: (None if v is None else round(v["delta_f_kJ"], 3)) for w, v in done.per_window.items()},
+        )
+        return _ONLINE_IBS_DONE
+
+
 # ---------------------------------------------------------------------------
 # 两条腿的配体约束/HMR 身份比较
 # ---------------------------------------------------------------------------
@@ -4976,10 +4997,10 @@ def build_parser() -> argparse.ArgumentParser:
         dest="outer_lambda_resource_manifest",
         default=None,
         help=(
-            "冻结 R1 资源 manifest 的路径。**仓库不再随包发任何冻结权重**"
-            "（2026-09-17 移出 resources/，理由见 archive/resources/…/WHY_RETIRED.md）："
-            "不给这个参数就没有可加载的冻结模型，配体不匹配会走 EXP-033 P1 闭式重训。"
-            "换配体重训出来的产物用这个显式指过去——只是指路，不放宽任何身份门："
+            "冻结 R1 资源 manifest 的路径。**仓库不随包发任何冻结权重**（resources/ 为空）："
+            "开 outer 时必须给这个参数，否则在采样前就拒绝。权重由 "
+            "tools/refit_outer_residual_from_stage2.py 从一次不开 outer 的 run 重训得到，"
+            "流程见 docs/RETRAIN_LOCAL_RESIDUAL.md。只是指路，不放宽任何身份门："
             "配体指纹、原子数、payload/weights sha、插件源码 sha 全部照常校验。"
         ),
     )
@@ -7278,6 +7299,10 @@ def _path_evolution_kwargs(config) -> dict:
     ):
         if config.get(_k) is not None:
             out[_k] = _cast(config.get(_k))
+    # 🔑 [2026-10-21] 在线 IBS 对照臂（设计 docs/design/DESIGN_online_ibs_vs_lcr_2026-10-21.md）。
+    # 设了才透传；在 abfe_pipeline._NON_IDENTITY_KWARGS 里、不进身份。不设 ⟹ 逐字不变。
+    if config.get("stage2_online_ibs") is not None:
+        out["stage2_online_ibs"] = config.get("stage2_online_ibs")
     # 🔑 [2026-09-30] 去电荷 REMD 生产前的平衡段步数（不进 MBAR）。设了才透传；
     # 进 decharging 的采样指纹与 stage 指纹（只进 stage 1，见
     # abfe_pipeline._scope_stage1_only_kwargs），不设 ⟹ 老路径逐字不变。
@@ -7325,13 +7350,28 @@ def _path_evolution_kwargs(config) -> dict:
     return out
 
 
+def _complex_leg_only_kwargs(config) -> dict:
+    """只给复合物腿的键，设了才透传（溶剂腿那次调用不带）。
+
+    🔑 [2026-10-26] `complex_stage2_n_steps_per_window`：复合物 stage 2 每段步数，单独于
+    `n_steps_per_window`（后者照旧管溶剂腿 stage 2，以及没设 stage1_n_steps_per_window 时的
+    stage 1）。只进复合物 vanishing 指纹（abfe_pipeline._scope_stage2_only_kwargs）⟹ 加长复合物
+    stage 2 时复合物 stage 1 与溶剂腿缓存照常复用。不设 ⟹ 一个键都不加，行为逐字不变。
+    """
+    out = {}
+    _s2_steps = config.get("complex_stage2_n_steps_per_window")
+    if _s2_steps is not None and int(_s2_steps) > 0:
+        out["complex_stage2_n_steps_per_window"] = int(_s2_steps)
+    return out
+
+
 def _frozen_residual_manifest_covers_ligand(manifest_path, topology, ligand_indices, system) -> bool:
     """冻结 manifest 声明的配体是不是当前这个。
 
     判据用 loader 自己那把尺子（`ligand_chemical_identity`：配体局部原子序数序列 +
     内部键图的 canonical-JSON SHA-256，跟蛋白无关），所以这里判 True 就等于
     `build_outer_lambda_local_residual_runtime` 的身份闸门会放行。
-    判 False 不是错误 —— 是"这个配体要先重训"的信号。
+    判 False ⟹ 入口拒绝，提示用 tools/refit_outer_residual_from_stage2.py 先重训（2026-10-17）。
     """
 
     from local_residual.openmm_plugin import (
@@ -7341,7 +7381,7 @@ def _frozen_residual_manifest_covers_ligand(manifest_path, topology, ligand_indi
 
     try:
         manifest, _payload, _weights = _load_resource_manifest(manifest_path)
-    except Exception:  # noqa: BLE001 - 读不动/不存在都按"没覆盖"处理，交给重训
+    except Exception:  # noqa: BLE001 - 读不动/不存在都按"没覆盖"处理
         return False
     expected = manifest.get("supported_ligand") or {}
     ligand_ids = tuple(int(v) for v in ligand_indices)
@@ -7352,96 +7392,6 @@ def _frozen_residual_manifest_covers_ligand(manifest_path, topology, ligand_indi
         identity["atomic_numbers"] == expected.get("atomic_numbers")
         and identity["internal_bonds"] == expected.get("internal_bonds")
     )
-
-
-def _refit_outer_lambda_residual_for_this_ligand(
-    *, pipeline, config, output_dir, topology, system, ligand_indices, log,
-):
-    """换配体时的一次闭式重训（EXP-033 §5 P1），产出一份 run 内 manifest。
-
-    帧源写死 `<output_dir>/pre_equilibration.dcd` —— 名字是固定的，有多少帧用多少。
-    调用点必须在**基线预平衡之后**：那条轨迹到那时才存在。
-
-    为什么可以用 run 内的帧：`B_φ` 在 outer，**不进哈密顿量**（physical target 永远
-    不含残差），所以换哪个系综的帧都不改变 ΔG 的正确性，只改变这个采样增强项好不好用。
-    EXP-033 P1 item 1 原文写"用那次 run 自己的 stage2 产物"，是因为当时有 rerun1/2/3
-    三条平行实验、LORO 能按独立 run 分折；而新配体在跑 stage 2 之前根本没有那些产物。
-
-    ⚠️ 做 A/B 时不要走这条路：两臂各自重训会让 `sampling_score_sha256` 变成
-    run-dependent，两臂不再共用同一把尺子。A/B 要的是先离线冻一份、两臂共用
-    （`tools/retrain_local_residual_offline.py`），并按 EXP-027 U3 口径各自标定 f_k。
-    """
-
-    import numpy as np
-
-    from local_residual.refit import closed_form_refit, write_refit_payload
-
-    trajectory = os.path.join(output_dir, "pre_equilibration.dcd")
-    if not os.path.exists(trajectory):
-        raise RuntimeError(
-            f"闭式重训要用预平衡轨迹，但找不到 {trajectory}。"
-            "这条重训必须挂在基线预平衡之后 —— 挂错时序就会撞到这里。"
-        )
-    work_dir = os.path.join(output_dir, "outer_lambda_refit")
-    lam_max = float(config.get("outer_lambda_refit_lambda_max", 1.0))
-    lam_min = float(config.get("outer_lambda_refit_lambda_min", 0.5))
-    n_states = int(config.get("outer_lambda_refit_n_states", 8))
-    log.info(
-        "%s：当前配体不在冻结 manifest 的覆盖范围内 ⟹ 走 EXP-033 §5 P1 闭式重训"
-        "（帧源 pre_equilibration.dcd，λ_vdw %.3g→%.3g，%d 态）",
-        OUTER_LAMBDA_RESIDUAL_FEATURE_NAME, lam_max, lam_min, n_states,
-    )
-    result = closed_form_refit(
-        system=system,
-        topology=topology,
-        positions=pipeline.positions,
-        box_vectors=pipeline.box_vectors,
-        ligand_indices=ligand_indices,
-        trajectory_path=trajectory,
-        lambdas_vdw=np.linspace(lam_max, lam_min, n_states).tolist(),
-        temperature_kelvin=float(config.temperature),
-        platform_name=config.platform,
-        output_dir=work_dir,
-        ligand_name=str(config.ligand),
-        topology_cif=os.path.join(output_dir, "topology.cif"),
-        ligand_indices_path=os.path.join(output_dir, "ligand_indices.json"),
-        system_xml=os.path.join(output_dir, "system_native.xml"),
-        log=lambda message: log.info("%s", message),
-    )
-    resources = os.path.join(work_dir, "resources")
-    write_refit_payload(
-        result,
-        output_dir=resources,
-        ligand_topology_indices=sorted(int(v) for v in ligand_indices),
-        protocol_sha256=result["protocol_sha256"],
-        log=lambda message: log.info("%s", message),
-    )
-    manifest_path = os.path.join(resources, "manifest.json")
-    # 顶层名是 `abfe_scripts` 不是 `scripts`：`mace_torch` 装了个同名顶层正规包，
-    # 正规包永远赢过 PEP 420 namespace 目录 ⟹ 旧写法在任何装了 MACE 的环境里必然
-    # ModuleNotFoundError（2026-09-12 实测）。改名后这里就是一句普通 import，
-    # 也让 tests/test_fresh_clone_imports.py 的 AST 门重新看得见这个依赖。
-    from abfe_scripts.write_local_residual_resource_manifest import main as write_manifest
-
-    write_manifest([
-        "--payload", os.path.join(resources, "r1_model_payload_v1.json"),
-        "--weights", os.path.join(resources, "r1_model_weights_f64.bin"),
-        "--topology", os.path.join(output_dir, "topology.cif"),
-        "--ligand-indices", os.path.join(output_dir, "ligand_indices.json"),
-        "--system", os.path.join(output_dir, "system_native.xml"),
-        "--ligand-name", str(config.ligand),
-        "--experiment-id", "EXP-033",
-        "--output", manifest_path,
-    ])
-    log.info(
-        "%s：闭式重训完成 | 相对改善 %.4f | tanh 改形 %.2f%% | manifest=%s"
-        " ⟹ 这是「值得上机的信号」，不是验收（验收口径见 EXP-033 §4）",
-        OUTER_LAMBDA_RESIDUAL_FEATURE_NAME,
-        result["fit_report"]["relative_improvement"],
-        100.0 * result["tanh_saturated_fraction"],
-        manifest_path,
-    )
-    return manifest_path
 
 
 _LEG_STATUS_KEYS = (
@@ -8217,15 +8167,13 @@ def main():
             )
 
     outer_lambda_runtime = None
-    # 🔑 [EXP-033 §5 P1] 冻结 manifest 覆盖不到当前配体时，**不是**在这里失败，
-    # 而是推迟到基线预平衡之后做一次闭式重训——训练帧源 `pre_equilibration.dcd`
-    # 到那时才存在。覆盖得到就走原路，一个字节都不变。
-    _residual_refit_pending = False
-    # 🔑 本次运行**实际**用的那份 manifest。两条腿都必须读这一个变量：重训产出的
-    # manifest 只写在这里，溶剂腿若仍去读 `config.outer_lambda_resource_manifest`
-    # 就会拿冻结那份去建，新配体在那里撞身份闸门 —— 而且是在复合物腿跑完之后才炸。
-    # 权重**绑配体不绑体系**（docs/RETRAIN_LOCAL_RESIDUAL.md 的表：复合物腿↔溶剂腿
-    # 不用重训），所以一次重训的产物两条腿共用，不重训第二次。
+    # 🔑 [2026-10-17] manifest 覆盖不到当前配体 ⟹ 在任何计算之前就拒绝。
+    # 以前这里会推迟到基线预平衡之后用 `pre_equilibration.dcd` 闭式重训（EXP-033 §5 P1），
+    # 但那批帧是 λ_coul=1、λ_vdw=1，目标态是 λ_coul=0：重要性权重塌到 1 帧（SERT 五个 run
+    # 的 Kish ESS 全是 1.0），拟出的 B 是噪声。现在的流程：先不开 outer 跑出问题的那次
+    # （stage2 旁车带水），用 tools/refit_outer_residual_from_stage2.py 从它的 stage2 帧重训，
+    # 再带 --outer-lambda-resource-manifest 重跑。见 docs/RETRAIN_LOCAL_RESIDUAL.md。
+    # 只有复合物腿用 `_residual_resource_manifest`；溶剂腿不开 outer（2026-10-19 用户定，见溶剂腿处）。
     _residual_resource_manifest = getattr(config, "outer_lambda_resource_manifest", None)
     if config.outer_lambda_local_residual_ibs:
         _frozen_manifest = _residual_resource_manifest or (
@@ -8234,10 +8182,18 @@ def main():
                 "resources/outer_lambda_local_residual/manifest.json",
             )
         )
-        _residual_refit_pending = not _frozen_residual_manifest_covers_ligand(
+        if not _frozen_residual_manifest_covers_ligand(
             _frozen_manifest, topology, ligand_indices, system
-        )
-    if config.outer_lambda_local_residual_ibs and not _residual_refit_pending:
+        ):
+            raise RuntimeError(
+                f"{OUTER_LAMBDA_RESIDUAL_FEATURE_NAME} 开着，但 manifest {_frozen_manifest} "
+                "覆盖不到当前配体（或读不动）。先不开 outer 把这个配体跑一次（stage2 旁车会存水），"
+                "再用 `python tools/refit_outer_residual_from_stage2.py --runs <那次的输出目录> "
+                "--output <目录>` 重训，然后加 `--outer-lambda-resource-manifest <目录>/manifest.json` "
+                "重跑。用预平衡帧自动重训的路径已删除（权重塌到 1 帧）。流程见 "
+                "docs/RETRAIN_LOCAL_RESIDUAL.md。"
+            )
+    if config.outer_lambda_local_residual_ibs:
         # This is the sole mainline plugin entry point.  It validates the
         # frozen source/model artifacts and loads all plugin libraries before
         # any residual XML Force can be deserialized by a window builder.
@@ -8506,48 +8462,6 @@ def main():
     else:
         boresch_restraint = resolve_boresch_restraint(config, pipeline)
 
-    # ----- 4b. 换配体：闭式重训 outer-λ 局部残差（EXP-033 §5 P1） -----
-    # 位置是**刻意**选在这里：`resolve_boresch_restraint` 内部会无条件跑完基线预平衡，
-    # 所以 `pre_equilibration.dcd` 到这一行才保证存在；而 vanishing 采样还没开始，
-    # 残差要影响的正是它。绑定走 pipeline 的统一入口，与构造期共用同一段 fail-closed
-    # 校验（no_residual_twin / plugin identity 两道都不绕过）。
-    if _residual_refit_pending:
-        _residual_resource_manifest = _refit_outer_lambda_residual_for_this_ligand(
-            pipeline=pipeline, config=config, output_dir=output_dir,
-            topology=topology, system=system, ligand_indices=ligand_indices, log=log,
-        )
-        outer_lambda_runtime = build_outer_lambda_local_residual_runtime(
-            topology=topology,
-            ligand_indices=ligand_indices,
-            system=system,
-            temperature_kelvin=float(config.temperature),
-            potential_type=str(config.potential),
-            output_dir=output_dir,
-            ligand_indices_path=os.path.join(output_dir, "ligand_indices.json"),
-            leg_name="complex",
-            platform_name=config.platform,
-            resource_manifest=_residual_resource_manifest,
-        )
-        config.data["outer_lambda_local_residual_ibs_identity"] = (
-            outer_lambda_runtime.provenance_payload()
-        )
-        pipeline.attach_residual_sampling_runtime(
-            enabled=True,
-            basis_force_factory=outer_lambda_runtime.force_factory,
-            state_coefficients_factory=outer_lambda_runtime.state_coefficients_factory,
-            energy_offset_kj_mol=outer_lambda_runtime.energy_offset_kj_mol,
-            sampling_score_sha256=outer_lambda_runtime.sampling_score_sha256,
-            plugin_identity=outer_lambda_runtime.provenance_payload(),
-            em_policy=outer_lambda_runtime.em_policy,
-            feature_name=OUTER_LAMBDA_RESIDUAL_FEATURE_NAME,
-        )
-        log.info(
-            "%s 已延迟绑定 | score=%s | em_policy=%s",
-            OUTER_LAMBDA_RESIDUAL_FEATURE_NAME,
-            outer_lambda_runtime.sampling_score_sha256,
-            outer_lambda_runtime.em_policy,
-        )
-
     # ----- 5. 带限制力再平衡（如果启用） -----
     if boresch_restraint and not config.skip_rebalance:
         log.info("执行带 Boresch 限制力的再平衡...")
@@ -8617,23 +8531,18 @@ def main():
             pipeline, outer_lambda_runtime is not None
         )
         # 🔑 开关开着 ⟹ 要么真挂上了，要么**报错**。绝不静默跑 baseline。
-        #
-        # 缺冻结 manifest 是**正常初始状态**，不是错误状态 —— 输入的时候谁都没有这份
-        # 蒸馏出来的权重。所以 fail-closed 的位置从"资源缺失"挪到了这里："训完了仍然
-        # 没有"。中间那一步（EXP-033 P1 闭式重训）自己失败会当场抛，不会走到这。
-        #
-        # 这道断言防的是**未来重构**：`_residual_refit_pending` 的赋值、重训调用点、
-        # 腿的分支只要有一处挪位，开着开关的 run 就会拿 `residual_sampling_enabled=False`
-        # 造出来的 pipeline 一路跑完，报告里一切正常，而残差一次都没生效。
+        # 这道断言防的是**未来重构**：manifest 判定、运行时构造、腿的分支只要有一处挪位，
+        # 开着开关的 run 就会拿 `residual_sampling_enabled=False` 造出来的 pipeline 一路跑完，
+        # 报告里一切正常，而残差一次都没生效。
         if config.outer_lambda_local_residual_ibs and outer_lambda_runtime is None:
             raise RuntimeError(
                 f"{OUTER_LAMBDA_RESIDUAL_FEATURE_NAME} 开关是开的，但到开始采样时运行时"
-                "仍然没有绑上。这不该发生：冻结 manifest 覆盖不到当前配体时应该走自动"
-                "闭式重训（docs/archive/EXP-033_P1_LANDED_2026-09-12.md）。"
+                "仍然没有绑上。这不该发生：manifest 覆盖不到当前配体时入口就该拒绝。"
                 "拒绝静默按 baseline 跑完 —— 那会产出一份看起来一切正常、而残差从未生效的结果。"
             )
 
-        complex_results = pipeline.run_full_pipeline(
+        complex_results = _run_complex_leg_pipeline(
+            pipeline,
             # 🔑 [2026-09-01] 质量门放行开关（见 --allow-untrusted-stage-results）。
             # 不传的话 _last_run_config 里就是 False，行为与之前完全一致（fail-closed）。
             allow_untrusted_stage_results=bool(
@@ -8702,6 +8611,7 @@ def main():
                 "stage2_max_production_blocks_per_window"
             ),
             **_path_evolution_kwargs(config),
+            **_complex_leg_only_kwargs(config),
             stage2_free_energy_densify_points=config.get(
                 "stage2_free_energy_densify_points"
             ),
@@ -8743,6 +8653,8 @@ def main():
             attachment_seed=config.get("attachment_seed", 20260728),
             attachment_n_seeds=config.get("attachment_n_seeds", 1),
         )
+        if complex_results is _ONLINE_IBS_DONE:
+            return
     
         # 🔑 [P1-12] 之前这里 .get(..., 0.0) 会把缺字段静默补成 0：一条损坏/部分
         # 失败的腿会被汇总成"看似成功"的 ΔG_bind。统一 sanity gate 缺字段/非有限/
@@ -8779,24 +8691,12 @@ def main():
         
     pos_solv, box_solv = center_system_rigidly(pos_solv, box_solv, lig_idx_solv)
 
+    # 🔑 [2026-10-19 用户定] 溶剂腿**永远不开** outer。溶剂腿是通用的（配体在体相水里），
+    # manifest 只用复合物腿 stage2 帧训练，在水里是外推：Atomoxetine_1Na rep5 开 outer 时
+    # 溶剂腿 stage2 的 g 从 1–20 涨到 69–122，w0 去相关后只剩 6 帧被跳过，整条 run 报错
+    # （SERT_ABFE/experiments/2026-10-18_ato1Na_outer_ab/PLAN.md 第四节）。B 只进 outer
+    # 不进哈密顿量，所以两腿口径不需要一致；溶剂腿走普通 IBS。
     outer_lambda_runtime_solv = None
-    if outer_lambda_runtime is not None:
-        # The loader/factory contract is shared, but the plugin Force is bound
-        # to each leg's concrete topology.  Do not reuse a Force or silently
-        # reuse complex atom-type indices in the solvent System.
-        outer_lambda_runtime_solv = build_outer_lambda_local_residual_runtime(
-            topology=top_solv,
-            ligand_indices=lig_idx_solv,
-            system=sys_solv,
-            temperature_kelvin=float(config.temperature),
-            potential_type=str(config.potential),
-            output_dir=output_dir,
-            ligand_indices_path=os.path.join(output_dir, "ligand_indices_solvent.json"),
-            leg_name="solvent",
-            platform_name=config.platform,
-            # 见上面 `_residual_resource_manifest` 的说明：两段 vdW 共用同一份权重。
-            resource_manifest=_residual_resource_manifest,
-        )
 
     solvent_out_dir = os.path.join(output_dir, "solvent_leg")
     # 🔑 溶剂腿有两条**方向相反**的规矩，别搞混：
@@ -8903,13 +8803,6 @@ def main():
     _scope_pipeline_with_optional_outer_lambda_em(
         pipeline_solv, outer_lambda_runtime_solv is not None
     )
-    if config.outer_lambda_local_residual_ibs and outer_lambda_runtime_solv is None:
-        raise RuntimeError(
-            f"{OUTER_LAMBDA_RESIDUAL_FEATURE_NAME} 开关是开的，但溶剂腿的运行时没绑上。"
-            "两段 vdW 必须用同一份权重；只有一条腿挂上残差，两腿的 ligand–environment "
-            "口径就不一致，ΔG_bind = ΔG_solv − ΔG_cplx 的差值里会混进一个协议差。"
-        )
-
     solv_results = pipeline_solv.run_full_pipeline(
         # 🔑 [2026-09-18] 与复合物腿同一个开关，两腿必须同口径 ——
         # 一腿放大一腿不放大，ΔG_bind 的误差合成就是混口径的。

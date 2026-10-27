@@ -79,6 +79,7 @@ void ReferenceCalcLocalManyBodyResidualForceKernel::initialize(const System& sys
     if (!(force.getInnerCutoffAngstrom() > 0.0 && force.getInnerCutoffAngstrom() < force.getOuterCutoffAngstrom()))
         throw OpenMMException("LocalManyBodyResidualForce: cutoffs must satisfy 0 < inner < outer");
     if (!(force.getBMaxReduced() > 0.0)) throw OpenMMException("LocalManyBodyResidualForce: b_max_reduced must be positive");
+    if (!std::isfinite(force.getRawOffsetReduced())) throw OpenMMException("LocalManyBodyResidualForce: raw_offset_reduced must be finite");
     if (!(force.getTemperatureKelvin() > 0.0)) throw OpenMMException("LocalManyBodyResidualForce: temperatureKelvin must be positive");
 
     int maxEdges, maxNeighborsPerLigand, maxEnvironmentAtoms;
@@ -92,6 +93,7 @@ void ReferenceCalcLocalManyBodyResidualForceKernel::initialize(const System& sys
     model.innerCutoffAngstrom = force.getInnerCutoffAngstrom();
     model.outerCutoffAngstrom = force.getOuterCutoffAngstrom();
     model.bMaxReduced = force.getBMaxReduced();
+    model.rawOffsetReduced = force.getRawOffsetReduced();
     model.maxEdges = maxEdges;
     model.maxNeighborsPerLigand = maxNeighborsPerLigand;
     model.maxEnvironmentAtoms = maxEnvironmentAtoms;

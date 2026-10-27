@@ -85,6 +85,8 @@ int LocalManyBodyResidualForce::getNumRadialBasis() const { return (int)radialCe
 
 void LocalManyBodyResidualForce::setBMaxReduced(double v) { bMaxReduced = v; }
 double LocalManyBodyResidualForce::getBMaxReduced() const { return bMaxReduced; }
+void LocalManyBodyResidualForce::setRawOffsetReduced(double v) { rawOffsetReduced = v; }
+double LocalManyBodyResidualForce::getRawOffsetReduced() const { return rawOffsetReduced; }
 
 void LocalManyBodyResidualForce::setCapacityCeilings(int edges, int neighbors, int environmentAtoms) {
     maxEdges = edges;

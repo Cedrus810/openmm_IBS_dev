@@ -3082,6 +3082,11 @@ _NON_IDENTITY_KWARGS = (
     "stage2_lcr_max_rounds",
     "stage2_lcr_burn_in_steps",
     "stage2_lcr_zero_window_end_shift_kT",
+    # 🔑 [2026-10-21] 在线 IBS 对照臂的配置（初始 f、每窗步数、更新间隔）。新键、不进身份 ⟹
+    # 对存量缓存逐位 no-op；代价同 B+：在线 run 必须写到新目录（设计
+    # docs/design/DESIGN_online_ibs_vs_lcr_2026-10-21.md §5）。实际用的值记在
+    # checkpoints/stage2_online_ibs_ledger.json。
+    "stage2_online_ibs",
 )
 
 
@@ -3092,6 +3097,19 @@ REPRO_FK_CYCLES_DEFAULT = 3
 # 复现模式默认的逐轮倾斜：+1 左 / 0 中 / -1 右（与默认轮数一一对应）。
 # 显式给 `stage2_repro_fk_tilt_signs` 覆盖；给 `[0, 0, 0]` 等于关掉倾斜。
 REPRO_FK_TILT_SIGNS_DEFAULT = (1, 0, -1)
+
+
+class Stage2OnlineIBSSamplingComplete(Exception):
+    """[2026-10-21] 在线 IBS 对照臂：复合物 stage 2 全部窗口采完的**正常结束信号**（不是错误）。
+
+    在线数据的估计在离线工具里做（docs/design/DESIGN_online_ibs_vs_lcr_2026-10-21.md §7）；
+    runabfe 接住它后记日志并返回，不再写 final_* 或跑溶剂腿。
+    """
+
+    def __init__(self, ledger_path, per_window):
+        super().__init__(f"online IBS stage 2 sampling complete: {ledger_path}")
+        self.ledger_path = ledger_path
+        self.per_window = per_window
 
 
 def _finalize_stage_with_indeterminate(result, indeterminate):
@@ -3140,6 +3158,27 @@ def _scope_stage1_only_kwargs(run_config: Dict, stage_name: str) -> Dict:
     return run_config
 
 
+# 🔑 [2026-10-26] 只影响复合物腿 stage 2（vanishing）每段长度的键。runabfe 只往复合物腿传，
+# 溶剂腿照旧用 `n_steps_per_window`。只进 vanishing 的指纹（不作废 decharging 缓存），
+# 不设时 kwargs 里没有这个键 ⟹ 既有指纹逐位不变。用途：只加长复合物 stage 2、复用已有
+# stage 1 与溶剂腿（fragment-opt 0.5 → 2 ns）。
+_COMPLEX_STAGE2_ONLY_KWARGS = ("complex_stage2_n_steps_per_window",)
+
+
+def _complex_stage2_n_steps_per_window(kwargs: Dict, default: int) -> int:
+    """stage 2 每段步数：设了 `complex_stage2_n_steps_per_window` 用它，否则沿用 `n_steps_per_window`。"""
+    v = kwargs.get("complex_stage2_n_steps_per_window")
+    return int(v) if v is not None and int(v) > 0 else int(default)
+
+
+def _scope_stage2_only_kwargs(run_config: Dict, stage_name: str) -> Dict:
+    kw = run_config.get("kwargs")
+    if stage_name != "vanishing" and isinstance(kw, dict) and any(k in kw for k in _COMPLEX_STAGE2_ONLY_KWARGS):
+        run_config = dict(run_config)
+        run_config["kwargs"] = {k: v for k, v in kw.items() if k not in _COMPLEX_STAGE2_ONLY_KWARGS}
+    return run_config
+
+
 def _scope_stage2_lcr_switch(run_config: Dict, stage_name: str) -> Dict:
     """`stage2_lcr_rounds` 只进 vanishing 的指纹、且只在为真时进（不改入参）。
 
@@ -3161,7 +3200,9 @@ def _scope_stage2_lcr_switch(run_config: Dict, stage_name: str) -> Dict:
         run_config = dict(run_config)
         run_config["kwargs"] = {k: v for k, v in kw.items() if k != "stage2_lcr_relay"}
     # 🔑 [2026-09-30] 同理，只作用于 stage 1 的采样协议键只进 decharging 的指纹。
-    return _scope_stage1_only_kwargs(run_config, stage_name)
+    # [2026-10-26] 复合物 stage 2 每段步数只进 vanishing 的指纹。
+    return _scope_stage2_only_kwargs(
+        _scope_stage1_only_kwargs(run_config, stage_name), stage_name)
 
 
 def _strip_non_identity_kwargs(run_config: Dict) -> Dict:
@@ -6333,6 +6374,8 @@ class ABFEPipeline:
         # [2026-10-02] stage2 接力：逐窗起跑坐标 + 是否落盘窗口末态（见 run_all_windows）。
         window_start_positions: Optional[Dict[int, Any]] = None,
         save_window_final_state: bool = False,
+        # [2026-10-21] 在线 IBS 对照臂：{window_idx: {"update_every_frames": int}}，透传给 run_all_windows。
+        online_ibs_by_window: Optional[Dict[int, Dict[str, Any]]] = None,
         only_window_indices: Optional[List[int]] = None,
         # 🔑 [路径演化] 调用方保证这份 window_ranges 是权威的（保前缀插点的产物，
         # 与全局分窗器重算的结果必然不同）。默认 False 时逐字保持原有严格判据。
@@ -7038,6 +7081,7 @@ class ABFEPipeline:
             segment_seed_tag=segment_seed_tag,
             window_start_positions=window_start_positions,
             save_window_final_state=bool(save_window_final_state),
+            **({"online_ibs_by_window": online_ibs_by_window} if online_ibs_by_window else {}),
             # 🔑 [2026-09-11 实验开关，默认 False] 见 ibs_engine 里的参数注释。
             accept_recalibrated_f_k_without_gate=bool(
                 kwargs.get("stage2_accept_recalibrated_f_k_without_gate", False)
@@ -15118,6 +15162,96 @@ class ABFEPipeline:
             f"标签 " + "，".join(f"w{w}={v[0]}" for w, v in labels.items()))
         return merged
 
+    # ------------------------------------------------------------------
+    # 🔑 [2026-10-21] 在线 IBS 对照臂（配置键 `stage2_online_ibs`，只在 `stage2_lcr_rounds` 开着时生效，
+    # 只接管复合物腿；不设 ⟹ 老路径逐字不变）。每个窗口一段、一条链：初始 f 用配置给的值（= 配对
+    # LCR run 第一轮中段），burn-in 之后每帧按原文 TA 估计量更新 f_k，步数按窗口给。全帧 + 逐帧
+    # 生成器的 TMBAR 由 stage2_online_ibs.solve_per_frame_generators 给出；截断分析在离线工具
+    # tools/audit/online_ibs_truncation_analysis.py 里做。流水线**不**为这条腿产出 ΔG（逐窗 ΔF 只作
+    # 记录），免得把在线数据当固定 f 的单生成器去合并。
+    # 设计：docs/design/DESIGN_online_ibs_vs_lcr_2026-10-21.md。
+    _STAGE2_ONLINE_IBS_LEDGER = "stage2_online_ibs_ledger.json"
+
+    def _run_stage2_online_ibs(self, run_once, *, lambdas_var, window_ranges, kt: float, run_kwargs):
+        import stage2_online_ibs as _soi
+
+        kw = run_kwargs or {}
+        cfg = _soi.parse_online_ibs_config(kw.get("stage2_online_ibs"))
+        lam = [float(x) for x in lambdas_var]
+        ranges = [(int(a), int(b)) for a, b in window_ranges]
+        stage_dir = os.path.join(self.output_dir, "vanishing")
+        ckpt = self.checkpoint_dir
+        windows = sorted(cfg["init_f_k_kJ"])
+        bad = [w for w in windows if not (0 <= w < len(ranges))
+               or len(cfg["init_f_k_kJ"][w]) != ranges[w][1] - ranges[w][0]]
+        if bad:
+            raise ValueError(f"[在线 IBS] 窗口 {bad} 不在布局里或初始 f 长度与窗口态数不符；布局={ranges}")
+        ledger_path = os.path.join(ckpt, self._STAGE2_ONLINE_IBS_LEDGER)
+        ledger = {}
+        if os.path.isfile(ledger_path):
+            with open(ledger_path, "r", encoding="utf-8") as fh:
+                ledger = json.load(fh)
+        ledger.update({
+            "protocol_version": _soi.STAGE2_ONLINE_IBS_PROTOCOL_VERSION,
+            "layout": {"lambdas_var": lam, "window_ranges": [list(r) for r in ranges]},
+            "config": {"init_f_k_kJ": {str(w): cfg["init_f_k_kJ"][w] for w in windows},
+                       "n_steps": {str(w): cfg["n_steps"][w] for w in windows},
+                       "update_every_frames": cfg["update_every_frames"],
+                       "seed_tag": cfg["seed_tag"]},
+        })
+        status = ledger.setdefault("status", {})
+        _atomic_write_json(ledger_path, ledger)
+        self._log(f"  [在线 IBS] 窗口 {windows}，每窗步数 "
+                  + "，".join(f"w{w}={cfg['n_steps'][w]}" for w in windows)
+                  + f"；每 {cfg['update_every_frames']} 帧更新一次。")
+        for w in windows:
+            if status.get(str(w), {}).get("state") == "SAMPLED":
+                continue
+            try:
+                run_once(
+                    len(lam), lam, ranges,
+                    _output_dir_override=None,
+                    _checkpoint_dir_override=None,
+                    _only_window_indices=[w],
+                    _authoritative_window_ranges=True,
+                    _resume_override=True,
+                    _fixed_f_k_by_window={w: cfg["init_f_k_kJ"][w]},
+                    _segment_seed_tag=cfg["seed_tag"],
+                    _production_step_overrides={w: int(cfg["n_steps"][w])},
+                    _online_ibs_by_window={w: {"update_every_frames": cfg["update_every_frames"]}},
+                )
+                status[str(w)] = {"state": "SAMPLED"}
+            except (RuntimeError, ArithmeticError, openmm.OpenMMException) as err:
+                self._log(f"  [在线 IBS] 窗口 {w} 失败：{err!r} ⟹ 标 FAILED，其余照常。")
+                status[str(w)] = {"state": "FAILED", "error": repr(err)[:500]}
+            _atomic_write_json(ledger_path, ledger)
+
+        per_window = {}
+        for w in windows:
+            if status.get(str(w), {}).get("state") != "SAMPLED":
+                per_window[str(w)] = None
+                continue
+            s_nk = np.load(os.path.join(stage_dir, f"dual_window_{w}_vdw_sampling_states.npy"))
+            u_kn = np.load(os.path.join(stage_dir, f"dual_window_{w}_vdw_energies.npy"))
+            fk = np.load(os.path.join(stage_dir, f"dual_window_{w}_vdw_sampling_fk.npy"))
+            r = _soi.solve_per_frame_generators(s_nk.T, u_kn, fk, kt)
+            per_window[str(w)] = {"delta_f_kJ": r["delta_f_kJ"], "n_frames": r["n_frames"],
+                                  "min_state_ess": float(min(r["state_ess"])),
+                                  "solver_converged": r["converged"]}
+        ledger["per_window_full_length"] = per_window
+        _atomic_write_json(ledger_path, ledger)
+        done = [v for v in per_window.values() if v is not None]
+        self._log("  [在线 IBS] 全长逐窗 ΔF（只作记录）："
+                  + "，".join(f"w{w}={v['delta_f_kJ']:.3f}" if v else f"w{w}=FAILED"
+                              for w, v in per_window.items())
+                  + (f"；和 = {sum(v['delta_f_kJ'] for v in done):.3f} kJ/mol" if len(done) == len(windows) else ""))
+        failed = [w for w in windows if status.get(str(w), {}).get("state") != "SAMPLED"]
+        if failed:
+            raise RuntimeError(f"[在线 IBS] 窗口 {failed} 采样失败（见 {ledger_path}）；修好后 --resume 只补这些窗口。")
+        # 采样完成即止：流水线后面的阶段检查 / 合并求解 / ΔG_bind 都按「固定 f 的生成器」设计，
+        # 不适用于在线数据。由 runabfe 接住、正常结束（不写 final_*，不跑溶剂腿）。
+        raise Stage2OnlineIBSSamplingComplete(ledger_path, per_window)
+
     def _recalibrate_f_k_and_resample_segment(
         self,
         run_once,
@@ -18545,6 +18679,15 @@ class ABFEPipeline:
                                _protocol_fingerprint(analysis_context))
             if should_run_stage2:
                 self._log("\n[双λ] Stage 2: 去VDW (λ_coul=0, λ_vdw: 1→0)")
+                # 🔑 [2026-10-26] stage 2 每段步数：本块里**所有**用到段长的地方都读它
+                # （首次采样、LCR 轮次、自治控制器、复现节奏、rescue 默认）。不设
+                # `complex_stage2_n_steps_per_window` ⟹ 等于 n_steps_per_window，逐字不变。
+                _s2_steps_per_window = _complex_stage2_n_steps_per_window(kwargs, n_steps_per_window)
+                if _s2_steps_per_window != int(n_steps_per_window):
+                    self._log(
+                        f"  stage 2 每段 {_s2_steps_per_window} 步"
+                        f"（complex_stage2_n_steps_per_window；n_steps_per_window={int(n_steps_per_window)}）"
+                    )
 
                 # 闭包按引用取值，但先在这里落一个默认，避免任何提前调用踩 NameError。
                 # 显式分窗、以及任何非默认分窗判据，产出的布局都与贪心等弧长分窗
@@ -18574,7 +18717,8 @@ class ABFEPipeline:
                                       _fixed_f_k_by_window=None,
                                       _segment_seed_tag=None,
                                       _window_start_positions=None,
-                                      _save_window_final_state=False):
+                                      _save_window_final_state=False,
+                                      _online_ibs_by_window=None):
                     # [2026-09-25] stage2 轮次控制器给的是**已倾斜好的固定 f_k**：
                     # 不再套复现节奏的默认倾斜（否则会倾斜两次）。
                     if _fixed_f_k_by_window is not None:
@@ -18615,7 +18759,7 @@ class ABFEPipeline:
                         potential_type=potential_type,
                         dexp_params=dexp_params,
                         n_states=_n_states,
-                        n_steps_per_window=n_steps_per_window,
+                        n_steps_per_window=_s2_steps_per_window,
                         steps_per_update=steps_per_update,
                         system_type=system_type,
                         resume=(
@@ -18664,6 +18808,9 @@ class ABFEPipeline:
                         segment_seed_tag=_segment_seed_tag,
                         window_start_positions=_window_start_positions,
                         save_window_final_state=_save_window_final_state,
+                        # 不传 / None ⟹ 调用与老路径逐字相同（见 _run_dual_lambda_stage）。
+                        **({"online_ibs_by_window": _online_ibs_by_window}
+                           if _online_ibs_by_window else {}),
                         fixed_f_k_burn_in_steps=int(
                             kwargs.get("stage2_lcr_burn_in_steps", 25000)),
                         production_step_overrides=_production_step_overrides,
@@ -18739,7 +18886,21 @@ class ABFEPipeline:
                     raise ValueError(
                         "stage2_lcr_rounds=true 要求冻结布局：必须同时设 "
                         "stage2_uniform_lambda_states 与 stage2_window_ranges。")
-                if _lcr_on:
+                # 🔑 [2026-10-21] 在线 IBS 对照臂：只接管复合物腿（溶剂腿照旧走 LCR）。不设 ⟹ 逐字不变。
+                _online_ibs_on = (
+                    _lcr_on and kwargs.get("stage2_online_ibs") is not None
+                    and (self.leg_name or "complex") != "solvent"
+                )
+                if _online_ibs_on:
+                    stage2 = self._run_stage2_online_ibs(
+                        _run_stage2_once,
+                        lambdas_var=optimized_lambdas_2,
+                        window_ranges=expected_vanishing_ranges,
+                        kt=(unit.MOLAR_GAS_CONSTANT_R * self.temperature).value_in_unit(
+                            unit.kilojoule_per_mole),
+                        run_kwargs=kwargs,
+                    )
+                elif _lcr_on:
                     stage2 = self._run_stage2_rounds(
                         _run_stage2_once,
                         lambdas_var=optimized_lambdas_2,
@@ -18750,7 +18911,7 @@ class ABFEPipeline:
                         pilot_mean_dU_dlambda=stage2_pilot_mean_dU_dlambda,
                         pilot_std_dU_dlambda=stage2_pilot_std_dU_dlambda,
                         pilot_n_dU_dlambda_samples=stage2_pilot_n_dU_dlambda_samples,
-                        n_steps_per_window=int(n_steps_per_window),
+                        n_steps_per_window=int(_s2_steps_per_window),
                         run_kwargs=kwargs,
                     )
                 else:
@@ -18838,7 +18999,7 @@ class ABFEPipeline:
                             # —— 配 50000 时会超采 5 倍，配 500000 时会按 500k 拒掉一个
                             # 实际只跑 250k 的动作。首轮采样用的是真参数，所以这个偏差
                             # 只出现在自治补采上，更难看出来。
-                            n_steps_per_window=int(n_steps_per_window),
+                            n_steps_per_window=int(_s2_steps_per_window),
                             # 审计 #1：控制器消费的**全部** 7 个配置键，从这一处
                             # 解析好的有效值组装，而不是让它去 run_dir 下找文件。
                             # 键名与 `Stage2RepairController.__init__` 读的完全一致；
@@ -18855,7 +19016,7 @@ class ABFEPipeline:
                             # 的 None 语义是"上限未知、不拦"，同样靠缺键表达。）
                             effective_config={
                                 k: v for k, v in {
-                                    "n_steps_per_window": int(n_steps_per_window),
+                                    "n_steps_per_window": int(_s2_steps_per_window),
                                     "stage2_window_min_states": kwargs.get(
                                         "stage2_window_min_states"),
                                     "stage2_window_max_states": kwargs.get(
@@ -19082,7 +19243,7 @@ class ABFEPipeline:
                     for failing_window in failing_windows:
                         old_target = int(
                             production_rescue_targets.get(
-                                failing_window, n_steps_per_window
+                                failing_window, _s2_steps_per_window
                             )
                         )
                         production_rescue_targets[failing_window] = int(
@@ -19141,7 +19302,7 @@ class ABFEPipeline:
                         self._log(
                             f"  [复现模式] f_k 固定节奏 {_cycle}/{_repro_cycles}："
                             "拿上一段的生产帧重解**全部**窗口的 f_k，再采一整段"
-                            f"（{int(n_steps_per_window)} 步/窗）。不看任何判据。"
+                            f"（{int(_s2_steps_per_window)} 步/窗）。不看任何判据。"
                         )
                         _seg_result, _seg_diag = self._recalibrate_f_k_and_resample_segment(
                             _run_stage2_once,
@@ -19405,7 +19566,7 @@ class ABFEPipeline:
                         rescue_steps = int(
                             kwargs.get(
                                 "stage2_bridge_production_steps",
-                                n_steps_per_window,
+                                _s2_steps_per_window,
                             )
                         )
                         self._log(

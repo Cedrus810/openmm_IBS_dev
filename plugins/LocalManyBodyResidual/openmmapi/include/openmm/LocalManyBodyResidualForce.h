@@ -124,6 +124,12 @@ public:
 
     void setBMaxReduced(double bMaxReduced);
     double getBMaxReduced() const;
+    /** Constant subtracted from the summed raw readout BEFORE the tanh bound:
+     *  B = bMax * tanh((S - rawOffsetReduced) / bMax). The closed-form refit
+     *  centres its linear B by this constant, so the tanh must see the same
+     *  centred value. Default 0 (models exported before 2026-10-18). */
+    void setRawOffsetReduced(double rawOffsetReduced);
+    double getRawOffsetReduced() const;
 
     // ---- hard capacity ceilings (fail-closed, not truncation) ----
     // Scoped to ACTIVE edges only (r < outer_cutoff, i.e. the physical support
@@ -166,6 +172,7 @@ private:
     std::vector<double> pairWeight;
     std::vector<LocalManyBodyTypedMLP> rho;
     double bMaxReduced = 0.0;
+    double rawOffsetReduced = 0.0;
     int maxEdges = 0, maxNeighborsPerLigand = 0, maxEnvironmentAtoms = 0;
     double skinAngstrom = 0.0;
     int candidateListCapacity = 0;

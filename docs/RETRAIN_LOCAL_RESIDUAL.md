@@ -1,6 +1,44 @@
 # 给新配体重训 Local-Residual R1 权重
 
-更新日期：2026-09-10
+更新日期：2026-09-10（2026-10-17 加了下面这一节，**生产重训以它为准**；2026-10-27 补插件与 manifest 说明）
+
+## 2026-10-17 起：从一次不开 outer 的 run 的 stage2 帧重训
+
+仓库**不随包发任何冻结权重**（`resources/` 为空）。开 `--outer-lambda-local-residual-ibs`
+就必须同时给 `--outer-lambda-resource-manifest`，权重只能按下面三步自己重训出来。
+
+预平衡帧自动重训（下文 "P1 已落地" 那条）**已删除**：那批帧是 λ_coul=1、λ_vdw=1，目标态是
+λ_coul=0，重要性权重塌到 1 帧（实测 5 个 run 的 Kish ESS 全是 1.0），拟出来的 B 是噪声。
+现在开 outer 而 manifest 覆盖不到配体，`runabfe` 在入口就拒绝。流程：
+
+```bash
+# 1. 不开 outer 跑（需要 outer 的体系本来就是先跑出了问题的那次）。stage2 旁车默认带水
+#    （ABFE_STAGE2_COORDS_WATER_NM=0.8；10-17 以前的 run 没存水，不能用）
+# 2. 从一个或多个这样的 run（同一配体，可混 rep、可混不同盒子）重训
+python tools/refit_outer_residual_from_stage2.py --runs <run1> [<run2> ...] --output <dir> [--stride N]
+# 3. 带冻结权重重跑
+python runabfe.py ... --outer-lambda-local-residual-ibs --outer-lambda-resource-manifest <dir>/manifest.json
+```
+
+中心仍只用配体原子（离线比较过加 Y176 / 口袋残基当中心，在不带水的特征上没有额外收益）。
+容量取 配体原子数 × 80（每原子邻居上限），配体最多 102 个原子（插件候选表 8192）。
+`<dir>/stage2_refit_report.json` 里有每个 run 每个窗口目标态的 Kish ESS、留出 loss 比、tanh 改形比例。
+
+只有复合物腿用 outer，溶剂腿不开（2026-10-19 定）。
+
+**插件**：默认加载 `plugins/LocalManyBodyResidual/build/`，2026-10-27 起指向
+`build_20261018/`（按当前源码编的）。`.so` 里不含 device code，CUDA kernel 由 OpenMM
+运行时编译，不绑显卡架构；绑定的是 `environment.yml` 钉的 `openmm=8.5.2`。
+要用别的编译目录：`export ABFE_LMBR_PLUGIN_DIR=<和 platforms/ 同级的编译目录>`（源码 sha 门照样过）。
+
+**manifest 的可选 `deployment` 节**（2026-10-21）：`scale`（B 的缩放 c）、
+`rereference_window_coefficients`（窗口内 A_k → A_k − ⟨A_k⟩）、
+`window_basis_offsets_kj_mol`（按窗口 B → B − m_w，键 = 窗口首末 λ_vdW）。
+`tools/refit_outer_residual_from_stage2.py` **不生成这一节**（不写 ⟹ 与 10-21 之前行为相同）；
+要用需在生成的 `manifest.json` 里手动添加，读取与校验见
+`local_residual/openmm_plugin.py` 的 `_parse_deployment`。
+
+以下是 09-10 的旧说明，手工 A/B 链仍然可用。
 
 `outer_lambda_local_residual_ibs` 用的那个残差模型（R1）**绑配体，不绑体系**。
 
@@ -26,13 +64,7 @@ float64（24 KB）。
 > `abfe_scripts/run_exp019_softlift_d0.py` 的参数里没有任何 teacher/model 入口。
 > EXP-010 那套 `exp010-*` 教师子命令是**另一条谱系**，不在 R1 重训链上。
 
-> **P1 已落地（2026-09-12）：** 这条四步链的 ①② 现在有了自动替代 —— 开
-> `--outer-lambda-local-residual-ibs` 且配体不在冻结 manifest 覆盖范围内时，主线会在
-> 基线预平衡之后自己做一次闭式重训（帧源 `pre_equilibration.dcd`），③④ 不变。
-> 见 [EXP-033_P1_LANDED_2026-09-12.md](archive/EXP-033_P1_LANDED_2026-09-12.md)。
-> **做 A/B 仍然走本文这条手工链**（两臂必须共用同一份冻结权重）。
-> 原始方案登记在
-> [EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md](archive/EXP-033_LOCAL_RESIDUAL_REFIT_2026-09-10.md)。
+> 2026-09-12 曾有过「开 outer 时在预平衡之后自动闭式重训」的路径，**2026-10-17 已删除**（预平衡帧与目标态不重叠，权重塌到 1 帧）。现行流程见本文第一节；做 A/B 时两臂必须共用同一份冻结权重。
 
 ## 链条
 
@@ -45,8 +77,7 @@ float64（24 KB）。
 ```
 
 代码位置：训练本体在 `local_residual/`（`softlift*`、`student`、`loss`、
-`environment`、`mace_graph`、`atom_mapping`、`geometry`），2026-09-10 从
-Atenolol-rank11 搬入。**生产入口不会 import 到它们**——`local_residual/__init__.py`
+`environment`、`mace_graph`、`atom_mapping`、`geometry`）。**生产入口不会 import 到它们**——`local_residual/__init__.py`
 故意保持空，`import runabfe` 只会拉进 `openmm_plugin` 和 `em_no_residual`
 （`tests/test_import_time_side_effects.py` 守着这条）。
 

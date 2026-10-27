@@ -16,36 +16,54 @@ __pycache__/
 *.o
 *.so
 *.a
-# 注意：`build` 在本机是指向 `build_exp026_a2` 的**符号链接**，不是目录，
+# 注意：`build` 在本机是指向 `build_20261018` 的**符号链接**，不是目录，
 # 所以规则不能带尾斜杠（带斜杠只匹配目录）。
 plugins/*/build
 plugins/*/build_*
 
-# 例外：预编译的 LocalManyBodyResidual 插件**随仓库分发**（2026-09-12 拍板）。
-# 对着 openmm=8.5.2 编的，而 environment.yml 钉的就是这个版本 ⟹ 按环境文件建环境
-# 开箱可用，不用编。只有不走环境文件用了别的 OpenMM 版本、或改了插件源码才需要重编。
+# 例外：预编译的 LocalManyBodyResidual 插件**随仓库分发**（2026-09-12 拍板；
+# 2026-10-27 插件源码更新后，分发的那份换成 build_20261018 的构建）。
+# 对着 openmm=8.5.2 编的（g0_build.sh 用 conda 环境里的头文件，environment.yml
+# 钉的就是这个版本）⟹ 按环境文件建环境开箱可用，不用编。只有不走环境文件用了
+# 别的 OpenMM 版本、或改了插件源码才需要重编。
 #
-# ⚠️ 顺序有讲究：git 不会下降进被排除的**目录**，所以必须先把 `build_exp026_a2/`
-# 本身放回来，再放里面的 `*.so`。`build` 那条放的是**符号链接**（指向前者）。
+# ⚠️ 顺序有讲究：git 不会下降进被排除的**目录**，所以必须先把 `build_20261018/`
+# 本身放回来；随后把目录内容整体排掉、只放回 `*.so` —— 无扩展名的 gtest 可执行
+# 文件、*.o、regression_suite.log 都被 `/*` 那条挡住，不用再单排 tests/。
+# `build` 那条放的是**符号链接**（指向本目录，不能带尾斜杠，理由见上）。
 !plugins/LocalManyBodyResidual/build
-!plugins/LocalManyBodyResidual/build_exp026_a2/
-!plugins/LocalManyBodyResidual/build_exp026_a2/*.so
-# 但编译出来的 gtest 可执行文件没有扩展名，不被上面的 *.o/*.so/*.a 挡住，
-# 而放开目录就把它们一起放了进来 —— 单独排掉。
-plugins/LocalManyBodyResidual/build_exp026_a2/tests/
+!plugins/LocalManyBodyResidual/build_20261018/
+plugins/LocalManyBodyResidual/build_20261018/*
+!plugins/LocalManyBodyResidual/build_20261018/*.so
 .mypy_cache/
 .ruff_cache/
 
-# 调试轨迹与重构重放数据不进 git（2026-09-27 维护者拍板）
+# 调试轨迹不进 git（2026-09-27 维护者拍板；refactor/ 整目录 2026-10-27 起见下）
 tmp/
-refactor/replay/
 
-# 论文工作区不进 git（2026-09-30 维护者拍板：AIBS_ 全都是论文稿件）
-AIBS_*.md
-docs/manuscript_data/
+# 论文工作区不进 git（2026-09-30 维护者拍板；2026-10-27 全套收进 paper/ 一个目录：
+# 源稿、Word、修订与导出记录、论文脚本、报告、第三方 PDF，入口 paper/MANUSCRIPT_CURRENT.md）
+paper/
 # 第三方文献全文（JCTC 2026 SwapMC 的 markdown 转写），版权原因不入库
 acs.jctc.6c00178.md
 
 # analysis/ 是 fragment-opt-abfe-benchmark 工作区的产物（其 README 路径都指向那边），
 # 不进本仓（2026-10-12 拍板）
 analysis/
+
+# 内部材料（2026-10-27）：已移入 docs/archive/ 的内部记录与各过程目录，公开版不含。
+# ⚠️ /archive/、/experiments/、/refactor/ 必须带前导斜杠锚定根目录：不带斜杠的
+# `archive/` 会连 docs/archive/ 目录一起排掉，git 不进被排除的目录，
+# `!docs/archive/removed_*.md` 就救不回来（tests/test_att27 守着那四份归档）。
+/docs/archive/*
+!docs/archive/removed_*.md
+/archive/
+/experiments/
+/refactor/
+tools/audit/
+# /output/ 同样锚定根目录：不锚定会连 tests/fixtures/output/（测试夹具）一起忽略。
+/output/
+.claude/
+.codex-test-tmp/
+.codex-worktrees/
+.commit_drafts/

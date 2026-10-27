@@ -126,6 +126,8 @@ inline LoadedPayload loadModelPayload(const std::string& payloadJsonPath, const 
     model.innerCutoffAngstrom = jNum(config, "inner_cutoff_angstrom");
     model.outerCutoffAngstrom = jNum(config, "outer_cutoff_angstrom");
     model.bMaxReduced = jNum(config, "b_max_reduced");
+    // Optional: payloads exported before 2026-10-18 carry no offset (= 0).
+    if (yyjson_val* off = yyjson_obj_get(config, "raw_offset_reduced")) model.rawOffsetReduced = yyjson_get_num(off);
     model.maxEdges = jInt(config, "max_edges");
     model.maxNeighborsPerLigand = jInt(config, "max_neighbors_per_ligand");
     model.maxEnvironmentAtoms = jInt(config, "max_environment_atoms");

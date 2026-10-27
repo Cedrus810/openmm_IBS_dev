@@ -105,10 +105,15 @@ bash plugins/LocalManyBodyResidual/g0_build.sh
 
 - 编译时吃 `$CONDA_PREFIX/include` 下的 OpenMM **公有 API + Reference 平台私有头
   + CUDA/Common 平台私有头**（私有头没有 ABI 稳定性承诺）；
-- 链接 `-lOpenMM -lOpenMMCUDA`，`-rpath` 写死 `$CONDA_PREFIX/lib`。
+- 链接 `-lOpenMM -lOpenMMCUDA`；`-rpath` 是 `$ORIGIN`（2026-10-27 起，插件自己的三个库
+  互相在同一目录里找），`libOpenMM` / `libOpenMMCUDA` 在 Python 进程里按 SONAME 匹配已加载的那份。
 
-⟹ 换 OpenMM 版本、换 conda 环境、甚至同版本换一次 build，都要重新跑一遍
+⟹ 换 OpenMM 版本、或者同版本换一次 OpenMM build，都要重新跑一遍
 `g0_build.sh`。**开发与验证用的是 OpenMM 8.5.2（`git_revision 36a30cb`）。**
+
+仓库里的 `build/` 是指向 `build_20261018/` 的符号链接（按当前插件源码编的那份）。
+`g0_build.sh` 默认写进 `build/`；想先编到别处验证，设 `LMBR_BUILD_DIR=<目录>`，
+运行时用 `ABFE_LMBR_PLUGIN_DIR=<目录>` 指过去（目录须与 `platforms/` 同级）。
 
 ### 显卡型号不用操心
 

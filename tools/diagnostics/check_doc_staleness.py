@@ -56,7 +56,8 @@ _CN_ZHIQI = re.compile(r"截至\s*(\d{4}-\d{2}-\d{2})")
 
 TRACKED_DOCS: dict[str, re.Pattern] = {
     # "> **本页整理截至 2026-09-05**（协议版本一栏当天逐个对过源码常量）。"
-    "docs/STATUS.md": _CN_ZHIQI,
+    # 2026-10-27 起在 docs/archive/（内部材料，不随公开版发布；本工具只在本地手动跑）
+    "docs/archive/STATUS.md": _CN_ZHIQI,
     # 2026-09-05 README 去重，追踪表从三份 README 换成这一份：
     #   科学状态、结果登记和协议版本表原来在 README.md / README_cn.md /
     #   README_en.md / docs/README.md 各存一份，热力学路径版本已经在其中三份里

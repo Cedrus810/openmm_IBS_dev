@@ -1,8 +1,7 @@
 # 输出、结果解读与续跑
 
 > 本文说明输出目录、Boresch 来源、结果口径、缓存/续跑以及 GPU 并行。它描述的是
-> 工作流行为，不代表当前某一轮结果已经通过科学验证。当前结论请查阅
-> [状态与验证文档](HISTORY_LOG.md)。
+> 工作流行为，不代表某一轮结果已经通过科学验证。
 
 [返回项目首页](../README.md) · [文档导航](README.md)
 
@@ -126,8 +125,8 @@ Delta G_bind = Delta G_solvent - Delta G_complex + Delta G_APBS
 >
 > 本节早期版本给的是**两条可以直接复制粘贴、但现在必然失败的命令**
 > （带 `--parallel-stages` + `IBS_STAGE1/2_CUDA_DEVICE`）。已删除。
-> 为什么移除见 [archive/removed_parallel_stages.md](archive/removed_parallel_stages.md)
-> —— 它在移除之前就**早已被无条件禁用**，所以从来没有真正并行过。
+> 它在移除之前就**早已被无条件禁用**（跨进程 warmup 失败反馈没有序列化），
+> 所以从来没有真正并行过。
 >
 > ⚠️ CLI 里那个 `--parallel-stages` 参数**还在**（`runabfe.py:4020`），
 > 保留的只是「几秒内明确失败」的守卫，不是功能。

@@ -30,7 +30,8 @@ set -euo pipefail
 : "${CONDA_PREFIX:?请先 conda activate 装有 OpenMM 的环境（本脚本对着它的头文件编译）}"
 CUDA_HOME="${CUDA_HOME:-/opt/cuda}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD="$HERE/build"
+# LMBR_BUILD_DIR：先编到别的目录验证，再替换生产用的 build/（编到一半报错不会留下半新半旧的 build/）。
+BUILD="${LMBR_BUILD_DIR:-$HERE/build}"
 mkdir -p "$BUILD"
 
 CXX=g++
@@ -43,7 +44,10 @@ INC_REFERENCE_PLATFORM=(-I"$CONDA_PREFIX/include/openmm/reference")
 INC_CUDA_TOOLKIT=(-I"$CUDA_HOME/include")
 
 LIBDIR=(-L"$CONDA_PREFIX/lib")
-RPATH=(-Wl,-rpath,"$CONDA_PREFIX/lib" -Wl,-rpath,"$BUILD")
+# $ORIGIN = 本 .so 所在目录（2026-10-27）。原来写死 $CONDA_PREFIX/lib 和 $BUILD 的绝对路径，
+# 而这几个 .so 没有 SONAME ⟹ CUDA/Reference 插件按 RUNPATH 去找基础库，换机器就找不到。
+# libOpenMM / libOpenMMCUDA 有 SONAME，在 Python 进程里按已加载的那份匹配。
+RPATH=(-Wl,-rpath,'$ORIGIN')
 
 echo "== [1/3] public API lib: libOpenMMLocalManyBodyResidual.so =="
 INC_SERIALIZATION=(-I"$HERE/serialization/include")

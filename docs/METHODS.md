@@ -1,12 +1,14 @@
 # 方法学与文献 / Methods and references
 
-[项目入口](../README.md) · [文档导航](README.md) · [当前科学状态](STATUS.md)
+[项目入口](../README.md) · [文档导航](README.md)
 
 本页把管线的每个环节对应到**它实现的是哪篇文献的方法**，以及**代码在哪**。
 写论文的方法学一节、或者审稿人问"这一步依据是什么"时看这里。
 
 DOI 逐条核对过（2026-09-05）。这里只列**本管线真正执行**的方法；计划中、
-实验中和已退役的路线不在此列（见 [STATUS.md](STATUS.md) 的状态词）。
+实验中和已退役的路线不在此列。仓库里有代码、但**不在默认生产路径上**的：
+DEXP、MACE、ORB、outer-λ 局部残差（默认关，用法见
+[RETRAIN_LOCAL_RESIDUAL.md](RETRAIN_LOCAL_RESIDUAL.md)）、膜体系、charge-transfer、RBFE。
 
 ## 核心方法
 
@@ -56,6 +58,23 @@ LJ 长程（尾）修正在 `ibs_engine.py` 里按 **pair-specific `sigma_ij` �
 `D_ij(r) = alpha_lj * sigma_ij^6 * (1-λ)^m + r^6` 的口径严格一致——这一点必须在
 方法学里说明，因为把尾修正按 pair 无关的标量处理（本仓库 v2 的做法）与采样
 哈密顿量不自洽。
+
+## 协议版本
+
+直接读自源码常量，由 `tests/test_doc_staleness_contract.py` 对着源码钉住：改了常量而没改这张表，测试会红。
+
+| 协议 | 常量 | 值 |
+|---|---|---|
+| IBS 偏置 | `ibs_engine.IBS_BIAS_PROTOCOL_VERSION` | 33 |
+| 热力学路径 | `abfe_preoptimizer.THERMODYNAMIC_PATH_PROTOCOL_VERSION` | 22 |
+| LJ 长程修正 | `ibs_engine.TRADITIONAL_LJ_LRC_PROTOCOL_VERSION` | 3 |
+| WCA 记账 | `ibs_engine.WCA_ACCOUNTING_VERSION` | 3 |
+| ESS 门 | `ibs_engine.ESS_GATE_PROTOCOL_VERSION` | 5 |
+| 配体 COM 约束 | `ibs_engine.LIGAND_COM_RESTRAINT_PROTOCOL_VERSION` | 2 |
+
+协议版本变化可能使既有缓存失配（例如 IBS 偏置 32 → 33 时，既有 `dual_window_*` /
+`ibs_state_*` / `convergence.json` 全部失配、必须重跑），不要手工复用旧产物。
+版本号为什么跳，逐版说明写在源码常量上方的注释里。
 
 ## 参照真值
 

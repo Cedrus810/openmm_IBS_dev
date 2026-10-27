@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -28,8 +29,10 @@ FROZEN_CANDIDATE_LIST_CAPACITY = 8192
 # 2026-09-10 重钉：主线迁移时给插件源码加了 15 行 MIT/NOTICE 版权头，源码正文
 # 与 rank11 冻结版逐字节相同（`diff` 只有那段注释），因此这里连同 manifest 一起
 # 换成新 sha，而不是放宽这道门。旧值 10afff53...b5b0be（无版权头）。
+# 2026-10-18 重钉：G3 cell list 改按分数坐标分格（斜盒漏跨面邻居），readout 在 tanh
+# 前减 rawOffsetReduced。旧值 5c74365d...2dfd81；旧 manifest 一律要重新生成。
 KNOWN_PLUGIN_SOURCE_SHA256 = (
-    "5c74365dffaa648d0ddb86154b90682803c1a951d1e3bee0d453b721ba2dfd81"
+    "0ecbc6e1869d879b6aab6088868b7d22f387c2b11945fbd4b58b5933f656d69e"
 )
 FEATURE_NAME = "Outer-Lambda Local Residual for IBS"
 EM_POLICY = "no_residual_twin"
@@ -52,6 +55,9 @@ class R1Payload:
     radial_width: float
     rho: list[dict[str, np.ndarray]]
     source_checkpoint_sha256: str
+    # 闭式重训减掉的常数；插件在 tanh 前减（B = b_max·tanh((S − offset)/b_max)）。
+    # 2026-10-18 以前导出的 payload 没有这个键，按 0 读。
+    raw_offset_reduced: float = 0.0
 
 
 def sha256_file(path: str | Path) -> str:
@@ -109,6 +115,7 @@ def load_r1_payload(payload_json_path: str | Path, weights_bin_path: str | Path)
         radial_width=float(tensors["radial_width"].reshape(())),
         rho=rho,
         source_checkpoint_sha256=source_sha,
+        raw_offset_reduced=float(cfg.get("raw_offset_reduced", 0.0)),
     )
 
 
@@ -259,16 +266,64 @@ RESOURCE_MISSING_HINT = (
     "键图），换配体不能只换 manifest。\n"
     "已有资源：用 resource_manifest= 指向它，或放回默认位置 "
     "resources/outer_lambda_local_residual/。\n"
-    "走 runabfe 主线时通常**不该看到这条**：EXP-033 P1 落地后，manifest 缺失或覆盖"
-    "不到当前配体会走自动闭式重训（基线预平衡之后，帧源 pre_equilibration.dcd），"
-    "见 docs/archive/EXP-033_P1_LANDED_2026-09-12.md。看到这条说明 loader 被直接调用了，"
-    "或者那条自动重训本身失败了。\n"
-    "要手工冻一份（做 A/B 时两臂必须共用同一份）：按 docs/RETRAIN_LOCAL_RESIDUAL.md "
-    "重训，再用 abfe_scripts/write_local_residual_resource_manifest.py 生成 manifest。"
-    "训练栈已在本仓（local_residual/softlift*、student、loss、environment、"
-    "mace_graph、atom_mapping + abfe_scripts/ 下的 exp019/exp020 入口）。\n"
+    "仓库不随包发任何冻结权重（resources/ 为空），也没有自动重训：先不开 outer 把这个"
+    "配体跑一次，用 tools/refit_outer_residual_from_stage2.py 从它的 stage2 帧重训，"
+    "再用 --outer-lambda-resource-manifest 指向生成的 manifest.json。"
+    "流程见 docs/RETRAIN_LOCAL_RESIDUAL.md（做 A/B 时两臂必须共用同一份）。\n"
     "不需要该功能时保持该开关为 false 即可（默认值）。"
 )
+
+
+class WindowCoefficients(tuple):
+    """One IBS window's per-state A_k plus that window's frozen basis offset (kJ/mol).
+
+    Returned by `state_coefficients_factory` only when the manifest has a `deployment`
+    section with per-window offsets; `ibs_engine` then uses `energy_offset_kj_mol` for
+    that window instead of the runtime's single global offset. A plain list keeps the
+    old behaviour.
+    """
+
+    def __new__(cls, values, energy_offset_kj_mol: float):
+        obj = super().__new__(cls, (float(value) for value in values))
+        obj.energy_offset_kj_mol = float(energy_offset_kj_mol)
+        return obj
+
+
+def _window_key(lambdas_vdw) -> tuple[float, float]:
+    values = [float(value) for value in lambdas_vdw]
+    return (round(values[0], 6), round(values[-1], 6))
+
+
+def _parse_deployment(doc: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Optional frozen deployment correction (2026-10-21, SERT_ABFE outer A/B PLAN.md §12).
+
+    The training objective (gap variance with dA_k * B) is invariant to a per-window
+    constant in B and to a per-window constant in A_k; `deployment` fixes both directions
+    so the sampler does not move away from the physical targets for nothing:
+      scale                              c multiplying A_k
+      rereference_window_coefficients    A_k -> A_k - mean_k A_k inside each window
+      window_basis_offsets_kj_mol        [{"lambdas_vdw": [first, last], "offset_kj_mol": m}]
+                                         B -> B - m for that window (m = training-frame mean)
+    """
+    dep = doc.get("deployment")
+    if dep is None:
+        return None
+    if not isinstance(dep, Mapping):
+        raise RuntimeError("resource manifest 的 deployment 必须是对象")
+    scale = float(dep.get("scale", 1.0))
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise RuntimeError(f"deployment.scale 必须是正的有限数，得到 {scale}")
+    offsets = []
+    for entry in dep.get("window_basis_offsets_kj_mol", []):
+        offset = float(entry["offset_kj_mol"])
+        if not np.isfinite(offset):
+            raise RuntimeError("deployment.window_basis_offsets_kj_mol 含非有限值")
+        offsets.append((_window_key(entry["lambdas_vdw"]), offset))
+    return {
+        "scale": scale,
+        "rereference_window_coefficients": bool(dep.get("rereference_window_coefficients", False)),
+        "window_basis_offsets_kj_mol": tuple(offsets),
+    }
 
 
 def _load_resource_manifest(manifest_path: str | Path) -> tuple[dict[str, Any], Path, Path]:
@@ -378,7 +433,8 @@ def build_local_manybody_residual_force_xml(
         f'numTypes="{n_types}" outerCutoffAngstrom="{repr(float(payload.outer_cutoff_angstrom))}" '
         f'pairWeight="{_encode_double_array(payload.pair_weight)}" '
         f'radialCenters="{_encode_double_array(payload.radial_centers)}" '
-        f'radialWidthAngstrom="{repr(float(payload.radial_width))}" schema_version="{SCHEMA_VERSION}" '
+        f'radialWidthAngstrom="{repr(float(payload.radial_width))}" '
+        f'rawOffsetReduced="{repr(float(payload.raw_offset_reduced))}" schema_version="{SCHEMA_VERSION}" '
         f'skinAngstrom="{repr(float(skin_angstrom))}" '
         f'sourceCheckpointSha256="{payload.source_checkpoint_sha256}" '
         f'temperatureKelvin="{repr(float(temperature_kelvin))}" '
@@ -433,6 +489,7 @@ class OuterLambdaLocalResidualRuntime:
     ligand_indices_sha256: str
     leg_name: str
     supported_ligand: str
+    deployment: dict[str, Any] | None = None
 
     @property
     def energy_offset_kj_mol(self) -> float:
@@ -457,7 +514,24 @@ class OuterLambdaLocalResidualRuntime:
     def state_coefficients_factory(self, lc_win, lv_win):
         if len(lc_win) != len(lv_win):
             raise ValueError("lc_win/lv_win 长度不一致，无法生成 A_k")
-        return [row[0] for row in self.controller.coefficient_matrix(lv_win)]
+        coefficients = [row[0] for row in self.controller.coefficient_matrix(lv_win)]
+        dep = self.deployment
+        if dep is None:
+            return coefficients
+        if dep["rereference_window_coefficients"]:
+            mean = sum(coefficients) / len(coefficients)
+            coefficients = [value - mean for value in coefficients]
+        coefficients = [dep["scale"] * value for value in coefficients]
+        offsets = dict(dep["window_basis_offsets_kj_mol"])
+        if not offsets:
+            return coefficients
+        key = _window_key(lv_win)
+        if key not in offsets:
+            raise RuntimeError(
+                f"deployment 的按窗口 offset 没有覆盖窗口 lambda_vdW {key[0]}→{key[1]}；"
+                f"manifest 里有 {sorted(offsets)}。冻结的部署只对训练时的窗口布局有效"
+            )
+        return WindowCoefficients(coefficients, offsets[key])
 
     def provenance_payload(self) -> dict[str, Any]:
         return {
@@ -506,7 +580,13 @@ def build_outer_lambda_local_residual_runtime(
     import openmm
 
     repo_root = Path(__file__).resolve().parents[1]
-    plugin_dir = Path(plugin_build_dir or repo_root / "plugins/LocalManyBodyResidual/build")
+    # ABFE_LMBR_PLUGIN_DIR：不替换生产 build/ 就让实验 run 用另一份编译产物（2026-10-18，
+    # 新插件在 build_20261018/ 验证期间）。目录必须和 platforms/ 同级，源码 sha 门照样过。
+    plugin_dir = Path(
+        plugin_build_dir
+        or os.environ.get("ABFE_LMBR_PLUGIN_DIR")
+        or repo_root / "plugins/LocalManyBodyResidual/build"
+    )
     manifest_path = Path(
         resource_manifest
         or repo_root / "resources/outer_lambda_local_residual/manifest.json"
@@ -635,6 +715,17 @@ def build_outer_lambda_local_residual_runtime(
         "skin_angstrom": FROZEN_SKIN_ANGSTROM,
         "candidate_list_capacity": FROZEN_CANDIDATE_LIST_CAPACITY,
     }
+    deployment = _parse_deployment(manifest)
+    if deployment is not None:
+        # only when present, so runs without a deployment section keep their sampling score
+        payload_identity["deployment"] = {
+            "scale": deployment["scale"],
+            "rereference_window_coefficients": deployment["rereference_window_coefficients"],
+            "window_basis_offsets_kj_mol": [
+                {"lambdas_vdw": list(key), "offset_kj_mol": value}
+                for key, value in deployment["window_basis_offsets_kj_mol"]
+            ],
+        }
     identity_without_score = {
         "feature": FEATURE_NAME,
         "em_policy": EM_POLICY,
@@ -661,4 +752,5 @@ def build_outer_lambda_local_residual_runtime(
         ligand_indices_sha256=ligand_indices_sha256,
         leg_name=str(leg_name),
         supported_ligand=str(expected_ligand["name"]),
+        deployment=deployment,
     )

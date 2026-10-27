@@ -89,6 +89,7 @@ void LocalManyBodyResidualForceProxy::serialize(const void* object, Serializatio
     node.setStringProperty("outerCutoffAngstrom", encodeDouble(force.getOuterCutoffAngstrom()));
     node.setStringProperty("radialWidthAngstrom", encodeDouble(force.getRadialWidthAngstrom()));
     node.setStringProperty("bMaxReduced", encodeDouble(force.getBMaxReduced()));
+    node.setStringProperty("rawOffsetReduced", encodeDouble(force.getRawOffsetReduced()));
     int maxEdges, maxNeighborsPerLigand, maxEnvironmentAtoms;
     force.getCapacityCeilings(maxEdges, maxNeighborsPerLigand, maxEnvironmentAtoms);
     node.setIntProperty("maxEdges", maxEdges);
@@ -134,6 +135,7 @@ void* LocalManyBodyResidualForceProxy::deserialize(const SerializationNode& node
         force->setOuterCutoffAngstrom(stod(node.getStringProperty("outerCutoffAngstrom", "0")));
         force->setRadialWidthAngstrom(stod(node.getStringProperty("radialWidthAngstrom", "0")));
         force->setBMaxReduced(stod(node.getStringProperty("bMaxReduced", "0")));
+        force->setRawOffsetReduced(stod(node.getStringProperty("rawOffsetReduced", "0")));
         int maxEdges = node.getIntProperty("maxEdges", 0);
         int maxNeighborsPerLigand = node.getIntProperty("maxNeighborsPerLigand", 0);
         int maxEnvironmentAtoms = node.getIntProperty("maxEnvironmentAtoms", 0);

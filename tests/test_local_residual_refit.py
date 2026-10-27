@@ -268,3 +268,33 @@ def test_exported_payload_reproduces_the_fitted_linear_basis(tmp_path):
 
     raw = result["features"] @ reloaded.pair_weight.reshape(-1)
     assert np.allclose(raw, result["features"] @ result["theta"], rtol=0.0, atol=0.0)
+
+
+# =============================================================================
+# 特征的距离下限：和插件 computeQ 一样把 r 钳到 1.5 Å（r1_model_layout.h:135）
+# =============================================================================
+def _one_edge_features(r_angstrom):
+    from local_residual.refit import frame_basis_features
+
+    box = np.diag([30.0, 30.0, 30.0])
+    positions = np.array([[15.0, 15.0, 15.0], [15.0 + r_angstrom, 15.0, 15.0]])
+    return frame_basis_features(
+        positions_angstrom=positions, box_angstrom=box,
+        ligand_indices=[0], environment_indices=[1],
+        ligand_type_index=[0], environment_type_index=[0, 1], n_types=2,
+        radial_centers=np.linspace(0.0, 5.0, 16), radial_width=5.0 / 15.0,
+        inner_cutoff_angstrom=4.0, outer_cutoff_angstrom=5.0,
+    )
+
+
+def test_edge_below_plugin_floor_is_clamped_not_dropped():
+    """小于 1.5 Å 的边按 1.5 Å 算 envelope 和径向基，边照样计数（插件不丢这条边）。"""
+    from local_residual.refit import PLUGIN_R_FLOOR_ANGSTROM
+
+    assert PLUGIN_R_FLOOR_ANGSTROM == 1.5
+    at_floor, used_floor = _one_edge_features(1.5)
+    inside, used_inside = _one_edge_features(0.8)
+    assert used_inside["edges"] == 1 and used_inside == used_floor
+    np.testing.assert_array_equal(inside, at_floor)
+    above, _ = _one_edge_features(2.0)
+    assert not np.array_equal(above, at_floor)  # 下限以上照常随 r 变

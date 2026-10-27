@@ -100,6 +100,7 @@ struct TypedMLP {
 struct ModelParams {
     int nLigandAtoms = 0, nRadialBasis = 0, typeCount = 0;
     double innerCutoffAngstrom = 0, outerCutoffAngstrom = 0, bMaxReduced = 0;
+    double rawOffsetReduced = 0;  // subtracted from rawS before the tanh bound (2026-10-18)
     int64_t maxEdges = 0, maxNeighborsPerLigand = 0, maxEnvironmentAtoms = 0;
     std::vector<double> radialCenters;  // [nRadialBasis]
     double radialWidth = 0;
@@ -340,8 +341,8 @@ inline ForwardResult evaluate(const AtomSystemView& fx, const ModelParams& model
         out.rawS += out.perLigand[i];
     }
     double bMax = model.bMaxReduced;
-    out.bReduced = bMax * std::tanh(out.rawS / bMax);
-    double tanhVal = std::tanh(out.rawS / bMax);
+    double tanhVal = std::tanh((out.rawS - model.rawOffsetReduced) / bMax);
+    out.bReduced = bMax * tanhVal;
     double sech2 = 1.0 - tanhVal * tanhVal;
     std::vector<double> dB_dq(nLigand, 0.0);
     for (int i = 0; i < nLigand; i++) dB_dq[i] = sech2 * dRhoQ_dq[i];

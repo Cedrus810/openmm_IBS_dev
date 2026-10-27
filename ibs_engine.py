@@ -1086,6 +1086,9 @@ def _production_history_lengths(sampler) -> int:
             len(sampler.sampling_state_energy_history),
             len(sampler.residual_basis_history),
         )
+    # [2026-10-21] 在线窗口的逐帧 f_k 与能量账本同步追加、同步截断。
+    if getattr(sampler, "online_fk_history", None) is not None:
+        lengths += (len(sampler.online_fk_history),)
     if len(set(lengths)) != 1:
         raise RuntimeError(
             f"三份长度不一致（含可选 residual ledgers）energy/bias/base/sampling_state/residual = {lengths}；"
@@ -1113,9 +1116,48 @@ def _truncate_production_history(sampler, keep: int) -> int:
     if hasattr(sampler, "sampling_state_energy_history"):
         del sampler.sampling_state_energy_history[keep:]
         del sampler.residual_basis_history[keep:]
+    if getattr(sampler, "online_fk_history", None) is not None:
+        del sampler.online_fk_history[keep:]
     _truncate_coords_sidecar(sampler, keep)
     _production_history_lengths(sampler)  # 截断后仍须等长
     return current - keep
+
+
+# 🔑 [2026-10-21 / 在线 IBS 对照] 设计：docs/design/DESIGN_online_ibs_vs_lcr_2026-10-21.md。
+# 在线窗口的 TA 状态是「初始 f + 已采帧」的纯函数：续跑、灾难回退都从当前的
+# sampling_state 账本重放得到，与帧天然对齐。
+def _online_ibs_resync(sim, prefix: str, sampler, online_ta) -> np.ndarray:
+    """按 sampler 现有帧重放 TA，把逐帧 f 账本和 Context 里的 f_k 同步到重放结果。"""
+    online_ta.replay(sampler.sampling_state_energy_history)
+    sampler.online_fk_history = [np.asarray(x, dtype=np.float64).copy()
+                                 for x in online_ta.fk_history]
+    f_now = np.asarray(online_ta.current_f_kj, dtype=np.float64)
+    for k in range(f_now.size):
+        sim.context.setParameter(f"{prefix}_f_{k}", float(f_now[k]))
+    return f_now.copy()
+
+
+def _online_ibs_after_frame(sim, prefix: str, sampler, online_ta, n_before: int):
+    """生产循环里每次 collect_energies() 之后调用；没追加帧（丢帧）就什么都不做。
+
+    返回新的 f（写回 Context 后的值，供调用方更新 f_k 锁），没追加帧时返回 None。
+    """
+    if len(sampler.sampling_state_energy_history) <= int(n_before):
+        return None
+    sampler.online_fk_history.append(np.asarray(online_ta.current_f_kj, dtype=np.float64).copy())
+    f_new = np.asarray(online_ta.push(sampler.sampling_state_energy_history[-1]), dtype=np.float64)
+    for k in range(f_new.size):
+        sim.context.setParameter(f"{prefix}_f_{k}", float(f_new[k]))
+    return f_new.copy()
+
+
+def _save_online_fk_history(output_dir: str, window_idx: int, stage_type: str, sampler) -> None:
+    hist = getattr(sampler, "online_fk_history", None)
+    if hist is None:
+        return
+    arr = (np.vstack(hist) if hist else np.zeros((0, 0), dtype=np.float64)).astype(np.float64)
+    _atomic_save_npy(
+        os.path.join(output_dir, f"dual_window_{window_idx}_{stage_type}_sampling_fk.npy"), arr)
 
 
 # 🔑 [2026-09-24] stage2 生产坐标旁车 —— **只作诊断**，不进缓存身份、不进任何判据。
@@ -1124,16 +1166,85 @@ def _truncate_production_history(sampler, keep: int) -> int:
 # 续采都只需按 idx 过滤，不可能与能量错位。
 # 开关用环境变量而不是 config：config kwargs 会进 stage_protocol_key，加一个键就会
 # 作废全部窗口缓存（见 incident_config_change_invalidated_all_window_caches）。
-# ponytail: 只存非水原子（配体+蛋白+离子）；要看水/盆时再加最近 N 个水。
+# 固定部分存全部非水原子（配体+蛋白+离子）。
 STAGE2_COORDS_EVERY = int(os.environ.get("ABFE_STAGE2_COORDS_EVERY", "5"))
+# 🔑 [2026-10-17] 再按帧加配体附近的水：氧离任一配体原子 < 这个距离 (nm) 的整个水分子，
+# 每帧个数不同，按帧存（water_idx / water_xyz），存盘时拼接 + water_offsets。
+# 用途：从 stage2 帧离线重训 outer 残差时要算水边（插件外截断 0.5 nm；0.8 = 0.5 + H 伸出
+# 约 0.1 + 余量），见 docs/design/PLAN_outer_center_selection_2026-10-17.md。0 = 不存水。
+STAGE2_COORDS_WATER_NM = float(os.environ.get("ABFE_STAGE2_COORDS_WATER_NM", "0.8"))
 
 
 def _coords_sidecar_path(energies_path: str) -> str:
     return energies_path[: -len("_energies.npy")] + "_coords.npz"
 
 
+# 🔑 [2026-10-22] 窗口**中途**的坐标快照（每 100 个 update 整份重写，长窗口单份 100+ MB）可改写到
+# 本机目录（如 /dev/shm），免得 NFS 被反复整份重写；窗口结束时完整坐标照旧写回 NFS 原位置，并删掉
+# 本机那份。旁车只作诊断、读回时按帧号过滤 ⟹ 本机那份丢了（换节点续跑）只是少一段坐标，不影响
+# 能量账本与续跑。空串（默认）⟹ 逐字不变。用环境变量不用 config：理由同 ABFE_STAGE2_COORDS_EVERY。
+STAGE2_COORDS_SNAPSHOT_DIR = os.environ.get("ABFE_STAGE2_COORDS_SNAPSHOT_DIR", "")
+
+
+def _coords_snapshot_path(nfs_path: str) -> str:
+    """窗口中途快照写哪：没设本机目录 ⟹ 就是 NFS 原路径；设了 ⟹ 本机目录下按原路径展平的文件名。"""
+    if not STAGE2_COORDS_SNAPSHOT_DIR:
+        return nfs_path
+    name = os.path.abspath(nfs_path).strip(os.sep).replace(os.sep, "__")
+    return os.path.join(STAGE2_COORDS_SNAPSHOT_DIR, "abfe_stage2_coords", name)
+
+
+def _coords_resume_source(nfs_path: str) -> str:
+    """续采读哪份：本机快照在就读它（同节点续跑，比 NFS 上窗口结束时那份新），否则读 NFS。"""
+    snap = _coords_snapshot_path(nfs_path)
+    return snap if snap != nfs_path and os.path.isfile(snap) else nfs_path
+
+
+def _discard_coords_snapshot(nfs_path: str) -> None:
+    snap = _coords_snapshot_path(nfs_path)
+    if snap != nfs_path and os.path.exists(snap):
+        os.remove(snap)
+
+
 def _empty_coords_sidecar() -> Dict[str, list]:
-    return {"idx": [], "xyz": [], "box": []}
+    return {"idx": [], "xyz": [], "box": [], "water_idx": [], "water_xyz": []}
+
+
+def _minimum_image(d, box):
+    """OpenMM 约化盒（a 沿 x、b 在 xy 面）上的最小像，按 c、b、a 依次减。"""
+    d = np.array(d, dtype=np.float64, copy=True)
+    for k in (2, 1, 0):
+        d -= np.rint(d[..., k:k + 1] / box[k, k]) * box[k]
+    return d
+
+
+def _water_molecule_atoms(topology) -> Optional[np.ndarray]:
+    """每个水分子的原子编号，(n_water, atoms_per_water)，氧在第 0 列；没有水或各水原子数不一致时 None。"""
+    rows = []
+    for residue in topology.residues():
+        if residue.name not in WATER_MOLECULE_NAMES:
+            continue
+        atoms = list(residue.atoms())
+        oxygen = [a.index for a in atoms if a.element is not None and a.element.symbol == "O"]
+        if len(oxygen) != 1:
+            return None
+        rows.append(oxygen + [a.index for a in atoms if a.index != oxygen[0]])
+    if not rows or len({len(r) for r in rows}) != 1:
+        return None
+    return np.asarray(rows, dtype=np.int64)
+
+
+def _water_shell(positions_nm, box_nm, ligand, water_atoms, cutoff_nm):
+    """氧离任一配体原子 < cutoff 的水分子的行号（先按到配体质心的距离粗筛）。"""
+    lig = positions_nm[ligand]
+    centre = lig.mean(axis=0)
+    reach = float(np.linalg.norm(_minimum_image(lig - centre, box_nm), axis=1).max()) + cutoff_nm
+    oxygen = positions_nm[water_atoms[:, 0]]
+    near = np.flatnonzero(np.linalg.norm(_minimum_image(oxygen - centre, box_nm), axis=1) < reach)
+    if near.size == 0:
+        return near
+    d = np.linalg.norm(_minimum_image(oxygen[near][:, None, :] - lig[None, :, :], box_nm), axis=-1)
+    return near[d.min(axis=1) < cutoff_nm]
 
 
 def _truncate_coords_sidecar(sampler, keep: int) -> None:
@@ -1154,38 +1265,67 @@ def _record_production_coords(sim, sampler, n_before: int, positions=None, box_v
     if positions is None or box_vectors is None:
         state = sim.context.getState(getPositions=True)
         positions, box_vectors = state.getPositions(asNumpy=True), state.getPeriodicBoxVectors()
-    xyz = np.asarray(positions.value_in_unit(unit.nanometer))[sel]
+    all_xyz = np.asarray(positions.value_in_unit(unit.nanometer))
+    xyz = all_xyz[sel]
     box = np.asarray([[v.x, v.y, v.z] for v in box_vectors.value_in_unit(unit.nanometer)])
     sampler.coord_sidecar["idx"].append(n - 1)
     sampler.coord_sidecar["xyz"].append(xyz.astype(np.float32))
     sampler.coord_sidecar["box"].append(box)
+    water = getattr(sampler, "coord_water", None)
+    if water is not None:
+        ligand, water_atoms, cutoff_nm = water
+        rows = _water_shell(all_xyz, box, ligand, water_atoms, cutoff_nm)
+        atoms = water_atoms[rows].ravel()
+        sampler.coord_sidecar["water_idx"].append(atoms.astype(np.int64))
+        sampler.coord_sidecar["water_xyz"].append(all_xyz[atoms].astype(np.float32))
 
 
 def _save_coords_sidecar(path: str, sampler) -> None:
     sc = getattr(sampler, "coord_sidecar", None)
     if not sc or not sc["idx"]:
         return
+    arrays = dict(
+        idx=np.asarray(sc["idx"], dtype=np.int64),
+        xyz=np.stack(sc["xyz"]),
+        box=np.stack(sc["box"]),
+        atom_indices=np.asarray(sampler.coord_atom_indices, dtype=np.int64),
+    )
+    water_idx = sc.get("water_idx") or []
+    if len(water_idx) == len(sc["idx"]):
+        arrays["water_offsets"] = np.concatenate([[0], np.cumsum([len(w) for w in water_idx])]).astype(np.int64)
+        arrays["water_idx"] = np.concatenate(water_idx).astype(np.int64)
+        arrays["water_xyz"] = np.concatenate(sc["water_xyz"]).reshape(-1, 3).astype(np.float32)
+        arrays["water_shell_nm"] = np.float64(getattr(sampler, "coord_water")[2])
     tmp = path + ".tmp"
     with open(tmp, "wb") as handle:
-        np.savez(
-            handle,
-            idx=np.asarray(sc["idx"], dtype=np.int64),
-            xyz=np.stack(sc["xyz"]),
-            box=np.stack(sc["box"]),
-            atom_indices=np.asarray(sampler.coord_atom_indices, dtype=np.int64),
-        )
+        np.savez(handle, **arrays)
     os.replace(tmp, path)
 
 
-def _load_coords_sidecar(path: str, n_frames: int, atom_indices) -> Dict[str, list]:
-    """续采：只接受与当前原子选择一致、且帧号落在已恢复能量帧内的旧坐标。"""
+def _load_coords_sidecar(path: str, n_frames: int, atom_indices, water_shell_nm=None) -> Dict[str, list]:
+    """续采：只接受与当前原子选择一致、且帧号落在已恢复能量帧内的旧坐标。
+
+    这一轮要存水（water_shell_nm 不是 None）时，旧文件也必须按同一距离存了水，
+    否则续上去的帧会一部分有水、一部分没有 —— 直接不接旧坐标。
+    """
     try:
         with np.load(path) as z:
             if not np.array_equal(z["atom_indices"], np.asarray(atom_indices)):
                 return _empty_coords_sidecar()
-            keep = z["idx"] < n_frames
-            return {"idx": [int(i) for i in z["idx"][keep]],
-                    "xyz": list(z["xyz"][keep]), "box": list(z["box"][keep])}
+            has_water = "water_offsets" in z.files
+            if water_shell_nm is not None and not (
+                    has_water and float(z["water_shell_nm"]) == float(water_shell_nm)):
+                return _empty_coords_sidecar()
+            keep = np.flatnonzero(z["idx"] < n_frames)
+            out = _empty_coords_sidecar()
+            out["idx"] = [int(i) for i in z["idx"][keep]]
+            out["xyz"] = list(z["xyz"][keep])
+            out["box"] = list(z["box"][keep])
+            if water_shell_nm is not None:
+                off, w_idx, w_xyz = z["water_offsets"], z["water_idx"], z["water_xyz"]
+                out["water_idx"] = [w_idx[off[i]:off[i + 1]] for i in keep]
+                out["water_xyz"] = [w_xyz[off[i]:off[i + 1]] for i in keep]
+            return out
     except (OSError, KeyError, ValueError):
         return _empty_coords_sidecar()
 
@@ -8941,6 +9081,9 @@ class IBSSampler:
         # physical target ledger which excludes the sampling-only residual.
         self.sampling_state_energy_history = []
         self.residual_basis_history = []
+        # [2026-10-21 / 在线 IBS 对照] 逐帧「生成时」的 f_k；只有在线窗口才不是 None
+        # （见 stage2_online_ibs 与 run_all_windows 的 online_ibs_by_window）。
+        self.online_fk_history = None
         # New checkpoints preserve real f trajectories; old ones still load
         # through the update-count fallback below.
         self.sampling_score_family_sha256 = None
@@ -14954,10 +15097,12 @@ class IBSWindowManagerDualLambda:
         # 30k 原子 × getParticleParameters 的分配风暴。
         residual_kwargs = {}
         if self.residual_basis_force_factory is not None:
-            coefficients = [
-                float(value)
-                for value in self.residual_state_coefficients_factory(lc_win, lv_win)
-            ]
+            window_coefficients = self.residual_state_coefficients_factory(lc_win, lv_win)
+            # [2026-10-21] a frozen per-window basis offset (local_residual.openmm_plugin.
+            # WindowCoefficients) replaces the single global offset for this window; the
+            # sampling-state ledger reads the offset back from this window's IBSBiasForce.
+            window_offset = getattr(window_coefficients, "energy_offset_kj_mol", None)
+            coefficients = [float(value) for value in window_coefficients]
             if len(coefficients) != len(lc_win):
                 raise ValueError(
                     "residual coefficient factory 返回长度与当前窗口状态数不一致："
@@ -14971,7 +15116,9 @@ class IBSWindowManagerDualLambda:
             residual_kwargs = {
                 "residual_basis_force": residual_force,
                 "residual_state_coefficients": coefficients,
-                "residual_energy_offset_kj_mol": self.residual_energy_offset_kj_mol,
+                "residual_energy_offset_kj_mol": (
+                    self.residual_energy_offset_kj_mol if window_offset is None else float(window_offset)
+                ),
             }
         return build_ibs_dual_system(
             ensure_owned_system(XmlSerializer.clone(self.system_template)),
@@ -15028,10 +15175,11 @@ class IBSWindowManagerDualLambda:
                 os.path.join(self.output_dir, f"dual_window_{window_idx}_{stage_type}_residual_basis.npy"),
                 residual_basis,
             )
-        _save_coords_sidecar(
-            os.path.join(self.output_dir, f"dual_window_{window_idx}_{stage_type}_coords.npz"),
-            sampler,
-        )
+        _save_online_fk_history(self.output_dir, window_idx, stage_type, sampler)
+        _coords_snap = _coords_snapshot_path(
+            os.path.join(self.output_dir, f"dual_window_{window_idx}_{stage_type}_coords.npz"))
+        os.makedirs(os.path.dirname(_coords_snap), exist_ok=True)
+        _save_coords_sidecar(_coords_snap, sampler)
 
     def _production_disaster_rollback(
         self,
@@ -15173,6 +15321,12 @@ class IBSWindowManagerDualLambda:
         # True ⟹ 每个窗口生产结束时把全体系末态坐标与盒子写到
         # {output_dir}/dual_window_{w}_{stage}_final_state.npz（接力的下一段从这里起跑）。
         save_window_final_state: bool = False,
+        # 🔑 [2026-10-21 / 在线 IBS 对照] {window_idx: {"update_every_frames": int}}。给了的窗口
+        # 必须同时在 fixed_f_k_by_window 里（那份 f 就是在线更新的初始 f）：burn-in 照旧用初始 f，
+        # 进生产后每采一帧按原文 TA 估计量更新一次 f_k（stage2_online_ibs.OnlineTAWeights），
+        # 逐帧生成时的 f 落盘到 dual_window_{w}_{stage}_sampling_fk.npy。None ⟹ 逐字不变。
+        # 设计：docs/design/DESIGN_online_ibs_vs_lcr_2026-10-21.md。
+        online_ibs_by_window: Optional[Dict[int, Dict[str, Any]]] = None,
         production_step_overrides: Optional[Dict[int, int]] = None,
         enable_early_stop: bool = False,
         early_stop_min_steps: int = 100000,
@@ -15361,6 +15515,18 @@ class IBSWindowManagerDualLambda:
         _fixed_f_k_by_window = {
             int(k): [float(x) for x in v] for k, v in (fixed_f_k_by_window or {}).items()
         }
+        _online_ibs_by_window = {
+            int(k): dict(v or {}) for k, v in (online_ibs_by_window or {}).items()
+        }
+        _online_missing_init = sorted(set(_online_ibs_by_window) - set(_fixed_f_k_by_window))
+        if _online_missing_init:
+            raise ValueError(
+                f"online_ibs_by_window 的窗口 {_online_missing_init} 不在 fixed_f_k_by_window 里："
+                "在线窗口的初始 f 由 fixed_f_k_by_window 给出。")
+        if _online_ibs_by_window and enable_early_stop:
+            # 截断分析要求在线更新与总步数无关（设计 §2）；提前停会让「跑到哪」依赖数据。
+            print("  [在线 IBS] 有在线窗口 ⟹ 本次调用关闭 early stop。")
+            enable_early_stop = False
         # 🔑 [non_mutating_v1] Validate the sampling repair policy ONCE at entry,
         # fail-closed on any unrecognized value (a typo must never silently
         # re-open the deprecated mutating fixed-H/recalibration path).
@@ -19351,6 +19517,7 @@ class IBSWindowManagerDualLambda:
                 sampler.residual_basis_history = []
             production_coords_path = _coords_sidecar_path(production_energies_path)
             sampler.coord_atom_indices = None
+            sampler.coord_water = None
             sampler.coord_sidecar = _empty_coords_sidecar()
             if STAGE2_COORDS_EVERY > 0:
                 sampler.coord_atom_indices = np.asarray(
@@ -19358,13 +19525,22 @@ class IBSWindowManagerDualLambda:
                      if a.residue.name not in WATER_MOLECULE_NAMES],
                     dtype=np.int64,
                 )
+                if STAGE2_COORDS_WATER_NM > 0:
+                    if not hasattr(self, "_coord_water_atoms"):
+                        self._coord_water_atoms = _water_molecule_atoms(self.topology)
+                    if self._coord_water_atoms is not None:
+                        sampler.coord_water = (np.asarray(sorted(self.ligand_indices), dtype=np.int64),
+                                               self._coord_water_atoms, STAGE2_COORDS_WATER_NM)
                 if resumed_production_checkpoint:
                     sampler.coord_sidecar = _load_coords_sidecar(
-                        production_coords_path, len(sampler.energy_history),
+                        _coords_resume_source(production_coords_path), len(sampler.energy_history),
                         sampler.coord_atom_indices,
+                        water_shell_nm=(sampler.coord_water[2] if sampler.coord_water is not None else None),
                     )
             if not resumed_production_checkpoint and os.path.exists(production_coords_path):
                 os.remove(production_coords_path)  # 上一轮的坐标与这轮能量不是同一批帧
+            if not resumed_production_checkpoint:
+                _discard_coords_snapshot(production_coords_path)
             sampler.production_segment_starts = (
                 [{key: seg[key] for key in ("start_frame", "reason", "session_id")}
                  for seg in prior_segments] if resumed_production_checkpoint else []
@@ -19372,6 +19548,21 @@ class IBSWindowManagerDualLambda:
             _start_production_segment(
                 sampler, "cross_process_resume" if resumed_production_checkpoint else "fresh_or_rebuilt"
             )
+            # 🔑 [2026-10-21 / 在线 IBS 对照] 在线窗口：TA 从初始 f 起，把（续跑恢复的）已有帧
+            # 重放一遍 ⟹ 逐帧 f 账本、Context 里的 f_k 都与帧对齐。非在线窗口不碰。
+            online_ta = None
+            online_init_f_k = None
+            if int(window_idx) in _online_ibs_by_window:
+                from stage2_online_ibs import OnlineTAWeights
+                online_init_f_k = np.asarray(_fixed_f_k_by_window[int(window_idx)], dtype=np.float64)
+                online_ta = OnlineTAWeights(
+                    online_init_f_k, float(self.kt),
+                    int(_online_ibs_by_window[int(window_idx)].get("update_every_frames", 1)))
+                _online_ibs_resync(sim, self.prefix, sampler, online_ta)
+                print(
+                    f"  [在线 IBS] 窗口 {window_idx}：生产期每 {online_ta.update_every_frames} 帧按原文 TA "
+                    f"更新一次 f_k；已重放 {online_ta.n_frames} 帧，已更新 {online_ta.n_updates} 次。"
+                )
             production_pos_backup = safety_state.getPositions(asNumpy=True)
             # 🔑 [P1-13] 与坐标备份**同时**记下三份 history 的长度。灾难回退只把
             # 坐标退回这个备份点，却把备份之后已经写入的 energy/bias/base history
@@ -19402,9 +19593,16 @@ class IBSWindowManagerDualLambda:
                 ],
                 dtype=np.float64,
             )
+            # 在线窗口的 f_k 在生产期本来就要变（续跑时已按重放结果写回），入口只要求
+            # 它就是 TA 当前给出的值；锁随后每帧跟着 TA 更新（见主循环）。
+            _entry_f_expected = (
+                np.asarray(online_ta.current_f_kj, dtype=np.float64)
+                if online_ta is not None
+                else np.asarray(production_frozen_f_k, dtype=np.float64)
+            )
             if not np.allclose(
                 production_f_k_lock,
-                np.asarray(production_frozen_f_k, dtype=np.float64),
+                _entry_f_expected,
                 rtol=0.0,
                 atol=1.0e-12,
             ):
@@ -19442,7 +19640,10 @@ class IBSWindowManagerDualLambda:
             # 存/拒绝三种动作，保证真正跑生产用的分支判断和离线单元测试用的
             # 是同一份代码，而不是各自维护一份容易漂移的复制。
             _entry_marker_action, _entry_marker_value = _resolve_production_entry_marker(
-                sampler.production_entry_f_k, production_f_k_lock, resumed_production_checkpoint
+                sampler.production_entry_f_k,
+                # 在线窗口的入口标记 = 初始 f（生产开始时的值），不是续跑时 TA 已走到的值。
+                online_init_f_k if online_ta is not None else production_f_k_lock,
+                resumed_production_checkpoint,
             )
             if _entry_marker_action == "refuse":
                 raise RuntimeError(
@@ -19680,6 +19881,9 @@ class IBSWindowManagerDualLambda:
                             label_prefix="", progress_note=f"update={up}/{n_updates}, ",
                             diagnose_prefix=f"窗口{window_idx}_回退_update{up}",
                         )
+                        if online_ta is not None:
+                            # 帧已截回分叉点 ⟹ TA 也退回分叉点（重放），f_k 锁跟着走。
+                            production_f_k_lock = _online_ibs_resync(sim, self.prefix, sampler, online_ta)
                         continue
 
                     if do_force_check:
@@ -19705,6 +19909,10 @@ class IBSWindowManagerDualLambda:
                     _record_production_coords(
                         sim, sampler, _n_before, guard_positions, guard_box_vectors
                     )
+                if online_ta is not None:
+                    _f_new = _online_ibs_after_frame(sim, self.prefix, sampler, online_ta, _n_before)
+                    if _f_new is not None:
+                        production_f_k_lock = _f_new
                 if len(sampler.energy_buffer) >= 10:
                     sampler.energy_buffer = []
                 if (up + 1) % 100 == 0:
@@ -20001,6 +20209,8 @@ class IBSWindowManagerDualLambda:
                             label_prefix="余数补齐", progress_note="",
                             diagnose_prefix=f"窗口{window_idx}_余数补齐回退",
                         )
+                        if online_ta is not None:
+                            production_f_k_lock = _online_ibs_resync(sim, self.prefix, sampler, online_ta)
                         remainder_disaster = True
                     else:
                         production_pos_backup = guard_positions
@@ -20018,6 +20228,10 @@ class IBSWindowManagerDualLambda:
                         _record_production_coords(
                             sim, sampler, _n_before, guard_positions, guard_box_vectors
                         )
+                    if online_ta is not None:
+                        _f_new = _online_ibs_after_frame(sim, self.prefix, sampler, online_ta, _n_before)
+                        if _f_new is not None:
+                            production_f_k_lock = _f_new
                     if len(sampler.energy_buffer) >= 10:
                         sampler.energy_buffer = []
                     # 🔑 [性能修复：重复落盘] 不在这里再调 _enqueue_window_snapshot()——
@@ -20055,7 +20269,9 @@ class IBSWindowManagerDualLambda:
                 production_sampling_states_path,
                 sampling_states_arr,
             )
+            _save_online_fk_history(self.output_dir, window_idx, stage_type, sampler)
             _save_coords_sidecar(production_coords_path, sampler)
+            _discard_coords_snapshot(production_coords_path)  # 完整坐标已写回 NFS，本机快照作废
             if save_window_final_state:
                 _fs = sim.context.getState(getPositions=True)
                 _fs_path = os.path.join(

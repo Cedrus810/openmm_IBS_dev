@@ -132,6 +132,7 @@ private:
     std::vector<int> ligandSystemIds;   // [numLigandAtoms], SORTED ascending (matches Reference convention)
     std::vector<int> typeBySystemId;    // [numParticles]
     double innerCutoffAngstrom = 0, outerCutoffAngstrom = 0, bMaxReduced = 0, radialWidthAngstrom = 0;
+    double rawOffsetReduced = 0;  // subtracted from the summed readout before tanh (2026-10-18)
     int64_t maxEdges = 0, maxNeighborsPerLigand = 0, maxEnvironmentAtoms = 0;
     double kBTKilojoulePerMole = 0.0;
 
